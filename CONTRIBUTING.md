@@ -1,0 +1,41 @@
+# Contributing to MLX VLM
+
+Below are some tips to port Vision LLMs available on Hugging Face to MLX.
+
+Next, from this directory, do an editable install:
+
+```shell
+pip install -e .
+```
+
+Then check if the model has weights in the
+[safetensors](https://huggingface.co/docs/safetensors/index) format. If not
+[follow instructions](https://huggingface.co/spaces/safetensors/convert) to
+convert it.
+
+After that, add the model file to the
+[`mlx_vlm/models`](https://github.com/Blaizzy/mlx-vlm/tree/main/src/models)
+directory. You can see other examples there. We recommend starting from a model
+that is similar to the model you are porting.
+
+Make sure the name of the new model file is the same as the `model_type` in the
+`config.json`, for example
+[llava](https://huggingface.co/llava-hf/llava-1.5-7b-hf/blob/main/config.json#L7).
+
+To determine the model layer names, we suggest either:
+
+- Refer to the Transformers implementation if you are familiar with the
+  codebase.
+- Load the model weights and check the weight names which will tell you about
+  the model structure.
+- Look at the names of the weights by inspecting `model.safetensors.index.json`
+  in the Hugging Face repo.
+
+Finally, add a test for the new modle type to the [model
+tests](https://github.com/Blaizzy/mlx-vlm/tree/main/src/tests/test_models.py).
+
+From the `src/` directory, you can run the tests with:
+
+```shell
+python -m unittest discover tests/
+```
