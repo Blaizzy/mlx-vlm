@@ -3,7 +3,7 @@ from pathlib import Path
 
 from setuptools import setup
 
-package_dir = Path(__file__).parent / "mlx_lm"
+package_dir = Path(__file__).parent / "mlx_vlm"
 with open(package_dir / "requirements.txt") as fid:
     requirements = [l.strip() for l in fid.readlines()]
 
