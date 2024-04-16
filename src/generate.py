@@ -1,5 +1,3 @@
-# Copyright © 2024 Apple Inc.
-
 import argparse
 import codecs
 from pathlib import Path

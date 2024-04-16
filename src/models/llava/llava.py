@@ -1,4 +1,4 @@
-# Copyright © 2024 Apple Inc.
+
 
 import glob
 import inspect

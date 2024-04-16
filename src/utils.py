@@ -1,4 +1,3 @@
-# Copyright © 2023-2024 Apple Inc.
 
 import copy
 import re
