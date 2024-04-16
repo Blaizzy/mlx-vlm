@@ -143,11 +143,11 @@ def main():
 
     print("Image Path:\n")
     print(args.image)
-    print("="*20)
+    print("="*20+"\n")
 
     print("Prompt:\n")
     print(prompt)
-    print("="*20)
+    print("="*20+"\n")
     input_ids, pixel_values = prepare_inputs(image_processor, processor, args.image, prompt)
 
     generated_text = generate_text(
