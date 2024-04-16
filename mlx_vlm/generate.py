@@ -5,9 +5,9 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import requests
-from .utils import get_model_class
+from .utils import load
 from PIL import Image
-from transformers import AutoProcessor, AutoConfig
+from transformers import AutoTokenizer, AutoConfig
 
 MODEL_TYPE = ""
 def parse_arguments():
@@ -29,7 +29,7 @@ def parse_arguments():
     parser.add_argument(
         "--prompt",
         type=str,
-        default="<image>\nWhat are these?",
+        default="What are these?",
         help="Message to be processed by the model.",
     )
     parser.add_argument(
@@ -87,10 +87,8 @@ def prepare_inputs(image_processor, processor, image, prompt):
 
 def load_model(model_path):
     global MODEL_TYPE
-    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    model_class, MODEL_TYPE, image_processor = get_model_class(config.to_dict())
-    model = model_class.Model.from_pretrained(model_path)
+    model, _, MODEL_TYPE, processor, image_processor = load(model_path)
+
     return processor, model, image_processor
 
 
@@ -128,20 +126,20 @@ def main():
 
     if "chat_template" in processor.__dict__.keys():
         prompt = processor.apply_chat_template(
-            [{"role": "user", "content": f"{prompt}"}],
+            [{"role": "user", "content": f"<image>\n{prompt}"}],
             tokenize=False,
             add_generation_prompt=True,
         )
     elif "tokenizer" in processor.__dict__.keys():
         prompt = processor.tokenizer.apply_chat_template(
-            [{"role": "user", "content": f"{prompt}"}],
+            [{"role": "user", "content": f"<image>\n{prompt}"}],
             tokenize=False,
             add_generation_prompt=True,
         )
     else:
         ValueError("Error: processor does not have 'chat_template' or 'tokenizer' attribute.")
 
-    print("Image Path:\n")
+    print("\nImage Path:\n")
     print(args.image)
     print("="*20+"\n")
 
@@ -154,7 +152,7 @@ def main():
         input_ids, pixel_values, model, processor, args.max_tokens, args.temp
     )
     print("Generated_text:\n")
-    print(generated_text)
+    print(generated_text+"\n")
 
 
 if __name__ == "__main__":

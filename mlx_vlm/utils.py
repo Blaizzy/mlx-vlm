@@ -75,18 +75,36 @@ def load(model_path: Path, lazy: bool = False) -> nn.Module:
         FileNotFoundError: If the weight files (.safetensors) are not found.
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
+
+    path = Path(model_path)
+    if not path.exists():
+        path = Path(
+            snapshot_download(
+                repo_id=model_path,
+                allow_patterns=[
+                    "*.json",
+                    "*.safetensors",
+                    "*.py",
+                    "tokenizer.model",
+                    "*.tiktoken",
+                ],
+
+            )
+        )
+
     try:
-        with open(model_path / "config.json", "r") as f:
+        with open(path / "config.json", "r") as f:
             config = json.load(f)
             quantization = config.get("quantization", None)
+        
     except FileNotFoundError:
-        logging.error(f"Config file not found in {model_path}")
+        logging.error(f"Config file not found in {path}")
         raise
 
-    weight_files = glob.glob(str(model_path / "*.safetensors"))
+    weight_files = glob.glob(str(path / "*.safetensors"))
     if not weight_files:
-        logging.error(f"No safetensors found in {model_path}")
-        raise FileNotFoundError(f"No safetensors found in {model_path}")
+        logging.error(f"No safetensors found in {path}")
+        raise FileNotFoundError(f"No safetensors found in {path}")
 
     weights = {}
     for wf in weight_files:
@@ -129,6 +147,9 @@ def load(model_path: Path, lazy: bool = False) -> nn.Module:
             for k, v in weights.items()
         }
 
+    weights = model_class.VisionModel(model_config.vision_config).sanitize(weights=weights)
+    weights = model_class.LanguageModel(model_config.text_config).sanitize(weights=weights)
+
     if quantization is not None:
         # for legacy models that don't have lm_head quant due to non-32 dims
         if "lm_head.scales" not in weights.keys():
@@ -150,15 +171,11 @@ def load(model_path: Path, lazy: bool = False) -> nn.Module:
                 linear_class_predicate=linear_class_predicate,
             )
 
-    weights = model_class.VisionModel(model_config.vision_config).sanitize(weights=weights)
-    weights = model_class.LanguageModel(model_config.text_config).sanitize(weights=weights)
-
     model.load_weights(list(weights.items()))
+    # if not lazy:
+    #     mx.eval(model.parameters())
 
-    if not lazy:
-        mx.eval(model.parameters())
-
-    model.eval()
+    # model.eval()
     return model, config, model_type, processor, image_processor
 
 def fetch_from_hub(
