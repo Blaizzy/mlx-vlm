@@ -141,19 +141,11 @@ def main():
     else:
         ValueError("Error: processor does not have 'chat_template' or 'tokenizer' attribute.")
 
-    print("Image Path:\n")
-    print(args.image)
-    print("="*20)
-
-    print("Prompt:\n")
-    print(prompt)
-    print("="*20)
     input_ids, pixel_values = prepare_inputs(image_processor, processor, args.image, prompt)
 
     generated_text = generate_text(
         input_ids, pixel_values, model, processor, args.max_tokens, args.temp
     )
-    print("Generated_text:\n")
     print(generated_text)
 
 
