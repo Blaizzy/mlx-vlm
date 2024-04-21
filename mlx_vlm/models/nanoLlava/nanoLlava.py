@@ -233,6 +233,15 @@ class Model(nn.Module):
         for wf in weight_files:
             weights.update(mx.load(wf))
 
+        weights = model.sanitize(weights=weights)
+
+        weights = VisionModel(model_config.vision_config).sanitize(weights=weights)
+        weights = LanguageModel(model_config.text_config).sanitize(weights=weights)
+        model.load_weights(list(weights.items()))
+        return model
+
+
+    def sanitize(self, weights):
         weights = {
             f"{k.split('.', 1)[1]}" if re.match(r'^model\.vision_tower', k) else
             f"mm_projector.linear_1.{k.split('.')[-1]}" if re.match(r'^model\.mm_projector\.0', k) else
@@ -248,7 +257,4 @@ class Model(nn.Module):
             for k, v in weights.items()
         }
 
-        weights = VisionModel(model_config.vision_config).sanitize(weights=weights)
-        weights = LanguageModel(model_config.text_config).sanitize(weights=weights)
-        model.load_weights(list(weights.items()))
-        return model
+        return weights
