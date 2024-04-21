@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 
-from setuptools import setup
+from setuptools import setup, find_packages
 
 package_dir = Path(__file__).parent / "mlx_vlm"
 with open(package_dir / "requirements.txt") as fid:
@@ -22,6 +22,6 @@ setup(
     url="https://github.com/Blaizzy/mlx-vlm",
     license="MIT",
     install_requires=requirements,
-    packages=["mlx_vlm", "mlx_vlm.models"],
+    packages=find_packages(),
     python_requires=">=3.8",
 )
