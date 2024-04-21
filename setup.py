@@ -13,7 +13,7 @@ from version import __version__
 setup(
     name="mlx-vlm",
     version=__version__,
-    description="Visual LLMs on Apple silicon with MLX and the Hugging Face Hub",
+    description="Vision LLMs on Apple silicon with MLX and the Hugging Face Hub",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     readme="README.md",
