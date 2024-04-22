@@ -59,7 +59,6 @@ def sample(logits, temperature=0.0):
 def main():
     args = parse_arguments()
     model, processor, image_processor = get_model_and_processors(args.model)
-    print(processor.detokenizer)
 
     prompt = codecs.decode(args.prompt, "unicode_escape")
 
