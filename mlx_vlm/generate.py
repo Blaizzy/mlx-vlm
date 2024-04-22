@@ -80,11 +80,7 @@ def main():
 
     print("\nImage Path:\n")
     print(args.image)
-    print("="*20+"\n")
-
-    print("Prompt:\n")
-    print(prompt)
-    print("="*20+"\n")
+    print("="*10+"\n")
 
 
     generate(
