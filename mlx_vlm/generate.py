@@ -78,11 +78,6 @@ def main():
     else:
         ValueError("Error: processor does not have 'chat_template' or 'tokenizer' attribute.")
 
-    print("\nImage Path:\n")
-    print(args.image)
-    print("="*10+"\n")
-
-
     generate(
         model,
         processor,
