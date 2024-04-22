@@ -42,7 +42,7 @@ def parse_arguments():
 
 def get_model_and_processors(model_path):
     model_path = get_model_path(model_path)
-    model, processor = load(model_path)
+    model, processor = load(model_path, {"trust_remote_code": True})
     config = load_config(model_path)
     image_processor = load_image_processor(config)
     return model, processor, image_processor
