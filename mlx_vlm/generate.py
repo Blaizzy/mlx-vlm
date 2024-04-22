@@ -1,13 +1,9 @@
 import argparse
 import codecs
-from pathlib import Path
 
 import mlx.core as mx
-import numpy as np
-import requests
-from .utils import load
-from PIL import Image
-from transformers import AutoTokenizer, AutoConfig
+from .utils import load, load_config, load_image_processor, generate, get_model_path
+
 
 MODEL_TYPE = ""
 def parse_arguments():
@@ -44,52 +40,12 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def load_image(image_source):
-    """
-    Helper function to load an image from either a URL or file.
-    """
-    if image_source.startswith(("http://", "https://")):
-        try:
-            response = requests.get(image_source, stream=True)
-            response.raise_for_status()
-            return Image.open(response.raw)
-        except Exception as e:
-            raise ValueError(
-                f"Failed to load image from URL: {image_source} with error {e}"
-            )
-    elif Path(image_source).is_file():
-        try:
-            return Image.open(image_source)
-        except IOError as e:
-            raise ValueError(f"Failed to load image {image_source} with error: {e}")
-    else:
-        raise ValueError(
-            f"The image {image_source} must be a valid URL or existing file."
-        )
-
-
-def prepare_inputs(image_processor, processor, image, prompt):
-    if isinstance(image, str):
-        image = load_image(image)
-
-    if MODEL_TYPE == "nanoLlava":
-        text_chunks = [processor(chunk).input_ids for chunk in prompt.split("<image>")]
-        input_ids = mx.array([text_chunks[0] + [-200] + text_chunks[1]])
-        pixel_values = image_processor.preprocess([image])[0]
-        pixel_values = mx.array(np.expand_dims(pixel_values, axis=0))
-    else:
-        inputs = processor(prompt, image, return_tensors="np")
-        pixel_values = mx.array(inputs["pixel_values"])
-        input_ids = mx.array(inputs["input_ids"])
-
-    return input_ids, pixel_values
-
-
-def load_model(model_path):
-    global MODEL_TYPE
-    model, _, MODEL_TYPE, processor, image_processor = load(model_path)
-
-    return processor, model, image_processor
+def get_model_and_processors(model_path):
+    model_path = get_model_path(model_path)
+    model, processor = load(model_path, {"trust_remote_code": True})
+    config = load_config(model_path)
+    image_processor = load_image_processor(config)
+    return model, processor, image_processor
 
 
 def sample(logits, temperature=0.0):
@@ -99,28 +55,10 @@ def sample(logits, temperature=0.0):
         return mx.random.categorical(logits * (1 / temperature))
 
 
-def generate_text(input_ids, pixel_values, model, processor, max_tokens, temperature):
-
-    logits, cache = model(input_ids, pixel_values)
-    logits = logits[:, -1, :]
-    y = sample(logits, temperature=temperature)
-    tokens = [y.item()]
-
-    for n in range(max_tokens - 1):
-        logits, cache = model.language_model(y[None], cache=cache)
-        logits = logits[:, -1, :]
-        y = sample(logits, temperature)
-        token = y.item()
-        if token == processor.eos_token_id:
-            break
-        tokens.append(token)
-
-    return processor.decode(tokens)
-
 
 def main():
     args = parse_arguments()
-    processor, model, image_processor = load_model(args.model)
+    model, processor, image_processor = get_model_and_processors(args.model)
 
     prompt = codecs.decode(args.prompt, "unicode_escape")
 
@@ -139,20 +77,16 @@ def main():
     else:
         ValueError("Error: processor does not have 'chat_template' or 'tokenizer' attribute.")
 
-    print("\nImage Path:\n")
-    print(args.image)
-    print("="*20+"\n")
-
-    print("Prompt:\n")
-    print(prompt)
-    print("="*20+"\n")
-    input_ids, pixel_values = prepare_inputs(image_processor, processor, args.image, prompt)
-
-    generated_text = generate_text(
-        input_ids, pixel_values, model, processor, args.max_tokens, args.temp
+    generate(
+        model,
+        processor,
+        args.image,
+        prompt,
+        image_processor,
+        args.temp,
+        args.max_tokens,
+        True
     )
-    print("Generated_text:\n")
-    print(generated_text+"\n")
 
 
 if __name__ == "__main__":

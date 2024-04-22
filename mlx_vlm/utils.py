@@ -10,13 +10,18 @@ import time
 from pathlib import Path
 from textwrap import dedent
 from typing import Any, Callable, Dict, Generator, Optional, Tuple, Union
+import requests
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
+from PIL import Image
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_unflatten
-from transformers import AutoConfig, AutoProcessor, PreTrainedTokenizer
+from transformers import AutoConfig, AutoProcessor, PreTrainedTokenizer, PreTrainedTokenizerFast
 
+from .tokenizer_utils import TokenizerWrapper, load_tokenizer
+from .models.base import BaseImageProcessor
 from .sample_utils import top_p_sampling
 
 # Constants
@@ -32,9 +37,9 @@ linear_class_predicate = (
     != 8  # avoid quantizing gate layers, otherwise we have to re-quant and upload all the mixtral models
 )
 
-def get_model_class(config: dict):
+def get_model_and_args(config: dict):
     """
-    Retrieve the model clas based on the configuration.
+    Retrieve the model object based on the configuration.
 
     Args:
         config (dict): The model configuration.
@@ -46,21 +51,50 @@ def get_model_class(config: dict):
     model_type = MODEL_REMAPPING.get(model_type, model_type)
     try:
         arch = importlib.import_module(f"mlx_vlm.models.{model_type}")
-        if model_type == "nanoLlava":
-            image_processor = arch.SigLipImageProcessor()
-        else:
-            image_processor = ""
     except ImportError:
         msg = f"Model type {model_type} not supported."
         logging.error(msg)
         raise ValueError(msg)
 
 
-    return arch, model_type, image_processor
+    return arch, model_type
 
-def load(model_path: Path, lazy: bool = False) -> nn.Module:
+
+def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
     """
-    Load and initialize the model and processor from a given path.
+    Ensures the model is available locally. If the path does not exist locally,
+    it is downloaded from the Hugging Face Hub.
+
+    Args:
+        path_or_hf_repo (str): The local path or Hugging Face repository ID of the model.
+        revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
+
+    Returns:
+        Path: The path to the model.
+    """
+    model_path = Path(path_or_hf_repo)
+    if not model_path.exists():
+        model_path = Path(
+            snapshot_download(
+                repo_id=path_or_hf_repo,
+                revision=revision,
+                allow_patterns=[
+                    "*.json",
+                    "*.safetensors",
+                    "*.py",
+                    "tokenizer.model",
+                    "*.tiktoken",
+                    "*.txt",
+                ],
+                resume_download=True,
+            )
+        )
+    return model_path
+
+
+def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
+    """
+    Load and initialize the model from a given path.
 
     Args:
         model_path (Path): The path to load the model from.
@@ -76,42 +110,22 @@ def load(model_path: Path, lazy: bool = False) -> nn.Module:
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
 
-    path = Path(model_path)
-    if not path.exists():
-        path = Path(
-            snapshot_download(
-                repo_id=model_path,
-                allow_patterns=[
-                    "*.json",
-                    "*.safetensors",
-                    "*.py",
-                    "tokenizer.model",
-                    "*.tiktoken",
-                ],
 
-            )
-        )
+    config = load_config(model_path)
+    quantization = config.get("quantization", None)
 
-    try:
-        with open(path / "config.json", "r") as f:
-            config = json.load(f)
-            quantization = config.get("quantization", None)
-        
-    except FileNotFoundError:
-        logging.error(f"Config file not found in {path}")
-        raise
 
-    weight_files = glob.glob(str(path / "*.safetensors"))
+    weight_files = glob.glob(str(model_path / "*.safetensors"))
     if not weight_files:
-        logging.error(f"No safetensors found in {path}")
-        raise FileNotFoundError(f"No safetensors found in {path}")
+        logging.error(f"No safetensors found in {model_path}")
+        raise FileNotFoundError(f"No safetensors found in {model_path}")
 
     weights = {}
     for wf in weight_files:
         weights.update(mx.load(wf))
 
 
-    model_class, model_type, image_processor = get_model_class(config=config)
+    model_class, model_type = get_model_and_args(config=config)
 
     if model_type == "nanoLlava":
         vision_config = AutoConfig.from_pretrained(config["mm_vision_tower"])
@@ -121,8 +135,6 @@ def load(model_path: Path, lazy: bool = False) -> nn.Module:
         config["vision_config"] = vision_config["vision_config"]
         config["text_config"] = text_config
 
-    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-
     model_config = model_class.ModelConfig.from_dict(config)
     model_config.vision_config = model_class.VisionConfig.from_dict(config["vision_config"])
     model_config.text_config = model_class.TextConfig.from_dict(config["text_config"])
@@ -130,22 +142,6 @@ def load(model_path: Path, lazy: bool = False) -> nn.Module:
 
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
-
-    if model_type == "nanoLlava":
-        weights = {
-            f"{k.split('.', 1)[1]}" if re.match(r'^model\.vision_tower', k) else
-            f"mm_projector.linear_1.{k.split('.')[-1]}" if re.match(r'^model\.mm_projector\.0', k) else
-            f"mm_projector.linear_2.{k.split('.')[-1]}" if re.match(r'^model\.mm_projector\.2', k) else
-            f"language_model.model.{k}" if re.match(r'^lm_head', k) else
-            f"language_model.{k}" if re.match(r'^model\.(embed_tokens|norm|layers)', k) else k: v
-            for k, v in weights.items()
-        }
-
-        weights = {
-            f"vision_tower.vision_tower.vision_model.head.attention.in_proj.bias" if re.match(r'^vision_tower\.vision_tower\.vision_model\.head\.attention\.in_proj_bias', k) else
-            f"vision_tower.vision_tower.vision_model.head.attention.in_proj.weight" if re.match(r'^vision_tower\.vision_tower\.vision_model\.head\.attention\.in_proj_weight', k) else k: v
-            for k, v in weights.items()
-        }
 
     weights = model_class.VisionModel(model_config.vision_config).sanitize(weights=weights)
     weights = model_class.LanguageModel(model_config.text_config).sanitize(weights=weights)
@@ -172,16 +168,77 @@ def load(model_path: Path, lazy: bool = False) -> nn.Module:
             )
 
     model.load_weights(list(weights.items()))
-    # if not lazy:
-    #     mx.eval(model.parameters())
+    if not lazy:
+        mx.eval(model.parameters())
 
-    # model.eval()
-    return model, config, model_type, processor, image_processor
+    model.eval()
+    return model
+
+
+def load(
+    path_or_hf_repo: str,
+    processor_config={},
+    lazy: bool = False,
+) -> Tuple[nn.Module, Union[PreTrainedTokenizer, PreTrainedTokenizerFast]]:
+    """
+    Load the model and tokenizer from a given path or a huggingface repository.
+
+    Args:
+        path_or_hf_repo (Path): The path or the huggingface repository to load the model from.
+        tokenizer_config (dict, optional): Configuration parameters specifically for the tokenizer.
+            Defaults to an empty dictionary.
+        adapter_path (str, optional): Path to the LoRA adapters. If provided, applies LoRA layers
+            to the model. Default: ``None``.
+        lazy (bool): If False eval the model parameters to make sure they are
+            loaded in memory before returning, otherwise they will be loaded
+            when needed. Default: ``False``
+    Returns:
+        Tuple[nn.Module, TokenizerWrapper]: A tuple containing the loaded model and tokenizer.
+
+    Raises:
+        FileNotFoundError: If config file or safetensors are not found.
+        ValueError: If model class or args class are not found.
+    """
+    model_path = get_model_path(path_or_hf_repo)
+
+    model = load_model(model_path, lazy)
+    processor = load_processor(model_path, processor_config=processor_config)
+
+    return model, processor
+
+def load_config(model_path: Path) -> dict:
+    try:
+        with open(model_path / "config.json", "r") as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        logging.error(f"Config file not found in {model_path}")
+        raise
+    return config
+
+def load_image_processor(config: dict) -> BaseImageProcessor:
+    model_class, _ = get_model_and_args(config)
+    image_processor = None
+
+    if hasattr(model_class, "ImageProcessor"):
+        image_processor = model_class.ImageProcessor()
+
+    return image_processor
+
+def load_processor(model_path, processor_config={"trust_remote_code": True}) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+    processor = AutoProcessor.from_pretrained(model_path, **processor_config)
+    detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
+    if "tokenizer" in processor.__dict__.keys():
+        processor.detokenizer = detokenizer_class(processor.tokenizer)
+    else:
+        processor.detokenizer = detokenizer_class(processor)
+    return processor
 
 def fetch_from_hub(
     model_path: Path, lazy: bool = False
 ) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
-    model, config, _, processor, _ = load(model_path, lazy)
+    model = load_model(model_path, lazy)
+    config = load_config(model_path)
+    processor = load_processor(model_path)
 
     return model, config, processor
 
@@ -377,10 +434,7 @@ def quantize_model(
         Tuple: Tuple containing quantized weights and config.
     """
     quantized_config = copy.deepcopy(config)
-
-    nn.QuantizedLinear.quantize_module(
-        model, q_group_size, q_bits, linear_class_predicate=linear_class_predicate
-    )
+    nn.quantize(model, q_group_size, q_bits)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
     quantized_weights = dict(tree_flatten(model.parameters()))
 
@@ -494,9 +548,63 @@ def convert(
     if upload_repo is not None:
         upload_to_hub(mlx_path, upload_repo, hf_path)
 
+def load_image(image_source):
+    """
+    Helper function to load an image from either a URL or file.
+    """
+    if image_source.startswith(("http://", "https://")):
+        try:
+            response = requests.get(image_source, stream=True)
+            response.raise_for_status()
+            return Image.open(response.raw)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load image from URL: {image_source} with error {e}"
+            )
+    elif Path(image_source).is_file():
+        try:
+            return Image.open(image_source)
+        except IOError as e:
+            raise ValueError(f"Failed to load image {image_source} with error: {e}")
+    else:
+        raise ValueError(
+            f"The image {image_source} must be a valid URL or existing file."
+        )
+
+def prepare_inputs(image_processor, processor, image, prompt):
+    if isinstance(image, str):
+        image = load_image(image)
+
+    if image_processor is not None:
+        text_chunks = [processor(chunk).input_ids for chunk in prompt.split("<image>")]
+        input_ids = mx.array([text_chunks[0] + [-200] + text_chunks[1]])
+        pixel_values = image_processor.preprocess(images=[image])[0]
+        pixel_values = mx.array(np.expand_dims(pixel_values, axis=0))
+    else:
+        inputs = processor(prompt, image, return_tensors="np")
+        pixel_values = mx.array(inputs["pixel_values"])
+        input_ids = mx.array(inputs["input_ids"])
+
+    return input_ids, pixel_values
+
+def sample(logits: mx.array, temp:float, top_p:float) -> Tuple[mx.array, float]:
+    softmax_logits = mx.softmax(logits)
+
+    if temp == 0:
+        token = mx.argmax(logits, axis=-1)
+    else:
+        if top_p > 0 and top_p < 1.0:
+            token = top_p_sampling(logits, top_p, temp)
+        else:
+            token = mx.random.categorical(logits * (1 / temp))
+
+    prob = softmax_logits[0, token]
+    return token, prob
+
 def generate_step(
-    prompt: mx.array,
     model: nn.Module,
+    prompt: mx.array,
+    cache = None,
     temp: float = 0.0,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
@@ -518,20 +626,6 @@ def generate_step(
         one token and probability per call.
     """
 
-    def sample(logits: mx.array) -> Tuple[mx.array, float]:
-        softmax_logits = mx.softmax(logits)
-
-        if temp == 0:
-            token = mx.argmax(logits, axis=-1)
-        else:
-            if top_p > 0 and top_p < 1.0:
-                token = top_p_sampling(logits, top_p, temp)
-            else:
-                token = mx.random.categorical(logits * (1 / temp))
-
-        prob = softmax_logits[0, token]
-        return token, prob
-
     if repetition_penalty and (
         repetition_penalty < 0 or not isinstance(repetition_penalty, float)
     ):
@@ -539,8 +633,7 @@ def generate_step(
             f"repetition_penalty must be a non-negative float, got {repetition_penalty}"
         )
 
-    y = prompt
-    cache = None
+    y, prob = sample(prompt, temp, top_p)
 
     repetition_context = prompt.tolist()
 
@@ -555,10 +648,10 @@ def generate_step(
             logits = apply_repetition_penalty(
                 logits, repetition_context, repetition_penalty
             )
-            y, prob = sample(logits)
+            y, prob = sample(logits, temp, top_p)
             repetition_context.append(y.item())
         else:
-            y, prob = sample(logits)
+            y, prob = sample(logits, temp, top_p)
 
         if repetition_context_size:
             if len(repetition_context) > repetition_context_size:
@@ -568,8 +661,10 @@ def generate_step(
 
 def generate(
     model: nn.Module,
-    tokenizer: PreTrainedTokenizer,
+    processor: PreTrainedTokenizer,
+    image: str,
     prompt: str,
+    image_processor = None,
     temp: float = 0.0,
     max_tokens: int = 100,
     verbose: bool = False,
@@ -596,18 +691,34 @@ def generate(
     """
     if verbose:
         print("=" * 10)
+        print("Image:", image, "\n")
         print("Prompt:", prompt)
 
-    prompt_tokens = mx.array(tokenizer.encode(prompt))
-    detokenizer = tokenizer.detokenizer
+
+    if image_processor is not None:
+        prompt_tokens = mx.array(processor.encode(prompt))
+        tokenizer = processor
+    else:
+        prompt_tokens = mx.array(processor.tokenizer.encode(prompt))
+        tokenizer = processor.tokenizer
+
+    input_ids, pixel_values = prepare_inputs(image_processor, processor, image, prompt)
+    logits, cache = model(input_ids, pixel_values)
+    logits = logits[:, -1, :]
+    y, _ = sample(logits, temp, top_p)
+
 
     tic = time.perf_counter()
+    detokenizer = processor.detokenizer
     detokenizer.reset()
+
+    detokenizer.add_token(y.item())
 
     for (token, prob), n in zip(
         generate_step(
-            prompt_tokens,
-            model,
+            model.language_model,
+            logits,
+            cache,
             temp,
             repetition_penalty,
             repetition_context_size,
@@ -619,8 +730,11 @@ def generate(
         if n == 0:
             prompt_time = time.perf_counter() - tic
             tic = time.perf_counter()
+
         if token == tokenizer.eos_token_id:
             break
+
+
         detokenizer.add_token(token)
 
         if verbose:
@@ -643,6 +757,7 @@ def generate(
             return
         prompt_tps = prompt_tokens.size / prompt_time
         gen_tps = (token_count - 1) / gen_time
+
         print(f"Prompt: {prompt_tps:.3f} tokens-per-sec")
         print(f"Generation: {gen_tps:.3f} tokens-per-sec")
 

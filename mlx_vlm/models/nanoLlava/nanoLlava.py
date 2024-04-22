@@ -14,15 +14,15 @@ from huggingface_hub import snapshot_download
 from transformers import AutoConfig
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
+from ..base import BaseImageProcessor
 
 
 from typing import Optional, Dict
 from dataclasses import dataclass
 from functools import partial, reduce
 from PIL import Image
-from transformers.image_processing_utils import get_size_dict
 from transformers.image_transforms import (convert_to_rgb, normalize, rescale, resize, to_channel_dimension_format, )
-from transformers.image_utils import (ChannelDimension, PILImageResampling, to_numpy_array, )
+from transformers.image_utils import ( to_numpy_array, )
 
 @dataclass
 class ModelConfig:
@@ -51,26 +51,7 @@ class ModelConfig:
         )
 
 
-class SigLipImageProcessor:
-    def __init__(self,
-                 image_mean=(0.5, 0.5, 0.5),
-                 image_std=(0.5, 0.5, 0.5),
-                 size=(384, 384),
-                 crop_size: Dict[str, int] = None,
-                 resample=PILImageResampling.BICUBIC,
-                 rescale_factor=1 / 255,
-                 data_format=ChannelDimension.FIRST):
-        crop_size = crop_size if crop_size is not None else {"height": 384, "width": 384}
-        crop_size = get_size_dict(crop_size, default_to_square=True, param_name="crop_size")
-
-        self.image_mean = image_mean
-        self.image_std = image_std
-        self.size = size
-        self.resample = resample
-        self.rescale_factor = rescale_factor
-        self.data_format = data_format
-        self.crop_size = crop_size
-
+class ImageProcessor(BaseImageProcessor):
     def preprocess(self, images):
         if isinstance(images, Image.Image):
             images = [images]
@@ -233,6 +214,15 @@ class Model(nn.Module):
         for wf in weight_files:
             weights.update(mx.load(wf))
 
+        weights = model.sanitize(weights=weights)
+
+        weights = VisionModel(model_config.vision_config).sanitize(weights=weights)
+        weights = LanguageModel(model_config.text_config).sanitize(weights=weights)
+        model.load_weights(list(weights.items()))
+        return model
+
+
+    def sanitize(self, weights):
         weights = {
             f"{k.split('.', 1)[1]}" if re.match(r'^model\.vision_tower', k) else
             f"mm_projector.linear_1.{k.split('.')[-1]}" if re.match(r'^model\.mm_projector\.0', k) else
@@ -248,7 +238,4 @@ class Model(nn.Module):
             for k, v in weights.items()
         }
 
-        weights = VisionModel(model_config.vision_config).sanitize(weights=weights)
-        weights = LanguageModel(model_config.text_config).sanitize(weights=weights)
-        model.load_weights(list(weights.items()))
-        return model
+        return weights
