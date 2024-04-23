@@ -146,26 +146,17 @@ def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
     weights = model_class.VisionModel(model_config.vision_config).sanitize(weights=weights)
     weights = model_class.LanguageModel(model_config.text_config).sanitize(weights=weights)
 
-    if quantization is not None:
-        # for legacy models that don't have lm_head quant due to non-32 dims
-        if "lm_head.scales" not in weights.keys():
-            vocab_size = config["vocab_size"]
-            extended_linear_class_predicate = (
-                lambda layer: linear_class_predicate(layer)
-                and layer.weight.shape[0] != vocab_size
-            )
-            nn.QuantizedLinear.quantize_module(
-                model,
-                **quantization,
-                linear_class_predicate=extended_linear_class_predicate,
-            )
-        # for models that have lm_head quant
-        else:
-            nn.QuantizedLinear.quantize_module(
-                model,
-                **quantization,
-                linear_class_predicate=linear_class_predicate,
-            )
+    if (quantization := config.get("quantization", None)) is not None:
+        # Handle legacy models which may not have everything quantized
+        class_predicate = (
+            lambda p, m: isinstance(m, (nn.Linear, nn.Embedding))
+            and f"{p}.scales" in weights
+        )
+        nn.quantize(
+            model,
+            **quantization,
+            class_predicate=class_predicate,
+        )
 
     model.load_weights(list(weights.items()))
     if not lazy:
@@ -279,23 +270,23 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
     import os
 
     from huggingface_hub import HfApi, ModelCard, logging
+    from . import __version__
 
     card = ModelCard.load(hf_path)
     card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"]
     card.text = dedent(
         f"""
         # {upload_repo}
-        This model was converted to MLX format from [`{hf_path}`]() using mlx-vllm version **0.0.0**.
+        This model was converted to MLX format from [`{hf_path}`]() using mlx-vllm version **{__version__}**.
         Refer to the [original model card](https://huggingface.co/{hf_path}) for more details on the model.
         ## Use with mlx
 
         ```bash
-        git clone https://github.com/ml-explore/mlx-examples.git
+        pip install -U mlx-vlm
         ```
 
         ```bash
-        cd mlx-lm/vllms
-        python -m generate --model {path} --max-tokens 10 --temp 0.0
+        python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temp 0.0
         ```
         """
     )
@@ -417,6 +408,8 @@ def save_weights(
             indent=4,
         )
 
+def class_predicate(path, m):
+    return isinstance(m, nn.Linear) and not isinstance(m, nn.Embedding)
 
 def quantize_model(
     model: nn.Module, config: dict, q_group_size: int, q_bits: int
@@ -434,7 +427,7 @@ def quantize_model(
         Tuple: Tuple containing quantized weights and config.
     """
     quantized_config = copy.deepcopy(config)
-    nn.quantize(model, q_group_size, q_bits)
+    nn.quantize(model, q_group_size, q_bits, class_predicate=class_predicate)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
     quantized_weights = dict(tree_flatten(model.parameters()))
 
@@ -508,7 +501,7 @@ def convert(
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
-    model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
+    model, config, tokenizer = fetch_from_hub(model_path, lazy=False)
 
     weights = dict(tree_flatten(model.parameters()))
     dtype = mx.float16 if quantize else getattr(mx, dtype)
@@ -537,13 +530,12 @@ def convert(
     for file in py_files:
         shutil.copy(file, mlx_path)
 
-    if "tokenizer" in tokenizer.__dict__.keys():
-        tokenizer.tokenizer.save_pretrained(mlx_path)
-    else:
-        tokenizer.save_pretrained(mlx_path)
+
+    tokenizer.save_pretrained(mlx_path)
 
 
     save_config(config, config_path=mlx_path / "config.json")
+
 
     if upload_repo is not None:
         upload_to_hub(mlx_path, upload_repo, hf_path)
