@@ -270,23 +270,23 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
     import os
 
     from huggingface_hub import HfApi, ModelCard, logging
+    from . import __version__
 
     card = ModelCard.load(hf_path)
     card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"]
     card.text = dedent(
         f"""
         # {upload_repo}
-        This model was converted to MLX format from [`{hf_path}`]() using mlx-vllm version **0.0.0**.
+        This model was converted to MLX format from [`{hf_path}`]() using mlx-vllm version **{__version__}**.
         Refer to the [original model card](https://huggingface.co/{hf_path}) for more details on the model.
         ## Use with mlx
 
         ```bash
-        git clone https://github.com/ml-explore/mlx-examples.git
+        pip install -U mlx-vlm
         ```
 
         ```bash
-        cd mlx-lm/vllms
-        python -m generate --model {path} --max-tokens 10 --temp 0.0
+        python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temp 0.0
         ```
         """
     )
