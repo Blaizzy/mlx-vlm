@@ -1,27 +1,34 @@
 import sys
 from pathlib import Path
-
 from setuptools import setup, find_packages
 
-package_dir = Path(__file__).parent / "mlx_vlm"
-with open(package_dir / "requirements.txt") as fid:
+# Get the project root directory
+root_dir = Path(__file__).parent
+
+# Add the package directory to the Python path
+package_dir = root_dir / "mlx_vlm"
+sys.path.append(str(package_dir))
+
+# Read the requirements from the requirements.txt file
+requirements_path = root_dir / "requirements.txt"
+with open(requirements_path) as fid:
     requirements = [l.strip() for l in fid.readlines()]
 
-sys.path.append(str(package_dir))
+# Import the version from the package
 from version import __version__
 
+# Setup configuration
 setup(
     name="mlx-vlm",
     version=__version__,
     description="Vision LLMs on Apple silicon with MLX and the Hugging Face Hub",
-    long_description=open("README.md", encoding="utf-8").read(),
+    long_description=open(root_dir / "README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
-    readme="README.md",
     author_email="prince.gdt@gmail.com",
     author="MLX Contributors",
     url="https://github.com/Blaizzy/mlx-vlm",
     license="MIT",
     install_requires=requirements,
-    packages=find_packages(),
+    packages=find_packages(where=root_dir),
     python_requires=">=3.8",
 )
