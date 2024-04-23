@@ -1,28 +1,32 @@
-
 import copy
-import re
 import glob
 import importlib
 import json
 import logging
+import re
 import shutil
 import time
 from pathlib import Path
 from textwrap import dedent
 from typing import Any, Callable, Dict, Generator, Optional, Tuple, Union
-import requests
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from PIL import Image
+import requests
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_unflatten
-from transformers import AutoConfig, AutoProcessor, PreTrainedTokenizer, PreTrainedTokenizerFast
+from PIL import Image
+from transformers import (
+    AutoConfig,
+    AutoProcessor,
+    PreTrainedTokenizer,
+    PreTrainedTokenizerFast,
+)
 
-from .tokenizer_utils import TokenizerWrapper, load_tokenizer
 from .models.base import BaseImageProcessor
 from .sample_utils import top_p_sampling
+from .tokenizer_utils import TokenizerWrapper, load_tokenizer
 
 # Constants
 MODEL_REMAPPING = {
@@ -36,6 +40,7 @@ linear_class_predicate = (
     and m.weight.shape[0]
     != 8  # avoid quantizing gate layers, otherwise we have to re-quant and upload all the mixtral models
 )
+
 
 def get_model_and_args(config: dict):
     """
@@ -55,7 +60,6 @@ def get_model_and_args(config: dict):
         msg = f"Model type {model_type} not supported."
         logging.error(msg)
         raise ValueError(msg)
-
 
     return arch, model_type
 
@@ -110,10 +114,8 @@ def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
 
-
     config = load_config(model_path)
     quantization = config.get("quantization", None)
-
 
     weight_files = glob.glob(str(model_path / "*.safetensors"))
     if not weight_files:
@@ -123,7 +125,6 @@ def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
     weights = {}
     for wf in weight_files:
         weights.update(mx.load(wf))
-
 
     model_class, model_type = get_model_and_args(config=config)
 
@@ -136,15 +137,21 @@ def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
         config["text_config"] = text_config
 
     model_config = model_class.ModelConfig.from_dict(config)
-    model_config.vision_config = model_class.VisionConfig.from_dict(config["vision_config"])
+    model_config.vision_config = model_class.VisionConfig.from_dict(
+        config["vision_config"]
+    )
     model_config.text_config = model_class.TextConfig.from_dict(config["text_config"])
     model = model_class.Model(model_config)
 
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
-    weights = model_class.VisionModel(model_config.vision_config).sanitize(weights=weights)
-    weights = model_class.LanguageModel(model_config.text_config).sanitize(weights=weights)
+    weights = model_class.VisionModel(model_config.vision_config).sanitize(
+        weights=weights
+    )
+    weights = model_class.LanguageModel(model_config.text_config).sanitize(
+        weights=weights
+    )
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized
@@ -197,6 +204,7 @@ def load(
 
     return model, processor
 
+
 def load_config(model_path: Path) -> dict:
     try:
         with open(model_path / "config.json", "r") as f:
@@ -206,10 +214,11 @@ def load_config(model_path: Path) -> dict:
         raise
     return config
 
+
 def load_image_processor(model_path: Union[str, Path]) -> BaseImageProcessor:
     if isinstance(model_path, str):
         model_path = get_model_path(model_path)
-        
+
     config = load_config(model_path)
     model_class, _ = get_model_and_args(config)
     image_processor = None
@@ -219,7 +228,10 @@ def load_image_processor(model_path: Union[str, Path]) -> BaseImageProcessor:
 
     return image_processor
 
-def load_processor(model_path, processor_config={"trust_remote_code": True}) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+
+def load_processor(
+    model_path, processor_config={"trust_remote_code": True}
+) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     processor = AutoProcessor.from_pretrained(model_path, **processor_config)
     detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
     if "tokenizer" in processor.__dict__.keys():
@@ -227,6 +239,7 @@ def load_processor(model_path, processor_config={"trust_remote_code": True}) -> 
     else:
         processor.detokenizer = detokenizer_class(processor)
     return processor
+
 
 def fetch_from_hub(
     model_path: Path, lazy: bool = False
@@ -274,6 +287,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
     import os
 
     from huggingface_hub import HfApi, ModelCard, logging
+
     from . import __version__
 
     card = ModelCard.load(hf_path)
@@ -306,6 +320,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         repo_type="model",
     )
     print(f"Upload successful, go to https://huggingface.co/{upload_repo} for details.")
+
 
 def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
     """
@@ -361,6 +376,7 @@ def apply_repetition_penalty(logits: mx.array, generated_tokens: Any, penalty: f
         logits[:, indices] = selected_logits
     return logits
 
+
 def save_weights(
     save_path: Union[str, Path],
     weights: Dict[str, Any],
@@ -412,8 +428,10 @@ def save_weights(
             indent=4,
         )
 
+
 def class_predicate(path, m):
     return isinstance(m, nn.Linear) and not isinstance(m, nn.Embedding)
+
 
 def quantize_model(
     model: nn.Module, config: dict, q_group_size: int, q_bits: int
@@ -460,6 +478,7 @@ def save_config(
     with open(config_path, "w") as fid:
         json.dump(config, fid, indent=4)
 
+
 def dequantize_model(model: nn.Module) -> nn.Module:
     """
     Dequantize the quantized linear layers in the model.
@@ -491,6 +510,7 @@ def dequantize_model(model: nn.Module) -> nn.Module:
     if len(de_quantize_layers) > 0:
         model.update_modules(tree_unflatten(de_quantize_layers))
     return model
+
 
 def convert(
     hf_path: str,
@@ -534,15 +554,13 @@ def convert(
     for file in py_files:
         shutil.copy(file, mlx_path)
 
-
     tokenizer.save_pretrained(mlx_path)
-
 
     save_config(config, config_path=mlx_path / "config.json")
 
-
     if upload_repo is not None:
         upload_to_hub(mlx_path, upload_repo, hf_path)
+
 
 def load_image(image_source):
     """
@@ -567,6 +585,7 @@ def load_image(image_source):
             f"The image {image_source} must be a valid URL or existing file."
         )
 
+
 def prepare_inputs(image_processor, processor, image, prompt):
     if isinstance(image, str):
         image = load_image(image)
@@ -583,7 +602,8 @@ def prepare_inputs(image_processor, processor, image, prompt):
 
     return input_ids, pixel_values
 
-def sample(logits: mx.array, temp:float, top_p:float) -> Tuple[mx.array, float]:
+
+def sample(logits: mx.array, temp: float, top_p: float) -> Tuple[mx.array, float]:
     softmax_logits = mx.softmax(logits)
 
     if temp == 0:
@@ -597,10 +617,11 @@ def sample(logits: mx.array, temp:float, top_p:float) -> Tuple[mx.array, float]:
     prob = softmax_logits[0, token]
     return token, prob
 
+
 def generate_step(
     model: nn.Module,
     prompt: mx.array,
-    cache = None,
+    cache=None,
     temp: float = 0.0,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
@@ -660,7 +681,7 @@ def generate(
     processor: PreTrainedTokenizer,
     image: str,
     prompt: str,
-    image_processor = None,
+    image_processor=None,
     temp: float = 0.0,
     max_tokens: int = 100,
     verbose: bool = False,
@@ -690,7 +711,6 @@ def generate(
         print("Image:", image, "\n")
         print("Prompt:", prompt)
 
-
     if image_processor is not None:
         prompt_tokens = mx.array(processor.encode(prompt))
         tokenizer = processor
@@ -702,7 +722,6 @@ def generate(
     logits, cache = model(input_ids, pixel_values)
     logits = logits[:, -1, :]
     y, _ = sample(logits, temp, top_p)
-
 
     tic = time.perf_counter()
     detokenizer = processor.detokenizer
@@ -729,7 +748,6 @@ def generate(
 
         if token == tokenizer.eos_token_id:
             break
-
 
         detokenizer.add_token(token)
 
