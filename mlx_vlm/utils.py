@@ -206,7 +206,11 @@ def load_config(model_path: Path) -> dict:
         raise
     return config
 
-def load_image_processor(config: dict) -> BaseImageProcessor:
+def load_image_processor(model_path: Union[str, Path]) -> BaseImageProcessor:
+    if isinstance(model_path, str):
+        model_path = get_model_path(model_path)
+        
+    config = load_config(model_path)
     model_class, _ = get_model_and_args(config)
     image_processor = None
 
