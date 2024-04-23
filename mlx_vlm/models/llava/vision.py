@@ -33,6 +33,20 @@ class VisionConfig:
             }
         )
 
+def check_array_shape(arr):
+    shape = arr.shape
+
+    # Check if the shape has 4 dimensions
+    if len(shape) != 4:
+        return False
+
+    out_channels, kH, KW, _ = shape
+
+    # Check if out_channels is the largest, and kH and KW are the same
+    if (out_channels >= kH) and (out_channels >= KW) and (kH == KW):
+        return True
+    else:
+        return False
 
 class Attention(nn.Module):
     def __init__(
@@ -217,7 +231,10 @@ class VisionModel(nn.Module):
                 #   [out_channels, in_channels, kH, KW]
                 # MLX conv2d expects the weight be of shape:
                 #   [out_channels, kH, KW, in_channels]
-                sanitized_weights[k] = v.transpose(0, 2, 3, 1)
+                if check_array_shape(v):
+                    sanitized_weights[k] = v
+                else:
+                    sanitized_weights[k] = v.transpose(0, 2, 3, 1)
             else:
                 sanitized_weights[k] = v
 
