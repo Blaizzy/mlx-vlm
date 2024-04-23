@@ -6,7 +6,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
-
 @dataclass
 class TextConfig:
     model_type: str
@@ -162,12 +161,11 @@ class Qwen2Model(nn.Module):
         cache=None,
         inputs_embeds=None,
     ):
-       # for passing merged input embeddings
+        # for passing merged input embeddings
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
         else:
             h = inputs_embeds
-
 
         mask = None
         if h.shape[1] > 1:
@@ -179,7 +177,6 @@ class Qwen2Model(nn.Module):
 
         for e, layer in enumerate(self.layers):
             h, cache[e] = layer(h, mask, cache[e])
-
 
         return self.lm_head(self.norm(h)), cache
 
@@ -201,8 +198,13 @@ class LanguageModel(nn.Module):
         return out, cache
 
     def sanitize(self, weights):
-        if self.args.tie_word_embeddings and "language_model.model.lm_head.weight" not in weights:
-            weights["language_model.model.lm_head.weight"] = weights["language_model.model.embed_tokens.weight"]
+        if (
+            self.args.tie_word_embeddings
+            and "language_model.model.lm_head.weight" not in weights
+        ):
+            weights["language_model.model.lm_head.weight"] = weights[
+                "language_model.model.embed_tokens.weight"
+            ]
 
         return {
             k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k

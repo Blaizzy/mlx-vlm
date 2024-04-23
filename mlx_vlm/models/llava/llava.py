@@ -1,5 +1,3 @@
-
-
 import glob
 import inspect
 import json
@@ -11,6 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
+
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 

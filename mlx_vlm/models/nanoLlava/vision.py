@@ -1,5 +1,3 @@
-
-
 import inspect
 from dataclasses import dataclass
 from typing import Optional
@@ -32,6 +30,7 @@ class VisionConfig:
             }
         )
 
+
 def check_array_shape(arr):
     shape = arr.shape
 
@@ -46,6 +45,7 @@ def check_array_shape(arr):
         return True
     else:
         return False
+
 
 class Attention(nn.Module):
     def __init__(
