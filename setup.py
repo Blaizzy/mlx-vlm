@@ -25,7 +25,7 @@ setup(
     long_description=open(root_dir / "README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     author_email="prince.gdt@gmail.com",
-    author="MLX Contributors",
+    author="Prince Canuma",
     url="https://github.com/Blaizzy/mlx-vlm",
     license="MIT",
     install_requires=requirements,

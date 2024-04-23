@@ -16,14 +16,5 @@ pip install mlx-vlm
 **Inference**:
 
 ```sh
-python -m mlx_vlm.generate --model mlx-community/llava-1.5-7b-hf-4bit --max-tokens 10 --temp 0.0
-```
-
-**Convert models**:
-
-```sh
-pip -m mlx_vlm.convert
-    --hf-path  llava-hf/llava-1.5-7b-hf\
-    -q \
-    --upload-repo mlx-community/llava-1.5-7b-hf-4bit
+python -m mlx_vlm.generate --model qnguyen3/nanoLLaVA --max-tokens 100 --temp 0.0
 ```
