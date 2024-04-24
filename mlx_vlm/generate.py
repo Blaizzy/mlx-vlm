@@ -2,10 +2,12 @@ import argparse
 import codecs
 
 import mlx.core as mx
-from .utils import load, load_config, load_image_processor, generate, get_model_path
 
+from .utils import generate, get_model_path, load, load_config, load_image_processor
 
 MODEL_TYPE = ""
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Generate text from an image using a model."
@@ -43,8 +45,7 @@ def parse_arguments():
 def get_model_and_processors(model_path):
     model_path = get_model_path(model_path)
     model, processor = load(model_path, {"trust_remote_code": True})
-    config = load_config(model_path)
-    image_processor = load_image_processor(config)
+    image_processor = load_image_processor(model_path)
     return model, processor, image_processor
 
 
@@ -53,7 +54,6 @@ def sample(logits, temperature=0.0):
         return mx.argmax(logits, axis=-1)
     else:
         return mx.random.categorical(logits * (1 / temperature))
-
 
 
 def main():
@@ -75,7 +75,9 @@ def main():
             add_generation_prompt=True,
         )
     else:
-        ValueError("Error: processor does not have 'chat_template' or 'tokenizer' attribute.")
+        ValueError(
+            "Error: processor does not have 'chat_template' or 'tokenizer' attribute."
+        )
 
     generate(
         model,
@@ -85,7 +87,7 @@ def main():
         image_processor,
         args.temp,
         args.max_tokens,
-        True
+        True,
     )
 
 
