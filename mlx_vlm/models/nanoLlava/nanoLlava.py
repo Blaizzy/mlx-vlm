@@ -1,28 +1,31 @@
-
-import re
 import glob
 import inspect
 import json
+import re
 from dataclasses import dataclass
+from functools import partial, reduce
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
+from PIL import Image
 from transformers import AutoConfig
+from transformers.image_transforms import (
+    convert_to_rgb,
+    normalize,
+    rescale,
+    resize,
+    to_channel_dimension_format,
+)
+from transformers.image_utils import to_numpy_array
+
+from ..base import BaseImageProcessor
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
-from ..base import BaseImageProcessor
 
-
-from typing import Optional, Dict
-from dataclasses import dataclass
-from functools import partial, reduce
-from PIL import Image
-from transformers.image_transforms import (convert_to_rgb, normalize, rescale, resize, to_channel_dimension_format, )
-from transformers.image_utils import ( to_numpy_array, )
 
 @dataclass
 class ModelConfig:
@@ -38,7 +41,6 @@ class ModelConfig:
     ignore_index: int = -100
     image_token_index: int = -200
     vocab_size: int = 151936
-
 
     @classmethod
     def from_dict(cls, params):
@@ -61,15 +63,30 @@ class ImageProcessor(BaseImageProcessor):
         transforms = [
             convert_to_rgb,
             to_numpy_array,
-            partial(resize, size=self.size, resample=self.resample, data_format=self.data_format),
+            partial(
+                resize,
+                size=self.size,
+                resample=self.resample,
+                data_format=self.data_format,
+            ),
             partial(rescale, scale=self.rescale_factor, data_format=self.data_format),
-            partial(normalize, mean=self.image_mean, std=self.image_std, data_format=self.data_format),
-            partial(to_channel_dimension_format, channel_dim=self.data_format, input_channel_dim=self.data_format),
+            partial(
+                normalize,
+                mean=self.image_mean,
+                std=self.image_std,
+                data_format=self.data_format,
+            ),
+            partial(
+                to_channel_dimension_format,
+                channel_dim=self.data_format,
+                input_channel_dim=self.data_format,
+            ),
         ]
 
         images = reduce(lambda x, f: [*map(f, x)], transforms, images)
 
         return images
+
 
 class LlavaMultiModalProjector(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -88,6 +105,7 @@ class LlavaMultiModalProjector(nn.Module):
         x = self.linear_2(x)
         return x
 
+
 class SigLipVisionTower(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
@@ -97,6 +115,7 @@ class SigLipVisionTower(nn.Module):
         self, x: mx.array, output_hidden_states: Optional[bool] = None
     ) -> mx.array:
         return self.vision_tower(x, output_hidden_states)
+
 
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -131,9 +150,7 @@ class Model(nn.Module):
         )
         return final_inputs_embeds
 
-    def _prepare_inputs_for_multimodal(
-        self, image_features, inputs_embeds, input_ids
-    ):
+    def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
         image_token_index = self.config.image_token_index
         num_images, num_image_patches, embed_dim = image_features.shape
 
@@ -161,12 +178,7 @@ class Model(nn.Module):
         # (1, num_image_patches*num_images + sequence_len, embed_dim)
         return mx.concatenate(final_embeddings, axis=1)
 
-    def __call__(
-        self,
-        input_ids: mx.array,
-        pixel_values: mx.array,
-        cache=None
-    ):
+    def __call__(self, input_ids: mx.array, pixel_values: mx.array, cache=None):
         input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
         logits, cache = self.language_model(
             inputs=input_ids, cache=cache, inputs_embeds=input_embeddings
@@ -187,7 +199,6 @@ class Model(nn.Module):
                         "tokenizer.model",
                         "*.tiktoken",
                     ],
-
                 )
             )
 
@@ -221,20 +232,48 @@ class Model(nn.Module):
         model.load_weights(list(weights.items()))
         return model
 
-
     def sanitize(self, weights):
         weights = {
-            f"{k.split('.', 1)[1]}" if re.match(r'^model\.vision_tower', k) else
-            f"mm_projector.linear_1.{k.split('.')[-1]}" if re.match(r'^model\.mm_projector\.0', k) else
-            f"mm_projector.linear_2.{k.split('.')[-1]}" if re.match(r'^model\.mm_projector\.2', k) else
-            f"language_model.model.{k}" if re.match(r'^lm_head', k) else
-            f"language_model.{k}" if re.match(r'^model\.(embed_tokens|norm|layers)', k) else k: v
+            (
+                f"{k.split('.', 1)[1]}"
+                if re.match(r"^model\.vision_tower", k)
+                else (
+                    f"mm_projector.linear_1.{k.split('.')[-1]}"
+                    if re.match(r"^model\.mm_projector\.0", k)
+                    else (
+                        f"mm_projector.linear_2.{k.split('.')[-1]}"
+                        if re.match(r"^model\.mm_projector\.2", k)
+                        else (
+                            f"language_model.model.{k}"
+                            if re.match(r"^lm_head", k)
+                            else (
+                                f"language_model.{k}"
+                                if re.match(r"^model\.(embed_tokens|norm|layers)", k)
+                                else k
+                            )
+                        )
+                    )
+                )
+            ): v
             for k, v in weights.items()
         }
 
         weights = {
-            f"vision_tower.vision_tower.vision_model.head.attention.in_proj.bias" if re.match(r'^vision_tower\.vision_tower\.vision_model\.head\.attention\.in_proj_bias', k) else
-            f"vision_tower.vision_tower.vision_model.head.attention.in_proj.weight" if re.match(r'^vision_tower\.vision_tower\.vision_model\.head\.attention\.in_proj_weight', k) else k: v
+            (
+                f"vision_tower.vision_tower.vision_model.head.attention.in_proj.bias"
+                if re.match(
+                    r"^vision_tower\.vision_tower\.vision_model\.head\.attention\.in_proj_bias",
+                    k,
+                )
+                else (
+                    f"vision_tower.vision_tower.vision_model.head.attention.in_proj.weight"
+                    if re.match(
+                        r"^vision_tower\.vision_tower\.vision_model\.head\.attention\.in_proj_weight",
+                        k,
+                    )
+                    else k
+                )
+            ): v
             for k, v in weights.items()
         }
 

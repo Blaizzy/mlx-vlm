@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
-from setuptools import setup, find_packages
+
+from setuptools import find_packages, setup
 
 # Get the project root directory
 root_dir = Path(__file__).parent
