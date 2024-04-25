@@ -1,6 +1,6 @@
-# LLaVA
+# LLaVA-Phi-3-Mini
 
-An example of LLaVA-Phi-3-Mini: Phi-3-Mini comnined with CLIP fine-tuned on 1.27M samples in MLX.[^1] LLaVA is
+An example of LLaVA-Phi-3-Mini: Phi-3-Mini combined with CLIP fine-tuned on 1.27M samples in MLX.[^1] LLaVA is
 a multimodal model that can generate text given combined image and text inputs.
 
 ## Setup
@@ -33,8 +33,7 @@ This uses the following image:
 And generates the output:
 
 ```
-These are two cats lying on a pink couch.
-```
+These are two cats sleeping on a pink couch.<|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|><|end|>```
 
 You can also use LLaVA-Phi-3-Mini in Python:
 
