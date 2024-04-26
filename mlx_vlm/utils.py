@@ -429,10 +429,6 @@ def save_weights(
         )
 
 
-def class_predicate(path, m):
-    return isinstance(m, nn.Linear) and not isinstance(m, nn.Embedding)
-
-
 def quantize_model(
     model: nn.Module, config: dict, q_group_size: int, q_bits: int
 ) -> Tuple:
@@ -449,6 +445,13 @@ def quantize_model(
         Tuple: Tuple containing quantized weights and config.
     """
     quantized_config = copy.deepcopy(config)
+    vision_intermediate_size = model.config.vision_config.intermediate_size
+    class_predicate = lambda path, m: isinstance(m, nn.Linear) and (
+        path.split(".")[0] != "vision_tower"
+        if any(vision_intermediate_size % size != 0 for size in [64, 128])
+        else not isinstance(m, nn.Embedding)
+    )
+
     nn.quantize(model, q_group_size, q_bits, class_predicate=class_predicate)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
     quantized_weights = dict(tree_flatten(model.parameters()))
