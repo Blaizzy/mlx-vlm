@@ -35,7 +35,6 @@ class ModelConfig:
     auto_map: dict
     hidden_size: int
     mm_hidden_size: int
-    mm_hidden_size: int
     mm_vision_tower: str
     mm_projector_type: str = "mlp2x_gelu"
     ignore_index: int = -100
