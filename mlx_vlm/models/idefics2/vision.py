@@ -9,16 +9,14 @@ import mlx.nn as nn
 @dataclass
 class VisionConfig:
     model_type: str
-    num_hidden_layers: int = 27
     hidden_size: int = 1152
     intermediate_size: int = 4304
+    num_hidden_layers: int = 27
     num_attention_heads: int = 16
-    image_size: int = 384
+    image_size: int = 980
     patch_size: int = 14
-    projection_dim: int = 768
-    vocab_size: int = 32000
-    num_channels: int = 3
     layer_norm_eps: float = 1e-6
+    num_channels: int = 3
 
     @classmethod
     def from_dict(cls, params):
@@ -218,7 +216,6 @@ class SigLipVisionModel(nn.Module):
         self.embeddings = VisionEmbeddings(config)
         self.encoder = Encoder(config)
         self.post_layernorm = nn.LayerNorm(config.hidden_size)
-        self.head = SigLipMultiheadAttentionPoolingHead(config)
 
     def __call__(
         self,
@@ -235,36 +232,8 @@ class SigLipVisionModel(nn.Module):
                 encoder_states = encoder_states + (x,)
 
         pooler_output = self.post_layernorm(x[:, 0, :])
-        pooler_output = self.head(pooler_output)
+
         return pooler_output, x, encoder_states
-
-
-class SigLipMultiheadAttentionPoolingHead(nn.Module):
-
-    def __init__(self, config: VisionConfig):
-        super().__init__()
-
-        self.probe = mx.ones(
-            (
-                1,
-                1,
-                config.hidden_size,
-            )
-        )
-        self.attention = MHA(
-            config.hidden_size, num_heads=config.num_attention_heads, bias=True
-        )
-        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.mlp = MLP(config)
-
-    def __call__(self, x: mx.array):
-        x = self.attention(self.probe, x)[0]
-
-        residual = x
-        x = self.layernorm(x)
-        x = residual + self.mlp(x)
-
-        return x[:, 0]
 
 
 class VisionModel(nn.Module):
