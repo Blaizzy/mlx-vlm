@@ -39,6 +39,12 @@ def parse_arguments():
     parser.add_argument(
         "--temp", type=float, default=0.3, help="Temperature for sampling."
     )
+    parser.add_argument(
+        "--verbose",
+        type=bool,
+        help="Detailed output.",
+        default=True,
+    )
     return parser.parse_args()
 
 
@@ -79,7 +85,7 @@ def main():
             "Error: processor does not have 'chat_template' or 'tokenizer' attribute."
         )
 
-    generate(
+    output = generate(
         model,
         processor,
         args.image,
@@ -87,8 +93,10 @@ def main():
         image_processor,
         args.temp,
         args.max_tokens,
-        True,
+        args.verbose,
     )
+    if not args.verbose:
+        print(output)
 
 
 if __name__ == "__main__":
