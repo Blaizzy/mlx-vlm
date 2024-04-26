@@ -141,7 +141,7 @@ class TransformerBlock(nn.Module):
         return out, cache
 
 
-class Qwen2Model(nn.Module):
+class MistralModel(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
         self.args = args
@@ -186,7 +186,7 @@ class LanguageModel(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = Qwen2Model(args)
+        self.model = MistralModel(args)
 
     def __call__(
         self,
