@@ -1,0 +1,35 @@
+name: Test PRs
+
+on:
+    pull_request:
+        branches:
+            - main
+
+jobs:
+    test:
+        runs-on: macos-14
+
+        steps:
+        - name: Checkout code
+          uses: actions/checkout@v2
+
+        - name: Set up Python
+          run: |
+            brew install python@3.8
+            python3.8 -m venv env
+            source env/bin/activate
+
+
+        - name: Run style checks
+          run: |
+            pip install pre-commit
+            pre-commit run --all
+            if ! git diff --quiet; then echo 'Style checks failed, please install pre-commit and run pre-commit run --all and push the change'; exit 1; fi
+
+        - name: Install dependencies
+          run: pip install -e .
+
+        - name: Run Python tests
+          run: |
+            cd mlx_vlm/
+            pytest ./tests
