@@ -208,3 +208,7 @@ class LanguageModel(nn.Module):
         return {
             k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
         }
+
+    @property
+    def layers(self):
+        return self.model.layers
