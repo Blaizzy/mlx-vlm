@@ -27,7 +27,9 @@ jobs:
             if ! git diff --quiet; then echo 'Style checks failed, please install pre-commit and run pre-commit run --all and push the change'; exit 1; fi
 
         - name: Install dependencies
-          run: pip install -e .
+          run: |
+            pip install pytest
+            pip install -e .
 
         - name: Run Python tests
           run: |
