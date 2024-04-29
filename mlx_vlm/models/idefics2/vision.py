@@ -9,12 +9,12 @@ import mlx.nn as nn
 @dataclass
 class VisionConfig:
     model_type: str
-    hidden_size: int = 1152
-    intermediate_size: int = 4304
-    num_hidden_layers: int = 27
-    num_attention_heads: int = 16
-    image_size: int = 980
-    patch_size: int = 14
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    image_size: int
+    patch_size: int
     layer_norm_eps: float = 1e-6
     num_channels: int = 3
 
@@ -55,7 +55,6 @@ class Attention(nn.Module):
         value_input_dims: Optional[int] = None,
         value_dims: Optional[int] = None,
         value_output_dims: Optional[int] = None,
-        bias: bool = False,
     ):
         super().__init__()
 
@@ -75,10 +74,10 @@ class Attention(nn.Module):
         head_dim = dims // num_heads
         self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(query_input_dims, dims, bias=bias)
-        self.k_proj = nn.Linear(key_input_dims, dims, bias=bias)
-        self.v_proj = nn.Linear(value_input_dims, value_dims, bias=bias)
-        self.out_proj = nn.Linear(value_dims, value_output_dims, bias=bias)
+        self.q_proj = nn.Linear(query_input_dims, dims, bias=True)
+        self.k_proj = nn.Linear(key_input_dims, dims, bias=True)
+        self.v_proj = nn.Linear(value_input_dims, value_dims, bias=True)
+        self.out_proj = nn.Linear(value_dims, value_output_dims, bias=True)
 
     def __call__(self, queries, keys, values, mask=None):
         queries = self.q_proj(queries)
@@ -158,9 +157,7 @@ class EncoderLayer(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.embed_dim = config.hidden_size
-        self.self_attn = Attention(
-            config.hidden_size, config.num_attention_heads, bias=True
-        )
+        self.self_attn = Attention(config.hidden_size, config.num_attention_heads)
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = MLP(config)
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
@@ -193,7 +190,7 @@ class VisionEmbeddings(nn.Module):
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
             stride=self.patch_size,
-            bias=True,
+            dilation=1,
         )
 
         self.num_patches = (self.image_size // self.patch_size) ** 2
@@ -201,18 +198,27 @@ class VisionEmbeddings(nn.Module):
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        batch_size = x.shape[0]
+        batch_size, max_im_h, max_im_w, _ = x.shape
         patch_embeddings = self.patch_embedding(x)
         patch_embeddings = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
-
+        max_nb_patches_h, max_nb_patches_w = (
+            max_im_h // self.patch_size,
+            max_im_w // self.patch_size,
+        )
+        position_ids = mx.zeros(
+            (batch_size, max_nb_patches_h * max_nb_patches_w)
+        ).astype(mx.uint64)
         embeddings = patch_embeddings
-        embeddings += self.position_embedding.weight
+        embeddings += self.position_embedding(position_ids)
         return embeddings
 
 
-class SigLipVisionModel(nn.Module):
+class VisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
+        self.model_type = config.model_type
+        if self.model_type != "idefics2":
+            raise ValueError(f"Unsupported model type: {self.model_type}")
         self.embeddings = VisionEmbeddings(config)
         self.encoder = Encoder(config)
         self.post_layernorm = nn.LayerNorm(config.hidden_size)
@@ -231,24 +237,9 @@ class SigLipVisionModel(nn.Module):
             if output_hidden_states:
                 encoder_states = encoder_states + (x,)
 
-        pooler_output = self.post_layernorm(x[:, 0, :])
+        pooler_output = self.post_layernorm(x)
 
         return pooler_output, x, encoder_states
-
-
-class VisionModel(nn.Module):
-    def __init__(self, config: VisionConfig):
-        super().__init__()
-        self.model_type = config.model_type
-        if self.model_type != "siglip_vision_model":
-            raise ValueError(f"Unsupported model type: {self.model_type}")
-
-        self.vision_model = SigLipVisionModel(config)
-
-    def __call__(
-        self, x: mx.array, output_hidden_states: Optional[bool] = None
-    ) -> mx.array:
-        return self.vision_model(x, output_hidden_states)
 
     def sanitize(self, weights):
         sanitized_weights = {}
