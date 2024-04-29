@@ -13,7 +13,7 @@ import numpy as np
 import PIL
 from huggingface_hub import snapshot_download
 from PIL import Image
-from transformers import Idefics2Config
+from transformers import AutoConfig, Idefics2Config
 from transformers.image_transforms import (
     convert_to_rgb,
     normalize,
@@ -24,24 +24,28 @@ from transformers.image_transforms import (
 from transformers.image_utils import to_numpy_array
 
 from ..base import BaseImageProcessor
-from .image_transforms import PaddingMode, pad, resize, to_channel_dimension_format
-from .image_utils import (
-    IMAGENET_STANDARD_MEAN,
-    IMAGENET_STANDARD_STD,
-    ChannelDimension,
-    ImageInput,
-    PILImageResampling,
-    get_image_size,
-    infer_channel_dimension_format,
-    is_scaled_image,
-    is_valid_image,
-    to_numpy_array,
-    valid_images,
-    validate_preprocess_arguments,
-)
-from .language import MLP, LanguageModel, TextConfig
-from .perceiver import Idefics2PerceiverResampler, PerceiverConfig
+from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
+
+
+@dataclass
+class PerceiverConfig:
+    model_type: str
+    num_key_value_heads: int = 4
+    resampler_depth: int = 3
+    resampler_head_dim: int = 96
+    resampler_n_heads: int = 16
+    resampler_n_latents: int = 64
+
+    @classmethod
+    def from_dict(cls, params):
+        return cls(
+            **{
+                k: v
+                for k, v in params.items()
+                if k in inspect.signature(cls).parameters
+            }
+        )
 
 
 @dataclass
@@ -50,8 +54,6 @@ class ModelConfig:
     vision_config: VisionConfig
     perceiver_config: PerceiverConfig
     model_type: str
-    auto_map: dict
-    hidden_size: int
     ignore_index: int = -100
     image_token_index: int = 32001
     vocab_size: int = 151936
@@ -67,602 +69,187 @@ class ModelConfig:
         )
 
 
-def get_resize_output_image_size(image, size, input_data_format) -> Tuple[int, int]:
-    """
-    Get the output size of the image after resizing given a dictionary specifying the max and min sizes.
+class Idefics2PerceiverAttention(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
 
-    Args:
-        image (`np.ndarray`):
-            Image to resize.
-        size (`Dict[str, int]`):
-            Size of the output image containing the keys "shortest_edge" and "longest_edge".
-        input_data_format (`ChannelDimension` or `str`):
-            The channel dimension format of the input image.
+        dim = config.text_config.hidden_size
+        self.n_heads = n_heads = config.perceiver_config.resampler_n_heads
+        self.n_kv_heads = n_kv_heads = config.perceiver_config.num_key_value_heads
 
-    Returns:
-        The output size of the image after resizing.
-    """
-    height, width = get_image_size(image, channel_dim=input_data_format)
+        head_dim = config.perceiver_config.resampler_head_dim
+        self.scale = head_dim**-0.5
 
-    min_len = size["shortest_edge"]
-    max_len = size["longest_edge"]
-    aspect_ratio = width / height
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-    if width >= height and width > max_len:
-        width = max_len
-        height = int(width / aspect_ratio)
-    elif height > width and height > max_len:
-        height = max_len
-        width = int(height * aspect_ratio)
-    height = max(height, min_len)
-    width = max(width, min_len)
-    return height, width
+    def __call__(
+        self,
+        x: mx.array,
+        kv: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Tuple[mx.array, mx.array]] = None,
+    ) -> mx.array:
+        B, L, D = x.shape
+        kv_seq_len = L + kv.shape[1]
+        hidden_states = mx.concatenate([kv, x], axis=-2)
 
+        queries = self.q_proj(x)
+        keys = self.k_proj(hidden_states)
+        values = self.v_proj(hidden_states)
 
-def make_list_of_images(images: ImageInput) -> List[List[np.ndarray]]:
-    """
-    Convert a single image or a list of images to a list of numpy arrays.
-
-    Args:
-        images (`ImageInput`):
-            A single image or a list of images.
-
-    Returns:
-        A list of numpy arrays.
-    """
-    # If it's a single image, convert it to a list of lists
-    if is_valid_image(images):
-        images = [[images]]
-    # If it's a list of images, it's a single batch, so convert it to a list of lists
-    elif (
-        isinstance(images, (list, tuple))
-        and len(images) > 0
-        and is_valid_image(images[0])
-    ):
-        images = [images]
-    # If it's a list of batches, it's already in the right format
-    elif (
-        isinstance(images, (list, tuple))
-        and len(images) > 0
-        and isinstance(images[0], (list, tuple))
-        and is_valid_image(images[0][0])
-    ):
-        pass
-    else:
-        raise ValueError(
-            "Invalid input type. Must be a single image, a list of images, or a list of batches of images."
+        # Prepare the queries, keys and values for the attention computation
+        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, kv_seq_len, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, kv_seq_len, self.n_kv_heads, -1).transpose(
+            0, 2, 1, 3
         )
-    return images
+
+        if cache is not None:
+            key_cache, value_cache = cache
+            keys = mx.concatenate([key_cache, keys], axis=2)
+            values = mx.concatenate([value_cache, values], axis=2)
+
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=self.scale, mask=mask
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(output), (keys, values)
 
 
-# Copied from transformers.models.detr.image_processing_detr.max_across_indices
-def max_across_indices(values: Iterable[Any]) -> List[Any]:
-    """
-    Return the maximum value across all indices of an iterable of values.
-    """
-    return [max(values_i) for values_i in zip(*values)]
+class Idefics2PerceiverLayer(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.hidden_size = config.text_config.hidden_size
+        self.n_latents = config.perceiver_config.resampler_n_latents
+        self.depth = config.perceiver_config.resampler_depth
+        self.rms_norm_eps = config.text_config.rms_norm_eps
+
+        self.input_latents_norm = nn.RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
+        self.input_context_norm = nn.RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
+        self.self_attn = Idefics2PerceiverAttention(config)
+        self.post_attention_layernorm = nn.RMSNorm(
+            self.hidden_size, eps=self.rms_norm_eps
+        )
+        self.mlp = MLP(self.hidden_size, self.hidden_size * 4, self.hidden_size)
+
+    def __call__(
+        self,
+        x: mx.array,
+        hidden_states: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Tuple[mx.array, mx.array]] = None,
+    ) -> mx.array:
+        latents = self.input_latents_norm(x)
+        context = self.input_context_norm(hidden_states)
+
+        latents, cache = self.self_attn(latents, context, mask=mask, cache=cache)
+
+        latents = x + latents
+        r = latents
+
+        latents = self.post_attention_layernorm(latents)
+        latents = self.mlp(latents)
+        latents = r + latents
+        return latents, cache
 
 
-def get_max_height_width(
-    images_list: List[List[np.ndarray]],
-    input_data_format: Optional[Union[str, ChannelDimension]] = None,
-) -> List[int]:
-    """
-    Get the maximum height and width across all images in a batch.
-    """
-    if input_data_format is None:
-        input_data_format = infer_channel_dimension_format(images_list[0][0])
+class Idefics2PerceiverResampler(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.hidden_size = config.text_config.hidden_size
+        self.n_latents = config.perceiver_config.resampler_n_latents
 
-    image_sizes = []
-    for images in images_list:
-        for image in images:
-            image_sizes.append(get_image_size(image, channel_dim=input_data_format))
+        self.latents = mx.ones((self.n_latents, self.hidden_size))
+        self.layers = [
+            Idefics2PerceiverLayer(config)
+            for _ in range(config.perceiver_config.resampler_depth)
+        ]
+        self.norm = nn.RMSNorm(self.hidden_size, eps=config.text_config.rms_norm_eps)
 
-    max_height, max_width = max_across_indices(image_sizes)
-    return (max_height, max_width)
+    def __call__(self, x: mx.array, mask: Optional[mx.array] = None, cache=None):
 
+        mask = None
+        # if x.shape[1] > 1:
+        #     mask = nn.MultiHeadAttention.create_additive_causal_mask(x.shape[1])
+        #     mask = mask.astype(x.dtype)
+        #     mask = mx.expand_dims(mask, axis=0)
+        #     mask = mx.repeat(mask, x.shape[0], axis=0)
 
-# Copied from transformers.models.detr.image_processing_detr.make_pixel_mask
-def make_pixel_mask(
-    image: np.ndarray,
-    output_size: Tuple[int, int],
-    input_data_format: Optional[Union[str, ChannelDimension]] = None,
-) -> np.ndarray:
-    """
-    Make a pixel mask for the image, where 1 indicates a valid pixel and 0 indicates padding.
+        if cache is None:
+            cache = [None] * len(self.layers)
 
-    Args:
-        image (`np.ndarray`):
-            Image to make the pixel mask for.
-        output_size (`Tuple[int, int]`):
-            Output size of the mask.
-    """
-    input_height, input_width = get_image_size(image, channel_dim=input_data_format)
-    mask = np.zeros(output_size, dtype=np.int64)
-    mask[:input_height, :input_width] = 1
-    return mask
+        h = mx.expand_dims(self.latents, axis=0)
+        h = mx.repeat(h, x.shape[0], axis=0)
+        for e, layer in enumerate(self.layers):
+            h, cache[e] = layer(h, x, mask=mask, cache=cache[e])
 
-
-# FIXME Amy: merge this function with the one in image_transforms.py
-def convert_to_rgb(image: ImageInput) -> ImageInput:
-    """
-    Converts an image to RGB format. Only converts if the image is of type PIL.Image.Image, otherwise returns the image
-    as is.
-    Args:
-        image (Image):
-            The image to convert.
-    """
-    if not isinstance(image, PIL.Image.Image):
-        return image
-
-    # `image.convert("RGB")` would only work for .jpg images, as it creates a wrong background
-    # for transparent images. The call to `alpha_composite` handles this case
-    if image.mode == "RGB":
-        return image
-
-    image_rgba = image.convert("RGBA")
-    background = Image.new("RGBA", image_rgba.size, (255, 255, 255))
-    alpha_composite = Image.alpha_composite(background, image_rgba)
-    alpha_composite = alpha_composite.convert("RGB")
-    return alpha_composite
+        return self.norm(h), cache
 
 
 class ImageProcessor(BaseImageProcessor):
-
-    model_input_names = ["pixel_values"]
-
-    def __init__(
-        self,
-        do_convert_rgb: bool = True,
-        do_resize: bool = True,
-        size: Dict[str, int] = None,
-        resample: PILImageResampling = PILImageResampling.BILINEAR,
-        do_rescale: bool = True,
-        rescale_factor: float = 1 / 255,
-        do_normalize: bool = True,
-        image_mean: Optional[Union[float, List[float]]] = None,
-        image_std: Optional[Union[float, List[float]]] = None,
-        do_pad: bool = True,
-        do_image_splitting: bool = False,
-        **kwargs,
-    ) -> None:
-        super().__init__(**kwargs)
-        self.do_convert_rgb = do_convert_rgb
-        self.do_resize = do_resize
-        self.size = (
-            size if size is not None else {"shortest_edge": 378, "longest_edge": 980}
-        )
-        self.resample = resample
-        self.do_rescale = do_rescale
-        self.rescale_factor = rescale_factor
-        self.do_normalize = do_normalize
-        self.image_mean = (
-            image_mean if image_mean is not None else IMAGENET_STANDARD_MEAN
-        )
-        self.image_std = image_std if image_std is not None else IMAGENET_STANDARD_STD
-        self.do_pad = do_pad
-        self.do_image_splitting = do_image_splitting
-
-    def resize(
-        self,
-        image: np.ndarray,
-        size: Dict[str, int],
-        resample: PILImageResampling = PILImageResampling.BILINEAR,
-        data_format: Optional[Union[str, ChannelDimension]] = None,
-        input_data_format: Optional[Union[str, ChannelDimension]] = None,
-        **kwargs,
-    ) -> np.ndarray:
-        """
-        Resize an image. The shortest edge of the image is resized to size["shortest_edge"], with the longest edge
-        resized to keep the input aspect ratio.
-
-        Args:
-            image (`np.ndarray`):
-                Image to resize.
-            size (`Dict[str, int]`):
-                Size of the output image.
-            resample (`PILImageResampling`, *optional*, defaults to `PILImageResampling.BICUBIC`):
-                Resampling filter to use when resiizing the image.
-            data_format (`str` or `ChannelDimension`, *optional*):
-                The channel dimension format of the image. If not provided, it will be the same as the input image.
-            input_data_format (`ChannelDimension` or `str`, *optional*):
-                The channel dimension format of the input image. If not provided, it will be inferred.
-        """
-        if "shortest_edge" in size and "longest_edge" in size:
-            size = get_resize_output_image_size(image, size, input_data_format)
-        elif "height" in size and "width" in size:
-            size = (size["height"], size["width"])
+    def preprocess(self, images):
+        if isinstance(images, Image.Image):
+            images = [images]
         else:
-            raise ValueError(
-                "size must be a dictionary with keys 'shortest_edge' and 'longest_edge' or 'height' and 'width'."
-            )
-        return resize(
-            image,
-            size,
-            resample=resample,
-            data_format=data_format,
-            input_data_format=input_data_format,
-            **kwargs,
-        )
+            assert isinstance(images, list)
 
-    # Copied from transformers.models.vilt.image_processing_vilt.ViltImageProcessor._pad_image
-    def _pad_image(
-        self,
-        image: np.ndarray,
-        output_size: Tuple[int, int],
-        constant_values: Union[float, Iterable[float]] = 0,
-        data_format: Optional[ChannelDimension] = None,
-        input_data_format: Optional[Union[str, ChannelDimension]] = None,
-    ) -> np.ndarray:
-        """
-        Pad an image with zeros to the given size.
-        """
-        input_height, input_width = get_image_size(image, channel_dim=input_data_format)
-        output_height, output_width = output_size
-
-        pad_bottom = output_height - input_height
-        pad_right = output_width - input_width
-        padding = ((0, pad_bottom), (0, pad_right))
-        padded_image = pad(
-            image,
-            padding,
-            mode=PaddingMode.CONSTANT,
-            constant_values=constant_values,
-            data_format=data_format,
-            input_data_format=input_data_format,
-        )
-        return padded_image
-
-    def pad(
-        self,
-        images: List[np.ndarray],
-        constant_values: Union[float, Iterable[float]] = 0,
-        return_pixel_mask: bool = True,
-        return_tensors: Optional[Union[str, TensorType]] = None,
-        data_format: Optional[ChannelDimension] = None,
-        input_data_format: Optional[Union[str, ChannelDimension]] = None,
-    ) -> BatchFeature:
-        """
-        For a list of images, for each images, pads a batch of images to the bottom and right of the image with zeros to the size of largest height and width.
-        For each sample in the batch, pads the sample with empty images to the max_number of images per sample in the batch. Optionally returns a pixel mask.
-
-        Args:
-            images (`np.ndarray`):
-                List of list of images to pad. Pads to the largest height and width in the batch.
-            constant_values (`float` or `Iterable[float]`, *optional*):
-                The value to use for the padding if `mode` is `"constant"`.
-            return_pixel_mask (`bool`, *optional*, defaults to `True`):
-                Whether to return a pixel mask.
-            return_tensors (`str` or `TensorType`, *optional*):
-                The type of tensors to return. Can be one of:
-                    - Unset: Return a list of `np.ndarray`.
-                    - `TensorType.TENSORFLOW` or `'tf'`: Return a batch of type `tf.Tensor`.
-                    - `TensorType.PYTORCH` or `'pt'`: Return a batch of type `torch.Tensor`.
-                    - `TensorType.NUMPY` or `'np'`: Return a batch of type `np.ndarray`.
-                    - `TensorType.JAX` or `'jax'`: Return a batch of type `jax.numpy.ndarray`.
-            data_format (`str` or `ChannelDimension`, *optional*):
-                The channel dimension format of the image. If not provided, it will be the same as the input image.
-            input_data_format (`ChannelDimension` or `str`, *optional*):
-                The channel dimension format of the input image. If not provided, it will be inferred.
-        """
-        pad_size = get_max_height_width(images, input_data_format=input_data_format)
-
-        batch_size = len(images)
-        max_num_images = max(len(images_) for images_ in images)
-        input_data_format = (
-            infer_channel_dimension_format(images[0][0])
-            if input_data_format is None
-            else input_data_format
-        )
-        data_format = input_data_format if data_format is None else data_format
-
-        def empty_image(size, input_data_format):
-            if input_data_format == ChannelDimension.FIRST:
-                return np.zeros((3, *size), dtype=np.uint8)
-            elif input_data_format == ChannelDimension.LAST:
-                return np.zeros((*size, 3), dtype=np.uint8)
-            raise ValueError("Invalid channel dimension format.")
-
-        padded_images_list = [
-            [empty_image(pad_size, data_format) for _ in range(max_num_images)]
-            for _ in range(batch_size)
-        ]
-        padded_masks = [
-            [np.zeros(pad_size) for _ in range(max_num_images)]
-            for _ in range(batch_size)
+        transforms = [
+            convert_to_rgb,
+            to_numpy_array,
+            partial(
+                resize,
+                size=self.size,
+                resample=self.resample,
+                data_format=self.data_format,
+            ),
+            partial(rescale, scale=self.rescale_factor, data_format=self.data_format),
+            partial(
+                normalize,
+                mean=self.image_mean,
+                std=self.image_std,
+                data_format=self.data_format,
+            ),
+            partial(
+                to_channel_dimension_format,
+                channel_dim=self.data_format,
+                input_channel_dim=self.data_format,
+            ),
         ]
 
-        for batch_idx in range(batch_size):
-            for sample_idx, image in enumerate(images[batch_idx]):
-                padded_images_list[batch_idx][sample_idx] = self._pad_image(
-                    image,
-                    pad_size,
-                    constant_values=constant_values,
-                    data_format=data_format,
-                    input_data_format=input_data_format,
-                )
-                padded_masks[batch_idx][sample_idx] = make_pixel_mask(
-                    image, output_size=pad_size, input_data_format=input_data_format
-                )
+        images = reduce(lambda x, f: [*map(f, x)], transforms, images)
 
-        padded_masks = padded_masks if return_pixel_mask else None
-        return padded_images_list, padded_masks
+        return images
 
-    def _crop(
-        self,
-        im: np.ndarray,
-        w1: int,
-        h1: int,
-        w2: int,
-        h2: int,
-        input_data_format: Optional[Union[str, ChannelDimension]] = None,
-    ) -> np.ndarray:
-        if input_data_format == ChannelDimension.FIRST:
-            return im[:, h1:h2, w1:w2]
-        elif input_data_format == ChannelDimension.LAST:
-            return im[h1:h2, w1:w2, :]
 
-    def split_image(
-        self,
-        image: np.ndarray,
-        input_data_format: Optional[Union[str, ChannelDimension]] = None,
-    ):
-        """
-        Split an image into 4 equal sub-images, and the concatenate that sequence with the original image.
-        That means that a single image becomes a sequence of 5 images.
-        This is a "trick" to spend more compute on each image with no changes in the vision encoder.
+class MLP(nn.Module):
+    def __init__(self, dim, hidden_dim, output_size):
+        super().__init__()
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, output_size, bias=False)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
-        Args:
-            image (`np.ndarray`):
-                Images to split.
-            input_data_format (`ChannelDimension` or `str`, *optional*):
-                The channel dimension format of the input image. If not provided, it will be inferred.
-        """
-        height, width = get_image_size(image, input_data_format)
-
-        mid_width = width // 2
-        mid_height = height // 2
-        return [
-            self._crop(image, 0, 0, mid_width, mid_height, input_data_format),
-            self._crop(image, mid_width, 0, width, mid_height, input_data_format),
-            self._crop(image, 0, mid_height, mid_width, height, input_data_format),
-            self._crop(image, mid_width, mid_height, width, height, input_data_format),
-            image,
-        ]
-
-    def preprocess(
-        self,
-        images: ImageInput,
-        do_convert_rgb: Optional[bool] = None,
-        do_resize: Optional[bool] = None,
-        size: Optional[Dict[str, int]] = None,
-        resample: PILImageResampling = None,
-        do_rescale: Optional[bool] = None,
-        rescale_factor: Optional[float] = None,
-        do_normalize: Optional[bool] = None,
-        image_mean: Optional[Union[float, List[float]]] = None,
-        image_std: Optional[Union[float, List[float]]] = None,
-        do_pad: Optional[bool] = None,
-        do_image_splitting: Optional[bool] = None,
-        return_tensors: Optional[Union[str, TensorType]] = None,
-        input_data_format: Optional[ChannelDimension] = None,
-        data_format: Optional[ChannelDimension] = ChannelDimension.FIRST,
-    ):
-        """
-        Preprocess a batch of images.
-
-        Args:
-            images (`ImageInput`):
-                A list of images to preprocess.
-            do_convert_rgb (`bool`, *optional*, defaults to `self.do_convert_rgb`):
-                Whether to convert the image to RGB.
-            do_resize (`bool`, *optional*, defaults to `self.do_resize`):
-                Whether to resize the image.
-            size (`Dict[str, int]`, *optional*, defaults to `self.size`):
-                Size of the image after resizing. Shortest edge of the image is resized to size["shortest_edge"], with
-                the longest edge resized to keep the input aspect ratio.
-            resample (`int`, *optional*, defaults to `self.resample`):
-                Resampling filter to use if resizing the image. This can be one of the enum `PILImageResampling`. Only
-                has an effect if `do_resize` is set to `True`.
-            do_rescale (`bool`, *optional*, defaults to `self.do_rescale`):
-                Whether to rescale the image.
-            rescale_factor (`float`, *optional*, defaults to `self.rescale_factor`):
-                Rescale factor to rescale the image by if `do_rescale` is set to `True`.
-            do_normalize (`bool`, *optional*, defaults to `self.do_normalize`):
-                Whether to normalize the image.
-            image_mean (`float` or `List[float]`, *optional*, defaults to `self.image_mean`):
-                Image mean to use for normalization. Only has an effect if `do_normalize` is set to `True`.
-            image_std (`float` or `List[float]`, *optional*, defaults to `self.image_std`):
-                Image standard deviation to use for normalization. Only has an effect if `do_normalize` is set to
-                `True`.
-            do_pad (`bool`, *optional*, defaults to `self.do_pad`):
-                Whether or not to pad the images to the largest height and width in the batch.
-            do_image_splitting (`bool`, *optional*, defaults to `self.do_image_splitting`):
-                Whether to split the image into a sequence 4 equal sub-images concatenated with the original image. That
-                strategy was first introduced in https://arxiv.org/abs/2311.06607.
-            return_tensors (`str` or `TensorType`, *optional*):
-                The type of tensors to return. Can be one of:
-                - Unset: Return a list of `np.ndarray`.
-                - `TensorType.TENSORFLOW` or `'tf'`: Return a batch of type `tf.Tensor`.
-                - `TensorType.PYTORCH` or `'pt'`: Return a batch of type `torch.Tensor`.
-                - `TensorType.NUMPY` or `'np'`: Return a batch of type `np.ndarray`.
-                - `TensorType.JAX` or `'jax'`: Return a batch of type `jax.numpy.ndarray`.
-            data_format (`ChannelDimension` or `str`, *optional*, defaults to `ChannelDimension.FIRST`):
-                The channel dimension format for the output image. Can be one of:
-                - `"channels_first"` or `ChannelDimension.FIRST`: image in (num_channels, height, width) format.
-                - `"channels_last"` or `ChannelDimension.LAST`: image in (height, width, num_channels) format.
-                - Unset: Use the channel dimension format of the input image.
-            input_data_format (`ChannelDimension` or `str`, *optional*):
-                The channel dimension format for the input image. If unset, the channel dimension format is inferred
-                from the input image. Can be one of:
-                - `"channels_first"` or `ChannelDimension.FIRST`: image in (num_channels, height, width) format.
-                - `"channels_last"` or `ChannelDimension.LAST`: image in (height, width, num_channels) format.
-                - `"none"` or `ChannelDimension.NONE`: image in (height, width) format.
-        """
-        do_resize = do_resize if do_resize is not None else self.do_resize
-        size = size if size is not None else self.size
-        resample = resample if resample is not None else self.resample
-        do_rescale = do_rescale if do_rescale is not None else self.do_rescale
-        rescale_factor = (
-            rescale_factor if rescale_factor is not None else self.rescale_factor
-        )
-        do_normalize = do_normalize if do_normalize is not None else self.do_normalize
-        image_mean = image_mean if image_mean is not None else self.image_mean
-        image_std = image_std if image_std is not None else self.image_std
-        do_convert_rgb = (
-            do_convert_rgb if do_convert_rgb is not None else self.do_convert_rgb
-        )
-        do_pad = do_pad if do_pad is not None else self.do_pad
-        do_image_splitting = (
-            do_image_splitting
-            if do_image_splitting is not None
-            else self.do_image_splitting
-        )
-
-        images_list = make_list_of_images(images)
-
-        if not valid_images(images_list[0]):
-            raise ValueError(
-                "Invalid image type. Must be of type PIL.Image.Image, numpy.ndarray, "
-                "torch.Tensor, tf.Tensor or jax.ndarray."
-            )
-
-        validate_preprocess_arguments(
-            do_rescale=do_rescale,
-            rescale_factor=rescale_factor,
-            do_normalize=do_normalize,
-            image_mean=image_mean,
-            image_std=image_std,
-            do_resize=do_resize,
-            size=size,
-            resample=resample,
-        )
-
-        if do_convert_rgb:
-            images_list = [
-                [convert_to_rgb(image) for image in images] for images in images_list
-            ]
-
-        # All transformations expect numpy arrays.
-        images_list = [
-            [to_numpy_array(image) for image in images] for images in images_list
-        ]
-
-        if is_scaled_image(images_list[0][0]) and do_rescale:
-            logger.warning_once(
-                "It looks like you are trying to rescale already rescaled images. If the input"
-                " images have pixel values between 0 and 1, set `do_rescale=False` to avoid rescaling them again."
-            )
-
-        if input_data_format is None:
-            # We assume that all images have the same channel dimension format.
-            input_data_format = infer_channel_dimension_format(images_list[0][0])
-
-        if do_image_splitting:
-            new_images_list = []
-            for images in images_list:
-                new_images = []
-                for image in images:
-                    new_images.extend(self.split_image(image, input_data_format))
-                new_images_list.append(new_images)
-            images_list = new_images_list
-
-        if do_resize:
-            images_list = [
-                [
-                    self.resize(
-                        image=image,
-                        size=size,
-                        resample=resample,
-                        input_data_format=input_data_format,
-                    )
-                    for image in images
-                ]
-                for images in images_list
-            ]
-
-        if do_rescale:
-            images_list = [
-                [
-                    self.rescale(
-                        image=image,
-                        scale=rescale_factor,
-                        input_data_format=input_data_format,
-                    )
-                    for image in images
-                ]
-                for images in images_list
-            ]
-
-        if do_normalize:
-            images_list = [
-                [
-                    self.normalize(
-                        image=image,
-                        mean=image_mean,
-                        std=image_std,
-                        input_data_format=input_data_format,
-                    )
-                    for image in images
-                ]
-                for images in images_list
-            ]
-
-        pixel_attention_mask = None
-        if do_pad:
-            images_list, pixel_attention_mask = self.pad(
-                images_list,
-                return_pixel_mask=True,
-                return_tensors=return_tensors,
-                input_data_format=input_data_format,
-            )
-
-        if data_format is not None:
-            images_list = [
-                [
-                    to_channel_dimension_format(
-                        image, data_format, input_channel_dim=input_data_format
-                    )
-                    for image in images
-                ]
-                for images in images_list
-            ]
-
-        data = {
-            "pixel_values": np.array(images_list) if do_pad else images_list
-        }  # Faster tensor conversion
-        if pixel_attention_mask is not None:
-            data["pixel_attention_mask"] = (
-                np.array(pixel_attention_mask) if do_pad else pixel_attention_mask
-            )
-
-        return data
+    def __call__(self, x) -> mx.array:
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Idefics2Connector(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.modality_projector = MLP(
-            config.vision_config.hidden_size, config.text_config.hidden_size, bias=True
+        self.modality_projection = MLP(
+            config.vision_config.hidden_size,
+            config.text_config.intermediate_size,
+            config.text_config.hidden_size,
         )
 
-        self.perceiver_resampler = Idefics2PerceiverResampler(config.text_config)
+        self.perceiver_resampler = Idefics2PerceiverResampler(config)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = self.modality_projector(x)
+        x = self.modality_projection(x)
         x = self.perceiver_resampler(x)
         return x
-
-
-class SigLipVisionTower(nn.Module):
-    def __init__(self, config: VisionConfig):
-        super().__init__()
-        self.vision_tower = VisionModel(config)
-
-    def __call__(
-        self, x: mx.array, output_hidden_states: Optional[bool] = None
-    ) -> mx.array:
-        return self.vision_tower(x, output_hidden_states)
 
 
 class Model(nn.Module):
@@ -670,8 +257,8 @@ class Model(nn.Module):
         self.model_type = config.model_type
         self.config = config
 
-        self.vision_tower = SigLipVisionTower(config.vision_config)
-        self.language_model = LanguageModel(config.text_config)
+        self.vision_model = VisionModel(config.vision_config)
+        self.text_model = LanguageModel(config.text_config)
         self.connector = Idefics2Connector(config)
 
     def get_input_embeddings(
@@ -680,18 +267,16 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
     ):
         if pixel_values is None:
-            return self.language_model(input_ids)
+            return self.text_model(input_ids)
 
-        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
-
-        *_, hidden_state = self.vision_tower(
+        inputs_embeds = self.text_model.embed_tokens(input_ids)
+        *_, hidden_state = self.vision_model(
             pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
         )
 
         image_features = hidden_state[-1].astype(pixel_values.dtype)
-        assert image_features.shape[-2] == 729
 
-        image_features = self.connector(image_features)
+        image_features, _ = self.connector(image_features)
 
         final_inputs_embeds = self._prepare_inputs_for_multimodal(
             image_features, inputs_embeds, input_ids
@@ -699,36 +284,26 @@ class Model(nn.Module):
         return final_inputs_embeds
 
     def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
+
         image_token_index = self.config.image_token_index
         num_images, num_image_patches, embed_dim = image_features.shape
+        special_image_token_mask = input_ids == image_token_index
 
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
+        reshaped_image_hidden_states = image_features.reshape(-1, embed_dim)
 
-        if len(image_positions) != num_images:
-            raise ValueError(
-                f"The number of image tokens ({len(image_positions)}) does not "
-                f" match the number of image inputs ({num_images})."
-            )
+        # Find the positions of the <image> tokens in the input_ids
+        image_token_positions = mx.array(np.where(special_image_token_mask)[1])
 
-        text_segments = []
-        start_idx = 0
+        # Advanced indexing to place reshaped image features at the corresponding positions
+        inputs_embeds[0, image_token_positions, :] = reshaped_image_hidden_states[
+            : len(image_token_positions)
+        ]
 
-        for position in image_positions:
-            text_segments.append(inputs_embeds[:, start_idx:position])
-            start_idx = position + 1
-
-        image_embeddings = mx.split(image_features, image_features.shape[0])
-        final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
-        final_embeddings += [inputs_embeds[:, start_idx:]]
-
-        # Create a final embedding of shape
-        # (1, num_image_patches*num_images + sequence_len, embed_dim)
-        return mx.concatenate(final_embeddings, axis=1)
+        return inputs_embeds
 
     def __call__(self, input_ids: mx.array, pixel_values: mx.array, cache=None):
         input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
-        logits, cache = self.language_model(
+        logits, cache = self.text_model(
             inputs=input_ids, cache=cache, inputs_embeds=input_embeddings
         )
         return logits, cache
@@ -753,6 +328,9 @@ class Model(nn.Module):
         with open(path / "config.json", "r") as f:
             config = json.load(f)
 
+        text_config = AutoConfig.from_pretrained(config["text_config"]["model_type"])
+        text_config = text_config.to_dict()
+        config["text_config"] = text_config
         model_config = ModelConfig.from_dict(config)
         model_config.vision_config = VisionConfig.from_dict(config["vision_config"])
         model_config.text_config = TextConfig.from_dict(config["text_config"])
@@ -776,4 +354,17 @@ class Model(nn.Module):
         model.load_weights(list(weights.items()))
         return model
 
-    # def sanitize(self, weights):
+    def sanitize(self, weights):
+        weights = {
+            (
+                f"{k.split('.', 1)[1]}"
+                if re.match(r"^model\.", k)
+                else (f"text_model.{k}" if re.match(r"^lm_head\.", k) else k)
+            ): v
+            for k, v in weights.items()
+        }
+
+        return weights
+
+
+# Create a image classifier using torch

@@ -1,4 +1,5 @@
 import inspect
+import re
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Union
 
@@ -15,11 +16,10 @@ class TextConfig:
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
-    num_key_value_heads: int = None
-    rope_theta: float = 1000000
-    rope_traditional: bool = False
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    tie_word_embeddings: bool = True
+    num_key_value_heads: int
+    rope_theta: float = 10000.0
+    rope_traditional: bool = True
+    tie_word_embeddings: bool = False
 
     @classmethod
     def from_dict(cls, params):
@@ -35,14 +35,6 @@ class TextConfig:
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
-        if self.rope_scaling:
-            required_keys = {"factor", "type"}
-            if not all(key in self.rope_scaling for key in required_keys):
-                raise ValueError(f"rope_scaling must contain keys {required_keys}")
-
-            if self.rope_scaling["type"] != "linear":
-                raise ValueError("rope_scaling 'type' currently only supports 'linear'")
-
 
 class Attention(nn.Module):
     def __init__(self, args: TextConfig):
@@ -55,21 +47,15 @@ class Attention(nn.Module):
         head_dim = args.hidden_size // n_heads
         self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        rope_scale = (
-            1 / args.rope_scaling["factor"]
-            if args.rope_scaling is not None and args.rope_scaling["type"] == "linear"
-            else 1
-        )
         self.rope = nn.RoPE(
             head_dim,
             traditional=args.rope_traditional,
             base=args.rope_theta,
-            scale=rope_scale,
         )
 
     def __call__(
@@ -141,10 +127,11 @@ class TransformerBlock(nn.Module):
         return out, cache
 
 
-class MistralModel(nn.Module):
+class LanguageModel(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
         self.args = args
+        self.model_type = args.model_type
         self.vocab_size = args.vocab_size
         self.num_hidden_layers = args.num_hidden_layers
         assert self.vocab_size > 0
@@ -180,32 +167,8 @@ class MistralModel(nn.Module):
 
         return self.lm_head(self.norm(h)), cache
 
-
-class LanguageModel(nn.Module):
-    def __init__(self, args: TextConfig):
-        super().__init__()
-        self.args = args
-        self.model_type = args.model_type
-        self.model = MistralModel(args)
-
-    def __call__(
-        self,
-        inputs: mx.array,
-        cache=None,
-        inputs_embeds=None,
-    ):
-        out, cache = self.model(inputs, cache, inputs_embeds=inputs_embeds)
-        return out, cache
-
     def sanitize(self, weights):
-        if (
-            self.args.tie_word_embeddings
-            and "language_model.model.lm_head.weight" not in weights
-        ):
-            weights["language_model.model.lm_head.weight"] = weights[
-                "language_model.model.embed_tokens.weight"
-            ]
-
+        # Remove unused precomputed rotary freqs
         return {
             k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
         }
