@@ -250,9 +250,9 @@ class Model(nn.Module):
         return inputs_embeds
 
     def __call__(self, input_ids: mx.array, pixel_values: mx.array, cache=None):
-        # input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
+        input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
         logits, cache = self.language_model(
-            inputs=input_ids, cache=cache, inputs_embeds=None
+            inputs=input_ids, cache=cache, inputs_embeds=input_embeddings
         )
         return logits, cache
 
