@@ -23,6 +23,7 @@ from transformers import (
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
 )
+from transformers.image_utils import load_image
 
 from .models.base import BaseImageProcessor
 from .sample_utils import top_p_sampling
@@ -562,28 +563,28 @@ def convert(
         upload_to_hub(mlx_path, upload_repo, hf_path)
 
 
-def load_image(image_source):
-    """
-    Helper function to load an image from either a URL or file.
-    """
-    if image_source.startswith(("http://", "https://")):
-        try:
-            response = requests.get(image_source, stream=True)
-            response.raise_for_status()
-            return Image.open(response.raw)
-        except Exception as e:
-            raise ValueError(
-                f"Failed to load image from URL: {image_source} with error {e}"
-            )
-    elif Path(image_source).is_file():
-        try:
-            return Image.open(image_source)
-        except IOError as e:
-            raise ValueError(f"Failed to load image {image_source} with error: {e}")
-    else:
-        raise ValueError(
-            f"The image {image_source} must be a valid URL or existing file."
-        )
+# def load_image(image_source):
+#     """
+#     Helper function to load an image from either a URL or file.
+#     """
+#     if image_source.startswith(("http://", "https://")):
+#         try:
+#             response = requests.get(image_source, stream=True)
+#             response.raise_for_status()
+#             return Image.open(response.raw)
+#         except Exception as e:
+#             raise ValueError(
+#                 f"Failed to load image from URL: {image_source} with error {e}"
+#             )
+#     elif Path(image_source).is_file():
+#         try:
+#             return Image.open(image_source)
+#         except IOError as e:
+#             raise ValueError(f"Failed to load image {image_source} with error: {e}")
+#     else:
+#         raise ValueError(
+#             f"The image {image_source} must be a valid URL or existing file."
+#         )
 
 
 def prepare_inputs(image_processor, processor, image, prompt):
