@@ -214,7 +214,7 @@ class Model(nn.Module):
             return self.language_model(input_ids)
 
         inputs_embeds = self.language_model.embed_tokens(input_ids)
-        print(pixel_values[0].shape)
+
         pooler_output, embeddings, hidden_state = self.vision_model(
             pixel_values[0].transpose(0, 2, 3, 1), output_hidden_states=True
         )
