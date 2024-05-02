@@ -18,7 +18,7 @@ class TextConfig:
     vocab_size: int
     num_key_value_heads: int
     rope_theta: float = 10000.0
-    rope_traditional: bool = True
+    rope_traditional: bool = False
     tie_word_embeddings: bool = False
 
     @classmethod
