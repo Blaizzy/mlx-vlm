@@ -16,7 +16,7 @@ class VisionConfig:
     num_attention_heads: int
     image_size: int
     patch_size: int
-    layer_norm_eps: float = 1e-6
+    layer_norm_eps: float
     num_channels: int = 3
 
     @classmethod
@@ -163,7 +163,10 @@ class VisionEmbeddings(nn.Module):
             H // self.patch_size,
             W // self.patch_size,
         )
-        position_ids = np.full((B, max_nb_patches_h * max_nb_patches_w), fill_value=0)
+        sequence = np.arange(max_nb_patches_h * max_nb_patches_w)
+
+        # Tile the sequence to repeat it B times, each time as a new row
+        position_ids = np.tile(sequence, (B, 1))
 
         embeddings = patch_embeddings
         embeddings += self.position_embedding(mx.array(position_ids))
@@ -214,7 +217,7 @@ class VisionModel(nn.Module):
             if output_hidden_states:
                 encoder_states = encoder_states + (x,)
 
-        pooler_output = self.post_layernorm(x[:, 0, :])
+        pooler_output = self.post_layernorm(x[:, -1, :])
 
         return pooler_output, x, encoder_states
 
