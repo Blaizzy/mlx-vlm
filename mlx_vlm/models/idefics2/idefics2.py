@@ -101,7 +101,7 @@ class Idefics2PerceiverAttention(nn.Module):
             values = mx.concatenate([value_cache, values], axis=2)
 
         output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
+            queries, keys, values, scale=self.scale
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output), (keys, values)
@@ -128,12 +128,11 @@ class Idefics2PerceiverLayer(nn.Module):
         x: mx.array,
         hidden_states: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[Tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
         latents = self.input_latents_norm(x)
         context = self.input_context_norm(hidden_states)
 
-        latents, cache = self.self_attn(latents, context, mask=mask, cache=cache)
+        latents, _ = self.self_attn(latents, context, mask=mask)
 
         latents = x + latents
         r = latents
@@ -141,7 +140,7 @@ class Idefics2PerceiverLayer(nn.Module):
         latents = self.post_attention_layernorm(latents)
         latents = self.mlp(latents)
         latents = r + latents
-        return latents, cache
+        return latents
 
 
 class Idefics2PerceiverResampler(nn.Module):
@@ -157,18 +156,15 @@ class Idefics2PerceiverResampler(nn.Module):
         ]
         self.norm = nn.RMSNorm(self.hidden_size, eps=config.text_config.rms_norm_eps)
 
-    def __call__(self, x: mx.array, mask: Optional[mx.array] = None, cache=None):
-
-        if cache is None:
-            cache = [None] * len(self.layers)
+    def __call__(self, x: mx.array, mask: Optional[mx.array] = None):
 
         h = mx.expand_dims(self.latents, axis=0)
         h = mx.repeat(h, x.shape[0], axis=0)
 
-        for e, layer in enumerate(self.layers):
-            h, cache[e] = layer(h, x, mask=mask, cache=cache[e])
+        for layer in self.layers:
+            h = layer(h, x, mask=mask)
 
-        return self.norm(h), cache
+        return self.norm(h)
 
 
 class MLP(nn.Module):
@@ -218,13 +214,14 @@ class Model(nn.Module):
             return self.language_model(input_ids)
 
         inputs_embeds = self.language_model.embed_tokens(input_ids)
-        *_, hidden_state = self.vision_model(
+        print(pixel_values[0].shape)
+        pooler_output, embeddings, hidden_state = self.vision_model(
             pixel_values[0].transpose(0, 2, 3, 1), output_hidden_states=True
         )
 
         image_features = hidden_state[-1].astype(pixel_values.dtype)
 
-        image_features, _ = self.connector(image_features, mask=None)
+        image_features = self.connector(image_features, mask=None)
 
         final_inputs_embeds = self._prepare_inputs_for_multimodal(
             image_features, inputs_embeds, input_ids
@@ -243,9 +240,7 @@ class Model(nn.Module):
         image_token_positions = mx.array(np.where(special_image_token_mask)[1])
 
         # Advanced indexing to place reshaped image features at the corresponding positions
-        inputs_embeds[0, image_token_positions, :] = reshaped_image_hidden_states[
-            : len(image_token_positions)
-        ]
+        inputs_embeds[0, image_token_positions, :] = reshaped_image_hidden_states
 
         return inputs_embeds
 

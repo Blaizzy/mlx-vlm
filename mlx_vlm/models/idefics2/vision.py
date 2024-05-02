@@ -4,6 +4,7 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 
 @dataclass
@@ -79,59 +80,17 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(value_input_dims, value_dims, bias=True)
         self.out_proj = nn.Linear(value_dims, value_output_dims, bias=True)
 
-    def __call__(self, queries, keys, values, mask=None):
-        queries = self.q_proj(queries)
-        keys = self.k_proj(keys)
-        values = self.v_proj(values)
+    def __call__(self, x: mx.array, mask=None):
+        B, L, _ = x.shape
+        queries = self.q_proj(x)
+        keys = self.k_proj(x)
+        values = self.v_proj(x)
 
         num_heads = self.num_heads
-        B, L, D = queries.shape
-        _, S, _ = keys.shape
+
         queries = queries.reshape(B, L, num_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
-
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
-        )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.out_proj(output)
-
-
-class MHA(nn.Module):
-    def __init__(
-        self,
-        dims: int,
-        num_heads: int,
-        bias: bool = False,
-    ):
-        super().__init__()
-
-        if (dims % num_heads) != 0:
-            raise ValueError(
-                "The input feature dimensions should be divisible by the "
-                f"number of heads ({dims} % {num_heads}) != 0"
-            )
-
-        self.num_heads = num_heads
-        head_dim = dims // num_heads
-        self.scale = head_dim**-0.5
-
-        self.in_proj = nn.Linear(dims, dims * 3, bias=bias)
-        self.out_proj = nn.Linear(dims, dims, bias=bias)
-
-    def __call__(self, queries: mx.array, kv: mx.array, mask=None, cache=None):
-        B, L, D = queries.shape
-
-        qkv = self.in_proj(queries)
-        _, keys, values = mx.split(qkv, 3, axis=-1)
-
-        num_heads = self.num_heads
-        B, L, D = queries.shape
-        _, S, _ = keys.shape
-        queries = queries.reshape(B, L, num_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, num_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, num_heads, -1).transpose(0, 2, 1, 3)
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
@@ -164,7 +123,7 @@ class EncoderLayer(nn.Module):
 
     def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
         y = self.layer_norm1(x)
-        y = self.self_attn(y, y, y, mask)
+        y = self.self_attn(y, mask)
         x = x + y
         y = self.layer_norm2(x)
         y = self.mlp(y)
@@ -190,32 +149,31 @@ class VisionEmbeddings(nn.Module):
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
             stride=self.patch_size,
-            dilation=1,
         )
 
         self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
 
-    def __call__(self, x: mx.array) -> mx.array:
-        batch_size, max_im_h, max_im_w, _ = x.shape
+    def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
+        B, H, W, C = x.shape
         patch_embeddings = self.patch_embedding(x)
         patch_embeddings = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
         max_nb_patches_h, max_nb_patches_w = (
-            max_im_h // self.patch_size,
-            max_im_w // self.patch_size,
+            H // self.patch_size,
+            W // self.patch_size,
         )
-        position_ids = mx.zeros(
-            (batch_size, max_nb_patches_h * max_nb_patches_w)
-        ).astype(mx.uint64)
+        position_ids = np.full((B, max_nb_patches_h * max_nb_patches_w), fill_value=0)
+
         embeddings = patch_embeddings
-        embeddings += self.position_embedding(position_ids)
+        embeddings += self.position_embedding(mx.array(position_ids))
         return embeddings
 
 
 class VisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
+        self.config = config
         self.model_type = config.model_type
         if self.model_type != "idefics2":
             raise ValueError(f"Unsupported model type: {self.model_type}")
@@ -226,18 +184,37 @@ class VisionModel(nn.Module):
     def __call__(
         self,
         x: mx.array,
+        patch_attention_mask: Optional[mx.array] = None,
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
-        x = self.embeddings(x)
+
+        B, L, D, C = x.shape
+        if patch_attention_mask is None:
+            patch_size = self.config.patch_size
+            patch_attention_mask = mx.ones(
+                (
+                    B,
+                    L // patch_size,
+                    D // patch_size,
+                )
+            )
+
+        x = self.embeddings(x, mask=None)
 
         encoder_states = (x,) if output_hidden_states else None
+        patch_size = self.config.patch_size
 
-        for l in self.encoder.layers:
-            x = l(x, mask=None)
+        mask = None
+        if x.shape[1] > 1:
+            mask = nn.MultiHeadAttention.create_additive_causal_mask(x.shape[1])
+            mask = mask.astype(x.dtype)
+
+        for layers in self.encoder.layers:
+            x = layers(x, mask=None)
             if output_hidden_states:
                 encoder_states = encoder_states + (x,)
 
-        pooler_output = self.post_layernorm(x)
+        pooler_output = self.post_layernorm(x[:, 0, :])
 
         return pooler_output, x, encoder_states
 
