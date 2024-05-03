@@ -3,6 +3,7 @@ import codecs
 
 import mlx.core as mx
 
+from .prompt_utils import get_message_json
 from .utils import generate, get_model_path, load, load_config, load_image_processor
 
 MODEL_TYPE = ""
@@ -50,9 +51,10 @@ def parse_arguments():
 
 def get_model_and_processors(model_path):
     model_path = get_model_path(model_path)
+    config = load_config(model_path)
     model, processor = load(model_path, {"trust_remote_code": True})
     image_processor = load_image_processor(model_path)
-    return model, processor, image_processor
+    return model, processor, image_processor, config
 
 
 def sample(logits, temperature=0.0):
@@ -64,22 +66,24 @@ def sample(logits, temperature=0.0):
 
 def main():
     args = parse_arguments()
-    model, processor, image_processor = get_model_and_processors(args.model)
+    model, processor, image_processor, config = get_model_and_processors(args.model)
 
     prompt = codecs.decode(args.prompt, "unicode_escape")
 
     if "chat_template" in processor.__dict__.keys():
         prompt = processor.apply_chat_template(
-            [{"role": "user", "content": f"<image>\n{prompt}"}],
+            [get_message_json(config["model_type"], prompt)],
             tokenize=False,
             add_generation_prompt=True,
         )
+
     elif "tokenizer" in processor.__dict__.keys():
         prompt = processor.tokenizer.apply_chat_template(
-            [{"role": "user", "content": f"<image>\n{prompt}"}],
+            [get_message_json(config["model_type"], prompt)],
             tokenize=False,
             add_generation_prompt=True,
         )
+
     else:
         ValueError(
             "Error: processor does not have 'chat_template' or 'tokenizer' attribute."
