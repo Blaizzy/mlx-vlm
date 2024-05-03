@@ -205,6 +205,69 @@ class TestModels(unittest.TestCase):
             (args.vision_config.image_size, args.vision_config.image_size),
         )
 
+    def test_idefics2(self):
+        from mlx_vlm.models import idefics2
+
+        text_config = idefics2.TextConfig(
+            model_type="mistral",
+            hidden_size=4096,
+            num_hidden_layers=32,
+            intermediate_size=14336,
+            num_attention_heads=32,
+            rms_norm_eps=1e-5,
+            vocab_size=32000,
+            num_key_value_heads=8,
+            rope_theta=10000.0,
+            rope_traditional=False,
+        )
+
+        vision_config = idefics2.VisionConfig(
+            model_type="idefics2",
+            num_hidden_layers=27,
+            hidden_size=1152,
+            intermediate_size=4304,
+            num_attention_heads=16,
+            image_size=980,
+            patch_size=14,
+            num_channels=3,
+            layer_norm_eps=1e-6,
+        )
+
+        perceiver_config = idefics2.PerceiverConfig(
+            model_type="idefics2Perceiver",
+            resampler_n_latents=64,
+            resampler_depth=3,
+            resampler_n_heads=16,
+            resampler_head_dim=96,
+            num_key_value_heads=4,
+        )
+
+        args = idefics2.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            perceiver_config=perceiver_config,
+            model_type="idefics2",
+            ignore_index=-100,
+            image_token_index=32001,
+        )
+
+        model = idefics2.Model(args)
+
+        self.language_test_runner(
+            model.language_model,
+            args.text_config.model_type,
+            args.text_config.vocab_size,
+            args.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_model,
+            args.vision_config.model_type,
+            args.vision_config.hidden_size,
+            args.vision_config.num_channels,
+            (args.vision_config.image_size, args.vision_config.image_size),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
