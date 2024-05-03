@@ -167,7 +167,6 @@ class VisionEmbeddings(nn.Module):
         boundaries = np.arange(1 / self.num_patches, 1.0, 1 / self.num_patches)
         sequence = np.zeros((max_nb_patches_h * max_nb_patches_w))
 
-        # Step 3: Use broadcasting to expand this row to B rows
         position_ids = np.zeros_like(mask, dtype=int)
 
         def bucketize(values, boundaries):

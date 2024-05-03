@@ -291,7 +291,6 @@ class Model(nn.Module):
             weights.update(mx.load(wf))
 
         weights = model.sanitize(weights=weights)
-
         weights = VisionModel(model_config.vision_config).sanitize(weights=weights)
         weights = LanguageModel(model_config.text_config).sanitize(weights=weights)
         model.load_weights(list(weights.items()))

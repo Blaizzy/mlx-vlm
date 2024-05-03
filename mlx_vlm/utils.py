@@ -143,9 +143,11 @@ def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
         config["vision_config"]
     )
     model_config.text_config = model_class.TextConfig.from_dict(config["text_config"])
-    model_config.perceiver_config = model_class.PerceiverConfig.from_dict(
-        config["perceiver_config"]
-    )
+
+    if hasattr(model_config, "perceiver_config"):
+        model_config.perceiver_config = model_class.PerceiverConfig.from_dict(
+            config["perceiver_config"]
+        )
     model = model_class.Model(model_config)
 
     if hasattr(model, "sanitize"):
