@@ -18,3 +18,18 @@ pip install mlx-vlm
 ```sh
 python -m mlx_vlm.generate --model qnguyen3/nanoLLaVA --max-tokens 100 --temp 0.0
 ```
+
+### Example Calls
+
+* Idefics 2 w/ Local Path
+
+```sh
+python -m mlx_vlm.generate --model mlx-community/idefics2-8b-4bit --max-tokens 1000 --temp 0.0  --prompt "Describe this image" --image /path/to/file.png
+```
+
+* Idefics 2 w/ Local Path
+
+```sh
+python -m mlx_vlm.generate --model mlx-community/idefics2-8b-4bit --max-tokens 1000 --temp 0.0  --prompt "Is this a logo?" --image https://pypi.org/static/images/logo-small.8998e9d1.svg
+```
+
