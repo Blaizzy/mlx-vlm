@@ -6,6 +6,7 @@ import logging
 import re
 import shutil
 import time
+import textwrap
 from pathlib import Path
 from textwrap import dedent
 from typing import Any, Callable, Dict, Generator, Optional, Tuple, Union
@@ -120,7 +121,20 @@ def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
     weight_files = glob.glob(str(model_path / "*.safetensors"))
     if not weight_files:
         logging.error(f"No safetensors found in {model_path}")
-        raise FileNotFoundError(f"No safetensors found in {model_path}")
+        message = f"""
+No safetensors found in {model_path}
+Create safetensors using the following code:
+from transformers import AutoModelForCausalLM, AutoProcessor
+
+model_id= "<huggingface_model_id>"
+model = AutoModelForCausalLM.from_pretrained(model_id)
+processor = AutoProcessor.from_pretrained(model_id) 
+
+model.save_pretrained("<local_id>")
+
+processor.save_pretrained("<local_id>")
+        """
+        raise FileNotFoundError(message)
 
     weights = {}
     for wf in weight_files:
