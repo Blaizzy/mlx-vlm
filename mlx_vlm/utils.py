@@ -456,11 +456,56 @@ def quantize_model(
     """
     quantized_config = copy.deepcopy(config)
     vision_intermediate_size = model.config.vision_config.intermediate_size
-    class_predicate = lambda path, m: isinstance(m, nn.Linear) and (
-        path.split(".")[0] not in ["vision_model", "vision_tower"]
-        if any(vision_intermediate_size % size != 0 for size in [64, 128])
-        else not isinstance(m, nn.Embedding)
+    divisor = 64
+    if any(vision_intermediate_size % size != 0 for size in [64, 128]):
+        for name, module in model.named_modules():
+            if (
+                isinstance(module, nn.Linear)
+                or isinstance(module, nn.Embedding)
+                and ("vision_model" in name or "vision_tower" in name)
+            ):
+                out_features, in_features = module.weight.shape
+
+                # Calculate the padding needed for each dimension
+                new_out_features = (
+                    ((out_features // divisor) + 1) * divisor
+                    if out_features % divisor != 0
+                    else out_features
+                )
+                new_in_features = (
+                    ((in_features // divisor) + 1) * divisor
+                    if in_features % divisor != 0
+                    else in_features
+                )
+                if (
+                    out_features == vision_intermediate_size
+                    or in_features == vision_intermediate_size
+                ):
+
+                    # If padding is needed, proceed
+                    if (
+                        new_out_features != out_features
+                        or new_in_features != in_features
+                    ):
+                        # Create new weight and bias tensors
+                        new_weight = mx.zeros((new_out_features, new_in_features))
+                        new_bias = mx.zeros((new_out_features))
+
+                        # Copy existing weights and biases to the new tensors
+                        new_weight[:out_features, :in_features] = module.weight
+                        module.weight = new_weight
+
+                        if hasattr(module, "bias"):
+                            new_bias[:out_features] = module.bias
+                            module.bias = new_bias
+
+    quantized_config["vision_config"]["intermediate_size"] = (
+        ((vision_intermediate_size // divisor) + 1) * divisor
+        if vision_intermediate_size % divisor != 0
+        else vision_intermediate_size
     )
+
+    class_predicate = lambda path, m: isinstance(m, nn.Linear)
 
     nn.quantize(model, q_group_size, q_bits, class_predicate=class_predicate)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
