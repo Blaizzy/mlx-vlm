@@ -123,15 +123,17 @@ def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
         message = f"""
 No safetensors found in {model_path}
 Create safetensors using the following code:
+```
 from transformers import AutoModelForCausalLM, AutoProcessor
 
 model_id= "<huggingface_model_id>"
 model = AutoModelForCausalLM.from_pretrained(model_id)
 processor = AutoProcessor.from_pretrained(model_id) 
 
-model.save_pretrained("<local_id>")
-
-processor.save_pretrained("<local_id>")
+model.save_pretrained("<local_dir>")
+processor.save_pretrained("<local_dir>")
+```
+Then use the <local_dir> as the --hf-path.
         """
         raise FileNotFoundError(message)
 
