@@ -133,7 +133,10 @@ processor = AutoProcessor.from_pretrained(model_id)
 model.save_pretrained("<local_dir>")
 processor.save_pretrained("<local_dir>")
 ```
-Then use the <local_dir> as the --hf-path.
+Then use the <local_dir> as the --hf-path in the convert script.
+```
+python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
+```
         """
         raise FileNotFoundError(message)
 
