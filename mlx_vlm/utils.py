@@ -120,7 +120,25 @@ def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
     weight_files = glob.glob(str(model_path / "*.safetensors"))
     if not weight_files:
         logging.error(f"No safetensors found in {model_path}")
-        raise FileNotFoundError(f"No safetensors found in {model_path}")
+        message = f"""
+No safetensors found in {model_path}
+Create safetensors using the following code:
+```
+from transformers import AutoModelForCausalLM, AutoProcessor
+
+model_id= "<huggingface_model_id>"
+model = AutoModelForCausalLM.from_pretrained(model_id)
+processor = AutoProcessor.from_pretrained(model_id) 
+
+model.save_pretrained("<local_dir>")
+processor.save_pretrained("<local_dir>")
+```
+Then use the <local_dir> as the --hf-path in the convert script.
+```
+python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
+```
+        """
+        raise FileNotFoundError(message)
 
     weights = {}
     for wf in weight_files:
