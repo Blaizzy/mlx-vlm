@@ -128,7 +128,7 @@ from transformers import AutoModelForCausalLM, AutoProcessor
 
 model_id= "<huggingface_model_id>"
 model = AutoModelForCausalLM.from_pretrained(model_id)
-processor = AutoProcessor.from_pretrained(model_id) 
+processor = AutoProcessor.from_pretrained(model_id)
 
 model.save_pretrained("<local_dir>")
 processor.save_pretrained("<local_dir>")
@@ -233,7 +233,11 @@ def load(
     return model, processor
 
 
-def load_config(model_path: Path) -> dict:
+def load_config(model_path: Union[str, Path]) -> dict:
+
+    if isinstance(model_path, str):
+        model_path = get_model_path(model_path)
+
     try:
         with open(model_path / "config.json", "r") as f:
             config = json.load(f)
