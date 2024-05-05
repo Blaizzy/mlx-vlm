@@ -505,9 +505,7 @@ def quantize_model(
         else vision_intermediate_size
     )
 
-    class_predicate = lambda path, m: isinstance(m, nn.Linear)
-
-    nn.quantize(model, q_group_size, q_bits, class_predicate=class_predicate)
+    nn.quantize(model, q_group_size, q_bits)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
     quantized_weights = dict(tree_flatten(model.parameters()))
 

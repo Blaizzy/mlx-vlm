@@ -5,6 +5,7 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 
 @dataclass
@@ -163,6 +164,7 @@ class VisionEmbeddings(nn.Module):
         self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches + 1
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
+        self.position_ids = mx.array(np.arange(self.num_positions)[None, :])
 
     def __call__(self, x: mx.array) -> mx.array:
         batch_size = x.shape[0]
@@ -173,7 +175,7 @@ class VisionEmbeddings(nn.Module):
             self.class_embedding, (batch_size, 1, embed_dim)
         )
         embeddings = mx.concatenate((cls_embeddings, patch_embeddings), axis=1)
-        embeddings += self.position_embedding.weight
+        embeddings += self.position_embedding(self.position_ids)
         return embeddings
 
 
