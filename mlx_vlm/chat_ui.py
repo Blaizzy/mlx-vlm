@@ -97,11 +97,19 @@ def chat(message, history, temperature, max_tokens):
     if message["files"]:
         chat.append(get_message_json(config["model_type"], message["text"]))
 
-    messages = processor.apply_chat_template(
-        chat,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    if "chat_template" in processor.__dict__.keys():
+        messages = processor.apply_chat_template(
+            chat,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    elif "tokenizer" in processor.__dict__.keys():
+        messages = processor.tokenizer.apply_chat_template(
+            chat,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
     response = ""
     for chunk in generate(
         model,
