@@ -89,10 +89,6 @@ def generate(
 def chat(message, history, temperature, max_tokens):
 
     chat = []
-    for item in history:
-        chat.append(get_message_json(config["model_type"], item[0]))
-        if item[1] is not None:
-            chat.append({"role": "assistant", "content": item[1]})
 
     if message["files"]:
         chat.append(get_message_json(config["model_type"], message["text"]))
