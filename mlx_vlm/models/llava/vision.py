@@ -164,7 +164,6 @@ class VisionEmbeddings(nn.Module):
         self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches + 1
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
-        self.position_ids = mx.array(np.arange(self.num_positions)[None, :])
 
     def __call__(self, x: mx.array) -> mx.array:
         batch_size = x.shape[0]
@@ -174,8 +173,10 @@ class VisionEmbeddings(nn.Module):
         cls_embeddings = mx.broadcast_to(
             self.class_embedding, (batch_size, 1, embed_dim)
         )
+        position_ids = mx.array(np.arange(self.num_positions)[None, :])
+
         embeddings = mx.concatenate((cls_embeddings, patch_embeddings), axis=1)
-        embeddings += self.position_embedding(self.position_ids)
+        embeddings += self.position_embedding(position_ids)
         return embeddings
 
 
@@ -221,8 +222,7 @@ class VisionModel(nn.Module):
     ) -> mx.array:
         return self.vision_model(x, output_hidden_states)
 
-    @staticmethod
-    def sanitize(weights):
+    def sanitize(self, weights):
         sanitized_weights = {}
         for k, v in weights.items():
             if "position_ids" in k:
