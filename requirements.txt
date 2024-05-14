@@ -4,5 +4,6 @@ numpy
 transformers
 torch
 huggingface_hub
+gradio
 Pillow
 requests
