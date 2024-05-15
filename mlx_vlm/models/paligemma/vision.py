@@ -10,14 +10,13 @@ import numpy as np
 @dataclass
 class VisionConfig:
     model_type: str
-    num_hidden_layers: int = 27
-    hidden_size: int = 1152
-    intermediate_size: int = 4304
-    num_attention_heads: int = 16
-    image_size: int = 384
-    patch_size: int = 14
-    projection_dim: int = 2048
-    vocab_size: int = 32000
+    num_hidden_layers: int
+    hidden_size: int
+    intermediate_size: int
+    num_attention_heads: int
+    patch_size: int
+    projection_dim: int
+    image_size: int = 224
     num_channels: int = 3
     layer_norm_eps: float = 1e-6
 
@@ -58,7 +57,7 @@ class Attention(nn.Module):
         value_input_dims: Optional[int] = None,
         value_dims: Optional[int] = None,
         value_output_dims: Optional[int] = None,
-        bias: bool = False,
+        bias: bool = True,
     ):
         super().__init__()
 
@@ -83,10 +82,10 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(value_input_dims, value_dims, bias=bias)
         self.out_proj = nn.Linear(value_dims, value_output_dims, bias=bias)
 
-    def __call__(self, queries, keys, values, mask=None):
-        queries = self.q_proj(queries)
-        keys = self.k_proj(keys)
-        values = self.v_proj(values)
+    def __call__(self, x, mask=None):
+        queries = self.q_proj(x)
+        keys = self.k_proj(x)
+        values = self.v_proj(x)
 
         num_heads = self.num_heads
         B, L, D = queries.shape
@@ -107,7 +106,7 @@ class MHA(nn.Module):
         self,
         dims: int,
         num_heads: int,
-        bias: bool = False,
+        bias: bool = True,
     ):
         super().__init__()
 
@@ -148,8 +147,8 @@ class MLP(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.activation_fn = nn.GELU(approx="fast")
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=True)
+        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=True)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.activation_fn(self.fc1(x))
@@ -170,7 +169,7 @@ class EncoderLayer(nn.Module):
 
     def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
         y = self.layer_norm1(x)
-        y = self.self_attn(y, y, y, mask)
+        y = self.self_attn(y, mask)
         x = x + y
         y = self.layer_norm2(x)
         y = self.mlp(y)
@@ -202,15 +201,14 @@ class VisionEmbeddings(nn.Module):
         self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
-        self.position_ids = mx.array(np.arange(self.num_positions)[None, :])
 
     def __call__(self, x: mx.array) -> mx.array:
         batch_size = x.shape[0]
         patch_embeddings = self.patch_embedding(x)
         patch_embeddings = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
-
+        position_ids = mx.array(np.arange(self.num_positions)[None, :])
         embeddings = patch_embeddings
-        embeddings += self.position_embedding(self.position_ids)
+        embeddings += self.position_embedding(position_ids)
         return embeddings
 
 
@@ -220,7 +218,6 @@ class SigLipVisionModel(nn.Module):
         self.embeddings = VisionEmbeddings(config)
         self.encoder = Encoder(config)
         self.post_layernorm = nn.LayerNorm(config.hidden_size)
-        self.head = SigLipMultiheadAttentionPoolingHead(config)
 
     def __call__(
         self,
@@ -236,37 +233,9 @@ class SigLipVisionModel(nn.Module):
             if output_hidden_states:
                 encoder_states = encoder_states + (x,)
 
-        pooler_output = self.post_layernorm(x[:, 0, :])
-        pooler_output = self.head(pooler_output)
+        pooler_output = self.post_layernorm(x[0])
+
         return pooler_output, x, encoder_states
-
-
-class SigLipMultiheadAttentionPoolingHead(nn.Module):
-
-    def __init__(self, config: VisionConfig):
-        super().__init__()
-
-        self.probe = mx.ones(
-            (
-                1,
-                1,
-                config.hidden_size,
-            )
-        )
-        self.attention = MHA(
-            config.hidden_size, num_heads=config.num_attention_heads, bias=True
-        )
-        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.mlp = MLP(config)
-
-    def __call__(self, x: mx.array):
-        x = self.attention(self.probe, x)[0]
-
-        residual = x
-        x = self.layernorm(x)
-        x = residual + self.mlp(x)
-
-        return x[:, 0]
 
 
 class VisionModel(nn.Module):
