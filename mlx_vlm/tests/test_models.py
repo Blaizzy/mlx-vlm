@@ -268,6 +268,68 @@ class TestModels(unittest.TestCase):
             (args.vision_config.image_size, args.vision_config.image_size),
         )
 
+    def test_paligemma(self):
+        from mlx_vlm.models import paligemma
+
+        text_config = paligemma.TextConfig(
+            model_type="gemma",
+            hidden_size=2048,
+            num_hidden_layers=18,
+            intermediate_size=16384,
+            num_attention_heads=8,
+            rms_norm_eps=1e-6,
+            vocab_size=257216,
+            num_key_value_heads=1,
+            rope_theta=10000.0,
+            rope_traditional=False,
+        )
+
+        vision_config = paligemma.VisionConfig(
+            model_type="siglip_vision_model",
+            num_hidden_layers=27,
+            hidden_size=1152,
+            intermediate_size=4304,
+            num_attention_heads=16,
+            image_size=224,
+            patch_size=14,
+            projection_dim=2048,
+            num_channels=3,
+            layer_norm_eps=1e-6,
+        )
+
+        args = paligemma.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="paligemma",
+            ignore_index=-100,
+            image_token_index=257152,
+            hidden_size=2048,
+            vocab_size=257216,
+        )
+
+        model = paligemma.Model(args)
+
+        self.language_test_runner(
+            model.language_model,
+            args.text_config.model_type,
+            args.text_config.vocab_size,
+            args.text_config.num_hidden_layers,
+        )
+
+        self.mm_projector_test_runner(
+            model.multi_modal_projector,
+            args.vision_config.hidden_size,
+            args.text_config.hidden_size,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            args.vision_config.model_type,
+            args.vision_config.hidden_size,
+            args.vision_config.num_channels,
+            (args.vision_config.image_size, args.vision_config.image_size),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
