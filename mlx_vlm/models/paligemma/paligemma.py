@@ -1,9 +1,7 @@
 import glob
 import inspect
 import json
-import re
 from dataclasses import dataclass
-from functools import partial, reduce
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -11,8 +9,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
-from PIL import Image
-from transformers import AutoConfig
 
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
@@ -23,14 +19,10 @@ class ModelConfig:
     text_config: TextConfig
     vision_config: VisionConfig
     model_type: str
-    auto_map: dict
-    hidden_size: int
-    mm_hidden_size: int
-    mm_vision_tower: str
-    mm_projector_type: str = "mlp2x_gelu"
+    vocab_size: int
     ignore_index: int = -100
-    image_token_index: int = -200
-    vocab_size: int = 151936
+    image_token_index: int = 257152
+    hidden_size: int = 2048
 
     @classmethod
     def from_dict(cls, params):
@@ -47,11 +39,14 @@ class PaliGemmaMultiModalProjector(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.linear = nn.Linear(
-            config.vision_config.hidden_size, config.text_config.hidden_size, bias=True
+            config.vision_config.hidden_size,
+            config.vision_config.projection_dim,
+            bias=True,
         )
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.linear(x)
+        output = self.linear(x)
+        return output
 
 
 class Model(nn.Module):
@@ -73,13 +68,11 @@ class Model(nn.Module):
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        *_, hidden_state = self.vision_tower(
+        hidden_state, _, _ = self.vision_tower(
             pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
         )
 
-        image_features = hidden_state[-1].astype(pixel_values.dtype)
-        assert image_features.shape[-2] == 729
-
+        image_features = hidden_state[None, :].astype(pixel_values.dtype)
         image_features = self.multi_modal_projector(image_features)
 
         final_inputs_embeds = self._prepare_inputs_for_multimodal(
@@ -90,30 +83,19 @@ class Model(nn.Module):
     def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
         image_token_index = self.config.image_token_index
         num_images, num_image_patches, embed_dim = image_features.shape
+        # image_features /= (self.config.hidden_size**0.5)
 
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
+        special_image_token_mask = input_ids == image_token_index
 
-        if len(image_positions) != num_images:
-            raise ValueError(
-                f"The number of image tokens ({len(image_positions)}) does not "
-                f" match the number of image inputs ({num_images})."
-            )
+        reshaped_image_hidden_states = image_features.reshape(-1, embed_dim)
 
-        text_segments = []
-        start_idx = 0
+        # Find the positions of the <image> tokens in the input_ids
+        image_token_positions = mx.array(np.where(special_image_token_mask)[1])
 
-        for position in image_positions:
-            text_segments.append(inputs_embeds[:, start_idx:position])
-            start_idx = position + 1
+        # Advanced indexing to place reshaped image features at the corresponding positions
+        inputs_embeds[0, image_token_positions, :] = reshaped_image_hidden_states
 
-        image_embeddings = mx.split(image_features, image_features.shape[0])
-        final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
-        final_embeddings += [inputs_embeds[:, start_idx:]]
-
-        # Create a final embedding of shape
-        # (1, num_image_patches*num_images + sequence_len, embed_dim)
-        return mx.concatenate(final_embeddings, axis=1)
+        return inputs_embeds
 
     def __call__(self, input_ids: mx.array, pixel_values: mx.array, cache=None):
         input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
@@ -142,13 +124,6 @@ class Model(nn.Module):
         with open(path / "config.json", "r") as f:
             config = json.load(f)
 
-        siglip_config = AutoConfig.from_pretrained(config["mm_vision_tower"])
-        text_config = AutoConfig.from_pretrained(config["language_model"])
-        siglip_config = siglip_config.to_dict()
-        text_config = text_config.to_dict()
-        config["vision_config"] = siglip_config["vision_config"]
-        config["text_config"] = text_config
-
         model_config = ModelConfig.from_dict(config)
         model_config.vision_config = VisionConfig.from_dict(config["vision_config"])
         model_config.text_config = TextConfig.from_dict(config["text_config"])
@@ -165,6 +140,5 @@ class Model(nn.Module):
         weights = model.sanitize(weights=weights)
 
         weights = VisionModel(model_config.vision_config).sanitize(weights=weights)
-        weights = LanguageModel(model_config.text_config).sanitize(weights=weights)
         model.load_weights(list(weights.items()))
         return model
