@@ -83,7 +83,6 @@ class Model(nn.Module):
     def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
         image_token_index = self.config.image_token_index
         num_images, num_image_patches, embed_dim = image_features.shape
-        # image_features /= (self.config.hidden_size**0.5)
 
         special_image_token_mask = input_ids == image_token_index
 
