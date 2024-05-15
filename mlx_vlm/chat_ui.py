@@ -112,7 +112,7 @@ def chat(message, history, temperature, max_tokens):
                 add_generation_prompt=True,
             )
         else:
-            messages = message["text"][-1]
+            messages = message["text"]
 
     response = ""
     for chunk in generate(
