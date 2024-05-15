@@ -54,7 +54,10 @@ def generate(
     else:
         tokenizer = processor.tokenizer
 
-    input_ids, pixel_values = prepare_inputs(image_processor, processor, image, prompt)
+    image_token_index = model.config.image_token_index
+    input_ids, pixel_values = prepare_inputs(
+        image_processor, processor, image, prompt, image_token_index
+    )
     logits, cache = model(input_ids, pixel_values)
     logits = logits[:, -1, :]
     y, _ = sample(logits, temp, top_p)
