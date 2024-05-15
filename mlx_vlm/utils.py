@@ -157,9 +157,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config = AutoConfig.from_pretrained(model_path).to_dict()
 
     model_config = model_class.ModelConfig.from_dict(config)
+
     model_config.vision_config = model_class.VisionConfig.from_dict(
         config["vision_config"]
     )
+
     model_config.text_config = model_class.TextConfig.from_dict(config["text_config"])
 
     if hasattr(model_config, "perceiver_config"):
@@ -664,15 +666,17 @@ def load_image(image_source):
         )
 
 
-def prepare_inputs(image_processor, processor, image, prompt):
+def prepare_inputs(image_processor, processor, image, prompt, image_token_index):
     from transformers.image_utils import load_image
 
     if isinstance(image, str):
         image = load_image(image)
 
     if image_processor is not None:
+
         text_chunks = [processor(chunk).input_ids for chunk in prompt.split("<image>")]
-        input_ids = mx.array([text_chunks[0] + [-200] + text_chunks[1]])
+        input_ids = mx.array([text_chunks[0] + [image_token_index] + text_chunks[1]])
+
         pixel_values = image_processor.preprocess(images=[image])[0]
         pixel_values = mx.array(np.expand_dims(pixel_values, axis=0))
     else:
@@ -797,7 +801,10 @@ def generate(
         prompt_tokens = mx.array(processor.tokenizer.encode(prompt))
         tokenizer = processor.tokenizer
 
-    input_ids, pixel_values = prepare_inputs(image_processor, processor, image, prompt)
+    image_token_index = model.config.image_token_index
+    input_ids, pixel_values = prepare_inputs(
+        image_processor, processor, image, prompt, image_token_index
+    )
     logits, cache = model(input_ids, pixel_values)
     logits = logits[:, -1, :]
     y, _ = sample(logits, temp, top_p)
