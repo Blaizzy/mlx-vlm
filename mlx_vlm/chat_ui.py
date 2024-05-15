@@ -125,7 +125,6 @@ def chat(message, history, temperature, max_tokens):
         max_tokens,
     ):
         response += chunk
-        print(chunk)
         yield response
 
 
