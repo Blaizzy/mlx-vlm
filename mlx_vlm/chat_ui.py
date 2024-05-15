@@ -92,8 +92,7 @@ def generate(
 def chat(message, history, temperature, max_tokens):
 
     chat = []
-
-    if message["files"]:
+    if len(message["files"]) >= 0:
         chat.append(get_message_json(config["model_type"], message["text"]))
     else:
         raise Exception("Please upload an image. Text only chat is not supported.")
@@ -106,22 +105,27 @@ def chat(message, history, temperature, max_tokens):
         )
 
     elif "tokenizer" in processor.__dict__.keys():
-        messages = processor.tokenizer.apply_chat_template(
-            chat,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        if processor.tokenizer.chat_template:
+            messages = processor.tokenizer.apply_chat_template(
+                chat,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            messages = message["text"][-1]
+
     response = ""
     for chunk in generate(
         model,
         processor,
-        message["files"][0],
+        message["files"][-1],
         messages,
         image_processor,
         temperature,
         max_tokens,
     ):
         response += chunk
+        print(chunk)
         yield response
 
 
@@ -133,7 +137,7 @@ demo = gr.ChatInterface(
     ),
     additional_inputs=[
         gr.Slider(
-            minimum=0, maximum=1, step=0.1, value=0.9, label="Temperature", render=False
+            minimum=0, maximum=1, step=0.1, value=0.1, label="Temperature", render=False
         ),
         gr.Slider(
             minimum=128,
