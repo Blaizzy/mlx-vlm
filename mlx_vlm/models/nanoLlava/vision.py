@@ -202,13 +202,12 @@ class VisionEmbeddings(nn.Module):
         self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
-        self.position_ids = mx.array(np.arange(self.num_positions)[None, :])
 
     def __call__(self, x: mx.array) -> mx.array:
         batch_size = x.shape[0]
         patch_embeddings = self.patch_embedding(x)
         patch_embeddings = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
-
+        self.position_ids = mx.array(np.arange(self.num_positions)[None, :])
         embeddings = patch_embeddings
         embeddings += self.position_embedding(self.position_ids)
         return embeddings
