@@ -32,4 +32,10 @@ setup(
     install_requires=requirements,
     packages=find_packages(where=root_dir),
     python_requires=">=3.8",
+    entry_points={
+        "console_scripts": [
+            "mlx_vlm.convert = mlx_vlm.convert:main",
+            "mlx_vlm.generate = mlx_vlm.generate:main",
+        ]
+    },
 )
