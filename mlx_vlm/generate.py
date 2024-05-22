@@ -78,7 +78,7 @@ def main():
         )
 
     elif "tokenizer" in processor.__dict__.keys():
-        if processor.tokenizer.chat_template:
+        if model.config.model_type != "paligemma":
             prompt = processor.tokenizer.apply_chat_template(
                 [get_message_json(config["model_type"], prompt)],
                 tokenize=False,
