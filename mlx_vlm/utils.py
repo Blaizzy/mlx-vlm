@@ -669,6 +669,7 @@ def load_image(image_source):
 def prepare_inputs(image_processor, processor, image, prompt, image_token_index):
     from transformers.image_utils import load_image
 
+    mask = None
     if isinstance(image, str):
         image = load_image(image)
 
@@ -678,12 +679,12 @@ def prepare_inputs(image_processor, processor, image, prompt, image_token_index)
         input_ids = mx.array([text_chunks[0] + [image_token_index] + text_chunks[1]])
 
         pixel_values = image_processor.preprocess(images=[image])[0]
-        pixel_values = mx.array(np.expand_dims(pixel_values, axis=0))
     else:
         inputs = processor(prompt, image, return_tensors="np")
         pixel_values = mx.array(inputs["pixel_values"])
         input_ids = mx.array(inputs["input_ids"])
-    return input_ids, pixel_values
+        mask = mx.array(inputs["attention_mask"])
+    return input_ids, pixel_values, mask
 
 
 def sample(logits: mx.array, temp: float, top_p: float) -> Tuple[mx.array, float]:
@@ -704,6 +705,7 @@ def sample(logits: mx.array, temp: float, top_p: float) -> Tuple[mx.array, float
 def generate_step(
     model: nn.Module,
     prompt: mx.array,
+    mask: mx.array,
     cache=None,
     temp: float = 0.0,
     repetition_penalty: Optional[float] = None,
@@ -741,7 +743,7 @@ def generate_step(
         repetition_context = repetition_context[-repetition_context_size:]
 
     while True:
-        logits, cache = model(y[None], cache=cache)
+        logits, cache = model(y[None], mask=mask, cache=cache)
         logits = logits[:, -1, :]
 
         if repetition_penalty:
@@ -802,10 +804,10 @@ def generate(
         tokenizer = processor.tokenizer
 
     image_token_index = model.config.image_token_index
-    input_ids, pixel_values = prepare_inputs(
+    input_ids, pixel_values, mask = prepare_inputs(
         image_processor, processor, image, prompt, image_token_index
     )
-    logits, cache = model(input_ids, pixel_values)
+    logits, cache = model(input_ids, pixel_values, mask)
     logits = logits[:, -1, :]
     y, _ = sample(logits, temp, top_p)
 
@@ -819,6 +821,7 @@ def generate(
         generate_step(
             model.language_model,
             logits,
+            mask,
             cache,
             temp,
             repetition_penalty,
