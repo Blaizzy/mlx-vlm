@@ -175,6 +175,7 @@ class TestModels(unittest.TestCase):
         args = llava.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
+            model_type="llava",
             ignore_index=-100,
             image_token_index=32000,
             vocab_size=32000,
