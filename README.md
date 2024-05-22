@@ -33,7 +33,7 @@ from mlx_vlm import load, generate
 model_path = "mlx-community/llava-1.5-7b-4bit"
 model, processor = load(model_path)
 
-prompt = processor.apply_chat_template(
+prompt = processor.tokenizer.apply_chat_template(
     [{"role": "user", "content": f"<image>\nWhat are these?"}],
     tokenize=False,
     add_generation_prompt=True,
