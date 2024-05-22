@@ -162,7 +162,7 @@ class Encoder(nn.Module):
         for l in self.layers:
             x = l(x, mask=mask)
             if output_hidden_states:
-                encoder_states = encoder_states + (h,)
+                encoder_states = encoder_states + (x,)
 
             h = x[0]
 
