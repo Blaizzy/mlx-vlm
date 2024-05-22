@@ -18,6 +18,7 @@ from .vision import VisionConfig, VisionModel
 class ModelConfig:
     text_config: TextConfig
     vision_config: VisionConfig
+    model_type: str
     ignore_index: int = -100
     image_token_index: int = 32000
     vision_feature_select_strategy: str = "default"
@@ -130,7 +131,9 @@ class Model(nn.Module):
         # (1, num_image_patches*num_images + sequence_len, embed_dim)
         return mx.concatenate(final_embeddings, axis=1)
 
-    def __call__(self, input_ids: mx.array, pixel_values: mx.array, cache=None):
+    def __call__(
+        self, input_ids: mx.array, pixel_values: mx.array, mask: mx.array, cache=None
+    ):
         input_embddings = self.get_input_embeddings(input_ids, pixel_values)
         logits, cache = self.language_model(
             input_ids, cache=cache, inputs_embeds=input_embddings

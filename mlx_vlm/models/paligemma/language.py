@@ -1,6 +1,6 @@
 import inspect
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -156,7 +156,7 @@ class GemmaModel(nn.Module):
         else:
             h = inputs_embeds
 
-        if h.shape[1] > 1:
+        if cache is not None:
             mask = nn.MultiHeadAttention.create_additive_causal_mask(h.shape[1])
             mask = mask.astype(h.dtype)
 
@@ -188,7 +188,6 @@ class LanguageModel(nn.Module):
         return out, cache
 
     def sanitize(self, weights):
-
         return {
             k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
         }

@@ -177,7 +177,13 @@ class Model(nn.Module):
         # (1, num_image_patches*num_images + sequence_len, embed_dim)
         return mx.concatenate(final_embeddings, axis=1)
 
-    def __call__(self, input_ids: mx.array, pixel_values: mx.array, cache=None):
+    def __call__(
+        self,
+        input_ids: mx.array,
+        pixel_values: mx.array,
+        mask: Optional[mx.array] = None,
+        cache=None,
+    ):
         input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
         logits, cache = self.language_model(
             inputs=input_ids, cache=cache, inputs_embeds=input_embeddings
