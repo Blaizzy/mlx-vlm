@@ -101,57 +101,29 @@ class Attention(nn.Module):
         return self.out_proj(output)
 
 
-class MHA(nn.Module):
-    def __init__(
-        self,
-        dims: int,
-        num_heads: int,
-        bias: bool = True,
-    ):
-        super().__init__()
+class FastGELUActivation(nn.Module):
+    """
+    Applies GELU approximation that is slower than QuickGELU but more accurate. See: https://github.com/hendrycks/GELUs
+    """
 
-        if (dims % num_heads) != 0:
-            raise ValueError(
-                "The input feature dimensions should be divisible by the "
-                f"number of heads ({dims} % {num_heads}) != 0"
-            )
-
-        self.num_heads = num_heads
-        head_dim = dims // num_heads
-        self.scale = head_dim**-0.5
-
-        self.in_proj = nn.Linear(dims, dims * 3, bias=bias)
-        self.out_proj = nn.Linear(dims, dims, bias=bias)
-
-    def __call__(self, queries: mx.array, kv: mx.array, mask=None, cache=None):
-        B, L, D = queries.shape
-
-        qkv = self.in_proj(queries)
-        _, keys, values = mx.split(qkv, 3, axis=-1)
-
-        num_heads = self.num_heads
-        B, L, D = queries.shape
-        _, S, _ = keys.shape
-        queries = queries.reshape(B, L, num_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
-
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
+    def __call__(self, input: mx.array) -> mx.array:
+        return (
+            0.5
+            * input
+            * (1.0 + mx.tanh(np.sqrt(2 / np.pi) * (input + 0.044715 * (input**3))))
         )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.out_proj(output)
 
 
 class MLP(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
-        self.activation_fn = nn.GELU(approx="fast")
+        self.activation_fn = FastGELUActivation()
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=True)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=True)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = self.activation_fn(self.fc1(x))
+        x = self.fc1(x)
+        x = self.activation_fn(x)
         x = self.fc2(x)
         return x
 
@@ -168,18 +140,33 @@ class EncoderLayer(nn.Module):
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
 
     def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
-        y = self.layer_norm1(x)
-        y = self.self_attn(y, mask)
-        x = x + y
-        y = self.layer_norm2(x)
-        y = self.mlp(y)
-        return x + y
+        r = self.self_attn(self.layer_norm1(x), mask)
+        h = x + r
+        r = self.mlp(self.layer_norm2(h))
+        return h + r
 
 
 class Encoder(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.layers = [EncoderLayer(config) for _ in range(config.num_hidden_layers)]
+
+    def __call__(
+        self,
+        x: mx.array,
+        output_hidden_states: Optional[bool] = None,
+        mask: Optional[mx.array] = None,
+    ) -> mx.array:
+        encoder_states = (x,) if output_hidden_states else None
+        h = x
+        for l in self.layers:
+            x = l(x, mask=mask)
+            if output_hidden_states:
+                encoder_states = encoder_states + (h,)
+
+            h = x[0]
+
+        return (h, encoder_states)
 
 
 class VisionEmbeddings(nn.Module):
@@ -195,7 +182,6 @@ class VisionEmbeddings(nn.Module):
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
             stride=self.patch_size,
-            bias=True,
         )
 
         self.num_patches = (self.image_size // self.patch_size) ** 2
@@ -203,7 +189,6 @@ class VisionEmbeddings(nn.Module):
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        batch_size = x.shape[0]
         patch_embeddings = self.patch_embedding(x)
         patch_embeddings = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
         position_ids = mx.array(np.arange(self.num_positions)[None, :])
@@ -226,16 +211,13 @@ class SigLipVisionModel(nn.Module):
     ) -> mx.array:
         x = self.embeddings(x)
 
-        encoder_states = (x,) if output_hidden_states else None
+        encoder_outputs = self.encoder(
+            x=x, output_hidden_states=output_hidden_states, mask=None
+        )
 
-        for l in self.encoder.layers:
-            x = l(x, mask=None)
-            if output_hidden_states:
-                encoder_states = encoder_states + (x,)
+        pooler_output = self.post_layernorm(encoder_outputs[0])
 
-        pooler_output = self.post_layernorm(x[0])
-
-        return pooler_output, x, encoder_states
+        return pooler_output, x, encoder_outputs[-1]
 
 
 class VisionModel(nn.Module):
