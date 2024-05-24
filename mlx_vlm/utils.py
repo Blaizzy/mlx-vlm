@@ -674,11 +674,10 @@ def prepare_inputs(image_processor, processor, image, prompt, image_token_index)
         image = load_image(image)
 
     if image_processor is not None:
-
         text_chunks = [processor(chunk).input_ids for chunk in prompt.split("<image>")]
         input_ids = mx.array([text_chunks[0] + [image_token_index] + text_chunks[1]])
-
         pixel_values = image_processor.preprocess(images=[image])[0]
+        pixel_values = mx.array(np.expand_dims(pixel_values, axis=0))
     else:
         inputs = processor(prompt, image, return_tensors="np")
         pixel_values = mx.array(inputs["pixel_values"])
