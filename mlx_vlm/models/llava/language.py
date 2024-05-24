@@ -198,6 +198,7 @@ class LanguageModel(nn.Module):
         inputs: mx.array,
         cache=None,
         inputs_embeds=None,
+        mask: Optional[mx.array] = None,
     ):
         out, cache = self.model(inputs, cache, inputs_embeds)
         return self.lm_head(out), cache

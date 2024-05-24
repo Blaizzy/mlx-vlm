@@ -78,11 +78,12 @@ def main():
         )
 
     elif "tokenizer" in processor.__dict__.keys():
-        prompt = processor.tokenizer.apply_chat_template(
-            [get_message_json(config["model_type"], prompt)],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        if model.config.model_type != "paligemma":
+            prompt = processor.tokenizer.apply_chat_template(
+                [get_message_json(config["model_type"], prompt)],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
 
     else:
         ValueError(

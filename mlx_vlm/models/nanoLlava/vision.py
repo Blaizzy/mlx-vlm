@@ -4,6 +4,7 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 
 @dataclass
@@ -206,9 +207,9 @@ class VisionEmbeddings(nn.Module):
         batch_size = x.shape[0]
         patch_embeddings = self.patch_embedding(x)
         patch_embeddings = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
-
+        self.position_ids = mx.array(np.arange(self.num_positions)[None, :])
         embeddings = patch_embeddings
-        embeddings += self.position_embedding.weight
+        embeddings += self.position_embedding(self.position_ids)
         return embeddings
 
 
