@@ -55,10 +55,10 @@ def generate(
         tokenizer = processor.tokenizer
 
     image_token_index = model.config.image_token_index
-    input_ids, pixel_values = prepare_inputs(
+    input_ids, pixel_values, mask = prepare_inputs(
         image_processor, processor, image, prompt, image_token_index
     )
-    logits, cache = model(input_ids, pixel_values)
+    logits, cache = model(input_ids, pixel_values, mask=mask)
     logits = logits[:, -1, :]
     y, _ = sample(logits, temp, top_p)
 
@@ -71,6 +71,7 @@ def generate(
         generate_step(
             model.language_model,
             logits,
+            mask,
             cache,
             temp,
             repetition_penalty,
@@ -92,11 +93,12 @@ def generate(
 def chat(message, history, temperature, max_tokens):
 
     chat = []
-    if len(message["files"]) >= 0:
+    if len(message["files"]) >= 1:
         chat.append(get_message_json(config["model_type"], message["text"]))
     else:
-        raise Exception("Please upload an image. Text only chat is not supported.")
+        raise gr.Error("Please upload an image. Text only chat is not supported.")
 
+    files = message["files"][-1]
     if "chat_template" in processor.__dict__.keys():
         messages = processor.apply_chat_template(
             chat,
@@ -105,7 +107,7 @@ def chat(message, history, temperature, max_tokens):
         )
 
     elif "tokenizer" in processor.__dict__.keys():
-        if processor.tokenizer.chat_template:
+        if model.config.model_type != "paligemma":
             messages = processor.tokenizer.apply_chat_template(
                 chat,
                 tokenize=False,
@@ -118,7 +120,7 @@ def chat(message, history, temperature, max_tokens):
     for chunk in generate(
         model,
         processor,
-        message["files"][-1],
+        files,
         messages,
         image_processor,
         temperature,
