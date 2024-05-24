@@ -152,9 +152,11 @@ class GemmaModel(nn.Module):
         # for passing merged input embeddings
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
-            h = h * (self.args.hidden_size**0.5)
+
         else:
             h = inputs_embeds
+
+        h = h * (self.args.hidden_size**0.5)
 
         if cache is not None:
             mask = nn.MultiHeadAttention.create_additive_causal_mask(h.shape[1])
