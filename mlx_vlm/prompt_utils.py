@@ -16,6 +16,8 @@ def get_message_json(model_name, prompt):
         }
     elif model_name in ["llava-qwen2", "llava"]:
         message = {"role": "user", "content": f"<image>\n{prompt}"}
+    elif model_name == "paligemma":
+        message = prompt
     else:
         raise ValueError(f"Unsupported model: {model_name}")
 

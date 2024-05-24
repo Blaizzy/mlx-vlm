@@ -157,9 +157,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config = AutoConfig.from_pretrained(model_path).to_dict()
 
     model_config = model_class.ModelConfig.from_dict(config)
+
     model_config.vision_config = model_class.VisionConfig.from_dict(
         config["vision_config"]
     )
+
     model_config.text_config = model_class.TextConfig.from_dict(config["text_config"])
 
     if hasattr(model_config, "perceiver_config"):
@@ -478,13 +480,56 @@ def quantize_model(
     """
     quantized_config = copy.deepcopy(config)
     vision_intermediate_size = model.config.vision_config.intermediate_size
-    class_predicate = lambda path, m: isinstance(m, nn.Linear) and (
-        path.split(".")[0] not in ["vision_model", "vision_tower"]
-        if any(vision_intermediate_size % size != 0 for size in [64, 128])
-        else not isinstance(m, nn.Embedding)
+    divisor = 64
+    if any(vision_intermediate_size % size != 0 for size in [64, 128]):
+        for name, module in model.named_modules():
+            if (
+                isinstance(module, nn.Linear)
+                or isinstance(module, nn.Embedding)
+                and ("vision_model" in name or "vision_tower" in name)
+            ):
+                out_features, in_features = module.weight.shape
+
+                # Calculate the padding needed for each dimension
+                new_out_features = (
+                    ((out_features // divisor) + 1) * divisor
+                    if out_features % divisor != 0
+                    else out_features
+                )
+                new_in_features = (
+                    ((in_features // divisor) + 1) * divisor
+                    if in_features % divisor != 0
+                    else in_features
+                )
+                if (
+                    out_features == vision_intermediate_size
+                    or in_features == vision_intermediate_size
+                ):
+
+                    # If padding is needed, proceed
+                    if (
+                        new_out_features != out_features
+                        or new_in_features != in_features
+                    ):
+                        # Create new weight and bias tensors
+                        new_weight = mx.zeros((new_out_features, new_in_features))
+                        new_bias = mx.zeros((new_out_features))
+
+                        # Copy existing weights and biases to the new tensors
+                        new_weight[:out_features, :in_features] = module.weight
+                        module.weight = new_weight
+
+                        if hasattr(module, "bias"):
+                            new_bias[:out_features] = module.bias
+                            module.bias = new_bias
+
+    quantized_config["vision_config"]["intermediate_size"] = (
+        ((vision_intermediate_size // divisor) + 1) * divisor
+        if vision_intermediate_size % divisor != 0
+        else vision_intermediate_size
     )
 
-    nn.quantize(model, q_group_size, q_bits, class_predicate=class_predicate)
+    nn.quantize(model, q_group_size, q_bits)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
     quantized_weights = dict(tree_flatten(model.parameters()))
 
@@ -621,22 +666,25 @@ def load_image(image_source):
         )
 
 
-def prepare_inputs(image_processor, processor, image, prompt):
+def prepare_inputs(image_processor, processor, image, prompt, image_token_index):
     from transformers.image_utils import load_image
 
+    mask = None
     if isinstance(image, str):
         image = load_image(image)
 
     if image_processor is not None:
+
         text_chunks = [processor(chunk).input_ids for chunk in prompt.split("<image>")]
-        input_ids = mx.array([text_chunks[0] + [-200] + text_chunks[1]])
+        input_ids = mx.array([text_chunks[0] + [image_token_index] + text_chunks[1]])
+
         pixel_values = image_processor.preprocess(images=[image])[0]
-        pixel_values = mx.array(np.expand_dims(pixel_values, axis=0))
     else:
         inputs = processor(prompt, image, return_tensors="np")
         pixel_values = mx.array(inputs["pixel_values"])
         input_ids = mx.array(inputs["input_ids"])
-    return input_ids, pixel_values
+        mask = mx.array(inputs["attention_mask"])
+    return input_ids, pixel_values, mask
 
 
 def sample(logits: mx.array, temp: float, top_p: float) -> Tuple[mx.array, float]:
@@ -657,6 +705,7 @@ def sample(logits: mx.array, temp: float, top_p: float) -> Tuple[mx.array, float
 def generate_step(
     model: nn.Module,
     prompt: mx.array,
+    mask: mx.array,
     cache=None,
     temp: float = 0.0,
     repetition_penalty: Optional[float] = None,
@@ -694,7 +743,7 @@ def generate_step(
         repetition_context = repetition_context[-repetition_context_size:]
 
     while True:
-        logits, cache = model(y[None], cache=cache)
+        logits, cache = model(y[None], mask=mask, cache=cache)
         logits = logits[:, -1, :]
 
         if repetition_penalty:
@@ -754,8 +803,11 @@ def generate(
         prompt_tokens = mx.array(processor.tokenizer.encode(prompt))
         tokenizer = processor.tokenizer
 
-    input_ids, pixel_values = prepare_inputs(image_processor, processor, image, prompt)
-    logits, cache = model(input_ids, pixel_values)
+    image_token_index = model.config.image_token_index
+    input_ids, pixel_values, mask = prepare_inputs(
+        image_processor, processor, image, prompt, image_token_index
+    )
+    logits, cache = model(input_ids, pixel_values, mask)
     logits = logits[:, -1, :]
     y, _ = sample(logits, temp, top_p)
 
@@ -769,6 +821,7 @@ def generate(
         generate_step(
             model.language_model,
             logits,
+            mask,
             cache,
             temp,
             repetition_penalty,
