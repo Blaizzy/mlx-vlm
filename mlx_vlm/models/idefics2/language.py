@@ -17,7 +17,7 @@ class TextConfig:
     rms_norm_eps: float
     vocab_size: int
     num_key_value_heads: int
-    rope_theta: float = 10000.0
+    rope_theta: float = 1000000.0
     rope_traditional: bool = False
     tie_word_embeddings: bool = False
 
