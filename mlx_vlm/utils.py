@@ -1,3 +1,23 @@
+"""
+
+Module Document: `utils`
+
+This module provides a wide array of functionalities to support models from MLX (Model Library eXchange). Its primary focus is on downloading models from the Hugging Face Hub, loading and processing models, handling tokenization, and assisting with input generation, quantization, dequantization, and serialization of models.
+
+Key components of the module include:
+
+- Functionality to fetch model configurations and load models along with their weights.
+- Support for image processors to handle different image input types and preprocessing before model inference.
+- Utilities for handling tokenizers, including loading and wrapping existing tokenizer implementations.
+- Functions to assist with model quantization and dequantization for efficient storage and computation.
+- Functions to prepare inputs for models, which handle the construction of appropriate inputs from text prompts and images.
+- Sampling utility functions to aid with temperature-controlled and top-p sampling from model output distributions.
+- Helper functions to manage model serialization, including the creation of weight shards to manage large models within filesystem limitations.
+- Utility functions to upload serialized models to the Hugging Face Hub.
+
+The module ensures that the models from MLX are easily accessible, customizable, and efficient for use in different environments. Its design provides a seamless bridge between MLX's model capabilities and the extensive resources available through the Hugging Face Hub, enabling developers and data scientists to incorporate advanced ML models into their applications with ease.
+"""
+
 import copy
 import glob
 import importlib
@@ -45,13 +65,27 @@ linear_class_predicate = (
 
 def get_model_and_args(config: dict):
     """
-    Retrieve the model object based on the configuration.
+    Generates and returns a message structure for a given model and prompt.
+    This function takes a model name and a prompt, then constructs a message object in the appropriate
+    format expected by the model. The output is a json-compatible dictionary that contains keys like
+    'role' and 'content', which in turn may contain keys like 'type' and 'text'. The format of the message
+    depends on the model's specific requirements.
 
     Args:
-        config (dict): The model configuration.
+        model_name (str):
+             The name of the model for which the message is being generated.
+        prompt (str):
+             The input or instruction for the model to process.
 
     Returns:
-        A tuple containing the Model class and the ModelArgs class.
+        (dict):
+             A structured message in the form of a dictionary compatible with the model's API.
+
+    Raises:
+        ValueError:
+             If the 'model_name' is not supported, a ValueError is raised with an appropriate
+            error message detailing the unsupported model.
+
     """
     model_type = config["model_type"]
     model_type = MODEL_REMAPPING.get(model_type, model_type)
@@ -67,15 +101,26 @@ def get_model_and_args(config: dict):
 
 def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
     """
-    Ensures the model is available locally. If the path does not exist locally,
-    it is downloaded from the Hugging Face Hub.
+    Gets the path to a machine learning model, either from a local path or from a HuggingFace repository.
+    This function helps in locating and optionally downloading the model specified by path_or_hf_repo and
+    its associated files. If the given path exists locally, it is simply returned. If the path does not exist,
+    an attempt is made to download the model from the HuggingFace Hub based on the repository identifier.
+    The function allows specific patterns of files to be downloaded and supports the resume of downloads.
 
     Args:
-        path_or_hf_repo (str): The local path or Hugging Face repository ID of the model.
-        revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
+        path_or_hf_repo (str):
+             A string representing a local filesystem path or a HuggingFace repository identifier.
+        revision (Optional[str], optional):
+              The specific model revision to download. Defaults to None.
 
     Returns:
-        Path: The path to the model.
+        (Path):
+             A pathlib.Path object representing the path to the downloaded or local model.
+
+    Raises:
+        OSError:
+             If the model files cannot be located or downloaded from the specified path or repository.
+
     """
     model_path = Path(path_or_hf_repo)
     if not model_path.exists():
@@ -99,20 +144,29 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
 
 def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
     """
-    Load and initialize the model from a given path.
+    Loads a model from a specified path containing model configurations and weights.
+    This function first calls `load_config` to load the model configuration from a JSON file. It then looks for safetensor files (weights) in the model's directory. If no weights are found, it raises a `FileNotFoundError` with a detailed error message instructing how to generate safetensors from a Hugging Face model.
+    The function retrieves the model and its arguments based on the configuration file, catering specifically to different model types by adjusting the configurations accordingly. It instantiates the model using the configuration class provided by `model_class.ModelConfig` and loads the weights.
+    If the model's configuration specifies quantization settings, the function quantizes the model before it is fully loaded.
+    The function also ensures that the subset of the model's parameters designated as 'sanitized' is properly formatted before loading. After loading the weights, it sets the model to evaluation mode.
+    In cases where the `lazy` argument is `False`, the function also initialises the model parameters for evaluation.
 
     Args:
-        model_path (Path): The path to load the model from.
-        lazy (bool): If False eval the model parameters to make sure they are
-            loaded in memory before returning, otherwise they will be loaded
-            when needed. Default: ``False``
+        model_path (Path):
+             A pathlib `Path` object pointing to the directory where the model configuration and safetensors (weights) are stored.
+        lazy (bool, optional):
+             If set to `True`, the model parameters will not be initialised for evaluation. Defaults to `False`.
 
     Returns:
-        nn.Module: The loaded and initialized model.
+        (nn.Module):
+             The fully loaded and instantiated model ready for evaluation.
 
     Raises:
-        FileNotFoundError: If the weight files (.safetensors) are not found.
-        ValueError: If the model class or args class are not found or cannot be instantiated.
+        FileNotFoundError:
+             If no safetensors are found in the provided `model_path` or if configuration files are missing.
+        ValueError:
+             If the configuration includes settings for an unsupported model type.
+
     """
 
     config = load_config(model_path)
@@ -210,23 +264,38 @@ def load(
     lazy: bool = False,
 ) -> Tuple[nn.Module, Union[PreTrainedTokenizer, PreTrainedTokenizerFast]]:
     """
-    Load the model and tokenizer from a given path or a huggingface repository.
+    Loads a model and processor given a file path or Hugging Face repository name.
+    This function is designed to simplify the process of loading a model and its associated
+    processor using either a local file path or the name of a model repository from Hugging Face.
+    It leverages an internal get_model_path function to retrieve the model path and then calls
+    the load_model and load_processor functions to load the model and processor respectively.
 
     Args:
-        path_or_hf_repo (Path): The path or the huggingface repository to load the model from.
-        tokenizer_config (dict, optional): Configuration parameters specifically for the tokenizer.
+        path_or_hf_repo (str):
+             A string representing either the local file path to the model
+            directory or the exact name of the Hugging Face model repository.
+        processor_config (dict, optional):
+             A dictionary of configuration options for the processor.
             Defaults to an empty dictionary.
-        adapter_path (str, optional): Path to the LoRA adapters. If provided, applies LoRA layers
-            to the model. Default: ``None``.
-        lazy (bool): If False eval the model parameters to make sure they are
-            loaded in memory before returning, otherwise they will be loaded
-            when needed. Default: ``False``
+        lazy (bool, optional):
+             A flag to determine whether or not to lazily initialize the model.
+            If True, the model is initialized but not fully loaded until necessary. This can be
+            beneficial when loading large models to save memory. Defaults to False.
+
     Returns:
-        Tuple[nn.Module, TokenizerWrapper]: A tuple containing the loaded model and tokenizer.
+        (Tuple[nn.Module, Union[PreTrainedTokenizer, PreTrainedTokenizerFast]]):
+             A tuple containing
+            the loaded model and processor. The model is an instance of nn.Module, and the processor
+            is either an instance of PreTrainedTokenizer or PreTrainedTokenizerFast depending on the
+            model that was loaded.
 
     Raises:
-        FileNotFoundError: If config file or safetensors are not found.
-        ValueError: If model class or args class are not found.
+        FileNotFoundError:
+             If the model or processor files cannot be found at the specified path or
+            repository name.
+        ValueError:
+             If an unsupported model type is encountered during the loading process.
+
     """
     model_path = get_model_path(path_or_hf_repo)
 
@@ -237,7 +306,27 @@ def load(
 
 
 def load_config(model_path: Union[str, Path]) -> dict:
+    """
+    Loads a configuration file from a given model path.
 
+    Args:
+        model_path (Union[str, Path]):
+             A string or Path object representing the
+            path to the model directory. If a string is provided, it will be
+            converted to a Path object and validated.
+
+    Returns:
+        (dict):
+             A dictionary containing configuration parameters.
+
+    Raises:
+        FileNotFoundError:
+             If the 'config.json' file is not found in the specified
+            model path directory.
+        TypeError:
+             If `model_path` input is neither a string nor a Path object.
+
+    """
     if isinstance(model_path, str):
         model_path = get_model_path(model_path)
 
@@ -251,6 +340,34 @@ def load_config(model_path: Union[str, Path]) -> dict:
 
 
 def load_image_processor(model_path: Union[str, Path]) -> BaseImageProcessor:
+    """
+    Loads an image processor for a given model path.
+    The function accepts a model path as either a string or a Path object. It attempts to resolve
+    the model path and load the associated configuration file. It then retrieves the model class
+    based on the model type specified in the configuration and checks if the model class has an
+    attribute 'ImageProcessor'. If so, it initializes and returns an instance of the ImageProcessor
+    class associated with the model. If the model path does not exist or the model class does not
+    have an ImageProcessor attribute, the function returns None.
+
+    Args:
+        model_path (Union[str, Path]):
+             The file path or Hugging Face repository name where the model
+            and associated files are located.
+
+    Returns:
+        (BaseImageProcessor):
+             An instance of the ImageProcessor class if available, otherwise None.
+
+    Raises:
+        FileNotFoundError:
+             If the config.json file cannot be found within the resolved model path.
+        ValueError:
+             If the specified model type is not supported (not present in MODEL_REMAPPING or
+            the mlx_vlm.models package).
+        ImportError:
+             If the module containing the model architecture cannot be imported.
+
+    """
     if isinstance(model_path, str):
         model_path = get_model_path(model_path)
 
@@ -267,6 +384,24 @@ def load_image_processor(model_path: Union[str, Path]) -> BaseImageProcessor:
 def load_processor(
     model_path, processor_config={"trust_remote_code": True}
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+    """
+    Loads a processor for a specific model, given a model path and an optional processor configuration.
+    This function initializes an `AutoProcessor` from a pretrained model, which may include both a tokenizer and a feature extractor, depending on the model. Additionally, it identifies an appropriate detokenizer class to instantiate a detokenizer compatible with the loaded tokenizer. The function attaches this detokenizer instance to the processor object before returning it.
+
+    Args:
+        model_path (str | os.PathLike):
+             The path to the directory where the pretrained model is saved.
+        processor_config (dict, optional):
+             Additional configuration parameters for initializing the processor. Defaults to {'trust_remote_code': True}.
+
+    Returns:
+        (Union[PreTrainedTokenizer, PreTrainedTokenizerFast]):
+             An instance of a processor class that includes both the tokenizer and detokenizer components.
+
+    Raises:
+        Any exceptions raised during the instantiation of `AutoProcessor` or related components are propagated without modification.
+
+    """
     processor = AutoProcessor.from_pretrained(model_path, **processor_config)
     detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
     if "tokenizer" in processor.__dict__.keys():
@@ -279,6 +414,31 @@ def load_processor(
 def fetch_from_hub(
     model_path: Path, lazy: bool = False
 ) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
+    """
+    Fetches a model, its configuration, and processor from the hub based on a specified path.
+    This function retrieves a model, its configuration dictionary, and tokenizer/processor from a remote source or
+    local cache. It's meant to be used when working with models hosted on HuggingFace's model hub or similar platforms.
+
+    Args:
+        model_path (Path):
+             The path to the model directory or the identifier of the hosted model repository.
+        lazy (bool, optional):
+             A flag that indicates whether to load the model weights immediately or do it
+            in a lazy manner (i.e., weights are loaded when needed). Defaults to False.
+
+    Returns:
+        (Tuple[nn.Module, dict, PreTrainedTokenizer]):
+             A tuple containing the loaded model (as an instance of nn.Module),
+            the configuration dictionary, and the pretrained tokenizer/processor.
+
+    Raises:
+        FileNotFoundError:
+             If any expected files, such as the configuration file or model weights, are not found in
+            the provided model_path.
+        ValueError:
+             If the model type specified in the configuration is not supported.
+
+    """
     model = load_model(model_path, lazy)
     config = load_config(model_path)
     processor = load_processor(model_path)
@@ -288,14 +448,22 @@ def fetch_from_hub(
 
 def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list:
     """
-    Splits the weights into smaller shards.
+    Generates a list of shards from a dictionary of weights, where each shard is a sub-dictionary of weights that does not exceed a specified maximum file size in gigabytes.
 
     Args:
-        weights (dict): Model weights.
-        max_file_size_gb (int): Maximum size of each shard in gigabytes.
+        weights (dict):
+             A dictionary with keys representing weight names and values as numerical objects that have the attribute `nbytes`.
+        max_file_size_gb (int, optional):
+             The maximum file size for each shard in gigabytes. Default value is defined by the constant `MAX_FILE_FILE_SIZE_GB`.
 
     Returns:
-        list: List of weight shards.
+        (list):
+             A list of shard dictionaries. Each shard is a sub-dictionary of weights where the total size in bytes does not exceed the `max_file_size_bytes` derived from the `max_file_size_gb`.
+
+    Raises:
+        ValueError:
+             If a single weight size in bytes is larger than max_file_size_bytes, making it impossible to create a valid shard.
+
     """
     max_file_size_bytes = max_file_size_gb << 30
     shards = []
@@ -312,12 +480,23 @@ def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list
 
 def upload_to_hub(path: str, upload_repo: str, hf_path: str):
     """
-    Uploads the model to Hugging Face hub.
+    Uploads a local directory to the Hugging Face Model Hub under a specified repository name.
 
     Args:
-        path (str): Local path to the model.
-        upload_repo (str): Name of the HF repo to upload to.
-        hf_path (str): Path to the original Hugging Face model.
+        path (str):
+             The local directory path which contains the files to be uploaded.
+        upload_repo (str):
+             The name of the repository on the Hugging Face Model Hub where the files will be uploaded.
+        hf_path (str):
+             The path to the original model card on the Hugging Face Model Hub, used to reference in the newly uploaded README.
+
+    Raises:
+        Exception:
+             If any issue occurs during the creation of the repository, the upload of files, or saving of the model card.
+
+    Note:
+        This function assumes that the user is already logged into the Hugging Face Hub using their api key. If not, the function will fail and prompt the user to log in.
+
     """
     import os
 
@@ -359,15 +538,29 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
 
 def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
     """
-    Ensures the model is available locally. If the path does not exist locally,
-    it is downloaded from the Hugging Face Hub.
+    Fetches the path to a model, downloading it if necessary.
+    Retrieves the path to a model specified by either a local file path or a Hugging Face repository.
+    If the model does not exist locally at the given path, it will attempt to download it from the provided Hugging Face repository.
+    Only files matching certain patterns (such as '*.json', '*.safetensors', '*.py', 'tokenizer.model', '*.tiktoken', '*.txt')
+    will be downloaded.
+    If a specific revision of the model is required, it can be specified with the 'revision' parameter.
+    If 'revision' is not provided, the default branch of the repository will be used.
+    The function will return the path to the local model directory.
 
-    Args:
-        path_or_hf_repo (str): The local path or Hugging Face repository ID of the model.
-        revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
+    Parameters:
+        path_or_hf_repo (str):
+             A string representing either the local file path or the Hugging Face repository ID of the model.
+        revision (Optional[str], optional):
+             The specific revision of the model to use. Defaults to None, which will use the default branch.
 
     Returns:
-        Path: The path to the model.
+        (Path):
+             A Path object representing the local path to the model.
+
+    Raises:
+        ModelDownloadError:
+             An exception indicating that the download failed or the model could not be found at the specified location.
+
     """
     model_path = Path(path_or_hf_repo)
     if not model_path.exists():
@@ -390,17 +583,30 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
 
 def apply_repetition_penalty(logits: mx.array, generated_tokens: Any, penalty: float):
     """
-    Apply repetition penalty to specific logits based on the given context.
-
-    Paper: https://arxiv.org/abs/1909.05858
+    Applies a repetition penalty to logits based on previously generated tokens.
 
     Args:
-        logits (mx.array): The logits produced by the language model.
-        generated_tokens (any): A list of N previous tokens.
-        penalty (float): The repetition penalty factor to be applied.
+        logits (mx.array):
+             The logits array of shape (batch_size, vocabulary_size). Logits represent
+            the unnormalized prediction scores for each vocabulary item.
+        generated_tokens (Any):
+             The sequence of generated tokens. This should be convertible
+            to an array format that MXNet operations can handle. The specific type or collection
+            is not prescribed to allow for flexibility in handling different token representations.
+        penalty (float):
+             The penalty factor to apply to the logits of previously generated tokens.
+            Values greater than 1.0 decrease the likelihood of previous tokens being selected again,
+            while values less than 1.0 increase their likelihood.
 
     Returns:
-        logits (mx.array): Logits with repetition penalty applied to generated tokens.
+        (mx.array):
+             The updated logits array with penalties applied to the scores of previously
+            generated tokens.
+
+    Raises:
+        TypeError:
+             If the `generated_tokens` cannot be converted to a format suitable for MXNet operations.
+
     """
     if len(generated_tokens) > 0:
         indices = mx.array([token for token in generated_tokens])
@@ -418,7 +624,30 @@ def save_weights(
     *,
     donate_weights: bool = False,
 ) -> None:
-    """Save model weights into specified directory."""
+    """
+    Saves the provided weights to a specified path in `safetensors` format, with consideration for file size restrictions and optional weight donation behavior.
+    This function saves the given weights as multiple files if their combined size exceeds the maximum file size for a single file.
+    It organizes these files into shards, where each shard is a group of weights that does not surpass the maximum allowed file size.
+    The weights are saved in a directory specified by `save_path`, and the directory is created if it doesn't exist.
+    If `donate_weights` is set to True, the original weights dictionary is cleared and its memory is deallocated after saving.
+
+    Args:
+        save_path (Union[str, Path]):
+             The path (as a string or `pathlib.Path`) to the directory where the weight files are saved.
+        weights (Dict[str, Any]):
+             A dictionary where keys are weight names and values are the weight values.
+        donate_weights (bool, optional):
+             If set to True, the original weights dictionary is cleared and its memory is deallocated. Defaults to False.
+
+    Raises:
+        FileNotFoundError:
+             If `save_path` is not found and cannot be created.
+
+    Returns:
+        (None):
+             The function does not return any values and operates solely via side effects, such as writing files to disk.
+
+    """
     if isinstance(save_path, str):
         save_path = Path(save_path)
     save_path.mkdir(parents=True, exist_ok=True)
@@ -468,16 +697,31 @@ def quantize_model(
     model: nn.Module, config: dict, q_group_size: int, q_bits: int
 ) -> Tuple:
     """
-    Applies quantization to the model weights.
+    Quantizes the given neural network model according to the specified configuration, group size, and bit precision.
+    The function modifies the intermediate layers of a vision model if their dimensions are not divisible by a
+    particular divisor (default 64). It pads the dimensions to make them divisible, ensuring the proper functionality
+    of grouped quantization. After adjusting the dimensions, it quantizes the model's weights using the specified
+    number of bits and group size, which are aspects of the quantization process that affect the model's
+    precision and performance.
 
     Args:
-        model (nn.Module): The model to be quantized.
-        config (dict): Model configuration.
-        q_group_size (int): Group size for quantization.
-        q_bits (int): Bits per weight for quantization.
+        model (nn.Module):
+             The neural network model to be quantized.
+        config (dict):
+             A dictionary containing the model's configuration parameters.
+        q_group_size (int):
+             The size of the weight groups to be used in quantization.
+        q_bits (int):
+             The number of bits to use for quantizing the weights.
 
     Returns:
-        Tuple: Tuple containing quantized weights and config.
+        (Tuple):
+             A tuple containing the quantized weights of the model and the new quantized configuration.
+
+    Raises:
+        ValueError:
+             If the input configuration or model is inappropriate for the quantization process.
+
     """
     quantized_config = copy.deepcopy(config)
     vision_intermediate_size = model.config.vision_config.intermediate_size
@@ -541,13 +785,22 @@ def save_config(
     config: dict,
     config_path: Union[str, Path],
 ) -> None:
-    """Save the model configuration to the ``config_path``.
-
-    The final configuration will be sorted before saving for better readability.
+    """
+    Saves a configuration dictionary to a specified file after removing a specific key and sorting the dictionary.
 
     Args:
-        config (dict): The model configuration.
-        config_path (Union[str, Path]): Model configuration file path.
+        config (dict):
+             Configuration dictionary that needs to be saved. The function
+            removes the key '_name_or_path' from it if present before saving.
+        config_path (Union[str, Path]):
+             The file path where the configuration should
+            be saved. This can be a string or a Path object.
+
+    Raises:
+        IOError:
+             If there is an issue opening or writing to the file specified by
+            config_path, an IOError is raised.
+
     """
     # Clean unused keys
     config.pop("_name_or_path", None)
@@ -562,13 +815,20 @@ def save_config(
 
 def dequantize_model(model: nn.Module) -> nn.Module:
     """
-    Dequantize the quantized linear layers in the model.
+    Dequantizes a given neural network model by converting any quantized linear layers to standard linear layers with floating-point precision.
 
     Args:
-        model (nn.Module): The model with quantized linear layers.
+        model (nn.Module):
+             The neural network model containing the layers to be dequantized.
 
     Returns:
-        nn.Module: The model with dequantized layers.
+        (nn.Module):
+             The dequantized neural network model with standard linear layers.
+
+    Raises:
+        ValueError:
+             If the dequantization process encounters unsupported layer configurations or data types.
+
     """
     de_quantize_layers = []
     for name, module in model.named_modules():
@@ -604,6 +864,38 @@ def convert(
     revision: Optional[str] = None,
     dequantize: bool = False,
 ):
+    """
+    Converts a model from Hugging Face's hub to MLX format with optional quantization or dequantization, saves the converted model locally or uploads it to the Hugging Face hub.
+
+    Args:
+        hf_path (str):
+             The Hugging Face repository identifier or local path of the original model.
+        mlx_path (str):
+             The local path where the converted MLX model will be saved. Defaults to 'mlx_model'.
+        quantize (bool):
+             Whether to quantize the model weights. Defaults to False.
+        q_group_size (int):
+             Group size used in quantization. Defaults to 64.
+        q_bits (int):
+             Number of bits used in quantization. Defaults to 4.
+        dtype (str):
+             Type to cast the model parameters before saving. Defaults to 'float16'.
+        upload_repo (str):
+             Hugging Face repository name where the converted model will be uploaded. If None, the model will not be uploaded. Defaults to None.
+        revision (Optional[str]):
+             The specific model revision to convert. Defaults to None.
+        dequantize (bool):
+             Whether to dequantize the model weights. Defaults to False.
+
+    Raises:
+        ValueError:
+             If both quantize and dequantize arguments are True.
+
+    Returns:
+        (None):
+             The function does not return any value.
+
+    """
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
     model, config, tokenizer = fetch_from_hub(model_path, lazy=False)
@@ -645,7 +937,26 @@ def convert(
 
 def load_image(image_source: Union[str, Path, BytesIO]):
     """
-    Helper function to load an image from either a URL or file.
+    Loads an image from a given source which can be a URL, a file path, or a BytesIO stream.
+
+    Args:
+        image_source (Union[str, Path, BytesIO]):
+             The source of the image to load. This can be a URL (str),
+            a file system path (str or Path), or an in-memory BytesIO stream.
+
+    Returns:
+        (PIL.Image.Image):
+             The loaded image as a PIL image object.
+
+    Raises:
+        ValueError:
+             If the image_source is not a valid URL, file path, or BytesIO stream;
+            if the image cannot be loaded from the provided BytesIO stream;
+            if the image cannot be fetched from the provided URL due to either network
+            issues or the server's response;
+            if the image cannot be opened from the given file path due to the file not
+            existing or being unreadable.
+
     """
     if isinstance(image_source, BytesIO):
         # for base64 encoded images
@@ -674,6 +985,45 @@ def load_image(image_source: Union[str, Path, BytesIO]):
 
 
 def prepare_inputs(image_processor, processor, image, prompt, image_token_index):
+    """
+    Prepares the inputs required for image and text processing for a given image and prompt.
+    This function supports loading and processing an image, splitting a prompt with specialized
+    placeholders into chunks, and preparing image and text tensors for input to a model.
+    If an `image_processor` is provided, it gets used to preprocess the image. Otherwise, processing
+    is done using the `processor`. The image is loaded either from a provided URL or from the local
+    filesystem. Attention masks are also generated if necessary.
+
+    Args:
+        image_processor (BaseImageProcessor):
+             An instance of an image processor to preprocess
+            the image.
+        processor (transformers.PreTrainedTokenizer):
+             An instance of a tokenizer to process the
+            textual input.
+        image (Image.Image or str):
+             The image to be processed or a URL/path pointing to the image.
+        prompt (str):
+             The text prompt which may include placeholders for the image.
+        image_token_index (int):
+             The index of the image token in the tokenizer's vocabulary.
+
+    Returns:
+        (Tuple[ndarray, ndarray, Optional[ndarray]]):
+             A tuple containing the input_ids, pixel_values,
+            and an optional attention_mask. If `image_processor` is not provided, attention_mask will
+            not be returned.
+
+    Raises:
+        ValueError:
+             If the provided `image` argument is a string that neither corresponds to a URL
+            nor a file path, or if it fails to load as an Image object.
+        Imports:
+            from mxnet import ndarray as mx
+            from transformers.image_utils import load_image
+            import numpy as np
+            import io
+
+    """
     from transformers.image_utils import load_image
 
     mask = None
@@ -694,6 +1044,37 @@ def prepare_inputs(image_processor, processor, image, prompt, image_token_index)
 
 
 def sample(logits: mx.array, temp: float, top_p: float) -> Tuple[mx.array, float]:
+    """
+    Generates a single token sample from the provided logits using specified sampling techniques.
+
+    Args:
+        logits (mx.array):
+             The array of logits from which to sample.
+        temp (float):
+             The temperature to use for scaling the logits before sampling.
+            A temperature closer to 0 makes the model more deterministic, with 0 acting as a greedy
+            selection from the highest logit. Higher temperatures result in more diversity.
+        top_p (float):
+             The nucleus sampling probability threshold. If set between 0 and 1,
+            it performs top-p (nucleus) sampling, which selects the smallest set of tokens whose
+            cumulative probability exceeds the threshold of top_p. If set to a value outside this range,
+            top-p sampling is not applied.
+
+    Returns:
+        (Tuple[mx.array, float]):
+             A tuple where the first element is the sampled token as an mx.array
+            and the second element is the corresponding probability of the selected token.
+
+    Raises:
+        ValueError:
+             If 'top_p' is in the range (0, 1) but 'top_p_sampling' is defined to return
+            an unsupported type or if any other precondition for 'top_p_sampling' is violated.
+
+    Note:
+        The returned probability corresponds to the softmax probability of the chosen token
+        after applying the temperature scaling.
+
+    """
     softmax_logits = mx.softmax(logits)
 
     if temp == 0:
@@ -719,19 +1100,35 @@ def generate_step(
     top_p: float = 1.0,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
-    A generator producing text based on the given prompt from the model.
+    Generates a single step for a language generation model given a prompt and various generation parameters.
+    This function is a generator that yields a tuple containing the generated token and its associated probability. It allows for incorporating custom stopping criteria or other logic in the generation process managed by the caller.
 
     Args:
-        prompt (mx.array): The input prompt.
-        model (nn.Module): The model to use for generation.
-        temp (float): The temperature for sampling, if 0 the argmax is used.
-        repetition_penalty (float, optional): The penalty factor for repeating tokens.
-        repetition_context_size (int, optional): The number of tokens to consider for repetition penalty (default 20).
-        top_p (float, optional): Nulceus sampling, higher means model considers more less likely words
+        model (nn.Module):
+             The language generation model to use for generating the next token.
+        prompt (mx.array):
+             The input prompt tokens as an MXNet array to the model.
+        mask (mx.array):
+             The mask array that indicates which tokens are part of the prompt and which are generated.
+        cache (Optional, default=None):
+             A cache that stores information from previous steps, which can speed up subsequent token generation.
+        temp (float, default=0.0):
+             The temperature to use for sampling. A lower temperature tends to produce more deterministic output.
+        repetition_penalty (Optional[float], default=None):
+             The penalty to apply to tokens that already appeared in the context. A higher penalty discourages repetition.
+        repetition_context_size (Optional[int], default=20):
+             The number of previously generated tokens to consider when applying the repetition penalty.
+        top_p (float, default=1.0):
+             The nucleous sampling parameter that controls the size of the probability distribution from which to sample. Lower values lead to more focused generation.
 
     Yields:
-        Generator[Tuple[mx.array, mx.array]]: A generator producing
-        one token and probability per call.
+        Tuple[mx.array, mx.array]:
+             A tuple containing the generated token and its associated probability.
+
+    Raises:
+        ValueError:
+             If the repetition_penalty is not a non-negative float.
+
     """
 
     if repetition_penalty and (
@@ -782,20 +1179,42 @@ def generate(
     top_p: float = 1.0,
 ) -> str:
     """
-    Generate text from the model.
+    Generates a text response based on a given image and textual prompt using a provided model and processor.
+    This function pre-processes the input image and prompt, fetches the corresponding logits from the model, and
+    samples the continuation tokens based on the provided parameters such as temperature, top_p, etc. It supports
+    additional options like repetition penalty and verbose output.
 
     Args:
-       model (nn.Module): The language model.
-       tokenizer (PreTrainedTokenizer): The tokenizer.
-       prompt (str): The string prompt.
-       temp (float): The temperature for sampling (default 0).
-       max_tokens (int): The maximum number of tokens (default 100).
-       verbose (bool): If ``True``, print tokens and timing information
-           (default ``False``).
-       formatter (Optional[Callable]): A function which takes a token and a
-           probability and displays it.
-       repetition_penalty (float, optional): The penalty factor for repeating tokens.
-       repetition_context_size (int, optional): The number of tokens to consider for repetition penalty.
+        model (nn.Module):
+             The model to use for generating the output text.
+        processor (PreTrainedTokenizer):
+             Tokenizer to encode the text prompt and process the generated tokens.
+        image (str):
+             An image file path or a URL to use as a part of the input.
+        prompt (str):
+             The text prompt to use as a starting point for text generation.
+        image_processor (optional):
+             The processor to use for image pre-processing if required by the model.
+        temp (float, optional):
+             The sampling temperature to use when selecting tokens. Defaults to 0.0.
+        max_tokens (int, optional):
+             The maximum number of tokens to generate. Defaults to 100.
+        verbose (bool, optional):
+             Whether to print out verbose information during generation. Defaults to False.
+        formatter (Callable, optional):
+             A formatter function for verbose output of generated tokens.
+        repetition_penalty (float, optional):
+             The penalty applied to discourage repetition.
+        repetition_context_size (int, optional):
+             The size of the context window for applying repetition penalty.
+        top_p (float, optional):
+             The nucleus sampling hyperparameter controlling the size of the probability mass
+            considered for sampling tokens. Defaults to 1.0.
+
+    Returns:
+        (str):
+             The generated text based on the input image and prompt.
+
     """
     if verbose:
         print("=" * 10)
