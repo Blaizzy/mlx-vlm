@@ -642,7 +642,7 @@ def convert(
         upload_to_hub(mlx_path, upload_repo, hf_path)
 
 
-def load_image(image_source: typing.Union[str, Path, BytesIO]):
+def load_image(image_source: Union[str, Path, BytesIO]):
     """
     Helper function to load an image from either a URL or file.
     """
