@@ -6,6 +6,7 @@ import logging
 import re
 import shutil
 import time
+from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
 from typing import Any, Callable, Dict, Generator, Optional, Tuple, Union
@@ -642,11 +643,17 @@ def convert(
         upload_to_hub(mlx_path, upload_repo, hf_path)
 
 
-def load_image(image_source):
+def load_image(image_source: Union[str, Path, BytesIO]):
     """
     Helper function to load an image from either a URL or file.
     """
-    if image_source.startswith(("http://", "https://")):
+    if isinstance(image_source, BytesIO):
+        # for base64 encoded images
+        try:
+            return Image.open(image_source)
+        except IOError as e:
+            raise ValueError(f"Failed to load image from BytesIO with error: {e}")
+    elif image_source.startswith(("http://", "https://")):
         try:
             response = requests.get(image_source, stream=True)
             response.raise_for_status()
