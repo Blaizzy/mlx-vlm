@@ -6,10 +6,11 @@ import logging
 import re
 import shutil
 import time
+from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
 from typing import Any, Callable, Dict, Generator, Optional, Tuple, Union
-from io import BytesIO
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
