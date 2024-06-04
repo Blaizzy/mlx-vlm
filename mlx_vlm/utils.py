@@ -144,6 +144,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(mx.load(wf))
 
+    if "language_config" in config:
+        config["text_config"] = config["language_config"]
+        del config["language_config"]
+
     model_class, model_type = get_model_and_args(config=config)
 
     if model_type == "nanoLlava":
