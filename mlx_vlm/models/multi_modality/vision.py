@@ -331,7 +331,7 @@ class VisionEmbeddings(nn.Module):
         return self.norm(patch_embeddings)
 
 
-class ClipVisionModel(nn.Module):
+class SiglipVisionModel(nn.Module):
     def __init__(
         self, config: VisionConfig, pre_norm: bool = False, no_embed_class: bool = True
     ):
@@ -387,7 +387,7 @@ class VisionModel(nn.Module):
         if self.model_type != "vision":
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
-        self.vision_model = ClipVisionModel(config)
+        self.vision_model = SiglipVisionModel(config)
 
     def __call__(
         self, x: mx.array, output_hidden_states: Optional[bool] = None
