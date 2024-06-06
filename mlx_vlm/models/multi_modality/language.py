@@ -9,12 +9,12 @@ import mlx.nn as nn
 @dataclass
 class TextConfig:
     model_type: str
-    hidden_size: int = 4096
-    num_hidden_layers: int = 32
-    intermediate_size: int = 11008
-    num_attention_heads: int = 32
+    hidden_size: int = 2048
+    num_hidden_layers: int = 24
+    intermediate_size: int = 5632
+    num_attention_heads: int = 16
     rms_norm_eps: float = 1e-6
-    vocab_size: int = 32000
+    vocab_size: int = 102400
     num_key_value_heads: int = None
     rope_theta: float = 10000
     rope_traditional: bool = False
