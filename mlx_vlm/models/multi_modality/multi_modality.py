@@ -25,6 +25,16 @@ class AlignerConfig:
     model_type: str
     params: dict
 
+    @classmethod
+    def from_dict(cls, params):
+        return cls(
+            **{
+                k: v
+                for k, v in params.items()
+                if k in inspect.signature(cls).parameters
+            }
+        )
+
 
 @dataclass
 class ModelConfig:
@@ -33,9 +43,11 @@ class ModelConfig:
     aligner_config: AlignerConfig
     model_type: str
     ignore_index: int = -100
-    image_token_index: int = 32000
+    image_token_index: int = 100015
     vision_feature_select_strategy: str = "default"
     select_layer: int = -1
+    pad_id: int = 100001
+    num_image_tokens: int = 576
     vocab_size: int = 32000
 
     @classmethod
@@ -57,14 +69,14 @@ class ImageProcessor(BaseImageProcessor):
         image_size: int = 384,
         min_size: int = 14,
         image_mean: Union[Tuple[float, float, float], List[float]] = (
-            0.48145466,
-            0.4578275,
-            0.40821073,
+            0.5,
+            0.5,
+            0.5,
         ),
         image_std: Union[Tuple[float, float, float], List[float]] = (
-            0.26862954,
-            0.26130258,
-            0.27577711,
+            0.5,
+            0.5,
+            0.5,
         ),
         rescale_factor: float = 1.0 / 255.0,
         do_normalize: bool = True,
@@ -106,12 +118,7 @@ class ImageProcessor(BaseImageProcessor):
             print(f"orig size = {pil_img.size}, new size = {size}")
             raise ValueError("Invalid size!")
 
-        pil_img = self.resize_image(
-            pil_img,
-            size,
-            interpolation=Image.BICUBIC,
-            antialias=True,
-        )
+        pil_img = pil_img.resize(size=tuple(size[::-1]), resample=Image.BICUBIC)
 
         pil_img = expand2square(pil_img, self.background_color)
         x = to_numpy_array(pil_img)
@@ -121,13 +128,7 @@ class ImageProcessor(BaseImageProcessor):
 
         return x
 
-    def resize_image(
-        self, pil_img, size, interpolation=Image.BILINEAR, antialias=False
-    ):
-        """Resize the input PIL Image to the given size."""
-        return pil_img.resize(size, resample=interpolation)
-
-    def preprocess(self, images, return_tensors: str = "np", **kwargs) -> BatchFeature:
+    def preprocess(self, images, **kwargs) -> BatchFeature:
         # resize and pad to [self.image_size, self.image_size]
         # then convert from [H, W, 3] to [3, H, W]
         images: List[np.ndarray] = [self.resize(image) for image in images]
@@ -156,16 +157,12 @@ class ImageProcessor(BaseImageProcessor):
 
         return images
 
-    @property
-    def default_shape(self):
-        return [self.image_size, self.image_size, 3]
-
 
 class MlpProjector(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
 
-        if config.aligner_config["params"]["projector_type"] == "mlp_gelu":
+        if config.aligner_config.params["projector_type"] == "mlp_gelu":
             self.layers = [
                 nn.Linear(
                     config.vision_config.hidden_size,
@@ -173,7 +170,7 @@ class MlpProjector(nn.Module):
                     bias=True,
                 )
             ]
-            mlp_depth = config.aligner_config["params"]["depth"]
+            mlp_depth = config.aligner_config.params["depth"]
             for _ in range(1, mlp_depth):
                 self.layers.append(nn.GELU())
                 self.layers.append(
@@ -185,7 +182,7 @@ class MlpProjector(nn.Module):
                 )
 
         else:
-            projector_type = config.aligner_config["params"]["projector_type"]
+            projector_type = config.aligner_config.params["projector_type"]
             raise ValueError(f"Unknown projector type: {projector_type}")
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -203,6 +200,53 @@ class Model(nn.Module):
         self.vision_feature_layer = config.select_layer
         self.vision_feature_select_strategy = config.vision_feature_select_strategy
 
+    def add_image_token(
+        self,
+        image_indices: list,
+        input_ids: np.ndarray,
+        image_token_index: int,
+        num_image_tokens: int,
+        add_special_token: bool = False,
+    ):
+        """
+        Inserts image tokens into an array of input IDs at specified indices.
+
+        Args:
+            image_indices (List[int]): Indices where image tokens should be inserted.
+            input_ids (np.ndarray): Original array of input IDs, expected to be two-dimensional.
+            image_token_index (int): The ID used to represent an image token.
+            num_image_tokens (int): Number of image tokens to insert at each index.
+            add_special_token (bool): If True, adjusts the indices to include a special token.
+
+        Returns:
+            Tuple of (np.ndarray, np.ndarray):
+                - Updated array of input IDs with image tokens inserted.
+                - Array indicating the number of image tokens added at each position.
+        """
+        input_slices = []
+
+        start = 0
+        flat_input_ids = input_ids.flatten()
+
+        for index in image_indices:
+            end = (index[0] + 1) if add_special_token else index[0]
+
+            input_slices.append(flat_input_ids[start:end])
+            input_slices.append(
+                np.full((num_image_tokens,), image_token_index, dtype=np.int64)
+            )
+            start = index[0] + 1  # Move start past the current image insertion point
+
+        input_slices.append(flat_input_ids[start:])
+
+        input_ids = np.concatenate(input_slices, axis=0)
+        num_image_tokens_array = np.array(
+            [num_image_tokens] * len(image_indices), dtype=np.int64
+        )
+        input_ids = input_ids.reshape(1, -1)
+
+        return input_ids, num_image_tokens_array
+
     def get_input_embeddings(
         self,
         input_ids: Optional[mx.array] = None,
@@ -210,6 +254,21 @@ class Model(nn.Module):
     ):
         if pixel_values is None:
             return self.language_model(input_ids)
+
+        image_token_index = self.config.image_token_index
+        num_image_tokens = self.config.num_image_tokens
+
+        image_token_mask = np.array(input_ids[0] == image_token_index).astype(bool)
+        image_indices = np.nonzero(image_token_mask)
+
+        input_ids, num_image_tokens = self.add_image_token(
+            image_indices=image_indices,
+            input_ids=np.array(input_ids),
+            image_token_index=image_token_index,
+            num_image_tokens=num_image_tokens,
+        )
+
+        input_ids = mx.array(input_ids)
 
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
@@ -220,7 +279,7 @@ class Model(nn.Module):
         )
 
         # Select the hidden states from the desired layer
-        selected_image_feature = hidden_states[None, :]
+        selected_image_feature = hidden_states
 
         if self.vision_feature_select_strategy == "default":
             selected_image_feature = selected_image_feature[:, 1:]
@@ -245,17 +304,9 @@ class Model(nn.Module):
         self, image_features, inputs_embeds, input_ids
     ):
         image_token_index = self.config.image_token_index
-        num_images, num_image_patches, embed_dim = image_features.shape
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
-
-        if len(image_positions) != num_images:
-            raise ValueError(
-                f"The number of image tokens ({len(image_positions)}) does not "
-                f" match the number of image inputs ({num_images})."
-            )
-
         text_segments = []
         start_idx = 0
 
@@ -274,9 +325,10 @@ class Model(nn.Module):
     def __call__(
         self, input_ids: mx.array, pixel_values: mx.array, mask: mx.array, cache=None
     ):
-        input_embddings = self.get_input_embeddings(input_ids, pixel_values)
+
+        input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
         logits, cache = self.language_model(
-            input_ids, cache=cache, inputs_embeds=input_embddings
+            input_ids, cache=cache, inputs_embeds=input_embeddings
         )
         return logits, cache
 
@@ -303,6 +355,9 @@ class Model(nn.Module):
         model_config = ModelConfig.from_dict(model_config)
 
         model_config.vision_config = VisionConfig.from_dict(model_config.vision_config)
+        model_config.aligner_config = AlignerConfig.from_dict(
+            model_config.aligner_config
+        )
         model_config.text_config = TextConfig.from_dict(model_config.text_config)
 
         model = Model(model_config)

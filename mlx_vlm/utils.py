@@ -172,6 +172,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         model_config.perceiver_config = model_class.PerceiverConfig.from_dict(
             config["perceiver_config"]
         )
+    if hasattr(model_config, "aligner_config"):
+        model_config.aligner_config = model_class.AlignerConfig.from_dict(
+            config["aligner_config"]
+        )
+
     model = model_class.Model(model_config)
 
     if hasattr(model, "sanitize"):
