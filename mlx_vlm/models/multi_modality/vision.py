@@ -18,8 +18,6 @@ class VisionConfig:
     num_attention_heads: int = 16
     image_size: int = 384
     patch_size: int = 16
-    projection_dim: int = 768
-    vocab_size: int = 32000
     num_channels: int = 3
     layer_norm_eps: float = 1e-5
 
@@ -54,87 +52,6 @@ def check_array_shape(arr):
         return True
     else:
         return False
-
-
-def interpolate(arr, new_size, mode="bicubic", antialias=True):
-    # Simple implementation of interpolation using NumPy
-    old_size = arr.shape[-2:]
-    scale_factors = [ns / os for ns, os in zip(new_size, old_size)]
-    new_arr = np.zeros((arr.shape[0], arr.shape[1], *new_size))
-
-    for i in range(new_size[0]):
-        for j in range(new_size[1]):
-            old_i, old_j = i / scale_factors[0], j / scale_factors[1]
-            old_i_floor, old_j_floor = int(old_i), int(old_j)
-            old_i_ceil, old_j_ceil = min(old_i_floor + 1, old_size[0] - 1), min(
-                old_j_floor + 1, old_size[1] - 1
-            )
-
-            # Perform interpolation (assuming bicubic)
-            t, u = old_i - old_i_floor, old_j - old_j_floor
-            new_arr[:, :, i, j] = (
-                arr[:, :, old_i_floor, old_j_floor] * (1 - t) * (1 - u)
-                + arr[:, :, old_i_ceil, old_j_floor] * t * (1 - u)
-                + arr[:, :, old_i_floor, old_j_ceil] * (1 - t) * u
-                + arr[:, :, old_i_ceil, old_j_ceil] * t * u
-            )
-
-    return new_arr
-
-
-def resample_abs_pos_embed(
-    posemb,
-    new_size: List[int],
-    old_size: Optional[List[int]] = None,
-    num_prefix_tokens: int = 1,
-    interpolation: str = "bicubic",
-    antialias: bool = True,
-    verbose: bool = False,
-):
-    # sort out sizes, assume square if old size not provided
-    num_pos_tokens = posemb.shape[1]
-    num_new_tokens = new_size[0] * new_size[1] + num_prefix_tokens
-    if num_new_tokens == num_pos_tokens and new_size[0] == new_size[1]:
-        return posemb
-    if old_size is None:
-        hw = int(np.sqrt(num_pos_tokens - num_prefix_tokens))
-        old_size = hw, hw
-    if num_prefix_tokens:
-        posemb_prefix, posemb = (
-            posemb[:, :num_prefix_tokens],
-            posemb[:, num_prefix_tokens:],
-        )
-    else:
-        posemb_prefix, posemb = None, posemb
-    # do the interpolation
-    embed_dim = posemb.shape[-1]
-    orig_dtype = posemb.dtype
-    posemb = posemb.astype(np.float32)  # interpolate needs float32
-    posemb = posemb.reshape(1, old_size[0], old_size[1], -1).transpose(0, 3, 1, 2)
-    posemb = interpolate(posemb, new_size, mode=interpolation, antialias=antialias)
-    posemb = posemb.transpose(0, 2, 3, 1).reshape(1, -1, embed_dim)
-    posemb = posemb.astype(orig_dtype)
-    # add back extra (class, etc) prefix tokens
-    if posemb_prefix is not None:
-        posemb = np.concatenate([posemb_prefix, posemb], axis=1)
-    if verbose:
-        print(f"Resized position embedding: {old_size} to {new_size}.")
-    return posemb
-
-
-class LayerScale(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        init_values: float = 1e-5,
-        inplace: bool = False,
-    ) -> None:
-        super().__init__()
-        self.inplace = inplace
-        self.gamma = nn.Parameter(init_values * mx.ones((dim,)))
-
-    def forward(self, x: mx.array):
-        return x @ self.gamma if self.inplace else x * self.gamma
 
 
 class AttentionPoolLatent(nn.Module):
@@ -272,10 +189,23 @@ class Attention(nn.Module):
         return self.proj(output)
 
 
+class FastGELUActivation(nn.Module):
+    """
+    Applies GELU approximation that is slower than QuickGELU but more accurate. See: https://github.com/hendrycks/GELUs
+    """
+
+    def __call__(self, input: mx.array) -> mx.array:
+        return (
+            0.5
+            * input
+            * (1.0 + mx.tanh(np.sqrt(2 / np.pi) * (input + 0.044715 * (input**3))))
+        )
+
+
 class MLP(nn.Module):
     def __init__(self, config: Union[VisionConfig, Dict], bias: bool = True):
         super().__init__()
-        self.activation_fn = nn.GELU(approx="fast")
+        self.activation_fn = FastGELUActivation()
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=bias)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=bias)
 
@@ -321,9 +251,13 @@ class VisionEmbeddings(nn.Module):
         )
 
         self.num_patches = (self.image_size // self.patch_size) ** 2
-        self.num_positions = self.num_patches + 1
+        self.num_positions = self.num_patches
 
-        self.norm = nn.LayerNorm(config.hidden_size) if norm_layer else nn.Identity()
+        self.norm = (
+            nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+            if norm_layer
+            else nn.Identity()
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
         patch_embeddings = self.proj(x)
@@ -333,12 +267,17 @@ class VisionEmbeddings(nn.Module):
 
 class SiglipVisionModel(nn.Module):
     def __init__(
-        self, config: VisionConfig, pre_norm: bool = False, no_embed_class: bool = True
+        self,
+        config: VisionConfig,
+        ignore_head: bool,
+        pre_norm: bool = False,
+        no_embed_class: bool = True,
     ):
         super().__init__()
         self.num_prefix_tokens = 1
         self.no_embed_class = False
         self.dynamic_img_size = False
+        self.ignore_head = ignore_head
         self.cls_token = None
         self.reg_token = None
         self.patch_embed = VisionEmbeddings(config)
@@ -349,11 +288,9 @@ class SiglipVisionModel(nn.Module):
         embed_len = (
             num_patches if no_embed_class else num_patches + self.num_prefix_tokens
         )
-        self.pos_embed = (
-            mx.random.normal((embed_len, config.hidden_size))[None, :] * 0.02
-        )
+        self.pos_embed = mx.random.normal((embed_len, config.hidden_size))[None, :]
 
-        norm_layer = partial(nn.LayerNorm, eps=1e-6)
+        norm_layer = partial(nn.LayerNorm, eps=1e-5)
         self.attn_pool = AttentionPoolLatent(
             config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -376,18 +313,21 @@ class SiglipVisionModel(nn.Module):
                 encoder_states = encoder_states + (x,)
 
         pooler_output = self.norm(x)
-        return self.attn_pool(pooler_output), x, encoder_states
+
+        if not self.ignore_head:
+            pooler_output = self.attn_pool(pooler_output)
+        return pooler_output, x, encoder_states
 
 
 class VisionModel(nn.Module):
-    def __init__(self, config: VisionConfig):
+    def __init__(self, config: VisionConfig, ignore_head: bool = True):
         super().__init__()
 
         self.model_type = config.model_type
         if self.model_type != "vision":
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
-        self.vision_model = SiglipVisionModel(config)
+        self.vision_model = SiglipVisionModel(config, ignore_head)
 
     def __call__(
         self, x: mx.array, output_hidden_states: Optional[bool] = None
