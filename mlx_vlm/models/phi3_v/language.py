@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import inspect
 
+
 @dataclass
 class TextConfig:
     @classmethod
@@ -12,6 +13,7 @@ class TextConfig:
                 if k in inspect.signature(cls).parameters
             }
         )
+
 
 class LanguageModel:
     pass

@@ -13,6 +13,7 @@ from .su_rope import Phi3SuScaledRotaryEmbedding
 from .language import TextConfig, LanguageModel
 from .vision import VisionConfig, VisionModel
 
+
 @dataclass
 class ModelConfig:
     text_config: TextConfig
@@ -37,7 +38,6 @@ class ModelConfig:
     max_position_embeddings: int = 131072
     original_max_position_embeddings: int = 4096
 
-
     @classmethod
     def from_dict(cls, params):
         return cls(
@@ -47,6 +47,7 @@ class ModelConfig:
                 if k in inspect.signature(cls).parameters
             }
         )
+
 
 class Attention(nn.Module):
     def __init__(self, args: TextConfig):
@@ -179,11 +180,12 @@ class Phi3V(nn.Module):
         image_sizes=None,
         cache=None,
     ):
+        # print('inputs', inputs) # debug
         h = self.embed_tokens(inputs)
         p = np.argwhere(inputs < 0).tolist()
         if pixel_values is not None:
-            x = self.vision_embed_tokens(h, pixel_values, image_sizes, p)
-        mask=None
+            h = self.vision_embed_tokens(pixel_values, h, image_sizes, p)
+        mask = None
         if h.shape[1] > 1:
             mask = nn.MultiHeadAttention.create_additive_causal_mask(h.shape[1])
             mask = mask.astype(h.dtype)
@@ -210,7 +212,7 @@ class Model(nn.Module):
         cache=None,
     ):
         out, cache = self.model(inputs, pixel_values, mask, cache)
-        return self.lm_head(out), cache
+        return self.lm_head(out).astype(self.lm_head.weight.dtype), cache
 
     @property
     def layers(self):
@@ -227,3 +229,7 @@ class Model(nn.Module):
     @property
     def language_model(self):
         return self
+
+    @property
+    def vision_model(self):
+        return self.model.vision_embed_tokens

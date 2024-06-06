@@ -1,4 +1,4 @@
-from .phi3vision import (
+from .phi3_v import (
     LanguageModel,
     Model,
     ModelConfig,
