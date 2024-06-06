@@ -1,4 +1,5 @@
 from .multi_modality import (
+    AlignerConfig,
     ImageProcessor,
     LanguageModel,
     Model,
