@@ -66,6 +66,7 @@ class ImageProcessor(BaseImageProcessor):
 
     def __init__(
         self,
+        config,
         image_size: int = 384,
         min_size: int = 14,
         image_mean: Union[Tuple[float, float, float], List[float]] = (
@@ -83,11 +84,18 @@ class ImageProcessor(BaseImageProcessor):
         **kwargs,
     ):
         super().__init__(**kwargs)
+        if "high_res_cfg" in config["vision_config"]["params"]:
+            self.image_size = config["vision_config"]["params"]["high_res_cfg"][
+                "image_size"
+            ]
+            self.image_mean = (0.48145466, 0.4578275, 0.40821073)
+            self.image_std = (0.26862954, 0.26130258, 0.27577711)
+        else:
+            self.image_size = image_size
+            self.image_mean = image_mean
+            self.image_std = image_std
 
-        self.image_size = image_size
         self.rescale_factor = rescale_factor
-        self.image_mean = image_mean
-        self.image_std = image_std
         self.min_size = min_size
         self.do_normalize = do_normalize
 
@@ -180,12 +188,42 @@ class MlpProjector(nn.Module):
                         bias=True,
                     )
                 )
+        elif (
+            config.aligner_config.params["projector_type"]
+            == "low_high_hybrid_split_mlp_gelu"
+        ):
+            mlp_depth = config.aligner_config.params["depth"]
+            self.high_up_proj = nn.Linear(
+                config.vision_config.hidden_size, config.text_config.hidden_size // 2
+            )
+            self.low_up_proj = nn.Linear(
+                config.vision_config.hidden_size, config.text_config.hidden_size // 2
+            )
+
+            self.layers = []
+            for _ in range(1, mlp_depth):
+                self.layers.append(nn.GELU())
+                self.layers.append(
+                    nn.Linear(
+                        config.text_config.hidden_size, config.text_config.hidden_size
+                    )
+                )
 
         else:
             projector_type = config.aligner_config.params["projector_type"]
             raise ValueError(f"Unknown projector type: {projector_type}")
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: Union[mx.array, Tuple]) -> mx.array:
+
+        if isinstance(x, tuple):
+            high_x, low_x = x
+
+            high_x = self.high_up_proj(high_x)
+            B, H, W, D = high_x.shape
+            high_x = high_x.reshape(B, -1, D)
+            low_x = self.low_up_proj(low_x)
+            x = mx.concatenate([high_x, low_x], axis=-1)
+
         for layer in self.layers:
             x = layer(x)
         return x
@@ -194,7 +232,7 @@ class MlpProjector(nn.Module):
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         self.config = config
-        self.vision_tower = VisionModel(config.vision_config)
+        self.vision_model = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config)
         self.aligner = MlpProjector(config)
         self.vision_feature_layer = config.select_layer
@@ -274,25 +312,27 @@ class Model(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
-        hidden_states, _, _ = self.vision_tower(
-            pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
-        )
-
-        # Select the hidden states from the desired layer
-        selected_image_feature = hidden_states
-
-        if self.vision_feature_select_strategy == "default":
-            selected_image_feature = selected_image_feature[:, 1:]
-        elif self.vision_feature_select_strategy == "full":
-            selected_image_feature = selected_image_feature
+        if self.config.vision_config.cls == "HybridVisionTower":
+            hidden_states = self.vision_model(
+                pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
+            )
         else:
-            raise ValueError(
-                "Unexpected feature selection strategy: "
-                f"{self.vision_feature_select_strategy}"
+            hidden_states, _, _ = self.vision_model(
+                pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
             )
 
+        # if self.vision_feature_select_strategy == "default":
+        #     hidden_states = hidden_states[:, 1:]
+        # elif self.vision_feature_select_strategy == "full":
+        #     hidden_states = hidden_states
+        # else:
+        #     raise ValueError(
+        #         "Unexpected feature selection strategy: "
+        #         f"{self.vision_feature_select_strategy}"
+        #     )
+
         # Pass image features through the multi-modal projector
-        image_features = self.aligner(selected_image_feature)
+        image_features = self.aligner(hidden_states)
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self._merge_input_ids_with_image_features(
@@ -374,15 +414,3 @@ class Model(nn.Module):
 
         model.load_weights(list(weights.items()))
         return model
-
-    def sanitize(self, weights):
-        weights = {
-            (
-                f"vision_tower.vision_model.{re.sub(r'^vision_model.vision_tower.', '', k)}"
-                if re.match(r"^vision_model.vision_tower.", k)
-                else k
-            ): v
-            for k, v in weights.items()
-        }
-
-        return weights

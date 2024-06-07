@@ -267,7 +267,14 @@ def load_image_processor(model_path: Union[str, Path]) -> BaseImageProcessor:
     image_processor = None
 
     if hasattr(model_class, "ImageProcessor"):
-        image_processor = model_class.ImageProcessor()
+        import inspect
+
+        init_signature = inspect.signature(model_class.ImageProcessor.__init__)
+
+        if "config" in init_signature.parameters:
+            image_processor = model_class.ImageProcessor(config=config)
+        else:
+            image_processor = model_class.ImageProcessor()
 
     return image_processor
 
