@@ -34,4 +34,4 @@ jobs:
         - name: Run Python tests
           run: |
             cd mlx_vlm/
-            pytest ./tests
+            pytest -s ./tests
