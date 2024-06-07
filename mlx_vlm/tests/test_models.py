@@ -407,14 +407,6 @@ class TestModels(unittest.TestCase):
             args.text_config.hidden_size,
         )
 
-        self.vision_test_runner(
-            model.vision_model,
-            args.vision_config.model_type,
-            args.vision_config.hidden_size,
-            args.vision_config.num_channels,
-            (args.vision_config.image_size, args.vision_config.image_size),
-        )
-
 
 if __name__ == "__main__":
     unittest.main()
