@@ -68,12 +68,6 @@ def resize_image(image_np, new_size=(96, 96), order=1):
     return mx.array(resized_image_np)[None, :]
 
 
-# Example usage:
-# Assume first_global_feature is your input numpy array with shape (64, original_height, original_width)
-# resized_image = resize_image_64_channels(first_global_feature, new_size=(96, 96))
-
-
-# This class and its supporting functions below lightly adapted from the ViTDet backbone available at: https://github.com/facebookresearch/detectron2/blob/main/detectron2/modeling/backbone/vit.py # noqa
 class SAMEncoder(nn.Module):
     def __init__(
         self,
@@ -368,11 +362,6 @@ class Attention(nn.Module):
         x = self.proj(x)
 
         return x
-
-
-from typing import Tuple
-
-import numpy as np
 
 
 def window_partition(
