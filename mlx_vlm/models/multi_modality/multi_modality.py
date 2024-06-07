@@ -90,19 +90,20 @@ class ImageProcessor(BaseImageProcessor):
             ]
             self.image_mean = (0.48145466, 0.4578275, 0.40821073)
             self.image_std = (0.26862954, 0.26130258, 0.27577711)
+            self.do_normalize = False
         else:
             self.image_size = image_size
             self.image_mean = image_mean
             self.image_std = image_std
+            self.do_normalize = do_normalize
 
         self.rescale_factor = rescale_factor
         self.min_size = min_size
-        self.do_normalize = do_normalize
 
         if image_mean is None:
             self.background_color = (127, 127, 127)
         else:
-            self.background_color = tuple([int(x * 255) for x in image_mean])
+            self.background_color = tuple([int(x * 255) for x in self.image_mean])
 
     def resize(self, pil_img: Image) -> np.ndarray:
         """
