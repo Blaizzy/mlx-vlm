@@ -351,63 +351,42 @@ class HybridVisionModel(nn.Module):
 
 
 def resize_image(image, size, antialias=True):
-    from PIL import Image
+    """
+    Resize an image using scipy.ndimage.zoom with an option for bicubic interpolation.
 
-    # Preprocess the image array
-    image = np.squeeze(image).astype(np.uint8)  # Remove singleton dimensions
-    # image = (image * 255.0).astype(np.uint8)  # Scale and convert to uint8
+    Args:
+        image (numpy.ndarray): The input image array.
+        size (tuple): The target size as (width, height).
+        antialias (bool): True to use bicubic interpolation, False to use nearest neighbor.
 
-    # Convert the preprocessed array to a PIL image
-    pil_image = Image.fromarray(image)
+    Returns:
+        numpy.ndarray: The resized image array.
+    """
+    # Ensure the image is an array and remove singleton dimensions
+    image = np.array(image[0])
 
-    # Resize the PIL image
-    resized_image = pil_image.resize(
-        tuple(size[::-1]), resample=Image.BICUBIC if antialias else Image.NEAREST
-    )
+    # Calculate zoom factors for the spatial dimensions
+    # Note: size is expected as (width, height) but image.shape gives (height, width)
+    current_height, current_width = image.shape[:2]
+    width_factor = size[0] / current_width
+    height_factor = size[1] / current_height
+    zoom_factors = (height_factor, width_factor)  # Apply zoom to height and width
 
-    # Convert the resized PIL image back to a NumPy array
-    resized_array = np.array(resized_image).astype(np.float16)
+    # Choose the interpolation order: 3 for bicubic, 0 for nearest
+    order = 3 if antialias else 0
 
-    return resized_array
+    # Apply zoom to the image. Handle both grayscale and color images.
+    if image.ndim == 2:  # Grayscale image
+        resized_image = zoom(image, zoom_factors, order=order)
+    elif image.ndim == 3:  # Color image
+        # Apply zoom separately for each channel
+        resized_channels = [
+            zoom(image[:, :, i], zoom_factors, order=order)
+            for i in range(image.shape[2])
+        ]
+        resized_image = np.stack(resized_channels, axis=2)
 
-
-# def resize_image(image, size, antialias=True):
-#     """
-#     Resize an image using scipy.ndimage.zoom with an option for bicubic interpolation.
-
-#     Args:
-#         image (numpy.ndarray): The input image array.
-#         size (tuple): The target size as (width, height).
-#         antialias (bool): True to use bicubic interpolation, False to use nearest neighbor.
-
-#     Returns:
-#         numpy.ndarray: The resized image array.
-#     """
-#     # Ensure the image is an array and remove singleton dimensions
-#     image = np.array(image[0])
-
-#     # Calculate zoom factors for the spatial dimensions
-#     # Note: size is expected as (width, height) but image.shape gives (height, width)
-#     current_height, current_width = image.shape[:2]
-#     width_factor = size[0] / current_width
-#     height_factor = size[1] / current_height
-#     zoom_factors = (height_factor, width_factor)  # Apply zoom to height and width
-
-#     # Choose the interpolation order: 3 for bicubic, 0 for nearest
-#     order = 3 if antialias else 0
-
-#     # Apply zoom to the image. Handle both grayscale and color images.
-#     if image.ndim == 2:  # Grayscale image
-#         resized_image = zoom(image, zoom_factors, order=order)
-#     elif image.ndim == 3:  # Color image
-#         # Apply zoom separately for each channel
-#         resized_channels = [zoom(image[:, :, i], zoom_factors, order=order) for i in range(image.shape[2])]
-#         resized_image = np.stack(resized_channels, axis=2)
-
-#     # Convert the resized image to a lower precision float16
-#     resized_array = resized_image.astype(np.float16)
-
-#     return resized_array
+    return resized_image
 
 
 class VisionModel(nn.Module):
