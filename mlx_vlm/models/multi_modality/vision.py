@@ -1,3 +1,4 @@
+import copy
 import inspect
 from dataclasses import dataclass
 from functools import partial
@@ -7,6 +8,9 @@ from typing import Dict, List, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from scipy.ndimage import zoom
+
+from .sam import SAMEncoder
 
 
 @dataclass
@@ -20,6 +24,12 @@ class VisionConfig:
     patch_size: int = 16
     num_channels: int = 3
     layer_norm_eps: float = 1e-5
+    cls: str = None
+    params: dict = None
+
+    def __post_init__(self):
+        if "high_res_cfg" in self.params:
+            self.image_size = self.params["high_res_cfg"]["image_size"]
 
     @classmethod
     def from_dict(cls, params):
@@ -265,7 +275,7 @@ class VisionEmbeddings(nn.Module):
         return self.norm(patch_embeddings)
 
 
-class SiglipVisionModel(nn.Module):
+class SigLipVisionModel(nn.Module):
     def __init__(
         self,
         config: VisionConfig,
@@ -319,28 +329,153 @@ class SiglipVisionModel(nn.Module):
         return pooler_output, x, encoder_states
 
 
+class HybridVisionModel(nn.Module):
+    def __init__(self, config: VisionConfig, resolution: str, ignore_head: bool = True):
+        super().__init__()
+
+        self.model_type = config.model_type
+        self.resolution = resolution
+        if self.model_type != "vision":
+            raise ValueError(f"Unsupported model type: {self.model_type}")
+
+        if resolution == "high":
+            self.vision_tower = SAMEncoder()
+        else:
+            self.vision_tower = SigLipVisionModel(config, ignore_head)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        if self.resolution == "high":
+            return self.vision_tower(x)
+        else:
+            return self.vision_tower(x)[0]
+
+
+def resize_image(image, size, antialias=True):
+    from PIL import Image
+
+    # Preprocess the image array
+    image = np.squeeze(image).astype(np.uint8)  # Remove singleton dimensions
+    # image = (image * 255.0).astype(np.uint8)  # Scale and convert to uint8
+
+    # Convert the preprocessed array to a PIL image
+    pil_image = Image.fromarray(image)
+
+    # Resize the PIL image
+    resized_image = pil_image.resize(
+        tuple(size[::-1]), resample=Image.BICUBIC if antialias else Image.NEAREST
+    )
+
+    # Convert the resized PIL image back to a NumPy array
+    resized_array = np.array(resized_image).astype(np.float16)
+
+    return resized_array
+
+
+# def resize_image(image, size, antialias=True):
+#     """
+#     Resize an image using scipy.ndimage.zoom with an option for bicubic interpolation.
+
+#     Args:
+#         image (numpy.ndarray): The input image array.
+#         size (tuple): The target size as (width, height).
+#         antialias (bool): True to use bicubic interpolation, False to use nearest neighbor.
+
+#     Returns:
+#         numpy.ndarray: The resized image array.
+#     """
+#     # Ensure the image is an array and remove singleton dimensions
+#     image = np.array(image[0])
+
+#     # Calculate zoom factors for the spatial dimensions
+#     # Note: size is expected as (width, height) but image.shape gives (height, width)
+#     current_height, current_width = image.shape[:2]
+#     width_factor = size[0] / current_width
+#     height_factor = size[1] / current_height
+#     zoom_factors = (height_factor, width_factor)  # Apply zoom to height and width
+
+#     # Choose the interpolation order: 3 for bicubic, 0 for nearest
+#     order = 3 if antialias else 0
+
+#     # Apply zoom to the image. Handle both grayscale and color images.
+#     if image.ndim == 2:  # Grayscale image
+#         resized_image = zoom(image, zoom_factors, order=order)
+#     elif image.ndim == 3:  # Color image
+#         # Apply zoom separately for each channel
+#         resized_channels = [zoom(image[:, :, i], zoom_factors, order=order) for i in range(image.shape[2])]
+#         resized_image = np.stack(resized_channels, axis=2)
+
+#     # Convert the resized image to a lower precision float16
+#     resized_array = resized_image.astype(np.float16)
+
+#     return resized_array
+
+
 class VisionModel(nn.Module):
     def __init__(self, config: VisionConfig, ignore_head: bool = True):
         super().__init__()
 
         self.model_type = config.model_type
+        self.config = config
         if self.model_type != "vision":
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
-        self.vision_model = SiglipVisionModel(config, ignore_head)
+        if config.cls == "HybridVisionTower":
+            self.high_layer_norm = nn.LayerNorm(
+                config.params["high_res_cfg"]["output_dim"]
+            )
+            self.low_layer_norm = nn.LayerNorm(
+                config.params["low_res_cfg"]["output_dim"]
+            )
+
+            high_res_cfg = copy.deepcopy(config)
+            high_res_cfg.image_size = config.params["high_res_cfg"]["image_size"]
+            self.vision_tower_high = HybridVisionModel(
+                high_res_cfg, "high", ignore_head
+            )
+
+            low_res_cfg = copy.deepcopy(config)
+            low_res_cfg.image_size = config.params["low_res_cfg"]["image_size"]
+
+            self.vision_tower_low = HybridVisionModel(low_res_cfg, "low", ignore_head)
+            self.low_res_size = config.params["low_res_cfg"]["image_size"]
+            self.resize = lambda image: resize_image(
+                image, (self.low_res_size, self.low_res_size), antialias=True
+            )
+
+        else:
+            self.vision_tower = SigLipVisionModel(config, ignore_head)
 
     def __call__(
         self, x: mx.array, output_hidden_states: Optional[bool] = None
     ) -> mx.array:
-        return self.vision_model(x, output_hidden_states)
+        if self.config.cls == "HybridVisionTower":
+            high_images = x
+            low_images = mx.array(self.resize(np.array(x)))[None, :]
+
+            high_res = self.vision_tower_high(high_images)
+            low_res = self.vision_tower_low(low_images)
+
+            return (high_res, low_res)
+        else:
+            return self.vision_tower(x, output_hidden_states)
 
     def sanitize(self, weights):
         sanitized_weights = {}
+        weight_keys = {
+            "neck.0.weight",
+            "neck.2.weight",
+            "neck_hd.0.weight",
+            "neck_hd.2.weight",
+            "downsamples.0.weight",
+            "downsamples.1.weight",
+            "patch_embed.proj.weight",
+        }
         for k, v in weights.items():
             if "position_ids" in k:
                 # Remove unused position_ids
                 continue
-            elif "patch_embed.proj.weight" in k:
+
+            elif ".".join(k.split(".")[-3:]) in weight_keys:
                 # PyTorch conv2d weight tensors have shape:
                 #   [out_channels, in_channels, kH, KW]
                 # MLX conv2d expects the weight be of shape:
