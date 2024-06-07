@@ -15,7 +15,7 @@ jobs:
 
         - name: Set up Python
           run: |
-            brew install python3
+            brew install python@3.10
             python3 -m venv env
             source env/bin/activate
 

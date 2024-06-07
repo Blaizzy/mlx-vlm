@@ -54,7 +54,6 @@ class TestModels(unittest.TestCase):
         num_channels,
         image_size: tuple,
         vision_feature_layer=-2,
-        pooler=False,
     ):
         self.assertEqual(vision_tower.model_type, model_type)
 
@@ -401,6 +400,14 @@ class TestModels(unittest.TestCase):
             model.aligner,
             args.vision_config.hidden_size,
             args.text_config.hidden_size,
+        )
+
+        self.vision_test_runner(
+            model.vision_model,
+            args.vision_config.model_type,
+            args.vision_config.hidden_size,
+            args.vision_config.num_channels,
+            (args.vision_config.image_size, args.vision_config.image_size),
         )
 
 
