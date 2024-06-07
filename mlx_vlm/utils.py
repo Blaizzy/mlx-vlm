@@ -3,7 +3,6 @@ import glob
 import importlib
 import json
 import logging
-import re
 import shutil
 import time
 from io import BytesIO
@@ -27,7 +26,7 @@ from transformers import (
 
 from .models.base import BaseImageProcessor
 from .sample_utils import top_p_sampling
-from .tokenizer_utils import TokenizerWrapper, load_tokenizer
+from .tokenizer_utils import load_tokenizer
 
 # Constants
 MODEL_REMAPPING = {

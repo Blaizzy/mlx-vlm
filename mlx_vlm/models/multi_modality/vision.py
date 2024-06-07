@@ -3,7 +3,7 @@ import inspect
 from dataclasses import dataclass
 from functools import partial
 from math import sqrt
-from typing import Dict, List, Optional, Union
+from typing import Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
