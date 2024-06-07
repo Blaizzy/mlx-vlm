@@ -1,12 +1,7 @@
-import logging
 import unittest
 
 import mlx.core as mx
 from mlx.utils import tree_map
-
-logging.basicConfig(
-    level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s"
-)
 
 
 class TestModels(unittest.TestCase):
