@@ -1,7 +1,12 @@
+import logging
 import unittest
 
 import mlx.core as mx
 from mlx.utils import tree_map
+
+logging.basicConfig(
+    level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 
 class TestModels(unittest.TestCase):
@@ -357,13 +362,7 @@ class TestModels(unittest.TestCase):
             patch_size=14,
             num_channels=3,
             layer_norm_eps=1e-5,
-            params={
-                "high_res_cfg": {
-                    "image_size": 1024,
-                    "pixel_mean": [0.48145466, 0.4578275, 0.40821073],
-                    "pixel_std": [0.26862954, 0.26130258, 0.27577711],
-                },
-            },
+            params={},
         )
 
         aligner_config = multi_modality.AlignerConfig(
@@ -400,6 +399,14 @@ class TestModels(unittest.TestCase):
             model.aligner,
             args.vision_config.hidden_size,
             args.text_config.hidden_size,
+        )
+
+        self.vision_test_runner(
+            model.vision_model,
+            args.vision_config.model_type,
+            args.vision_config.hidden_size,
+            args.vision_config.num_channels,
+            (args.vision_config.image_size, args.vision_config.image_size),
         )
 
 
