@@ -326,16 +326,6 @@ class Model(nn.Module):
                 pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
             )
 
-        # if self.vision_feature_select_strategy == "default":
-        #     hidden_states = hidden_states[:, 1:]
-        # elif self.vision_feature_select_strategy == "full":
-        #     hidden_states = hidden_states
-        # else:
-        #     raise ValueError(
-        #         "Unexpected feature selection strategy: "
-        #         f"{self.vision_feature_select_strategy}"
-        #     )
-
         # Pass image features through the multi-modal projector
         image_features = self.aligner(hidden_states)
 
