@@ -356,8 +356,6 @@ class Attention(nn.Module):
 
             return x
 
-        # from haiscale.utils import on_demand_checkpoint
-        # x = on_demand_checkpoint(do_attention, q, k, v)
         x = do_attention(q, k, v)
         x = self.proj(x)
 
