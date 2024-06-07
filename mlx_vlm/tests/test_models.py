@@ -357,6 +357,31 @@ class TestModels(unittest.TestCase):
             patch_size=14,
             num_channels=3,
             layer_norm_eps=1e-5,
+            params={
+                "concat_type": "tuple",
+                "freeze_high": True,
+                "freeze_low": True,
+                "high_res_cfg": {
+                    "ckpt_path": "",
+                    "image_size": 1024,
+                    "model_name": "sam_b_downsample",
+                    "output_dim": 1024,
+                    "pixel_mean": [0.48145466, 0.4578275, 0.40821073],
+                    "pixel_std": [0.26862954, 0.26130258, 0.27577711],
+                    "select_feature": "same",
+                    "select_layer": -1,
+                },
+                "low_res_cfg": {
+                    "ckpt_path": "",
+                    "image_size": 384,
+                    "model_name": "siglip_large_patch16_384",
+                    "output_dim": 1024,
+                    "pixel_mean": [0.5, 0.5, 0.5],
+                    "pixel_std": [0.5, 0.5, 0.5],
+                    "select_feature": "same",
+                    "select_layer": -1,
+                },
+            },
         )
 
         aligner_config = multi_modality.AlignerConfig(
@@ -396,7 +421,7 @@ class TestModels(unittest.TestCase):
         )
 
         self.vision_test_runner(
-            model.vision_tower,
+            model.vision_model,
             args.vision_config.model_type,
             args.vision_config.hidden_size,
             args.vision_config.num_channels,
