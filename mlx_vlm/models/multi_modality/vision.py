@@ -120,7 +120,6 @@ class AttentionPoolLatent(nn.Module):
         B, N, C = x.shape
 
         if self.pos_embed is not None:
-            # FIXME interpolate
             x = x + self.pos_embed.unsqueeze(0).to(x.dtype)
 
         q_latent = mx.array(self.latent)
