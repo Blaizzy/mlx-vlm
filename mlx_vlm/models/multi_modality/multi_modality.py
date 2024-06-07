@@ -224,13 +224,16 @@ class MlpProjector(nn.Module):
             high_x, low_x = x
 
             high_x = self.high_up_proj(high_x)
-            B, H, W, D = high_x.shape
-            high_x = high_x.reshape(B, -1, D)
             low_x = self.low_up_proj(low_x)
+
+            B, _, _, D = high_x.shape
+            high_x = high_x.reshape(B, -1, D)
+
             x = mx.concatenate([high_x, low_x], axis=-1)
 
         for layer in self.layers:
             x = layer(x)
+
         return x
 
 
