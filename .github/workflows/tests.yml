@@ -15,8 +15,8 @@ jobs:
 
         - name: Set up Python
           run: |
-            brew install python@3.8
-            python3.8 -m venv env
+            brew install python@3.10
+            python3 -m venv env
             source env/bin/activate
 
 
@@ -34,4 +34,4 @@ jobs:
         - name: Run Python tests
           run: |
             cd mlx_vlm/
-            pytest ./tests
+            pytest -s ./tests

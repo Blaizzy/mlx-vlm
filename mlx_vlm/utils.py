@@ -3,7 +3,6 @@ import glob
 import importlib
 import json
 import logging
-import re
 import shutil
 import time
 from io import BytesIO
@@ -27,7 +26,7 @@ from transformers import (
 
 from .models.base import BaseImageProcessor
 from .sample_utils import top_p_sampling
-from .tokenizer_utils import TokenizerWrapper, load_tokenizer
+from .tokenizer_utils import load_tokenizer
 
 # Constants
 MODEL_REMAPPING = {
@@ -145,6 +144,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(mx.load(wf))
 
+    if "language_config" in config:
+        config["text_config"] = config["language_config"]
+        del config["language_config"]
+
     model_class, model_type = get_model_and_args(config=config)
 
     if model_type == "nanoLlava":
@@ -169,6 +172,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         model_config.perceiver_config = model_class.PerceiverConfig.from_dict(
             config["perceiver_config"]
         )
+    if hasattr(model_config, "aligner_config"):
+        model_config.aligner_config = model_class.AlignerConfig.from_dict(
+            config["aligner_config"]
+        )
+
     model = model_class.Model(model_config)
 
     if hasattr(model, "sanitize"):
@@ -259,7 +267,14 @@ def load_image_processor(model_path: Union[str, Path]) -> BaseImageProcessor:
     image_processor = None
 
     if hasattr(model_class, "ImageProcessor"):
-        image_processor = model_class.ImageProcessor()
+        import inspect
+
+        init_signature = inspect.signature(model_class.ImageProcessor.__init__)
+
+        if "config" in init_signature.parameters:
+            image_processor = model_class.ImageProcessor(config=config)
+        else:
+            image_processor = model_class.ImageProcessor()
 
     return image_processor
 

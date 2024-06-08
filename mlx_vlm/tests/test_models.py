@@ -331,6 +331,79 @@ class TestModels(unittest.TestCase):
             (args.vision_config.image_size, args.vision_config.image_size),
         )
 
+    def test_multi_modality(self):
+        from mlx_vlm.models import multi_modality
+
+        text_config = multi_modality.TextConfig(
+            model_type="llama",
+            hidden_size=2048,
+            num_hidden_layers=24,
+            intermediate_size=5632,
+            num_attention_heads=16,
+            rms_norm_eps=1e-6,
+            vocab_size=32000,
+            rope_theta=10000.0,
+            rope_traditional=False,
+            rope_scaling=None,
+        )
+
+        vision_config = multi_modality.VisionConfig(
+            model_type="vision",
+            num_hidden_layers=24,
+            hidden_size=1024,
+            intermediate_size=4096,
+            num_attention_heads=16,
+            image_size=384,
+            patch_size=14,
+            num_channels=3,
+            layer_norm_eps=1e-5,
+            params={},
+        )
+
+        aligner_config = multi_modality.AlignerConfig(
+            cls="MlpProjector",
+            model_type="aligner",
+            params={
+                "depth": 2,
+                "input_dim": 1024,
+                "n_embed": 2048,
+                "projector_type": "mlp_gelu",
+            },
+        )
+
+        args = multi_modality.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            aligner_config=aligner_config,
+            model_type="multi_modality",
+            ignore_index=-100,
+            image_token_index=100015,
+            vocab_size=32000,
+        )
+
+        model = multi_modality.Model(args)
+
+        self.language_test_runner(
+            model.language_model,
+            args.text_config.model_type,
+            args.text_config.vocab_size,
+            args.text_config.num_hidden_layers,
+        )
+
+        self.mm_projector_test_runner(
+            model.aligner,
+            args.vision_config.hidden_size,
+            args.text_config.hidden_size,
+        )
+
+        self.vision_test_runner(
+            model.vision_model,
+            args.vision_config.model_type,
+            args.vision_config.hidden_size,
+            args.vision_config.num_channels,
+            (args.vision_config.image_size, args.vision_config.image_size),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
