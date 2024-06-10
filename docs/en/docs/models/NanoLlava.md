@@ -1,5 +1,3 @@
-### NanoLlava
-
 nanoLLaVA is a "small but mighty" 1B vision-language model designed to run efficiently on edge devices.
 
 **Example Usage:**

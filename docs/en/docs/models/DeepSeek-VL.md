@@ -1,5 +1,3 @@
-### DeepSeek-VL
-
 DeepSeek-VL possesses general multimodal understanding capabilities, capable of processing logical diagrams, web pages, formula recognition, scientific literature, natural images, and embodied intelligence in complex scenarios.
 
 - Paper: https://arxiv.org/abs/2403.05525
