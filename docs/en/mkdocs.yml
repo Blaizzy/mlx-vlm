@@ -2,7 +2,10 @@ site_name: MLX-VLM
 site_url: https://mlx-vlm.blaizzy.com
 repo_name: Blaizzy/mlx-vlm
 repo_url: https://github.com/Blaizzy/mlx-vlm/
-
+markdown_extensions:
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
 theme:
   name: material
   palette:
@@ -23,16 +26,15 @@ theme:
         icon: material/brightness-4
         name: Switch to system preference
 
-
-
-
-
   icon:
     repo: fontawesome/brands/git-alt
   features:
     - search.suggest
     - search.highlight
     - search.share
+    - content.code.copy
+    - content.tabs.link
+    - navigation.footer
 
   plugins:
     - git-revision-date-localized:

@@ -1,2 +1,2 @@
-# Welcome to MLX-VLM
+# Home
 
