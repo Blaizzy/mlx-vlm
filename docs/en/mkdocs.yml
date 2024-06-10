@@ -1,0 +1,39 @@
+site_name: MLX-VLM
+site_url: https://mlx-vlm.blaizzy.com
+repo_name: Blaizzy/mlx-vlm
+repo_url: https://github.com/Blaizzy/mlx-vlm/
+
+theme:
+  name: material
+  palette:
+
+    # Palette toggle for light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+
+    # Palette toggle for dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+
+
+
+
+
+  icon:
+    repo: fontawesome/brands/git-alt
+  features:
+    - search.suggest
+    - search.highlight
+    - search.share
+
+  plugins:
+    - git-revision-date-localized:
+      enable_creation_date: true
