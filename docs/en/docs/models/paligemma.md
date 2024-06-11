@@ -11,5 +11,11 @@ model, processor = load(model_path)
 
 prompt = "What are these?"
 
-output = generate(model, processor, "http://images.cocodataset.org/val2017/000000039769.jpg", prompt, verbose=True)
+output = generate(
+    model,
+    processor,
+    "http://images.cocodataset.org/val2017/000000039769.jpg",
+    prompt,
+    verbose=True
+)
 ```

@@ -17,5 +17,11 @@ prompt = processor.tokenizer.apply_chat_template(
     add_generation_prompt=True,
 )
 
-output = generate(model, processor, "http://images.cocodataset.org/val2017/000000039769.jpg", prompt, verbose=False)
+output = generate(
+    model,
+    processor,
+    "http://images.cocodataset.org/val2017/000000039769.jpg",
+    prompt,
+    verbose=False
+)
 ```
