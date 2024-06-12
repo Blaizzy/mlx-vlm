@@ -1,7 +1,9 @@
 import math
 from typing import Union
+
 import mlx.core as mx
 import mlx.nn as nn
+
 
 class LoRaLayer(nn.Module):
     def __init__(
@@ -10,11 +12,11 @@ class LoRaLayer(nn.Module):
         rank: int,
         alpha: float = 0.1,
         dropout: float = 0.0,
-
     ):
         super().__init__()
 
         self.original_layer = linear
+
         self.dropout = nn.Dropout(p=dropout)
 
         output_dims, input_dims = linear.weight.shape
@@ -26,13 +28,14 @@ class LoRaLayer(nn.Module):
             high=std_dev,
             shape=(input_dims, rank),
         )
-        self.B = mx.zeros(rank, output_dims)
+        self.B = mx.zeros((rank, output_dims))
         self.alpha = alpha
 
     def __call__(self, x):
         y = self.original_layer(x)
         lora_update = (self.dropout(x) @ self.A) @ self.B
-        return y +  (self.alpha * lora_update).astype(x.dtype)
+        return y + (self.alpha * lora_update).astype(x.dtype)
+
 
 def replace_lora_with_linear(model):
     for i, layer in enumerate(model.layers):
@@ -45,7 +48,9 @@ def replace_lora_with_linear(model):
             updated_bias = layer.original_layer.bias
 
             # Create a new Linear layer with the updated parameters
-            new_linear_layer = nn.Linear(updated_weight.size(1), updated_weight.size(0), bias=use_bias)
+            new_linear_layer = nn.Linear(
+                updated_weight.size(1), updated_weight.size(0), bias=use_bias
+            )
 
             new_linear_layer.weight = updated_weight
 
@@ -59,7 +64,5 @@ def replace_lora_with_linear(model):
                     new_linear_layer.bits,
                 )
 
-
             # Replace the LoRaLayer with the new Linear layer in the model
             model.layers[i] = new_linear_layer
-
