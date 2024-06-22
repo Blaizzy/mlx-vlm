@@ -16,7 +16,7 @@ def get_message_json(model_name, prompt):
             "role": "user",
             "content": [{"type": "image"}, {"type": "text", "text": prompt}],
         }
-    elif model_name.lower() in ["llava-qwen2", "llava"]:
+    elif model_name.lower() in ["llava-qwen2", "llava", "llava_next"]:
         message = {"role": "user", "content": f"<image>\n{prompt}"}
     elif model_name.lower() == "multi_modality":
         message = {"role": "user", "content": f"<image>{prompt}"}
