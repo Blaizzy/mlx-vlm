@@ -141,6 +141,71 @@ class TestModels(unittest.TestCase):
             (args.vision_config.image_size, args.vision_config.image_size),
         )
 
+    def test_llava_next(self):
+        from mlx_vlm.models import llava_next
+
+        text_config = llava_next.TextConfig(
+            model_type="llama",
+            hidden_size=4096,
+            num_hidden_layers=32,
+            intermediate_size=11008,
+            num_attention_heads=32,
+            rms_norm_eps=1e-5,
+            vocab_size=32000,
+            num_key_value_heads=32,
+            rope_theta=10000.0,
+            rope_traditional=False,
+            rope_scaling=None,
+        )
+
+        vision_config = llava_next.VisionConfig(
+            model_type="clip_vision_model",
+            num_hidden_layers=23,
+            hidden_size=1024,
+            intermediate_size=4096,
+            num_attention_heads=16,
+            image_size=336,
+            patch_size=14,
+            projection_dim=768,
+            vocab_size=32000,
+            num_channels=3,
+            layer_norm_eps=1e-6,
+        )
+
+        args = llava_next.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="llava",
+            ignore_index=-100,
+            image_token_index=32000,
+            vocab_size=32000,
+            vision_feature_layer=-2,
+            vision_feature_select_strategy="default",
+        )
+
+        model = llava_next.Model(args)
+
+        self.language_test_runner(
+            model.language_model,
+            args.text_config.model_type,
+            args.text_config.vocab_size,
+            args.text_config.num_hidden_layers,
+        )
+
+        self.mm_projector_test_runner(
+            model.multi_modal_projector,
+            args.vision_config.hidden_size,
+            args.text_config.hidden_size,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            args.vision_config.model_type,
+            args.vision_config.hidden_size,
+            args.vision_config.num_channels,
+            (args.vision_config.image_size, args.vision_config.image_size),
+        )
+
     def test_llava(self):
         from mlx_vlm.models import llava
 
