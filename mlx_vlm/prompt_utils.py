@@ -18,6 +18,8 @@ def get_message_json(model_name, prompt):
         }
     elif model_name.lower() in ["llava-qwen2", "llava", "llava_next"]:
         message = {"role": "user", "content": f"<image>\n{prompt}"}
+    elif model_name.lower() == "phi3_v":
+        message = {"role": "user", "content": f"<|image_1|>\n{prompt}"}
     elif model_name.lower() == "multi_modality":
         message = {"role": "user", "content": f"<image>{prompt}"}
     elif model_name.lower() == "paligemma":
