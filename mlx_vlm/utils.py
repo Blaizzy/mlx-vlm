@@ -159,6 +159,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config["text_config"] = text_config
     if model_type == "idefics2":
         config = AutoConfig.from_pretrained(model_path).to_dict()
+    if model_type == "phi3_v":
+        config["vision_config"] = config["img_processor"]
+        config["text_config"] = {}
 
     model_config = model_class.ModelConfig.from_dict(config)
 
@@ -539,11 +542,12 @@ def quantize_model(
                             new_bias[:out_features] = module.bias
                             module.bias = new_bias
 
-    quantized_config["vision_config"]["intermediate_size"] = (
-        ((vision_intermediate_size // divisor) + 1) * divisor
-        if vision_intermediate_size % divisor != 0
-        else vision_intermediate_size
-    )
+    if "vision_config" in quantized_config:
+        quantized_config["vision_config"]["intermediate_size"] = (
+            ((vision_intermediate_size // divisor) + 1) * divisor
+            if vision_intermediate_size % divisor != 0
+            else vision_intermediate_size
+        )
 
     nn.quantize(model, q_group_size, q_bits)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
@@ -705,6 +709,8 @@ def prepare_inputs(image_processor, processor, image, prompt, image_token_index)
         pixel_values = mx.array(inputs["pixel_values"])
         input_ids = mx.array(inputs["input_ids"])
         mask = mx.array(inputs["attention_mask"])
+        if "image_sizes" in inputs:
+            return input_ids, pixel_values, inputs["image_sizes"]
     return input_ids, pixel_values, mask
 
 
