@@ -542,11 +542,12 @@ def quantize_model(
                             new_bias[:out_features] = module.bias
                             module.bias = new_bias
 
-    quantized_config["vision_config"]["intermediate_size"] = (
-        ((vision_intermediate_size // divisor) + 1) * divisor
-        if vision_intermediate_size % divisor != 0
-        else vision_intermediate_size
-    )
+    if "vision_config" in quantized_config:
+        quantized_config["vision_config"]["intermediate_size"] = (
+            ((vision_intermediate_size // divisor) + 1) * divisor
+            if vision_intermediate_size % divisor != 0
+            else vision_intermediate_size
+        )
 
     nn.quantize(model, q_group_size, q_bits)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
