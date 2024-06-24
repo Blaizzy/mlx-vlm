@@ -1,7 +1,6 @@
 import inspect
 import math
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Optional
 
 import mlx.core as mx
@@ -11,7 +10,7 @@ import numpy as np
 
 @dataclass
 class VisionConfig:
-    model_type: str = "phi3_v"
+    model_type: str
     num_hidden_layers: int = 24
     hidden_size: int = 1024
     intermediate_size: int = 4096
@@ -22,10 +21,6 @@ class VisionConfig:
     vocab_size: int = 32000
     num_channels: int = 3
     layer_norm_eps: float = 1e-5
-    image_dim_out: int = (1024,)
-    model_name: str = "openai/clip-vit-large-patch14-336"
-    name: str = "clip_vision_model"
-    num_img_tokens: int = 144
 
     @classmethod
     def from_dict(cls, params):
@@ -185,10 +180,9 @@ class VisionEmbeddings(nn.Module):
         return embeddings
 
 
-class ClipModel(nn.Module):
+class ClipVisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
-        self.model_type = config.model_type
         self.embeddings = VisionEmbeddings(config)
         self.pre_layrnorm = nn.LayerNorm(config.hidden_size)
         self.encoder = Encoder(config)
@@ -213,108 +207,32 @@ class ClipModel(nn.Module):
         return pooler_output, x, encoder_states
 
 
-class ClipVModel(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.model_type = config.model_type
-        self.vision_model = ClipModel(config)
-
-
 class VisionModel(nn.Module):
-    CLIP_VIT_LARGE_PATCH14_336_CONFIG = SimpleNamespace(
-        model_type="phi3_v",
-        hidden_size=1024,
-        image_size=336,
-        intermediate_size=4096,
-        layer_norm_eps=1e-05,
-        num_attention_heads=16,
-        num_channels=3,
-        num_hidden_layers=24,
-        patch_size=14,
-    )
-
-    def __init__(self, config):
+    def __init__(self, config: VisionConfig):
         super().__init__()
+
         self.model_type = config.model_type
-        self.img_processor = ClipVModel(self.CLIP_VIT_LARGE_PATCH14_336_CONFIG)
-        self.image_dim_out = image_dim_out = 1024
-        self.glb_GN = mx.zeros([1, 1, image_dim_out * 4])
-        self.sub_GN = mx.zeros([1, 1, 1, image_dim_out * 4])
-        self.img_projection = [
-            nn.Linear(image_dim_out * 4, config.hidden_size),
-            nn.GELU(),
-            nn.Linear(config.hidden_size, config.hidden_size),
-        ]
+        if self.model_type != "clip_vision_model":
+            raise ValueError(f"Unsupported model type: {self.model_type}")
+
+        self.vision_model = ClipVisionModel(config)
 
     def __call__(
-        self,
-        img_embeds,
-        txt_embeds=None,
-        img_sizes=None,
-        positions=None,
-        output_hidden_states=None,
-    ):
-        if output_hidden_states:
-            return self.img_processor.vision_model(
-                img_embeds, output_hidden_states=output_hidden_states
-            )
-        # print(0, txt_embeds.shape, img_embeds.shape, img_sizes.shape)
-        img_embeds = mx.array(img_embeds)
-        img_sizes = mx.array(img_sizes)
-        B = img_embeds.shape[0]
-        img_sizes = (img_sizes // 336).tolist()
-        img_features = self.img_processor.vision_model(
-            img_embeds.reshape(-1, *img_embeds.shape[2:]).transpose(0, 2, 3, 1), True
-        )[-1][-2][:, 1:]
-        img_features = img_features.reshape(B, -1, *img_features.shape[1:])
-        C, H = self.image_dim_out, int(img_features.shape[2] ** 0.5)
-        output_imgs, output_len = [], []
-        for _bs in range(B):
-            h, w = img_sizes[_bs]
-            B_ = h * w
-
-            def _reshape_and_concatenate(img, shape, tile_shape):
-                return mx.concatenate(
-                    [
-                        img.reshape(shape)
-                        .transpose(0, 1, 3, 2, 4, 5)
-                        .reshape(tile_shape),
-                        mx.tile(self.sub_GN, (1, tile_shape[1], 1, 1)),
-                    ],
-                    axis=2,
-                ).reshape(1, -1, 4 * C)
-
-            glb_img = _reshape_and_concatenate(
-                img_features[_bs, :1],
-                (1, H // 2, 2, H // 2, 2, C),
-                (1, H // 2, H // 2, 4 * C),
-            )
-            sub_img = _reshape_and_concatenate(
-                img_features[_bs, 1 : B_ + 1],
-                (B_, H // 2, 2, H // 2, 2, C),
-                (1, h * 12, w * 12, 4 * C),
-            )
-            x = mx.concatenate([sub_img, self.glb_GN, glb_img], axis=1)
-            for l in self.img_projection:
-                x = l(x)
-            output_imgs.append(np.array(x.astype(mx.float32)))
-            output_len.append(int((h * w + 1) * 144 + 1 + (h + 1) * 12))
-        idx = 0
-        txt_embeds = np.array(txt_embeds.astype(mx.float32))
-        for i, cnt in enumerate(output_len):
-            txt_embeds[
-                positions[idx][0], positions[idx][1] : positions[idx][1] + cnt
-            ] = output_imgs[i]
-            idx += cnt
-        txt_embeds = mx.array(txt_embeds)
-        return txt_embeds
+        self, x: mx.array, output_hidden_states: Optional[bool] = None
+    ) -> mx.array:
+        return self.vision_model(x, output_hidden_states)
 
     def sanitize(self, weights):
         sanitized_weights = {}
         for k, v in weights.items():
             if "position_ids" in k:
+                # Remove unused position_ids
                 continue
             elif "patch_embedding.weight" in k:
+                # PyTorch conv2d weight tensors have shape:
+                #   [out_channels, in_channels, kH, KW]
+                # MLX conv2d expects the weight be of shape:
+                #   [out_channels, kH, KW, in_channels]
                 if check_array_shape(v):
                     sanitized_weights[k] = v
                 else:
