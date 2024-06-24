@@ -1,16 +1,15 @@
 import inspect
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
 from types import SimpleNamespace
-from typing import Optional
+from typing import Dict, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from .language import LanguageModel, TextConfig
 from .su_rope import Phi3SuScaledRotaryEmbedding
-from .language import TextConfig, LanguageModel
 from .vision import VisionConfig, VisionModel
 
 

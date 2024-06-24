@@ -160,7 +160,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     if model_type == "idefics2":
         config = AutoConfig.from_pretrained(model_path).to_dict()
     if model_type == "phi3_v":
-        config["vision_config"] = config['img_processor']
+        config["vision_config"] = config["img_processor"]
         config["text_config"] = {}
 
     model_config = model_class.ModelConfig.from_dict(config)
@@ -708,8 +708,8 @@ def prepare_inputs(image_processor, processor, image, prompt, image_token_index)
         pixel_values = mx.array(inputs["pixel_values"])
         input_ids = mx.array(inputs["input_ids"])
         mask = mx.array(inputs["attention_mask"])
-        if 'image_sizes' in inputs:
-            return input_ids, pixel_values, inputs['image_sizes']
+        if "image_sizes" in inputs:
+            return input_ids, pixel_values, inputs["image_sizes"]
     return input_ids, pixel_values, mask
 
 

@@ -468,6 +468,7 @@ class TestModels(unittest.TestCase):
             args.vision_config.num_channels,
             (args.vision_config.image_size, args.vision_config.image_size),
         )
+
     def test_phi3_v(self):
         from mlx_vlm.models import phi3_v
 
