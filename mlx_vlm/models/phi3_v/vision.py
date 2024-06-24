@@ -258,7 +258,6 @@ class VisionModel(nn.Module):
             return self.img_processor.vision_model(
                 img_embeds, output_hidden_states=output_hidden_states
             )
-        # print(0, txt_embeds.shape, img_embeds.shape, img_sizes.shape)
         img_embeds = mx.array(img_embeds)
         img_sizes = mx.array(img_sizes)
         B = img_embeds.shape[0]
