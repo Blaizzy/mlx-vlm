@@ -1,4 +1,4 @@
-from .nanoLlava import (
+from .llava_bunny import (
     ImageProcessor,
     LanguageModel,
     Model,
