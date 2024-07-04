@@ -70,10 +70,10 @@ class TestModels(unittest.TestCase):
             hidden_states[vision_feature_layer][-1][-1].shape, (vision_hidden_size,)
         )
 
-    def test_nanoLlava(self):
-        from mlx_vlm.models import nanoLlava
+    def test_llava_bunny(self):
+        from mlx_vlm.models import llava_bunny
 
-        text_config = nanoLlava.TextConfig(
+        text_config = llava_bunny.TextConfig(
             model_type="qwen2",
             hidden_size=4096,
             num_hidden_layers=32,
@@ -87,7 +87,7 @@ class TestModels(unittest.TestCase):
             rope_scaling=None,
         )
 
-        vision_config = nanoLlava.VisionConfig(
+        vision_config = llava_bunny.VisionConfig(
             model_type="siglip_vision_model",
             num_hidden_layers=27,
             hidden_size=1152,
@@ -101,7 +101,7 @@ class TestModels(unittest.TestCase):
             layer_norm_eps=1e-6,
         )
 
-        args = nanoLlava.ModelConfig(
+        args = llava_bunny.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
             model_type="llava-qwen2",
@@ -118,7 +118,7 @@ class TestModels(unittest.TestCase):
             vocab_size=151936,
         )
 
-        model = nanoLlava.Model(args)
+        model = llava_bunny.Model(args)
 
         self.language_test_runner(
             model.language_model,

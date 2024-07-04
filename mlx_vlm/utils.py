@@ -29,9 +29,7 @@ from .sample_utils import top_p_sampling
 from .tokenizer_utils import load_tokenizer
 
 # Constants
-MODEL_REMAPPING = {
-    "llava-qwen2": "nanoLlava",
-}
+MODEL_REMAPPING = {"llava-qwen2": "llava_bunny", "bunny-llama": "llava_bunny"}
 
 MAX_FILE_SIZE_GB = 5
 
@@ -150,12 +148,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     model_class, model_type = get_model_and_args(config=config)
 
-    if model_type == "nanoLlava":
+    if model_type == "llava_bunny":
         vision_config = AutoConfig.from_pretrained(config["mm_vision_tower"])
         text_config = AutoConfig.from_pretrained(config["language_model"])
         vision_config = vision_config.to_dict()
         text_config = text_config.to_dict()
-        config["vision_config"] = vision_config["vision_config"]
+        config["vision_config"] = {
+            **vision_config["vision_config"],
+            **config.get("vision_config", {}),
+        }
         config["text_config"] = text_config
     if model_type == "idefics2":
         config = AutoConfig.from_pretrained(model_path).to_dict()
@@ -194,7 +195,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         weights = model_class.LanguageModel(model_config.text_config).sanitize(
             weights=weights
         )
-
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized
         class_predicate = (
@@ -502,10 +502,8 @@ def quantize_model(
     divisor = 64
     if any(vision_intermediate_size % size != 0 for size in [64, 128]):
         for name, module in model.named_modules():
-            if (
-                isinstance(module, nn.Linear)
-                or isinstance(module, nn.Embedding)
-                and ("vision_model" in name or "vision_tower" in name)
+            if isinstance(module, nn.Linear) and (
+                "vision_model" in name or "vision_tower" in name
             ):
                 out_features, in_features = module.weight.shape
 
@@ -520,34 +518,30 @@ def quantize_model(
                     if in_features % divisor != 0
                     else in_features
                 )
-                if (
-                    out_features == vision_intermediate_size
-                    or in_features == vision_intermediate_size
-                ):
 
-                    # If padding is needed, proceed
-                    if (
-                        new_out_features != out_features
-                        or new_in_features != in_features
-                    ):
-                        # Create new weight and bias tensors
-                        new_weight = mx.zeros((new_out_features, new_in_features))
-                        new_bias = mx.zeros((new_out_features))
+                # If padding is needed, proceed
+                if new_out_features != out_features or new_in_features != in_features:
+                    # Create new weight and bias tensors
+                    new_weight = mx.zeros((new_out_features, new_in_features))
+                    new_bias = mx.zeros((new_out_features))
 
-                        # Copy existing weights and biases to the new tensors
-                        new_weight[:out_features, :in_features] = module.weight
-                        module.weight = new_weight
+                    # Copy existing weights and biases to the new tensors
+                    new_weight[:out_features, :in_features] = module.weight
+                    module.weight = new_weight
 
-                        if hasattr(module, "bias"):
-                            new_bias[:out_features] = module.bias
-                            module.bias = new_bias
+                    if hasattr(module, "bias"):
+                        new_bias[:out_features] = module.bias
+                        module.bias = new_bias
 
-    if "vision_config" in quantized_config:
-        quantized_config["vision_config"]["intermediate_size"] = (
-            ((vision_intermediate_size // divisor) + 1) * divisor
-            if vision_intermediate_size % divisor != 0
-            else vision_intermediate_size
-        )
+    # Ensure vision_config exists in quantized_config
+    quantized_config.setdefault("vision_config", {})
+
+    # Update intermediate_size
+    quantized_config["vision_config"]["intermediate_size"] = (
+        ((vision_intermediate_size // divisor) + 1) * divisor
+        if vision_intermediate_size % divisor != 0
+        else vision_intermediate_size
+    )
 
     nn.quantize(model, q_group_size, q_bits)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
