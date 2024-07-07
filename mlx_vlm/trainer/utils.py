@@ -1,6 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx.utils import tree_flatten
 
 from .lora import LoRaLayer
 
@@ -102,31 +103,12 @@ def collate_fn(processor, examples):
     return tokens
 
 
-def flatten_dict(dd, separator="_", prefix=""):
-    return (
-        {
-            prefix + separator + k if prefix else k: v
-            for kk, vv in dd.items()
-            for k, v in flatten_dict(vv, separator, kk).items()
-        }
-        if isinstance(dd, dict)
-        else {prefix: dd}
-    )
-
-
 def count_parameters(trainable_params_dict):
     total_params = 0
-    for k, v in flatten_dict(trainable_params_dict).items():
-        if hasattr(v, "shape"):
-            total_params += np.prod(v.shape)
-
-        if isinstance(v, list):
-            for v_ in v:
-                v_ = flatten_dict(v_)
-                if isinstance(v_, dict):
-                    total_params += sum(
-                        np.prod(p.shape) for p in v_.values() if hasattr(p, "shape")
-                    )
+    for modules in tree_flatten(trainable_params_dict):
+        mx_array = modules[-1]
+        if hasattr(mx_array, "shape"):
+            total_params += np.prod(mx_array.shape)
 
     return total_params
 
