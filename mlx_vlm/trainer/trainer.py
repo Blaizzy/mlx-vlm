@@ -1,3 +1,4 @@
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -7,6 +8,40 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten
+from PIL import Image
+
+
+class ImageTextDataset:
+    def __init__(self, image_dir, caption_file, img_size=(224, 224)):
+        self.image_dir = image_dir
+        self.img_size = img_size
+        self.image_captions = []
+        self.unique_captions = set()
+
+        with open(caption_file, "r") as f:
+            for line in f:
+                image_name, caption = line.strip().split(",")
+                self.image_captions.append((image_name, caption))
+                self.unique_captions.add(caption)
+
+        self.caption_to_id = {
+            caption: i for i, caption in enumerate(self.unique_captions)
+        }
+
+    def __len__(self):
+        return len(self.image_captions)
+
+    def __getitem__(self, idx):
+        image_name, caption = self.image_captions[idx]
+        image_path = os.path.join(self.image_dir, image_name)
+
+        image = Image.open(image_path).convert("RGB")
+        image = image.resize(self.img_size)
+        image_array = np.array(image).astype(np.float32) / 255.0
+
+        caption_id = self.caption_to_id[caption]
+
+        return mx.array(image_array), mx.array(caption_id, dtype=mx.int32)
 
 
 def grad_checkpoint(layer):
@@ -23,6 +58,7 @@ def grad_checkpoint(layer):
         return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
 
     type(layer).__call__ = checkpointed_fn
+
 
 @dataclass
 class TrainingArgs:
@@ -68,3 +104,46 @@ def default_loss(model, inputs, targets, lengths):
     ce = ce.sum() / ntoks
 
     return ce, ntoks
+
+
+class Trainer:
+    def __init__(self, model, optimizer, loss_fn):
+        self.model = model
+        self.optimizer = optimizer
+        self.loss_fn = loss_fn
+
+    def train_step(self, batch):
+        images, labels = batch
+
+        def loss_fn(model):
+            logits = model(images)
+            return self.loss_fn(logits, labels)
+
+        loss, grads = mx.value_and_grad(loss_fn)(self.model)
+        self.optimizer.update(self.model, grads)
+        return loss
+
+    @mx.compile
+    def train_epoch(self, dataloader):
+        total_loss = 0
+        for batch in dataloader:
+            loss = self.train_step(batch)
+            total_loss += loss
+        return total_loss / len(dataloader)
+
+    def evaluate(self, dataloader):
+        correct = total = 0
+        for images, labels in dataloader:
+            logits = self.model(images)
+            predictions = mx.argmax(logits, axis=1)
+            correct += mx.sum(predictions == labels)
+            total += labels.size
+        return correct / total
+
+
+def save_adapter(
+    model: nn.Module,
+    adapter_file: Union[str, Path],
+):
+    flattened_tree = tree_flatten(model.trainable_parameters())
+    mx.save_safetensors(str(adapter_file), dict(flattened_tree))
