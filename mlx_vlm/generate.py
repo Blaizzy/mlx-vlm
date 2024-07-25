@@ -6,7 +6,13 @@ import mlx.core as mx
 from .prompt_utils import get_message_json
 from .utils import generate, get_model_path, load, load_config, load_image_processor
 
-MODEL_TYPE = ""
+DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-4bit"
+DEFAULT_IMAGE = ("http://images.cocodataset.org/val2017/000000039769.jpg",)
+DEFAULT_PROMPT = "What are these?"
+DEFAULT_MAX_TOKENS = 100
+DEFAULT_TEMP = 0.3
+DEFAULT_TOP_P = 1.0
+DEFAULT_SEED = 0
 
 
 def parse_arguments():
@@ -16,36 +22,31 @@ def parse_arguments():
     parser.add_argument(
         "--model",
         type=str,
-        default="qnguyen3/nanoLLaVA",
+        default=DEFAULT_MODEL_PATH,
         help="The path to the local model directory or Hugging Face repo.",
     )
     parser.add_argument(
         "--image",
         type=str,
-        default="http://images.cocodataset.org/val2017/000000039769.jpg",
+        default=DEFAULT_IMAGE,
         help="URL or path of the image to process.",
     )
     parser.add_argument(
         "--prompt",
         type=str,
-        default="What are these?",
+        default=DEFAULT_PROMPT,
         help="Message to be processed by the model.",
     )
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=100,
+        default=DEFAULT_MAX_TOKENS,
         help="Maximum number of tokens to generate.",
     )
     parser.add_argument(
-        "--temp", type=float, default=0.3, help="Temperature for sampling."
+        "--temp", type=float, default=DEFAULT_TEMP, help="Temperature for sampling."
     )
-    parser.add_argument(
-        "--verbose",
-        type=bool,
-        help="Detailed output.",
-        default=True,
-    )
+    parser.add_argument("--verbose", action="store_false", help="Detailed output.")
     return parser.parse_args()
 
 
@@ -55,13 +56,6 @@ def get_model_and_processors(model_path):
     model, processor = load(model_path, {"trust_remote_code": True})
     image_processor = load_image_processor(model_path)
     return model, processor, image_processor, config
-
-
-def sample(logits, temperature=0.0):
-    if temperature == 0:
-        return mx.argmax(logits, axis=-1)
-    else:
-        return mx.random.categorical(logits * (1 / temperature))
 
 
 def main():
@@ -86,7 +80,7 @@ def main():
             )
 
     else:
-        ValueError(
+        raise ValueError(
             "Error: processor does not have 'chat_template' or 'tokenizer' attribute."
         )
 

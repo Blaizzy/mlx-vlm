@@ -140,13 +140,13 @@ class Model(nn.Module):
             input_ids, pixel_values, mask
         )
 
-        logits, cache = self.language_model(
+        logits = self.language_model(
             inputs=input_ids,
             cache=cache,
             inputs_embeds=input_embeddings,
             mask=final_attention_mask_4d,
         )
-        return logits, cache
+        return logits
 
     @staticmethod
     def from_pretrained(path_or_hf_repo: str):
