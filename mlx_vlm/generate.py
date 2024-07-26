@@ -10,7 +10,7 @@ DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-4bit"
 DEFAULT_IMAGE = ("http://images.cocodataset.org/val2017/000000039769.jpg",)
 DEFAULT_PROMPT = "What are these?"
 DEFAULT_MAX_TOKENS = 100
-DEFAULT_TEMP = 0.3
+DEFAULT_TEMP = 0.5
 DEFAULT_TOP_P = 1.0
 DEFAULT_SEED = 0
 
@@ -64,25 +64,26 @@ def main():
 
     prompt = codecs.decode(args.prompt, "unicode_escape")
 
-    if "chat_template" in processor.__dict__.keys():
-        prompt = processor.apply_chat_template(
-            [get_message_json(config["model_type"], prompt)],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+    if model.config.model_type != "paligemma":
+        if "chat_template" in processor.__dict__.keys():
+            prompt = processor.apply_chat_template(
+                [get_message_json(config["model_type"], prompt)],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
 
-    elif "tokenizer" in processor.__dict__.keys():
-        if model.config.model_type != "paligemma":
+        elif "tokenizer" in processor.__dict__.keys():
+
             prompt = processor.tokenizer.apply_chat_template(
                 [get_message_json(config["model_type"], prompt)],
                 tokenize=False,
                 add_generation_prompt=True,
             )
 
-    else:
-        raise ValueError(
-            "Error: processor does not have 'chat_template' or 'tokenizer' attribute."
-        )
+        else:
+            raise ValueError(
+                "Error: processor does not have 'chat_template' or 'tokenizer' attribute."
+            )
 
     output = generate(
         model,
