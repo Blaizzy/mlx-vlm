@@ -48,18 +48,18 @@ class TextConfig:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
 
-        dim = args.hidden_size
-        self.n_heads = n_heads = args.num_attention_heads
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
+        dim = config.hidden_size
+        self.n_heads = n_heads = config.num_attention_heads
+        self.n_kv_heads = n_kv_heads = config.num_key_value_heads
 
-        head_dim = args.hidden_size // n_heads
+        head_dim = config.hidden_size // n_heads
         self.scale = head_dim**-0.5
 
-        if hasattr(args, "attention_bias"):
-            attention_bias = args.attention_bias
+        if hasattr(config, "attention_bias"):
+            attention_bias = config.attention_bias
         else:
             attention_bias = False
 
@@ -69,14 +69,15 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
         rope_scale = (
-            1 / args.rope_scaling["factor"]
-            if args.rope_scaling is not None and args.rope_scaling["type"] == "linear"
+            1 / config.rope_scaling["factor"]
+            if config.rope_scaling is not None
+            and config.rope_scaling["type"] == "linear"
             else 1
         )
         self.rope = nn.RoPE(
             head_dim,
-            traditional=args.rope_traditional,
-            base=args.rope_theta,
+            traditional=config.rope_traditional,
+            base=config.rope_theta,
             scale=rope_scale,
         )
 
@@ -122,17 +123,17 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.num_attention_heads = args.num_attention_heads
-        self.hidden_size = args.hidden_size
-        self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size)
-        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.self_attn = Attention(config)
+        self.mlp = MLP(config.hidden_size, config.intermediate_size)
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
-            args.hidden_size, eps=args.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps
         )
-        self.args = args
+        self.config = config
 
     def __call__(
         self,
@@ -148,18 +149,18 @@ class TransformerBlock(nn.Module):
 
 
 class Qwen2Model(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.args = args
-        self.vocab_size = args.vocab_size
-        self.num_hidden_layers = args.num_hidden_layers
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.num_hidden_layers = config.num_hidden_layers
         assert self.vocab_size > 0
-        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
-            TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
+            TransformerBlock(config=config) for _ in range(config.num_hidden_layers)
         ]
-        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(
         self,
@@ -188,11 +189,11 @@ class Qwen2Model(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.args = args
-        self.model_type = args.model_type
-        self.model = Qwen2Model(args)
+        self.config = config
+        self.model_type = config.model_type
+        self.model = Qwen2Model(config)
 
     def __call__(
         self,
@@ -206,7 +207,7 @@ class LanguageModel(nn.Module):
 
     def sanitize(self, weights):
         if (
-            self.args.tie_word_embeddings
+            self.config.tie_word_embeddings
             and "language_model.model.lm_head.weight" not in weights
         ):
             weights["language_model.model.lm_head.weight"] = weights[
@@ -223,8 +224,8 @@ class LanguageModel(nn.Module):
 
     @property
     def head_dim(self):
-        return self.args.hidden_size // self.args.num_attention_heads
+        return self.config.hidden_size // self.config.num_attention_heads
 
     @property
     def n_kv_heads(self):
-        return self.args.num_key_value_heads
+        return self.config.num_key_value_heads

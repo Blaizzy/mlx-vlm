@@ -49,15 +49,15 @@ class ModelConfig:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
 
-        dim = args.hidden_size
-        self.n_heads = n_heads = args.num_attention_heads
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
-        self.num_hidden_layers = args.num_hidden_layers
+        dim = config.hidden_size
+        self.n_heads = n_heads = config.num_attention_heads
+        self.n_kv_heads = n_kv_heads = config.num_key_value_heads
+        self.num_hidden_layers = config.num_hidden_layers
 
-        self.head_dim = head_dim = args.hidden_size // n_heads
+        self.head_dim = head_dim = config.hidden_size // n_heads
         self.scale = head_dim**-0.5
 
         op_size = n_heads * head_dim + 2 * (n_kv_heads * head_dim)
@@ -65,24 +65,24 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
         rope_scale = 1.0
-        if args.rope_scaling and args.rope_scaling["type"] == "su":
+        if config.rope_scaling and config.rope_scaling["type"] == "su":
             self.rope = Phi3SuScaledRotaryEmbedding(
                 head_dim,
                 traditional=False,
-                base=args.rope_theta,
+                base=config.rope_theta,
                 scale=rope_scale,
-                max_position_embeddings=args.max_position_embeddings,
-                original_max_position_embeddings=args.original_max_position_embeddings,
-                short_factor=args.rope_scaling["short_factor"],
-                long_factor=args.rope_scaling["long_factor"],
+                max_position_embeddings=config.max_position_embeddings,
+                original_max_position_embeddings=config.original_max_position_embeddings,
+                short_factor=config.rope_scaling["short_factor"],
+                long_factor=config.rope_scaling["long_factor"],
             )
         else:
-            if args.rope_scaling and args.rope_scaling["type"] == "linear":
-                rope_scale = 1 / args.rope_scaling["factor"]
+            if config.rope_scaling and config.rope_scaling["type"] == "linear":
+                rope_scale = 1 / config.rope_scaling["factor"]
             self.rope = nn.RoPE(
                 head_dim,
-                traditional=args.rope_traditional,
-                base=args.rope_theta,
+                traditional=config.rope_traditional,
+                base=config.rope_theta,
                 scale=rope_scale,
             )
 
@@ -132,17 +132,17 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.num_attention_heads = args.num_attention_heads
-        self.hidden_size = args.hidden_size
-        self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size)
-        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.self_attn = Attention(config)
+        self.mlp = MLP(config.hidden_size, config.intermediate_size)
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
-            args.hidden_size, eps=args.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps
         )
-        self.args = args
+        self.config = config
 
     def __call__(
         self,
@@ -158,17 +158,17 @@ class TransformerBlock(nn.Module):
 
 
 class Phi3V(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.args = args
-        self.vocab_size = args.vocab_size
-        self.num_hidden_layers = args.num_hidden_layers
-        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.vision_embed_tokens = VisionModel(args)
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.num_hidden_layers = config.num_hidden_layers
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.vision_embed_tokens = VisionModel(config)
         self.layers = [
-            TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
+            TransformerBlock(config=config) for _ in range(config.num_hidden_layers)
         ]
-        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def __call__(
         self,
@@ -193,12 +193,12 @@ class Phi3V(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.model_type = args.model_type
-        self.model = Phi3V(args)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-        self.config = args
+        self.model_type = config.model_type
+        self.model = Phi3V(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.config = config
 
     def __call__(
         self,

@@ -41,14 +41,14 @@ class RMSNorm(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
 
-        dim = args.hidden_size
-        self.n_heads = n_heads = args.num_attention_heads
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
+        dim = config.hidden_size
+        self.n_heads = n_heads = config.num_attention_heads
+        self.n_kv_heads = n_kv_heads = config.num_key_value_heads
 
-        head_dim = args.hidden_size // n_heads
+        head_dim = config.hidden_size // n_heads
         self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
@@ -58,8 +58,8 @@ class Attention(nn.Module):
 
         self.rope = nn.RoPE(
             head_dim,
-            traditional=args.rope_traditional,
-            base=args.rope_theta,
+            traditional=config.rope_traditional,
+            base=config.rope_theta,
         )
 
     def __call__(
@@ -104,15 +104,17 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.num_attention_heads = args.num_attention_heads
-        self.hidden_size = args.hidden_size
-        self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size)
-        self.input_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.args = args
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.self_attn = Attention(config)
+        self.mlp = MLP(config.hidden_size, config.intermediate_size)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.config = config
 
     def __call__(
         self,
@@ -128,17 +130,17 @@ class TransformerBlock(nn.Module):
 
 
 class GemmaModel(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.args = args
-        self.vocab_size = args.vocab_size
-        self.num_hidden_layers = args.num_hidden_layers
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.num_hidden_layers = config.num_hidden_layers
         assert self.vocab_size > 0
-        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
-            TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
+            TransformerBlock(config=config) for _ in range(config.num_hidden_layers)
         ]
-        self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def __call__(
         self,
@@ -150,11 +152,10 @@ class GemmaModel(nn.Module):
         # for passing merged input embeddings
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
-
         else:
             h = inputs_embeds
 
-        h = h * (self.args.hidden_size**0.5)
+        h = h * (self.config.hidden_size**0.5)
 
         if cache is not None:
             mask = nn.MultiHeadAttention.create_additive_causal_mask(h.shape[1])
@@ -170,11 +171,11 @@ class GemmaModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.args = args
-        self.model_type = args.model_type
-        self.model = GemmaModel(args)
+        self.config = config
+        self.model_type = config.model_type
+        self.model = GemmaModel(config)
 
     def __call__(
         self,
@@ -195,3 +196,11 @@ class LanguageModel(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    @property
+    def head_dim(self):
+        return self.config.hidden_size // self.config.num_attention_heads
+
+    @property
+    def n_kv_heads(self):
+        return self.config.num_key_value_heads
