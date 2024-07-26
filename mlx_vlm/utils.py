@@ -930,8 +930,11 @@ def generate(
         if n == 0:
             prompt_time = time.perf_counter() - tic
             tic = time.perf_counter()
-
-        if token == tokenizer.eos_token_id:
+        # TODO: Fix <eos> as first token
+        # Handle special case for DeepSeek-vl-7b-chat and PaliGemma models
+        # These models may generate EOS token as the first token (n == 0)
+        # For all other cases, break the loop when EOS is encountered after the first token
+        if token == tokenizer.eos_token_id and n > 0:
             break
 
         detokenizer.add_token(token)
