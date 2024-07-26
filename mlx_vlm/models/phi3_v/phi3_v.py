@@ -49,15 +49,15 @@ class ModelConfig:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
 
-        dim = args.hidden_size
-        self.n_heads = n_heads = args.num_attention_heads
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
-        self.num_hidden_layers = args.num_hidden_layers
+        dim = config.hidden_size
+        self.n_heads = n_heads = config.num_attention_heads
+        self.n_kv_heads = n_kv_heads = config.num_key_value_heads
+        self.num_hidden_layers = config.num_hidden_layers
 
-        self.head_dim = head_dim = args.hidden_size // n_heads
+        self.head_dim = head_dim = config.hidden_size // n_heads
         self.scale = head_dim**-0.5
 
         op_size = n_heads * head_dim + 2 * (n_kv_heads * head_dim)
@@ -65,24 +65,24 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
         rope_scale = 1.0
-        if args.rope_scaling and args.rope_scaling["type"] == "su":
+        if config.rope_scaling and config.rope_scaling["type"] == "su":
             self.rope = Phi3SuScaledRotaryEmbedding(
                 head_dim,
                 traditional=False,
-                base=args.rope_theta,
+                base=config.rope_theta,
                 scale=rope_scale,
-                max_position_embeddings=args.max_position_embeddings,
-                original_max_position_embeddings=args.original_max_position_embeddings,
-                short_factor=args.rope_scaling["short_factor"],
-                long_factor=args.rope_scaling["long_factor"],
+                max_position_embeddings=config.max_position_embeddings,
+                original_max_position_embeddings=config.original_max_position_embeddings,
+                short_factor=config.rope_scaling["short_factor"],
+                long_factor=config.rope_scaling["long_factor"],
             )
         else:
-            if args.rope_scaling and args.rope_scaling["type"] == "linear":
-                rope_scale = 1 / args.rope_scaling["factor"]
+            if config.rope_scaling and config.rope_scaling["type"] == "linear":
+                rope_scale = 1 / config.rope_scaling["factor"]
             self.rope = nn.RoPE(
                 head_dim,
-                traditional=args.rope_traditional,
-                base=args.rope_theta,
+                traditional=config.rope_traditional,
+                base=config.rope_theta,
                 scale=rope_scale,
             )
 
@@ -105,11 +105,9 @@ class Attention(nn.Module):
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
-            offset = cache[0].shape[2]
-            queries = self.rope(queries, offset=offset)
-            keys = self.rope(keys, offset=offset)
-            keys = mx.concatenate([cache[0], keys], axis=2)
-            values = mx.concatenate([cache[1], values], axis=2)
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
+            keys, values = cache.update_and_fetch(keys, values)
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)
@@ -118,7 +116,7 @@ class Attention(nn.Module):
             queries, keys, values, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output), (keys, values)
+        return self.o_proj(output)
 
 
 class MLP(nn.Module):
@@ -134,17 +132,17 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.num_attention_heads = args.num_attention_heads
-        self.hidden_size = args.hidden_size
-        self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size)
-        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.self_attn = Attention(config)
+        self.mlp = MLP(config.hidden_size, config.intermediate_size)
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
-            args.hidden_size, eps=args.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps
         )
-        self.args = args
+        self.config = config
 
     def __call__(
         self,
@@ -152,25 +150,25 @@ class TransformerBlock(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
-        r, cache = self.self_attn(self.input_layernorm(x), mask, cache)
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         out = h + r
-        return out, cache
+        return out
 
 
 class Phi3V(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.args = args
-        self.vocab_size = args.vocab_size
-        self.num_hidden_layers = args.num_hidden_layers
-        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.vision_embed_tokens = VisionModel(args)
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.num_hidden_layers = config.num_hidden_layers
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.vision_embed_tokens = VisionModel(config)
         self.layers = [
-            TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
+            TransformerBlock(config=config) for _ in range(config.num_hidden_layers)
         ]
-        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def __call__(
         self,
@@ -179,7 +177,6 @@ class Phi3V(nn.Module):
         image_sizes=None,
         cache=None,
     ):
-        # print('inputs', inputs) # debug
         h = self.embed_tokens(inputs)
         p = np.argwhere(inputs < 0).tolist()
         if pixel_values is not None:
@@ -190,18 +187,18 @@ class Phi3V(nn.Module):
             mask = mask.astype(h.dtype)
         if cache is None:
             cache = [None] * len(self.layers)
-        for i, layer in enumerate(self.layers):
-            h, cache[i] = layer(h, mask, cache[i])
-        return self.norm(h), cache
+        for layer, c in zip(self.layers, cache):
+            h = layer(h, mask, c)
+        return self.norm(h)
 
 
 class Model(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.model_type = args.model_type
-        self.model = Phi3V(args)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-        self.config = args
+        self.model_type = config.model_type
+        self.model = Phi3V(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.config = config
 
     def __call__(
         self,
@@ -210,8 +207,8 @@ class Model(nn.Module):
         mask=None,
         cache=None,
     ):
-        out, cache = self.model(inputs, pixel_values, mask, cache)
-        return self.lm_head(out).astype(self.lm_head.weight.dtype), cache
+        out = self.model(inputs, pixel_values, mask, cache)
+        return self.lm_head(out).astype(self.lm_head.weight.dtype)
 
     @property
     def layers(self):
@@ -219,11 +216,11 @@ class Model(nn.Module):
 
     @property
     def head_dim(self):
-        return self.args.hidden_size // self.args.num_attention_heads
+        return self.config.hidden_size // self.config.num_attention_heads
 
     @property
     def n_kv_heads(self):
-        return self.args.num_key_value_heads
+        return self.config.num_key_value_heads
 
     @property
     def language_model(self):

@@ -28,3 +28,28 @@ def get_message_json(model_name, prompt):
         raise ValueError(f"Unsupported model: {model_name}")
 
     return message
+
+
+def apply_chat_template(processor, config, prompt):
+    message = get_message_json(config["model_type"], prompt)
+
+    if "chat_template" in processor.__dict__.keys() and hasattr(
+        processor, "default_chat_template"
+    ):
+        return processor.apply_chat_template(
+            [message],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    elif "tokenizer" in processor.__dict__.keys():
+        return processor.tokenizer.apply_chat_template(
+            [message],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    else:
+        raise ValueError(
+            "Error: processor does not have 'chat_template' or 'tokenizer' attribute."
+        )

@@ -16,13 +16,11 @@ class TestModels(unittest.TestCase):
             model.update(tree_map(lambda p: p.astype(t), model.parameters()))
 
             inputs = mx.array([[0, 1]])
-            outputs, cache = model(inputs)
+            outputs = model(inputs)
             self.assertEqual(outputs.shape, (batch_size, 2, vocab_size))
             self.assertEqual(outputs.dtype, t)
 
-            outputs, cache = model(
-                mx.argmax(outputs[0, -1:, :], keepdims=True), cache=cache
-            )
+            outputs = model(mx.argmax(outputs[0, -1:, :], keepdims=True), cache=None)
             self.assertEqual(outputs.shape, (batch_size, 1, vocab_size))
             self.assertEqual(outputs.dtype, t)
 
@@ -101,7 +99,7 @@ class TestModels(unittest.TestCase):
             layer_norm_eps=1e-6,
         )
 
-        args = llava_bunny.ModelConfig(
+        config = llava_bunny.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
             model_type="llava-qwen2",
@@ -118,27 +116,27 @@ class TestModels(unittest.TestCase):
             vocab_size=151936,
         )
 
-        model = llava_bunny.Model(args)
+        model = llava_bunny.Model(config)
 
         self.language_test_runner(
             model.language_model,
-            args.text_config.model_type,
-            args.text_config.vocab_size,
-            args.text_config.num_hidden_layers,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
         )
 
         self.mm_projector_test_runner(
             model.mm_projector,
-            args.vision_config.hidden_size,
-            args.text_config.hidden_size,
+            config.vision_config.hidden_size,
+            config.text_config.hidden_size,
         )
 
         self.vision_test_runner(
             model.vision_tower.vision_tower,
-            args.vision_config.model_type,
-            args.vision_config.hidden_size,
-            args.vision_config.num_channels,
-            (args.vision_config.image_size, args.vision_config.image_size),
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
         )
 
     def test_llava_next(self):
@@ -172,7 +170,7 @@ class TestModels(unittest.TestCase):
             layer_norm_eps=1e-6,
         )
 
-        args = llava_next.ModelConfig(
+        config = llava_next.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
             model_type="llava",
@@ -183,27 +181,27 @@ class TestModels(unittest.TestCase):
             vision_feature_select_strategy="default",
         )
 
-        model = llava_next.Model(args)
+        model = llava_next.Model(config)
 
         self.language_test_runner(
             model.language_model,
-            args.text_config.model_type,
-            args.text_config.vocab_size,
-            args.text_config.num_hidden_layers,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
         )
 
         self.mm_projector_test_runner(
             model.multi_modal_projector,
-            args.vision_config.hidden_size,
-            args.text_config.hidden_size,
+            config.vision_config.hidden_size,
+            config.text_config.hidden_size,
         )
 
         self.vision_test_runner(
             model.vision_tower,
-            args.vision_config.model_type,
-            args.vision_config.hidden_size,
-            args.vision_config.num_channels,
-            (args.vision_config.image_size, args.vision_config.image_size),
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
         )
 
     def test_llava(self):
@@ -237,7 +235,7 @@ class TestModels(unittest.TestCase):
             layer_norm_eps=1e-6,
         )
 
-        args = llava.ModelConfig(
+        config = llava.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
             model_type="llava",
@@ -248,27 +246,27 @@ class TestModels(unittest.TestCase):
             vision_feature_select_strategy="default",
         )
 
-        model = llava.Model(args)
+        model = llava.Model(config)
 
         self.language_test_runner(
             model.language_model,
-            args.text_config.model_type,
-            args.text_config.vocab_size,
-            args.text_config.num_hidden_layers,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
         )
 
         self.mm_projector_test_runner(
             model.multi_modal_projector,
-            args.vision_config.hidden_size,
-            args.text_config.hidden_size,
+            config.vision_config.hidden_size,
+            config.text_config.hidden_size,
         )
 
         self.vision_test_runner(
             model.vision_tower,
-            args.vision_config.model_type,
-            args.vision_config.hidden_size,
-            args.vision_config.num_channels,
-            (args.vision_config.image_size, args.vision_config.image_size),
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
         )
 
     def test_idefics2(self):
@@ -308,7 +306,7 @@ class TestModels(unittest.TestCase):
             num_key_value_heads=4,
         )
 
-        args = idefics2.ModelConfig(
+        config = idefics2.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
             perceiver_config=perceiver_config,
@@ -317,21 +315,21 @@ class TestModels(unittest.TestCase):
             image_token_index=32001,
         )
 
-        model = idefics2.Model(args)
+        model = idefics2.Model(config)
 
         self.language_test_runner(
             model.language_model,
-            args.text_config.model_type,
-            args.text_config.vocab_size,
-            args.text_config.num_hidden_layers,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
         )
 
         self.vision_test_runner(
             model.vision_model,
-            args.vision_config.model_type,
-            args.vision_config.hidden_size,
-            args.vision_config.num_channels,
-            (args.vision_config.image_size, args.vision_config.image_size),
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
         )
 
     def test_paligemma(self):
@@ -363,7 +361,7 @@ class TestModels(unittest.TestCase):
             layer_norm_eps=1e-6,
         )
 
-        args = paligemma.ModelConfig(
+        config = paligemma.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
             model_type="paligemma",
@@ -373,27 +371,27 @@ class TestModels(unittest.TestCase):
             vocab_size=257216,
         )
 
-        model = paligemma.Model(args)
+        model = paligemma.Model(config)
 
         self.language_test_runner(
             model.language_model,
-            args.text_config.model_type,
-            args.text_config.vocab_size,
-            args.text_config.num_hidden_layers,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
         )
 
         self.mm_projector_test_runner(
             model.multi_modal_projector,
-            args.vision_config.hidden_size,
-            args.text_config.hidden_size,
+            config.vision_config.hidden_size,
+            config.text_config.hidden_size,
         )
 
         self.vision_test_runner(
             model.vision_tower,
-            args.vision_config.model_type,
-            args.vision_config.hidden_size,
-            args.vision_config.num_channels,
-            (args.vision_config.image_size, args.vision_config.image_size),
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
         )
 
     def test_multi_modality(self):
@@ -436,7 +434,7 @@ class TestModels(unittest.TestCase):
             },
         )
 
-        args = multi_modality.ModelConfig(
+        config = multi_modality.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
             aligner_config=aligner_config,
@@ -446,27 +444,27 @@ class TestModels(unittest.TestCase):
             vocab_size=32000,
         )
 
-        model = multi_modality.Model(args)
+        model = multi_modality.Model(config)
 
         self.language_test_runner(
             model.language_model,
-            args.text_config.model_type,
-            args.text_config.vocab_size,
-            args.text_config.num_hidden_layers,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
         )
 
         self.mm_projector_test_runner(
             model.aligner,
-            args.vision_config.hidden_size,
-            args.text_config.hidden_size,
+            config.vision_config.hidden_size,
+            config.text_config.hidden_size,
         )
 
         self.vision_test_runner(
             model.vision_model,
-            args.vision_config.model_type,
-            args.vision_config.hidden_size,
-            args.vision_config.num_channels,
-            (args.vision_config.image_size, args.vision_config.image_size),
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
         )
 
     def test_phi3_v(self):
@@ -482,7 +480,7 @@ class TestModels(unittest.TestCase):
             num_img_tokens=144,
         )
 
-        args = phi3_v.ModelConfig(
+        config = phi3_v.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
             **{
@@ -603,21 +601,21 @@ class TestModels(unittest.TestCase):
             },
         )
 
-        model = phi3_v.Model(args)
+        model = phi3_v.Model(config)
 
         self.language_test_runner(
             model.language_model,
-            args.model_type,
-            args.vocab_size,
-            args.num_hidden_layers,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
         )
 
         self.vision_test_runner(
             model.vision_model,
-            args.vision_config.model_type,
-            args.vision_config.hidden_size,
-            args.vision_config.num_channels,
-            (args.vision_config.image_size, args.vision_config.image_size),
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
         )
 
 

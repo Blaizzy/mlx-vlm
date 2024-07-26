@@ -37,14 +37,14 @@ class TextConfig:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
 
-        dim = args.hidden_size
-        self.n_heads = n_heads = args.num_attention_heads
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
+        dim = config.hidden_size
+        self.n_heads = n_heads = config.num_attention_heads
+        self.n_kv_heads = n_kv_heads = config.num_key_value_heads
 
-        head_dim = args.hidden_size // n_heads
+        head_dim = config.hidden_size // n_heads
         self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
@@ -54,8 +54,8 @@ class Attention(nn.Module):
 
         self.rope = nn.RoPE(
             head_dim,
-            traditional=args.rope_traditional,
-            base=args.rope_theta,
+            traditional=config.rope_traditional,
+            base=config.rope_theta,
         )
 
     def __call__(
@@ -74,11 +74,9 @@ class Attention(nn.Module):
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
-            key_cache, value_cache = cache
-            queries = self.rope(queries, offset=key_cache.shape[2])
-            keys = self.rope(keys, offset=key_cache.shape[2])
-            keys = mx.concatenate([key_cache, keys], axis=2)
-            values = mx.concatenate([value_cache, values], axis=2)
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
+            keys, values = cache.update_and_fetch(keys, values)
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)
@@ -87,7 +85,7 @@ class Attention(nn.Module):
             queries, keys, values, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output), (keys, values)
+        return self.o_proj(output)
 
 
 class MLP(nn.Module):
@@ -102,17 +100,17 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.num_attention_heads = args.num_attention_heads
-        self.hidden_size = args.hidden_size
-        self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size)
-        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.self_attn = Attention(config)
+        self.mlp = MLP(config.hidden_size, config.intermediate_size)
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
-            args.hidden_size, eps=args.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps
         )
-        self.args = args
+        self.config = config
 
     def __call__(
         self,
@@ -120,27 +118,27 @@ class TransformerBlock(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
-        r, cache = self.self_attn(self.input_layernorm(x), mask, cache)
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         out = h + r
-        return out, cache
+        return out
 
 
 class LanguageModel(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.args = args
-        self.model_type = args.model_type
-        self.vocab_size = args.vocab_size
-        self.num_hidden_layers = args.num_hidden_layers
+        self.config = config
+        self.model_type = config.model_type
+        self.vocab_size = config.vocab_size
+        self.num_hidden_layers = config.num_hidden_layers
         assert self.vocab_size > 0
-        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
-            TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
+            TransformerBlock(config=config) for _ in range(config.num_hidden_layers)
         ]
-        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(
         self,
@@ -163,10 +161,10 @@ class LanguageModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        for e, layer in enumerate(self.layers):
-            h, cache[e] = layer(h, mask, cache[e])
+        for layer, c in zip(self.layers, cache):
+            h = layer(h, mask, c)
 
-        return self.lm_head(self.norm(h)), cache
+        return self.lm_head(self.norm(h))
 
     def sanitize(self, weights):
         # Remove unused precomputed rotary freqs
@@ -177,3 +175,11 @@ class LanguageModel(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    @property
+    def head_dim(self):
+        return self.config.hidden_size // self.config.num_attention_heads
+
+    @property
+    def n_kv_heads(self):
+        return self.config.num_key_value_heads
