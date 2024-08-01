@@ -1,12 +1,10 @@
 import argparse
-from typing import Optional
 
 import gradio as gr
-import mlx.core as mx
 
 from mlx_vlm import load
 
-from .prompt_utils import apply_chat_template, get_message_json
+from .prompt_utils import apply_chat_template
 from .utils import load, load_config, load_image_processor, stream_generate
 
 
