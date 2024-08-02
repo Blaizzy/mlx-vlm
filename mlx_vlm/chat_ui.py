@@ -1,20 +1,11 @@
 import argparse
-from typing import Optional
 
 import gradio as gr
-import mlx.core as mx
 
 from mlx_vlm import load
 
-from .prompt_utils import get_message_json
-from .utils import (
-    generate_step,
-    load,
-    load_config,
-    load_image_processor,
-    prepare_inputs,
-    sample,
-)
+from .prompt_utils import apply_chat_template
+from .utils import load, load_config, load_image_processor, stream_generate
 
 
 def parse_arguments():
@@ -36,95 +27,22 @@ model, processor = load(args.model, {"trust_remote_code": True})
 image_processor = load_image_processor(args.model)
 
 
-def generate(
-    model,
-    processor,
-    image: str,
-    prompt: str,
-    image_processor=None,
-    temp: float = 0.0,
-    max_tokens: int = 100,
-    repetition_penalty: Optional[float] = None,
-    repetition_context_size: Optional[int] = None,
-    top_p: float = 1.0,
-):
-
-    if image_processor is not None:
-        tokenizer = processor
-    else:
-        tokenizer = processor.tokenizer
-
-    image_token_index = model.config.image_token_index
-    input_ids, pixel_values, mask = prepare_inputs(
-        image_processor, processor, image, prompt, image_token_index
-    )
-    logits, cache = model(input_ids, pixel_values, mask=mask)
-    logits = logits[:, -1, :]
-    y, _ = sample(logits, temp, top_p)
-
-    detokenizer = processor.detokenizer
-    detokenizer.reset()
-
-    detokenizer.add_token(y.item())
-
-    for (token, _), n in zip(
-        generate_step(
-            model.language_model,
-            logits,
-            mask,
-            cache,
-            temp,
-            repetition_penalty,
-            repetition_context_size,
-            top_p,
-        ),
-        range(max_tokens),
-    ):
-        token = token.item()
-
-        if token == tokenizer.eos_token_id:
-            break
-
-        detokenizer.add_token(token)
-        detokenizer.finalize()
-        yield detokenizer.last_segment
-
-
 def chat(message, history, temperature, max_tokens):
-
     chat = []
-    if len(message["files"]) >= 1:
-        chat.append(get_message_json(config["model_type"], message["text"]))
+    if len(message.files) >= 1:
+        chat.append(message.text)
     else:
         raise gr.Error("Please upload an image. Text only chat is not supported.")
 
-    files = message["files"][-1]
-    if "chat_template" in processor.__dict__.keys():
-        messages = processor.apply_chat_template(
-            chat,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-    elif "tokenizer" in processor.__dict__.keys():
-        if model.config.model_type != "paligemma":
-            messages = processor.tokenizer.apply_chat_template(
-                chat,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        else:
-            messages = message["text"]
+    files = message.files[-1].path
+    if model.config.model_type != "paligemma":
+        messages = apply_chat_template(processor, config, chat)
+    else:
+        messages = message.text
 
     response = ""
-    for chunk in generate(
-        model,
-        processor,
-        files,
-        messages,
-        image_processor,
-        temperature,
-        max_tokens,
+    for chunk in stream_generate(
+        model, processor, files, messages, image_processor, max_tokens, temp=temperature
     ):
         response += chunk
         yield response
