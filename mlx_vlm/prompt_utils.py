@@ -33,9 +33,7 @@ def get_message_json(model_name, prompt):
 def apply_chat_template(processor, config, prompt):
     message = get_message_json(config["model_type"], prompt)
 
-    if "chat_template" in processor.__dict__.keys() and hasattr(
-        processor, "default_chat_template"
-    ):
+    if "chat_template" in processor.__dict__.keys():
         return processor.apply_chat_template(
             [message],
             tokenize=False,
