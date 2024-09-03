@@ -24,14 +24,12 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-from .models.base import BaseImageProcessor
+from .models.base import BaseImageProcessor, KVCache
 from .sample_utils import top_p_sampling
-from .tokenizer_utils import load_tokenizer
+from .tokenizer_utils import TokenizerWrapper, load_tokenizer
 
 # Constants
-MODEL_REMAPPING = {
-    "llava-qwen2": "nanoLlava",
-}
+MODEL_REMAPPING = {"llava-qwen2": "llava_bunny", "bunny-llama": "llava_bunny"}
 
 MAX_FILE_SIZE_GB = 5
 
@@ -150,15 +148,21 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     model_class, model_type = get_model_and_args(config=config)
 
-    if model_type == "nanoLlava":
+    if model_type == "llava_bunny":
         vision_config = AutoConfig.from_pretrained(config["mm_vision_tower"])
         text_config = AutoConfig.from_pretrained(config["language_model"])
         vision_config = vision_config.to_dict()
         text_config = text_config.to_dict()
-        config["vision_config"] = vision_config["vision_config"]
+        config["vision_config"] = {
+            **vision_config["vision_config"],
+            **config.get("vision_config", {}),
+        }
         config["text_config"] = text_config
     if model_type == "idefics2":
         config = AutoConfig.from_pretrained(model_path).to_dict()
+    if model_type == "phi3_v":
+        config["vision_config"] = config["img_processor"]
+        config["text_config"] = {}
 
     model_config = model_class.ModelConfig.from_dict(config)
 
@@ -191,7 +195,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         weights = model_class.LanguageModel(model_config.text_config).sanitize(
             weights=weights
         )
-
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized
         class_predicate = (
@@ -499,10 +502,8 @@ def quantize_model(
     divisor = 64
     if any(vision_intermediate_size % size != 0 for size in [64, 128]):
         for name, module in model.named_modules():
-            if (
-                isinstance(module, nn.Linear)
-                or isinstance(module, nn.Embedding)
-                and ("vision_model" in name or "vision_tower" in name)
+            if isinstance(module, nn.Linear) and (
+                "vision_model" in name or "vision_tower" in name
             ):
                 out_features, in_features = module.weight.shape
 
@@ -517,28 +518,25 @@ def quantize_model(
                     if in_features % divisor != 0
                     else in_features
                 )
-                if (
-                    out_features == vision_intermediate_size
-                    or in_features == vision_intermediate_size
-                ):
 
-                    # If padding is needed, proceed
-                    if (
-                        new_out_features != out_features
-                        or new_in_features != in_features
-                    ):
-                        # Create new weight and bias tensors
-                        new_weight = mx.zeros((new_out_features, new_in_features))
-                        new_bias = mx.zeros((new_out_features))
+                # If padding is needed, proceed
+                if new_out_features != out_features or new_in_features != in_features:
+                    # Create new weight and bias tensors
+                    new_weight = mx.zeros((new_out_features, new_in_features))
+                    new_bias = mx.zeros((new_out_features))
 
-                        # Copy existing weights and biases to the new tensors
-                        new_weight[:out_features, :in_features] = module.weight
-                        module.weight = new_weight
+                    # Copy existing weights and biases to the new tensors
+                    new_weight[:out_features, :in_features] = module.weight
+                    module.weight = new_weight
 
-                        if hasattr(module, "bias"):
-                            new_bias[:out_features] = module.bias
-                            module.bias = new_bias
+                    if hasattr(module, "bias"):
+                        new_bias[:out_features] = module.bias
+                        module.bias = new_bias
 
+    # Ensure vision_config exists in quantized_config
+    quantized_config.setdefault("vision_config", {})
+
+    # Update intermediate_size
     quantized_config["vision_config"]["intermediate_size"] = (
         ((vision_intermediate_size // divisor) + 1) * divisor
         if vision_intermediate_size % divisor != 0
@@ -705,49 +703,59 @@ def prepare_inputs(image_processor, processor, image, prompt, image_token_index)
         pixel_values = mx.array(inputs["pixel_values"])
         input_ids = mx.array(inputs["input_ids"])
         mask = mx.array(inputs["attention_mask"])
+        if "image_sizes" in inputs:
+            return input_ids, pixel_values, inputs["image_sizes"]
     return input_ids, pixel_values, mask
 
 
-def sample(logits: mx.array, temp: float, top_p: float) -> Tuple[mx.array, float]:
-    softmax_logits = mx.softmax(logits)
-
-    if temp == 0:
-        token = mx.argmax(logits, axis=-1)
-    else:
-        if top_p > 0 and top_p < 1.0:
-            token = top_p_sampling(logits, top_p, temp)
-        else:
-            token = mx.random.categorical(logits * (1 / temp))
-
-    prob = softmax_logits[0, token]
-    return token, prob
-
-
 def generate_step(
+    input_ids: mx.array,
     model: nn.Module,
-    prompt: mx.array,
-    mask: mx.array,
-    cache=None,
+    pixel_values,
+    mask,
     temp: float = 0.0,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
+    logit_bias: Optional[Dict[int, float]] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
-    A generator producing text based on the given prompt from the model.
+    A generator producing token ids based on the given prompt from the model.
 
     Args:
         prompt (mx.array): The input prompt.
         model (nn.Module): The model to use for generation.
         temp (float): The temperature for sampling, if 0 the argmax is used.
-        repetition_penalty (float, optional): The penalty factor for repeating tokens.
-        repetition_context_size (int, optional): The number of tokens to consider for repetition penalty (default 20).
-        top_p (float, optional): Nulceus sampling, higher means model considers more less likely words
+          Default: ``0``.
+        repetition_penalty (float, optional): The penalty factor for repeating
+          tokens.
+        repetition_context_size (int, optional): The number of tokens to
+          consider for repetition penalty. Default: ``20``.
+        top_p (float, optional): Nulceus sampling, higher means model considers
+          more less likely words.
+        logit_bias (dictionary, optional): Additive logit bias.
 
     Yields:
-        Generator[Tuple[mx.array, mx.array]]: A generator producing
-        one token and probability per call.
+        Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
+          one token and a vector of log probabilities.
     """
+
+    def sample(logits: mx.array) -> Tuple[mx.array, float]:
+        if logit_bias:
+            indices = mx.array(list(logit_bias.keys()))
+            values = mx.array(list(logit_bias.values()))
+            logits[:, indices] += values
+        logprobs = logits - mx.logsumexp(logits)
+
+        if temp == 0:
+            token = mx.argmax(logits, axis=-1)
+        else:
+            if top_p > 0 and top_p < 1.0:
+                token = top_p_sampling(logits, top_p, temp)
+            else:
+                token = mx.random.categorical(logits * (1 / temp))
+
+        return token, logprobs
 
     if repetition_penalty and (
         repetition_penalty < 0 or not isinstance(repetition_penalty, float)
@@ -756,30 +764,101 @@ def generate_step(
             f"repetition_penalty must be a non-negative float, got {repetition_penalty}"
         )
 
-    y, prob = sample(prompt, temp, top_p)
+    y = input_ids
+    if hasattr(model.language_model, "make_cache"):
+        cache = model.language_model.make_cache()
+    else:
+        kv_heads = (
+            [model.language_model.n_kv_heads] * len(model.language_model.layers)
+            if isinstance(model.language_model.n_kv_heads, int)
+            else model.language_model.n_kv_heads
+        )
+        cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
 
-    repetition_context = prompt.tolist()
+    repetition_context = input_ids.tolist()
 
     if repetition_context_size:
         repetition_context = repetition_context[-repetition_context_size:]
 
-    while True:
-        logits, cache = model(y[None], mask=mask, cache=cache)
+    def _step(y):
+        nonlocal repetition_context
+        logits = model.language_model(y[None], cache=cache, mask=mask)
         logits = logits[:, -1, :]
 
         if repetition_penalty:
             logits = apply_repetition_penalty(
                 logits, repetition_context, repetition_penalty
             )
-            y, prob = sample(logits, temp, top_p)
+            y, logprobs = sample(logits)
             repetition_context.append(y.item())
         else:
-            y, prob = sample(logits, temp, top_p)
+            y, logprobs = sample(logits)
 
         if repetition_context_size:
             if len(repetition_context) > repetition_context_size:
                 repetition_context = repetition_context[-repetition_context_size:]
-        yield y, prob
+        return y, logprobs.squeeze(0)
+
+    logits = model(input_ids, pixel_values, cache=cache, mask=mask)
+    logits = logits[:, -1, :]
+    y, logprobs = sample(logits)
+    mx.async_eval(y)
+    while True:
+        next_y, next_logprobs = _step(y)
+        mx.async_eval(next_y)
+        yield y.item(), logprobs
+        y, logprobs = next_y, next_logprobs
+
+
+def stream_generate(
+    model: nn.Module,
+    processor: PreTrainedTokenizer,
+    image: str,
+    prompt: str,
+    image_processor=None,
+    max_tokens: int = 100,
+    **kwargs,
+) -> Union[str, Generator[str, None, None]]:
+    """
+    A generator producing text based on the given prompt from the model.
+
+    Args:
+        prompt (mx.array): The input prompt.
+        model (nn.Module): The model to use for generation.
+        max_tokens (int): The ma
+        kwargs: The remaining options get passed to :func:`generate_step`.
+          See :func:`generate_step` for more details.
+
+    Yields:
+        Generator[Tuple[mx.array, mx.array]]: A generator producing text.
+    """
+
+    if image_processor is not None:
+        tokenizer = processor
+    else:
+        tokenizer = processor.tokenizer
+
+    image_token_index = model.config.image_token_index
+    input_ids, pixel_values, mask = prepare_inputs(
+        image_processor, processor, image, prompt, image_token_index
+    )
+
+    detokenizer = processor.detokenizer
+
+    detokenizer.reset()
+    for (token, _), n in zip(
+        generate_step(input_ids, model, pixel_values, mask, **kwargs),
+        range(max_tokens),
+    ):
+        if token == tokenizer.eos_token_id:
+            break
+        detokenizer.add_token(token)
+
+        # Yield the last segment if streaming
+        yield detokenizer.last_segment
+
+    detokenizer.finalize()
+    yield detokenizer.last_segment
 
 
 def generate(
@@ -812,6 +891,7 @@ def generate(
        repetition_penalty (float, optional): The penalty factor for repeating tokens.
        repetition_context_size (int, optional): The number of tokens to consider for repetition penalty.
     """
+
     if verbose:
         print("=" * 10)
         print("Image:", image, "\n")
@@ -828,22 +908,17 @@ def generate(
     input_ids, pixel_values, mask = prepare_inputs(
         image_processor, processor, image, prompt, image_token_index
     )
-    logits, cache = model(input_ids, pixel_values, mask)
-    logits = logits[:, -1, :]
-    y, _ = sample(logits, temp, top_p)
 
     tic = time.perf_counter()
     detokenizer = processor.detokenizer
     detokenizer.reset()
 
-    detokenizer.add_token(y.item())
-
     for (token, prob), n in zip(
         generate_step(
-            model.language_model,
-            logits,
+            input_ids,
+            model,
+            pixel_values,
             mask,
-            cache,
             temp,
             repetition_penalty,
             repetition_context_size,
@@ -851,12 +926,15 @@ def generate(
         ),
         range(max_tokens),
     ):
-        token = token.item()
+
         if n == 0:
             prompt_time = time.perf_counter() - tic
             tic = time.perf_counter()
-
-        if token == tokenizer.eos_token_id:
+        # TODO: Fix <eos> as first token
+        # Handle special case for DeepSeek-vl-7b-chat and PaliGemma models
+        # These models may generate EOS token as the first token (n == 0)
+        # For all other cases, break the loop when EOS is encountered after the first token
+        if token == tokenizer.eos_token_id and n > 0:
             break
 
         detokenizer.add_token(token)

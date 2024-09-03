@@ -124,7 +124,7 @@ class MHA(nn.Module):
         self.in_proj = nn.Linear(dims, dims * 3, bias=bias)
         self.out_proj = nn.Linear(dims, dims, bias=bias)
 
-    def __call__(self, queries: mx.array, kv: mx.array, mask=None, cache=None):
+    def __call__(self, queries: mx.array, kv: mx.array, mask=None):
         B, L, D = queries.shape
 
         qkv = self.in_proj(queries)

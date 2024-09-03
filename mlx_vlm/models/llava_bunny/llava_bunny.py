@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from functools import partial, reduce
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -182,13 +182,13 @@ class Model(nn.Module):
         input_ids: mx.array,
         pixel_values: mx.array,
         mask: Optional[mx.array] = None,
-        cache=None,
+        cache: Optional[Tuple[mx.array, mx.array]] = None,
     ):
         input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
-        logits, cache = self.language_model(
+        logits = self.language_model(
             inputs=input_ids, cache=cache, inputs_embeds=input_embeddings
         )
-        return logits, cache
+        return logits
 
     @staticmethod
     def from_pretrained(path_or_hf_repo: str):

@@ -364,10 +364,10 @@ class Model(nn.Module):
     ):
 
         input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
-        logits, cache = self.language_model(
+        logits = self.language_model(
             input_ids, cache=cache, inputs_embeds=input_embeddings
         )
-        return logits, cache
+        return logits
 
     @staticmethod
     def from_pretrained(path_or_hf_repo: str):

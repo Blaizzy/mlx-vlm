@@ -3,6 +3,6 @@ mlx>=0.14
 numpy
 transformers>=4.39.3
 scipy==1.13.1
-gradio
+gradio==4.40.0
 Pillow
 requests
