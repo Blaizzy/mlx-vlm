@@ -688,24 +688,56 @@ def load_image(image_source: Union[str, Path, BytesIO]):
         )
 
 
-def prepare_inputs(image_processor, processor, image, prompt, image_token_index):
+def prepare_inputs(image_processor, processor, images, prompts, image_token_index):
     from transformers.image_utils import load_image
 
-    mask = None
-    if isinstance(image, str):
-        image = load_image(image)
+    # from pprint import pprint
+    if not isinstance(images, list):
+        images = [images]
+    if not isinstance(prompts, list):
+        prompts = [prompts]
+
+    # print(len(images), len(prompts))
+    # print(images)
+    # pprint(prompts)
+    assert len(images) == len(
+        prompts
+    ), f"Number of images ({len(images)}) and prompts ({len(prompts)}) must match"
+
+    masks = None
+    loaded_images = [load_image(img) if isinstance(img, str) else img for img in images]
 
     if image_processor is not None:
-        text_chunks = [processor(chunk).input_ids for chunk in prompt.split("<image>")]
-        input_ids = mx.array([text_chunks[0] + [image_token_index] + text_chunks[1]])
-        pixel_values = image_processor.preprocess(images=[image])[0]
-        pixel_values = mx.array(np.expand_dims(pixel_values, axis=0))
+        text_chunks = [
+            [processor(chunk).input_ids for chunk in prompt.split("<image>")]
+            for prompt in prompts
+        ]
+
+        # Find the maximum length for padding
+        max_length = max(
+            sum(len(chunk) for chunk in chunks) + 1 for chunks in text_chunks
+        )
+
+        # Pad and create input_ids
+        input_ids = []
+        for chunks in text_chunks:
+            ids = chunks[0] + [image_token_index] + chunks[1]
+            padding = [processor.pad_token_id] * (max_length - len(ids))
+            input_ids.append(mx.array(ids + padding))
+
+        input_ids = mx.array(input_ids)
+        pixel_values = image_processor.preprocess(images=loaded_images)
+        pixel_values = mx.array(np.stack(pixel_values))
+        masks = mx.array([(ids != processor.pad_token_id) for ids in input_ids]).astype(
+            mx.int32
+        )
     else:
-        inputs = processor(prompt, image, return_tensors="np")
+        inputs = processor(prompts, loaded_images, return_tensors="np", padding=True)
         pixel_values = mx.array(inputs["pixel_values"])
         input_ids = mx.array(inputs["input_ids"])
-        mask = mx.array(inputs["attention_mask"])
-    return input_ids, pixel_values, mask
+        masks = mx.array(inputs["attention_mask"])
+
+    return input_ids, pixel_values, masks
 
 
 def sample(logits: mx.array, temp: float, top_p: float) -> Tuple[mx.array, float]:
