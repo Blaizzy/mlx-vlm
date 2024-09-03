@@ -704,7 +704,7 @@ def load_image(image_source: Union[str, Path, BytesIO]):
         )
 
 
-def prepare_inputs(image_processor, processor, image, prompt, image_token_index):
+def prepare_inputs(image_processor, processor, images, prompts, image_token_index):
     from transformers.image_utils import load_image
 
     mask = None

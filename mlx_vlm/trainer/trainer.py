@@ -2,6 +2,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from pprint import pprint
 from typing import Union
 
 import mlx.core as mx
@@ -10,38 +11,88 @@ import numpy as np
 from mlx.utils import tree_flatten
 from PIL import Image
 
+from mlx_vlm.prompt_utils import get_message_json
+from mlx_vlm.utils import prepare_inputs
+
 
 class ImageTextDataset:
-    def __init__(self, image_dir, caption_file, img_size=(224, 224)):
-        self.image_dir = image_dir
-        self.img_size = img_size
-        self.image_captions = []
-        self.unique_captions = set()
-
-        with open(caption_file, "r") as f:
-            for line in f:
-                image_name, caption = line.strip().split(",")
-                self.image_captions.append((image_name, caption))
-                self.unique_captions.add(caption)
-
-        self.caption_to_id = {
-            caption: i for i, caption in enumerate(self.unique_captions)
-        }
+    def __init__(
+        self,
+        hf_dataset,
+        config,
+        processor,
+        image_processor=None,
+        take=None,
+        split="train",
+    ):
+        self.dataset = hf_dataset[split]
+        if take is not None:
+            self.dataset = self.dataset.take(take)
+        self.processor = processor
+        self.config = config
+        self.image_processor = image_processor
 
     def __len__(self):
-        return len(self.image_captions)
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        image_name, caption = self.image_captions[idx]
-        image_path = os.path.join(self.image_dir, image_name)
+        item = self.dataset[idx]
 
-        image = Image.open(image_path).convert("RGB")
-        image = image.resize(self.img_size)
-        image_array = np.array(image).astype(np.float32) / 255.0
+        # Process image data
+        image = item["image"]
 
-        caption_id = self.caption_to_id[caption]
+        conversations = item["conversations"]
+        # check if conversation is a list of list
+        if isinstance(conversations, list) and isinstance(conversations[0], list):
+            prompts = []
+            for conversation in conversations:
+                if "chat_template" in self.processor.__dict__.keys():
+                    prompts.append(
+                        self.processor.apply_chat_template(conversation, tokenize=False)
+                    )
 
-        return mx.array(image_array), mx.array(caption_id, dtype=mx.int32)
+                elif "tokenizer" in self.processor.__dict__.keys():
+                    if self.config["model_type"] != "paligemma":
+                        prompts.append(
+                            self.processor.tokenizer.apply_chat_template(
+                                conversation, tokenize=False
+                            )
+                        )
+                else:
+                    raise ValueError(
+                        "Processor does not have 'chat_template' or 'tokenizer' attribute."
+                    )
+
+        else:
+            if "chat_template" in self.processor.__dict__.keys():
+                prompts = self.processor.apply_chat_template(
+                    conversations, tokenize=False
+                )
+
+            elif "tokenizer" in self.processor.__dict__.keys():
+                if self.config["model_type"] != "paligemma":
+                    prompts = self.processor.tokenizer.apply_chat_template(
+                        conversations, tokenize=False
+                    )
+            else:
+                raise ValueError(
+                    "Processor does not have 'chat_template' or 'tokenizer' attribute."
+                )
+
+        print(prompts)
+        image_token_index = self.config["image_token_index"]
+        input_ids, pixel_values, mask = prepare_inputs(
+            self.image_processor, self.processor, image, prompts, image_token_index
+        )
+
+        if mask is None:
+            mask = mx.ones_like(input_ids)
+
+        return {
+            "pixel_values": pixel_values,
+            "input_ids": input_ids,
+            "attention_mask": mask,
+        }
 
 
 def grad_checkpoint(layer):
