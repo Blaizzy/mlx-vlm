@@ -163,6 +163,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     if model_type == "phi3_v":
         config["vision_config"] = config["img_processor"]
         config["text_config"] = {}
+    if model_type == "qwen2_vl":
+        config["text_config"] = {
+            k: v for k, v in config.items() if k != "vision_config"
+        }
 
     model_config = model_class.ModelConfig.from_dict(config)
 

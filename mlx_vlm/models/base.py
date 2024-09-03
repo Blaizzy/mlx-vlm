@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict
+from typing import Any, Dict, Optional
 
 import mlx.core as mx
 from PIL import Image
@@ -88,3 +88,28 @@ class KVCache:
         self.keys[..., prev : self.offset, :] = keys
         self.values[..., prev : self.offset, :] = values
         return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+
+
+def create_additive_causal_mask(N: int, offset: int = 0):
+    rinds = mx.arange(offset + N)
+    linds = mx.arange(offset, offset + N) if offset else rinds
+    mask = linds[:, None] < rinds[None]
+    return mask * -1e9
+
+
+def create_attention_mask(h: mx.array, cache: Optional[Any] = None):
+    T = h.shape[1]
+    if T > 1:
+        if cache is not None and cache[0] is not None:
+            c = cache[0]
+            if isinstance(c, RotatingKVCache):
+                offset = min(c.max_size - 1, c.offset)
+            else:
+                offset = c.offset
+        else:
+            offset = 0
+        mask = create_additive_causal_mask(T, offset)
+        mask = mask.astype(h.dtype)
+    else:
+        mask = None
+    return mask
