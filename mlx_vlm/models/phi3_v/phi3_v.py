@@ -1,23 +1,41 @@
 import inspect
+import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from types import SimpleNamespace
+from typing import Dict, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
+
+from .language import LanguageModel, TextConfig
+from .su_rope import Phi3SuScaledRotaryEmbedding
+from .vision import VisionConfig, VisionModel
 
 
 @dataclass
-class TextConfig:
+class ModelConfig:
+    text_config: TextConfig
+    vision_config: VisionConfig
     model_type: str
-    hidden_size: int
+    vocab_size: int
+
     num_hidden_layers: int
     intermediate_size: int
     num_attention_heads: int
-    num_key_value_heads: int
-    vocab_size: int
-    rms_norm_eps: float = 1e-6
+    rms_norm_eps: float
+
+    ignore_index: int = -100
+    image_token_index: int = 257152
+    hidden_size: int = 2048
+    pad_token_id: int = 0
+
+    num_key_value_heads: int = None
     rope_theta: float = 10000
     rope_traditional: bool = False
+    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    max_position_embeddings: int = 131072
+    original_max_position_embeddings: int = 4096
 
     @classmethod
     def from_dict(cls, params):
@@ -30,16 +48,6 @@ class TextConfig:
         )
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dims: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = mx.ones((dims,))
-        self.eps = eps
-
-    def __call__(self, x):
-        return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
-
-
 class Attention(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -47,20 +55,36 @@ class Attention(nn.Module):
         dim = config.hidden_size
         self.n_heads = n_heads = config.num_attention_heads
         self.n_kv_heads = n_kv_heads = config.num_key_value_heads
+        self.num_hidden_layers = config.num_hidden_layers
 
-        head_dim = config.hidden_size // n_heads
+        self.head_dim = head_dim = config.hidden_size // n_heads
         self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        op_size = n_heads * head_dim + 2 * (n_kv_heads * head_dim)
+        self.qkv_proj = nn.Linear(dim, op_size, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.rope = nn.RoPE(
-            head_dim,
-            traditional=config.rope_traditional,
-            base=config.rope_theta,
-        )
+        rope_scale = 1.0
+        if config.rope_scaling and config.rope_scaling["type"] == "su":
+            self.rope = Phi3SuScaledRotaryEmbedding(
+                head_dim,
+                traditional=False,
+                base=config.rope_theta,
+                scale=rope_scale,
+                max_position_embeddings=config.max_position_embeddings,
+                original_max_position_embeddings=config.original_max_position_embeddings,
+                short_factor=config.rope_scaling["short_factor"],
+                long_factor=config.rope_scaling["long_factor"],
+            )
+        else:
+            if config.rope_scaling and config.rope_scaling["type"] == "linear":
+                rope_scale = 1 / config.rope_scaling["factor"]
+            self.rope = nn.RoPE(
+                head_dim,
+                traditional=config.rope_traditional,
+                base=config.rope_theta,
+                scale=rope_scale,
+            )
 
     def __call__(
         self,
@@ -70,9 +94,12 @@ class Attention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
 
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        qkv = self.qkv_proj(x)
+        query_pos = self.n_heads * self.head_dim
+        queries, keys, values = mx.split(
+            qkv, [query_pos, query_pos + self.n_kv_heads * self.head_dim], axis=-1
+        )
 
-        # Prepare the queries, keys and values for the attention computation
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
@@ -95,12 +122,13 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.gate_up_proj = nn.Linear(dim, 2 * hidden_dim, bias=False)
         self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.gelu(self.gate_proj(x)) * self.up_proj(x))
+        x = self.gate_up_proj(x)
+        gate, x = mx.split(x, 2, axis=-1)
+        return self.down_proj(nn.silu(gate) * x)
 
 
 class TransformerBlock(nn.Module):
@@ -110,8 +138,8 @@ class TransformerBlock(nn.Module):
         self.hidden_size = config.hidden_size
         self.self_attn = Attention(config)
         self.mlp = MLP(config.hidden_size, config.intermediate_size)
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.config = config
@@ -129,69 +157,58 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class GemmaModel(nn.Module):
+class Phi3V(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
-        assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.vision_embed_tokens = VisionModel(config)
         self.layers = [
             TransformerBlock(config=config) for _ in range(config.num_hidden_layers)
         ]
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def __call__(
         self,
         inputs: mx.array,
+        pixel_values=None,
+        image_sizes=None,
         cache=None,
-        inputs_embeds=None,
-        mask: Optional[mx.array] = None,
     ):
-        # for passing merged input embeddings
-        if inputs_embeds is None:
-            h = self.embed_tokens(inputs)
-        else:
-            h = inputs_embeds
-
-        h = h * (self.config.hidden_size**0.5)
-
-        if cache is not None:
+        h = self.embed_tokens(inputs)
+        p = np.argwhere(inputs < 0).tolist()
+        if pixel_values is not None:
+            h = self.vision_embed_tokens(pixel_values, h, image_sizes, p)
+        mask = None
+        if h.shape[1] > 1:
             mask = nn.MultiHeadAttention.create_additive_causal_mask(h.shape[1])
             mask = mask.astype(h.dtype)
-
         if cache is None:
             cache = [None] * len(self.layers)
-
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
-
         return self.norm(h)
 
 
-class LanguageModel(nn.Module):
+class Model(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
-        self.config = config
         self.model_type = config.model_type
-        self.model = GemmaModel(config)
+        self.model = Phi3V(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.config = config
 
     def __call__(
         self,
         inputs: mx.array,
+        pixel_values=None,
+        mask=None,
         cache=None,
-        inputs_embeds=None,
-        mask: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache, inputs_embeds=inputs_embeds, mask=mask)
-        out = self.model.embed_tokens.as_linear(out)
-        return out
-
-    def sanitize(self, weights):
-        return {
-            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
-        }
+        out = self.model(inputs, pixel_values, mask, cache)
+        return self.lm_head(out).astype(self.lm_head.weight.dtype)
 
     @property
     def layers(self):
@@ -204,3 +221,11 @@ class LanguageModel(nn.Module):
     @property
     def n_kv_heads(self):
         return self.config.num_key_value_heads
+
+    @property
+    def language_model(self):
+        return self
+
+    @property
+    def vision_model(self):
+        return self.model.vision_embed_tokens

@@ -16,13 +16,11 @@ class TestModels(unittest.TestCase):
             model.update(tree_map(lambda p: p.astype(t), model.parameters()))
 
             inputs = mx.array([[0, 1]])
-            outputs, cache = model(inputs)
+            outputs = model(inputs)
             self.assertEqual(outputs.shape, (batch_size, 2, vocab_size))
             self.assertEqual(outputs.dtype, t)
 
-            outputs, cache = model(
-                mx.argmax(outputs[0, -1:, :], keepdims=True), cache=cache
-            )
+            outputs = model(mx.argmax(outputs[0, -1:, :], keepdims=True), cache=None)
             self.assertEqual(outputs.shape, (batch_size, 1, vocab_size))
             self.assertEqual(outputs.dtype, t)
 
@@ -70,10 +68,10 @@ class TestModels(unittest.TestCase):
             hidden_states[vision_feature_layer][-1][-1].shape, (vision_hidden_size,)
         )
 
-    def test_nanoLlava(self):
-        from mlx_vlm.models import nanoLlava
+    def test_llava_bunny(self):
+        from mlx_vlm.models import llava_bunny
 
-        text_config = nanoLlava.TextConfig(
+        text_config = llava_bunny.TextConfig(
             model_type="qwen2",
             hidden_size=4096,
             num_hidden_layers=32,
@@ -87,7 +85,7 @@ class TestModels(unittest.TestCase):
             rope_scaling=None,
         )
 
-        vision_config = nanoLlava.VisionConfig(
+        vision_config = llava_bunny.VisionConfig(
             model_type="siglip_vision_model",
             num_hidden_layers=27,
             hidden_size=1152,
@@ -101,7 +99,7 @@ class TestModels(unittest.TestCase):
             layer_norm_eps=1e-6,
         )
 
-        args = nanoLlava.ModelConfig(
+        config = llava_bunny.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
             model_type="llava-qwen2",
@@ -118,27 +116,27 @@ class TestModels(unittest.TestCase):
             vocab_size=151936,
         )
 
-        model = nanoLlava.Model(args)
+        model = llava_bunny.Model(config)
 
         self.language_test_runner(
             model.language_model,
-            args.text_config.model_type,
-            args.text_config.vocab_size,
-            args.text_config.num_hidden_layers,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
         )
 
         self.mm_projector_test_runner(
             model.mm_projector,
-            args.vision_config.hidden_size,
-            args.text_config.hidden_size,
+            config.vision_config.hidden_size,
+            config.text_config.hidden_size,
         )
 
         self.vision_test_runner(
             model.vision_tower.vision_tower,
-            args.vision_config.model_type,
-            args.vision_config.hidden_size,
-            args.vision_config.num_channels,
-            (args.vision_config.image_size, args.vision_config.image_size),
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
         )
 
     def test_llava_next(self):
@@ -172,7 +170,7 @@ class TestModels(unittest.TestCase):
             layer_norm_eps=1e-6,
         )
 
-        args = llava_next.ModelConfig(
+        config = llava_next.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
             model_type="llava",
@@ -183,27 +181,27 @@ class TestModels(unittest.TestCase):
             vision_feature_select_strategy="default",
         )
 
-        model = llava_next.Model(args)
+        model = llava_next.Model(config)
 
         self.language_test_runner(
             model.language_model,
-            args.text_config.model_type,
-            args.text_config.vocab_size,
-            args.text_config.num_hidden_layers,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
         )
 
         self.mm_projector_test_runner(
             model.multi_modal_projector,
-            args.vision_config.hidden_size,
-            args.text_config.hidden_size,
+            config.vision_config.hidden_size,
+            config.text_config.hidden_size,
         )
 
         self.vision_test_runner(
             model.vision_tower,
-            args.vision_config.model_type,
-            args.vision_config.hidden_size,
-            args.vision_config.num_channels,
-            (args.vision_config.image_size, args.vision_config.image_size),
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
         )
 
     def test_llava(self):
@@ -237,7 +235,7 @@ class TestModels(unittest.TestCase):
             layer_norm_eps=1e-6,
         )
 
-        args = llava.ModelConfig(
+        config = llava.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
             model_type="llava",
@@ -248,27 +246,27 @@ class TestModels(unittest.TestCase):
             vision_feature_select_strategy="default",
         )
 
-        model = llava.Model(args)
+        model = llava.Model(config)
 
         self.language_test_runner(
             model.language_model,
-            args.text_config.model_type,
-            args.text_config.vocab_size,
-            args.text_config.num_hidden_layers,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
         )
 
         self.mm_projector_test_runner(
             model.multi_modal_projector,
-            args.vision_config.hidden_size,
-            args.text_config.hidden_size,
+            config.vision_config.hidden_size,
+            config.text_config.hidden_size,
         )
 
         self.vision_test_runner(
             model.vision_tower,
-            args.vision_config.model_type,
-            args.vision_config.hidden_size,
-            args.vision_config.num_channels,
-            (args.vision_config.image_size, args.vision_config.image_size),
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
         )
 
     def test_idefics2(self):
@@ -308,7 +306,7 @@ class TestModels(unittest.TestCase):
             num_key_value_heads=4,
         )
 
-        args = idefics2.ModelConfig(
+        config = idefics2.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
             perceiver_config=perceiver_config,
@@ -317,21 +315,21 @@ class TestModels(unittest.TestCase):
             image_token_index=32001,
         )
 
-        model = idefics2.Model(args)
+        model = idefics2.Model(config)
 
         self.language_test_runner(
             model.language_model,
-            args.text_config.model_type,
-            args.text_config.vocab_size,
-            args.text_config.num_hidden_layers,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
         )
 
         self.vision_test_runner(
             model.vision_model,
-            args.vision_config.model_type,
-            args.vision_config.hidden_size,
-            args.vision_config.num_channels,
-            (args.vision_config.image_size, args.vision_config.image_size),
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
         )
 
     def test_paligemma(self):
@@ -363,7 +361,7 @@ class TestModels(unittest.TestCase):
             layer_norm_eps=1e-6,
         )
 
-        args = paligemma.ModelConfig(
+        config = paligemma.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
             model_type="paligemma",
@@ -373,27 +371,27 @@ class TestModels(unittest.TestCase):
             vocab_size=257216,
         )
 
-        model = paligemma.Model(args)
+        model = paligemma.Model(config)
 
         self.language_test_runner(
             model.language_model,
-            args.text_config.model_type,
-            args.text_config.vocab_size,
-            args.text_config.num_hidden_layers,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
         )
 
         self.mm_projector_test_runner(
             model.multi_modal_projector,
-            args.vision_config.hidden_size,
-            args.text_config.hidden_size,
+            config.vision_config.hidden_size,
+            config.text_config.hidden_size,
         )
 
         self.vision_test_runner(
             model.vision_tower,
-            args.vision_config.model_type,
-            args.vision_config.hidden_size,
-            args.vision_config.num_channels,
-            (args.vision_config.image_size, args.vision_config.image_size),
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
         )
 
     def test_multi_modality(self):
@@ -436,7 +434,7 @@ class TestModels(unittest.TestCase):
             },
         )
 
-        args = multi_modality.ModelConfig(
+        config = multi_modality.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
             aligner_config=aligner_config,
@@ -446,27 +444,178 @@ class TestModels(unittest.TestCase):
             vocab_size=32000,
         )
 
-        model = multi_modality.Model(args)
+        model = multi_modality.Model(config)
 
         self.language_test_runner(
             model.language_model,
-            args.text_config.model_type,
-            args.text_config.vocab_size,
-            args.text_config.num_hidden_layers,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
         )
 
         self.mm_projector_test_runner(
             model.aligner,
-            args.vision_config.hidden_size,
-            args.text_config.hidden_size,
+            config.vision_config.hidden_size,
+            config.text_config.hidden_size,
         )
 
         self.vision_test_runner(
             model.vision_model,
-            args.vision_config.model_type,
-            args.vision_config.hidden_size,
-            args.vision_config.num_channels,
-            (args.vision_config.image_size, args.vision_config.image_size),
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
+    def test_phi3_v(self):
+        from mlx_vlm.models import phi3_v
+
+        text_config = phi3_v.TextConfig()
+
+        vision_config = phi3_v.VisionConfig(
+            model_type="phi3_v",
+            image_dim_out=1024,
+            model_name="openai/clip-vit-large-patch14-336",
+            name="clip_vision_model",
+            num_img_tokens=144,
+        )
+
+        config = phi3_v.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            **{
+                "hidden_size": 3072,
+                "intermediate_size": 8192,
+                "max_position_embeddings": 131072,
+                "model_type": "phi3_v",
+                "num_attention_heads": 32,
+                "num_hidden_layers": 32,
+                "num_key_value_heads": 32,
+                "original_max_position_embeddings": 4096,
+                "rms_norm_eps": 1e-05,
+                "rope_scaling": {
+                    "long_factor": [
+                        1.0299999713897705,
+                        1.0499999523162842,
+                        1.0499999523162842,
+                        1.0799999237060547,
+                        1.2299998998641968,
+                        1.2299998998641968,
+                        1.2999999523162842,
+                        1.4499999284744263,
+                        1.5999999046325684,
+                        1.6499998569488525,
+                        1.8999998569488525,
+                        2.859999895095825,
+                        3.68999981880188,
+                        5.419999599456787,
+                        5.489999771118164,
+                        5.489999771118164,
+                        9.09000015258789,
+                        11.579999923706055,
+                        15.65999984741211,
+                        15.769999504089355,
+                        15.789999961853027,
+                        18.360000610351562,
+                        21.989999771118164,
+                        23.079999923706055,
+                        30.009998321533203,
+                        32.35000228881836,
+                        32.590003967285156,
+                        35.56000518798828,
+                        39.95000457763672,
+                        53.840003967285156,
+                        56.20000457763672,
+                        57.95000457763672,
+                        59.29000473022461,
+                        59.77000427246094,
+                        59.920005798339844,
+                        61.190006256103516,
+                        61.96000671386719,
+                        62.50000762939453,
+                        63.3700065612793,
+                        63.48000717163086,
+                        63.48000717163086,
+                        63.66000747680664,
+                        63.850006103515625,
+                        64.08000946044922,
+                        64.760009765625,
+                        64.80001068115234,
+                        64.81001281738281,
+                        64.81001281738281,
+                    ],
+                    "short_factor": [
+                        1.05,
+                        1.05,
+                        1.05,
+                        1.1,
+                        1.1,
+                        1.1,
+                        1.2500000000000002,
+                        1.2500000000000002,
+                        1.4000000000000004,
+                        1.4500000000000004,
+                        1.5500000000000005,
+                        1.8500000000000008,
+                        1.9000000000000008,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.000000000000001,
+                        2.1000000000000005,
+                        2.1000000000000005,
+                        2.2,
+                        2.3499999999999996,
+                        2.3499999999999996,
+                        2.3499999999999996,
+                        2.3499999999999996,
+                        2.3999999999999995,
+                        2.3999999999999995,
+                        2.6499999999999986,
+                        2.6999999999999984,
+                        2.8999999999999977,
+                        2.9499999999999975,
+                        3.049999999999997,
+                        3.049999999999997,
+                        3.049999999999997,
+                    ],
+                    "type": "su",
+                },
+                "rope_theta": 10000.0,
+                "vocab_size": 32064,
+            },
+        )
+
+        model = phi3_v.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_model,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
         )
 
 
