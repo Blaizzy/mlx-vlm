@@ -167,6 +167,7 @@ class Qwen2Model(nn.Module):
         inputs: mx.array,
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
     ):
         # for passing merged input embeddings
         if inputs_embeds is None:
@@ -174,8 +175,8 @@ class Qwen2Model(nn.Module):
         else:
             h = inputs_embeds
 
-        mask = None
-        if h.shape[1] > 1:
+        # mask = None
+        if h.shape[1] > 1 and mask is None:
             mask = nn.MultiHeadAttention.create_additive_causal_mask(h.shape[1])
             mask = mask.astype(h.dtype)
 
@@ -202,7 +203,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+        out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds, mask=None)
         return out
 
     def sanitize(self, weights):
