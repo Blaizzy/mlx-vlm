@@ -187,7 +187,7 @@ class Model(nn.Module):
     ):
         input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
         logits = self.language_model(
-            inputs=input_ids, cache=cache, inputs_embeds=input_embeddings
+            inputs=input_ids, cache=cache, inputs_embeds=input_embeddings, mask=mask
         )
         return logits
 

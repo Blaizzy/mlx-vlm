@@ -15,7 +15,7 @@ from mlx_vlm.prompt_utils import get_message_json
 from mlx_vlm.utils import prepare_inputs
 
 
-class ImageTextDataset:
+class Dataset:
     def __init__(
         self,
         hf_dataset,
@@ -79,7 +79,6 @@ class ImageTextDataset:
                     "Processor does not have 'chat_template' or 'tokenizer' attribute."
                 )
 
-        print(prompts)
         image_token_index = self.config["image_token_index"]
         input_ids, pixel_values, mask = prepare_inputs(
             self.image_processor, self.processor, image, prompts, image_token_index
@@ -158,19 +157,45 @@ def default_loss(model, inputs, targets, lengths):
 
 
 class Trainer:
-    def __init__(self, model, optimizer, loss_fn):
+    def __init__(self, model, optimizer):
         self.model = model
         self.optimizer = optimizer
-        self.loss_fn = loss_fn
+
+    def loss_fn(self, model, batch):
+        pixel_values = batch["pixel_values"]
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        labels = mx.where(
+            attention_mask == 1, input_ids, -100
+        )  # Only compute loss on non-padded tokens
+
+        logits = model(input_ids, pixel_values, attention_mask)
+
+        # Ensure logits and labels have the same sequence length
+        min_length = min(logits.shape[1], labels.shape[1])
+        logits = logits[:, :min_length, :]
+        labels = labels[:, :min_length]
+        attention_mask = attention_mask[:, :min_length]
+
+        # Shift logits and labels for next-token prediction
+        shift_logits = logits[:, :-1, :]
+        shift_labels = labels[:, 1:]
+        shift_attention_mask = attention_mask[:, 1:]
+
+        # Flatten the tensors
+        flat_logits = shift_logits.reshape(-1, shift_logits.shape[-1])
+        flat_labels = shift_labels.reshape(-1)
+        flat_attention_mask = shift_attention_mask.reshape(-1)
+
+        # Compute loss only on non-padded tokens
+        ce = nn.losses.cross_entropy(flat_logits, flat_labels, reduction="none")
+        ce = (ce * flat_attention_mask).sum() / flat_attention_mask.sum()
+
+        return ce
 
     def train_step(self, batch):
-        images, labels = batch
-
-        def loss_fn(model):
-            logits = model(images)
-            return self.loss_fn(logits, labels)
-
-        loss, grads = mx.value_and_grad(loss_fn)(self.model)
+        loss_and_grad_fn = nn.value_and_grad(self.model, self.loss_fn)
+        loss, grads = loss_and_grad_fn(self.model, batch)
         self.optimizer.update(self.model, grads)
         return loss
 
@@ -181,15 +206,6 @@ class Trainer:
             loss = self.train_step(batch)
             total_loss += loss
         return total_loss / len(dataloader)
-
-    def evaluate(self, dataloader):
-        correct = total = 0
-        for images, labels in dataloader:
-            logits = self.model(images)
-            predictions = mx.argmax(logits, axis=1)
-            correct += mx.sum(predictions == labels)
-            total += labels.size
-        return correct / total
 
 
 def save_adapter(
