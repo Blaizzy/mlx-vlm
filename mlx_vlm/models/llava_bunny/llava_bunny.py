@@ -118,6 +118,7 @@ class SigLipVisionTower(nn.Module):
 
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
+        super().__init__()
         self.model_type = config.model_type
         self.config = config
 
@@ -151,31 +152,28 @@ class Model(nn.Module):
 
     def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
         image_token_index = self.config.image_token_index
-        num_images, num_image_patches, embed_dim = image_features.shape
+        batch_size, seq_length, embed_dim = inputs_embeds.shape
+        num_images, num_image_patches, _ = image_features.shape
 
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
+        # Positions of <image> tokens in input_ids for each batch
+        image_positions = mx.argmax(input_ids == image_token_index, axis=1)
 
-        if len(image_positions) != num_images:
-            raise ValueError(
-                f"The number of image tokens ({len(image_positions)}) does not "
-                f" match the number of image inputs ({num_images})."
-            )
+        final_embeddings = []
+        for b in range(batch_size):
+            text_segments = []
+            start_idx = 0
+            position = int(image_positions[b].item())
 
-        text_segments = []
-        start_idx = 0
+            text_segments.append(inputs_embeds[b : b + 1, start_idx:position])
+            text_segments.append(image_features[b : b + 1])
+            text_segments.append(inputs_embeds[b : b + 1, position + 1 :])
 
-        for position in image_positions:
-            text_segments.append(inputs_embeds[:, start_idx:position])
-            start_idx = position + 1
-
-        image_embeddings = mx.split(image_features, image_features.shape[0])
-        final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
-        final_embeddings += [inputs_embeds[:, start_idx:]]
+            batch_embeddings = mx.concatenate(text_segments, axis=1)
+            final_embeddings.append(batch_embeddings)
 
         # Create a final embedding of shape
-        # (1, num_image_patches*num_images + sequence_len, embed_dim)
-        return mx.concatenate(final_embeddings, axis=1)
+        # (batch_size, num_image_patches + sequence_len, embed_dim)
+        return mx.concatenate(final_embeddings, axis=0)
 
     def __call__(
         self,
