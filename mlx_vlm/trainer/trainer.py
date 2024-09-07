@@ -168,6 +168,19 @@ class Trainer:
         labels = mx.where(
             attention_mask == 1, input_ids, -100
         )  # Only compute loss on non-padded tokens
+        weight_mask = mx.ones_like(attention_mask)
+
+        assistant_response_index = np.where(input_ids == 77091)[1]
+        batch_size, seq_length = input_ids.shape
+        range_matrix = mx.repeat(
+            mx.expand_dims(mx.arange(seq_length), 0), batch_size, axis=0
+        )
+        assistant_mask = range_matrix <= mx.array(assistant_response_index).reshape(
+            -1, 1
+        )
+
+        # Apply the mask to weight_mask
+        weight_mask = mx.where(assistant_mask, mx.zeros_like(weight_mask), weight_mask)
 
         logits = model(input_ids, pixel_values, attention_mask)
 
@@ -181,15 +194,21 @@ class Trainer:
         shift_logits = logits[:, :-1, :]
         shift_labels = labels[:, 1:]
         shift_attention_mask = attention_mask[:, 1:]
+        shift_weight_mask = weight_mask[:, 1:]
 
         # Flatten the tensors
         flat_logits = shift_logits.reshape(-1, shift_logits.shape[-1])
         flat_labels = shift_labels.reshape(-1)
         flat_attention_mask = shift_attention_mask.reshape(-1)
+        flat_weight_mask = shift_weight_mask.reshape(-1)
 
         # Compute loss only on non-padded tokens
-        ce = nn.losses.cross_entropy(flat_logits, flat_labels, reduction="none")
-        ce = (ce * flat_attention_mask).sum() / flat_attention_mask.sum()
+        ce = (
+            nn.losses.cross_entropy(flat_logits, flat_labels, weights=flat_weight_mask)
+            * flat_attention_mask
+        )
+        ntoks = flat_attention_mask.sum()
+        ce = ce.sum() / ntoks
 
         return ce
 
@@ -197,6 +216,7 @@ class Trainer:
         loss_and_grad_fn = nn.value_and_grad(self.model, self.loss_fn)
         loss, grads = loss_and_grad_fn(self.model, batch)
         self.optimizer.update(self.model, grads)
+
         return loss
 
     @mx.compile
@@ -204,6 +224,7 @@ class Trainer:
         total_loss = 0
         for batch in dataloader:
             loss = self.train_step(batch)
+            mx.eval(self.model, self.optimizer.state)
             total_loss += loss
         return total_loss / len(dataloader)
 
