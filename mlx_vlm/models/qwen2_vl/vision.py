@@ -6,6 +6,8 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 
 @dataclass
@@ -84,9 +86,16 @@ class Qwen2RotaryEmbedding(nn.Module):
         )
 
 
+# def rotate_half(x):
+#     x1, x2 = mx.split(x, 2, axis=-1)
+#     return mx.concatenate((-x2, x1), axis=-1)
+
+
 def rotate_half(x):
-    x1, x2 = mx.split(x, 2, axis=-1)
-    return mx.concatenate((-x2, x1), axis=-1)
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
 
 def apply_multimodal_rotary_pos_emb(
@@ -109,16 +118,18 @@ def apply_multimodal_rotary_pos_emb(
     return q_embed, k_embed
 
 
-def apply_rotary_pos_emb_vision(tensor: mx.array, freqs: mx.array) -> mx.array:
+def apply_rotary_pos_emb_vision(tensor, freqs) -> mx.array:
+    tensor = torch.from_numpy(np.array(tensor))
+    freqs = torch.from_numpy(np.array(freqs))
     orig_dtype = tensor.dtype
-    tensor = tensor.astype(mx.float32)
-    cos = mx.cos(freqs)
-    sin = mx.sin(freqs)
-    cos = mx.expand_dims(mx.repeat(mx.expand_dims(cos, 1), 2, axis=1), 0)
-    sin = mx.expand_dims(mx.repeat(mx.expand_dims(sin, 1), 2, axis=1), 0)
+    tensor = tensor.float()
+    cos = freqs.cos()
+    sin = freqs.sin()
+    cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+    sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
     output = (tensor * cos) + (rotate_half(tensor) * sin)
-    output = output.astype(orig_dtype)
-    return output
+    output = output.to(orig_dtype)
+    return mx.array(output)
 
 
 class VisionRotaryEmbedding(nn.Module):
@@ -184,7 +195,9 @@ class PatchMerger(nn.Module):
         ]
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = self.mlp(self.ln_q(x).reshape(-1, self.hidden_size))
+        x = self.ln_q(x).reshape(-1, self.hidden_size)
+        for layer in self.mlp:
+            x = layer(x)
         return x
 
 
@@ -207,26 +220,21 @@ class Attention(nn.Module):
         q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
         k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
 
-        attention_mask = mx.zeros((1, seq_length, seq_length), dtype=mx.bool)
-        for i in range(1, len(cu_seqlens)):
-            attention_mask = mx.index_update(
-                attention_mask,
-                mx.index[
-                    :,
-                    cu_seqlens[i - 1] : cu_seqlens[i],
-                    cu_seqlens[i - 1] : cu_seqlens[i],
-                ],
-                True,
-            )
+        attention_mask = mx.ones((1, seq_length, seq_length))
 
-        q = q.transpose(0, 1)
-        k = k.transpose(0, 1)
-        v = v.transpose(0, 1)
-        attn_weights = mx.matmul(q, k.transpose(0, 2, 1)) / math.sqrt(self.head_dim)
+        for i in range(1, len(cu_seqlens)):
+            start = int(cu_seqlens[i - 1])
+            end = int(cu_seqlens[i])
+            attention_mask[start:end, start:end] = 0
+
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+        attn_weights = mx.matmul(q, mx.swapaxes(k, 3, 2)) / math.sqrt(self.head_dim)
         attn_weights = attn_weights + attention_mask
         attn_weights = mx.softmax(attn_weights, axis=-1)
         attn_output = mx.matmul(attn_weights, v)
-        attn_output = attn_output.transpose(0, 2, 1)
+        attn_output = attn_output.transpose(0, 2, 1, 3)
         attn_output = attn_output.reshape(seq_length, -1)
         attn_output = self.proj(attn_output)
         return attn_output
@@ -293,47 +301,34 @@ class VisionModel(nn.Module):
     def rot_pos_emb(self, grid_thw):
         pos_ids = []
         for t, h, w in grid_thw:
-            # Create hpos_ids
-            hpos_ids = mx.repeat(mx.expand_dims(mx.arange(h), axis=1), w, axis=1)
-            print(hpos_ids.shape, h, w)
+            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
             hpos_ids = hpos_ids.reshape(
                 h // self.spatial_merge_size,
                 self.spatial_merge_size,
                 w // self.spatial_merge_size,
                 self.spatial_merge_size,
             )
-            hpos_ids = mx.transpose(hpos_ids, (0, 2, 1, 3))
+            hpos_ids = hpos_ids.permute(0, 2, 1, 3)
             hpos_ids = hpos_ids.flatten()
 
-            # Create wpos_ids
-            wpos_ids = mx.broadcast_to(mx.arange(w)[None, :], (h, w))
+            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
             wpos_ids = wpos_ids.reshape(
                 h // self.spatial_merge_size,
                 self.spatial_merge_size,
                 w // self.spatial_merge_size,
                 self.spatial_merge_size,
             )
-            wpos_ids = mx.transpose(wpos_ids, (0, 2, 1, 3))
+            wpos_ids = wpos_ids.permute(0, 2, 1, 3)
             wpos_ids = wpos_ids.flatten()
-
-            # Stack and tile (equivalent to repeat in PyTorch)
-            stacked = mx.stack([hpos_ids, wpos_ids], axis=-1)
-            tiled = mx.tile(stacked[None, ...], (t, 1, 1))
-            pos_ids.append(tiled)
-
-        pos_ids = mx.concatenate(pos_ids, axis=0)
-
-        # Calculate max_grid_size
-        max_grid_size = mx.max(
-            mx.max(grid_thw[:, 1], axis=0), mx.max(grid_thw[:, 2], axis=0)
-        )
-
+            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+        pos_ids = torch.cat(pos_ids, dim=0)
+        max_grid_size = grid_thw[:, 1:].max()
+        max_grid_size = mx.array(max_grid_size)
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
-        rotary_pos_emb = rotary_pos_emb_full[pos_ids].reshape(
-            -1, rotary_pos_emb_full.shape[-1]
-        )
+        rotary_pos_emb_full = torch.from_numpy(np.array(rotary_pos_emb_full))
+        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
 
-        return rotary_pos_emb
+        return mx.array(rotary_pos_emb)
 
     def __call__(
         self,
@@ -344,10 +339,15 @@ class VisionModel(nn.Module):
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        cu_seqlens = mx.cumsum(
-            mx.repeat(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]), axis=0
-        )
-        cu_seqlens = mx.concatenate([mx.zeros(1, dtype=cu_seqlens.dtype), cu_seqlens])
+        # grid_thw = mx.array(grid_thw)
+        grid_thw = torch.from_numpy(grid_thw)
+
+        cu_seqlens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        ).cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+
+        cu_seqlens = mx.array(cu_seqlens)
 
         encoder_states = (hidden_states,) if output_hidden_states else None
 

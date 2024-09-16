@@ -195,22 +195,12 @@ class Model(nn.Module):
 
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
-        print(pixel_values.shape)
         # Get the ouptut hidden states from the vision model
-        *_, hidden_states = self.vision_tower(
+        hidden_states = self.vision_tower(
             pixel_values, image_grid_thw, output_hidden_states=True
         )
 
-        # Select the hidden states from the desired layer
-        image_features = hidden_states[self.vision_feature_layer]
-
-        if self.vision_feature_select_strategy == "default":
-            image_features = image_features[:, 1:]
-        else:
-            raise ValueError(
-                "Unexpected feature selection strategy: "
-                f"{self.vision_feature_select_strategy}"
-            )
+        image_features = hidden_states[-1].astype(pixel_values.dtype)
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self._merge_input_ids_with_image_features(
