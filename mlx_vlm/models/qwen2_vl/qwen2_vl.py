@@ -21,7 +21,7 @@ class ModelConfig:
     rope_scaling: dict
     model_type: str
     ignore_index: int = -100
-    image_token_index: int = 32000
+    image_token_index: int = 151655
     vision_feature_select_strategy: str = "default"
     vision_feature_layer: int = -2
     vocab_size: int = 32000
@@ -214,21 +214,14 @@ class Model(nn.Module):
         image_token_index = self.config.image_token_index
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
-        text_segments = []
-        start_idx = 0
+        image_positions = input_ids == image_token_index
+        inputs_embeds = mx.where(
+            mx.expand_dims(image_positions, axis=-1), image_features, inputs_embeds
+        )
 
-        for position in image_positions:
-            text_segments.append(inputs_embeds[:, start_idx:position])
-            start_idx = position + 1
+        # TODO: Add video features
 
-        image_embeddings = mx.split(image_features, image_features.shape[0])
-        final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
-        final_embeddings += [inputs_embeds[:, start_idx:]]
-
-        # Create a final embedding of shape
-        # (1, num_image_patches*num_images + sequence_len, embed_dim)
-        return mx.concatenate(final_embeddings, axis=1)
+        return mx.array(inputs_embeds)
 
     def __call__(
         self,
