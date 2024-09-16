@@ -171,18 +171,18 @@ class Trainer:
             attention_mask == 1, input_ids, -100
         )  # Only compute loss on non-padded tokens
         labels = labels[:, 1:]
-        weight_mask = mx.ones_like(attention_mask)
 
-        assistant_response_index = np.where(input_ids == 77091)[1]
         batch_size, seq_length = input_ids.shape
-        range_matrix = mx.repeat(
-            mx.expand_dims(mx.arange(seq_length), 0), batch_size, axis=0
-        )
-        assistant_mask = range_matrix <= mx.array(assistant_response_index).reshape(
-            -1, 1
-        )
 
         if self.train_on_completions:
+            weight_mask = mx.ones_like(attention_mask)
+            assistant_response_index = np.where(input_ids == 77091)[1]
+            range_matrix = mx.repeat(
+                mx.expand_dims(mx.arange(seq_length), 0), batch_size, axis=0
+            )
+            assistant_mask = range_matrix <= mx.array(assistant_response_index).reshape(
+                -1, 1
+            )
             # Apply the mask to weight_mask
             weight_mask = mx.where(
                 assistant_mask, mx.zeros_like(weight_mask), weight_mask
