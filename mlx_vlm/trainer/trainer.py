@@ -157,17 +157,20 @@ def default_loss(model, inputs, targets, lengths):
 
 
 class Trainer:
-    def __init__(self, model, optimizer):
+    def __init__(self, model, optimizer, train_on_completions=False):
         self.model = model
         self.optimizer = optimizer
+        self.train_on_completions = train_on_completions
 
     def loss_fn(self, model, batch):
         pixel_values = batch["pixel_values"]
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
+        lengths = mx.sum(attention_mask, axis=1)
         labels = mx.where(
             attention_mask == 1, input_ids, -100
         )  # Only compute loss on non-padded tokens
+        labels = labels[:, 1:]
         weight_mask = mx.ones_like(attention_mask)
 
         assistant_response_index = np.where(input_ids == 77091)[1]
@@ -179,35 +182,34 @@ class Trainer:
             -1, 1
         )
 
-        # Apply the mask to weight_mask
-        weight_mask = mx.where(assistant_mask, mx.zeros_like(weight_mask), weight_mask)
+        if self.train_on_completions:
+            # Apply the mask to weight_mask
+            weight_mask = mx.where(
+                assistant_mask, mx.zeros_like(weight_mask), weight_mask
+            )[:, 1:]
+        else:
+            weight_mask = None
 
+        input_ids = input_ids[:, :-1]
         logits = model(input_ids, pixel_values, attention_mask)
+        logits.astype(mx.float32)
 
         # Ensure logits and labels have the same sequence length
-        min_length = min(logits.shape[1], labels.shape[1])
-        logits = logits[:, :min_length, :]
-        labels = labels[:, :min_length]
-        attention_mask = attention_mask[:, :min_length]
+        if logits.shape[1] != labels.shape[1]:
+            logits = logits[:, -labels.shape[1] :, :]
 
-        # Shift logits and labels for next-token prediction
-        shift_logits = logits[:, :-1, :]
-        shift_labels = labels[:, 1:]
-        shift_attention_mask = attention_mask[:, 1:]
-        shift_weight_mask = weight_mask[:, 1:]
-
-        # Flatten the tensors
-        flat_logits = shift_logits.reshape(-1, shift_logits.shape[-1])
-        flat_labels = shift_labels.reshape(-1)
-        flat_attention_mask = shift_attention_mask.reshape(-1)
-        flat_weight_mask = shift_weight_mask.reshape(-1)
+        length_mask = mx.arange(input_ids.shape[1])[None, :] < lengths[:, None]
 
         # Compute loss only on non-padded tokens
         ce = (
-            nn.losses.cross_entropy(flat_logits, flat_labels, weights=flat_weight_mask)
-            * flat_attention_mask
+            nn.losses.cross_entropy(
+                logits,
+                labels,
+                weights=weight_mask,
+            )
+            * length_mask
         )
-        ntoks = flat_attention_mask.sum()
+        ntoks = length_mask.sum()
         ce = ce.sum() / ntoks
 
         return ce
