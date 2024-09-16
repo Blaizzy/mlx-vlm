@@ -11,11 +11,12 @@ def get_message_json(model_name, prompt):
     Returns:
         dict: A dictionary representing the JSON message for the specified model.
     """
-    if model_name.lower() == "idefics2":
+    if model_name.lower() in ["idefics2", "qwen2_vl"]:
         message = {
             "role": "user",
             "content": [{"type": "image"}, {"type": "text", "text": prompt}],
         }
+
     elif model_name.lower() in ["llava-qwen2", "llava", "llava_next", "bunny-llama"]:
         message = {"role": "user", "content": f"<image>\n{prompt}"}
     elif model_name.lower() == "phi3_v":

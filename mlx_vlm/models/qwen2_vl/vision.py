@@ -124,12 +124,16 @@ def apply_rotary_pos_emb_vision(tensor: mx.array, freqs: mx.array) -> mx.array:
 class VisionRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
-        inv_freq = 1.0 / (theta ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim))
-        self.inv_freq = mx.array(inv_freq)
+        self.dim = dim
+        self.theta = theta
 
     def __call__(self, seqlen: int) -> mx.array:
-        seq = mx.arange(seqlen, dtype=self.inv_freq.dtype)
-        freqs = mx.outer(seq, self.inv_freq)
+        inv_freq = 1.0 / (
+            self.theta ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
+        )
+        inv_freq = mx.array(inv_freq)
+        seq = mx.arange(seqlen, dtype=inv_freq.dtype)
+        freqs = mx.outer(seq, inv_freq)
         return freqs
 
 
@@ -139,7 +143,7 @@ class PatchEmbed(nn.Module):
         patch_size: int = 14,
         temporal_patch_size: int = 2,
         in_channels: int = 3,
-        embed_dim: int = 1152,
+        embed_dim: int = 1280,
     ) -> None:
         super().__init__()
         self.patch_size = patch_size
@@ -159,10 +163,10 @@ class PatchEmbed(nn.Module):
     def __call__(self, hidden_states: mx.array) -> mx.array:
         hidden_states = hidden_states.reshape(
             -1,
-            self.in_channels,
             self.temporal_patch_size,
             self.patch_size,
             self.patch_size,
+            self.in_channels,
         )
         hidden_states = self.proj(hidden_states).reshape(-1, self.embed_dim)
         return hidden_states
@@ -173,11 +177,11 @@ class PatchMerger(nn.Module):
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.ln_q = nn.LayerNorm(context_dim, eps=1e-6)
-        self.mlp = nn.Sequential(
+        self.mlp = [
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.GELU(),
             nn.Linear(self.hidden_size, dim),
-        )
+        ]
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.mlp(self.ln_q(x).reshape(-1, self.hidden_size))
@@ -261,43 +265,13 @@ class Qwen2VLVisionBlock(nn.Module):
         return hidden_states
 
 
-class VisionEmbeddings(nn.Module):
-    def __init__(self, config: VisionConfig):
-        super().__init__()
-        self.config = config
-        self.embed_dim = config.hidden_size
-        self.image_size = config.image_size
-        self.patch_size = config.patch_size
-
-        self.patch_embedding = nn.Conv2d(
-            in_channels=config.num_channels,
-            out_channels=self.embed_dim,
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
-            bias=True,
-        )
-
-        self.num_patches = (self.image_size // self.patch_size) ** 2
-        self.num_positions = self.num_patches
-        self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        batch_size = x.shape[0]
-        patch_embeddings = self.patch_embedding(x)
-        patch_embeddings = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
-        self.position_ids = mx.array(np.arange(self.num_positions)[None, :])
-        embeddings = patch_embeddings
-        embeddings += self.position_embedding(self.position_ids)
-        return embeddings
-
-
 class VisionModel(nn.Module):
 
     def __init__(self, config: VisionConfig) -> None:
         super().__init__()
         self.config = config
         self.model_type = config.model_type
-        if self.model_type != "siglip_vision_model":
+        if self.model_type != "qwen2_vl":
             raise ValueError(f"Unsupported model type: {self.model_type}")
         self.spatial_merge_size = config.spatial_merge_size
 
@@ -314,19 +288,24 @@ class VisionModel(nn.Module):
         self.blocks = [Qwen2VLVisionBlock(config) for _ in range(config.depth)]
         self.merger = PatchMerger(dim=config.hidden_size, context_dim=config.embed_dim)
 
+    import mlx.core as mx
+
     def rot_pos_emb(self, grid_thw):
         pos_ids = []
         for t, h, w in grid_thw:
-            hpos_ids = mx.broadcast_to(mx.arange(h)[:, None], (h, w))
+            # Create hpos_ids
+            hpos_ids = mx.repeat(mx.expand_dims(mx.arange(h), axis=1), w, axis=1)
+            print(hpos_ids.shape, h, w)
             hpos_ids = hpos_ids.reshape(
                 h // self.spatial_merge_size,
                 self.spatial_merge_size,
                 w // self.spatial_merge_size,
                 self.spatial_merge_size,
             )
-            hpos_ids = hpos_ids.transpose(0, 2, 1, 3)
+            hpos_ids = mx.transpose(hpos_ids, (0, 2, 1, 3))
             hpos_ids = hpos_ids.flatten()
 
+            # Create wpos_ids
             wpos_ids = mx.broadcast_to(mx.arange(w)[None, :], (h, w))
             wpos_ids = wpos_ids.reshape(
                 h // self.spatial_merge_size,
@@ -334,18 +313,34 @@ class VisionModel(nn.Module):
                 w // self.spatial_merge_size,
                 self.spatial_merge_size,
             )
-            wpos_ids = wpos_ids.transpose(0, 2, 1, 3)
+            wpos_ids = mx.transpose(wpos_ids, (0, 2, 1, 3))
             wpos_ids = wpos_ids.flatten()
-            pos_ids.append(mx.stack([hpos_ids, wpos_ids], axis=-1).repeat(t, axis=0))
+
+            # Stack and tile (equivalent to repeat in PyTorch)
+            stacked = mx.stack([hpos_ids, wpos_ids], axis=-1)
+            tiled = mx.tile(stacked[None, ...], (t, 1, 1))
+            pos_ids.append(tiled)
+
         pos_ids = mx.concatenate(pos_ids, axis=0)
-        max_grid_size = mx.max(grid_thw[:, 1:])
+
+        # Calculate max_grid_size
+        max_grid_size = mx.max(
+            mx.max(grid_thw[:, 1], axis=0), mx.max(grid_thw[:, 2], axis=0)
+        )
+
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].reshape(
             -1, rotary_pos_emb_full.shape[-1]
         )
+
         return rotary_pos_emb
 
-    def __call__(self, hidden_states: mx.array, grid_thw: mx.array) -> mx.array:
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        grid_thw: mx.array,
+        output_hidden_states: Optional[bool] = None,
+    ) -> mx.array:
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
@@ -354,10 +349,14 @@ class VisionModel(nn.Module):
         )
         cu_seqlens = mx.concatenate([mx.zeros(1, dtype=cu_seqlens.dtype), cu_seqlens])
 
+        encoder_states = (hidden_states,) if output_hidden_states else None
+
         for blk in self.blocks:
             hidden_states = blk(
                 hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
             )
+            if output_hidden_states:
+                encoder_states = encoder_states + (hidden_states,)
 
         return self.merger(hidden_states)
 
@@ -367,7 +366,7 @@ class VisionModel(nn.Module):
             if "position_ids" in k:
                 # Remove unused position_ids
                 continue
-            elif "patch_embedding.weight" in k:
+            elif "patch_embed.proj.weight" in k:
                 # PyTorch conv2d weight tensors have shape:
                 #   [out_channels, in_channels, kH, KW]
                 # MLX conv2d expects the weight be of shape:
@@ -375,7 +374,7 @@ class VisionModel(nn.Module):
                 if check_array_shape(v):
                     sanitized_weights[k] = v
                 else:
-                    sanitized_weights[k] = v.transpose(0, 2, 3, 1)
+                    sanitized_weights[k] = v.transpose(0, 2, 3, 4, 1)
             else:
                 sanitized_weights[k] = v
 

@@ -703,13 +703,17 @@ def prepare_inputs(image_processor, processor, image, prompt, image_token_index)
         pixel_values = image_processor.preprocess(images=[image])[0]
         pixel_values = mx.array(np.expand_dims(pixel_values, axis=0))
     else:
-        inputs = processor(prompt, image, return_tensors="np")
+        inputs = processor(
+            text=[prompt], images=[image], padding=True, return_tensors="np"
+        )
         pixel_values = mx.array(inputs["pixel_values"])
         input_ids = mx.array(inputs["input_ids"])
         mask = mx.array(inputs["attention_mask"])
         if "image_sizes" in inputs:
             return input_ids, pixel_values, inputs["image_sizes"]
-    return input_ids, pixel_values, mask
+        image_grid_thw = inputs.get("image_grid_thw", None)
+
+    return input_ids, pixel_values, mask, image_grid_thw
 
 
 def generate_step(
@@ -722,6 +726,7 @@ def generate_step(
     repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
     logit_bias: Optional[Dict[int, float]] = None,
+    **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -803,7 +808,7 @@ def generate_step(
                 repetition_context = repetition_context[-repetition_context_size:]
         return y, logprobs.squeeze(0)
 
-    logits = model(input_ids, pixel_values, cache=cache, mask=mask)
+    logits = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
     logits = logits[:, -1, :]
     y, logprobs = sample(logits)
     mx.async_eval(y)
@@ -909,9 +914,13 @@ def generate(
         tokenizer = processor.tokenizer
 
     image_token_index = model.config.image_token_index
-    input_ids, pixel_values, mask = prepare_inputs(
+    input_ids, pixel_values, mask, image_grid_thw = prepare_inputs(
         image_processor, processor, image, prompt, image_token_index
     )
+
+    kwargs = {
+        "image_grid_thw": image_grid_thw,
+    }
 
     tic = time.perf_counter()
     detokenizer = processor.detokenizer
@@ -927,6 +936,7 @@ def generate(
             repetition_penalty,
             repetition_context_size,
             top_p,
+            **kwargs,
         ),
         range(max_tokens),
     ):

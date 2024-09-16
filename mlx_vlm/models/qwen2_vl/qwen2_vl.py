@@ -43,9 +43,9 @@ class Model(nn.Module):
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config)
         embed_std = 1 / mx.sqrt(config.text_config.hidden_size)
-        self.image_newline = (
-            mx.random.normal((config.text_config.hidden_size,)) * embed_std
-        )
+        # self.image_newline = (
+        #     mx.random.normal((config.text_config.hidden_size,)) * embed_std
+        # )
         self.vision_feature_layer = config.vision_feature_layer
         self.vision_feature_select_strategy = config.vision_feature_select_strategy
 
@@ -188,16 +188,17 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        image_grid_thw: Optional[mx.array] = None,
     ):
         if pixel_values is None:
             return self.language_model(input_ids)
 
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
-
+        print(pixel_values.shape)
         # Get the ouptut hidden states from the vision model
         *_, hidden_states = self.vision_tower(
-            pixel_values[0].transpose(0, 2, 3, 1), output_hidden_states=True
+            pixel_values, image_grid_thw, output_hidden_states=True
         )
 
         # Select the hidden states from the desired layer
@@ -240,10 +241,17 @@ class Model(nn.Module):
         return mx.concatenate(final_embeddings, axis=1)
 
     def __call__(
-        self, input_ids: mx.array, pixel_values: mx.array, mask: mx.array, cache=None
+        self,
+        input_ids: mx.array,
+        pixel_values: mx.array,
+        mask: mx.array,
+        cache=None,
+        **kwargs,
     ):
-
-        input_embddings = self.get_input_embeddings(input_ids, pixel_values)
+        image_grid_thw = kwargs.pop("image_grid_thw", None)
+        input_embddings = self.get_input_embeddings(
+            input_ids, pixel_values, image_grid_thw
+        )
         logits = self.language_model(
             input_ids, cache=cache, inputs_embeds=input_embddings
         )
@@ -291,12 +299,9 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         weights = {
-            k.replace("visual", "vision_tower").replace("model", "language_model"): v
+            k.replace("visual", "vision_tower").replace(
+                "model", "language_model.model"
+            ): v
             for k, v in weights.items()
         }
-        weights = {
-            f"language_model.{k}" if k.startswith("lm_head") else k: v
-            for k, v in weights.items()
-        }
-        print(weights)
         return weights
