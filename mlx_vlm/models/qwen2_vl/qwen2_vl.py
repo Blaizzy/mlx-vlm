@@ -46,8 +46,6 @@ class Model(nn.Module):
         # self.image_newline = (
         #     mx.random.normal((config.text_config.hidden_size,)) * embed_std
         # )
-        self.vision_feature_layer = config.vision_feature_layer
-        self.vision_feature_select_strategy = config.vision_feature_select_strategy
 
     def get_rope_index(
         self,
@@ -190,6 +188,7 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
         image_grid_thw: Optional[mx.array] = None,
     ):
+
         if pixel_values is None:
             return self.language_model(input_ids)
 
@@ -197,14 +196,12 @@ class Model(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         # Get the ouptut hidden states from the vision model
         hidden_states = self.vision_tower(
-            pixel_values, image_grid_thw, output_hidden_states=True
+            pixel_values, image_grid_thw, output_hidden_states=False
         )
-
-        image_features = hidden_states[-1].astype(pixel_values.dtype)
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self._merge_input_ids_with_image_features(
-            image_features, inputs_embeds, input_ids
+            hidden_states, inputs_embeds, input_ids
         )
         return final_inputs_embeds
 
@@ -215,9 +212,8 @@ class Model(nn.Module):
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = input_ids == image_token_index
-        inputs_embeds = mx.where(
-            mx.expand_dims(image_positions, axis=-1), image_features, inputs_embeds
-        )
+        inputs_embeds = np.array(inputs_embeds.astype(mx.float32))
+        inputs_embeds[image_positions] = image_features
 
         # TODO: Add video features
 
@@ -235,6 +231,7 @@ class Model(nn.Module):
         input_embddings = self.get_input_embeddings(
             input_ids, pixel_values, image_grid_thw
         )
+
         logits = self.language_model(
             input_ids, cache=cache, inputs_embeds=input_embddings
         )

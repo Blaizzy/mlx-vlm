@@ -30,14 +30,14 @@ class TextConfig:
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
-        if self.rope_scaling:
-            self.rope_scaling = None
-            # required_keys = {"factor", "type"}
-            # if not all(key in self.rope_scaling for key in required_keys):
-            #     raise ValueError(f"rope_scaling must contain keys {required_keys}")
+        # if self.rope_scaling:
+        #     self.rope_scaling = None
+        # required_keys = {"factor", "type"}
+        # if not all(key in self.rope_scaling for key in required_keys):
+        #     raise ValueError(f"rope_scaling must contain keys {required_keys}")
 
-            # if self.rope_scaling["type"] != "linear":
-            #     raise ValueError("rope_scaling 'type' currently only supports 'linear'")
+        # if self.rope_scaling["type"] != "linear":
+        #     raise ValueError("rope_scaling 'type' currently only supports 'linear'")
 
     @classmethod
     def from_dict(cls, params):
@@ -50,123 +50,55 @@ class TextConfig:
         )
 
 
-class Qwen2VLRotaryEmbedding:
-    def __init__(
-        self,
-        dim=None,
-        max_position_embeddings=2048,
-        base=10000,
-        scaling_factor=1.0,
-        rope_type="default",
-        config=None,
-    ):
-        super().__init__()
-        self.rope_kwargs = {}
-        if config is None:
-            print(
-                "Warning: `Qwen2VLRotaryEmbedding` can now be fully parameterized by passing the model config through the "
-                "`config` argument. All other arguments will be removed in future versions."
-            )
-            self.rope_kwargs = {
-                "rope_type": rope_type,
-                "factor": scaling_factor,
-                "dim": dim,
-                "base": base,
-                "max_position_embeddings": max_position_embeddings,
-            }
-            self.rope_type = rope_type
-            self.max_seq_len_cached = max_position_embeddings
-            self.original_max_seq_len = max_position_embeddings
-        else:
-            if config.rope_scaling is not None:
-                self.rope_type = config.rope_scaling.get(
-                    "rope_type", config.rope_scaling.get("type")
-                )
-            else:
-                self.rope_type = "default"
-            self.max_seq_len_cached = config.max_position_embeddings
-            self.original_max_seq_len = config.max_position_embeddings
+class Qwen2RotaryEmbedding:
+    def __init__(self, dim, max_position_embeddings=2048, base=10000):
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
 
-        self.config = config
-        self.rope_init_fn = self._get_rope_init_function()
-
-        inv_freq, self.attention_scaling = self.rope_init_fn(
-            self.config, **self.rope_kwargs
+        inv_freq = 1.0 / (
+            self.base ** (np.arange(0, self.dim, 2).astype(np.float32) / self.dim)
         )
-        self.inv_freq = mx.array(inv_freq)
-        self.original_inv_freq = self.inv_freq
+        self.inv_freq = inv_freq
 
-    def _get_rope_init_function(self):
-        # Implement the ROPE_INIT_FUNCTIONS dictionary logic here
-        # For simplicity, we'll just implement the default RoPE initialization
-        def default_rope_init(config, **kwargs):
-            dim = kwargs.get("dim", config.hidden_size // config.num_attention_heads)
-            base = kwargs.get("base", 10000)
-            max_position_embeddings = kwargs.get(
-                "max_position_embeddings", config.max_position_embeddings
-            )
+        # Build the cos and sin cache
+        self._set_cos_sin_cache(seq_len=max_position_embeddings)
 
-            inv_freq = 1.0 / (base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim))
-            return inv_freq, 1.0
+    def _set_cos_sin_cache(self, seq_len):
+        self.max_seq_len_cached = seq_len
+        t = np.arange(self.max_seq_len_cached, dtype=np.float32)
 
-        return default_rope_init
+        freqs = np.outer(t, self.inv_freq)
 
-    def _dynamic_frequency_update(self, position_ids):
-        seq_len = mx.max(position_ids) + 1
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = np.concatenate((freqs, freqs), axis=-1)
+        self.cos_cached = np.cos(emb)
+        self.sin_cached = np.sin(emb)
+
+    def __call__(self, x, seq_len=None):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        if seq_len is None:
+            seq_len = x.shape[2]  # Assume seq_len is the third dimension
+
         if seq_len > self.max_seq_len_cached:
-            inv_freq, self.attention_scaling = self.rope_init_fn(
-                self.config, seq_len=seq_len, **self.rope_kwargs
-            )
-            self.inv_freq = mx.array(inv_freq)
-            self.max_seq_len_cached = seq_len
+            self._set_cos_sin_cache(seq_len=max_seq_len)
 
-        if (
-            seq_len < self.original_max_seq_len
-            and self.max_seq_len_cached > self.original_max_seq_len
-        ):
-            self.inv_freq = self.original_inv_freq
-            self.max_seq_len_cached = self.original_max_seq_len
-
-    def __call__(self, x, position_ids):
-        if "dynamic" in self.rope_type:
-            self._dynamic_frequency_update(position_ids)
-
-        # Core RoPE block. In contrast to other models, Qwen2_VL has different position ids for thw grids
-        # So we expand the inv_freq to shape (3, ...)
-        inv_freq_expanded = mx.expand_dims(
-            mx.expand_dims(mx.expand_dims(self.inv_freq, 0), 0), -1
+        return (
+            mx.array(self.cos_cached[:seq_len]).astype(x.dtype),
+            mx.array(self.sin_cached[:seq_len]).astype(x.dtype),
         )
-        inv_freq_expanded = np.tile(
-            inv_freq_expanded, (3, position_ids.shape[0], inv_freq_expanded.shape[2], 1)
-        )
-        inv_freq_expanded = mx.array(inv_freq_expanded)
-        position_ids = np.tile(position_ids, (3, 1, 1))
-        position_ids = mx.array(position_ids)
-        position_ids_expanded = mx.expand_dims(
-            position_ids, 2
-        )  # shape (3, bs, 1, positions)
-
-        freqs = mx.matmul(inv_freq_expanded, position_ids_expanded.astype(mx.float32))
-        freqs = mx.transpose(freqs, (0, 1, 3, 2))
-        emb = mx.concatenate((freqs, freqs), axis=-1)
-        cos = mx.cos(emb)
-        sin = mx.sin(emb)
-
-        # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
-        cos = cos * self.attention_scaling
-        sin = sin * self.attention_scaling
-
-        return cos.astype(x.dtype), sin.astype(x.dtype)
 
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
+    return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim=1):
+def apply_multimodal_rotary_pos_emb(
+    q, k, cos, sin, position_ids, mrope_section, unsqueeze_dim=1
+):
     """
     Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors.
 
@@ -181,26 +113,27 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim
     Returns:
         tuple(mx.array): The rotated query and key tensors.
     """
-    mrope_section = mx.array([m * 2 for m in mrope_section])[0]
 
-    # Split and concatenate cos and sin
-    cos_split = mx.split(cos, mrope_section, axis=-1)
-    sin_split = mx.split(sin, mrope_section, axis=-1)
+    mrope_section = mrope_section * 2
+    cos = torch.from_numpy(np.array(cos))
+    sin = torch.from_numpy(np.array(sin))
 
-    print(cos.shape)
+    cos = cos[position_ids]
+    sin = sin[position_ids]
+    cos = torch.cat(
+        [m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1
+    ).unsqueeze(unsqueeze_dim)
+    sin = torch.cat(
+        [m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1
+    ).unsqueeze(unsqueeze_dim)
 
-    cos = mx.concatenate([m[i % 3] for i, m in enumerate(cos_split)], axis=-1)
-    sin = mx.concatenate([m[i % 3] for i, m in enumerate(sin_split)], axis=-1)
-
-    # Unsqueeze
-    cos = mx.expand_dims(cos, axis=unsqueeze_dim)
-    sin = mx.expand_dims(sin, axis=unsqueeze_dim)
-
+    q = torch.from_numpy(np.array(q))
+    k = torch.from_numpy(np.array(k))
     # Apply rotary embedding
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
 
-    return q_embed, k_embed
+    return mx.array(q_embed), mx.array(k_embed)
 
 
 class Attention(nn.Module):
@@ -212,7 +145,7 @@ class Attention(nn.Module):
         assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
-        head_dim = args.hidden_size // n_heads
+        self.head_dim = head_dim = args.hidden_size // n_heads
         self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)
@@ -220,24 +153,12 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        # self.rope_scaling = args.rope_scaling
+        self.rope_scaling = args.rope_scaling
 
-        # self.rotary_emb = Qwen2VLRotaryEmbedding(
-        #     head_dim,
-        #     max_position_embeddings=args.max_position_embeddings,
-        #     base=args.rope_theta,
-        #     config=args
-        # )
-        rope_scale = (
-            1 / args.rope_scaling["factor"]
-            if args.rope_scaling is not None and args.rope_scaling["type"] == "linear"
-            else 1
-        )
-        self.rope = nn.RoPE(
+        self.rotary_emb = Qwen2RotaryEmbedding(
             head_dim,
-            traditional=args.rope_traditional,
+            max_position_embeddings=args.max_position_embeddings,
             base=args.rope_theta,
-            scale=rope_scale,
         )
 
     def __call__(
@@ -251,28 +172,30 @@ class Attention(nn.Module):
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
         # Prepare the queries, keys and values for the attention computation
-        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, self.n_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+
+        kv_seq_len = keys.shape[2]
+        if cache is not None:
+            kv_seq_len += cache.offset
+
+        position_ids = mx.arange(0, L)
+        position_ids = mx.expand_dims(position_ids, axis=0)
+        position_ids = np.tile(position_ids, (3, 1, 1))
+
+        cos, sin = self.rotary_emb(values, kv_seq_len)
+
+        queries, keys = apply_multimodal_rotary_pos_emb(
+            queries, keys, cos, sin, position_ids, self.rope_scaling["mrope_section"]
+        )
 
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
-
-        # kv_seq_len = keys.shape[-2]
-        # position_ids = mx.arange(0, kv_seq_len, dtype=mx.int32)[None,:]
-
-        # cos, sin = self.rotary_emb(values, position_ids)
-
-        # queries, keys = apply_multimodal_rotary_pos_emb(
-        #     queries, keys, cos, sin, position_ids, self.rope_scaling["mrope_section"]
-        # )
-
-        # keys, values = cache.update_and_fetch(keys, values)
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
@@ -338,7 +261,7 @@ class Qwen2Model(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
     ):
         if inputs_embeds is None:
-            h = self.embed_tokens(inputs)
+            h = self.embed_tokens(inputs).astype(mx.float32)
         else:
             h = inputs_embeds
 
@@ -379,11 +302,9 @@ class LanguageModel(nn.Module):
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
-        # Remove unused precomputed rotary freqs
-        # return {
-        #     k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
-        # }
-        return weights
+        return {
+            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
+        }
 
     @property
     def layers(self):

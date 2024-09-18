@@ -14,8 +14,8 @@ import torch.nn.functional as F
 class VisionConfig:
     model_type: str = "qwen2_vl"
     depth: int = 32
-    embed_dim: int = 768
-    hidden_size: int = 3584
+    embed_dim: int = 1280
+    hidden_size: int = 1536
     num_heads: int = 16
     image_size: int = 384
     patch_size: int = 14
@@ -23,6 +23,7 @@ class VisionConfig:
     mlp_ratio: float = 4.0
     in_channels: int = 3
     layer_norm_eps: float = 1e-6
+    spatial_patch_size = 14
     spatial_merge_size: int = 2
     temporal_patch_size: int = 2
 
@@ -154,7 +155,7 @@ class PatchEmbed(nn.Module):
         patch_size: int = 14,
         temporal_patch_size: int = 2,
         in_channels: int = 3,
-        embed_dim: int = 1280,
+        embed_dim: int = 1152,
     ) -> None:
         super().__init__()
         self.patch_size = patch_size
@@ -172,6 +173,7 @@ class PatchEmbed(nn.Module):
         )
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
+        target_dtype = self.proj.weight.dtype
         hidden_states = hidden_states.reshape(
             -1,
             self.temporal_patch_size,
@@ -296,8 +298,6 @@ class VisionModel(nn.Module):
         self.blocks = [Qwen2VLVisionBlock(config) for _ in range(config.depth)]
         self.merger = PatchMerger(dim=config.hidden_size, context_dim=config.embed_dim)
 
-    import mlx.core as mx
-
     def rot_pos_emb(self, grid_thw):
         pos_ids = []
         for t, h, w in grid_thw:
@@ -339,7 +339,6 @@ class VisionModel(nn.Module):
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        # grid_thw = mx.array(grid_thw)
         grid_thw = torch.from_numpy(grid_thw)
 
         cu_seqlens = torch.repeat_interleave(

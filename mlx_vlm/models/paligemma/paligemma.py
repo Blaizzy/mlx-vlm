@@ -135,6 +135,7 @@ class Model(nn.Module):
         pixel_values: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[mx.array] = None,
+        **kwargs,
     ):
         input_embeddings, final_attention_mask_4d = self.get_input_embeddings(
             input_ids, pixel_values, mask
