@@ -180,15 +180,21 @@ class Attention(nn.Module):
             0, 2, 1, 3
         )
 
-        kv_seq_len = keys.shape[2]
+        kv_seq_len = keys.shape[-2]
         if cache is not None:
             kv_seq_len += cache.offset
+            position_ids = mx.arange(cache.offset, cache.offset + L)
+        else:
+            position_ids = mx.arange(0, L)
 
-        position_ids = mx.arange(0, L)
         position_ids = mx.expand_dims(position_ids, axis=0)
         position_ids = np.tile(position_ids, (3, 1, 1))
 
         cos, sin = self.rotary_emb(values, kv_seq_len)
+
+        if mask is not None:
+            mask = mask[None, None, :, :]
+            mask = mask[:, :, :, : keys.shape[-2]]
 
         queries, keys = apply_multimodal_rotary_pos_emb(
             queries, keys, cos, sin, position_ids, self.rope_scaling["mrope_section"]
@@ -215,15 +221,32 @@ class MLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class TransformerBlock(nn.Module):
+class Qwen2RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        """
+        Qwen2RMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = mx.ones((hidden_size,))
+        self.variance_epsilon = eps
+
+    def __call__(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.astype(mx.float32)
+        variance = mx.mean(mx.square(hidden_states), axis=-1, keepdims=True)
+        hidden_states = hidden_states * mx.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.astype(input_dtype)
+
+
+class Qwen2VLDecoderLayer(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
         self.num_attention_heads = args.num_attention_heads
         self.hidden_size = args.hidden_size
         self.self_attn = Attention(args)
         self.mlp = MLP(args.hidden_size, args.intermediate_size)
-        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(
+        self.input_layernorm = Qwen2RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = Qwen2RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
         self.args = args
@@ -250,9 +273,9 @@ class Qwen2Model(nn.Module):
         assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
+            Qwen2VLDecoderLayer(args=args) for _ in range(args.num_hidden_layers)
         ]
-        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = Qwen2RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
         self,
