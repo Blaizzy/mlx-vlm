@@ -42,145 +42,6 @@ class Model(nn.Module):
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config)
-        embed_std = 1 / mx.sqrt(config.text_config.hidden_size)
-        # self.image_newline = (
-        #     mx.random.normal((config.text_config.hidden_size,)) * embed_std
-        # )
-
-    def get_rope_index(
-        self,
-        input_ids: mx.array,
-        image_grid_thw: Optional[mx.array] = None,
-        video_grid_thw: Optional[mx.array] = None,
-        attention_mask: Optional[mx.array] = None,
-    ) -> Tuple[mx.array, mx.array]:
-
-        spatial_merge_size = self.config.vision_config.spatial_merge_size
-        image_token_id = self.config.image_token_id
-        video_token_id = self.config.video_token_id
-        vision_start_token_id = self.config.vision_start_token_id
-        mrope_position_deltas = []
-
-        if image_grid_thw is not None or video_grid_thw is not None:
-            total_input_ids = input_ids
-            position_ids = mx.ones(
-                (3, input_ids.shape[0], input_ids.shape[1]), dtype=input_ids.dtype
-            )
-            image_index, video_index = 0, 0
-
-            for i, input_ids in enumerate(total_input_ids):
-                if attention_mask is not None:
-                    input_ids = input_ids[attention_mask[i] == 1]
-
-                vision_start_indices = mx.argwhere(
-                    input_ids == vision_start_token_id
-                ).squeeze(1)
-                vision_tokens = input_ids[vision_start_indices + 1]
-                image_nums = mx.sum(vision_tokens == image_token_id)
-                video_nums = mx.sum(vision_tokens == video_token_id)
-                input_tokens = input_ids.tolist()
-                llm_pos_ids_list = []
-                st = 0
-                remain_images, remain_videos = image_nums, video_nums
-
-                for _ in range(image_nums + video_nums):
-                    if image_token_id in input_tokens and remain_images > 0:
-                        ed_image = input_tokens.index(image_token_id, st)
-                    else:
-                        ed_image = len(input_tokens) + 1
-                    if video_token_id in input_tokens and remain_videos > 0:
-                        ed_video = input_tokens.index(video_token_id, st)
-                    else:
-                        ed_video = len(input_tokens) + 1
-
-                    if ed_image < ed_video:
-                        t, h, w = image_grid_thw[image_index]
-                        image_index += 1
-                        remain_images -= 1
-                        ed = ed_image
-                    else:
-                        t, h, w = video_grid_thw[video_index]
-                        video_index += 1
-                        remain_videos -= 1
-                        ed = ed_video
-
-                    llm_grid_t, llm_grid_h, llm_grid_w = (
-                        t,
-                        h // spatial_merge_size,
-                        w // spatial_merge_size,
-                    )
-                    text_len = ed - st
-
-                    st_idx = (
-                        mx.max(llm_pos_ids_list[-1]) + 1
-                        if len(llm_pos_ids_list) > 0
-                        else 0
-                    )
-                    llm_pos_ids_list.append(
-                        mx.broadcast_to(mx.arange(text_len).reshape(1, -1), (3, -1))
-                        + st_idx
-                    )
-
-                    t_index = mx.broadcast_to(
-                        mx.arange(llm_grid_t).reshape(-1, 1),
-                        (-1, llm_grid_h * llm_grid_w),
-                    ).flatten()
-                    h_index = mx.broadcast_to(
-                        mx.arange(llm_grid_h).reshape(1, -1, 1),
-                        (llm_grid_t, -1, llm_grid_w),
-                    ).flatten()
-                    w_index = mx.broadcast_to(
-                        mx.arange(llm_grid_w).reshape(1, 1, -1),
-                        (llm_grid_t, llm_grid_h, -1),
-                    ).flatten()
-                    llm_pos_ids_list.append(
-                        mx.stack([t_index, h_index, w_index]) + text_len + st_idx
-                    )
-                    st = ed + llm_grid_t * llm_grid_h * llm_grid_w
-
-                if st < len(input_tokens):
-                    st_idx = (
-                        mx.max(llm_pos_ids_list[-1]) + 1
-                        if len(llm_pos_ids_list) > 0
-                        else 0
-                    )
-                    text_len = len(input_tokens) - st
-                    llm_pos_ids_list.append(
-                        mx.broadcast_to(mx.arange(text_len).reshape(1, -1), (3, -1))
-                        + st_idx
-                    )
-
-                llm_positions = mx.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
-                position_ids = position_ids.at[..., i, attention_mask[i] == 1].set(
-                    llm_positions
-                )
-                mrope_position_deltas.append(
-                    mx.max(llm_positions) + 1 - len(total_input_ids[i])
-                )
-
-            mrope_position_deltas = mx.array(mrope_position_deltas).reshape(-1, 1)
-            return position_ids, mrope_position_deltas
-        else:
-            if attention_mask is not None:
-                position_ids = mx.cumsum(attention_mask, axis=-1) - 1
-                position_ids = mx.where(attention_mask == 0, 1, position_ids)
-                position_ids = mx.broadcast_to(
-                    position_ids.reshape(1, *position_ids.shape), (3, -1, -1)
-                )
-                max_position_ids = mx.max(
-                    mx.max(position_ids, axis=0, keepdims=False), axis=-1, keepdims=True
-                )
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
-            else:
-                position_ids = mx.broadcast_to(
-                    mx.arange(input_ids.shape[1]).reshape(1, 1, -1),
-                    (3, input_ids.shape[0], -1),
-                )
-                mrope_position_deltas = mx.zeros(
-                    (input_ids.shape[0], 1), dtype=input_ids.dtype
-                )
-
-            return position_ids, mrope_position_deltas
 
     def get_input_embeddings(
         self,
@@ -229,13 +90,12 @@ class Model(nn.Module):
         **kwargs,
     ):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
+        image_grid_thw = mx.array(image_grid_thw)
         input_embddings = self.get_input_embeddings(
             input_ids, pixel_values, image_grid_thw
         )
 
-        logits = self.language_model(
-            input_ids, cache=cache, inputs_embeds=input_embddings
-        )
+        logits = self.language_model(None, cache=cache, inputs_embeds=input_embddings)
         return logits
 
     @staticmethod

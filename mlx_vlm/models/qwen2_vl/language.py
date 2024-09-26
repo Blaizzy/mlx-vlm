@@ -77,11 +77,9 @@ class Qwen2RotaryEmbedding:
 
     def __call__(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
-        if seq_len is None:
-            seq_len = x.shape[2]  # Assume seq_len is the third dimension
 
         if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=max_seq_len)
+            self._set_cos_sin_cache(seq_len=seq_len)
 
         return (
             mx.array(self.cos_cached[:seq_len]).astype(x.dtype),
@@ -115,11 +113,12 @@ def apply_multimodal_rotary_pos_emb(
     """
 
     mrope_section = mrope_section * 2
-    cos = torch.from_numpy(np.array(cos))
-    sin = torch.from_numpy(np.array(sin))
 
+    position_ids = position_ids.tolist()
     cos = cos[position_ids]
     sin = sin[position_ids]
+    cos = torch.from_numpy(np.array(cos))
+    sin = torch.from_numpy(np.array(sin))
     cos = torch.cat(
         [m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1
     ).unsqueeze(unsqueeze_dim)
@@ -182,7 +181,7 @@ class Attention(nn.Module):
 
         kv_seq_len = keys.shape[-2]
         if cache is not None:
-            kv_seq_len += cache.offset
+            kv_seq_len += cache.offset + 1
             position_ids = mx.arange(cache.offset, cache.offset + L)
         else:
             position_ids = mx.arange(0, L)
@@ -221,23 +220,6 @@ class MLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Qwen2RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        """
-        Qwen2RMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
-        self.weight = mx.ones((hidden_size,))
-        self.variance_epsilon = eps
-
-    def __call__(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.astype(mx.float32)
-        variance = mx.mean(mx.square(hidden_states), axis=-1, keepdims=True)
-        hidden_states = hidden_states * mx.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.astype(input_dtype)
-
-
 class Qwen2VLDecoderLayer(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -245,8 +227,8 @@ class Qwen2VLDecoderLayer(nn.Module):
         self.hidden_size = args.hidden_size
         self.self_attn = Attention(args)
         self.mlp = MLP(args.hidden_size, args.intermediate_size)
-        self.input_layernorm = Qwen2RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = Qwen2RMSNorm(
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
         self.args = args
@@ -275,7 +257,7 @@ class Qwen2Model(nn.Module):
         self.layers = [
             Qwen2VLDecoderLayer(args=args) for _ in range(args.num_hidden_layers)
         ]
-        self.norm = Qwen2RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
         self,

@@ -1,5 +1,4 @@
 import inspect
-import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -7,7 +6,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 
 @dataclass
@@ -60,11 +58,10 @@ class Qwen2RotaryEmbedding(nn.Module):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        inv_freq = 1.0 / (
+        self.inv_freq = 1.0 / (
             self.base
             ** (mx.arange(0, self.dim, 2, dtype=mx.int64).astype(mx.float32) / self.dim)
         )
-        self.inv_freq = mx.array(inv_freq)
         self._set_cos_sin_cache(seq_len=max_position_embeddings, dtype=mx.float32)
 
     def _set_cos_sin_cache(self, seq_len, dtype):
@@ -87,36 +84,11 @@ class Qwen2RotaryEmbedding(nn.Module):
         )
 
 
-# def rotate_half(x):
-#     x1, x2 = mx.split(x, 2, axis=-1)
-#     return mx.concatenate((-x2, x1), axis=-1)
-
-
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_multimodal_rotary_pos_emb(
-    q, k, cos, sin, position_ids, mrope_section, unsqueeze_dim=1
-):
-    cos = cos[position_ids]
-    sin = sin[position_ids]
-    mrope_section = mrope_section * 2
-    cos = mx.concatenate(
-        [m[i % 3] for i, m in enumerate(mx.split(cos, mrope_section, axis=-1))], axis=-1
-    )
-    sin = mx.concatenate(
-        [m[i % 3] for i, m in enumerate(mx.split(sin, mrope_section, axis=-1))], axis=-1
-    )
-    cos = mx.expand_dims(cos, axis=unsqueeze_dim)
-    sin = mx.expand_dims(sin, axis=unsqueeze_dim)
-
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
 
 
 def apply_rotary_pos_emb_vision(tensor, freqs) -> mx.array:
@@ -143,7 +115,6 @@ class VisionRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (
             self.theta ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
         )
-        inv_freq = mx.array(inv_freq)
         seq = mx.arange(seqlen, dtype=inv_freq.dtype)
         freqs = mx.outer(seq, inv_freq)
         return freqs
@@ -173,7 +144,6 @@ class PatchEmbed(nn.Module):
         )
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
-        target_dtype = self.proj.weight.dtype
         hidden_states = hidden_states.reshape(
             -1,
             self.temporal_patch_size,
@@ -207,7 +177,8 @@ class Attention(nn.Module):
     def __init__(self, dim: int, num_heads: int = 16) -> None:
         super().__init__()
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        self.head_dim = head_dim = dim // num_heads
+        self.scale = head_dim**-0.5
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
 
@@ -233,14 +204,13 @@ class Attention(nn.Module):
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
-        attn_weights = mx.matmul(q, mx.swapaxes(k, 3, 2)) / math.sqrt(self.head_dim)
-        attn_weights = attn_weights + attention_mask
-        attn_weights = mx.softmax(attn_weights, axis=-1)
-        attn_output = mx.matmul(attn_weights, v)
-        attn_output = attn_output.transpose(0, 2, 1, 3)
-        attn_output = attn_output.reshape(seq_length, -1)
-        attn_output = self.proj(attn_output)
-        return attn_output
+
+        output = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=self.scale, mask=attention_mask
+        )
+        output = output.transpose(0, 2, 1, 3)
+        output = output.reshape(seq_length, -1)
+        return self.proj(output)
 
 
 class MLP(nn.Module):
@@ -301,35 +271,49 @@ class VisionModel(nn.Module):
 
     def rot_pos_emb(self, grid_thw):
         pos_ids = []
+
         for t, h, w in grid_thw:
-            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+            h, w = int(h), int(w)  # Ensure h and w are integers
+            hpos_ids = mx.expand_dims(mx.arange(h), 1)
+            hpos_ids = mx.repeat(hpos_ids, w, axis=1)
             hpos_ids = hpos_ids.reshape(
                 h // self.spatial_merge_size,
                 self.spatial_merge_size,
                 w // self.spatial_merge_size,
                 self.spatial_merge_size,
             )
-            hpos_ids = hpos_ids.permute(0, 2, 1, 3)
+            hpos_ids = mx.transpose(hpos_ids, (0, 2, 1, 3))
             hpos_ids = hpos_ids.flatten()
 
-            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+            wpos_ids = mx.expand_dims(mx.arange(w), 0)
+            wpos_ids = mx.repeat(wpos_ids, h, axis=0)
             wpos_ids = wpos_ids.reshape(
                 h // self.spatial_merge_size,
                 self.spatial_merge_size,
                 w // self.spatial_merge_size,
                 self.spatial_merge_size,
             )
-            wpos_ids = wpos_ids.permute(0, 2, 1, 3)
+            wpos_ids = mx.transpose(wpos_ids, (0, 2, 1, 3))
             wpos_ids = wpos_ids.flatten()
-            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
-        pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = grid_thw[:, 1:].max()
-        max_grid_size = mx.array(max_grid_size)
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
-        rotary_pos_emb_full = torch.from_numpy(np.array(rotary_pos_emb_full))
-        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
 
-        return mx.array(rotary_pos_emb)
+            stacked_pos_ids = mx.stack([hpos_ids, wpos_ids], axis=-1)
+            pos_ids.append(mx.repeat(stacked_pos_ids, t, axis=0))
+
+        pos_ids = mx.concatenate(pos_ids, axis=0)
+        max_grid_size = mx.max(grid_thw[:, 1:])
+        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+
+        # Convert pos_ids to numpy for indexing
+        pos_ids_np = np.array(pos_ids)
+        rotary_pos_emb_full_np = np.array(rotary_pos_emb_full)
+
+        # Perform indexing using numpy
+        rotary_pos_emb_np = rotary_pos_emb_full_np[pos_ids_np]
+
+        # Convert back to MLX array and flatten
+        rotary_pos_emb = mx.array(rotary_pos_emb_np).reshape(pos_ids.shape[0], -1)
+
+        return rotary_pos_emb
 
     def __call__(
         self,
@@ -340,14 +324,9 @@ class VisionModel(nn.Module):
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        grid_thw = torch.from_numpy(grid_thw)
-
-        cu_seqlens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-        ).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-
-        cu_seqlens = mx.array(cu_seqlens)
+        cu_seqlens = mx.repeat(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
+        cu_seqlens = mx.array(np.cumsum(cu_seqlens, dtype=np.int32))
+        cu_seqlens = mx.pad(cu_seqlens, (1, 0), mode="constant", constant_values=0)
 
         encoder_states = (hidden_states,) if output_hidden_states else None
 
