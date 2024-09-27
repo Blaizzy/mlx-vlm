@@ -57,7 +57,7 @@ class Qwen2RotaryEmbedding:
         self.base = base
 
         inv_freq = 1.0 / (
-            self.base ** (np.arange(0, self.dim, 2).astype(np.float32) / self.dim)
+            self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
         )
         self.inv_freq = inv_freq
 
@@ -66,14 +66,14 @@ class Qwen2RotaryEmbedding:
 
     def _set_cos_sin_cache(self, seq_len):
         self.max_seq_len_cached = seq_len
-        t = np.arange(self.max_seq_len_cached, dtype=np.float32)
+        t = mx.arange(self.max_seq_len_cached).astype(mx.float32)
 
-        freqs = np.outer(t, self.inv_freq)
+        freqs = mx.outer(t, self.inv_freq)
 
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = np.concatenate((freqs, freqs), axis=-1)
-        self.cos_cached = np.cos(emb)
-        self.sin_cached = np.sin(emb)
+        emb = mx.concatenate((freqs, freqs), axis=-1)
+        self.cos_cached = mx.cos(emb)
+        self.sin_cached = mx.sin(emb)
 
     def __call__(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
@@ -91,12 +91,10 @@ def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+    return mx.concatenate([-x2, x1], axis=-1)
 
 
-def apply_multimodal_rotary_pos_emb(
-    q, k, cos, sin, position_ids, mrope_section, unsqueeze_dim=1
-):
+def apply_multimodal_rotary_pos_emb(q, k, cos, sin, position_ids, mrope_section):
     """
     Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors.
 
@@ -112,22 +110,21 @@ def apply_multimodal_rotary_pos_emb(
         tuple(mx.array): The rotated query and key tensors.
     """
 
-    mrope_section = mrope_section * 2
+    mrope_section = np.cumsum(mrope_section * 2)[:-1].tolist()
 
     position_ids = position_ids.tolist()
     cos = cos[position_ids]
     sin = sin[position_ids]
-    cos = torch.from_numpy(np.array(cos))
-    sin = torch.from_numpy(np.array(sin))
-    cos = torch.cat(
-        [m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1
-    ).unsqueeze(unsqueeze_dim)
-    sin = torch.cat(
-        [m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1
-    ).unsqueeze(unsqueeze_dim)
 
-    q = torch.from_numpy(np.array(q))
-    k = torch.from_numpy(np.array(k))
+    cos = mx.concatenate(
+        [m[i % 3] for i, m in enumerate(mx.split(cos, mrope_section, axis=-1))], axis=-1
+    )[
+        :, None, :, :
+    ]  # unsqueeze dim 1
+    sin = mx.concatenate(
+        [m[i % 3] for i, m in enumerate(mx.split(sin, mrope_section, axis=-1))], axis=-1
+    )[:, None, :, :]
+
     # Apply rotary embedding
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)

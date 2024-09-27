@@ -146,12 +146,14 @@ class PatchEmbed(nn.Module):
     def __call__(self, hidden_states: mx.array) -> mx.array:
         hidden_states = hidden_states.reshape(
             -1,
+            self.in_channels,
             self.temporal_patch_size,
             self.patch_size,
             self.patch_size,
-            self.in_channels,
-        )
-        hidden_states = self.proj(hidden_states).reshape(-1, self.embed_dim)
+        ).moveaxis(1, 4)
+
+        hidden_states = self.proj(hidden_states)
+        hidden_states = hidden_states.reshape(-1, self.embed_dim)
         return hidden_states
 
 
@@ -303,17 +305,9 @@ class VisionModel(nn.Module):
         max_grid_size = mx.max(grid_thw[:, 1:])
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
 
-        # Convert pos_ids to numpy for indexing
-        pos_ids_np = np.array(pos_ids)
-        rotary_pos_emb_full_np = np.array(rotary_pos_emb_full)
+        rotary_pos_emb_np = rotary_pos_emb_full[pos_ids]
 
-        # Perform indexing using numpy
-        rotary_pos_emb_np = rotary_pos_emb_full_np[pos_ids_np]
-
-        # Convert back to MLX array and flatten
-        rotary_pos_emb = mx.array(rotary_pos_emb_np).reshape(pos_ids.shape[0], -1)
-
-        return rotary_pos_emb
+        return rotary_pos_emb_np.reshape(pos_ids.shape[0], -1)
 
     def __call__(
         self,
@@ -325,7 +319,7 @@ class VisionModel(nn.Module):
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
         cu_seqlens = mx.repeat(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
-        cu_seqlens = mx.array(np.cumsum(cu_seqlens, dtype=np.int32))
+        cu_seqlens = mx.cumsum(cu_seqlens.astype(mx.int32))
         cu_seqlens = mx.pad(cu_seqlens, (1, 0), mode="constant", constant_values=0)
 
         encoder_states = (hidden_states,) if output_hidden_states else None
