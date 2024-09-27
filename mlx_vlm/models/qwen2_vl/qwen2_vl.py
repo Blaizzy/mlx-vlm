@@ -144,6 +144,8 @@ class Model(nn.Module):
                 key = key.replace("visual", "vision_tower")
             if "language_model.model" not in key:
                 key = key.replace("model", "language_model.model")
+            if "lm_head" in key:
+                key = key.replace("lm_head", "language_model.lm_head")
             return key
 
         return {transform_key(k): v for k, v in weights.items()}
