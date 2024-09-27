@@ -139,10 +139,11 @@ class Model(nn.Module):
         return model
 
     def sanitize(self, weights):
-        weights = {
-            k.replace("visual", "vision_tower").replace(
-                "model", "language_model.model"
-            ): v
-            for k, v in weights.items()
-        }
-        return weights
+        def transform_key(key):
+            if "vision_tower" not in key:
+                key = key.replace("visual", "vision_tower")
+            if "language_model.model" not in key:
+                key = key.replace("model", "language_model.model")
+            return key
+
+        return {transform_key(k): v for k, v in weights.items()}

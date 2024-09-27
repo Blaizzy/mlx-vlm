@@ -199,6 +199,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         weights = model_class.LanguageModel(model_config.text_config).sanitize(
             weights=weights
         )
+
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized
         class_predicate = (
@@ -502,7 +503,11 @@ def quantize_model(
         Tuple: Tuple containing quantized weights and config.
     """
     quantized_config = copy.deepcopy(config)
-    vision_intermediate_size = model.config.vision_config.intermediate_size
+    vision_intermediate_size = (
+        model.config.vision_config.intermediate_size
+        if hasattr(model.config.vision_config, "intermediate_size")
+        else model.config.vision_config.hidden_size
+    )
     divisor = 64
     if any(vision_intermediate_size % size != 0 for size in [64, 128]):
         for name, module in model.named_modules():
@@ -541,11 +546,20 @@ def quantize_model(
     quantized_config.setdefault("vision_config", {})
 
     # Update intermediate_size
-    quantized_config["vision_config"]["intermediate_size"] = (
-        ((vision_intermediate_size // divisor) + 1) * divisor
-        if vision_intermediate_size % divisor != 0
-        else vision_intermediate_size
-    )
+    if hasattr(model.config.vision_config, "intermediate_size"):
+        quantized_config["vision_config"]["intermediate_size"] = (
+            ((vision_intermediate_size // divisor) + 1) * divisor
+            if vision_intermediate_size % divisor != 0
+            else vision_intermediate_size
+        )
+    elif hasattr(model.config.vision_config, "hidden_size"):
+        quantized_config["vision_config"]["hidden_size"] = (
+            ((vision_intermediate_size // divisor) + 1) * divisor
+            if vision_intermediate_size % divisor != 0
+            else vision_intermediate_size
+        )
+    else:
+        raise ValueError("No intermediate_size or hidden_size found in vision_config")
 
     nn.quantize(model, q_group_size, q_bits)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
