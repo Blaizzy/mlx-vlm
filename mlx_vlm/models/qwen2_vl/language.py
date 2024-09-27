@@ -30,15 +30,6 @@ class TextConfig:
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
-        # if self.rope_scaling:
-        #     self.rope_scaling = None
-        # required_keys = {"factor", "type"}
-        # if not all(key in self.rope_scaling for key in required_keys):
-        #     raise ValueError(f"rope_scaling must contain keys {required_keys}")
-
-        # if self.rope_scaling["type"] != "linear":
-        #     raise ValueError("rope_scaling 'type' currently only supports 'linear'")
-
     @classmethod
     def from_dict(cls, params):
         return cls(
@@ -82,8 +73,8 @@ class Qwen2RotaryEmbedding:
             self._set_cos_sin_cache(seq_len=seq_len)
 
         return (
-            mx.array(self.cos_cached[:seq_len]).astype(x.dtype),
-            mx.array(self.sin_cached[:seq_len]).astype(x.dtype),
+            self.cos_cached[:seq_len].astype(x.dtype),
+            self.sin_cached[:seq_len].astype(x.dtype),
         )
 
 
@@ -300,13 +291,6 @@ class LanguageModel(nn.Module):
         else:
             out = self.lm_head(out)
         return out
-
-    def sanitize(self, weights):
-        if self.args.tie_word_embeddings:
-            weights.pop("lm_head.weight", None)
-        return {
-            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
-        }
 
     @property
     def layers(self):
