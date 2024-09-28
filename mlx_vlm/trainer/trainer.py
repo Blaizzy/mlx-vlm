@@ -25,7 +25,10 @@ class Dataset:
         take=None,
         split="train",
     ):
-        self.dataset = hf_dataset[split]
+        if split is not None:
+            self.dataset = hf_dataset[split]
+        else:
+            self.dataset = hf_dataset
         if take is not None:
             self.dataset = self.dataset.take(take)
         self.processor = processor
@@ -157,7 +160,9 @@ def default_loss(model, inputs, targets, lengths):
 
 
 class Trainer:
-    def __init__(self, model, optimizer, train_on_completions=False):
+    def __init__(
+        self, model, optimizer, train_on_completions=False, assistant_id=77091
+    ):
         self.model = model
         self.optimizer = optimizer
         self.train_on_completions = train_on_completions
@@ -176,7 +181,8 @@ class Trainer:
 
         if self.train_on_completions:
             weight_mask = mx.ones_like(attention_mask)
-            assistant_response_index = np.where(input_ids == 77091)[1]
+
+            assistant_response_index = np.where(input_ids == assistant_id)[1]
             range_matrix = mx.repeat(
                 mx.expand_dims(mx.arange(seq_length), 0), batch_size, axis=0
             )
