@@ -91,21 +91,26 @@ def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+    return mx.concatenate([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb_vision(tensor, freqs) -> mx.array:
-    tensor = torch.from_numpy(np.array(tensor))
-    freqs = torch.from_numpy(np.array(freqs))
     orig_dtype = tensor.dtype
-    tensor = tensor.float()
-    cos = freqs.cos()
-    sin = freqs.sin()
-    cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
-    sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+
+    cos = mx.cos(freqs)
+    sin = mx.sin(freqs)
+
+    # Reshape cos and sin to match the input tensor shape
+    cos = cos.reshape(1, cos.shape[0], 1, cos.shape[1])
+    sin = sin.reshape(1, sin.shape[0], 1, sin.shape[1])
+
+    # Ensure the last dimension of cos and sin matches tensor
+    cos = mx.repeat(cos, 2, axis=-1)
+    sin = mx.repeat(sin, 2, axis=-1)
+
     output = (tensor * cos) + (rotate_half(tensor) * sin)
-    output = output.to(orig_dtype)
-    return mx.array(output)
+    output = mx.array(output, dtype=orig_dtype)
+    return output
 
 
 class VisionRotaryEmbedding(nn.Module):
