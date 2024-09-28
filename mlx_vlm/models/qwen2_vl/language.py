@@ -5,7 +5,6 @@ from typing import Dict, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-import torch
 
 from ..base import KVCache, create_attention_mask
 
