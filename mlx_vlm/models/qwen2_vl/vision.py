@@ -109,8 +109,7 @@ def apply_rotary_pos_emb_vision(tensor, freqs) -> mx.array:
     sin = mx.repeat(sin, 2, axis=-1)
 
     output = (tensor * cos) + (rotate_half(tensor) * sin)
-    output = mx.array(output, dtype=orig_dtype)
-    return output
+    return output.astype(orig_dtype)
 
 
 class VisionRotaryEmbedding(nn.Module):
