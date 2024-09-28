@@ -163,6 +163,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     if model_type == "phi3_v":
         config["vision_config"] = config["img_processor"]
         config["text_config"] = {}
+    if model_type == "qwen2_vl":
+        config["text_config"] = {
+            k: v for k, v in config.items() if k != "vision_config"
+        }
 
     model_config = model_class.ModelConfig.from_dict(config)
 
@@ -195,6 +199,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         weights = model_class.LanguageModel(model_config.text_config).sanitize(
             weights=weights
         )
+
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized
         class_predicate = (
@@ -498,7 +503,11 @@ def quantize_model(
         Tuple: Tuple containing quantized weights and config.
     """
     quantized_config = copy.deepcopy(config)
-    vision_intermediate_size = model.config.vision_config.intermediate_size
+    vision_intermediate_size = (
+        model.config.vision_config.intermediate_size
+        if hasattr(model.config.vision_config, "intermediate_size")
+        else model.config.vision_config.hidden_size
+    )
     divisor = 64
     if any(vision_intermediate_size % size != 0 for size in [64, 128]):
         for name, module in model.named_modules():
@@ -537,11 +546,20 @@ def quantize_model(
     quantized_config.setdefault("vision_config", {})
 
     # Update intermediate_size
-    quantized_config["vision_config"]["intermediate_size"] = (
-        ((vision_intermediate_size // divisor) + 1) * divisor
-        if vision_intermediate_size % divisor != 0
-        else vision_intermediate_size
-    )
+    if hasattr(model.config.vision_config, "intermediate_size"):
+        quantized_config["vision_config"]["intermediate_size"] = (
+            ((vision_intermediate_size // divisor) + 1) * divisor
+            if vision_intermediate_size % divisor != 0
+            else vision_intermediate_size
+        )
+    elif hasattr(model.config.vision_config, "hidden_size"):
+        quantized_config["vision_config"]["hidden_size"] = (
+            ((vision_intermediate_size // divisor) + 1) * divisor
+            if vision_intermediate_size % divisor != 0
+            else vision_intermediate_size
+        )
+    else:
+        raise ValueError("No intermediate_size or hidden_size found in vision_config")
 
     nn.quantize(model, q_group_size, q_bits)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
@@ -699,13 +717,17 @@ def prepare_inputs(image_processor, processor, image, prompt, image_token_index)
         pixel_values = image_processor.preprocess(images=[image])[0]
         pixel_values = mx.array(np.expand_dims(pixel_values, axis=0))
     else:
-        inputs = processor(prompt, image, return_tensors="np")
+        inputs = processor(
+            text=[prompt], images=[image], padding=True, return_tensors="np"
+        )
         pixel_values = mx.array(inputs["pixel_values"])
         input_ids = mx.array(inputs["input_ids"])
         mask = mx.array(inputs["attention_mask"])
         if "image_sizes" in inputs:
             return input_ids, pixel_values, inputs["image_sizes"]
-    return input_ids, pixel_values, mask
+        image_grid_thw = inputs.get("image_grid_thw", None)
+
+    return input_ids, pixel_values, mask, image_grid_thw
 
 
 def generate_step(
@@ -718,6 +740,7 @@ def generate_step(
     repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
     logit_bias: Optional[Dict[int, float]] = None,
+    **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -799,7 +822,7 @@ def generate_step(
                 repetition_context = repetition_context[-repetition_context_size:]
         return y, logprobs.squeeze(0)
 
-    logits = model(input_ids, pixel_values, cache=cache, mask=mask)
+    logits = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
     logits = logits[:, -1, :]
     y, logprobs = sample(logits)
     mx.async_eval(y)
@@ -905,9 +928,13 @@ def generate(
         tokenizer = processor.tokenizer
 
     image_token_index = model.config.image_token_index
-    input_ids, pixel_values, mask = prepare_inputs(
+    input_ids, pixel_values, mask, image_grid_thw = prepare_inputs(
         image_processor, processor, image, prompt, image_token_index
     )
+
+    kwargs = {
+        "image_grid_thw": image_grid_thw,
+    }
 
     tic = time.perf_counter()
     detokenizer = processor.detokenizer
@@ -923,6 +950,7 @@ def generate(
             repetition_penalty,
             repetition_context_size,
             top_p,
+            **kwargs,
         ),
         range(max_tokens),
     ):
