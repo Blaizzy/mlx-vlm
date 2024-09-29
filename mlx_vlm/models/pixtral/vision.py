@@ -75,7 +75,9 @@ def generate_block_attention_mask(patch_embeds_list, tensor):
         start, end = int(start), int(end)  # Convert to integers for indexing
         causal_mask[start:end, start:end] = 0
 
-    causal_mask = mx.broadcast_to(causal_mask[None, None, :, :], (tensor.shape[0], 1, seq_len, seq_len))
+    causal_mask = mx.broadcast_to(
+        causal_mask[None, None, :, :], (tensor.shape[0], 1, seq_len, seq_len)
+    )
     return causal_mask
 
 
@@ -84,12 +86,14 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return mx.concatenate((-x2, x1), axis=-1)
 
+
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     cos = mx.expand_dims(cos, axis=unsqueeze_dim)
     sin = mx.expand_dims(sin, axis=unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
 
 class Attention(nn.Module):
     def __init__(
@@ -140,7 +144,6 @@ class Attention(nn.Module):
         keys = keys.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
 
-
         cos, sin = position_embeddings
         queries, keys = apply_rotary_pos_emb(queries, keys, cos, sin, unsqueeze_dim=0)
 
@@ -181,7 +184,12 @@ class EncoderLayer(nn.Module):
         self.feed_forward = MLP(config)
         self.ffn_norm = nn.RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
 
-    def __call__(self, x: mx.array, position_embeddings: mx.array, mask: Optional[mx.array] = None) -> mx.array:
+    def __call__(
+        self,
+        x: mx.array,
+        position_embeddings: mx.array,
+        mask: Optional[mx.array] = None,
+    ) -> mx.array:
         y = self.attention_norm(x)
         y = self.attention(y, y, y, position_embeddings, mask)
         x = x + y
@@ -196,22 +204,27 @@ class Encoder(nn.Module):
         self.layers = [EncoderLayer(config) for _ in range(config.num_hidden_layers)]
 
 
-class PixtralRotaryEmbedding():
+class PixtralRotaryEmbedding:
     def __init__(self, config):
         self.dim = config.head_dim
         self.base = config.rope_theta
         max_patches_per_side = config.image_size // config.patch_size
-        freqs = 1.0 / (self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim))
+        freqs = 1.0 / (
+            self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
+        )
 
         h = mx.arange(max_patches_per_side)
         w = mx.arange(max_patches_per_side)
 
         freqs_h = mx.outer(h, freqs[::2]).astype(mx.float32)
         freqs_w = mx.outer(w, freqs[1::2]).astype(mx.float32)
-        inv_freq = mx.concatenate([
-            mx.tile(freqs_h[:, None, :], (1, max_patches_per_side, 1)),
-            mx.tile(freqs_w[None, :, :], (max_patches_per_side, 1, 1))
-        ], axis=-1).reshape(-1, self.dim // 2)
+        inv_freq = mx.concatenate(
+            [
+                mx.tile(freqs_h[:, None, :], (1, max_patches_per_side, 1)),
+                mx.tile(freqs_w[None, :, :], (max_patches_per_side, 1, 1)),
+            ],
+            axis=-1,
+        ).reshape(-1, self.dim // 2)
 
         self.inv_freq = mx.concatenate((inv_freq, inv_freq), axis=-1)
 
@@ -221,6 +234,7 @@ class PixtralRotaryEmbedding():
         cos = mx.cos(emb)
         sin = mx.sin(emb)
         return cos.astype(x.dtype), sin.astype(x.dtype)
+
 
 class ClipVisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
@@ -245,12 +259,15 @@ class ClipVisionModel(nn.Module):
         B, H, W, C = x.shape
         patch_embeds_list = [self.patch_conv(img[None, :]) for img in x]
 
-        patch_embeds = mx.concatenate([p.reshape(B, -1, p.shape[-1]) for p in patch_embeds_list], axis=1)
+        patch_embeds = mx.concatenate(
+            [p.reshape(B, -1, p.shape[-1]) for p in patch_embeds_list], axis=1
+        )
 
         patch_embeds = self.ln_pre(patch_embeds)
 
         position_ids = position_ids_in_meshgrid(
-            patch_embeds_list, max_width=self.config.image_size // self.config.patch_size
+            patch_embeds_list,
+            max_width=self.config.image_size // self.config.patch_size,
         )
 
         position_embedding = self.patch_positional_embedding(patch_embeds, position_ids)
@@ -262,7 +279,9 @@ class ClipVisionModel(nn.Module):
         encoder_states = (patch_embeds,) if output_hidden_states else None
 
         for l in self.transformer.layers:
-            patch_embeds = l(patch_embeds, mask=mask, position_embeddings=position_embedding)
+            patch_embeds = l(
+                patch_embeds, mask=mask, position_embeddings=position_embedding
+            )
             if output_hidden_states:
                 encoder_states = encoder_states + (patch_embeds,)
 

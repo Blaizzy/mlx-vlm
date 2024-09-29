@@ -82,7 +82,6 @@ class Model(nn.Module):
         # Select the hidden states from the desired layer
         selected_image_feature = hidden_states[self.vision_feature_layer]
 
-
         if self.vision_feature_select_strategy == "default":
             selected_image_feature = selected_image_feature[:, 1:]
         elif self.vision_feature_select_strategy == "full":
@@ -92,7 +91,6 @@ class Model(nn.Module):
                 "Unexpected feature selection strategy: "
                 f"{self.vision_feature_select_strategy}"
             )
-
 
         # Pass image features through the multi-modal projector
         image_features = self.multi_modal_projector(selected_image_feature)
@@ -128,7 +126,12 @@ class Model(nn.Module):
         return mx.concatenate(final_embeddings, axis=1)
 
     def __call__(
-        self, input_ids: mx.array, pixel_values: mx.array, mask: mx.array, cache=None, **kwargs
+        self,
+        input_ids: mx.array,
+        pixel_values: mx.array,
+        mask: mx.array,
+        cache=None,
+        **kwargs,
     ):
         input_embddings = self.get_input_embeddings(input_ids, pixel_values)
         logits = self.language_model(
@@ -188,5 +191,3 @@ class Model(nn.Module):
             return key
 
         return {transform_key(k): v for k, v in weights.items()}
-
-
