@@ -728,7 +728,15 @@ def prepare_inputs(image_processor, processor, image, prompt, image_token_index)
                 text=prompt, images=[image], padding=True, return_tensors="mlx"
             )  # for phi3_v model
 
-        pixel_values = mx.array(inputs["pixel_values"])
+        if isinstance(inputs["pixel_values"], list):
+            pixel_values = mx.array(inputs["pixel_values"][0][0])[None, :]
+        elif isinstance(inputs["pixel_values"], np.ndarray):
+            pixel_values = mx.array(inputs["pixel_values"])
+        else:
+            raise ValueError(
+                f"Invalid pixel_values type: {type(inputs['pixel_values'])}"
+            )
+
         input_ids = mx.array(inputs["input_ids"])
         mask = inputs["attention_mask"]
         image_grid_thw = inputs.get("image_grid_thw", None)
