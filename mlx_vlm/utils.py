@@ -708,11 +708,20 @@ def prepare_inputs(image_processor, processor, images, prompts, image_token_inde
     from transformers.image_utils import load_image
 
     mask = None
-    if isinstance(image, str):
-        image = load_image(image)
+    if not isinstance(images, list):
+        images = [images]
+    if not isinstance(prompts, list):
+        prompts = [prompts]
+
+    assert len(images) == len(
+        prompts
+    ), f"Number of images ({len(images)}) and prompts ({len(prompts)}) must match"
+
+    images = [load_image(img) if isinstance(img, str) else img for img in images]
 
     image_grid_thw = None
     if image_processor is not None:
+        processor.pad_token = processor.eos_token
         text_chunks = [
             [processor(chunk).input_ids for chunk in prompt.split("<image>")]
             for prompt in prompts
@@ -731,36 +740,51 @@ def prepare_inputs(image_processor, processor, images, prompts, image_token_inde
             input_ids.append(mx.array(ids + padding))
 
         input_ids = mx.array(input_ids)
-        pixel_values = image_processor.preprocess(images=loaded_images)
+        pixel_values = image_processor.preprocess(images=images)
         pixel_values = mx.array(np.stack(pixel_values))
-        masks = mx.array([(ids != processor.pad_token_id) for ids in input_ids]).astype(
+
+        mask = mx.array([(ids != processor.pad_token_id) for ids in input_ids]).astype(
             mx.int32
         )
     else:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
+
         try:
             inputs = processor(
-                text=[prompt], images=[image], padding=True, return_tensors="mlx"
+                text=prompts, images=images, padding=True, return_tensors="mlx"
             )
-        except Exception as e:
-            inputs = processor(
-                text=prompt, images=[image], padding=True, return_tensors="mlx"
-            )  # for phi3_v model
-
-        if isinstance(inputs["pixel_values"], list):
-            pixel_values = mx.array(inputs["pixel_values"][0][0])[None, :]
-        elif isinstance(inputs["pixel_values"], np.ndarray):
             pixel_values = mx.array(inputs["pixel_values"])
-        else:
-            raise ValueError(
-                f"Invalid pixel_values type: {type(inputs['pixel_values'])}"
+            input_ids = mx.array(inputs["input_ids"])
+            mask = mx.array(inputs["attention_mask"])
+            image_grid_thw = inputs.get("image_grid_thw", None)
+            if image_grid_thw is not None:
+                image_grid_thw = mx.array(image_grid_thw)
+
+        except Exception as e:
+            inputs = []
+            for i in range(len(images)):
+                inputs.append(
+                    processor(
+                        text=str(prompts[i]),
+                        images=images[i],
+                        padding=True,
+                        return_tensors="mlx",
+                    )
+                )
+            input_ids = mx.concatenate(
+                [mx.array(i["input_ids"]) for i in inputs], axis=0
+            )
+            pixel_values = mx.concatenate(
+                [mx.array(i["pixel_values"]) for i in inputs], axis=0
+            )
+            mask = mx.concatenate(
+                [mx.array(i["attention_mask"]) for i in inputs], axis=0
+            )
+            image_sizes = mx.concatenate(
+                [mx.array(i["image_sizes"]) for i in inputs], axis=0
             )
 
-        input_ids = mx.array(inputs["input_ids"])
-        mask = inputs["attention_mask"]
-        image_grid_thw = inputs.get("image_grid_thw", None)
-        if "image_sizes" in inputs:
-            return input_ids, pixel_values, inputs["image_sizes"], image_grid_thw
+            return input_ids, pixel_values, image_sizes, image_grid_thw
 
     return input_ids, pixel_values, mask, image_grid_thw
 
