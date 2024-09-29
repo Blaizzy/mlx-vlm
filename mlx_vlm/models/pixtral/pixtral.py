@@ -182,7 +182,7 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         def transform_key(key):
-            if "vision_tower" in key:
+            if "vision_tower" in key and "vision_model" not in key:
                 if "transformer" in key:
                     key = key.replace("vision_tower", "vision_tower.vision_model")
                 if "patch_conv" in key:

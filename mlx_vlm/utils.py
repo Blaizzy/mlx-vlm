@@ -295,14 +295,15 @@ def load_image_processor(model_path: Union[str, Path]) -> BaseImageProcessor:
 
 
 def load_processor(
-    model_path, processor_config={"trust_remote_code": True}
+    model_path, processor_config={"trust_remote_code": True}, add_detokenizer=True
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     processor = AutoProcessor.from_pretrained(model_path, **processor_config)
-    detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
-    if "tokenizer" in processor.__dict__.keys():
-        processor.detokenizer = detokenizer_class(processor.tokenizer)
-    else:
-        processor.detokenizer = detokenizer_class(processor)
+    if add_detokenizer:
+        detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
+        if "tokenizer" in processor.__dict__.keys():
+            processor.detokenizer = detokenizer_class(processor.tokenizer)
+        else:
+            processor.detokenizer = detokenizer_class(processor)
     return processor
 
 
@@ -311,8 +312,7 @@ def fetch_from_hub(
 ) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
     model = load_model(model_path, lazy)
     config = load_config(model_path)
-    processor = load_processor(model_path)
-
+    processor = load_processor(model_path, add_detokenizer=False)
     return model, config, processor
 
 
@@ -644,7 +644,7 @@ def convert(
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
-    model, config, tokenizer = fetch_from_hub(model_path, lazy=False)
+    model, config, processor = fetch_from_hub(model_path, lazy=False)
 
     weights = dict(tree_flatten(model.parameters()))
     dtype = mx.float16 if quantize else getattr(mx, dtype)
@@ -673,7 +673,7 @@ def convert(
     for file in py_files:
         shutil.copy(file, mlx_path)
 
-    tokenizer.save_pretrained(mlx_path)
+    processor.save_pretrained(mlx_path)
 
     save_config(config, config_path=mlx_path / "config.json")
 
@@ -724,7 +724,7 @@ def prepare_inputs(image_processor, processor, images, prompts, image_token_inde
         prompts
     ), f"Number of images ({len(images)}) and prompts ({len(prompts)}) must match"
 
-    images = [load_image(img) if isinstance(img, str) else img for img in images]
+    images = [img for img in images]
 
     image_grid_thw = None
     if image_processor is not None:
@@ -755,12 +755,12 @@ def prepare_inputs(image_processor, processor, images, prompts, image_token_inde
         )
     else:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
-
         try:
-            inputs = processor(
-                text=prompts, images=images, padding=True, return_tensors="mlx"
-            )
-            pixel_values = mx.array(inputs["pixel_values"])
+            inputs = processor(text=prompts, images=images, return_tensors="mlx")
+            if isinstance(inputs["pixel_values"], list):
+                pixel_values = mx.array(inputs["pixel_values"][0][0])[None, :]
+            else:
+                pixel_values = mx.array(inputs["pixel_values"])
             input_ids = mx.array(inputs["input_ids"])
             mask = mx.array(inputs["attention_mask"])
             image_grid_thw = inputs.get("image_grid_thw", None)
