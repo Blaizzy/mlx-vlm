@@ -1,12 +1,9 @@
 import inspect
-import math
 from dataclasses import dataclass
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
-import torch
 
 
 @dataclass
@@ -50,6 +47,37 @@ def check_array_shape(arr):
         return True
     else:
         return False
+
+
+def position_ids_in_meshgrid(patch_embeds_list, max_width):
+    positions = []
+    for patch in patch_embeds_list:
+        height, width = patch.shape[1], patch.shape[2]
+        h_grid, v_grid = mx.meshgrid(mx.arange(height), mx.arange(width), indexing="ij")
+        h_grid = h_grid.reshape(-1, 1)
+        v_grid = v_grid.reshape(-1, 1)
+        ids = h_grid * max_width + v_grid
+        positions.append(ids.flatten())
+    return mx.concatenate(positions)
+
+
+def generate_block_attention_mask(patch_embeds_list, tensor):
+    seq_len = tensor.shape[1]
+    d_min = -1e9  # Using a large negative value as MLX doesn't have finfo
+
+    causal_mask = mx.full((seq_len, seq_len), vals=d_min)
+
+    block_end_idx = mx.cumsum(mx.array(patch_embeds_list))
+    block_start_idx = mx.concatenate([mx.array([0]), mx.array(patch_embeds_list[:-1])])
+    block_start_idx = mx.cumsum(block_start_idx)
+
+    for start, end in zip(block_start_idx, block_end_idx):
+        start, end = int(start), int(end)  # Convert to integers for indexing
+        causal_mask[start:end, start:end] = 0
+
+    causal_mask = mx.broadcast_to(causal_mask[None, None, :, :], (tensor.shape[0], 1, seq_len, seq_len))
+    return causal_mask
+
 
 def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
@@ -240,33 +268,6 @@ class ClipVisionModel(nn.Module):
 
         return patch_embeds, encoder_states
 
-def position_ids_in_meshgrid(patch_embeds_list, max_width):
-    positions = []
-    for patch in patch_embeds_list:
-        height, width = patch.shape[1], patch.shape[2]
-        h_grid, v_grid = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
-        h_grid = h_grid.reshape(-1, 1)
-        v_grid = v_grid.reshape(-1, 1)
-        ids = h_grid * max_width + v_grid
-        positions.append(ids.flatten())
-    return mx.array(np.concatenate(positions))
-
-
-def generate_block_attention_mask(patch_embeds_list, tensor):
-    tensor = torch.from_numpy(np.array(tensor))
-    dtype = tensor.dtype
-    device = tensor.device
-    seq_len = tensor.shape[1]
-    d_min = torch.finfo(dtype).min
-    causal_mask = torch.full((seq_len, seq_len), fill_value=d_min, dtype=dtype, device=device)
-
-    block_end_idx = torch.tensor(patch_embeds_list).cumsum(-1)
-    block_start_idx = torch.tensor([0] + patch_embeds_list[:-1]).cumsum(-1)
-    for start, end in zip(block_start_idx, block_end_idx):
-        causal_mask[start:end, start:end] = 0
-
-    causal_mask = causal_mask[None, None, :, :].expand(tensor.shape[0], 1, -1, -1)
-    return mx.array(causal_mask)
 
 class VisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
@@ -286,7 +287,6 @@ class VisionModel(nn.Module):
     def sanitize(self, weights):
         sanitized_weights = {}
         for k, v in weights.items():
-
             if "position_ids" in k:
                 # Remove unused position_ids
                 continue
