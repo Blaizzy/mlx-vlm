@@ -708,6 +708,7 @@ def prepare_inputs(image_processor, processor, image, prompt, image_token_index)
     from transformers.image_utils import load_image
 
     mask = None
+    image_grid_thw = None
     if isinstance(image, str):
         image = load_image(image)
 
@@ -932,9 +933,9 @@ def generate(
         image_processor, processor, image, prompt, image_token_index
     )
 
-    kwargs = {
-        "image_grid_thw": image_grid_thw,
-    }
+    kwargs = {}
+    if image_grid_thw is not None:
+        kwargs["image_grid_thw"] = image_grid_thw
 
     tic = time.perf_counter()
     detokenizer = processor.detokenizer
