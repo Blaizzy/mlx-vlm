@@ -711,18 +711,20 @@ def prepare_inputs(image_processor, processor, image, prompt, image_token_index)
     if isinstance(image, str):
         image = load_image(image)
 
+    image_grid_thw = None
     if image_processor is not None:
         text_chunks = [processor(chunk).input_ids for chunk in prompt.split("<image>")]
         input_ids = mx.array([text_chunks[0] + [image_token_index] + text_chunks[1]])
-        pixel_values = image_processor.preprocess(images=[image])[0]
-        pixel_values = mx.array(np.expand_dims(pixel_values, axis=0))
+        pixel_values = mx.array(image_processor.preprocess(images=[image])[0])
+        pixel_values = mx.array(mx.expand_dims(pixel_values, axis=0))
     else:
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
         inputs = processor(
-            text=[prompt], images=[image], padding=True, return_tensors="np"
+            text=[prompt], images=[image], padding=True, return_tensors="mlx"
         )
         pixel_values = mx.array(inputs["pixel_values"])
-        input_ids = mx.array(inputs["input_ids"])
-        mask = mx.array(inputs["attention_mask"])
+        input_ids = inputs["input_ids"]
+        mask = inputs["attention_mask"]
         if "image_sizes" in inputs:
             return input_ids, pixel_values, inputs["image_sizes"]
         image_grid_thw = inputs.get("image_grid_thw", None)

@@ -206,6 +206,7 @@ class Model(nn.Module):
         pixel_values=None,
         mask=None,
         cache=None,
+        **kwargs,
     ):
         out = self.model(inputs, pixel_values, mask, cache)
         return self.lm_head(out).astype(self.lm_head.weight.dtype)

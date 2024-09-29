@@ -112,12 +112,6 @@ class Model(nn.Module):
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
 
-        # if len(image_positions) != num_images:
-        #     raise ValueError(
-        #         f"The number of image tokens ({len(image_positions)}) does not "
-        #         f" match the number of image inputs ({num_images})."
-        #     )
-
         text_segments = []
         start_idx = 0
 

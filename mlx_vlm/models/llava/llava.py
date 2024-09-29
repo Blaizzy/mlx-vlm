@@ -132,7 +132,7 @@ class Model(nn.Module):
         return mx.concatenate(final_embeddings, axis=1)
 
     def __call__(
-        self, input_ids: mx.array, pixel_values: mx.array, mask: mx.array, cache=None
+        self, input_ids: mx.array, pixel_values: mx.array, mask: mx.array, cache=None, **kwargs
     ):
         input_embddings = self.get_input_embeddings(input_ids, pixel_values)
         logits = self.language_model(
