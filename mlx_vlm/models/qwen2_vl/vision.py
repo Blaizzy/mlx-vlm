@@ -98,13 +98,13 @@ def apply_rotary_pos_emb_vision(tensor, freqs) -> mx.array:
     cos = mx.cos(freqs)
     sin = mx.sin(freqs)
 
-    # Reshape cos and sin to match the input tensor shape
-    cos = cos.reshape(1, cos.shape[0], 1, cos.shape[1])
-    sin = sin.reshape(1, sin.shape[0], 1, sin.shape[1])
+    cos = mx.expand_dims(cos, axis=1)  # Equivalent to unsqueeze(1)
+    cos = mx.tile(cos, (1, 1, 2))  # Equivalent to repeat(1, 1, 2)
+    cos = mx.expand_dims(cos, axis=0)  # Equivalent to [None, ...]
 
-    # Ensure the last dimension of cos and sin matches tensor
-    cos = mx.repeat(cos, 2, axis=-1)
-    sin = mx.repeat(sin, 2, axis=-1)
+    sin = mx.expand_dims(sin, axis=1)  # Equivalent to unsqueeze(1)
+    sin = mx.tile(sin, (1, 1, 2))  # Equivalent to repeat(1, 1, 2)
+    sin = mx.expand_dims(sin, axis=0)  # Equivalent to [None, ...]
 
     output = (tensor * cos) + (rotate_half(tensor) * sin)
     return output.astype(orig_dtype)
