@@ -168,6 +168,7 @@ class Qwen2Model(nn.Module):
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
     ):
         # for passing merged input embeddings
         if inputs_embeds is None:
@@ -200,6 +201,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
     ):
+        out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds, mask=None)
         out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds, mask=None)
         return out
 

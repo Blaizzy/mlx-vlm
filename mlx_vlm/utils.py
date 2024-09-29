@@ -713,10 +713,29 @@ def prepare_inputs(image_processor, processor, images, prompts, image_token_inde
 
     image_grid_thw = None
     if image_processor is not None:
-        text_chunks = [processor(chunk).input_ids for chunk in prompt.split("<image>")]
-        input_ids = mx.array([text_chunks[0] + [image_token_index] + text_chunks[1]])
-        pixel_values = mx.array(image_processor.preprocess(images=[image])[0])
-        pixel_values = mx.array(mx.expand_dims(pixel_values, axis=0))
+        text_chunks = [
+            [processor(chunk).input_ids for chunk in prompt.split("<image>")]
+            for prompt in prompts
+        ]
+
+        # Find the maximum length for padding
+        max_length = max(
+            sum(len(chunk) for chunk in chunks) + 1 for chunks in text_chunks
+        )
+
+        # Pad and create input_ids
+        input_ids = []
+        for chunks in text_chunks:
+            ids = chunks[0] + [image_token_index] + chunks[1]
+            padding = [processor.pad_token_id] * (max_length - len(ids))
+            input_ids.append(mx.array(ids + padding))
+
+        input_ids = mx.array(input_ids)
+        pixel_values = image_processor.preprocess(images=loaded_images)
+        pixel_values = mx.array(np.stack(pixel_values))
+        masks = mx.array([(ids != processor.pad_token_id) for ids in input_ids]).astype(
+            mx.int32
+        )
     else:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
         try:
