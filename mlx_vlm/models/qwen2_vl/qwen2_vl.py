@@ -73,10 +73,27 @@ class Model(nn.Module):
     ):
         image_token_index = self.config.image_token_index
 
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
+        # Positions of <image> tokens in input_ids
         image_positions = input_ids == image_token_index
+
+        # Convert inputs_embeds to numpy array if it's not already
         inputs_embeds = np.array(inputs_embeds.astype(mx.float32))
-        inputs_embeds[image_positions] = image_features
+
+        # Reshape image_features to match the batch size and number of image tokens
+        batch_size, seq_length, hidden_size = inputs_embeds.shape
+        num_images = image_positions.sum(axis=1)
+        max_images = num_images.max()
+
+        if max_images > 0:
+            image_features = image_features.reshape(batch_size, max_images, -1)
+
+            # Create a mask for valid image positions
+            valid_image_mask = np.arange(max_images) < num_images[:, None]
+
+            # Use broadcasting to assign image features to the correct positions
+            inputs_embeds[image_positions] = (
+                image_features * valid_image_mask[:, :, None]
+            ).reshape(-1, hidden_size)
 
         # TODO: Add video features
 
