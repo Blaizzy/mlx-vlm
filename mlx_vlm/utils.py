@@ -711,21 +711,37 @@ def prepare_inputs(image_processor, processor, image, prompt, image_token_index)
     if isinstance(image, str):
         image = load_image(image)
 
+    image_grid_thw = None
     if image_processor is not None:
         text_chunks = [processor(chunk).input_ids for chunk in prompt.split("<image>")]
         input_ids = mx.array([text_chunks[0] + [image_token_index] + text_chunks[1]])
-        pixel_values = image_processor.preprocess(images=[image])[0]
-        pixel_values = mx.array(np.expand_dims(pixel_values, axis=0))
+        pixel_values = mx.array(image_processor.preprocess(images=[image])[0])
+        pixel_values = mx.array(mx.expand_dims(pixel_values, axis=0))
     else:
-        inputs = processor(
-            text=[prompt], images=[image], padding=True, return_tensors="np"
-        )
-        pixel_values = mx.array(inputs["pixel_values"])
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
+        try:
+            inputs = processor(
+                text=[prompt], images=[image], padding=True, return_tensors="mlx"
+            )
+        except Exception as e:
+            inputs = processor(
+                text=prompt, images=[image], padding=True, return_tensors="mlx"
+            )  # for phi3_v model
+
+        if isinstance(inputs["pixel_values"], list):
+            pixel_values = mx.array(inputs["pixel_values"][0][0])[None, :]
+        elif isinstance(inputs["pixel_values"], np.ndarray):
+            pixel_values = mx.array(inputs["pixel_values"])
+        else:
+            raise ValueError(
+                f"Invalid pixel_values type: {type(inputs['pixel_values'])}"
+            )
+
         input_ids = mx.array(inputs["input_ids"])
-        mask = mx.array(inputs["attention_mask"])
-        if "image_sizes" in inputs:
-            return input_ids, pixel_values, inputs["image_sizes"]
+        mask = inputs["attention_mask"]
         image_grid_thw = inputs.get("image_grid_thw", None)
+        if "image_sizes" in inputs:
+            return input_ids, pixel_values, inputs["image_sizes"], image_grid_thw
 
     return input_ids, pixel_values, mask, image_grid_thw
 

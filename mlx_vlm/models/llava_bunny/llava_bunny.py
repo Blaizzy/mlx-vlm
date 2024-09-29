@@ -183,6 +183,7 @@ class Model(nn.Module):
         pixel_values: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Tuple[mx.array, mx.array]] = None,
+        **kwargs,
     ):
         input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
         logits = self.language_model(

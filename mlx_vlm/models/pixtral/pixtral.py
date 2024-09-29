@@ -20,9 +20,9 @@ class ModelConfig:
     vision_config: VisionConfig
     model_type: str
     ignore_index: int = -100
-    image_token_index: int = 32000
-    vision_feature_select_strategy: str = "default"
-    vision_feature_layer: int = -2
+    image_token_index: int = 10
+    vision_feature_select_strategy: str = "full"
+    vision_feature_layer: int = -1
     vocab_size: int = 32000
 
     @classmethod
@@ -110,12 +110,6 @@ class Model(nn.Module):
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
 
-        if len(image_positions) != num_images:
-            raise ValueError(
-                f"The number of image tokens ({len(image_positions)}) does not "
-                f" match the number of image inputs ({num_images})."
-            )
-
         text_segments = []
         start_idx = 0
 
@@ -184,3 +178,16 @@ class Model(nn.Module):
 
         model.load_weights(list(weights.items()))
         return model
+
+    def sanitize(self, weights):
+        def transform_key(key):
+            if "vision_tower" in key:
+                if "transformer" in key:
+                    key = key.replace("vision_tower", "vision_tower.vision_model")
+                if "patch_conv" in key:
+                    key = key.replace("vision_tower", "vision_tower.vision_model")
+                if "ln_pre" in key:
+                    key = key.replace("vision_tower", "vision_tower.vision_model")
+            return key
+
+        return {transform_key(k): v for k, v in weights.items()}
