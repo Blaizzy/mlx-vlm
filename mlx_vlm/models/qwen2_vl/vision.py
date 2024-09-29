@@ -310,9 +310,9 @@ class VisionModel(nn.Module):
         max_grid_size = mx.max(grid_thw[:, 1:])
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
 
-        rotary_pos_emb_np = rotary_pos_emb_full[pos_ids]
+        rotary_pos_emb_full = rotary_pos_emb_full[pos_ids]
 
-        return rotary_pos_emb_np.reshape(pos_ids.shape[0], -1)
+        return rotary_pos_emb_full.reshape(pos_ids.shape[0], -1)
 
     def __call__(
         self,

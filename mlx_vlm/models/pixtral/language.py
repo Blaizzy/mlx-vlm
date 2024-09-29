@@ -11,18 +11,17 @@ from ..base import KVCache, create_attention_mask
 @dataclass
 class TextConfig:
     model_type: str
-    hidden_size: int
-    num_hidden_layers: int
-    intermediate_size: int
-    num_attention_heads: int
-    rms_norm_eps: float
-    vocab_size: int
-    attention_bias: bool = True
-    num_key_value_heads: int = None
-    rope_theta: float = 1000000
+    hidden_size: int = 5120
+    head_dim: int = 128
+    num_hidden_layers: int = 40
+    intermediate_size: int = 14336
+    num_attention_heads: int = 32
+    rms_norm_eps: float = 1e-06
+    vocab_size: int = 131072
+    num_key_value_heads: int = 8
+    rope_theta: float = 1000000000.0
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    tie_word_embeddings: bool = True
 
     @classmethod
     def from_dict(cls, params):
@@ -55,17 +54,12 @@ class Attention(nn.Module):
         self.n_heads = n_heads = config.num_attention_heads
         self.n_kv_heads = n_kv_heads = config.num_key_value_heads
 
-        head_dim = config.hidden_size // n_heads
+        head_dim = config.head_dim
         self.scale = head_dim**-0.5
 
-        if hasattr(config, "attention_bias"):
-            attention_bias = config.attention_bias
-        else:
-            attention_bias = False
-
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=attention_bias)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
         rope_scale = (
@@ -85,7 +79,7 @@ class Attention(nn.Module):
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[Tuple[mx.array, mx.array]] = None,
+        cache: Optional[KVCache] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -139,7 +133,7 @@ class TransformerBlock(nn.Module):
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
-        cache=None,
+        cache: Optional[KVCache] = None,
     ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
@@ -148,7 +142,7 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class Qwen2Model(nn.Module):
+class Mistral(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
@@ -160,13 +154,12 @@ class Qwen2Model(nn.Module):
             TransformerBlock(config=config) for _ in range(config.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(
         self,
         inputs: mx.array,
         cache=None,
-        inputs_embeds: Optional[mx.array] = None,
+        inputs_embeds=None,
     ):
         # for passing merged input embeddings
         if inputs_embeds is None:
@@ -174,7 +167,7 @@ class Qwen2Model(nn.Module):
         else:
             h = inputs_embeds
 
-        mask = create_attention_mask(h)
+        mask = create_attention_mask(h, cache)
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -182,7 +175,7 @@ class Qwen2Model(nn.Module):
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
 
-        return self.lm_head(self.norm(h))
+        return self.norm(h)
 
 
 class LanguageModel(nn.Module):
@@ -190,27 +183,26 @@ class LanguageModel(nn.Module):
         super().__init__()
         self.config = config
         self.model_type = config.model_type
-        self.model = Qwen2Model(config)
+        if self.model_type != "mistral":
+            raise ValueError(
+                f"Model type {self.model_type} not supported. Currently only 'mistral' is supported"
+            )
+        self.model = Mistral(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(
         self,
         inputs: mx.array,
         cache=None,
-        inputs_embeds: Optional[mx.array] = None,
+        inputs_embeds=None,
         mask: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
-        return out
+        out = self.model(inputs, cache, inputs_embeds)
+        return self.lm_head(out)
 
-    def sanitize(self, weights):
-        if (
-            self.config.tie_word_embeddings
-            and "language_model.model.lm_head.weight" not in weights
-        ):
-            weights["language_model.model.lm_head.weight"] = weights[
-                "language_model.model.embed_tokens.weight"
-            ]
-
+    @staticmethod
+    def sanitize(weights):
+        # Remove unused precomputed rotary freqs
         return {
             k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
         }
@@ -221,7 +213,7 @@ class LanguageModel(nn.Module):
 
     @property
     def head_dim(self):
-        return self.config.hidden_size // self.config.num_attention_heads
+        return self.config.head_dim
 
     @property
     def n_kv_heads(self):

@@ -11,13 +11,13 @@ def get_message_json(model_name, prompt):
     Returns:
         dict: A dictionary representing the JSON message for the specified model.
     """
-    if model_name.lower() in ["idefics2", "qwen2_vl"]:
+    if model_name.lower() in ["idefics2", "qwen2_vl", "llava"]:
         message = {
             "role": "user",
             "content": [{"type": "image"}, {"type": "text", "text": prompt}],
         }
 
-    elif model_name.lower() in ["llava-qwen2", "llava", "llava_next", "bunny-llama"]:
+    elif model_name.lower() in ["llava-qwen2", "llava_next", "bunny-llama"]:
         message = {"role": "user", "content": f"<image>\n{prompt}"}
     elif model_name.lower() == "phi3_v":
         message = {"role": "user", "content": f"<|image_1|>\n{prompt}"}
@@ -25,6 +25,11 @@ def get_message_json(model_name, prompt):
         message = {"role": "user", "content": f"<image>{prompt}"}
     elif model_name.lower() == "paligemma":
         message = prompt
+    elif model_name.lower() == "pixtral":
+        message = {
+            "role": "user",
+            "content": [{"type": "image"}, {"type": "text", "content": prompt}],
+        }
     else:
         raise ValueError(f"Unsupported model: {model_name}")
 
