@@ -5,7 +5,7 @@ from typing import Dict, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache
+from ..base import KVCache, create_attention_mask
 
 
 @dataclass
@@ -174,10 +174,7 @@ class Qwen2Model(nn.Module):
         else:
             h = inputs_embeds
 
-        mask = None
-        if h.shape[1] > 1:
-            mask = nn.MultiHeadAttention.create_additive_causal_mask(h.shape[1])
-            mask = mask.astype(h.dtype)
+        mask = create_attention_mask(h)
 
         if cache is None:
             cache = [None] * len(self.layers)
