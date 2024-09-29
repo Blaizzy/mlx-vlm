@@ -236,7 +236,7 @@ class PixtralRotaryEmbedding:
         return cos.astype(x.dtype), sin.astype(x.dtype)
 
 
-class ClipVisionModel(nn.Module):
+class PixtralVisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.config = config
@@ -296,7 +296,7 @@ class VisionModel(nn.Module):
         if self.model_type not in ["clip_vision_model", "pixtral"]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
-        self.vision_model = ClipVisionModel(config)
+        self.vision_model = PixtralVisionModel(config)
 
     def __call__(
         self, x: mx.array, output_hidden_states: Optional[bool] = None
