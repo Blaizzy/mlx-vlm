@@ -25,6 +25,11 @@ def get_message_json(model_name, prompt):
         message = {"role": "user", "content": f"<image>{prompt}"}
     elif model_name.lower() == "paligemma":
         message = prompt
+    elif model_name.lower() == "pixtral":
+        message = {
+            "role": "user",
+            "content": [{"type": "image"}, {"type": "text", "content": prompt}],
+        }
     else:
         raise ValueError(f"Unsupported model: {model_name}")
 
