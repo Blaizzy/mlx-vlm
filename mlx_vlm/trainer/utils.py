@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
@@ -40,9 +42,10 @@ def get_peft_model(model, linear_layers, freeze=True, verbose=True):
         freeze_model(model)
 
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and name.split(".")[-1] in linear_layers:
-            lora_layer = LoRaLayer(module, 10, 0.1, 0.1)
-            set_module_by_name(model, name, lora_layer)
+        if isinstance(module, nn.Linear) or isinstance(module, nn.QuantizedLinear):
+            if name.split(".")[-1] in linear_layers:
+                lora_layer = LoRaLayer(module, 10, 0.1, 0.1)
+                set_module_by_name(model, name, lora_layer)
 
     lora_model_trainable = count_parameters(model.language_model.trainable_parameters())
     if verbose:
@@ -67,6 +70,7 @@ def freeze_model(model):
 
 def find_all_linear_names(model):
     cls = nn.Linear
+    quantized_cls = nn.QuantizedLinear
     lora_module_names = set()
     multimodal_keywords = [
         "mm_projector",
@@ -77,7 +81,7 @@ def find_all_linear_names(model):
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
-        if isinstance(module, cls):
+        if isinstance(module, cls) or isinstance(module, quantized_cls):
             names = name.split(".")
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
 
@@ -118,3 +122,29 @@ def print_trainable_parameters(source_model_trainable, lora_model_trainable):
     print(
         f"#trainable params: {lora_model_trainable} || all params: {source_model_trainable} || trainable%: {lora_trainable_percent}"
     )
+
+
+def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
+    """
+    Apply LoRA layers to the model.
+
+    Args:
+        model (nn.Module): The neural network model.
+        adapter_path (str): Path to the adapter configuration file.
+
+    Returns:
+        nn.Module: The updated model with LoRA layers applied.
+    """
+    adapter_path = Path(adapter_path)
+
+    if not adapter_path.exists():
+        raise FileNotFoundError(f"The adapter path does not exist: {adapter_path}")
+
+    # TODO: add lora params to the config and load them here
+    list_of_modules = find_all_linear_names(model.language_model.model)
+    model = get_peft_model(model, list_of_modules)
+
+    # TODO: Use custom adapter name
+    model.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
+
+    return model

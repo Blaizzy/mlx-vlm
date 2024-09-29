@@ -26,6 +26,12 @@ def parse_arguments():
         help="The path to the local model directory or Hugging Face repo.",
     )
     parser.add_argument(
+        "--adapter-path",
+        type=str,
+        default=None,
+        help="The path to the adapter weights.",
+    )
+    parser.add_argument(
         "--image",
         type=str,
         default=DEFAULT_IMAGE,
@@ -50,17 +56,21 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def get_model_and_processors(model_path):
+def get_model_and_processors(model_path, adapter_path):
     model_path = get_model_path(model_path)
     config = load_config(model_path)
-    model, processor = load(model_path, {"trust_remote_code": True})
+    model, processor = load(
+        model_path, {"trust_remote_code": True}, adapter_path=adapter_path
+    )
     image_processor = load_image_processor(model_path)
     return model, processor, image_processor, config
 
 
 def main():
     args = parse_arguments()
-    model, processor, image_processor, config = get_model_and_processors(args.model)
+    model, processor, image_processor, config = get_model_and_processors(
+        args.model, args.adapter_path
+    )
 
     prompt = codecs.decode(args.prompt, "unicode_escape")
 

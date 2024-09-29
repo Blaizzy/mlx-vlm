@@ -26,7 +26,8 @@ from transformers import (
 
 from .models.base import BaseImageProcessor, KVCache
 from .sample_utils import top_p_sampling
-from .tokenizer_utils import TokenizerWrapper, load_tokenizer
+from .tokenizer_utils import load_tokenizer
+from .trainer import apply_lora_layers
 
 # Constants
 MODEL_REMAPPING = {"llava-qwen2": "llava_bunny", "bunny-llama": "llava_bunny"}
@@ -223,6 +224,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 def load(
     path_or_hf_repo: str,
     processor_config={},
+    adapter_path: Optional[str] = None,
     lazy: bool = False,
 ) -> Tuple[nn.Module, Union[PreTrainedTokenizer, PreTrainedTokenizerFast]]:
     """
@@ -247,6 +249,11 @@ def load(
     model_path = get_model_path(path_or_hf_repo)
 
     model = load_model(model_path, lazy)
+    if adapter_path is not None:
+        # TODO: Support more modules than just language_model
+        model = apply_lora_layers(model, adapter_path)
+        model.eval()
+
     processor = load_processor(model_path, processor_config=processor_config)
 
     return model, processor

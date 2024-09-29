@@ -11,9 +11,6 @@ import numpy as np
 from mlx.utils import tree_flatten
 from PIL import Image
 
-from mlx_vlm.prompt_utils import get_message_json
-from mlx_vlm.utils import prepare_inputs
-
 
 class Dataset:
     def __init__(
@@ -39,6 +36,8 @@ class Dataset:
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        from mlx_vlm.utils import prepare_inputs
+
         item = self.dataset[idx]
 
         # Process image data
@@ -83,7 +82,7 @@ class Dataset:
                 )
 
         image_token_index = self.config["image_token_index"]
-        input_ids, pixel_values, mask = prepare_inputs(
+        input_ids, pixel_values, mask, image_grid_thw = prepare_inputs(
             self.image_processor, self.processor, image, prompts, image_token_index
         )
 
@@ -94,6 +93,7 @@ class Dataset:
             "pixel_values": pixel_values,
             "input_ids": input_ids,
             "attention_mask": mask,
+            "image_grid_thw": image_grid_thw,
         }
 
 
@@ -197,7 +197,14 @@ class Trainer:
             weight_mask = None
 
         input_ids = input_ids[:, :-1]
-        logits = model(input_ids, pixel_values, attention_mask)
+
+        kwargs = (
+            {"image_grid_thw": batch["image_grid_thw"]}
+            if "image_grid_thw" in batch
+            else {}
+        )
+        logits = model(input_ids, pixel_values, attention_mask, **kwargs)
+
         logits.astype(mx.float32)
 
         # Ensure logits and labels have the same sequence length
