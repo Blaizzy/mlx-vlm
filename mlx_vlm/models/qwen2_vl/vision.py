@@ -93,22 +93,18 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb_vision(tensor, freqs) -> mx.array:
-    tensor = tensor.astype(mx.float32)
-    freqs = freqs.astype(mx.float32)
     orig_dtype = tensor.dtype
 
     cos = mx.cos(freqs)
     sin = mx.sin(freqs)
 
     cos = mx.expand_dims(cos, axis=1)  # Equivalent to unsqueeze(1)
-    cos = mx.tile(cos, (1, 1, 2))      # Equivalent to repeat(1, 1, 2)
+    cos = mx.tile(cos, (1, 1, 2))  # Equivalent to repeat(1, 1, 2)
     cos = mx.expand_dims(cos, axis=0)  # Equivalent to [None, ...]
-    cos = cos.astype(mx.float32)       # Equivalent to .float()
 
     sin = mx.expand_dims(sin, axis=1)  # Equivalent to unsqueeze(1)
-    sin = mx.tile(sin, (1, 1, 2))      # Equivalent to repeat(1, 1, 2)
+    sin = mx.tile(sin, (1, 1, 2))  # Equivalent to repeat(1, 1, 2)
     sin = mx.expand_dims(sin, axis=0)  # Equivalent to [None, ...]
-    sin = sin.astype(mx.float32)       # Equivalent to .float()
 
     output = (tensor * cos) + (rotate_half(tensor) * sin)
     return output.astype(orig_dtype)
