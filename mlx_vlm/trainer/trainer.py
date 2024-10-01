@@ -1,8 +1,8 @@
+import json
 import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from pprint import pprint
 from typing import Union
 
 import mlx.core as mx
@@ -10,6 +10,26 @@ import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten
 from PIL import Image
+
+from ..prompt_utils import apply_chat_template
+
+
+def get_prompt(processor, conversation):
+    if "chat_template" in processor.__dict__.keys():
+        prompt = processor.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+
+    elif "tokenizer" in processor.__dict__.keys():
+        prompt = processor.tokenizer.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+
+    return prompt
 
 
 class Dataset:
@@ -40,50 +60,24 @@ class Dataset:
 
         item = self.dataset[idx]
 
-        # Process image data
-        image = item["image"]
+        images = item["images"]
+        conversations = item["messages"]
+        prompts = []
 
-        conversations = item["conversations"]
-        # check if conversation is a list of list
+        if self.config["model_type"] == "paligemma":
+            raise NotImplementedError("Paligemma is not supported yet")
+
         if isinstance(conversations, list) and isinstance(conversations[0], list):
-            prompts = []
             for conversation in conversations:
-                if "chat_template" in self.processor.__dict__.keys():
-                    prompts.append(
-                        self.processor.apply_chat_template(conversation, tokenize=False)
-                    )
-
-                elif "tokenizer" in self.processor.__dict__.keys():
-                    if self.config["model_type"] != "paligemma":
-                        prompts.append(
-                            self.processor.tokenizer.apply_chat_template(
-                                conversation, tokenize=False
-                            )
-                        )
-                else:
-                    raise ValueError(
-                        "Processor does not have 'chat_template' or 'tokenizer' attribute."
-                    )
-
+                prompt = get_prompt(self.processor, conversation)
+                prompts.append(prompt)
         else:
-            if "chat_template" in self.processor.__dict__.keys():
-                prompts = self.processor.apply_chat_template(
-                    conversations, tokenize=False
-                )
-
-            elif "tokenizer" in self.processor.__dict__.keys():
-                if self.config["model_type"] != "paligemma":
-                    prompts = self.processor.tokenizer.apply_chat_template(
-                        conversations, tokenize=False
-                    )
-            else:
-                raise ValueError(
-                    "Processor does not have 'chat_template' or 'tokenizer' attribute."
-                )
+            prompt = get_prompt(self.processor, conversations)
+            prompts.append(prompt)
 
         image_token_index = self.config["image_token_index"]
         input_ids, pixel_values, mask, image_grid_thw = prepare_inputs(
-            self.image_processor, self.processor, image, prompts, image_token_index
+            self.image_processor, self.processor, images, prompts, image_token_index
         )
 
         if mask is None:
@@ -248,5 +242,9 @@ def save_adapter(
     model: nn.Module,
     adapter_file: Union[str, Path],
 ):
+    path = Path(adapter_file)
+    if hasattr(model.config, "lora"):
+        with open(path.parent / "adapter_config.json", "w") as f:
+            json.dump(model.config.lora, f)
     flattened_tree = tree_flatten(model.trainable_parameters())
     mx.save_safetensors(str(adapter_file), dict(flattened_tree))
