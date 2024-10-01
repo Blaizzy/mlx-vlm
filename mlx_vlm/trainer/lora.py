@@ -20,6 +20,8 @@ class LoRaLayer(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
 
         output_dims, input_dims = linear.weight.shape
+        if isinstance(linear, nn.QuantizedLinear):
+            input_dims *= 32 // linear.bits
 
         std_dev = 1 / math.sqrt(rank)
 
