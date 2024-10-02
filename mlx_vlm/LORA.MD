@@ -10,6 +10,19 @@
 - MLX VLM library
 - Required Python packages: `argparse`, `mlx_vlm`, `mlx`
 
+## Supported Models
+- Qwen2
+- LLaVA (except for LLaVA-Next)
+- Pixtral
+- Idefics 2
+
+## Coming Soon
+- LLaVA-Next
+- Phi3_vision
+- Paligemma
+
+Note: The script only works with model in full or half precision. Quantized models are not supported at the moment.
+
 ## Usage
 
 To use the script, run it from the command line with the desired arguments:
