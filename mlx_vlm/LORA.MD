@@ -15,11 +15,12 @@
 - LLaVA (except for LLaVA-Next)
 - Pixtral
 - Idefics 2
+- Deepseek-VL
+- Paligemma
 
 ## Coming Soon
 - LLaVA-Next
 - Phi3_vision
-- Paligemma
 
 Note: The script only works with model in full or half precision. Quantized models are not supported at the moment.
 

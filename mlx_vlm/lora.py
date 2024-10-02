@@ -92,7 +92,7 @@ def main(args):
                 dataset[i * args.batch_size : (i + 1) * args.batch_size]
             )
             if i % args.print_every == 0:
-                print(f"Epoch {epoch} Step {i} Loss {loss.item():.4f}")
+                print({"Epoch": epoch, "Step": i, "Loss": f"{loss.item():.4f}"})
 
     save_adapter(model, args.output_path)
 
