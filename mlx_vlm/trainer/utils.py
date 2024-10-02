@@ -93,23 +93,6 @@ def find_all_linear_names(model):
     return list(lora_module_names)
 
 
-def collate_fn(processor, examples):
-    texts = ["answer " + example["question"] for example in examples]
-    labels = [example["multiple_choice_answer"] for example in examples]
-    images = [example["image"].convert("RGB") for example in examples]
-    tokens = processor(
-        text=texts,
-        images=images,
-        suffix=labels,
-        return_tensors="np",
-        padding="longest",
-        tokenize_newline_separately=False,
-    )
-
-    tokens = tokens.to(mx.float16)
-    return tokens
-
-
 def count_parameters(model):
     def nparams(m):
         if isinstance(m, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
