@@ -720,14 +720,16 @@ def prepare_inputs(image_processor, processor, images, prompts, image_token_inde
     if not isinstance(prompts, list):
         prompts = [prompts]
 
-    assert len(images) == len(
-        prompts
-    ), f"Number of images ({len(images)}) and prompts ({len(prompts)}) must match"
+    if len(images) != len(prompts):
+        print(
+            f"Number of images ({len(images)}) and prompts ({len(prompts)}) don't match"
+        )
 
-    images = [img for img in images]
+    images = [load_image(img) if isinstance(img, str) else img for img in images]
 
     image_grid_thw = None
     if image_processor is not None:
+
         processor.pad_token = processor.eos_token
         text_chunks = [
             [processor(chunk).input_ids for chunk in prompt.split("<image>")]
@@ -747,6 +749,7 @@ def prepare_inputs(image_processor, processor, images, prompts, image_token_inde
             input_ids.append(mx.array(ids + padding))
 
         input_ids = mx.array(input_ids)
+
         pixel_values = image_processor.preprocess(images=images)
         pixel_values = mx.array(np.stack(pixel_values))
 
@@ -756,9 +759,11 @@ def prepare_inputs(image_processor, processor, images, prompts, image_token_inde
     else:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
         try:
-            inputs = processor(text=prompts, images=images, return_tensors="mlx")
+            inputs = processor(
+                text=prompts, images=images, padding=True, return_tensors="mlx"
+            )
             if isinstance(inputs["pixel_values"], list):
-                pixel_values = mx.array(inputs["pixel_values"][0][0])[None, :]
+                pixel_values = inputs["pixel_values"]
             else:
                 pixel_values = mx.array(inputs["pixel_values"])
             input_ids = mx.array(inputs["input_ids"])
@@ -769,11 +774,11 @@ def prepare_inputs(image_processor, processor, images, prompts, image_token_inde
 
         except Exception as e:
             inputs = []
-            for i in range(len(images)):
+            for i, image in enumerate(images):
                 inputs.append(
                     processor(
                         text=str(prompts[i]),
-                        images=images[i],
+                        images=image,
                         padding=True,
                         return_tensors="mlx",
                     )

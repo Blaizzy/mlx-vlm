@@ -1,8 +1,6 @@
 import argparse
 import codecs
 
-import mlx.core as mx
-
 from .prompt_utils import apply_chat_template
 from .utils import generate, get_model_path, load, load_config, load_image_processor
 
