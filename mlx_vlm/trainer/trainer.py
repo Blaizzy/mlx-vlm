@@ -15,7 +15,9 @@ from PIL import Image
 from ..prompt_utils import apply_chat_template
 
 
-def get_prompt(processor, conversation):
+def get_prompt(model_type, processor, conversation):
+    if model_type == "paligemma":
+        return conversation
     if "chat_template" in processor.__dict__.keys():
         prompt = processor.apply_chat_template(
             conversation,
@@ -65,9 +67,6 @@ class Dataset:
         conversations = item["messages"]
         prompts = []
 
-        if self.config["model_type"] == "paligemma":
-            raise NotImplementedError("Paligemma is not supported yet")
-
         if isinstance(conversations, list) and isinstance(conversations[0], list):
             for conversation in conversations:
                 if self.config["model_type"] == "pixtral":
@@ -77,17 +76,21 @@ class Dataset:
                             "Pixtral batch processing is not supported yet. Set batch size to 1."
                         )
 
-                prompt = get_prompt(self.processor, conversation)
+                prompt = get_prompt(
+                    self.config["model_type"], self.processor, conversation
+                )
                 prompts.append(prompt)
 
         else:
             if self.config["model_type"] == "pixtral":
                 conversations = [json.loads(i) for i in conversations]
-            prompt = get_prompt(self.processor, conversations)
+            prompt = get_prompt(
+                self.config["model_type"], self.processor, conversations
+            )
             prompts.append(prompt)
 
         image_token_index = self.config["image_token_index"]
-        input_ids, pixel_values, mask, image_grid_thw = prepare_inputs(
+        input_ids, pixel_values, mask, image_grid_thw, image_sizes = prepare_inputs(
             self.image_processor, self.processor, images, prompts, image_token_index
         )
 
@@ -99,6 +102,7 @@ class Dataset:
             "input_ids": input_ids,
             "attention_mask": mask,
             "image_grid_thw": image_grid_thw,
+            "image_sizes": image_sizes,
         }
 
 
@@ -205,28 +209,31 @@ class Trainer:
         input_ids = input_ids[:, :-1]
 
         kwargs = (
-            {"image_grid_thw": batch["image_grid_thw"]}
-            if "image_grid_thw" in batch
+            {
+                "image_grid_thw": batch["image_grid_thw"],
+                "image_sizes": batch["image_sizes"],
+            }
+            if "image_grid_thw" in batch or "image_sizes" in batch
             else {}
         )
+
+        # Forward pass
         logits = model(input_ids, pixel_values, attention_mask, **kwargs)
 
+        # Cast to float32
         logits.astype(mx.float32)
 
         # Ensure logits and labels have the same sequence length
-        if logits.shape[1] != labels.shape[1]:
-            logits = logits[:, -labels.shape[1] :, :]
-            if logits.shape[1] != labels.shape[1]:
-                # pad logits with -100
+        def align_logits_with_labels(logits, labels):
+            if logits.shape[1] < labels.shape[1]:
                 pad_length = labels.shape[1] - logits.shape[1]
-                pad_width = (
-                    (0, 0),
-                    (0, pad_length),
-                    (0, 0),
-                )  # Padding for each dimension
-                logits = mx.pad(
-                    logits, pad_width, mode="constant", constant_values=-100
-                )
+                pad_width = ((0, 0), (0, pad_length), (0, 0))
+                return mx.pad(logits, pad_width, mode="constant", constant_values=-100)
+            elif logits.shape[1] > labels.shape[1]:
+                return logits[:, -labels.shape[1] :, :]
+            return logits
+
+        logits = align_logits_with_labels(logits, labels)
 
         length_mask = mx.arange(input_ids.shape[1])[None, :] < lengths[:, None]
 

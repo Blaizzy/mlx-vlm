@@ -728,6 +728,7 @@ def prepare_inputs(image_processor, processor, images, prompts, image_token_inde
     images = [load_image(img) if isinstance(img, str) else img for img in images]
 
     image_grid_thw = None
+    image_sizes = None
     if image_processor is not None:
 
         processor.pad_token = processor.eos_token
@@ -772,7 +773,12 @@ def prepare_inputs(image_processor, processor, images, prompts, image_token_inde
             if image_grid_thw is not None:
                 image_grid_thw = mx.array(image_grid_thw)
 
+            image_sizes = inputs.get("image_sizes", None)
+            if image_sizes is not None:
+                image_sizes = mx.array(image_sizes)
+
         except Exception as e:
+
             inputs = []
             for i, image in enumerate(images):
                 inputs.append(
@@ -796,9 +802,7 @@ def prepare_inputs(image_processor, processor, images, prompts, image_token_inde
                 [mx.array(i["image_sizes"]) for i in inputs], axis=0
             )
 
-            return input_ids, pixel_values, image_sizes, image_grid_thw
-
-    return input_ids, pixel_values, mask, image_grid_thw
+    return input_ids, pixel_values, mask, image_grid_thw, image_sizes
 
 
 def generate_step(
@@ -999,12 +1003,13 @@ def generate(
         tokenizer = processor.tokenizer
 
     image_token_index = model.config.image_token_index
-    input_ids, pixel_values, mask, image_grid_thw = prepare_inputs(
+    input_ids, pixel_values, mask, image_grid_thw, image_sizes = prepare_inputs(
         image_processor, processor, image, prompt, image_token_index
     )
 
     kwargs = {
         "image_grid_thw": image_grid_thw,
+        "image_sizes": image_sizes,
     }
 
     tic = time.perf_counter()
