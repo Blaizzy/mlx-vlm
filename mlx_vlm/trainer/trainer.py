@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Union
@@ -69,9 +70,19 @@ class Dataset:
 
         if isinstance(conversations, list) and isinstance(conversations[0], list):
             for conversation in conversations:
+                if self.config["model_type"] == "pixtral":
+                    conversation = [json.loads(i) for i in conversation]
+                    if len(conversations) > 1:
+                        warnings.warn(
+                            "Pixtral batch processing is not supported yet. Set batch size to 1."
+                        )
+
                 prompt = get_prompt(self.processor, conversation)
                 prompts.append(prompt)
+
         else:
+            if self.config["model_type"] == "pixtral":
+                conversations = [json.loads(i) for i in conversations]
             prompt = get_prompt(self.processor, conversations)
             prompts.append(prompt)
 
@@ -160,6 +171,7 @@ class Trainer:
         self.model = model
         self.optimizer = optimizer
         self.train_on_completions = train_on_completions
+        self.assistant_id = assistant_id
 
     def loss_fn(self, model, batch):
         pixel_values = batch["pixel_values"]
@@ -176,7 +188,7 @@ class Trainer:
         if self.train_on_completions:
             weight_mask = mx.ones_like(attention_mask)
 
-            assistant_response_index = np.where(input_ids == assistant_id)[1]
+            assistant_response_index = np.where(input_ids == self.assistant_id)[1]
             range_matrix = mx.repeat(
                 mx.expand_dims(mx.arange(seq_length), 0), batch_size, axis=0
             )
@@ -204,6 +216,17 @@ class Trainer:
         # Ensure logits and labels have the same sequence length
         if logits.shape[1] != labels.shape[1]:
             logits = logits[:, -labels.shape[1] :, :]
+            if logits.shape[1] != labels.shape[1]:
+                # pad logits with -100
+                pad_length = labels.shape[1] - logits.shape[1]
+                pad_width = (
+                    (0, 0),
+                    (0, pad_length),
+                    (0, 0),
+                )  # Padding for each dimension
+                logits = mx.pad(
+                    logits, pad_width, mode="constant", constant_values=-100
+                )
 
         length_mask = mx.arange(input_ids.shape[1])[None, :] < lengths[:, None]
 

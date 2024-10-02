@@ -33,29 +33,32 @@ def set_module_by_name(model, name, new_module):
         setattr(module, parts[-1], new_module)
 
 
-def get_peft_model(model, linear_layers, freeze=True, verbose=True):
-    source_model_trainable = count_parameters(
-        model.language_model.trainable_parameters()
-    )
-
+def get_peft_model(
+    model, linear_layers, rank=10, alpha=0.1, dropout=0.1, freeze=True, verbose=True
+):
     if freeze:
         freeze_model(model)
 
-    for name, module in model.named_modules():
+    for name, module in model.language_model.named_modules():
         if isinstance(module, nn.Linear) or isinstance(module, nn.QuantizedLinear):
             if name.split(".")[-1] in linear_layers:
-                lora_layer = LoRaLayer(module, 10, 0.1, 0.1)
-                set_module_by_name(model, name, lora_layer)
+                lora_layer = LoRaLayer(module, rank, alpha, dropout)
+                set_module_by_name(model.language_model, name, lora_layer)
 
-    lora_model_trainable = count_parameters(model.language_model.trainable_parameters())
+    model.config.lora = {}
+    model.config.lora["rank"] = rank
+    model.config.lora["alpha"] = alpha
+    model.config.lora["dropout"] = dropout
+
     if verbose:
-        print_trainable_parameters(source_model_trainable, lora_model_trainable)
+        print_trainable_parameters(model.language_model)
 
     return model
 
 
 def freeze_model(model):
     for name, module in model.named_modules():
+        name = name.split(".")[0]
         if name in [
             "language_model",
             "vision_model",
@@ -107,20 +110,36 @@ def collate_fn(processor, examples):
     return tokens
 
 
-def count_parameters(trainable_params_dict):
-    total_params = 0
-    for modules in tree_flatten(trainable_params_dict):
-        mx_array = modules[-1]
-        if hasattr(mx_array, "shape"):
-            total_params += np.prod(mx_array.shape)
+def count_parameters(model):
+    def nparams(m):
+        if isinstance(m, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+            return m.weight.size * (32 // m.bits)
+        return sum(v.size for _, v in tree_flatten(m.parameters()))
 
-    return total_params
+    leaf_modules = tree_flatten(
+        model.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
+    )
+    total_p = sum(nparams(m) for _, m in leaf_modules) / 10**6
+
+    return total_p
 
 
-def print_trainable_parameters(source_model_trainable, lora_model_trainable):
-    lora_trainable_percent = (lora_model_trainable / source_model_trainable) * 100
+def print_trainable_parameters(model):
+    def nparams(m):
+        if isinstance(m, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+            return m.weight.size * (32 // m.bits)
+        return sum(v.size for _, v in tree_flatten(m.parameters()))
+
+    leaf_modules = tree_flatten(
+        model.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
+    )
+    total_p = sum(nparams(m) for _, m in leaf_modules) / 10**6
+    trainable_p = (
+        sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 10**6
+    )
+
     print(
-        f"#trainable params: {lora_model_trainable} || all params: {source_model_trainable} || trainable%: {lora_trainable_percent}"
+        f"#trainable params: {trainable_p} M || all params: {total_p} M || trainable%: {(trainable_p * 100 / total_p):.3f}%"
     )
 
 

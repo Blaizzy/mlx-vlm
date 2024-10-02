@@ -1,5 +1,5 @@
 from .lora import LoRaLayer, replace_lora_with_linear
-from .trainer import Dataset, Trainer
+from .trainer import *
 from .utils import (
     apply_lora_layers,
     collate_fn,

@@ -1,60 +1,98 @@
 import argparse
+import json
+import logging
 
 import mlx.optimizers as optim
+from datasets import load_dataset
+from tqdm import tqdm
 
-from mlx_vlm.trainer import Dataset, Trainer
-from mlx_vlm.trainer.lora import *
-from mlx_vlm.trainer.utils import *
+from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.trainer import Dataset, Trainer, save_adapter
+from mlx_vlm.trainer.utils import find_all_linear_names, get_peft_model
 from mlx_vlm.utils import load, load_image_processor
 
-
-def add_image_token(items, image_token="<image>"):
-    conversations = []
-    for item in items["conversations"]:
-        if item["role"] == "user":
-            if item["content"].startswith(image_token):
-                conversations.append({"role": "user", "content": item["content"]})
-            else:
-                conversations.append(
-                    {"role": "user", "content": image_token + "\n" + item["content"]}
-                )
-        else:
-            conversations.append({"role": "assistant", "content": item["content"]})
-    return {"conversations": conversations}
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def main(args):
+    logger.info(f"\033[32mLoading model from {args.model_path}\033[0m")
     model, processor = load(
         args.model_path, processor_config={"trust_remote_code": True}
     )
+    config = model.config.__dict__
     image_processor = load_image_processor(args.model_path)
 
+    logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
+    dataset = load_dataset(args.dataset, split=args.split)
+
+    if "messages" not in dataset.column_names:
+        raise ValueError("Dataset must have a 'messages' column")
+    if "images" not in dataset.column_names:
+        raise ValueError("Dataset must have an 'images' column")
+
+    if args.apply_chat_template:
+        logger.info(f"\033[32mApplying chat template to the dataset\033[0m")
+
+        def process_data(examples):
+            if config["model_type"] == "pixtral":
+                conversations = apply_chat_template(
+                    config=config,
+                    processor=processor,
+                    prompt=examples["messages"],
+                    return_messages=True,
+                )
+                examples["messages"] = [
+                    json.dumps(item, ensure_ascii=False) for item in conversations
+                ]
+            else:
+                examples["messages"] = apply_chat_template(
+                    config=config,
+                    processor=processor,
+                    prompt=examples["messages"],
+                    return_messages=True,
+                )
+            return examples
+
+        dataset = dataset.map(process_data)
+
     dataset = Dataset(
-        args.dataset,
-        model.config.__dict__,
+        dataset,
+        config,
         processor,
         image_processor=image_processor,
         take=None,
         split=None,
     )
-    dataset = dataset.map(add_image_token)
 
+    logger.info(f"\033[32mSetting up LoRA\033[0m")
+    list_of_modules = find_all_linear_names(model.language_model)
+    model = get_peft_model(
+        model,
+        list_of_modules,
+        rank=args.lora_rank,
+        alpha=args.lora_alpha,
+        dropout=args.lora_dropout,
+    )
+
+    logger.info(f"\033[32mSetting up optimizer\033[0m")
     optimizer = optim.Adam(learning_rate=args.learning_rate)
+
+    logger.info(f"\033[32mSetting up trainer\033[0m")
     trainer = Trainer(model, optimizer)
 
-    list_of_modules = find_all_linear_names(model.language_model.model)
-    model = get_peft_model(model, list_of_modules)
-
-    model.vision_tower.freeze()
     model.train()
 
     for epoch in range(args.epochs):
-        for i in range(args.steps):
+        if args.steps == 0:
+            args.steps = len(dataset) // args.batch_size
+
+        for i in tqdm(range(args.steps)):
             loss = trainer.train_step(
                 dataset[i * args.batch_size : (i + 1) * args.batch_size]
             )
             if i % args.print_every == 0:
-                print(f"Epoch {epoch} Step {i} Loss {loss}")
+                print(f"Epoch {epoch} Step {i} Loss {loss.item():.4f}")
 
     save_adapter(model, args.output_path)
 
@@ -62,7 +100,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train NanoLLaVA model")
     parser.add_argument(
-        "--model_path",
+        "--model-path",
         type=str,
         default="mlx-community/nanoLLaVA-1.5-bf16",
         help="Path to the pre-trained model",
@@ -71,27 +109,40 @@ if __name__ == "__main__":
         "--dataset", type=str, required=True, help="Path to the dataset"
     )
     parser.add_argument(
-        "--learning_rate",
+        "--split", type=str, default="train", help="Split to use for training"
+    )
+    parser.add_argument(
+        "--apply-chat-template",
+        action="store_false",
+        help="Apply chat template to the dataset",
+    )
+    parser.add_argument(
+        "--learning-rate",
         type=float,
         default=1e-4,
         help="Learning rate for the optimizer",
     )
     parser.add_argument(
-        "--batch_size", type=int, default=2, help="Batch size for training"
+        "--batch-size", type=int, default=1, help="Batch size for training"
     )
     parser.add_argument(
         "--epochs", type=int, default=1, help="Number of epochs to train"
     )
     parser.add_argument(
-        "--steps", type=int, default=100, help="Number of steps per epoch"
+        "--steps", type=int, default=10, help="Number of steps per epoch"
     )
     parser.add_argument(
-        "--print_every", type=int, default=10, help="Print loss every n steps"
+        "--print-every", type=int, default=10, help="Print loss every n steps"
     )
     parser.add_argument(
-        "--output_path",
+        "--lora-alpha", type=int, default=0.1, help="LoRA alpha parameter"
+    )
+    parser.add_argument("--lora-rank", type=int, default=10, help="LoRA rank")
+    parser.add_argument("--lora-dropout", type=float, default=0.1, help="LoRA dropout")
+    parser.add_argument(
+        "--output-path",
         type=str,
-        default="nanollava_lora_adapter.safetensors",
+        default="adapters",
         help="Path to save the trained adapter",
     )
 
