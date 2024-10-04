@@ -90,10 +90,12 @@ class Dataset:
             prompts.append(prompt)
 
         image_token_index = self.config["image_token_index"]
-        input_ids, pixel_values, mask, image_grid_thw, image_sizes = prepare_inputs(
+
+        inputs = prepare_inputs(
             self.image_processor, self.processor, images, prompts, image_token_index
         )
-
+        input_ids, pixel_values, mask = inputs[:3]
+        kwargs = {k: v for k, v in zip(["image_grid_thw", "image_sizes"], inputs[3:])}
         if mask is None:
             mask = mx.ones_like(input_ids)
 
@@ -101,8 +103,7 @@ class Dataset:
             "pixel_values": pixel_values,
             "input_ids": input_ids,
             "attention_mask": mask,
-            "image_grid_thw": image_grid_thw,
-            "image_sizes": image_sizes,
+            **kwargs,
         }
 
 
