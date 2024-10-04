@@ -15,6 +15,31 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def custom_print(*args, **kwargs):
+    tqdm.write(" ".join(map(str, args)), **kwargs)
+
+
+def process_data(examples, config, processor):
+    if config["model_type"] == "pixtral":
+        conversations = apply_chat_template(
+            config=config,
+            processor=processor,
+            prompt=examples["messages"],
+            return_messages=True,
+        )
+        examples["messages"] = [
+            json.dumps(item, ensure_ascii=False) for item in conversations
+        ]
+    else:
+        examples["messages"] = apply_chat_template(
+            config=config,
+            processor=processor,
+            prompt=examples["messages"],
+            return_messages=True,
+        )
+    return examples
+
+
 def main(args):
     logger.info(f"\033[32mLoading model from {args.model_path}\033[0m")
     model, processor = load(
@@ -24,7 +49,9 @@ def main(args):
     image_processor = load_image_processor(args.model_path)
 
     logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
-    dataset = load_dataset(args.dataset, split=args.split)
+    dataset = load_dataset(args.dataset, split=args.split + "[:20%]")
+
+    dataset = dataset.rename_columns({"image": "images", "conversations": "messages"})
 
     if "messages" not in dataset.column_names:
         raise ValueError("Dataset must have a 'messages' column")
@@ -33,28 +60,10 @@ def main(args):
 
     if args.apply_chat_template:
         logger.info(f"\033[32mApplying chat template to the dataset\033[0m")
-
-        def process_data(examples):
-            if config["model_type"] == "pixtral":
-                conversations = apply_chat_template(
-                    config=config,
-                    processor=processor,
-                    prompt=examples["messages"],
-                    return_messages=True,
-                )
-                examples["messages"] = [
-                    json.dumps(item, ensure_ascii=False) for item in conversations
-                ]
-            else:
-                examples["messages"] = apply_chat_template(
-                    config=config,
-                    processor=processor,
-                    prompt=examples["messages"],
-                    return_messages=True,
-                )
-            return examples
-
-        dataset = dataset.map(process_data)
+        dataset = dataset.map(
+            lambda example: process_data(example, config, processor),
+            desc="Applying chat template",
+        )
 
     dataset = Dataset(
         dataset,
@@ -83,16 +92,32 @@ def main(args):
 
     model.train()
 
+    # Training loop
+    logger.info(f"\033[32mTraining model\033[0m")
     for epoch in range(args.epochs):
         if args.steps == 0:
             args.steps = len(dataset) // args.batch_size
 
-        for i in tqdm(range(args.steps)):
+        progress_bar = tqdm(range(args.steps), position=0, leave=True)
+        for i in progress_bar:
             loss = trainer.train_step(
                 dataset[i * args.batch_size : (i + 1) * args.batch_size]
             )
+            # Update progress bar
+            progress_bar.update(1)
+            progress_bar.set_postfix(
+                {"Epoch": epoch, "Step": i, "Loss": f"{loss.item():.4f}"}
+            )
+
             if i % args.print_every == 0:
-                print({"Epoch": epoch, "Step": i, "Loss": f"{loss.item():.4f}"})
+                # Log additional information
+                custom_print(
+                    {
+                        "Epoch": epoch,
+                        "Step": i,
+                        "Loss": f"{loss.item():.4f}",
+                    }
+                )
 
     save_adapter(model, args.output_path)
 
@@ -129,7 +154,7 @@ if __name__ == "__main__":
         "--epochs", type=int, default=1, help="Number of epochs to train"
     )
     parser.add_argument(
-        "--steps", type=int, default=10, help="Number of steps per epoch"
+        "--steps", type=int, default=20, help="Number of steps per epoch"
     )
     parser.add_argument(
         "--print-every", type=int, default=10, help="Print loss every n steps"
