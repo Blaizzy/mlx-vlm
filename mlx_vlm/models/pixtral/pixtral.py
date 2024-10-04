@@ -77,7 +77,14 @@ class Model(nn.Module):
 
         # Get the ouptut hidden states from the vision model
         if isinstance(pixel_values, list):
-            pixel_values = mx.array(pixel_values[0][0])[None, ...]
+            if input_ids.shape[0] == 1:  # Batch size is 1
+                pixel_values = mx.concatenate(
+                    [mx.array(pv) for pv in pixel_values[0]], axis=1
+                )[None, ...]
+            else:  # Batch size is greater than 1
+                pixel_values = mx.concatenate(
+                    [mx.array(pv) for pv in pixel_values], axis=0
+                )
         if pixel_values.ndim == 3:
             pixel_values = pixel_values[None, ...]
 
