@@ -66,7 +66,6 @@ def get_message_json(
     }
 
     if num_images > 1 and model_name in [
-        "llava",
         "llava_next",
         "llava-qwen2",
         "bunny-llama",
