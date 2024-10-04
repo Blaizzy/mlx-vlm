@@ -32,6 +32,7 @@ def parse_arguments():
     parser.add_argument(
         "--image",
         type=str,
+        nargs="+",
         default=DEFAULT_IMAGE,
         help="URL or path of the image to process.",
     )
@@ -71,9 +72,12 @@ def main():
     )
 
     prompt = codecs.decode(args.prompt, "unicode_escape")
+    # prompt = "mô tả bức tranh này"
 
     if model.config.model_type != "paligemma":
-        prompt = apply_chat_template(processor, config, prompt)
+        prompt = apply_chat_template(
+            processor, config, prompt, num_images=len(args.image)
+        )
 
     output = generate(
         model,
