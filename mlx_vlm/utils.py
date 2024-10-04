@@ -711,25 +711,45 @@ def load_image(image_source: Union[str, Path, BytesIO]):
         )
 
 
-def prepare_inputs(image_processor, processor, images, prompts, image_token_index):
+def resize_image(img, max_size):
+    ratio = min(max_size[0] / img.width, max_size[1] / img.height)
+    new_size = (int(img.width * ratio), int(img.height * ratio))
+    return img.resize(new_size)
+
+
+def process_image(img, resize_shape):
+    if isinstance(img, str):
+        img = load_image(img)
+    if resize_shape is not None:
+        img = resize_image(img, resize_shape)
+    return img
+
+
+def prepare_inputs(
+    image_processor, processor, images, prompts, image_token_index, resize_shape=None
+):
     from transformers.image_utils import load_image
 
     mask = None
     if not isinstance(images, list):
         images = [images]
-    if not isinstance(prompts, list):
-        prompts = [prompts]
 
     if len(images) != len(prompts):
         print(
             f"Number of images ({len(images)}) and prompts ({len(prompts)}) don't match"
         )
 
-    images = [load_image(img) if isinstance(img, str) else img for img in images]
+    # Process images
+    images = [
+        process_image(img, resize_shape) if isinstance(img, str) else img
+        for img in images
+    ]
 
     image_grid_thw = None
     image_sizes = None
     if image_processor is not None:
+        if not isinstance(prompts, list):
+            prompts = [prompts]
 
         processor.pad_token = processor.eos_token
         text_chunks = [
@@ -759,48 +779,21 @@ def prepare_inputs(image_processor, processor, images, prompts, image_token_inde
         )
     else:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
-        try:
-            inputs = processor(
-                text=prompts, images=images, padding=True, return_tensors="mlx"
-            )
-            if isinstance(inputs["pixel_values"], list):
-                pixel_values = inputs["pixel_values"]
-            else:
-                pixel_values = mx.array(inputs["pixel_values"])
-            input_ids = mx.array(inputs["input_ids"])
-            mask = mx.array(inputs["attention_mask"])
-            image_grid_thw = inputs.get("image_grid_thw", None)
-            if image_grid_thw is not None:
-                image_grid_thw = mx.array(image_grid_thw)
-
-            image_sizes = inputs.get("image_sizes", None)
-            if image_sizes is not None:
-                image_sizes = mx.array(image_sizes)
-
-        except Exception as e:
-
-            inputs = []
-            for i, image in enumerate(images):
-                inputs.append(
-                    processor(
-                        text=str(prompts[i]),
-                        images=image,
-                        padding=True,
-                        return_tensors="mlx",
-                    )
-                )
-            input_ids = mx.concatenate(
-                [mx.array(i["input_ids"]) for i in inputs], axis=0
-            )
-            pixel_values = mx.concatenate(
-                [mx.array(i["pixel_values"]) for i in inputs], axis=0
-            )
-            mask = mx.concatenate(
-                [mx.array(i["attention_mask"]) for i in inputs], axis=0
-            )
-            image_sizes = mx.concatenate(
-                [mx.array(i["image_sizes"]) for i in inputs], axis=0
-            )
+        inputs = processor(
+            text=prompts, images=images, padding=True, return_tensors="mlx"
+        )
+        if isinstance(inputs["pixel_values"], list):
+            pixel_values = inputs["pixel_values"]
+        else:
+            pixel_values = mx.array(inputs["pixel_values"])
+        input_ids = mx.array(inputs["input_ids"])
+        mask = mx.array(inputs["attention_mask"])
+        image_sizes = inputs.get("image_sizes", None)
+        if image_sizes is not None:
+            image_sizes = mx.array(image_sizes)
+        image_grid_thw = inputs.get("image_grid_thw", None)
+        if image_grid_thw is not None:
+            image_grid_thw = mx.array(image_grid_thw)
 
     return input_ids, pixel_values, mask, image_grid_thw, image_sizes
 
@@ -937,9 +930,11 @@ def stream_generate(
         tokenizer = processor.tokenizer
 
     image_token_index = model.config.image_token_index
-    input_ids, pixel_values, mask = prepare_inputs(
+    inputs = prepare_inputs(
         image_processor, processor, image, prompt, image_token_index
     )
+    input_ids, pixel_values, mask = inputs[:3]
+    kwargs = {k: v for k, v in zip(["image_grid_thw", "image_sizes"], inputs[3:])}
 
     detokenizer = processor.detokenizer
 
@@ -1003,33 +998,32 @@ def generate(
         tokenizer = processor.tokenizer
 
     image_token_index = model.config.image_token_index
-    input_ids, pixel_values, mask, image_grid_thw, image_sizes = prepare_inputs(
+    # Prepare inputs
+    inputs = prepare_inputs(
         image_processor, processor, image, prompt, image_token_index
     )
+    input_ids, pixel_values, mask = inputs[:3]
+    kwargs = {k: v for k, v in zip(["image_grid_thw", "image_sizes"], inputs[3:])}
 
-    kwargs = {
-        "image_grid_thw": image_grid_thw,
-        "image_sizes": image_sizes,
-    }
-
+    # Initialize timing and detokenizer
     tic = time.perf_counter()
     detokenizer = processor.detokenizer
     detokenizer.reset()
 
-    for (token, prob), n in zip(
-        generate_step(
-            input_ids,
-            model,
-            pixel_values,
-            mask,
-            temp,
-            repetition_penalty,
-            repetition_context_size,
-            top_p,
-            **kwargs,
-        ),
-        range(max_tokens),
-    ):
+    # Generate tokens
+    generator = generate_step(
+        input_ids,
+        model,
+        pixel_values,
+        mask,
+        temp,
+        repetition_penalty,
+        repetition_context_size,
+        top_p,
+        **kwargs,
+    )
+
+    for (token, prob), n in zip(generator, range(max_tokens)):
 
         if n == 0:
             prompt_time = time.perf_counter() - tic
