@@ -41,3 +41,10 @@ prompt = processor.tokenizer.apply_chat_template(
 
 output = generate(model, processor, "http://images.cocodataset.org/val2017/000000039769.jpg", prompt, verbose=False)
 ```
+
+Models with multi-image chat support
+- Idefics2
+- LlaVA (Interleave)
+- Qwen2-vl
+- Phi3-v
+- Pixtral
