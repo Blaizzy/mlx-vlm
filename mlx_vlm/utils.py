@@ -734,11 +734,6 @@ def prepare_inputs(
     if not isinstance(images, list):
         images = [images]
 
-    if len(images) != len(prompts):
-        print(
-            f"Number of images ({len(images)}) and prompts ({len(prompts)}) don't match"
-        )
-
     # Process images
     images = [
         process_image(img, resize_shape) if isinstance(img, str) else img
