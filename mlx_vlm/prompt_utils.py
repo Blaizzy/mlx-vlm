@@ -30,6 +30,8 @@ def get_message_json(
                     message["content"] = (
                         f"{token_format * num_images}{message['content']}"
                     )
+        if role == "assistant" and model_name == "pixtral":
+            message["content"] = message["content"][0]["content"]
         return message
 
     message_formats = {
@@ -77,7 +79,6 @@ def get_message_json(
         )
 
     format_key = model_to_format.get(model_name)
-
     if format_key:
         return message_formats[format_key]()
     else:
@@ -92,67 +93,46 @@ def apply_chat_template(
     return_messages=False,
     num_images=1,
 ):
-    if not isinstance(config, dict):
-        config = config.__dict__
+    config = config if isinstance(config, dict) else config.__dict__
 
-    messages = []
-    if isinstance(prompt, list):
-        if isinstance(prompt[0], dict) and len(prompt) >= 1:
-            for i, p in enumerate(prompt):
-                if isinstance(p, str):
-                    message = get_message_json(
-                        config["model_type"],
-                        p,
-                        skip_image_token=i >= 1,
-                        num_images=num_images,
-                    )
-                elif isinstance(p, dict) and "role" in p.keys():
-                    message = get_message_json(
-                        config["model_type"],
-                        p["content"],
-                        p["role"],
-                        skip_image_token=i >= 1,
-                        num_images=num_images,
-                    )
-                else:
-                    raise ValueError("Invalid prompt type")
-                messages.append(message)
-        else:
-            for prompts in prompt:
-                for i, p in enumerate(prompts):
-                    if isinstance(p, str):
-                        message = get_message_json(
-                            config["model_type"], p, skip_image_token=i >= 1
-                        )
-                    elif isinstance(p, dict) and "role" in p.keys():
-                        message = get_message_json(
-                            config["model_type"],
-                            p["content"],
-                            p["role"],
-                            skip_image_token=i >= 1,
-                            num_images=num_images,
-                        )
-                    else:
-                        raise ValueError("Invalid prompt type")
-                    messages.append(message)
-    else:
-        if isinstance(prompt, str):
-            message = get_message_json(
-                config["model_type"], prompt, num_images=num_images
-            )
-        elif isinstance(prompt, dict) and "role" in prompt.keys():
-            message = get_message_json(
+    def process_single_prompt(p, is_first=True):
+        if isinstance(p, str):
+            return get_message_json(
                 config["model_type"],
-                prompt["content"],
-                prompt["role"],
+                p,
+                skip_image_token=not is_first,
+                num_images=num_images,
+            )
+        elif isinstance(p, dict) and "role" in p:
+            return get_message_json(
+                config["model_type"],
+                p["content"],
+                p["role"],
+                skip_image_token=not is_first,
                 num_images=num_images,
             )
         else:
             raise ValueError("Invalid prompt type")
-        messages.append(message)
+
+    messages = []
+    if isinstance(prompt, list):
+        if isinstance(prompt[0], dict):
+            messages = [process_single_prompt(p, i == 0) for i, p in enumerate(prompt)]
+        else:
+            messages = [
+                msg
+                for prompts in prompt
+                for i, p in enumerate(prompts)
+                for msg in [process_single_prompt(p, i == 0)]
+            ]
+    else:
+        messages = [process_single_prompt(prompt)]
 
     if return_messages:
         return messages
+
+    if config["model_type"] == "paligemma":
+        return messages[-1]
 
     if "chat_template" in processor.__dict__.keys():
         return processor.apply_chat_template(
