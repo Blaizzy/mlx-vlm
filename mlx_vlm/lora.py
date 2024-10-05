@@ -6,10 +6,10 @@ import mlx.optimizers as optim
 from datasets import load_dataset
 from tqdm import tqdm
 
-from mlx_vlm.prompt_utils import apply_chat_template
-from mlx_vlm.trainer import Dataset, Trainer, save_adapter
-from mlx_vlm.trainer.utils import find_all_linear_names, get_peft_model
-from mlx_vlm.utils import load, load_image_processor
+from .prompt_utils import apply_chat_template
+from .trainer import Dataset, Trainer, save_adapter
+from .trainer.utils import find_all_linear_names, get_peft_model
+from .utils import load, load_image_processor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,27 +17,6 @@ logger = logging.getLogger(__name__)
 
 def custom_print(*args, **kwargs):
     tqdm.write(" ".join(map(str, args)), **kwargs)
-
-
-def process_data(examples, config, processor):
-    if config["model_type"] == "pixtral":
-        conversations = apply_chat_template(
-            config=config,
-            processor=processor,
-            prompt=examples["messages"],
-            return_messages=True,
-        )
-        examples["messages"] = [
-            json.dumps(item, ensure_ascii=False) for item in conversations
-        ]
-    else:
-        examples["messages"] = apply_chat_template(
-            config=config,
-            processor=processor,
-            prompt=examples["messages"],
-            return_messages=True,
-        )
-    return examples
 
 
 def main(args):
@@ -60,10 +39,28 @@ def main(args):
 
     if args.apply_chat_template:
         logger.info(f"\033[32mApplying chat template to the dataset\033[0m")
-        dataset = dataset.map(
-            lambda example: process_data(example, config, processor),
-            desc="Applying chat template",
-        )
+
+        def process_data(examples):
+            if config["model_type"] == "pixtral":
+                conversations = apply_chat_template(
+                    config=config,
+                    processor=processor,
+                    prompt=examples["messages"],
+                    return_messages=True,
+                )
+                examples["messages"] = [
+                    json.dumps(item, ensure_ascii=False) for item in conversations
+                ]
+            else:
+                examples["messages"] = apply_chat_template(
+                    config=config,
+                    processor=processor,
+                    prompt=examples["messages"],
+                    return_messages=True,
+                )
+            return examples
+
+        dataset = dataset.map(process_data)
 
     dataset = Dataset(
         dataset,
