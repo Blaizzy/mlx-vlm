@@ -5,7 +5,7 @@ from .prompt_utils import apply_chat_template
 from .utils import generate, get_model_path, load, load_config, load_image_processor
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
-DEFAULT_IMAGE = "http://images.cocodataset.org/val2017/000000039769.jpg"
+DEFAULT_IMAGE = ["http://images.cocodataset.org/val2017/000000039769.jpg"]
 DEFAULT_PROMPT = "What are these?"
 DEFAULT_MAX_TOKENS = 100
 DEFAULT_TEMP = 0.5
@@ -67,17 +67,16 @@ def get_model_and_processors(model_path, adapter_path):
 
 def main():
     args = parse_arguments()
+    if isinstance(args.image, str):
+        args.image = [args.image]
+
     model, processor, image_processor, config = get_model_and_processors(
         args.model, args.adapter_path
     )
 
     prompt = codecs.decode(args.prompt, "unicode_escape")
-    # prompt = "mô tả bức tranh này"
 
-    if model.config.model_type != "paligemma":
-        prompt = apply_chat_template(
-            processor, config, prompt, num_images=len(args.image)
-        )
+    prompt = apply_chat_template(processor, config, prompt, num_images=len(args.image))
 
     output = generate(
         model,
