@@ -92,6 +92,9 @@ def apply_chat_template(
     return_messages=False,
     num_images=1,
 ):
+    if not isinstance(config, dict):
+        config = config.__dict__
+
     messages = []
     if isinstance(prompt, list):
         if isinstance(prompt[0], dict) and len(prompt) >= 1:
