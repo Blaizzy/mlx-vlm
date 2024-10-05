@@ -1,8 +1,6 @@
 from pathlib import Path
 
-import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 from mlx.utils import tree_flatten
 
 from .lora import LoRaLayer
