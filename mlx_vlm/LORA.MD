@@ -1,14 +1,13 @@
-# lora.py - NanoLLaVA LoRA Training Script
+# LoRA Training Script
 
 ## Overview
 
-`lora.py` is a Python script for fine-tuning a NanoLLaVA model using Low-Rank Adaptation (LoRA). This script allows you to train the model on your custom dataset, adjusting various parameters through command-line arguments.
+`lora.py` is a Python script for fine-tuning a vision language models (VLMs) using Low-Rank Adaptation (LoRA or QLoRA). This script allows you to train the model on your custom dataset, adjusting various parameters through command-line arguments.
 
 ## Requirements
 
 - Python 3.7+
-- MLX VLM library
-- Required Python packages: `argparse`, `mlx_vlm`, `mlx`
+- Required Python packages: `mlx-vlm`, `numpy`, `transformers`, `datasets`, `PIL`
 
 ## Supported Models
 - Qwen2
@@ -21,8 +20,6 @@
 ## Coming Soon
 - LLaVA-Next
 - Phi3_vision
-
-Note: The script only works with model in full or half precision. Quantized models are not supported at the moment.
 
 ## Usage
 
@@ -50,11 +47,12 @@ The script accepts the following command-line arguments:
 Here's an example of how to run the script with custom parameters:
 
 ```
-python lora.py --dataset /path/to/your/dataset --epochs 2 --steps 200 --batch_size 4 --learning_rate 5e-5
+python lora.py --dataset /path/to/your/dataset --model_path /path/to/your/model --epochs 2 --steps 200 --batch_size 4 --learning_rate 5e-5
 ```
 
 This command will:
 - Use the dataset at `/path/to/your/dataset`
+- Use the model at `/path/to/your/model`
 - Train for 2 epochs
 - Perform 200 steps per epoch
 - Use a batch size of 4
@@ -66,12 +64,9 @@ The script will print the training loss at regular intervals (defined by `--prin
 
 ## Note
 
+If you want to use QLoRA, you need to pass a pre-quantized model to the script using the `--model_path` argument (i.e. `mlx-community/nanoLLaVA-1.5-4bit`).
 Make sure you have the necessary permissions to read the dataset and write the output file. Also, ensure that your system has sufficient computational resources to handle the specified batch size and model.
 
 ## Contributing
 
 Feel free to submit issues or pull requests if you find any bugs or have suggestions for improvements.
-
-## License
-
-[Specify the license here, e.g., MIT, Apache 2.0, etc.]

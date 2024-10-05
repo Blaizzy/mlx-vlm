@@ -10,21 +10,18 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten
-from PIL import Image
-
-from ..prompt_utils import apply_chat_template
 
 
 def get_prompt(model_type, processor, conversation):
     if model_type == "paligemma":
         return conversation
+
     if "chat_template" in processor.__dict__.keys():
         prompt = processor.apply_chat_template(
             conversation,
             tokenize=False,
             add_generation_prompt=False,
         )
-
     elif "tokenizer" in processor.__dict__.keys():
         prompt = processor.tokenizer.apply_chat_template(
             conversation,
