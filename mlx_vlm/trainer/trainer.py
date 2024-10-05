@@ -183,9 +183,6 @@ class Trainer:
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
         lengths = mx.sum(attention_mask, axis=1)
-        # labels = mx.where(
-        #     attention_mask == 1, input_ids, -100
-        # )  # Only compute loss on non-padded tokens
         labels = input_ids[:, 1:]
 
         batch_size, seq_length = input_ids.shape
