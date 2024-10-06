@@ -19,7 +19,7 @@ class VisionConfig:
     mlp_ratio: float = 4.0
     in_channels: int = 3
     layer_norm_eps: float = 1e-6
-    spatial_patch_size = 14
+    spatial_patch_size: int = 14
     spatial_merge_size: int = 2
     temporal_patch_size: int = 2
 
@@ -320,6 +320,7 @@ class VisionModel(nn.Module):
         grid_thw: mx.array,
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
+
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 

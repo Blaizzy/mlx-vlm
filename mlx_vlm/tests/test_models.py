@@ -52,6 +52,7 @@ class TestModels(unittest.TestCase):
         num_channels,
         image_size: tuple,
         vision_feature_layer=-2,
+        **kwargs,
     ):
         self.assertEqual(vision_tower.model_type, model_type)
 
@@ -61,12 +62,20 @@ class TestModels(unittest.TestCase):
             shape=(batch_size, image_size[0], image_size[1], num_channels)
         )
 
+        if kwargs.get("grid_thw", None) is not None:
+            input_tensor = mx.random.uniform(shape=(1380, 1176))
+
         # Perform a forward pass
-        *_, hidden_states = vision_tower(input_tensor, output_hidden_states=True)
-        # Check the output tensor shape
-        self.assertEqual(
-            hidden_states[vision_feature_layer][-1][-1].shape, (vision_hidden_size,)
+        *_, hidden_states = vision_tower(
+            input_tensor, output_hidden_states=True, **kwargs
         )
+        # Check the output tensor shape
+        if kwargs.get("grid_thw", None) is not None:
+            self.assertEqual(hidden_states.shape, (vision_hidden_size,))
+        else:
+            self.assertEqual(
+                hidden_states[vision_feature_layer][-1][-1].shape, (vision_hidden_size,)
+            )
 
     def test_llava_bunny(self):
         from mlx_vlm.models import llava_bunny
@@ -616,6 +625,136 @@ class TestModels(unittest.TestCase):
             config.vision_config.hidden_size,
             config.vision_config.num_channels,
             (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
+    def test_pixtral(self):
+        from mlx_vlm.models import pixtral
+
+        text_config = pixtral.TextConfig(
+            model_type="mistral",
+            hidden_size=4096,
+            num_hidden_layers=32,
+            intermediate_size=11008,
+            num_attention_heads=32,
+            rms_norm_eps=1e-5,
+            vocab_size=32000,
+            num_key_value_heads=32,
+            rope_theta=10000.0,
+            rope_traditional=False,
+            rope_scaling=None,
+        )
+
+        vision_config = pixtral.VisionConfig(
+            model_type="pixtral",
+            num_hidden_layers=24,
+            hidden_size=1024,
+            intermediate_size=4096,
+            num_attention_heads=16,
+            image_size=336,
+            patch_size=14,
+            projection_dim=768,
+            vocab_size=32000,
+            num_channels=3,
+            rms_norm_eps=1e-6,
+        )
+
+        config = pixtral.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="pixtral",
+            ignore_index=-100,
+            image_token_index=32000,
+            vocab_size=32000,
+            vision_feature_layer=-2,
+            vision_feature_select_strategy="default",
+        )
+
+        model = pixtral.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.mm_projector_test_runner(
+            model.multi_modal_projector,
+            config.vision_config.hidden_size,
+            config.text_config.hidden_size,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
+    def test_qwen2_vl(self):
+        from mlx_vlm.models import qwen2_vl
+
+        text_config = qwen2_vl.TextConfig(
+            model_type="qwen2_vl",
+            hidden_size=4096,
+            num_hidden_layers=32,
+            intermediate_size=11008,
+            num_attention_heads=32,
+            rms_norm_eps=1e-5,
+            vocab_size=32000,
+            num_key_value_heads=32,
+            max_position_embeddings=32768,
+            rope_theta=10000.0,
+            rope_traditional=False,
+            rope_scaling={"mrope_section": [16, 24, 24]},
+            tie_word_embeddings=True,
+        )
+
+        vision_config = qwen2_vl.VisionConfig(
+            model_type="qwen2_vl",
+            depth=32,
+            embed_dim=1280,
+            hidden_size=1536,
+            num_heads=16,
+            image_size=384,
+            patch_size=14,
+            vocab_size=32000,
+            mlp_ratio=4.0,
+            in_channels=3,
+            layer_norm_eps=1e-6,
+            spatial_patch_size=14,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+        )
+
+        config = qwen2_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="qwen2_vl",
+            ignore_index=-100,
+            image_token_index=32000,
+            vocab_size=32000,
+            vision_feature_layer=-2,
+            vision_feature_select_strategy="default",
+        )
+
+        model = qwen2_vl.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+        kwargs = {"grid_thw": mx.array([[1, 30, 46]])}
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.in_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+            **kwargs,
         )
 
 
