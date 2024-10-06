@@ -36,9 +36,9 @@ The script accepts the following command-line arguments:
 - `--model_path`: Path to the pre-trained model (default: "mlx-community/nanoLLaVA-1.5-bf16")
 - `--dataset`: Path to your dataset (required)
 - `--learning_rate`: Learning rate for the optimizer (default: 1e-4)
-- `--batch_size`: Batch size for training (default: 2)
+- `--batch_size`: Batch size for training (default: 1)
 - `--epochs`: Number of epochs to train (default: 1)
-- `--steps`: Number of steps per epoch (default: 100)
+- `--steps`: Number of steps per epoch (default: 0)
 - `--print_every`: Print loss every n steps (default: 10)
 - `--output_path`: Path to save the trained adapter (default: "nanollava_lora_adapter.safetensors")
 
@@ -47,7 +47,7 @@ The script accepts the following command-line arguments:
 Here's an example of how to run the script with custom parameters:
 
 ```
-python lora.py --dataset /path/to/your/dataset --model_path /path/to/your/model --epochs 2 --steps 200 --batch_size 4 --learning_rate 5e-5
+python lora.py --dataset /path/to/your/dataset --model_path /path/to/your/model --epochs 2 --batch_size 4 --learning_rate 5e-5
 ```
 
 This command will:

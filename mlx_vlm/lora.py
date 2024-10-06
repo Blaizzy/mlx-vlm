@@ -28,9 +28,7 @@ def main(args):
     image_processor = load_image_processor(args.model_path)
 
     logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
-    dataset = load_dataset(args.dataset, split=args.split + "[:20%]")
-
-    dataset = dataset.rename_columns({"image": "images", "conversations": "messages"})
+    dataset = load_dataset(args.dataset, split=args.split)
 
     if "messages" not in dataset.column_names:
         raise ValueError("Dataset must have a 'messages' column")
@@ -116,6 +114,7 @@ def main(args):
                     }
                 )
 
+    # Save the adapter
     save_adapter(model, args.output_path)
 
 
@@ -151,7 +150,7 @@ if __name__ == "__main__":
         "--epochs", type=int, default=1, help="Number of epochs to train"
     )
     parser.add_argument(
-        "--steps", type=int, default=20, help="Number of steps per epoch"
+        "--steps", type=int, default=0, help="Number of steps per epoch"
     )
     parser.add_argument(
         "--print-every", type=int, default=10, help="Print loss every n steps"
