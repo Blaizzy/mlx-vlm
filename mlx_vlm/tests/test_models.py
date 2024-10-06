@@ -67,7 +67,7 @@ class TestModels(unittest.TestCase):
         # Check vision hidden feature layer's shape matches the expected hidden size
         self.assertEqual(
             hidden_states[vision_feature_layer].shape[-1], vision_hidden_size
-  
+        )
 
     def test_llava_bunny(self):
         from mlx_vlm.models import llava_bunny
@@ -662,7 +662,7 @@ class TestModels(unittest.TestCase):
         )
 
         model = pixtral.Model(config)
-          
+
     def test_qwen2_vl(self):
         from mlx_vlm.models import qwen2_vl
 
