@@ -18,7 +18,6 @@ from .vision import VisionConfig, VisionModel
 class ModelConfig:
     text_config: TextConfig
     vision_config: VisionConfig
-    rope_scaling: dict
     model_type: str
     ignore_index: int = -100
     image_token_index: int = 151655

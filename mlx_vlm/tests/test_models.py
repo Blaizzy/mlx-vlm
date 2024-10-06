@@ -618,6 +618,71 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
         )
 
+    def test_pixtral(self):
+        from mlx_vlm.models import pixtral
+
+        text_config = pixtral.TextConfig(
+            model_type="mistral",
+            hidden_size=4096,
+            num_hidden_layers=32,
+            intermediate_size=11008,
+            num_attention_heads=32,
+            rms_norm_eps=1e-5,
+            vocab_size=32000,
+            num_key_value_heads=32,
+            rope_theta=10000.0,
+            rope_traditional=False,
+            rope_scaling=None,
+        )
+
+        vision_config = pixtral.VisionConfig(
+            model_type="pixtral",
+            num_hidden_layers=24,
+            hidden_size=1024,
+            intermediate_size=4096,
+            num_attention_heads=16,
+            image_size=336,
+            patch_size=14,
+            projection_dim=768,
+            vocab_size=32000,
+            num_channels=3,
+            rms_norm_eps=1e-6,
+        )
+
+        config = pixtral.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="pixtral",
+            ignore_index=-100,
+            image_token_index=32000,
+            vocab_size=32000,
+            vision_feature_layer=-2,
+            vision_feature_select_strategy="default",
+        )
+
+        model = pixtral.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.mm_projector_test_runner(
+            model.multi_modal_projector,
+            config.vision_config.hidden_size,
+            config.text_config.hidden_size,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
