@@ -145,13 +145,11 @@ class Model(nn.Module):
         def transform_key(key):
             if "vision_tower" not in key:
                 key = key.replace("visual", "vision_tower")
-            if "language_model.model" not in key and key.split(".")[0] not in [
-                "lm_head",
-                "language_model",
-            ]:
-                key = key.replace("model", "language_model.model")
-            if "lm_head" in key and key.split(".")[0] == "lm_head":
-                key = key.replace("lm_head", "language_model.lm_head")
+            if "language_model" not in key:
+                if "model" in key:
+                    key = key.replace("model", "language_model.model")
+                elif "lm_head" in key:
+                    key = key.replace("lm_head", "language_model.lm_head")
             return key
 
         return {transform_key(k): v for k, v in weights.items()}
