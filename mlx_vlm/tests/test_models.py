@@ -52,6 +52,7 @@ class TestModels(unittest.TestCase):
         num_channels,
         image_size: tuple,
         vision_feature_layer=-2,
+        **kwargs,
     ):
         self.assertEqual(vision_tower.model_type, model_type)
 
@@ -61,12 +62,20 @@ class TestModels(unittest.TestCase):
             shape=(batch_size, image_size[0], image_size[1], num_channels)
         )
 
+        if kwargs.get("grid_thw", None) is not None:
+            input_tensor = mx.random.uniform(shape=(1380, 1176))
+
         # Perform a forward pass
-        *_, hidden_states = vision_tower(input_tensor, output_hidden_states=True)
-        # Check the output tensor shape
-        self.assertEqual(
-            hidden_states[vision_feature_layer][-1][-1].shape, (vision_hidden_size,)
+        *_, hidden_states = vision_tower(
+            input_tensor, output_hidden_states=True, **kwargs
         )
+        # Check the output tensor shape
+        if kwargs.get("grid_thw", None) is not None:
+            self.assertEqual(hidden_states.shape, (vision_hidden_size,))
+        else:
+            self.assertEqual(
+                hidden_states[vision_feature_layer][-1][-1].shape, (vision_hidden_size,)
+            )
 
     def test_llava_bunny(self):
         from mlx_vlm.models import llava_bunny
