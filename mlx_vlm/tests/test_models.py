@@ -699,7 +699,6 @@ class TestModels(unittest.TestCase):
             model_type="qwen2_vl",
             text_config=text_config,
             vision_config=vision_config,
-            rope_scaling=text_config.rope_scaling,
             image_token_index=151655,
             vocab_size=32000,
         )
