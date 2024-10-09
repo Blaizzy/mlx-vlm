@@ -65,8 +65,6 @@ def main(args):
         config,
         processor,
         image_processor=image_processor,
-        take=None,
-        split=None,
     )
 
     logger.info(f"\033[32mSetting up LoRA\033[0m")

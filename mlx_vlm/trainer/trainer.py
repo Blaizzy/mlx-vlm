@@ -40,7 +40,7 @@ class Dataset:
         processor,
         image_processor=None,
         take=None,
-        split="train",
+        split=None,
     ):
         if split is not None:
             self.dataset = hf_dataset[split]
