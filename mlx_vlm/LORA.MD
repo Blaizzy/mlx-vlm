@@ -29,6 +29,19 @@ To use the script, run it from the command line with the desired arguments:
 python lora.py --dataset /path/to/your/dataset [other options]
 ```
 
+## Dataset format
+
+The dataset should be a Hugging Face dataset with a `images` column and a `messages` column.
+
+```
+{
+    "images": ...,
+    "messages": ...,
+}
+```
+
+Support for other formats and column names will be added soon.
+
 ## Arguments
 
 The script accepts the following command-line arguments:
@@ -49,14 +62,6 @@ Here's an example of how to run the script with custom parameters:
 ```
 python lora.py --dataset /path/to/your/dataset --model_path /path/to/your/model --epochs 2 --batch_size 4 --learning_rate 5e-5
 ```
-
-This command will:
-- Use the dataset at `/path/to/your/dataset`
-- Use the model at `/path/to/your/model`
-- Train for 2 epochs
-- Perform 200 steps per epoch
-- Use a batch size of 4
-- Set the learning rate to 5e-5
 
 ## Output
 
