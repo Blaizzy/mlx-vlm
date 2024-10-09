@@ -26,7 +26,8 @@ from transformers import (
 
 from .models.base import BaseImageProcessor, KVCache
 from .sample_utils import top_p_sampling
-from .tokenizer_utils import TokenizerWrapper, load_tokenizer
+from .tokenizer_utils import load_tokenizer
+from .trainer import apply_lora_layers
 
 # Constants
 MODEL_REMAPPING = {"llava-qwen2": "llava_bunny", "bunny-llama": "llava_bunny"}
@@ -223,6 +224,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 def load(
     path_or_hf_repo: str,
     processor_config={},
+    adapter_path: Optional[str] = None,
     lazy: bool = False,
 ) -> Tuple[nn.Module, Union[PreTrainedTokenizer, PreTrainedTokenizerFast]]:
     """
@@ -247,6 +249,11 @@ def load(
     model_path = get_model_path(path_or_hf_repo)
 
     model = load_model(model_path, lazy)
+    if adapter_path is not None:
+        # TODO: Support more modules than just language_model
+        model = apply_lora_layers(model, adapter_path)
+        model.eval()
+
     processor = load_processor(model_path, processor_config=processor_config)
 
     return model, processor
@@ -288,14 +295,15 @@ def load_image_processor(model_path: Union[str, Path]) -> BaseImageProcessor:
 
 
 def load_processor(
-    model_path, processor_config={"trust_remote_code": True}
+    model_path, processor_config={"trust_remote_code": True}, add_detokenizer=True
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     processor = AutoProcessor.from_pretrained(model_path, **processor_config)
-    detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
-    if "tokenizer" in processor.__dict__.keys():
-        processor.detokenizer = detokenizer_class(processor.tokenizer)
-    else:
-        processor.detokenizer = detokenizer_class(processor)
+    if add_detokenizer:
+        detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
+        if "tokenizer" in processor.__dict__.keys():
+            processor.detokenizer = detokenizer_class(processor.tokenizer)
+        else:
+            processor.detokenizer = detokenizer_class(processor)
     return processor
 
 
@@ -304,8 +312,7 @@ def fetch_from_hub(
 ) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
     model = load_model(model_path, lazy)
     config = load_config(model_path)
-    processor = load_processor(model_path)
-
+    processor = load_processor(model_path, add_detokenizer=False)
     return model, config, processor
 
 
@@ -637,7 +644,7 @@ def convert(
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
-    model, config, tokenizer = fetch_from_hub(model_path, lazy=False)
+    model, config, processor = fetch_from_hub(model_path, lazy=False)
 
     weights = dict(tree_flatten(model.parameters()))
     dtype = mx.float16 if quantize else getattr(mx, dtype)
@@ -666,7 +673,7 @@ def convert(
     for file in py_files:
         shutil.copy(file, mlx_path)
 
-    tokenizer.save_pretrained(mlx_path)
+    processor.save_pretrained(mlx_path)
 
     save_config(config, config_path=mlx_path / "config.json")
 
@@ -704,46 +711,86 @@ def load_image(image_source: Union[str, Path, BytesIO]):
         )
 
 
-def prepare_inputs(image_processor, processor, image, prompt, image_token_index):
+def resize_image(img, max_size):
+    ratio = min(max_size[0] / img.width, max_size[1] / img.height)
+    new_size = (int(img.width * ratio), int(img.height * ratio))
+    return img.resize(new_size)
+
+
+def process_image(img, resize_shape):
+    if isinstance(img, str):
+        img = load_image(img)
+    if resize_shape is not None:
+        img = resize_image(img, resize_shape)
+    return img
+
+
+def prepare_inputs(
+    image_processor, processor, images, prompts, image_token_index, resize_shape=None
+):
     from transformers.image_utils import load_image
 
     mask = None
-    if isinstance(image, str):
-        image = load_image(image)
+    if not isinstance(images, list):
+        images = [images]
+
+    # Process images
+    images = [
+        process_image(img, resize_shape) if isinstance(img, str) else img
+        for img in images
+    ]
 
     image_grid_thw = None
+    image_sizes = None
     if image_processor is not None:
-        text_chunks = [processor(chunk).input_ids for chunk in prompt.split("<image>")]
-        input_ids = mx.array([text_chunks[0] + [image_token_index] + text_chunks[1]])
-        pixel_values = mx.array(image_processor.preprocess(images=[image])[0])
-        pixel_values = mx.array(mx.expand_dims(pixel_values, axis=0))
+        if not isinstance(prompts, list):
+            prompts = [prompts]
+
+        processor.pad_token = processor.eos_token
+        text_chunks = [
+            [processor(chunk).input_ids for chunk in prompt.split("<image>")]
+            for prompt in prompts
+        ]
+
+        # Find the maximum length for padding
+        max_length = max(
+            sum(len(chunk) for chunk in chunks) + 1 for chunks in text_chunks
+        )
+
+        # Pad and create input_ids
+        input_ids = []
+        for chunks in text_chunks:
+            ids = chunks[0] + [image_token_index] + chunks[1]
+            padding = [processor.pad_token_id] * (max_length - len(ids))
+            input_ids.append(mx.array(ids + padding))
+
+        input_ids = mx.array(input_ids)
+
+        pixel_values = image_processor.preprocess(images=images)
+        pixel_values = mx.array(np.stack(pixel_values))
+
+        mask = mx.array([(ids != processor.pad_token_id) for ids in input_ids]).astype(
+            mx.int32
+        )
     else:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
-        try:
-            inputs = processor(
-                text=[prompt], images=[image], padding=True, return_tensors="mlx"
-            )
-        except Exception as e:
-            inputs = processor(
-                text=prompt, images=[image], padding=True, return_tensors="mlx"
-            )  # for phi3_v model
-
+        inputs = processor(
+            text=prompts, images=images, padding=True, return_tensors="mlx"
+        )
         if isinstance(inputs["pixel_values"], list):
-            pixel_values = mx.array(inputs["pixel_values"][0][0])[None, :]
-        elif isinstance(inputs["pixel_values"], np.ndarray):
-            pixel_values = mx.array(inputs["pixel_values"])
+            pixel_values = inputs["pixel_values"]
         else:
-            raise ValueError(
-                f"Invalid pixel_values type: {type(inputs['pixel_values'])}"
-            )
-
+            pixel_values = mx.array(inputs["pixel_values"])
         input_ids = mx.array(inputs["input_ids"])
-        mask = inputs["attention_mask"]
+        mask = mx.array(inputs["attention_mask"])
+        image_sizes = inputs.get("image_sizes", None)
+        if image_sizes is not None:
+            image_sizes = mx.array(image_sizes)
         image_grid_thw = inputs.get("image_grid_thw", None)
-        if "image_sizes" in inputs:
-            return input_ids, pixel_values, inputs["image_sizes"], image_grid_thw
+        if image_grid_thw is not None:
+            image_grid_thw = mx.array(image_grid_thw)
 
-    return input_ids, pixel_values, mask, image_grid_thw
+    return input_ids, pixel_values, mask, image_grid_thw, image_sizes
 
 
 def generate_step(
@@ -878,9 +925,11 @@ def stream_generate(
         tokenizer = processor.tokenizer
 
     image_token_index = model.config.image_token_index
-    input_ids, pixel_values, mask = prepare_inputs(
+    inputs = prepare_inputs(
         image_processor, processor, image, prompt, image_token_index
     )
+    input_ids, pixel_values, mask = inputs[:3]
+    kwargs = {k: v for k, v in zip(["image_grid_thw", "image_sizes"], inputs[3:])}
 
     detokenizer = processor.detokenizer
 
@@ -944,32 +993,32 @@ def generate(
         tokenizer = processor.tokenizer
 
     image_token_index = model.config.image_token_index
-    input_ids, pixel_values, mask, image_grid_thw = prepare_inputs(
+    # Prepare inputs
+    inputs = prepare_inputs(
         image_processor, processor, image, prompt, image_token_index
     )
+    input_ids, pixel_values, mask = inputs[:3]
+    kwargs = {k: v for k, v in zip(["image_grid_thw", "image_sizes"], inputs[3:])}
 
-    kwargs = {
-        "image_grid_thw": image_grid_thw,
-    }
-
+    # Initialize timing and detokenizer
     tic = time.perf_counter()
     detokenizer = processor.detokenizer
     detokenizer.reset()
 
-    for (token, prob), n in zip(
-        generate_step(
-            input_ids,
-            model,
-            pixel_values,
-            mask,
-            temp,
-            repetition_penalty,
-            repetition_context_size,
-            top_p,
-            **kwargs,
-        ),
-        range(max_tokens),
-    ):
+    # Generate tokens
+    generator = generate_step(
+        input_ids,
+        model,
+        pixel_values,
+        mask,
+        temp,
+        repetition_penalty,
+        repetition_context_size,
+        top_p,
+        **kwargs,
+    )
+
+    for (token, prob), n in zip(generator, range(max_tokens)):
 
         if n == 0:
             prompt_time = time.perf_counter() - tic

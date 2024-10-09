@@ -56,6 +56,7 @@ class LlavaMultiModalProjector(nn.Module):
 
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
+        super().__init__()
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config)
@@ -75,22 +76,23 @@ class Model(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
+        if isinstance(pixel_values, list):
+            if input_ids.shape[0] == 1:  # Batch size is 1
+                pixel_values = mx.concatenate(
+                    [mx.array(pv) for pv in pixel_values[0]], axis=1
+                )[None, ...]
+            else:  # Batch size is greater than 1
+                pixel_values = mx.concatenate(
+                    [mx.array(pv) for pv in pixel_values], axis=0
+                )
+        if pixel_values.ndim == 3:
+            pixel_values = pixel_values[None, ...]
+
         *_, hidden_states = self.vision_tower(
             pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
         )
-
         # Select the hidden states from the desired layer
         selected_image_feature = hidden_states[self.vision_feature_layer]
-
-        if self.vision_feature_select_strategy == "default":
-            selected_image_feature = selected_image_feature[:, 1:]
-        elif self.vision_feature_select_strategy == "full":
-            selected_image_feature = selected_image_feature
-        else:
-            raise ValueError(
-                "Unexpected feature selection strategy: "
-                f"{self.vision_feature_select_strategy}"
-            )
 
         # Pass image features through the multi-modal projector
         image_features = self.multi_modal_projector(selected_image_feature)
@@ -181,7 +183,7 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         def transform_key(key):
-            if "vision_tower" in key:
+            if "vision_tower" in key and "vision_model" not in key:
                 if "transformer" in key:
                     key = key.replace("vision_tower", "vision_tower.vision_model")
                 if "patch_conv" in key:

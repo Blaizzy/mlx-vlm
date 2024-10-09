@@ -19,7 +19,7 @@ class VisionConfig:
     mlp_ratio: float = 4.0
     in_channels: int = 3
     layer_norm_eps: float = 1e-6
-    spatial_patch_size = 14
+    spatial_patch_size: int = 14
     spatial_merge_size: int = 2
     temporal_patch_size: int = 2
 
@@ -320,10 +320,22 @@ class VisionModel(nn.Module):
         grid_thw: mx.array,
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
+
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        cu_seqlens = mx.repeat(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
+        # Assuming grid_thw has shape (batch_size, 3)
+        batch_size = grid_thw.shape[0]
+
+        # Calculate cu_seqlens for each item in the batch
+        cu_seqlens = []
+        for i in range(batch_size):
+            seq_len = grid_thw[i, 1] * grid_thw[i, 2]
+            cu_seqlens.append(mx.repeat(seq_len, grid_thw[i, 0]))
+
+        # Concatenate the cu_seqlens for all items in the batch
+        cu_seqlens = mx.concatenate(cu_seqlens)
+
         cu_seqlens = mx.cumsum(cu_seqlens.astype(mx.int32))
         cu_seqlens = mx.pad(cu_seqlens, (1, 0), mode="constant", constant_values=0)
 

@@ -21,6 +21,7 @@ class TextConfig:
     rope_theta: float = 10000
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    tie_word_embeddings: bool = False
 
     @classmethod
     def from_dict(cls, params):
@@ -58,9 +59,14 @@ class Attention(nn.Module):
         head_dim = config.hidden_size // n_heads
         self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        if config.model_type == "qwen2":
+            attention_bias = True
+        else:
+            attention_bias = False
+
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=attention_bias)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
         rope_scale = (
@@ -184,12 +190,13 @@ class LanguageModel(nn.Module):
         super().__init__()
         self.config = config
         self.model_type = config.model_type
-        if self.model_type != "llama":
+        if self.model_type not in ["llama", "qwen2"]:
             raise ValueError(
                 f"Model type {self.model_type} not supported. Currently only 'llama' is supported"
             )
         self.model = Llama(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if not config.tie_word_embeddings:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(
         self,
@@ -199,7 +206,11 @@ class LanguageModel(nn.Module):
         mask: Optional[mx.array] = None,
     ):
         out = self.model(inputs, cache, inputs_embeds)
-        return self.lm_head(out)
+        if self.config.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
+        return out
 
     @staticmethod
     def sanitize(weights):

@@ -151,31 +151,44 @@ class VisionEmbeddings(nn.Module):
         self.image_size = config.image_size
         self.patch_size = config.patch_size
 
-        self.class_embedding = mx.zeros((config.hidden_size,))
+        if config.model_type == "siglip_vision_model":
+            bias = True
+            self.class_embedding = None
+        else:
+            bias = False
+            self.class_embedding = mx.zeros((config.hidden_size,))
 
         self.patch_embedding = nn.Conv2d(
             in_channels=config.num_channels,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
             stride=self.patch_size,
-            bias=False,
+            bias=bias,
         )
 
         self.num_patches = (self.image_size // self.patch_size) ** 2
-        self.num_positions = self.num_patches + 1
+        self.num_positions = (
+            self.num_patches + 1
+            if config.model_type == "clip_vision_model"
+            else self.num_patches
+        )
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
 
     def __call__(self, x: mx.array) -> mx.array:
         batch_size = x.shape[0]
         patch_embeddings = self.patch_embedding(x)
         patch_embeddings = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
-        embed_dim = patch_embeddings.shape[-1]
-        cls_embeddings = mx.broadcast_to(
-            self.class_embedding, (batch_size, 1, embed_dim)
-        )
+        if self.config.model_type == "siglip_vision_model":
+            embeddings = patch_embeddings
+        else:
+            embed_dim = patch_embeddings.shape[-1]
+            cls_embeddings = mx.broadcast_to(
+                self.class_embedding, (batch_size, 1, embed_dim)
+            )
+            embeddings = mx.concatenate((cls_embeddings, patch_embeddings), axis=1)
+
         position_ids = mx.array(np.arange(self.num_positions)[None, :])
 
-        embeddings = mx.concatenate((cls_embeddings, patch_embeddings), axis=1)
         embeddings += self.position_embedding(position_ids)
         return embeddings
 
@@ -183,8 +196,10 @@ class VisionEmbeddings(nn.Module):
 class ClipVisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
+        self.config = config
         self.embeddings = VisionEmbeddings(config)
-        self.pre_layrnorm = nn.LayerNorm(config.hidden_size)
+        if self.config.model_type == "clip_vision_model":
+            self.pre_layrnorm = nn.LayerNorm(config.hidden_size)
         self.encoder = Encoder(config)
         self.post_layernorm = nn.LayerNorm(config.hidden_size)
 
@@ -194,7 +209,8 @@ class ClipVisionModel(nn.Module):
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
         x = self.embeddings(x)
-        x = self.pre_layrnorm(x)
+        if self.config.model_type == "clip_vision_model":
+            x = self.pre_layrnorm(x)
 
         encoder_states = (x,) if output_hidden_states else None
 
@@ -212,7 +228,7 @@ class VisionModel(nn.Module):
         super().__init__()
 
         self.model_type = config.model_type
-        if self.model_type != "clip_vision_model":
+        if self.model_type not in ["clip_vision_model", "siglip_vision_model"]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
         self.vision_model = ClipVisionModel(config)
