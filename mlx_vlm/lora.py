@@ -121,7 +121,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model-path",
         type=str,
-        default="mlx-community/nanoLLaVA-1.5-bf16",
+        default="mlx-community/Qwen2-VL-2B-Instruct-bf16",
         help="Path to the pre-trained model",
     )
     parser.add_argument(
