@@ -93,9 +93,9 @@ class Model(nn.Module):
 
         pixel_values = mx.split(pixel_values, num_images, axis=2)
 
-        # pass pixel_values as list of images, as each image is individually run through conv2d and position encoding
-        #  reference code from transformers: https://github.com/huggingface/transformers/blob/main/src/transformers/models/pixtral/modeling_pixtral.py#L479C9-L479C21
-        #  and mistral_inference: https://github.com/mistralai/mistral-inference/blob/main/src/mistral_inference/vision_encoder.py#L85
+        # Pass pixel_values as list of images, as each image is individually run through conv2d and position encoding
+        # Reference code from transformers: https://github.com/huggingface/transformers/blob/main/src/transformers/models/pixtral/modeling_pixtral.py#L479C9-L479C21
+        # and mistral_inference: https://github.com/mistralai/mistral-inference/blob/main/src/mistral_inference/vision_encoder.py#L85
         *_, hidden_states = self.vision_tower(
             [pv.transpose(0, 2, 3, 1) for pv in pixel_values], output_hidden_states=True
         )
@@ -127,9 +127,7 @@ class Model(nn.Module):
             text_segments.append(inputs_embeds[:, start_idx:position])
             start_idx = position + 1
 
-        # [IMG_BREAK] and [IMG_END] are missing with existing implementation
-        # image_embeddings = mx.split(image_features, image_features.shape[0])
-
+        # Split image features into separate embeddings for each image
         image_embeddings = mx.split(image_features, num_image_patches, axis=1)
         final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
         final_embeddings += [inputs_embeds[:, start_idx:]]
