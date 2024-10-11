@@ -1,6 +1,6 @@
 import inspect
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -253,11 +253,11 @@ class PixtralVisionModel(nn.Module):
 
     def __call__(
         self,
-        x: mx.array,
+        x: List[mx.array],
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
-        B, H, W, C = x.shape
-        patch_embeds_list = [self.patch_conv(img[None, :]) for img in x]
+        B, H, W, C = x[0].shape
+        patch_embeds_list = [self.patch_conv(img) for img in x]
 
         patch_embeds = mx.concatenate(
             [p.reshape(B, -1, p.shape[-1]) for p in patch_embeds_list], axis=1
@@ -299,7 +299,7 @@ class VisionModel(nn.Module):
         self.vision_model = PixtralVisionModel(config)
 
     def __call__(
-        self, x: mx.array, output_hidden_states: Optional[bool] = None
+        self, x: List[mx.array], output_hidden_states: Optional[bool] = None
     ) -> mx.array:
         return self.vision_model(x, output_hidden_states)
 

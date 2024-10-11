@@ -56,6 +56,7 @@ class LlavaMultiModalProjector(nn.Module):
 
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
+        super().__init__()
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config)

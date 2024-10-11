@@ -62,7 +62,6 @@ class TestModels(unittest.TestCase):
             shape=(batch_size, image_size[0], image_size[1], num_channels)
         )
 
-        # Perform a forward pass
         hidden_states = vision_tower(input_tensor, output_hidden_states=True, **kwargs)
 
         # Check vision hidden feature layer's shape matches the expected hidden size
@@ -620,6 +619,50 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
         )
 
+    def test_pixtral(self):
+        from mlx_vlm.models import pixtral
+
+        text_config = pixtral.TextConfig(
+            model_type="mistral",
+            hidden_size=4096,
+            num_hidden_layers=32,
+            intermediate_size=11008,
+            num_attention_heads=32,
+            rms_norm_eps=1e-5,
+            vocab_size=32000,
+            num_key_value_heads=32,
+            rope_theta=10000.0,
+            rope_traditional=False,
+            rope_scaling=None,
+        )
+
+        vision_config = pixtral.VisionConfig(
+            model_type="pixtral",
+            num_hidden_layers=24,
+            hidden_size=1024,
+            intermediate_size=4096,
+            num_attention_heads=16,
+            image_size=336,
+            patch_size=14,
+            projection_dim=768,
+            vocab_size=32000,
+            num_channels=3,
+            rms_norm_eps=1e-6,
+        )
+
+        config = pixtral.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="pixtral",
+            ignore_index=-100,
+            image_token_index=32000,
+            vocab_size=32000,
+            vision_feature_layer=-2,
+            vision_feature_select_strategy="default",
+        )
+
+        model = pixtral.Model(config)
+
     def test_qwen2_vl(self):
         from mlx_vlm.models import qwen2_vl
 
@@ -656,7 +699,6 @@ class TestModels(unittest.TestCase):
             model_type="qwen2_vl",
             text_config=text_config,
             vision_config=vision_config,
-            rope_scaling=text_config.rope_scaling,
             image_token_index=151655,
             vocab_size=32000,
         )

@@ -282,6 +282,10 @@ class LanguageModel(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self.model = Qwen2Model(args)
+
+        if args.model_type != "qwen2_vl":
+            raise ValueError(f"Unsupported model type: {args.model_type}")
+
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
