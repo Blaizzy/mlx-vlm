@@ -1,6 +1,6 @@
 import inspect
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
