@@ -207,9 +207,9 @@ class VisionEmbeddings(nn.Module):
         batch_size = x.shape[0]
         patch_embeddings = self.patch_embedding(x)
         patch_embeddings = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
-        self.position_ids = mx.array(np.arange(self.num_positions)[None, :])
+        position_ids = mx.array(np.arange(self.num_positions)[None, :])
         embeddings = patch_embeddings
-        embeddings += self.position_embedding(self.position_ids)
+        embeddings += self.position_embedding(position_ids)
         return embeddings
 
 

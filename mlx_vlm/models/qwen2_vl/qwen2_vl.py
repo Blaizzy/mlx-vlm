@@ -18,7 +18,6 @@ from .vision import VisionConfig, VisionModel
 class ModelConfig:
     text_config: TextConfig
     vision_config: VisionConfig
-    rope_scaling: dict
     model_type: str
     ignore_index: int = -100
     image_token_index: int = 151655
@@ -39,6 +38,7 @@ class ModelConfig:
 
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
+        super().__init__()
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config)
@@ -60,6 +60,9 @@ class Model(nn.Module):
         hidden_states = self.vision_tower(
             pixel_values, image_grid_thw, output_hidden_states=False
         )
+
+        if hidden_states.ndim == 2:
+            hidden_states = hidden_states[None, :, :]
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self._merge_input_ids_with_image_features(
