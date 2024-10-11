@@ -46,14 +46,14 @@ Support for other formats and column names will be added soon.
 
 The script accepts the following command-line arguments:
 
-- `--model_path`: Path to the pre-trained model (default: "mlx-community/nanoLLaVA-1.5-bf16")
+- `--model_path`: Path to the pre-trained model (default: "mlx-community/Qwen2-VL-2B-Instruct-bf16")
 - `--dataset`: Path to your dataset (required)
 - `--learning_rate`: Learning rate for the optimizer (default: 1e-4)
 - `--batch_size`: Batch size for training (default: 1)
 - `--epochs`: Number of epochs to train (default: 1)
 - `--steps`: Number of steps per epoch (default: 0)
 - `--print_every`: Print loss every n steps (default: 10)
-- `--output_path`: Path to save the trained adapter (default: "nanollava_lora_adapter.safetensors")
+- `--output_path`: Path to save the trained adapter (default: "adapters.safetensors")
 
 ## Example
 
@@ -69,7 +69,7 @@ The script will print the training loss at regular intervals (defined by `--prin
 
 ## Note
 
-If you want to use QLoRA, you need to pass a pre-quantized model to the script using the `--model_path` argument (i.e. `mlx-community/nanoLLaVA-1.5-4bit`).
+If you want to use QLoRA, you need to pass a pre-quantized model to the script using the `--model_path` argument (i.e. `mlx-community/Qwen2-VL-2B-Instruct-4bit`).
 Make sure you have the necessary permissions to read the dataset and write the output file. Also, ensure that your system has sufficient computational resources to handle the specified batch size and model.
 
 ## Contributing
