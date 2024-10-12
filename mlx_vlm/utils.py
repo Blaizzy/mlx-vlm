@@ -924,9 +924,12 @@ def stream_generate(
     else:
         tokenizer = processor.tokenizer
 
+    resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = model.config.image_token_index
+
+    # Prepare inputs
     inputs = prepare_inputs(
-        image_processor, processor, image, prompt, image_token_index
+        image_processor, processor, image, prompt, image_token_index, resize_shape
     )
     input_ids, pixel_values, mask = inputs[:3]
     kwargs = {k: v for k, v in zip(["image_grid_thw", "image_sizes"], inputs[3:])}
@@ -962,6 +965,7 @@ def generate(
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = None,
     top_p: float = 1.0,
+    **kwargs,
 ) -> str:
     """
     Generate text from the model.
@@ -992,10 +996,12 @@ def generate(
         prompt_tokens = mx.array(processor.tokenizer.encode(prompt))
         tokenizer = processor.tokenizer
 
+    resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = model.config.image_token_index
+
     # Prepare inputs
     inputs = prepare_inputs(
-        image_processor, processor, image, prompt, image_token_index
+        image_processor, processor, image, prompt, image_token_index, resize_shape
     )
     input_ids, pixel_values, mask = inputs[:3]
     kwargs = {k: v for k, v in zip(["image_grid_thw", "image_sizes"], inputs[3:])}
