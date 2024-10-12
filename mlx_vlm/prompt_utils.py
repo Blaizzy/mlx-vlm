@@ -65,6 +65,7 @@ def get_message_json(
         "multi_modality": "message_with_image_token",
         "pixtral": "message_list_with_image_type",
         "paligemma": "prompt_only",
+        "mllama": "message_list_with_image",
     }
 
     if num_images > 1 and model_name in [

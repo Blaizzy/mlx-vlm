@@ -790,7 +790,28 @@ def prepare_inputs(
         if image_grid_thw is not None:
             image_grid_thw = mx.array(image_grid_thw)
 
-    return input_ids, pixel_values, mask, image_grid_thw, image_sizes
+        aspect_ratio_ids = inputs.get("aspect_ratio_ids", None)
+        if aspect_ratio_ids is not None:
+            aspect_ratio_ids = mx.array(aspect_ratio_ids)
+
+        aspect_ratio_mask = inputs.get("aspect_ratio_mask", None)
+        if aspect_ratio_mask is not None:
+            aspect_ratio_mask = mx.array(aspect_ratio_mask)
+
+        cross_attention_mask = inputs.get("cross_attention_mask", None)
+        if cross_attention_mask is not None:
+            cross_attention_mask = mx.array(cross_attention_mask)
+
+    return (
+        input_ids,
+        pixel_values,
+        mask,
+        image_grid_thw,
+        image_sizes,
+        aspect_ratio_ids,
+        aspect_ratio_mask,
+        cross_attention_mask,
+    )
 
 
 def generate_step(
@@ -868,7 +889,12 @@ def generate_step(
 
     def _step(y):
         nonlocal repetition_context
-        logits = model.language_model(y[None], cache=cache, mask=mask)
+        logits, _ = model.language_model(
+            y[None],
+            cache=cache,
+            mask=mask,
+            cross_attention_states=cross_attention_states,
+        )
         logits = logits[:, -1, :]
 
         if repetition_penalty:
@@ -885,7 +911,9 @@ def generate_step(
                 repetition_context = repetition_context[-repetition_context_size:]
         return y, logprobs.squeeze(0)
 
-    logits = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
+    logits, cross_attention_states = model(
+        input_ids, pixel_values, cache=cache, mask=mask, **kwargs
+    )
     logits = logits[:, -1, :]
     y, logprobs = sample(logits)
     mx.async_eval(y)
@@ -1004,7 +1032,19 @@ def generate(
         image_processor, processor, image, prompt, image_token_index, resize_shape
     )
     input_ids, pixel_values, mask = inputs[:3]
-    kwargs = {k: v for k, v in zip(["image_grid_thw", "image_sizes"], inputs[3:])}
+    kwargs = {
+        k: v
+        for k, v in zip(
+            [
+                "image_grid_thw",
+                "image_sizes",
+                "aspect_ratio_ids",
+                "aspect_ratio_mask",
+                "cross_attention_mask",
+            ],
+            inputs[3:],
+        )
+    }
 
     # Initialize timing and detokenizer
     tic = time.perf_counter()
