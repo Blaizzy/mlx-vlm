@@ -47,10 +47,12 @@ Here's an example of how to use MLX-VLM in a Python script:
 import mlx.core as mx
 from mlx_vlm import load, generate
 from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.utils import load_config
 
 # Load the model
 model_path = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
 model, processor = load(model_path)
+config = load_config(model_path)
 
 # Prepare input
 image = ["http://images.cocodataset.org/val2017/000000039769.jpg"]
@@ -87,9 +89,11 @@ The following models support multi-image chat:
 ```python
 from mlx_vlm import load, generate
 from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.utils import load_config
 
 model_path = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
 model, processor = load(model_path)
+config = load_config(model_path)
 
 images = ["path/to/image1.jpg", "path/to/image2.jpg"]
 prompt = "Compare these two images."
