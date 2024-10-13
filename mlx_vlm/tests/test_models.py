@@ -17,12 +17,14 @@ class TestModels(unittest.TestCase):
 
             inputs = mx.array([[0, 1]])
             outputs = model(inputs)
-            self.assertEqual(outputs.shape, (batch_size, 2, vocab_size))
-            self.assertEqual(outputs.dtype, t)
+            logits = outputs.logits
+            self.assertEqual(logits.shape, (batch_size, 2, vocab_size))
+            self.assertEqual(logits.dtype, t)
 
-            outputs = model(mx.argmax(outputs[0, -1:, :], keepdims=True), cache=None)
-            self.assertEqual(outputs.shape, (batch_size, 1, vocab_size))
-            self.assertEqual(outputs.dtype, t)
+            outputs = model(mx.argmax(logits[0, -1:, :], keepdims=True), cache=None)
+            logits = outputs.logits
+            self.assertEqual(logits.shape, (batch_size, 1, vocab_size))
+            self.assertEqual(logits.dtype, t)
 
     def mm_projector_test_runner(
         self, mm_projector, vision_hidden_size, text_hidden_size
@@ -721,6 +723,76 @@ class TestModels(unittest.TestCase):
             vision_feature_layer=-1,
             grid_thw=mx.ones((1, 3)),  # image temporals shape (num_images, 3)
         )
+
+    def test_mllama(self):
+        from mlx_vlm.models import mllama
+
+        vision_config = mllama.VisionConfig(
+            image_size=50,
+            patch_size=14,
+            num_channels=3,
+            hidden_size=1280,
+            intermediate_size=5120,
+            num_hidden_layers=10,
+            num_attention_heads=16,
+            max_num_tiles=4,
+            max_aspect_ratio_id=8,
+            num_global_layers=8,
+            norm_eps=1e-5,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            vision_output_dim=7680,
+            intermediate_layers_indices=[3, 7, 15, 23, 30],
+        )
+
+        text_config = mllama.TextConfig(
+            model_type="mllama",
+            hidden_size=4096,
+            num_hidden_layers=10,
+            intermediate_size=14336,
+            num_attention_heads=16,
+            rms_norm_eps=1e-6,
+            vocab_size=32000,
+        )
+
+        model_config = mllama.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="mllama",
+            ignore_index=-100,
+            image_token_index=128256,
+            vision_feature_select_strategy="default",
+            vision_feature_layer=-2,
+            vocab_size=32000,
+        )
+
+        # Create the model
+        model = mllama.Model(model_config)
+
+        # Create dummy input data
+        batch_size = 1
+        seq_length = 5
+        num_tiles = 4
+        input_ids = mx.random.randint(0, 1000, (batch_size, seq_length))
+        pixel_values = mx.random.normal((batch_size, 1, num_tiles, 3, 50, 50))
+        mask = mx.ones((batch_size, seq_length))
+        aspect_ratio_ids = mx.zeros((batch_size, 1), dtype=mx.int32)
+        aspect_ratio_mask = mx.ones((batch_size, 1, num_tiles))
+        cross_attention_mask = mx.ones((batch_size, seq_length, 1, num_tiles))
+
+        # Forward pass
+        output = model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            mask=mask,
+            aspect_ratio_ids=aspect_ratio_ids,
+            aspect_ratio_mask=aspect_ratio_mask,
+            cross_attention_mask=cross_attention_mask,
+        )
+
+        # Check output shape
+        expected_shape = (batch_size, seq_length, model_config.vocab_size)
+        self.assertEqual(output.logits.shape, expected_shape)
 
 
 if __name__ == "__main__":
