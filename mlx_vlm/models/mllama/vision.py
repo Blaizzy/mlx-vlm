@@ -324,16 +324,16 @@ class VisionModel(nn.Module):
         batch_size, num_concurrent_media, num_tiles, num_channels, height, width = (
             pixel_values.shape
         )
-
-        pixel_values = pixel_values.reshape(
-            batch_size * num_concurrent_media * num_tiles, num_channels, height, width
-        )
         aspect_ratio_ids = aspect_ratio_ids.reshape(
             batch_size * num_concurrent_media, -1
         )
 
+        pixel_values = pixel_values.reshape(
+            batch_size * num_concurrent_media * num_tiles, num_channels, height, width
+        )
         # Patch embedding
         patch_embeds = self.patch_embedding(pixel_values.moveaxis(1, 3)).moveaxis(3, 1)
+
         hidden_state = patch_embeds.reshape(
             patch_embeds.shape[0], patch_embeds.shape[1], -1
         ).transpose(0, 2, 1)
@@ -421,6 +421,7 @@ class VisionModel(nn.Module):
             num_patches + num_padding_patches,
             dim,
         )
+
         hidden_state = hidden_state[:, :, :slice_index]
         hidden_state = hidden_state.reshape(
             batch_size, num_concurrent_media, num_tiles, num_patches, dim

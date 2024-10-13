@@ -6,7 +6,7 @@ from typing import Dict, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, create_attention_mask
+from ..base import KVCache, LanguageModelOutput, create_attention_mask
 
 
 @dataclass
@@ -163,7 +163,8 @@ class LanguageModel(nn.Module):
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
 
-        return self.lm_head(self.norm(h))
+        logits = self.lm_head(self.norm(h))
+        return LanguageModelOutput(logits=logits)
 
     def sanitize(self, weights):
         # Remove unused precomputed rotary freqs

@@ -887,15 +887,15 @@ def generate_step(
     if repetition_context_size:
         repetition_context = repetition_context[-repetition_context_size:]
 
-    def _step(y):
+    def _step(y, **kwargs):
         nonlocal repetition_context
-        logits, _ = model.language_model(
+        outputs = model.language_model(
             y[None],
             cache=cache,
             mask=mask,
-            cross_attention_states=cross_attention_states,
+            **kwargs,
         )
-        logits = logits[:, -1, :]
+        logits = outputs.logits[:, -1, :]
 
         if repetition_penalty:
             logits = apply_repetition_penalty(
@@ -911,14 +911,22 @@ def generate_step(
                 repetition_context = repetition_context[-repetition_context_size:]
         return y, logprobs.squeeze(0)
 
-    logits, cross_attention_states = model(
-        input_ids, pixel_values, cache=cache, mask=mask, **kwargs
-    )
-    logits = logits[:, -1, :]
+    outputs = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
+    if outputs.cross_attention_states is not None:
+        kwargs = {
+            k: v
+            for k, v in zip(
+                ["cross_attention_states"], [outputs.cross_attention_states]
+            )
+        }
+    else:
+        kwargs = {}
+
+    logits = outputs.logits[:, -1, :]
     y, logprobs = sample(logits)
     mx.async_eval(y)
     while True:
-        next_y, next_logprobs = _step(y)
+        next_y, next_logprobs = _step(y, **kwargs)
         mx.async_eval(next_y)
         yield y.item(), logprobs
         y, logprobs = next_y, next_logprobs

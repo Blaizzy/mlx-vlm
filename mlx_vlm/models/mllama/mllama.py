@@ -49,21 +49,6 @@ class Model(nn.Module):
             bias=True,
         )
 
-    def _merge_input_ids_with_image_features(
-        self, image_features, inputs_embeds, input_ids
-    ):
-        image_token_index = self.config.image_token_index
-
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = input_ids == image_token_index
-        inputs_embeds = np.array(inputs_embeds.astype(mx.float32))
-        print(inputs_embeds.shape, image_positions.shape, image_features.shape)
-        inputs_embeds[image_positions] = image_features
-
-        # TODO: Add video features
-
-        return mx.array(inputs_embeds)
-
     def __call__(
         self,
         input_ids: mx.array,
@@ -77,7 +62,6 @@ class Model(nn.Module):
         aspect_ratio_mask = kwargs.pop("aspect_ratio_mask", None)
         cross_attention_mask = kwargs.pop("cross_attention_mask", None)
 
-        # inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         inputs_embeds = None
         # Process vision input if provided
         if pixel_values is not None:
@@ -100,9 +84,7 @@ class Model(nn.Module):
                 cross_attention_states.shape[-2],
                 self.config.text_config.hidden_size,
             )
-            # inputs_embeds = self._merge_input_ids_with_image_features(
-            #     cross_attention_states, inputs_embeds, input_ids
-            # )
+
         else:
             cross_attention_states = None
 

@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, create_attention_mask
+from ..base import KVCache, LanguageModelOutput, create_attention_mask
 
 
 @dataclass
@@ -426,7 +426,9 @@ class LanguageModel(nn.Module):
 
         logits = self.lm_head(hidden_states)
 
-        return logits, cross_attention_states
+        return LanguageModelOutput(
+            logits=logits, cross_attention_states=cross_attention_states
+        )
 
     @staticmethod
     def sanitize(weights):
