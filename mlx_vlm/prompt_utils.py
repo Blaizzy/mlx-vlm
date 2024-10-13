@@ -74,6 +74,7 @@ def get_message_json(
         "bunny-llama",
         "paligemma",
         "multi_modality",
+        "mllama",
     ]:
         raise ValueError(
             f"Model {model_name} does not support multi-image chat. Please only use 1 image."
