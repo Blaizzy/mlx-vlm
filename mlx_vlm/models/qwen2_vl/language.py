@@ -6,7 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import KVCache, create_attention_mask
+from ..base import KVCache, LanguageModelOutput, create_attention_mask
 
 
 @dataclass

@@ -63,6 +63,7 @@ class Model(nn.Module):
         cross_attention_mask = kwargs.pop("cross_attention_mask", None)
 
         inputs_embeds = None
+
         # Process vision input if provided
         if pixel_values is not None:
             if aspect_ratio_ids is None:
@@ -104,7 +105,6 @@ class Model(nn.Module):
         else:
             full_text_row_masked_out_mask = None
 
-        # cache = None
         if cross_attention_mask is not None:
             cache_position = mx.arange(input_ids.shape[1], dtype=mx.int32)
             cross_attention_mask = cross_attention_mask[:, :, cache_position]

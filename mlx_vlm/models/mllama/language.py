@@ -1,5 +1,4 @@
 import inspect
-import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -11,6 +10,7 @@ from ..base import KVCache, LanguageModelOutput, create_attention_mask
 
 @dataclass
 class TextConfig:
+    model_type: str = "mllama"
     vocab_size: int = 32000
     hidden_size: int = 4096
     intermediate_size: int = 14336
@@ -147,7 +147,7 @@ class MllamaTextCrossAttention(nn.Module):
             key_states,
             value_states,
             scale=self.scale,
-            mask=attention_mask,
+            mask=attention_mask[:, :, None, :, :],  # add a dim for batch processing
         )
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(
             bsz, q_len, self.hidden_size
@@ -367,6 +367,9 @@ class MllamaTextModel(nn.Module):
             position_ids = mx.repeat(position_ids, batch_size, axis=0)
 
         hidden_states = inputs_embeds
+
+        if cache is None:
+            cache = [None] * len(self.layers)
 
         mask = create_attention_mask(hidden_states)
 

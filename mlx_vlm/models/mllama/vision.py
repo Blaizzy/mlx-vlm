@@ -1,7 +1,7 @@
 import inspect
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn

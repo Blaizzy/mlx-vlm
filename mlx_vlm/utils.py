@@ -742,6 +742,10 @@ def prepare_inputs(
 
     image_grid_thw = None
     image_sizes = None
+    aspect_ratio_ids = None
+    aspect_ratio_mask = None
+    cross_attention_mask = None
+
     if image_processor is not None:
         if not isinstance(prompts, list):
             prompts = [prompts]
