@@ -20,6 +20,7 @@
 ## Coming Soon
 - LLaVA-Next
 - Phi3_vision
+- Mllama (Llama-3.2-vision)
 
 ## Usage
 
