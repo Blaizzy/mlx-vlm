@@ -65,6 +65,7 @@ def main(args):
         config,
         processor,
         image_processor=image_processor,
+        image_resize_shape=args.image_resize_shape,
     )
 
     logger.info(f"\033[32mSetting up LoRA\033[0m")
@@ -129,6 +130,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--split", type=str, default="train", help="Split to use for training"
+    )
+    parser.add_argument(
+        "--image-resize-shape",
+        type=int,
+        nargs=2,
+        default=None,
+        help="Resize images to this shape",
     )
     parser.add_argument(
         "--apply-chat-template",
