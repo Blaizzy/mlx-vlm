@@ -44,41 +44,6 @@ class TextConfig:
         )
 
 
-class MllamaTextRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = mx.ones((hidden_size,))
-        self.variance_epsilon = eps
-
-    def __call__(self, hidden_states):
-        variance = mx.mean(hidden_states**2, axis=-1, keepdims=True)
-        hidden_states = hidden_states * mx.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states
-
-
-class MllamaRotaryEmbedding:
-    def __init__(self, config):
-        self.dim = config.hidden_size // config.num_attention_heads
-        self.max_position_embeddings = config.max_position_embeddings
-        self.base = config.rope_theta
-
-        inv_freq = 1.0 / (self.base ** (mx.arange(0, self.dim, 2) / self.dim))
-        self.inv_freq = inv_freq
-
-    def __call__(self, q, k, seq_len):
-        t = mx.arange(seq_len)
-        freqs = mx.outer(t, self.inv_freq)
-        emb = mx.concatenate((freqs, freqs), axis=-1)
-        cos = mx.cos(emb)
-        sin = mx.sin(emb)
-        return q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
-
-
-def rotate_half(x):
-    x1, x2 = mx.split(x, 2, axis=-1)
-    return mx.concatenate((-x2, x1), axis=-1)
-
-
 class MllamaTextCrossAttention(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: Optional[int] = None):
         super().__init__()
@@ -103,8 +68,8 @@ class MllamaTextCrossAttention(nn.Module):
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
 
-        self.q_norm = MllamaTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = MllamaTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def __call__(
         self,
@@ -147,7 +112,7 @@ class MllamaTextCrossAttention(nn.Module):
             key_states,
             value_states,
             scale=self.scale,
-            mask=attention_mask[:, :, None, :, :],  # add a dim for batch processing
+            mask=attention_mask,  # add a dim for batch processing
         )
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(
             bsz, q_len, self.hidden_size
@@ -248,10 +213,8 @@ class MllamaSelfAttentionDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.self_attn = MllamaTextSelfAttention(config, layer_idx=layer_idx)
         self.mlp = MllamaTextMLP(config)
-        self.input_layernorm = MllamaTextRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm = MllamaTextRMSNorm(
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -284,10 +247,8 @@ class MllamaCrossAttentionDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.cross_attn = MllamaTextCrossAttention(config, layer_idx=layer_idx)
         self.mlp = MllamaTextMLP(config)
-        self.input_layernorm = MllamaTextRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm = MllamaTextRMSNorm(
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.cross_attn_attn_gate = mx.zeros(1)
@@ -337,7 +298,7 @@ class MllamaTextModel(nn.Module):
             )
             for layer_idx in range(config.num_hidden_layers)
         ]
-        self.norm = MllamaTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def __call__(
         self,
