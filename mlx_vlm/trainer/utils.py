@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import mlx.nn as nn
@@ -140,9 +141,18 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
     if not adapter_path.exists():
         raise FileNotFoundError(f"The adapter path does not exist: {adapter_path}")
 
+    # Check if the adapter has lora params in the config (adapter_config.json)
+    with open(adapter_path / "adapter_config.json", "r") as f:
+        config = json.load(f)
+        if "rank" not in config:
+            raise ValueError("The adapter does not have lora params in the config")
+
     # TODO: add lora params to the config and load them here
     list_of_modules = find_all_linear_names(model.language_model.model)
-    model = get_peft_model(model, list_of_modules)
+    if config is not None:
+        model = get_peft_model(model, list_of_modules, **config)
+    else:
+        model = get_peft_model(model, list_of_modules)
 
     # TODO: Use custom adapter name
     model.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
