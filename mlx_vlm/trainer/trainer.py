@@ -39,6 +39,7 @@ class Dataset:
         image_processor=None,
         take=None,
         split=None,
+        image_resize_shape=None,
     ):
         if split is not None:
             self.dataset = hf_dataset[split]
@@ -49,6 +50,7 @@ class Dataset:
         self.processor = processor
         self.config = config
         self.image_processor = image_processor
+        self.image_resize_shape = image_resize_shape
 
     def __len__(self):
         return len(self.dataset)
@@ -87,7 +89,12 @@ class Dataset:
         image_token_index = self.config["image_token_index"]
 
         inputs = prepare_inputs(
-            self.image_processor, self.processor, images, prompts, image_token_index
+            self.image_processor,
+            self.processor,
+            images,
+            prompts,
+            image_token_index,
+            self.image_resize_shape,
         )
         input_ids, pixel_values, mask = inputs[:3]
         kwargs = {

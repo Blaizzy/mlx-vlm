@@ -717,10 +717,10 @@ def resize_image(img, max_size):
     return img.resize(new_size)
 
 
-def process_image(img, resize_shape):
+def process_image(img, resize_shape, image_processor):
     if isinstance(img, str):
         img = load_image(img)
-    if resize_shape is not None:
+    if resize_shape is not None and image_processor is None:
         img = resize_image(img, resize_shape)
     return img
 
@@ -735,10 +735,7 @@ def prepare_inputs(
         images = [images]
 
     # Process images
-    images = [
-        process_image(img, resize_shape) if isinstance(img, str) else img
-        for img in images
-    ]
+    images = [process_image(img, resize_shape, image_processor) for img in images]
 
     image_grid_thw = None
     image_sizes = None
