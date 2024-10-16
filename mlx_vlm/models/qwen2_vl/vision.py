@@ -336,7 +336,7 @@ class VisionModel(nn.Module):
         # Concatenate the cu_seqlens for all items in the batch
         cu_seqlens = mx.concatenate(cu_seqlens)
 
-        cu_seqlens = mx.cumsum(cu_seqlens.astype(mx.int32))
+        cu_seqlens = mx.cumsum(cu_seqlens.astype(mx.int32), axis=0)
         cu_seqlens = mx.pad(cu_seqlens, (1, 0), mode="constant", constant_values=0)
 
         encoder_states = (hidden_states,) if output_hidden_states else None
