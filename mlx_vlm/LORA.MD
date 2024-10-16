@@ -16,11 +16,11 @@
 - Idefics 2
 - Deepseek-VL
 - Paligemma
+- Mllama (Llama-3.2-vision)
 
 ## Coming Soon
 - LLaVA-Next
 - Phi3_vision
-- Mllama (Llama-3.2-vision)
 
 ## Usage
 
