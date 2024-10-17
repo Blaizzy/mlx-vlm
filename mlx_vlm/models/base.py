@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 from PIL import Image
@@ -205,3 +206,9 @@ def create_attention_mask(h: mx.array, cache: Optional[Any] = None):
     else:
         mask = None
     return mask
+
+
+@dataclass
+class LanguageModelOutput:
+    logits: mx.array
+    cross_attention_states: Optional[List[mx.array]] = None

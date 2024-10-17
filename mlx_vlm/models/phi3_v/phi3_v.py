@@ -8,7 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import KVCache, create_attention_mask
+from ..base import KVCache, LanguageModelOutput, create_attention_mask
 from .language import LanguageModel, TextConfig
 from .su_rope import Phi3SuScaledRotaryEmbedding
 from .vision import VisionConfig, VisionModel
@@ -213,7 +213,8 @@ class Model(nn.Module):
         **kwargs,
     ):
         out = self.model(inputs, pixel_values, image_sizes, cache)
-        return self.lm_head(out).astype(self.lm_head.weight.dtype)
+        logits = self.lm_head(out).astype(self.lm_head.weight.dtype)
+        return LanguageModelOutput(logits=logits)
 
     @property
     def layers(self):

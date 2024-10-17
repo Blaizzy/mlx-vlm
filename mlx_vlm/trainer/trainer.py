@@ -1,6 +1,4 @@
 import json
-import os
-import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,7 +7,7 @@ from typing import Union
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 
 
 def get_prompt(model_type, processor, conversation):
@@ -41,6 +39,7 @@ class Dataset:
         image_processor=None,
         take=None,
         split=None,
+        image_resize_shape=None,
     ):
         if split is not None:
             self.dataset = hf_dataset[split]
@@ -51,6 +50,7 @@ class Dataset:
         self.processor = processor
         self.config = config
         self.image_processor = image_processor
+        self.image_resize_shape = image_resize_shape
 
     def __len__(self):
         return len(self.dataset)
@@ -89,10 +89,27 @@ class Dataset:
         image_token_index = self.config["image_token_index"]
 
         inputs = prepare_inputs(
-            self.image_processor, self.processor, images, prompts, image_token_index
+            self.image_processor,
+            self.processor,
+            images,
+            prompts,
+            image_token_index,
+            self.image_resize_shape,
         )
         input_ids, pixel_values, mask = inputs[:3]
-        kwargs = {k: v for k, v in zip(["image_grid_thw", "image_sizes"], inputs[3:])}
+        kwargs = {
+            k: v
+            for k, v in zip(
+                [
+                    "image_grid_thw",
+                    "image_sizes",
+                    "aspect_ratio_ids",
+                    "aspect_ratio_mask",
+                    "cross_attention_mask",
+                ],
+                inputs[3:],
+            )
+        }
         if mask is None:
             mask = mx.ones_like(input_ids)
 
@@ -168,12 +185,18 @@ def default_loss(model, inputs, targets, lengths):
 
 class Trainer:
     def __init__(
-        self, model, optimizer, train_on_completions=False, assistant_id=77091
+        self,
+        model,
+        optimizer,
+        train_on_completions=False,
+        assistant_id=77091,
+        clip_gradients=None,
     ):
         self.model = model
         self.optimizer = optimizer
         self.train_on_completions = train_on_completions
         self.assistant_id = assistant_id
+        self.clip_gradients = clip_gradients
 
     def loss_fn(self, model, batch):
         pixel_values = batch["pixel_values"]
@@ -203,20 +226,22 @@ class Trainer:
 
         input_ids = input_ids[:, :-1]
 
-        kwargs = (
-            {
-                "image_grid_thw": batch["image_grid_thw"],
-                "image_sizes": batch["image_sizes"],
-            }
-            if "image_grid_thw" in batch or "image_sizes" in batch
-            else {}
-        )
+        kwargs = {}
+        image_keys = [
+            "image_grid_thw",
+            "image_sizes",
+            "aspect_ratio_ids",
+            "aspect_ratio_mask",
+            "cross_attention_mask",
+        ]
+        if any(key in batch for key in image_keys):
+            kwargs = {key: batch[key] for key in image_keys if key in batch}
 
         # Forward pass
-        logits = model(input_ids, pixel_values, attention_mask, **kwargs)
+        outputs = model(input_ids, pixel_values, attention_mask, **kwargs)
 
         # Cast to float32
-        logits.astype(mx.float32)
+        logits = outputs.logits.astype(mx.float32)
 
         # Ensure logits and labels have the same sequence length
         def align_logits_with_labels(logits, labels):
@@ -249,6 +274,13 @@ class Trainer:
     def train_step(self, batch):
         loss_and_grad_fn = nn.value_and_grad(self.model, self.loss_fn)
         loss, grads = loss_and_grad_fn(self.model, batch)
+
+        # Add gradient clipping
+        if self.clip_gradients is not None:
+            grads = tree_map(
+                lambda g: mx.clip(g, -self.clip_gradients, self.clip_gradients), grads
+            )
+
         self.optimizer.update(self.model, grads)
 
         return loss

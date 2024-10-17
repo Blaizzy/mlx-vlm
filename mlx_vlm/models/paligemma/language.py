@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, create_attention_mask
+from ..base import KVCache, LanguageModelOutput, create_attention_mask
 
 
 @dataclass
@@ -186,7 +186,7 @@ class LanguageModel(nn.Module):
     ):
         out = self.model(inputs, cache, inputs_embeds=inputs_embeds, mask=mask)
         out = self.model.embed_tokens.as_linear(out)
-        return out
+        return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
         return {

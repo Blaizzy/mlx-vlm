@@ -6,7 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import KVCache, create_attention_mask
+from ..base import KVCache, LanguageModelOutput, create_attention_mask
 
 
 @dataclass
@@ -301,7 +301,7 @@ class LanguageModel(nn.Module):
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return out
+        return LanguageModelOutput(logits=out)
 
     @property
     def layers(self):

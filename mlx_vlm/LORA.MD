@@ -16,6 +16,7 @@
 - Idefics 2
 - Deepseek-VL
 - Paligemma
+- Mllama (Llama-3.2-vision)
 
 ## Coming Soon
 - LLaVA-Next

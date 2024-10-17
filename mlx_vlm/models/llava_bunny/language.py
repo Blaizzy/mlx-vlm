@@ -5,7 +5,7 @@ from typing import Dict, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, create_attention_mask
+from ..base import KVCache, LanguageModelOutput, create_attention_mask
 
 
 @dataclass
@@ -200,8 +200,8 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds, mask=None)
-        return out
+        out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds, mask=mask)
+        return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
         if (
