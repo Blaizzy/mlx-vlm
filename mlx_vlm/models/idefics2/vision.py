@@ -91,6 +91,8 @@ class Attention(nn.Module):
         queries = queries.reshape(B, L, num_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, num_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, num_heads, -1).transpose(0, 2, 1, 3)
+        if mask is not None:
+            mask = mask[:, :, mask.shape[-2] :, :]
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
