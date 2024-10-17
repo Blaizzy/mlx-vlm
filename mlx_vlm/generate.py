@@ -37,6 +37,13 @@ def parse_arguments():
         help="URL or path of the image to process.",
     )
     parser.add_argument(
+        "--resize-shape",
+        type=int,
+        nargs=2,
+        default=None,
+        help="Resize shape for the image.",
+    )
+    parser.add_argument(
         "--prompt",
         type=str,
         default=DEFAULT_PROMPT,
@@ -78,6 +85,13 @@ def main():
 
     prompt = apply_chat_template(processor, config, prompt, num_images=len(args.image))
 
+    kwargs = {}
+    if args.resize_shape is not None:
+        assert (
+            len(args.resize_shape) == 2
+        ), "Resize shape must be a tuple of two integers"
+        kwargs["resize_shape"] = args.resize_shape
+
     output = generate(
         model,
         processor,
@@ -87,6 +101,7 @@ def main():
         args.temp,
         args.max_tokens,
         args.verbose,
+        **kwargs,
     )
     if not args.verbose:
         print(output)

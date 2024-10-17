@@ -1,11 +1,10 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_vlm.trainer.trainer import Dataset, Trainer, TrainingArgs
-from mlx_vlm.utils import prepare_inputs
+from mlx_vlm.trainer.trainer import Dataset, Trainer
 
 
 class TestDataset(unittest.TestCase):
@@ -15,8 +14,7 @@ class TestDataset(unittest.TestCase):
         self.mock_processor = MagicMock()
         self.mock_image_processor = MagicMock()
 
-    @patch("mlx_vlm.utils.prepare_inputs")
-    def test_dataset_initialization(self, mock_prepare_inputs):
+    def test_dataset_initialization(self):
         dataset = Dataset(
             self.mock_hf_dataset,
             self.mock_config,
@@ -93,18 +91,23 @@ class TestTrainer(unittest.TestCase):
         self.assertFalse(self.trainer.train_on_completions)
         self.assertEqual(self.trainer.assistant_id, 77091)
 
-    @patch("mlx.nn.losses.cross_entropy")
-    def test_loss_fn(self, mock_cross_entropy):
+    def test_loss_fn(self):
         batch = {
             "pixel_values": mx.array([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]),
             "input_ids": mx.array([[1, 2, 3], [4, 5, 6]]),
             "attention_mask": mx.array([[1, 1, 1], [1, 1, 0]]),
             "image_grid_thw": (1, 1, 1),
             "image_sizes": [224, 224],
+            "aspect_ratio_ids": mx.array([[1, 2], [3, 4]]),
+            "aspect_ratio_mask": mx.array([[1, 1], [1, 0]]),
+            "cross_attention_mask": mx.array([[1, 1], [1, 0]]),
         }
 
-        self.mock_model.return_value = mx.array([[[0.1, 0.2, 0.3]], [[0.4, 0.5, 0.6]]])
-        mock_cross_entropy.return_value = mx.array([[0.1, 0.2], [0.3, 0.4]])
+        mock_logits = mx.array([[[0.1, 0.2, 0.3]], [[0.4, 0.5, 0.6]]])
+        # Create a mock LanguageModelOutput with the logits
+        mock_output = Mock()
+        mock_output.logits = mock_logits
+        self.mock_model.return_value = mock_output
 
         loss = self.trainer.loss_fn(self.mock_model, batch)
 

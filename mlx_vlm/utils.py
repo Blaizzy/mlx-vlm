@@ -717,10 +717,10 @@ def resize_image(img, max_size):
     return img.resize(new_size)
 
 
-def process_image(img, resize_shape):
+def process_image(img, resize_shape, image_processor):
     if isinstance(img, str):
         img = load_image(img)
-    if resize_shape is not None:
+    if resize_shape is not None and image_processor is None:
         img = resize_image(img, resize_shape)
     return img
 
@@ -735,13 +735,14 @@ def prepare_inputs(
         images = [images]
 
     # Process images
-    images = [
-        process_image(img, resize_shape) if isinstance(img, str) else img
-        for img in images
-    ]
+    images = [process_image(img, resize_shape, image_processor) for img in images]
 
     image_grid_thw = None
     image_sizes = None
+    aspect_ratio_ids = None
+    aspect_ratio_mask = None
+    cross_attention_mask = None
+
     if image_processor is not None:
         if not isinstance(prompts, list):
             prompts = [prompts]
@@ -790,7 +791,28 @@ def prepare_inputs(
         if image_grid_thw is not None:
             image_grid_thw = mx.array(image_grid_thw)
 
-    return input_ids, pixel_values, mask, image_grid_thw, image_sizes
+        aspect_ratio_ids = inputs.get("aspect_ratio_ids", None)
+        if aspect_ratio_ids is not None:
+            aspect_ratio_ids = mx.array(aspect_ratio_ids)
+
+        aspect_ratio_mask = inputs.get("aspect_ratio_mask", None)
+        if aspect_ratio_mask is not None:
+            aspect_ratio_mask = mx.array(aspect_ratio_mask)
+
+        cross_attention_mask = inputs.get("cross_attention_mask", None)
+        if cross_attention_mask is not None:
+            cross_attention_mask = mx.array(cross_attention_mask)
+
+    return (
+        input_ids,
+        pixel_values,
+        mask,
+        image_grid_thw,
+        image_sizes,
+        aspect_ratio_ids,
+        aspect_ratio_mask,
+        cross_attention_mask,
+    )
 
 
 def generate_step(
@@ -866,10 +888,15 @@ def generate_step(
     if repetition_context_size:
         repetition_context = repetition_context[-repetition_context_size:]
 
-    def _step(y):
+    def _step(y, **kwargs):
         nonlocal repetition_context
-        logits = model.language_model(y[None], cache=cache, mask=mask)
-        logits = logits[:, -1, :]
+        outputs = model.language_model(
+            y[None],
+            cache=cache,
+            mask=mask,
+            **kwargs,
+        )
+        logits = outputs.logits[:, -1, :]
 
         if repetition_penalty:
             logits = apply_repetition_penalty(
@@ -885,12 +912,22 @@ def generate_step(
                 repetition_context = repetition_context[-repetition_context_size:]
         return y, logprobs.squeeze(0)
 
-    logits = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
-    logits = logits[:, -1, :]
+    outputs = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
+    if outputs.cross_attention_states is not None:
+        kwargs = {
+            k: v
+            for k, v in zip(
+                ["cross_attention_states"], [outputs.cross_attention_states]
+            )
+        }
+    else:
+        kwargs = {}
+
+    logits = outputs.logits[:, -1, :]
     y, logprobs = sample(logits)
     mx.async_eval(y)
     while True:
-        next_y, next_logprobs = _step(y)
+        next_y, next_logprobs = _step(y, **kwargs)
         mx.async_eval(next_y)
         yield y.item(), logprobs
         y, logprobs = next_y, next_logprobs
@@ -924,9 +961,12 @@ def stream_generate(
     else:
         tokenizer = processor.tokenizer
 
+    resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = model.config.image_token_index
+
+    # Prepare inputs
     inputs = prepare_inputs(
-        image_processor, processor, image, prompt, image_token_index
+        image_processor, processor, image, prompt, image_token_index, resize_shape
     )
     input_ids, pixel_values, mask = inputs[:3]
     kwargs = {k: v for k, v in zip(["image_grid_thw", "image_sizes"], inputs[3:])}
@@ -962,6 +1002,7 @@ def generate(
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = None,
     top_p: float = 1.0,
+    **kwargs,
 ) -> str:
     """
     Generate text from the model.
@@ -992,13 +1033,27 @@ def generate(
         prompt_tokens = mx.array(processor.tokenizer.encode(prompt))
         tokenizer = processor.tokenizer
 
+    resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = model.config.image_token_index
+
     # Prepare inputs
     inputs = prepare_inputs(
-        image_processor, processor, image, prompt, image_token_index
+        image_processor, processor, image, prompt, image_token_index, resize_shape
     )
     input_ids, pixel_values, mask = inputs[:3]
-    kwargs = {k: v for k, v in zip(["image_grid_thw", "image_sizes"], inputs[3:])}
+    kwargs = {
+        k: v
+        for k, v in zip(
+            [
+                "image_grid_thw",
+                "image_sizes",
+                "aspect_ratio_ids",
+                "aspect_ratio_mask",
+                "cross_attention_mask",
+            ],
+            inputs[3:],
+        )
+    }
 
     # Initialize timing and detokenizer
     tic = time.perf_counter()
