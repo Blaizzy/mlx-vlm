@@ -3,11 +3,10 @@ import inspect
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 from huggingface_hub import snapshot_download
 
 from .language import LanguageModel, TextConfig
@@ -93,7 +92,7 @@ class Model(nn.Module):
 
         batch_size, sequence_length = input_ids.shape
         scaled_image_features = image_features / (self.config.hidden_size**0.5)
-        final_embedding = np.zeros((batch_size, sequence_length, embed_dim))
+        final_embedding = mx.zeros((batch_size, sequence_length, embed_dim))
 
         text_mask = (input_ids != self.config.image_token_index) & (
             input_ids != self.config.pad_token_id
@@ -102,32 +101,37 @@ class Model(nn.Module):
         pad_mask = input_ids == self.config.pad_token_id
 
         # expand masks to match embedding dimension
-        text_mask_expanded = np.expand_dims(text_mask, -1).repeat(embed_dim, axis=-1)
-        pad_mask_expanded = np.expand_dims(pad_mask, -1).repeat(embed_dim, axis=-1)
+        text_mask_expanded = mx.expand_dims(text_mask, -1)
+        text_mask_expanded = mx.repeat(text_mask_expanded, embed_dim, axis=-1)
+        pad_mask_expanded = mx.expand_dims(pad_mask, -1)
+        pad_mask_expanded = mx.repeat(pad_mask_expanded, embed_dim, axis=-1)
 
         # insert padding and text token embeddings
-        final_embedding = np.where(text_mask_expanded, inputs_embeds, final_embedding)
-        final_embedding = np.where(
-            pad_mask_expanded, np.zeros_like(final_embedding), final_embedding
+        final_embedding = mx.where(text_mask_expanded, inputs_embeds, final_embedding)
+        final_embedding = mx.where(
+            pad_mask_expanded, mx.zeros_like(final_embedding), final_embedding
         )
-
+        pad_size = final_embedding.shape[1] - scaled_image_features.shape[1]
+        scaled_image_features = mx.pad(
+            scaled_image_features, ((0, 0), (0, pad_size), (0, 0))
+        )
         # insert image embeddings - the image mask is always less or equal to the sentence in length
-        image_mask_expanded = np.expand_dims(image_mask, -1).repeat(embed_dim, axis=-1)
-        final_embedding[image_mask_expanded] = scaled_image_features.flatten()
-
-        final_embedding = np.where(
-            pad_mask_expanded, np.zeros_like(final_embedding), final_embedding
+        image_mask_expanded = mx.expand_dims(image_mask, -1)
+        image_mask_expanded = mx.repeat(image_mask_expanded, embed_dim, axis=-1)
+        final_embedding = mx.where(
+            image_mask_expanded, scaled_image_features, final_embedding
         )
 
-        attention_mask_expanded_1 = np.expand_dims(attention_mask, 1)
-        attention_mask_expanded_2 = np.expand_dims(attention_mask, 2)
+        final_embedding = mx.where(
+            pad_mask_expanded, mx.zeros_like(final_embedding), final_embedding
+        )
+
+        attention_mask_expanded_1 = mx.expand_dims(attention_mask, 1)
+        attention_mask_expanded_2 = mx.expand_dims(attention_mask, 2)
         final_attention_mask_4d = attention_mask_expanded_1 * attention_mask_expanded_2
         final_attention_mask_4d = final_attention_mask_4d
-        final_attention_mask_4d = np.expand_dims(final_attention_mask_4d, 1).repeat(
-            self.config.text_config.num_key_value_heads, axis=1
-        )
+        final_attention_mask_4d = mx.expand_dims(final_attention_mask_4d, 1)
         final_embedding = mx.array(final_embedding)
-        final_attention_mask_4d = mx.array(final_attention_mask_4d)
         return final_embedding, final_attention_mask_4d
 
     def __call__(

@@ -158,8 +158,8 @@ class GemmaModel(nn.Module):
             h = inputs_embeds
 
         h *= self.config.hidden_size**0.5
-
-        mask = create_attention_mask(h)
+        if mask is None or cache[0].offset > 0:
+            mask = create_attention_mask(h)
 
         if cache is None:
             cache = [None] * len(self.layers)
