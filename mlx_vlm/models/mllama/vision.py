@@ -1,6 +1,5 @@
 import inspect
-import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import mlx.core as mx
@@ -23,7 +22,9 @@ class VisionConfig:
     attention_dropout: float = 0.0
     hidden_dropout: float = 0.0
     vision_output_dim: int = 7680
-    intermediate_layers_indices: Tuple[int, int, int, int, int] = (3, 7, 15, 23, 30)
+    intermediate_layers_indices: List[int] = field(
+        default_factory=lambda: [3, 7, 15, 23, 30]
+    )
     supported_aspect_ratios: Tuple[List[int]] = (
         [1, 1],
         [1, 2],
@@ -68,6 +69,7 @@ class MllamaVisionAttention(nn.Module):
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
+        self.scale = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(
             self.embed_dim, self.num_heads * self.head_dim, bias=False
@@ -104,23 +106,17 @@ class MllamaVisionAttention(nn.Module):
             batch_size, kv_seq_len, self.num_heads, self.head_dim
         ).transpose(0, 2, 1, 3)
 
-        attn_weights = mx.matmul(query, key.transpose(0, 1, 3, 2)) / math.sqrt(
-            self.head_dim
-        )
-
         if attention_mask is not None:
-            causal_mask = attention_mask[:, :, :, : key.shape[-2]]
-            attn_weights = attn_weights + causal_mask
+            attention_mask = attention_mask[:, :, : key.shape[-2], :]
 
-        attn_weights = mx.softmax(attn_weights, axis=-1)
-        attn_output = mx.matmul(attn_weights, value)
+        attn_output = mx.fast.scaled_dot_product_attention(
+            query, key, value, scale=self.scale, mask=attention_mask
+        )
 
         attn_output = attn_output.transpose(0, 2, 1, 3)
         attn_output = attn_output.reshape(batch_size, q_seq_len, -1)
 
-        output = self.o_proj(attn_output)
-
-        return output
+        return self.o_proj(attn_output)
 
 
 class MllamaVisionMLP(nn.Module):
@@ -128,14 +124,7 @@ class MllamaVisionMLP(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=True)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=True)
-        self.gelu = (
-            lambda x: x
-            * 0.5
-            * (
-                1.0
-                + mx.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * mx.power(x, 3)))
-            )
-        )
+        self.gelu = nn.GELU()
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
         hidden_states = self.fc1(hidden_states)
@@ -368,13 +357,13 @@ class VisionModel(nn.Module):
 
         # Compute the number of tokens to pad
         num_padding_patches = (8 - (hidden_state.shape[-2] % 8)) % 8
+
         # Pad the tensor
         padding = [(0, 0), (0, 0), (0, num_padding_patches), (0, 0)]
         hidden_state = mx.pad(hidden_state, padding)
         slice_index = -num_padding_patches if num_padding_patches > 0 else None
 
         # Prepare attention mask
-        # attention_mask = None
         attention_mask = aspect_ratio_mask.reshape(
             batch_size * num_concurrent_media, -1
         )
@@ -451,14 +440,10 @@ class VisionModel(nn.Module):
             [hidden_state, intermediate_hidden_states], axis=-1
         )
 
-        # Collect intermediate layer outputs from encoder output
-        # Note: In MLX, we don't have direct access to intermediate layers' outputs.
-        # You might need to modify the encoder to return these if needed.
-        # For now, we'll skip this step.
-
         return hidden_state
 
-    def sanitize(self, weights):
+    @staticmethod
+    def sanitize(weights):
         sanitized_weights = {}
         for k, v in weights.items():
             if "position_ids" in k:
@@ -479,22 +464,20 @@ class VisionModel(nn.Module):
         return sanitized_weights
 
 
-import numpy as np
-
-
 def _prepare_aspect_ratio_attention_mask(
-    aspect_ratio_mask: np.ndarray,
+    aspect_ratio_mask: mx.array,
     num_patches: int,
     target_length: int,
 ) -> mx.array:
-    dtype = np.float32
-    aspect_ratio_mask = np.array(aspect_ratio_mask, dtype=dtype)
+    dtype = mx.float32
+    aspect_ratio_mask = aspect_ratio_mask.astype(dtype)
+
     # Expand aspect ratio mask to target_length
     batch_size, max_num_tiles = aspect_ratio_mask.shape
     attention_mask = aspect_ratio_mask.reshape(batch_size, max_num_tiles, 1, 1).astype(
         dtype
     )
-    attention_mask = np.tile(attention_mask, (1, 1, target_length, 1))
+    attention_mask = mx.tile(attention_mask, (1, 1, target_length, 1))
 
     # Mask padding patches
     pad_patches = target_length - num_patches
@@ -508,9 +491,9 @@ def _prepare_aspect_ratio_attention_mask(
     attention_mask = attention_mask.reshape(
         batch_size, max_num_tiles * target_length, 1
     )
-    attention_mask = (
-        attention_mask @ attention_mask.transpose(0, 2, 1) * np.finfo(dtype).min
-    )
-    attention_mask = attention_mask[:, np.newaxis, :, :]
 
-    return mx.array(attention_mask)
+    min_value = -1e9
+    attention_mask = attention_mask @ attention_mask.transpose(0, 2, 1) * min_value
+    attention_mask = attention_mask[:, None, :, :]
+
+    return attention_mask

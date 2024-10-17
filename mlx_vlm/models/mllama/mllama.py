@@ -7,7 +7,6 @@ from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 from huggingface_hub import snapshot_download
 
 from ..base import KVCache
@@ -131,33 +130,33 @@ class Model(nn.Module):
         num_vision_tokens: int,
     ) -> Tuple[mx.array, mx.array]:
         batch_size, text_total_length, *_ = cross_attention_mask.shape
-        cross_attention_mask = np.repeat(
+        cross_attention_mask = mx.repeat(
             cross_attention_mask, num_vision_tokens, axis=3
         )
         cross_attention_mask = cross_attention_mask.reshape(
             batch_size, text_total_length, -1
         )
-        cross_attention_mask = np.expand_dims(cross_attention_mask, 1)
+        cross_attention_mask = mx.expand_dims(cross_attention_mask, 1)
 
         # Invert the mask
         inverted_cross_attn_mask = 1.0 - cross_attention_mask
-        cross_attention_mask = np.where(
+        fill_array = mx.array(-1e9)
+        fill_array = mx.broadcast_to(fill_array, inverted_cross_attn_mask.shape)
+        cross_attention_mask = mx.where(
             inverted_cross_attn_mask,
-            np.full_like(
-                inverted_cross_attn_mask, np.finfo(inverted_cross_attn_mask.dtype).min
-            ),
+            fill_array,
             cross_attention_mask,
         )
 
         # Apply full-row bias
-        full_text_row_masked_out_mask = np.any(
-            cross_attention_mask != np.finfo(cross_attention_mask.dtype).min,
+        full_text_row_masked_out_mask = mx.any(
+            cross_attention_mask != -1e9,
             axis=-1,
             keepdims=True,
         )
         cross_attention_mask *= full_text_row_masked_out_mask
 
-        return mx.array(cross_attention_mask), mx.array(full_text_row_masked_out_mask)
+        return cross_attention_mask, full_text_row_masked_out_mask
 
     @staticmethod
     def from_pretrained(path_or_hf_repo: str):

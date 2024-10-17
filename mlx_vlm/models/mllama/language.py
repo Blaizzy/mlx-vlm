@@ -23,11 +23,11 @@ class TextConfig:
     rms_norm_eps: float = 1e-6
     tie_word_embeddings: bool = False
     rope_theta: float = 10000.0
+    rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     cross_attention_layers: List[int] = field(
         default_factory=lambda: [3, 8, 13, 18, 23, 28, 33, 38]
     )
-    dropout: float = 0.0
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -78,6 +78,7 @@ class MllamaTextCrossAttention(nn.Module):
         attention_mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
     ) -> mx.array:
+
         bsz, q_len, _ = hidden_states.shape
         query_states = (
             self.q_proj(hidden_states)
@@ -144,9 +145,10 @@ class MllamaTextSelfAttention(nn.Module):
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
+
         self.rope = nn.RoPE(
             self.head_dim,
-            traditional=False,
+            traditional=config.rope_traditional,
             base=config.rope_theta,
             scale=1,
         )
