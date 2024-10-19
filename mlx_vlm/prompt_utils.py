@@ -20,6 +20,8 @@ def get_message_json(
         return {"role": role, "content": prompt}
 
     def add_image_tokens(message, token_format):
+        if role == "system":
+            return message
         if role == "user" and not skip_image_token:
             if isinstance(message["content"], list):
                 message["content"].extend([{"type": "image"}] * num_images)
@@ -119,14 +121,20 @@ def apply_chat_template(
     messages = []
     if isinstance(prompt, list):
         if isinstance(prompt[0], dict):
-            messages = [process_single_prompt(p, i == 0) for i, p in enumerate(prompt)]
+            for i, p in enumerate(prompt):
+                if p.get("role") in ["system", "assistant"]:
+                    messages.append(process_single_prompt(p, False))
+                else:
+                    is_first = i == 0 or i == 1
+                    messages.append(process_single_prompt(p, is_first))
         else:
-            messages = [
-                msg
-                for prompts in prompt
-                for i, p in enumerate(prompts)
-                for msg in [process_single_prompt(p, i == 0)]
-            ]
+            for prompts in prompt:
+                for i, p in enumerate(prompts):
+                    if p.get("role") in ["system", "assistant"]:
+                        messages.append(process_single_prompt(p, False))
+                    else:
+                        is_first = i == 0 or i == 1
+                        messages.append(process_single_prompt(p, is_first))
     else:
         messages = [process_single_prompt(prompt)]
 
