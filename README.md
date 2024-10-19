@@ -120,4 +120,4 @@ MLX-VLM supports fine-tuning models with LoRA and QLoRA.
 
 ## LoRA & QLoRA
 
-To learn more about LoRA, please refer to the [LoRA.md](./mlx_vlm/LoRA.md) file.
+To learn more about LoRA, please refer to the [LoRA.md](./mlx_vlm/LORA.MD) file.
