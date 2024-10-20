@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import time
+from dataclasses import asdict
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -168,6 +169,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config["text_config"] = {
             k: v for k, v in config.items() if k != "vision_config"
         }
+
+    if model_type == "molmo":
+        config["text_config"] = asdict(model_class.TextConfig())
+        config["vision_config"] = asdict(model_class.VisionConfig())
 
     model_config = model_class.ModelConfig.from_dict(config)
 
