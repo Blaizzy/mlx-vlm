@@ -24,7 +24,10 @@ def get_message_json(
             return message
         if role == "user" and not skip_image_token:
             if isinstance(message["content"], list):
-                message["content"].extend([{"type": "image"}] * num_images)
+                if model_name == "pixtral":
+                    message["content"] = [{"type": "image"}] * num_images + message["content"]
+                else:
+                    message["content"].extend([{"type": "image"}] * num_images)
             else:
                 if model_name == "phi3_v":
                     message["content"] = f"{token_format}{message['content']}"
