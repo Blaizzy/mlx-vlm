@@ -21,6 +21,7 @@ class ModelConfig:
     model_type: str
     ignore_index: int = -100
     image_token_index: int = 151655
+    video_token_index: int = 151656
     vision_feature_select_strategy: str = "default"
     vision_feature_layer: int = -2
     vocab_size: int = 32000
@@ -74,6 +75,7 @@ class Model(nn.Module):
         self, image_features, inputs_embeds, input_ids
     ):
         image_token_index = self.config.image_token_index
+        video_token_index = self.config.video_token_index
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = input_ids == image_token_index
@@ -90,6 +92,7 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
+
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         image_grid_thw = mx.array(image_grid_thw)
 

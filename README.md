@@ -112,6 +112,24 @@ print(output)
 python -m mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Compare these images" --image path/to/image1.jpg path/to/image2.jpg
 ```
 
+## Video Chat Support
+
+MLX-VLM also supports video analysis such as captioning, summarization, and more with select models.
+
+### Supported Models
+
+The following models support video chat:
+
+1. Qwen2-VL
+
+### Usage Examples
+
+#### Command Line
+```sh
+python -m mlx_vlm.video_generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --max-pixels 224 224 --fps 1.0
+```
+
+
 These examples demonstrate how to use multiple images with MLX-VLM for more complex visual reasoning tasks.
 
 # Fine-tuning
