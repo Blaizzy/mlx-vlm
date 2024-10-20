@@ -29,20 +29,20 @@ image_processor = load_image_processor(args.model)
 
 def chat(message, history, temperature, max_tokens):
     chat = []
-    if len(message.files) >= 1:
-        chat.append(message.text)
+    if len(message['files']) >= 1:
+        chat.append({"role": "user", "content": message['text']})
     else:
         raise gr.Error("Please upload an image. Text only chat is not supported.")
 
-    files = message.files[-1].path
+    file = message['files'][-1]
     if model.config.model_type != "paligemma":
-        messages = apply_chat_template(processor, config, chat)
+        prompt = apply_chat_template(processor, config, chat)
     else:
-        messages = message.text
+        prompt = message.text
 
     response = ""
     for chunk in stream_generate(
-        model, processor, files, messages, image_processor, max_tokens, temp=temperature
+        model, processor, file, prompt, image_processor, max_tokens, temp=temperature
     ):
         response += chunk
         yield response
