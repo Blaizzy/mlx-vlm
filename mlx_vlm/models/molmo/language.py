@@ -6,18 +6,20 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, LanguageModelOutput
+from ..base import KVCache, LanguageModelOutput, create_attention_mask
 
 
 @dataclass
 class TextConfig:
-    d_model: int = 768
-    n_heads: int = 12
-    n_layers: int = 12
+    d_model: int = 3584
+    n_heads: int = 28
+    n_kv_heads: int = 4
+    n_layers: int = 28
     mlp_ratio: int = 4
     max_sequence_length: int = 1024
-    vocab_size: int = 50257
-    embedding_size: Optional[int] = 50304
+    mlp_hidden_size: int = 37888
+    vocab_size: int = 152064
+    embedding_size: Optional[int] = 152064
     additional_vocab_size: Optional[int] = None
     attention_dropout: float = 0.1
     residual_dropout: float = 0.1
@@ -28,7 +30,8 @@ class TextConfig:
     pad_token_id: int = -1
     rope: bool = True
     rope_theta: float = 10000.0
-    weight_tying: bool = True
+    weight_tying: bool = False
+    additional_vocab_size: Optional[int] = 128
 
     @classmethod
     def from_dict(cls, params):
@@ -140,43 +143,78 @@ class MolmoMLP(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(config.d_model, config.d_model * config.mlp_ratio)
         self.fc2 = nn.Linear(config.d_model * config.mlp_ratio, config.d_model)
-        self.act = nn.SiLU()
-        self.dropout = nn.Dropout(config.residual_dropout)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.fc1(x)
-        x = self.act(x)
+        x = nn.silu(x)
         x = self.fc2(x)
-        x = self.dropout(x)
         return x
 
 
 class MolmoBlock(nn.Module):
     def __init__(self, config: TextConfig, layer_id: int):
         super().__init__()
-        self.config = config
-        self.layer_id = layer_id
+        self.attn_out = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.ff_out = nn.Linear(18944, config.d_model, bias=False)
+        self.rotary_emb = RotaryEmbedding(config)
+        self.attn_norm = nn.RMSNorm(config.d_model, eps=config.layer_norm_eps)
+        self.ff_norm = nn.RMSNorm(config.d_model, eps=config.layer_norm_eps)
+        self.att_proj = nn.Linear(config.d_model, 4608, bias=True)
+        self.ff_proj = nn.Linear(config.d_model, config.mlp_hidden_size, bias=False)
+        self.scale = 1 / math.sqrt(config.d_model)
 
-        self.ln1 = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
-        self.attn = MolmoAttention(config)
-        self.ln2 = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
-        self.mlp = MolmoMLP(config)
+    def __call__(self, x, attention_mask=None):
+        residual = x
+        x = self.attn_norm(x)
+        qkv = self.att_proj(x)
+        q, k, v = mx.split(qkv, 3, axis=-1)
 
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Tuple[mx.array, mx.array]] = None,
-    ) -> mx.array:
+        # Apply rotary embeddings
+        seq_len = x.shape[1]
+        q = self.rotary_emb(q, seq_len)
+        k = self.rotary_emb(k, seq_len)
+
+        # Perform attention
+        attn_output = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=self.scale, mask=attention_mask
+        )
+        attn_output = self.attn_out(attn_output)
+        x = residual + self.dropout(attn_output)
+
+        # Feed-forward layer
         residual = x
-        x = self.ln1(x)
-        attn_output = self.attn(x, mask, cache)
-        x = residual + attn_output
-        residual = x
-        x = self.ln2(x)
-        x = self.mlp(x)
+        x = self.ff_norm(x)
+        x = self.ff_proj(x)
+        x = nn.silu(x)
+        x = self.ff_out(x)
         x = residual + x
+
         return x
+
+
+class Embedding(nn.Module):
+    def __init__(
+        self,
+        num_embeddings: int,
+        num_new_embeddings: int,
+        features: int,
+        initializer_range: float = 0.02,
+        new_embed_initializer_range: float = 0.02,
+    ):
+        super().__init__()
+        self.initializer_range = initializer_range
+        self.new_embed_initializer_range = new_embed_initializer_range
+
+        # Initialize embeddings
+        self.embedding = mx.random.normal(
+            (num_embeddings, features), scale=self.initializer_range
+        )
+        self.new_embedding = mx.random.normal(
+            (num_new_embeddings, features), scale=self.new_embed_initializer_range
+        )
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return mx.concat([self.embedding, self.new_embedding], axis=0)[x]
 
 
 class Molmo(nn.Module):
@@ -184,47 +222,45 @@ class Molmo(nn.Module):
         super().__init__()
         self.config = config
 
-        self.wte = nn.Embedding(config.embedding_size, config.d_model)
-        if config.additional_vocab_size:
-            self.new_wte = nn.Embedding(config.additional_vocab_size, config.d_model)
+        self.wte = Embedding(
+            config.embedding_size, config.additional_vocab_size, config.d_model
+        )
+
         self.drop = nn.Dropout(config.embedding_dropout)
 
         self.blocks = [MolmoBlock(config, i) for i in range(config.n_layers)]
 
-        self.ln_f = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
+        self.ln_f = nn.RMSNorm(config.d_model, eps=config.layer_norm_eps)
 
         if not config.weight_tying:
-            self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+            self.ff_out = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
     def __call__(
         self,
         input_ids: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[List[Tuple[mx.array, mx.array]]] = None,
+        inputs_embeds: Optional[mx.array] = None,
     ) -> LanguageModelOutput:
+        if inputs_embeds is None:
+            h = self.wte(input_ids)
+        else:
+            h = inputs_embeds
+
         if cache is None:
             cache = [None] * self.config.n_layers
 
-        if self.config.additional_vocab_size:
-            emb = mx.where(
-                input_ids < self.config.embedding_size,
-                self.wte(input_ids),
-                self.new_wte(input_ids - self.config.embedding_size),
-            )
-        else:
-            emb = self.wte(input_ids)
-
-        hidden_states = self.drop(emb)
+        mask = create_attention_mask(mask)
 
         for i, (block, c) in enumerate(zip(self.blocks, cache)):
-            hidden_states = block(hidden_states, mask, c)
+            h = block(h, mask, c)
 
-        hidden_states = self.ln_f(hidden_states)
+        h = self.ln_f(h)
 
         if self.config.weight_tying:
-            logits = mx.matmul(hidden_states, self.wte.weight.T)
+            logits = mx.matmul(h, self.wte.weight.T)
         else:
-            logits = self.lm_head(hidden_states)
+            logits = self.ff_out(h)
 
         return LanguageModelOutput(logits=logits)
 
@@ -238,21 +274,27 @@ class LanguageModel(nn.Module):
     def __call__(
         self,
         input_ids: mx.array,
+        inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache: Optional[List[Tuple[mx.array, mx.array]]] = None,
     ) -> LanguageModelOutput:
-        outputs = self.model(input_ids, mask, cache)
+        outputs = self.model(input_ids, mask, cache, inputs_embeds)
 
         return outputs
 
+    @staticmethod
+    def sanitize(weights):
+        # Remove unused precomputed rotary freqs
+        return {k: v for k, v in weights.items() if "rotary_emb.inv_freq" not in k}
+
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.blocks
 
     @property
     def head_dim(self):
-        return self.args.hidden_size // self.args.num_attention_heads
+        return self.config.d_model // self.config.n_heads
 
     @property
     def n_kv_heads(self):
-        return self.args.num_key_value_heads
+        return self.config.n_kv_heads

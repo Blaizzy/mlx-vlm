@@ -41,23 +41,25 @@ class Model(nn.Module):
     def __call__(
         self,
         input_ids: mx.array,
-        mask: Optional[mx.array] = None,
-        pixel_values: Optional[mx.array] = None,
-        cache: Optional[KVCache] = None,
+        pixel_values: mx.array,
+        mask: mx.array,
+        cache=None,
         **kwargs,
     ) -> Dict[str, Union[mx.array, List[Tuple[mx.array, mx.array]]]]:
+        if input_ids.ndim == 1:
+            input_ids = input_ids[None, :]
+
         batch_size, seq_len = input_ids.shape
 
-        image_masks = kwargs.get("image_masks", None)
         image_input_idx = kwargs.get("image_input_idx", None)
 
         if pixel_values is not None:
             assert (
-                image_masks is not None and image_input_idx is not None
-            ), "image_masks and image_input_idx must be provided when images are given"
+                mask is not None and image_input_idx is not None
+            ), "mask and image_input_idx must be provided when images are given"
 
             # Process images
-            image_features, cls_embed = self.vision_tower(pixel_values, image_masks)
+            image_features, cls_embed = self.vision_tower(pixel_values, mask)
 
             # Insert image features into the input embeddings
             input_embeddings = self.language_model.model.wte(input_ids)
@@ -85,8 +87,8 @@ class Model(nn.Module):
         # Forward pass through the language model
         logits = self.language_model(
             input_ids,
-            attention_mask=mask,
-            past_key_values=cache,
+            mask=None,
+            cache=cache,
             inputs_embeds=input_embeddings,
         )
 
@@ -140,6 +142,4 @@ class Model(nn.Module):
                 key = key.replace("model.vision_backbone", "vision_tower")
             return key
 
-        # weights_ = {transform_key(k): v for k, v in weights.items()}
-        # print(weights_.keys())
         return {transform_key(k): v for k, v in weights.items()}

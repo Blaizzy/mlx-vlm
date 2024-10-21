@@ -747,6 +747,7 @@ def prepare_inputs(
     aspect_ratio_ids = None
     aspect_ratio_mask = None
     cross_attention_mask = None
+    image_input_idx = None
 
     if image_processor is not None:
         if not isinstance(prompts, list):
@@ -780,18 +781,31 @@ def prepare_inputs(
         )
     else:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
-        inputs = processor(
+        inputs = processor.process(
             text=prompts, images=images, padding=True, return_tensors="mlx"
         )
+        if "images" in inputs:
+            inputs["pixel_values"] = inputs["images"]
+            inputs.pop("images")
+        if "image_masks" in inputs:
+            inputs["attention_mask"] = inputs["image_masks"]
+            inputs.pop("image_masks")
+
         if isinstance(inputs["pixel_values"], list):
             pixel_values = inputs["pixel_values"]
         else:
             pixel_values = mx.array(inputs["pixel_values"])
         input_ids = mx.array(inputs["input_ids"])
         mask = mx.array(inputs["attention_mask"])
+
+        image_input_idx = inputs.get("image_input_idx", None)
+        if image_input_idx is not None:
+            image_input_idx = mx.array(image_input_idx)
+
         image_sizes = inputs.get("image_sizes", None)
         if image_sizes is not None:
             image_sizes = mx.array(image_sizes)
+
         image_grid_thw = inputs.get("image_grid_thw", None)
         if image_grid_thw is not None:
             image_grid_thw = mx.array(image_grid_thw)
@@ -817,6 +831,7 @@ def prepare_inputs(
         aspect_ratio_ids,
         aspect_ratio_mask,
         cross_attention_mask,
+        image_input_idx,
     )
 
 
@@ -1039,7 +1054,10 @@ def generate(
         tokenizer = processor.tokenizer
 
     resize_shape = kwargs.pop("resize_shape", None)
-    image_token_index = model.config.image_token_index
+    if hasattr(model.config, "image_token_index"):
+        image_token_index = model.config.image_token_index
+    else:
+        image_token_index = None
 
     # Prepare inputs
     inputs = prepare_inputs(
@@ -1055,6 +1073,7 @@ def generate(
                 "aspect_ratio_ids",
                 "aspect_ratio_mask",
                 "cross_attention_mask",
+                "image_input_idx",
             ],
             inputs[3:],
         )
