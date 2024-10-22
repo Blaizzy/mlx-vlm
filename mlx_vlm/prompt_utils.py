@@ -25,7 +25,9 @@ def get_message_json(
         if role == "user" and not skip_image_token:
             if isinstance(message["content"], list):
                 if model_name == "pixtral":
-                    message["content"] = [{"type": "image"}] * num_images + message["content"]
+                    message["content"] = [{"type": "image"}] * num_images + message[
+                        "content"
+                    ]
                 else:
                     message["content"].extend([{"type": "image"}] * num_images)
             else:
