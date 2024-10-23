@@ -67,6 +67,7 @@ def get_message_json(
         "multi_modality": "message_with_image_token",
         "pixtral": "message_list_with_image_type",
         "paligemma": "prompt_only",
+        "florence2": "prompt_only",
         "mllama": "message_list_with_image",
     }
 
@@ -141,7 +142,7 @@ def apply_chat_template(
     if return_messages:
         return messages
 
-    if config["model_type"] == "paligemma":
+    if config["model_type"] in ["paligemma", "florence2"]:
         return messages[-1]
 
     if "chat_template" in processor.__dict__.keys():
