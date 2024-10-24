@@ -274,7 +274,8 @@ class Model(nn.Module):
         self,
         input_ids=None,
         pixel_values=None,
-        mask=None,
+        self_attn_cache=None,
+        cross_attn_cache=None,
         decoder_input_ids=None,
         decoder_attention_mask=None,
         labels=None,
@@ -288,11 +289,11 @@ class Model(nn.Module):
             # Get input embeddings if needed
             inputs_embeds = None
             if input_ids is not None:
-                inputs_embeds = self.language_model.encoder.embed_tokens(input_ids)
+                inputs_embeds = self.language_model.shared(input_ids)
 
             # Merge image features with text embeddings
             inputs_embeds, attention_mask = self._merge_input_ids_with_image_features(
-                image_features, inputs_embeds, mask
+                image_features, inputs_embeds, decoder_attention_mask
             )
 
         # Handle decoder input IDs
@@ -303,11 +304,14 @@ class Model(nn.Module):
 
         # Forward through language model
         outputs = self.language_model(
+            input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=decoder_attention_mask,
             labels=labels,
+            self_attn_cache=self_attn_cache,
+            cross_attn_cache=cross_attn_cache,
         )
 
         return outputs
