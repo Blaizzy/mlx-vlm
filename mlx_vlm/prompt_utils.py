@@ -99,6 +99,25 @@ def get_message_json(
         raise ValueError(f"Unsupported model: {model_name}")
 
 
+def get_chat_template(processor, messages, add_generation_prompt, tokenize=False):
+    if "chat_template" in processor.__dict__.keys():
+        return processor.apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+        )
+    elif "tokenizer" in processor.__dict__.keys():
+        return processor.tokenizer.apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+        )
+    else:
+        raise ValueError(
+            "Error: processor does not have 'chat_template' or 'tokenizer' attribute."
+        )
+
+
 def apply_chat_template(
     processor,
     config,
@@ -154,21 +173,4 @@ def apply_chat_template(
     if config["model_type"] in ["paligemma", "molmo", "florence2"]:
         return messages[-1]
 
-    if "chat_template" in processor.__dict__.keys():
-        return processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-
-    elif "tokenizer" in processor.__dict__.keys():
-        return processor.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-
-    else:
-        raise ValueError(
-            "Error: processor does not have 'chat_template' or 'tokenizer' attribute."
-        )
+    return get_chat_template(processor, messages, add_generation_prompt)
