@@ -25,7 +25,7 @@ class TextConfig:
     decoder_layerdrop: float = 0.0
     scale_embedding: bool = False
     use_cache: bool = True
-    max_position_embeddings: int = 1026
+    max_position_embeddings: int = 1024
     vocab_size: int = 51289
     pad_token_id: int = 1
     bos_token_id: int = 0
@@ -46,6 +46,44 @@ class TextConfig:
 
 def gelu(x):
     return 0.5 * x * (1 + mx.tanh(mx.sqrt(2 / mx.pi) * (x + 0.044715 * mx.power(x, 3))))
+
+
+class Florence2LearnedPositionalEmbedding(nn.Embedding):
+    """
+    This module learns positional embeddings up to a fixed maximum size.
+    Converted from PyTorch to MLX implementation.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        # Florence2 is set up so that if padding_idx is specified then offset the embedding ids by 2
+        # and adjust num_embeddings appropriately. Other models don't have this hack
+        self.offset = 2
+        super().__init__(num_embeddings + self.offset, embedding_dim)
+
+    def __call__(self, input_ids: mx.array, past_key_values_length: int = 0):
+        """
+        `input_ids' shape is expected to be [bsz x seqlen].
+
+        Args:
+            input_ids: Input tensor of shape [batch_size, sequence_length]
+            past_key_values_length: Length of past key values for position calculation
+
+        Returns:
+            Positional embeddings of shape [batch_size, sequence_length, embedding_dim]
+        """
+        # Get batch size and sequence length from input shape
+        bsz, seq_len = input_ids.shape[:2]
+
+        # Create position indices
+        positions = mx.arange(
+            past_key_values_length, past_key_values_length + seq_len, dtype=mx.int32
+        )
+
+        # Expand positions to match batch size
+        positions = mx.broadcast_to(positions[None, :], [bsz, seq_len])
+
+        # Add offset and pass through embedding layer
+        return super().__call__(positions + self.offset)
 
 
 class Florence2Attention(nn.Module):
@@ -154,20 +192,25 @@ class Florence2Attention(nn.Module):
         if self.is_causal and not is_cross_attention:
             causal_mask = create_attention_mask(hidden_states)
             if attention_mask is not None:
+                if attention_mask.shape != (batch_size, 1, tgt_len, src_len):
+                    raise ValueError(
+                        f"Attention mask should be of size {(batch_size, 1, tgt_len, src_len)}, but is {attention_mask.shape}"
+                    )
                 attention_mask = attention_mask * causal_mask
             else:
                 attention_mask = causal_mask
 
-        attn_output = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.scaling, mask=attention_mask
+        attn_output = (
+            mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scaling, mask=attention_mask
+            )
+            .transpose(0, 2, 1, 3)
+            .reshape(batch_size, tgt_len, -1)
         )
 
-        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(
-            batch_size, tgt_len, self.embed_dim
-        )
         attn_output = self.out_proj(attn_output)
 
-        return attn_output, None
+        return attn_output
 
 
 class Florence2EncoderLayer(nn.Module):
@@ -185,7 +228,7 @@ class Florence2EncoderLayer(nn.Module):
 
     def __call__(self, hidden_states, attention_mask=None):
         residual = hidden_states
-        hidden_states, _ = self.self_attn(hidden_states, attention_mask=attention_mask)
+        hidden_states = self.self_attn(hidden_states, attention_mask=attention_mask)
         hidden_states = residual + hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
 
@@ -204,7 +247,7 @@ class Florence2DecoderLayer(nn.Module):
         self.embed_dim = config.d_model
         self.self_attn = Florence2Attention(config, is_decoder=True, is_causal=True)
         self.dropout = config.dropout
-        self.activation_fn = gelu
+        self.activation_fn = nn.GELU()
         self.activation_dropout = config.activation_dropout
 
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
@@ -220,29 +263,68 @@ class Florence2DecoderLayer(nn.Module):
         encoder_hidden_states,
         attention_mask=None,
         encoder_attention_mask=None,
-        self_attn_cache: KVCache = None,
-        cross_attn_cache: KVCache = None,
+        cache: KVCache = None,
     ):
         residual = hidden_states
-        hidden_states, _ = self.self_attn(
+
+        self_attn_cache = None
+        if cache is not None:
+            self_attn_cache = KVCache(cache.k_head_dim, cache.n_kv_heads)
+            # Get first two positions (equivalent to past_key_value[:2])
+            if cache.offset > 0:
+                self_keys = cache.keys[:, :, :2, :]
+                self_values = cache.values[:, :, :2, :]
+                self_attn_cache.update_and_fetch(self_keys, self_values)
+
+        hidden_states = self.self_attn(
             hidden_states, attention_mask=None, cache=self_attn_cache
         )
 
         hidden_states = residual + hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
 
-        residual = hidden_states
         if encoder_hidden_states is not None:
+            residual = hidden_states
+            # Initialize cross attention cache from positions 3,4 if cache exists
+            cross_attn_cache = None
+            if cache is not None:
+                cross_attn_cache = KVCache(cache.k_head_dim, cache.n_kv_heads)
+                # Get last two positions (equivalent to past_key_value[-2:])
+                if cache.offset > 0:
+                    cross_keys = cache.keys[:, :, -2:, :]
+                    cross_values = cache.values[:, :, -2:, :]
+                    cross_attn_cache.update_and_fetch(cross_keys, cross_values)
 
-            hidden_states, _ = self.encoder_attn(
+            hidden_states = self.encoder_attn(
                 hidden_states,
                 key_value_states=encoder_hidden_states,
-                attention_mask=None,
+                attention_mask=encoder_attention_mask,
                 cache=cross_attn_cache,
             )
-        hidden_states = residual + hidden_states
-        hidden_states = self.encoder_attn_layer_norm(hidden_states)
+            # Update main cache with both self-attention and cross-attention caches
+            if (
+                cache is not None
+                and self_attn_cache is not None
+                and cross_attn_cache is not None
+            ):
+                # Combine self-attention (positions 1,2) and cross-attention (positions 3,4) caches
+                combined_keys = mx.concatenate(
+                    [
+                        self_attn_cache.keys[:, :, : self_attn_cache.offset, :],
+                        cross_attn_cache.keys[:, :, : cross_attn_cache.offset, :],
+                    ],
+                    axis=2,
+                )
+                combined_values = mx.concatenate(
+                    [
+                        self_attn_cache.values[:, :, : self_attn_cache.offset, :],
+                        cross_attn_cache.values[:, :, : cross_attn_cache.offset, :],
+                    ],
+                    axis=2,
+                )
+                cache.update_and_fetch(combined_keys, combined_values)
 
+        # Fully Connected
         residual = hidden_states
         hidden_states = self.activation_fn(self.fc1(hidden_states))
         hidden_states = self.fc2(hidden_states)
@@ -262,13 +344,15 @@ class Florence2Encoder(nn.Module):
         embed_dim = config.d_model
         self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
 
-        self.embed_positions = nn.Embedding(config.max_position_embeddings, embed_dim)
+        self.embed_positions = Florence2LearnedPositionalEmbedding(
+            config.max_position_embeddings, embed_dim
+        )
         self.layers = [
             Florence2EncoderLayer(config) for _ in range(config.encoder_layers)
         ]
         self.layernorm_embedding = nn.LayerNorm(embed_dim)
 
-    def __call__(self, input_ids, inputs_embeds=None, attention_mask=None):
+    def __call__(self, input_ids=None, inputs_embeds=None, attention_mask=None):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -276,8 +360,8 @@ class Florence2Encoder(nn.Module):
         else:
             input_shape = inputs_embeds.shape
 
-        embed_pos = self.embed_positions(mx.arange(input_shape[1]))
-        hidden_states = inputs_embeds + embed_pos[None, :]
+        embed_pos = self.embed_positions(mx.arange(input_shape[1])[None, :])
+        hidden_states = inputs_embeds + embed_pos
         hidden_states = self.layernorm_embedding(hidden_states)
 
         for encoder_layer in self.layers:
@@ -300,7 +384,7 @@ class Florence2Decoder(nn.Module):
         self.max_target_positions = config.max_position_embeddings
         self.embed_scale = math.sqrt(config.d_model) if config.scale_embedding else 1.0
 
-        self.embed_positions = nn.Embedding(
+        self.embed_positions = Florence2LearnedPositionalEmbedding(
             config.max_position_embeddings, config.d_model
         )
         self.layers = [
@@ -315,8 +399,7 @@ class Florence2Decoder(nn.Module):
         inputs_embeds=None,
         attention_mask=None,
         encoder_attention_mask=None,
-        self_attn_cache: KVCache = None,
-        cross_attn_cache: KVCache = None,
+        cache: KVCache = None,
     ):
 
         if inputs_embeds is None:
@@ -326,14 +409,12 @@ class Florence2Decoder(nn.Module):
             input_shape = inputs_embeds.shape
 
         # Embed positions
-        positions = self.embed_positions(mx.arange(input_shape[1]))
+        positions = self.embed_positions(mx.arange(input_shape[1])[None, :])
 
-        hidden_states = inputs_embeds + positions[None, :]
+        hidden_states = inputs_embeds + positions
         hidden_states = self.layernorm_embedding(hidden_states)
 
-        for decoder_layer, self_attn_c, cross_attn_c in zip(
-            self.layers, self_attn_cache, cross_attn_cache
-        ):
+        for decoder_layer, c in zip(self.layers, cache):
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             dropout_probability = mx.random.uniform()
             if self.training and (dropout_probability < self.layerdrop):
@@ -343,8 +424,7 @@ class Florence2Decoder(nn.Module):
                 encoder_hidden_states,
                 attention_mask,
                 encoder_attention_mask,
-                self_attn_cache=self_attn_c,
-                cross_attn_cache=cross_attn_c,
+                cache=c,
             )
 
         return hidden_states
@@ -371,8 +451,7 @@ class Florence2LanguageModel(nn.Module):
         attention_mask=None,
         decoder_attention_mask=None,
         encoder_outputs=None,
-        self_attn_cache: KVCache = None,
-        cross_attn_cache: KVCache = None,
+        cache: KVCache = None,
     ):
         self.encoder.embed_tokens = self.shared
         self.decoder.embed_tokens = self.shared
@@ -394,13 +473,8 @@ class Florence2LanguageModel(nn.Module):
 
         head_dim = self.config.d_model // self.config.decoder_attention_heads
 
-        if self_attn_cache is None:
-            self_attn_cache = [
-                KVCache(head_dim, self.config.decoder_attention_heads)
-                for _ in range(self.config.decoder_layers)
-            ]
-        if cross_attn_cache is None:
-            cross_attn_cache = [
+        if cache is None:
+            cache = [
                 KVCache(head_dim, self.config.decoder_attention_heads)
                 for _ in range(self.config.decoder_layers)
             ]
@@ -414,8 +488,7 @@ class Florence2LanguageModel(nn.Module):
             decoder_inputs_embeds,
             decoder_attention_mask,
             attention_mask,
-            self_attn_cache,
-            cross_attn_cache,
+            cache,
         )
         return decoder_outputs, encoder_outputs
 
@@ -425,7 +498,6 @@ class LanguageModel(nn.Module):
         super().__init__()
         self.config = config
         self.model = Florence2LanguageModel(config)
-
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
     def __call__(
@@ -437,8 +509,7 @@ class LanguageModel(nn.Module):
         attention_mask=None,
         decoder_attention_mask=None,
         encoder_outputs=None,
-        self_attn_cache: KVCache = None,
-        cross_attn_cache: KVCache = None,
+        cache: KVCache = None,
     ):
         decoder_outputs, encoder_outputs = self.model(
             input_ids,
@@ -448,8 +519,7 @@ class LanguageModel(nn.Module):
             attention_mask,
             decoder_attention_mask,
             encoder_outputs,
-            self_attn_cache,
-            cross_attn_cache,
+            cache,
         )
         out = self.lm_head(decoder_outputs)
         return LanguageModelOutput(logits=out), encoder_outputs
