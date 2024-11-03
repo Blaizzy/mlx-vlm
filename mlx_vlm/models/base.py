@@ -55,7 +55,7 @@ class BaseImageProcessor(ABC):
 
 class KVCache:
 
-    def __init__(self, head_dim, n_kv_heads):
+    def __init__(self, head_dim, n_kv_heads, step=256):
         self.n_kv_heads = n_kv_heads
         if isinstance(head_dim, int):
             self.k_head_dim = self.v_head_dim = head_dim
@@ -66,9 +66,13 @@ class KVCache:
         self.keys = None
         self.values = None
         self.offset = 0
-        self.step = 256
+        self.step = step
 
     def update_and_fetch(self, keys, values):
+        self.update(keys, values)
+        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+
+    def update(self, keys, values):
         prev = self.offset
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
             n_steps = (self.step + keys.shape[2] - 1) // self.step
@@ -88,7 +92,51 @@ class KVCache:
         self.offset += keys.shape[2]
         self.keys[..., prev : self.offset, :] = keys
         self.values[..., prev : self.offset, :] = values
-        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+
+
+class SimpleKVCache:
+    """A simple key-value cache for transformer attention layers.
+
+    Stores and concatenates key/value tensors along sequence dimension.
+    """
+
+    def __init__(self):
+        self.keys = None
+        self.values = None
+        self.cache_length = 0
+
+    def update_and_fetch(self, keys, values):
+        """Update cache with new key/value tensors and return full cache.
+
+        Args:
+            keys: New key tensor to add [batch, heads, seq_len, head_dim]
+            values: New value tensor to add [batch, heads, seq_len, head_dim]
+
+        Returns:
+            Tuple of (cached_keys, cached_values) containing full cache history
+        """
+        if self.cache_length == 0:
+            # First update - just store tensors
+            self.keys = keys
+            self.values = values
+        else:
+            # Concatenate with existing cache along sequence dimension
+            self.keys = mx.concatenate([self.keys, keys], axis=2)
+            self.values = mx.concatenate([self.values, values], axis=2)
+
+        self.cache_length += keys.shape[2]
+        return self.keys, self.values
+
+    def update(self, keys, values):
+        """Update cache with new key/value tensors without returning.
+
+        Args:
+            keys: New key tensor to store
+            values: New value tensor to store
+        """
+        self.keys = keys
+        self.values = values
+        self.cache_length += keys.shape[2]
 
 
 class RotatingKVCache:
@@ -212,3 +260,4 @@ def create_attention_mask(h: mx.array, cache: Optional[Any] = None):
 class LanguageModelOutput:
     logits: mx.array
     cross_attention_states: Optional[List[mx.array]] = None
+    encoder_outputs: Optional[List[mx.array]] = None
