@@ -12,6 +12,7 @@ from ..base import KVCache, LanguageModelOutput, create_attention_mask
 @dataclass
 class TextConfig:
     d_model: int = 768
+    model_type: str = "florence2"
     encoder_attention_heads: int = 8
     decoder_attention_heads: int = 8
     encoder_ffn_dim: int = 3072
@@ -94,7 +95,8 @@ class Florence2Attention(nn.Module):
         self,
         hidden_states,
         key_value_states=None,
-        cache: Optional[Tuple[mx.array, mx.array]] = None,
+        # cache: Optional[Tuple[mx.array, mx.array]] = None,
+        cache: Optional[KVCache] = None,
         attention_mask=None,
         layer_head_mask=None,
     ):
@@ -117,11 +119,13 @@ class Florence2Attention(nn.Module):
 
         if (
             is_cross_attention
-            and cache is not None
-            and cache[0].shape[2] == key_value_states.shape[1]
+            and cache.cache_length > 0
+            and cache.keys.shape[2] == key_value_states.shape[1]
         ):
-            k = cache[0]
-            v = cache[1]
+            # k = cache[0]
+            # v = cache[1]
+            k = cache.keys
+            v = cache.values
 
         elif is_cross_attention:
             # Cross attention
@@ -139,16 +143,16 @@ class Florence2Attention(nn.Module):
             # reuse k, v, self_attention
             k = (
                 self.k_proj(hidden_states)
-                .reshape(batch_size, src_len, self.num_heads, self.head_dim)
+                .reshape(batch_size, src_len, self.num_heads, -1)
                 .transpose(0, 2, 1, 3)
             )
             v = (
                 self.v_proj(hidden_states)
-                .reshape(batch_size, src_len, self.num_heads, self.head_dim)
+                .reshape(batch_size, src_len, self.num_heads, -1)
                 .transpose(0, 2, 1, 3)
             )
-            k = mx.concatenate([cache[0], k], axis=2)
-            v = mx.concatenate([cache[1], v], axis=2)
+
+            k, v = cache.update_and_fetch(k, v)
         else:
             # Self attention
             k = (
@@ -163,7 +167,7 @@ class Florence2Attention(nn.Module):
             )
 
         if self.is_decoder:
-            cache = (k, v)
+            cache.update(k, v)
 
         if self.is_causal and self.is_decoder:
             causal_mask = create_attention_mask(hidden_states)
@@ -179,7 +183,7 @@ class Florence2Attention(nn.Module):
 
         attn_output = self.out_proj(attn_output)
 
-        return attn_output, cache
+        return attn_output
 
 
 class Florence2EncoderLayer(nn.Module):
@@ -195,7 +199,7 @@ class Florence2EncoderLayer(nn.Module):
 
     def __call__(self, hidden_states, attention_mask=None):
         residual = hidden_states
-        hidden_states, _ = self.self_attn(hidden_states, attention_mask=attention_mask)
+        hidden_states = self.self_attn(hidden_states, attention_mask=attention_mask)
         hidden_states = residual + hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
 
@@ -230,21 +234,19 @@ class Florence2DecoderLayer(nn.Module):
         encoder_hidden_states,
         attention_mask=None,
         encoder_attention_mask=None,
-        cache: Optional[Tuple[mx.array, mx.array, mx.array, mx.array]] = None,
+        cache: Optional[Tuple[KVCache, KVCache]] = None,
     ):
         residual = hidden_states
 
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
-        self_attn_cache = cache[:2] if cache is not None else None
+        self_attn_cache = cache[0] if cache[0] is not None else None
 
-        hidden_states, present_cache = self.self_attn(
+        hidden_states = self.self_attn(
             hidden_states, attention_mask=attention_mask, cache=self_attn_cache
         )
 
         hidden_states = residual + hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-
-        cross_attn_present_cache = None
 
         if encoder_hidden_states is not None:
             residual = hidden_states
@@ -252,9 +254,9 @@ class Florence2DecoderLayer(nn.Module):
             mask = create_attention_mask(hidden_states)
 
             # cross_attn cached key/values tuple is at positions 3,4 of cache tuple
-            cross_attn_cache = cache[-2:] if cache is not None else None
+            cross_attn_cache = cache[-1] if cache[-1] is not None else None
 
-            hidden_states, cross_attn_present_cache = self.encoder_attn(
+            hidden_states = self.encoder_attn(
                 hidden_states,
                 key_value_states=encoder_hidden_states,
                 attention_mask=mask,
@@ -263,9 +265,6 @@ class Florence2DecoderLayer(nn.Module):
             hidden_states = residual + hidden_states
             hidden_states = self.encoder_attn_layer_norm(hidden_states)
 
-            # add cross-attn to positions 3,4 of cache tuple
-            present_cache += cross_attn_present_cache
-
         # Fully Connected
         residual = hidden_states
         hidden_states = self.activation_fn(self.fc1(hidden_states))
@@ -273,7 +272,7 @@ class Florence2DecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
 
-        return hidden_states, present_cache
+        return hidden_states
 
 
 class Florence2Encoder(nn.Module):
@@ -370,28 +369,27 @@ class Florence2Decoder(nn.Module):
         if positions.ndim == 1:
             positions = mx.expand_dims(positions, axis=0)
 
-        cache_length = cache[0][0].shape[2] if cache[0] is not None else 0
+        cache_length = cache[0][0].keys.shape[2] if cache[0][0].cache_length > 0 else 0
+
         embed_pos = self.embed_positions(positions, cache_length)
 
         hidden_states = inputs_embeds + embed_pos
         hidden_states = self.layernorm_embedding(hidden_states)
-        next_decoder_cache = []
-        for e, decoder_layer in enumerate(self.layers):
+
+        for decoder_layer, c in zip(self.layers, cache):
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             dropout_probability = mx.random.uniform()
             if self.training and (dropout_probability < self.layerdrop):
                 continue
-            hidden_states, decoder_cache = decoder_layer(
+            hidden_states = decoder_layer(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 attention_mask=attention_mask,
                 encoder_attention_mask=encoder_attention_mask,
-                cache=cache[e],
+                cache=c,
             )
-            next_decoder_cache += (decoder_cache,)
 
-        next_cache = next_decoder_cache
-        return hidden_states, next_cache
+        return hidden_states
 
 
 class Florence2LanguageModel(nn.Module):
@@ -445,7 +443,7 @@ class Florence2LanguageModel(nn.Module):
                 attention_mask=attention_mask,
             )
 
-        decoder_outputs, next_cache = self.decoder(
+        decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
             encoder_hidden_states=encoder_outputs,
@@ -453,7 +451,7 @@ class Florence2LanguageModel(nn.Module):
             inputs_embeds=decoder_inputs_embeds,
             cache=cache,
         )
-        return decoder_outputs, encoder_outputs, next_cache
+        return decoder_outputs, encoder_outputs
 
 
 class LanguageModel(nn.Module):
@@ -474,7 +472,7 @@ class LanguageModel(nn.Module):
         encoder_outputs=None,
         cache=None,
     ):
-        decoder_outputs, encoder_outputs, next_cache = self.model(
+        decoder_outputs, encoder_outputs = self.model(
             input_ids,
             inputs_embeds,
             decoder_input_ids,
@@ -485,13 +483,11 @@ class LanguageModel(nn.Module):
             cache,
         )
         out = self.lm_head(decoder_outputs)
-        return LanguageModelOutput(logits=out), encoder_outputs, next_cache
+        return LanguageModelOutput(logits=out, encoder_outputs=encoder_outputs)
 
     @property
     def layers(self):
-        return range(
-            self.model.config.encoder_layers + self.model.config.decoder_layers
-        )
+        return range(self.model.config.decoder_layers)
 
     @property
     def head_dim(self):
