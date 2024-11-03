@@ -111,7 +111,7 @@ class Florence2Attention(nn.Module):
         self,
         hidden_states,
         key_value_states=None,
-        cache: KVCache = None,
+        cache: Optional[Tuple[mx.array, mx.array]] = None,
         attention_mask=None,
         layer_head_mask=None,
     ):
@@ -134,20 +134,14 @@ class Florence2Attention(nn.Module):
 
         if (
             is_cross_attention
-            and cache.offset > 0
             and cache is not None
-            and cache.keys.shape[2] == key_value_states.shape[1]
+            and cache[0].shape[2] == key_value_states.shape[1]
         ):
-            # Reuse k, v, cross attention
-            # print("Reusing k, v, cross attention")
-            k, v = (
-                cache.keys[..., : cache.offset, :],
-                cache.values[..., : cache.offset, :],
-            )
+            k = cache[0]
+            v = cache[1]
 
         elif is_cross_attention:
             # Cross attention
-            # print("Cross attention")
             k = (
                 self.k_proj(key_value_states)
                 .reshape(batch_size, src_len, self.num_heads, self.head_dim)
@@ -159,8 +153,7 @@ class Florence2Attention(nn.Module):
                 .transpose(0, 2, 1, 3)
             )
         elif cache is not None:
-            # Reuse k, v, self attention
-            # print("Reuse k, v, self attention")
+            # reuse k, v, self_attention
             k = (
                 self.k_proj(hidden_states)
                 .reshape(batch_size, src_len, self.num_heads, self.head_dim)
@@ -171,10 +164,10 @@ class Florence2Attention(nn.Module):
                 .reshape(batch_size, src_len, self.num_heads, self.head_dim)
                 .transpose(0, 2, 1, 3)
             )
-            k, v = cache.update_and_fetch(k, v)
+            k = mx.concatenate([cache[0], k], axis=2)
+            v = mx.concatenate([cache[1], v], axis=2)
         else:
             # Self attention
-            # print("Self attention")
             k = (
                 self.k_proj(hidden_states)
                 .reshape(batch_size, src_len, self.num_heads, self.head_dim)
@@ -186,19 +179,12 @@ class Florence2Attention(nn.Module):
                 .transpose(0, 2, 1, 3)
             )
 
-        if cache is not None and self.is_decoder:
-            cache.update_and_fetch(k, v)
+        if self.is_decoder:
+            cache = (k, v)
 
-        if self.is_causal and not is_cross_attention:
+        if self.is_causal and self.is_decoder:
             causal_mask = create_attention_mask(hidden_states)
-            if attention_mask is not None:
-                if attention_mask.shape != (batch_size, 1, tgt_len, src_len):
-                    raise ValueError(
-                        f"Attention mask should be of size {(batch_size, 1, tgt_len, src_len)}, but is {attention_mask.shape}"
-                    )
-                attention_mask = attention_mask * causal_mask
-            else:
-                attention_mask = causal_mask
+            attention_mask = causal_mask
 
         attn_output = (
             mx.fast.scaled_dot_product_attention(
@@ -210,7 +196,7 @@ class Florence2Attention(nn.Module):
 
         attn_output = self.out_proj(attn_output)
 
-        return attn_output
+        return attn_output, cache
 
 
 class Florence2EncoderLayer(nn.Module):
@@ -263,66 +249,43 @@ class Florence2DecoderLayer(nn.Module):
         encoder_hidden_states,
         attention_mask=None,
         encoder_attention_mask=None,
-        cache: KVCache = None,
+        cache: Optional[Tuple[mx.array, mx.array, mx.array, mx.array]] = None,
     ):
         residual = hidden_states
 
-        self_attn_cache = None
-        if cache is not None:
-            self_attn_cache = KVCache(cache.k_head_dim, cache.n_kv_heads)
-            # Get first two positions (equivalent to past_key_value[:2])
-            if cache.offset > 0:
-                self_keys = cache.keys[:, :, :2, :]
-                self_values = cache.values[:, :, :2, :]
-                self_attn_cache.update_and_fetch(self_keys, self_values)
+        # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
+        self_attn_cache = cache[:2] if cache is not None else None
 
-        hidden_states = self.self_attn(
-            hidden_states, attention_mask=None, cache=self_attn_cache
+        hidden_states, present_cache = self.self_attn(
+            hidden_states, attention_mask=attention_mask, cache=self_attn_cache
         )
 
         hidden_states = residual + hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
 
+        cross_attn_present_cache = None
+
         if encoder_hidden_states is not None:
             residual = hidden_states
-            # Initialize cross attention cache from positions 3,4 if cache exists
-            cross_attn_cache = None
-            if cache is not None:
-                cross_attn_cache = KVCache(cache.k_head_dim, cache.n_kv_heads)
-                # Get last two positions (equivalent to past_key_value[-2:])
-                if cache.offset > 0:
-                    cross_keys = cache.keys[:, :, -2:, :]
-                    cross_values = cache.values[:, :, -2:, :]
-                    cross_attn_cache.update_and_fetch(cross_keys, cross_values)
 
-            hidden_states = self.encoder_attn(
+            # Turn mask into 4D
+            if encoder_attention_mask is not None:
+                encoder_attention_mask = encoder_attention_mask[:, None, None, :]
+
+            # cross_attn cached key/values tuple is at positions 3,4 of cache tuple
+            cross_attn_cache = cache[-2:] if cache is not None else None
+
+            hidden_states, cross_attn_present_cache = self.encoder_attn(
                 hidden_states,
                 key_value_states=encoder_hidden_states,
                 attention_mask=encoder_attention_mask,
                 cache=cross_attn_cache,
             )
-            # Update main cache with both self-attention and cross-attention caches
-            if (
-                cache is not None
-                and self_attn_cache is not None
-                and cross_attn_cache is not None
-            ):
-                # Combine self-attention (positions 1,2) and cross-attention (positions 3,4) caches
-                combined_keys = mx.concatenate(
-                    [
-                        self_attn_cache.keys[:, :, : self_attn_cache.offset, :],
-                        cross_attn_cache.keys[:, :, : cross_attn_cache.offset, :],
-                    ],
-                    axis=2,
-                )
-                combined_values = mx.concatenate(
-                    [
-                        self_attn_cache.values[:, :, : self_attn_cache.offset, :],
-                        cross_attn_cache.values[:, :, : cross_attn_cache.offset, :],
-                    ],
-                    axis=2,
-                )
-                cache.update_and_fetch(combined_keys, combined_values)
+            hidden_states = residual + hidden_states
+            hidden_states = self.encoder_attn_layer_norm(hidden_states)
+
+            # add cross-attn to positions 3,4 of cache tuple
+            present_cache += cross_attn_present_cache
 
         # Fully Connected
         residual = hidden_states
@@ -331,7 +294,7 @@ class Florence2DecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
 
-        return hidden_states
+        return hidden_states, present_cache
 
 
 class Florence2Encoder(nn.Module):
@@ -384,8 +347,8 @@ class Florence2Decoder(nn.Module):
         self.max_target_positions = config.max_position_embeddings
         self.embed_scale = math.sqrt(config.d_model) if config.scale_embedding else 1.0
 
-        self.embed_positions = Florence2LearnedPositionalEmbedding(
-            config.max_position_embeddings, config.d_model
+        self.embed_positions = nn.Embedding(
+            config.max_position_embeddings + 2, config.d_model
         )
         self.layers = [
             Florence2DecoderLayer(config) for _ in range(config.decoder_layers)
@@ -394,12 +357,14 @@ class Florence2Decoder(nn.Module):
 
     def __call__(
         self,
-        input_ids,
-        encoder_hidden_states,
-        inputs_embeds=None,
+        input_ids=None,
         attention_mask=None,
+        encoder_hidden_states=None,
         encoder_attention_mask=None,
-        cache: KVCache = None,
+        head_mask=None,
+        cross_attn_head_mask=None,
+        inputs_embeds=None,
+        cache=None,
     ):
 
         if inputs_embeds is None:
@@ -413,21 +378,23 @@ class Florence2Decoder(nn.Module):
 
         hidden_states = inputs_embeds + positions
         hidden_states = self.layernorm_embedding(hidden_states)
-
-        for decoder_layer, c in zip(self.layers, cache):
+        next_decoder_cache = []
+        for e, decoder_layer in enumerate(self.layers):
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             dropout_probability = mx.random.uniform()
             if self.training and (dropout_probability < self.layerdrop):
                 continue
-            hidden_states = decoder_layer(
-                hidden_states,
-                encoder_hidden_states,
-                attention_mask,
-                encoder_attention_mask,
-                cache=c,
+            hidden_states, decoder_cache = decoder_layer(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                attention_mask=attention_mask,
+                encoder_attention_mask=encoder_attention_mask,
+                cache=cache[e],
             )
+            next_decoder_cache += (decoder_cache,)
 
-        return hidden_states
+        next_cache = next_decoder_cache
+        return hidden_states, next_cache
 
 
 class Florence2LanguageModel(nn.Module):
@@ -444,14 +411,14 @@ class Florence2LanguageModel(nn.Module):
 
     def __call__(
         self,
-        input_ids,
+        input_ids=None,
         inputs_embeds=None,
         decoder_input_ids=None,
         decoder_inputs_embeds=None,
         attention_mask=None,
         decoder_attention_mask=None,
         encoder_outputs=None,
-        cache: KVCache = None,
+        cache=None,
     ):
         self.encoder.embed_tokens = self.shared
         self.decoder.embed_tokens = self.shared
@@ -471,26 +438,25 @@ class Florence2LanguageModel(nn.Module):
         if inputs_embeds is not None:
             inputs_embeds = inputs_embeds * self.embed_scale
 
-        head_dim = self.config.d_model // self.config.decoder_attention_heads
-
         if cache is None:
-            cache = [
-                KVCache(head_dim, self.config.decoder_attention_heads)
-                for _ in range(self.config.decoder_layers)
-            ]
+            cache = [None] * len(self.decoder.layers)
 
         if encoder_outputs is None:
-            encoder_outputs = self.encoder(input_ids, inputs_embeds, None)
+            encoder_outputs = self.encoder(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+            )
 
-        decoder_outputs = self.decoder(
-            decoder_input_ids,
-            encoder_outputs,
-            decoder_inputs_embeds,
-            decoder_attention_mask,
-            attention_mask,
-            cache,
+        decoder_outputs, next_cache = self.decoder(
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            encoder_hidden_states=encoder_outputs,
+            encoder_attention_mask=attention_mask,
+            inputs_embeds=decoder_inputs_embeds,
+            cache=cache,
         )
-        return decoder_outputs, encoder_outputs
+        return decoder_outputs, encoder_outputs, next_cache
 
 
 class LanguageModel(nn.Module):
@@ -502,16 +468,16 @@ class LanguageModel(nn.Module):
 
     def __call__(
         self,
-        input_ids,
-        inputs_embeds,
+        input_ids=None,
+        inputs_embeds=None,
         decoder_input_ids=None,
         decoder_inputs_embeds=None,
         attention_mask=None,
         decoder_attention_mask=None,
         encoder_outputs=None,
-        cache: KVCache = None,
+        cache=None,
     ):
-        decoder_outputs, encoder_outputs = self.model(
+        decoder_outputs, encoder_outputs, next_cache = self.model(
             input_ids,
             inputs_embeds,
             decoder_input_ids,
@@ -522,7 +488,7 @@ class LanguageModel(nn.Module):
             cache,
         )
         out = self.lm_head(decoder_outputs)
-        return LanguageModelOutput(logits=out), encoder_outputs
+        return LanguageModelOutput(logits=out), encoder_outputs, next_cache
 
     @property
     def layers(self):
