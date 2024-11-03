@@ -44,14 +44,9 @@ class TextConfig:
         )
 
 
-def gelu(x):
-    return 0.5 * x * (1 + mx.tanh(mx.sqrt(2 / mx.pi) * (x + 0.044715 * mx.power(x, 3))))
-
-
 class Florence2LearnedPositionalEmbedding(nn.Embedding):
     """
     This module learns positional embeddings up to a fixed maximum size.
-    Converted from PyTorch to MLX implementation.
     """
 
     def __init__(self, num_embeddings: int, embedding_dim: int):
@@ -61,28 +56,16 @@ class Florence2LearnedPositionalEmbedding(nn.Embedding):
         super().__init__(num_embeddings + self.offset, embedding_dim)
 
     def __call__(self, input_ids: mx.array, past_key_values_length: int = 0):
-        """
-        `input_ids' shape is expected to be [bsz x seqlen].
+        """`input_ids' shape is expected to be [bsz x seqlen]."""
 
-        Args:
-            input_ids: Input tensor of shape [batch_size, sequence_length]
-            past_key_values_length: Length of past key values for position calculation
-
-        Returns:
-            Positional embeddings of shape [batch_size, sequence_length, embedding_dim]
-        """
-        # Get batch size and sequence length from input shape
         bsz, seq_len = input_ids.shape[:2]
-
-        # Create position indices
         positions = mx.arange(
-            past_key_values_length, past_key_values_length + seq_len, dtype=mx.int32
+            past_key_values_length,
+            past_key_values_length + seq_len,
+            dtype=mx.int64,
         )
+        positions = mx.expand_dims(positions, axis=0)
 
-        # Expand positions to match batch size
-        positions = mx.broadcast_to(positions[None, :], [bsz, seq_len])
-
-        # Add offset and pass through embedding layer
         return super().__call__(positions + self.offset)
 
 
@@ -203,18 +186,16 @@ class Florence2EncoderLayer(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.embed_dim = config.d_model
-        self.self_attn = Florence2Attention(config, is_decoder=False)
+        self.self_attn = Florence2Attention(config, is_decoder=False, is_causal=False)
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
-        self.dropout = config.dropout
         self.activation_fn = nn.GELU()
-        self.activation_dropout = config.activation_dropout
         self.fc1 = nn.Linear(self.embed_dim, config.encoder_ffn_dim)
         self.fc2 = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
     def __call__(self, hidden_states, attention_mask=None):
         residual = hidden_states
-        hidden_states = self.self_attn(hidden_states, attention_mask=attention_mask)
+        hidden_states, _ = self.self_attn(hidden_states, attention_mask=attention_mask)
         hidden_states = residual + hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
 
@@ -268,9 +249,7 @@ class Florence2DecoderLayer(nn.Module):
         if encoder_hidden_states is not None:
             residual = hidden_states
 
-            # Turn mask into 4D
-            if encoder_attention_mask is not None:
-                encoder_attention_mask = encoder_attention_mask[:, None, None, :]
+            mask = create_attention_mask(hidden_states)
 
             # cross_attn cached key/values tuple is at positions 3,4 of cache tuple
             cross_attn_cache = cache[-2:] if cache is not None else None
@@ -278,7 +257,7 @@ class Florence2DecoderLayer(nn.Module):
             hidden_states, cross_attn_present_cache = self.encoder_attn(
                 hidden_states,
                 key_value_states=encoder_hidden_states,
-                attention_mask=encoder_attention_mask,
+                attention_mask=mask,
                 cache=cross_attn_cache,
             )
             hidden_states = residual + hidden_states
@@ -323,7 +302,13 @@ class Florence2Encoder(nn.Module):
         else:
             input_shape = inputs_embeds.shape
 
-        embed_pos = self.embed_positions(mx.arange(input_shape[1])[None, :])
+        positions = mx.arange(input_shape[1])
+
+        if positions.ndim == 1:
+            positions = mx.expand_dims(positions, axis=0)
+
+        embed_pos = self.embed_positions(positions)
+
         hidden_states = inputs_embeds + embed_pos
         hidden_states = self.layernorm_embedding(hidden_states)
 
@@ -347,8 +332,8 @@ class Florence2Decoder(nn.Module):
         self.max_target_positions = config.max_position_embeddings
         self.embed_scale = math.sqrt(config.d_model) if config.scale_embedding else 1.0
 
-        self.embed_positions = nn.Embedding(
-            config.max_position_embeddings + 2, config.d_model
+        self.embed_positions = Florence2LearnedPositionalEmbedding(
+            config.max_position_embeddings, config.d_model
         )
         self.layers = [
             Florence2DecoderLayer(config) for _ in range(config.decoder_layers)
@@ -366,17 +351,29 @@ class Florence2Decoder(nn.Module):
         inputs_embeds=None,
         cache=None,
     ):
-
-        if inputs_embeds is None:
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError(
+                "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
+            )
+        elif input_ids is not None:
             inputs_embeds = self.embed_tokens(input_ids)
-            input_shape = inputs_embeds.shape
+            input_shape = inputs_embeds.shape  # for 2d masks
+            positions = input_ids
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.shape[:-1]  # for 4d masks
+            positions = inputs_embeds[:, :, -1]
         else:
-            input_shape = inputs_embeds.shape
+            raise ValueError(
+                "You have to specify either decoder_input_ids or decoder_inputs_embeds"
+            )
 
-        # Embed positions
-        positions = self.embed_positions(mx.arange(input_shape[1])[None, :])
+        if positions.ndim == 1:
+            positions = mx.expand_dims(positions, axis=0)
 
-        hidden_states = inputs_embeds + positions
+        cache_length = cache[0][0].shape[2] if cache[0] is not None else 0
+        embed_pos = self.embed_positions(positions, cache_length)
+
+        hidden_states = inputs_embeds + embed_pos
         hidden_states = self.layernorm_embedding(hidden_states)
         next_decoder_cache = []
         for e, decoder_layer in enumerate(self.layers):
