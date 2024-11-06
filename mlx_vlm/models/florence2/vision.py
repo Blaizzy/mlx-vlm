@@ -123,7 +123,28 @@ class DepthWiseConv2d(nn.Module):
         H, W = size
         assert N == H * W
 
-        x = self.dw(x.transpose(0, 2, 1).reshape(B, C, H, W).swapaxes(0, 3))
+        # Process each channel separately since MLX doesn't have groups
+        x = x.transpose(0, 2, 1).reshape(B, C, H, W)
+
+        # Split channels, apply conv, and recombine
+        channels = [x[:, i : i + 1, :, :] for i in range(C)]
+
+        out_channels = [
+            mx.conv2d(
+                ch.swapaxes(1, 3),
+                self.dw.weight[i : i + 1],
+                self.dw.stride,
+                self.dw.padding,
+            ).swapaxes(1, 3)
+            for i, ch in enumerate(channels)
+        ]
+        if hasattr(self.dw, "bias"):
+            out_channels = [
+                ch + self.dw.bias[i : i + 1, None, None]
+                for i, ch in enumerate(out_channels)
+            ]
+
+        x = mx.concatenate(out_channels, axis=1)
         size = (x.shape[-2], x.shape[-1])
         x = x.flatten(2).transpose(0, 2, 1)
         return x, size
@@ -157,15 +178,20 @@ class ConvEmbed(nn.Module):
         self.pre_norm = pre_norm
 
     def __call__(self, x, size):
+        H, W = size
         if len(x.shape) == 3:
-            H, W = size
+
             if self.norm and self.pre_norm:
                 x = self.norm(x)
+
             x = x.reshape(-1, H, W, x.shape[-1]).transpose(0, 3, 1, 2)
 
-        x = self.proj(x.swapaxes(1, 3))
-        B, C, H, W = x.shape
-        x = x.reshape(B, C, -1).transpose(0, 2, 1)
+        x = self.proj(x.transpose(0, 2, 3, 1))
+        x = x.swapaxes(1, 3)
+        _, _, H, W = x.shape
+
+        # rearrange 'b c h w -> b (h w) c'
+        x = x.transpose(0, 2, 3, 1).reshape(x.shape[0], H * W, x.shape[1])
 
         if self.norm and not self.pre_norm:
             x = self.norm(x)
@@ -187,17 +213,46 @@ class ChannelAttention(nn.Module):
 
         qkv = self.qkv(x).reshape(B, N, 3, self.groups, C // self.groups)
         qkv = qkv.transpose(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = qkv[0], qkv[1], qkv[2]  # Each has shape (B, groups, N, C//groups)
 
         q = q * (float(N) ** -0.5)
-        attention = mx.matmul(q.transpose(-1, -2), k)
+
+        # For multi-head attention, we need to keep the groups dimension
+        attention = mx.matmul(q.transpose(0, 1, 3, 2), k)  # (B, groups, N, N)
         attention = mx.softmax(attention, axis=-1)
 
-        x = mx.matmul(attention, v.transpose(-1, -2)).transpose(-1, -2)
-        x = x.transpose(1, 2).reshape(B, N, C)
+        x = mx.matmul(attention, v.transpose(0, 1, 3, 2)).transpose(
+            0, 1, 3, 2
+        )  # (B, groups, N, C//groups)
+        x = x.transpose(0, 2, 1, 3).reshape(B, N, C)
         x = self.proj(x)
 
         return x, size
+
+
+def window_partition(x: mx.array, window_size: int):
+    """Partition into non-overlapping windows"""
+    B, H, W, C = x.shape
+    x = mx.reshape(
+        x, (B, H // window_size, window_size, W // window_size, window_size, C)
+    )
+    # MLX equivalent of permute and contiguous
+    windows = mx.reshape(
+        mx.transpose(x, (0, 1, 3, 2, 4, 5)), (-1, window_size, window_size, C)
+    )
+    return windows
+
+
+def window_reverse(
+    windows: mx.array, batch_size: int, window_size: int, H: int, W: int
+):
+    """Merge windows back to feature map"""
+    B = batch_size
+    x = mx.reshape(
+        windows, (B, H // window_size, W // window_size, window_size, window_size, -1)
+    )
+    x = mx.reshape(mx.transpose(x, (0, 1, 3, 2, 4, 5)), (B, H, W, -1))
+    return x
 
 
 class WindowAttention(nn.Module):
@@ -219,63 +274,48 @@ class WindowAttention(nn.Module):
     def __call__(self, x, size):
         H, W = size
         B, L, C = x.shape
-        assert L == H * W, "Input feature size doesn't match"
 
-        # Reshape to include windows
-        x = x.reshape(B, H, W, C)
-        pad_h = (self.window_size - H % self.window_size) % self.window_size
-        pad_w = (self.window_size - W % self.window_size) % self.window_size
-        if pad_h > 0 or pad_w > 0:
-            x = mx.pad(x, ((0, 0), (0, pad_h), (0, pad_w), (0, 0)))
-        Hp, Wp = x.shape[1], x.shape[2]
+        assert L == H * W, f"input feature has wrong size {L} == {H * W}"
 
-        # Partition windows
-        x = x.reshape(
-            B,
-            Hp // self.window_size,
-            self.window_size,
-            Wp // self.window_size,
-            self.window_size,
-            C,
-        )
-        windows = x.transpose(0, 1, 3, 2, 4, 5).reshape(
-            -1, self.window_size * self.window_size, C
-        )
+        x = mx.reshape(x, (B, H, W, C))
 
-        # Multi-head attention
-        qkv = self.qkv(windows).reshape(
-            -1,
-            self.window_size * self.window_size,
-            3,
-            self.num_heads,
-            C // self.num_heads,
-        )
-        qkv = qkv.transpose(2, 0, 3, 1, 4)
+        # Calculate padding
+        pad_l = pad_t = 0
+        pad_r = (self.window_size - W % self.window_size) % self.window_size
+        pad_b = (self.window_size - H % self.window_size) % self.window_size
+
+        # MLX padding
+        if pad_r > 0 or pad_b > 0:
+            x = mx.pad(x, [(0, 0), (pad_t, pad_b), (pad_l, pad_r), (0, 0)])
+
+        _, Hp, Wp, _ = x.shape
+
+        # Window partition
+        x = window_partition(x, self.window_size)
+        x = mx.reshape(x, (-1, self.window_size * self.window_size, C))
+
+        # Multi-head self attention
+        B_, N, C = x.shape
+        qkv = mx.reshape(self.qkv(x), (B_, N, 3, self.num_heads, C // self.num_heads))
+        qkv = mx.transpose(qkv, (2, 0, 3, 1, 4))
         q, k, v = qkv[0], qkv[1], qkv[2]
 
+        # Scaled dot-product attention
         q = q * self.scale
-        attn = mx.matmul(q, k.transpose(-2, -1))
+        attn = mx.matmul(q, mx.transpose(k, (0, 1, 3, 2)))
         attn = mx.softmax(attn, axis=-1)
-        x = mx.matmul(attn, v)
 
-        x = x.transpose(0, 2, 1, 3).reshape(-1, self.window_size * self.window_size, C)
+        x = mx.reshape(mx.transpose(mx.matmul(attn, v), (0, 2, 1, 3)), (B_, N, C))
         x = self.proj(x)
 
-        # Reverse window partition
-        x = x.reshape(
-            B,
-            Hp // self.window_size,
-            Wp // self.window_size,
-            self.window_size,
-            self.window_size,
-            C,
-        )
-        x = x.transpose(0, 1, 3, 2, 4, 5).reshape(B, Hp, Wp, C)
+        # Merge windows
+        x = mx.reshape(x, (-1, self.window_size, self.window_size, C))
+        x = window_reverse(x, B, self.window_size, Hp, Wp)
 
-        if pad_h > 0 or pad_w > 0:
+        if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :]
 
-        x = x.reshape(B, H * W, C)
+        x = mx.reshape(x, (B, H * W, C))
         return x, size
 
 
@@ -526,12 +566,12 @@ class VisionModel(nn.Module):
         for conv, blks in zip(self.convs, self.blocks):
             x, size = conv(x, input_size)
             for blk in blks:
-                print(x.shape)
+
                 x, size = blk(x, size)
             input_size = size
 
-        # Global average pooling
-        x = mx.mean(x, axis=1)
+        # # Global average pooling
+        # x = mx.mean(x, axis=1)
 
         return x
 

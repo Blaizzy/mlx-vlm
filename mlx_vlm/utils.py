@@ -24,7 +24,7 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-from .models.base import BaseImageProcessor, KVCache
+from .models.base import BaseImageProcessor, KVCache, SimpleKVCache
 from .sample_utils import top_p_sampling
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
@@ -881,7 +881,12 @@ def generate_step(
             if isinstance(model.language_model.n_kv_heads, int)
             else model.language_model.n_kv_heads
         )
-        cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
+        if model.language_model.config.model_type == "florence2":
+            cache = [
+                (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
+            ]
+        else:
+            cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
 
     repetition_context = input_ids.tolist()
 

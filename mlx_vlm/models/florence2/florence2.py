@@ -79,7 +79,7 @@ class LearnedPositionEmbedding2D(nn.Module):
         width_pos = mx.arange(width)
         height_pos = mx.arange(height)
 
-        x_emb = self.col_embeddings(width_pos)
+        x_emb = self.column_embeddings(width_pos)
         y_emb = self.row_embeddings(height_pos)
 
         pos = mx.concatenate(
@@ -205,13 +205,13 @@ class Model(nn.Module):
 
         self.image_feature_source = config.image_feature_source
 
-    def _encode_image(self, pixel_values):
+    def _encode_image(self, pixel_values, features):
         """Encode image using vision model and add position embeddings."""
         batch_size, channels, height, width = pixel_values.shape
         temporal_len = 1  # Single frame for now
 
         # Get vision features
-        x = self.vision_tower(pixel_values)
+        x = torch.from_numpy(features)  # self.vision_tower(pixel_values)
 
         # Add position embeddings
         if self.image_pos_embed is not None:
