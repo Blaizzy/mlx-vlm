@@ -1,10 +1,14 @@
+import glob
 import inspect
+import json
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+from huggingface_hub import snapshot_download
 from mlx.utils import tree_map
 
 from .language import LanguageModel, TextConfig
@@ -205,46 +209,68 @@ class Model(nn.Module):
 
         self.image_feature_source = config.image_feature_source
 
-    def _encode_image(self, pixel_values, features):
+    def _encode_image(self, pixel_values):
         """Encode image using vision model and add position embeddings."""
-        batch_size, channels, height, width = pixel_values.shape
-        temporal_len = 1  # Single frame for now
+        batch_size, C, H, W = pixel_values.shape
+        T = 1  # Single frame for now
 
         # Get vision features
-        x = torch.from_numpy(features)  # self.vision_tower(pixel_values)
+        x = self.vision_tower(pixel_values)
 
-        # Add position embeddings
+        # Assuming this is part of a class method, keeping the same structure
         if self.image_pos_embed is not None:
-            num_patches = x.shape[1]
-            h = w = int(math.sqrt(num_patches))
-            x = x.reshape(batch_size * temporal_len, h, w, -1)
+            # Reshape to (batch_size * T, -1, feature_dim)
+            x = mx.reshape(x, (batch_size * T, -1, x.shape[-1]))
+            num_tokens = x.shape[-2]
+            h, w = int(math.sqrt(num_tokens)), int(math.sqrt(num_tokens))
+            assert h * w == num_tokens, "only support square feature maps for now"
+            # Reshape to (batch_size * T, h, w, feature_dim)
+            x = mx.reshape(x, (batch_size * T, h, w, x.shape[-1]))
             pos_embed = self.image_pos_embed(x)
             x = x + pos_embed
-            x = x.reshape(batch_size, temporal_len * h * w, -1)
+            # Reshape to (batch_size, T * h * w, feature_dim)
+            x = mx.reshape(x, (batch_size, T * h * w, x.shape[-1]))
 
-        # Add temporal embeddings
-        if hasattr(self, "temporal_embeddings"):
-            temp_embed = self.temporal_embeddings[:temporal_len]
-            x = x.reshape(batch_size, temporal_len, -1, x.shape[-1])
-            x = x + temp_embed[:, None, :]
+        if self.visual_temporal_embed is not None:
+            # Reshape for temporal embedding
+            x_temp = mx.reshape(x, (batch_size, T, -1, x.shape[-1]))
+            temporal_input = x_temp[:, :, 0]
+            visual_temporal_embed = self.visual_temporal_embed(temporal_input)
+            # Expand dims for broadcasting
+            visual_temporal_embed = mx.expand_dims(visual_temporal_embed, axis=2)
+            x = mx.reshape(x, (batch_size, T, -1, x.shape[-1])) + visual_temporal_embed
 
-        # Process features according to config
-        features = {}
-        x_reshaped = x.reshape(batch_size, temporal_len, -1, x.shape[-1])
-        features["spatial_avg_pool"] = mx.mean(x_reshaped, axis=2)
-        features["temporal_avg_pool"] = mx.mean(x_reshaped, axis=1)
-        features["last_frame"] = x_reshaped[:, -1]
+        x_feat_dict = {}
 
-        # Combine selected features
-        selected_features = []
-        for source in self.image_feature_source:
-            if source not in features:
-                raise ValueError(f"Invalid image feature source: {source}")
-            selected_features.append(features[source])
+        # Spatial average pooling
+        x_spatial = mx.reshape(x, (batch_size, T, -1, x.shape[-1]))
+        spatial_avg_pool_x = mx.mean(x_spatial, axis=2)
+        x_feat_dict["spatial_avg_pool"] = spatial_avg_pool_x
 
-        x = mx.concatenate(selected_features, axis=1)
+        # Temporal average pooling
+        x_temporal = mx.reshape(x, (batch_size, T, -1, x.shape[-1]))
+        temporal_avg_pool_x = mx.mean(x_temporal, axis=1)
+        x_feat_dict["temporal_avg_pool"] = temporal_avg_pool_x
 
-        # Project to text dimension
+        # Last frame features
+        x_last = mx.reshape(x, (batch_size, T, -1, x.shape[-1]))
+        x = x_last[:, -1]
+        x_feat_dict["last_frame"] = x
+
+        # Gather features based on source configuration
+        new_x = []
+        for _image_feature_source in self.image_feature_source:
+            if _image_feature_source not in x_feat_dict:
+                raise ValueError(
+                    f"invalid image feature source: {_image_feature_source}"
+                )
+            new_x.append(x_feat_dict[_image_feature_source])
+
+        # Concatenate features
+        x = mx.concatenate(new_x, axis=1)
+
+        # Final projection and normalization
+        x = x @ self.image_projection
         x = self.image_proj_norm(x)
 
         return x
@@ -274,14 +300,14 @@ class Model(nn.Module):
         self,
         input_ids=None,
         pixel_values=None,
-        self_attn_cache=None,
-        cross_attn_cache=None,
+        cache=None,
         decoder_input_ids=None,
         decoder_attention_mask=None,
         labels=None,
         **kwargs,
     ):
         """Forward pass."""
+        attention_mask = None
         # Process image if provided
         if pixel_values is not None:
             image_features = self._encode_image(pixel_values)
@@ -310,8 +336,7 @@ class Model(nn.Module):
             decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=decoder_attention_mask,
             labels=labels,
-            self_attn_cache=self_attn_cache,
-            cross_attn_cache=cross_attn_cache,
+            cache=cache,
         )
 
         return outputs
