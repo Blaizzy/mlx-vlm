@@ -72,9 +72,10 @@ class MlpFC(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(in_features, hidden_features)
         self.fc2 = nn.Linear(hidden_features, out_features)
+        self.gelu = nn.GELU()
 
     def __call__(self, x):
-        return self.fc2(nn.gelu(self.fc1(x)))
+        return self.fc2(self.gelu(self.fc1(x)))
 
 
 class Mlp(nn.Module):
@@ -188,6 +189,7 @@ class ConvEmbed(nn.Module):
 
         x = self.proj(x.transpose(0, 2, 3, 1))
         x = x.swapaxes(1, 3)
+
         _, _, H, W = x.shape
 
         # rearrange 'b c h w -> b (h w) c'
@@ -285,8 +287,7 @@ class WindowAttention(nn.Module):
         pad_b = (self.window_size - H % self.window_size) % self.window_size
 
         # MLX padding
-        if pad_r > 0 or pad_b > 0:
-            x = mx.pad(x, [(0, 0), (pad_t, pad_b), (pad_l, pad_r), (0, 0)])
+        x = mx.pad(x, [(0, 0), (pad_t, pad_b), (pad_l, pad_r), (0, 0)])
 
         _, Hp, Wp, _ = x.shape
 
@@ -559,19 +560,15 @@ class VisionModel(nn.Module):
             depth_offset += config.depths[i] * 2
 
     def __call__(self, x):
-        B = x.shape[0]
         input_size = x.shape[2:]
 
         # Process through stages
         for conv, blks in zip(self.convs, self.blocks):
             x, size = conv(x, input_size)
-            for blk in blks:
 
+            for blk in blks:
                 x, size = blk(x, size)
             input_size = size
-
-        # # Global average pooling
-        # x = mx.mean(x, axis=1)
 
         return x
 
@@ -595,7 +592,6 @@ class VisionModel(nn.Module):
                     sanitized_weights[k] = v
             elif "blocks" in k:
                 if "dw.weight" in k:
-
                     sanitized_weights[k] = v.transpose(0, 2, 3, 1)
                 else:
                     sanitized_weights[k] = v
