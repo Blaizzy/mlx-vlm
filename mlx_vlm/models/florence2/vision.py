@@ -111,12 +111,13 @@ class DepthWiseConv2d(nn.Module):
         super().__init__()
 
         self.dw = nn.Conv2d(
-            1,
+            dim_in,
             dim_in,
             kernel_size=kernel_size,
             padding=padding,
             stride=stride,
             bias=bias,
+            groups=dim_in,
         )
 
     def __call__(self, x, size):
@@ -125,27 +126,13 @@ class DepthWiseConv2d(nn.Module):
         assert N == H * W
 
         # Process each channel separately since MLX doesn't have groups
-        x = x.transpose(0, 2, 1).reshape(B, C, H, W)
+        x = x.transpose(0, 2, 1).reshape(B, C, H, W).swapaxes(1, 3)
 
-        # Split channels, apply conv, and recombine
-        channels = [x[:, i : i + 1, :, :] for i in range(C)]
+        x = self.dw(x)
 
-        out_channels = [
-            mx.conv2d(
-                ch.swapaxes(1, 3),
-                self.dw.weight[i : i + 1],
-                self.dw.stride,
-                self.dw.padding,
-            ).swapaxes(1, 3)
-            for i, ch in enumerate(channels)
-        ]
-        if hasattr(self.dw, "bias"):
-            out_channels = [
-                ch + self.dw.bias[i : i + 1, None, None]
-                for i, ch in enumerate(out_channels)
-            ]
+        x = x.transpose(0, 3, 2, 1)
 
-        x = mx.concatenate(out_channels, axis=1)
+        # x = mx.concatenate(out_channels, axis=1)
         size = (x.shape[-2], x.shape[-1])
         x = x.flatten(2).transpose(0, 2, 1)
         return x, size
@@ -185,9 +172,12 @@ class ConvEmbed(nn.Module):
             if self.norm and self.pre_norm:
                 x = self.norm(x)
 
-            x = x.reshape(-1, H, W, x.shape[-1]).transpose(0, 3, 1, 2)
+            x = x.reshape(-1, H, W, x.shape[-1]).swapaxes(1, 2)
+        else:
+            x = x.transpose(0, 2, 3, 1)
 
-        x = self.proj(x.transpose(0, 2, 3, 1))
+        x = self.proj(x)
+
         x = x.swapaxes(1, 3)
 
         _, _, H, W = x.shape
@@ -472,7 +462,7 @@ class Block(nn.Module):
         window_size: int,
         mlp_ratio: float = 4.0,
         qkv_bias: bool = True,
-        drop_path_rate: float = 0.0,
+        drop_path_rate: Tuple[float, float] = (0.0, 0.0),
         conv_at_attn: bool = True,
         conv_at_ffn: bool = True,
     ):
@@ -481,7 +471,7 @@ class Block(nn.Module):
             dim,
             num_heads,
             window_size,
-            drop_path_rate=drop_path_rate,
+            drop_path_rate=drop_path_rate[0],
             qkv_bias=qkv_bias,
             mlp_ratio=mlp_ratio,
             conv_at_attn=conv_at_attn,
@@ -490,7 +480,7 @@ class Block(nn.Module):
         self.channel_block = ChannelBlock(
             dim,
             num_groups,
-            drop_path_rate=drop_path_rate,
+            drop_path_rate=drop_path_rate[1],
             qkv_bias=qkv_bias,
             mlp_ratio=mlp_ratio,
             conv_at_attn=conv_at_attn,
@@ -549,7 +539,7 @@ class VisionModel(nn.Module):
                         config.window_size,
                         config.mlp_ratio,
                         config.qkv_bias,
-                        dpr[depth_offset + j * 2],
+                        (dpr[depth_offset + j * 2], dpr[depth_offset + j * 2 + 1]),
                         config.conv_at_attn,
                         config.conv_at_ffn,
                     )
@@ -564,11 +554,9 @@ class VisionModel(nn.Module):
 
         # Process through stages
         for conv, blks in zip(self.convs, self.blocks):
-            x, size = conv(x, input_size)
-
+            x, input_size = conv(x, input_size)
             for blk in blks:
-                x, size = blk(x, size)
-            input_size = size
+                x, input_size = blk(x, input_size)
 
         return x
 
