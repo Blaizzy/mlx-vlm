@@ -125,14 +125,10 @@ class DepthWiseConv2d(nn.Module):
         H, W = size
         assert N == H * W
 
-        # Process each channel separately since MLX doesn't have groups
-        x = x.transpose(0, 2, 1).reshape(B, C, H, W).swapaxes(1, 3)
+        x = self.dw(x.reshape(B, H, W, C))
 
-        x = self.dw(x)
+        x = x.transpose(0, 3, 1, 2)
 
-        x = x.transpose(0, 3, 2, 1)
-
-        # x = mx.concatenate(out_channels, axis=1)
         size = (x.shape[-2], x.shape[-1])
         x = x.flatten(2).transpose(0, 2, 1)
         return x, size
@@ -172,18 +168,15 @@ class ConvEmbed(nn.Module):
             if self.norm and self.pre_norm:
                 x = self.norm(x)
 
-            x = x.reshape(-1, H, W, x.shape[-1]).swapaxes(1, 2)
+            x = x.reshape(-1, H, W, x.shape[-1])
         else:
             x = x.transpose(0, 2, 3, 1)
 
         x = self.proj(x)
 
-        x = x.swapaxes(1, 3)
+        B, H, W, C = x.shape
 
-        _, _, H, W = x.shape
-
-        # rearrange 'b c h w -> b (h w) c'
-        x = x.transpose(0, 2, 3, 1).reshape(x.shape[0], H * W, x.shape[1])
+        x = x.reshape(B, H * W, C)
 
         if self.norm and not self.pre_norm:
             x = self.norm(x)
@@ -228,7 +221,6 @@ def window_partition(x: mx.array, window_size: int):
     x = mx.reshape(
         x, (B, H // window_size, window_size, W // window_size, window_size, C)
     )
-    # MLX equivalent of permute and contiguous
     windows = mx.reshape(
         mx.transpose(x, (0, 1, 3, 2, 4, 5)), (-1, window_size, window_size, C)
     )
