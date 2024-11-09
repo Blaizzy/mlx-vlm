@@ -209,20 +209,24 @@ class Model(nn.Module):
 
         self.image_feature_source = config.image_feature_source
 
-    def _encode_image(self, pixel_values):
+    def _encode_image(self, pixel_values, extract_features=True):
         """Encode image using vision model and add position embeddings."""
-        batch_size, C, H, W = pixel_values.shape
         T = 1  # Single frame for now
 
         # Get vision features
-        x = self.vision_tower(pixel_values)
+        if extract_features:
+            batch_size, C, H, W = pixel_values.shape
+            x = self.vision_tower(pixel_values)
+        else:
+            x = pixel_values
+            batch_size = pixel_values.shape[0]
 
         # Assuming this is part of a class method, keeping the same structure
         if self.image_pos_embed is not None:
             # Reshape to (batch_size * T, -1, feature_dim)
             x = mx.reshape(x, (batch_size * T, -1, x.shape[-1]))
             num_tokens = x.shape[-2]
-            h, w = int(math.sqrt(num_tokens)), int(math.sqrt(num_tokens))
+            h, w = int(num_tokens**0.5), int(num_tokens**0.5)
             assert h * w == num_tokens, "only support square feature maps for now"
             # Reshape to (batch_size * T, h, w, feature_dim)
             x = mx.reshape(x, (batch_size * T, h, w, x.shape[-1]))
