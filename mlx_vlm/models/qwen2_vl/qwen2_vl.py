@@ -80,8 +80,6 @@ class Model(nn.Module):
         image_indices = np.where(image_positions)[1].tolist()
         inputs_embeds[:, image_indices, :] = image_features
 
-        # TODO: Add video features
-
         return inputs_embeds
 
     def __call__(
