@@ -903,7 +903,7 @@ def generate_step(
         )
         cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
 
-    repetition_context = input_ids.tolist()
+    repetition_context = input_ids.tolist()[0]
 
     if repetition_context_size:
         repetition_context = repetition_context[-repetition_context_size:]
@@ -1020,7 +1020,7 @@ def generate(
     verbose: bool = False,
     formatter: Optional[Callable] = None,
     repetition_penalty: Optional[float] = None,
-    repetition_context_size: Optional[int] = None,
+    repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
     **kwargs,
 ) -> str:
