@@ -29,7 +29,7 @@ class TextConfig:
     use_cache: bool = True
     pad_token_id: int = -1
     rope: bool = True
-    rope_theta: float = 10000.0
+    rope_theta: float = 1000000.0
     weight_tying: bool = False
     additional_vocab_size: Optional[int] = 128
 
@@ -151,41 +151,77 @@ class MolmoMLP(nn.Module):
         return x
 
 
+class SwiGLU(nn.Module):
+    def __call__(self, x: mx.array) -> mx.array:
+        x, gate = mx.split(x, 2, axis=-1)
+        return nn.silu(gate) * x
+
+
 class MolmoBlock(nn.Module):
-    def __init__(self, config: TextConfig, layer_id: int):
+    def __init__(self, config: TextConfig):
         super().__init__()
         self.attn_out = nn.Linear(config.d_model, config.d_model, bias=False)
         self.ff_out = nn.Linear(18944, config.d_model, bias=False)
-        self.rotary_emb = RotaryEmbedding(config)
+        self.rotary_emb = nn.RoPE(
+            config.d_model, traditional=False, base=config.rope_theta, scale=1
+        )
         self.attn_norm = nn.RMSNorm(config.d_model, eps=config.layer_norm_eps)
         self.ff_norm = nn.RMSNorm(config.d_model, eps=config.layer_norm_eps)
         self.att_proj = nn.Linear(config.d_model, 4608, bias=True)
-        self.ff_proj = nn.Linear(config.d_model, config.mlp_hidden_size, bias=False)
+        self.ff_proj = nn.Linear(config.d_model, 37888, bias=False)
         self.scale = 1 / math.sqrt(config.d_model)
+        self.n_heads = config.n_heads
+        self.d_head = config.d_model // config.n_heads
+        self.n_kv_heads = config.n_kv_heads
+        head_dim = config.d_model // config.n_heads
+        self.fused_dims = (
+            config.d_model,
+            config.n_kv_heads * head_dim,
+            config.n_kv_heads * head_dim,
+        )
+        self.act = SwiGLU()
 
-    def __call__(self, x, attention_mask=None):
+    def __call__(self, x, attention_mask=None, cache=None):
+        batch_size, seq_len, D = x.shape
         residual = x
         x = self.attn_norm(x)
         qkv = self.att_proj(x)
-        q, k, v = mx.split(qkv, 3, axis=-1)
+        q, k, v = mx.split(
+            qkv, [self.fused_dims[0], self.fused_dims[0] + self.fused_dims[1]], axis=-1
+        )
+
+        q = q.reshape(batch_size, seq_len, self.n_heads, D // self.n_heads).transpose(
+            0, 2, 1, 3
+        )
+        k = k.reshape(
+            batch_size, seq_len, self.n_kv_heads, D // self.n_heads
+        ).transpose(0, 2, 1, 3)
+        v = v.reshape(
+            batch_size, seq_len, self.n_kv_heads, D // self.n_heads
+        ).transpose(0, 2, 1, 3)
 
         # Apply rotary embeddings
-        seq_len = x.shape[1]
-        q = self.rotary_emb(q, seq_len)
-        k = self.rotary_emb(k, seq_len)
+        if cache is not None:
+            q = self.rotary_emb(q, cache.offset)
+            k = self.rotary_emb(k, cache.offset)
+            k, v = cache.update_and_fetch(k, v)
+        else:
+            q = self.rotary_emb(q, k.shape[2])
+            k = self.rotary_emb(k, k.shape[2])
 
         # Perform attention
         attn_output = mx.fast.scaled_dot_product_attention(
             q, k, v, scale=self.scale, mask=attention_mask
         )
+        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, D)
         attn_output = self.attn_out(attn_output)
-        x = residual + self.dropout(attn_output)
+        x = residual + attn_output
 
         # Feed-forward layer
         residual = x
         x = self.ff_norm(x)
         x = self.ff_proj(x)
-        x = nn.silu(x)
+        x = self.act(x)
         x = self.ff_out(x)
         x = residual + x
 
@@ -228,7 +264,7 @@ class Molmo(nn.Module):
 
         self.drop = nn.Dropout(config.embedding_dropout)
 
-        self.blocks = [MolmoBlock(config, i) for i in range(config.n_layers)]
+        self.blocks = [MolmoBlock(config) for _ in range(config.n_layers)]
 
         self.ln_f = nn.RMSNorm(config.d_model, eps=config.layer_norm_eps)
 
@@ -242,6 +278,7 @@ class Molmo(nn.Module):
         cache: Optional[List[Tuple[mx.array, mx.array]]] = None,
         inputs_embeds: Optional[mx.array] = None,
     ) -> LanguageModelOutput:
+
         if inputs_embeds is None:
             h = self.wte(input_ids)
         else:
@@ -250,7 +287,7 @@ class Molmo(nn.Module):
         if cache is None:
             cache = [None] * self.config.n_layers
 
-        mask = create_attention_mask(mask)
+        mask = create_attention_mask(h)
 
         for i, (block, c) in enumerate(zip(self.blocks, cache)):
             h = block(h, mask, c)

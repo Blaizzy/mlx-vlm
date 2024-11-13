@@ -239,7 +239,8 @@ class VisionModel(nn.Module):
 
         return image_features, cls_embed
 
-    def sanitize(self, weights):
+    @staticmethod
+    def sanitize(weights):
         sanitized_weights = {}
         for k, v in weights.items():
             if "position_ids" in k:
