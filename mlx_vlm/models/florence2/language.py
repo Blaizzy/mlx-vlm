@@ -45,31 +45,6 @@ class TextConfig:
         )
 
 
-class Florence2LearnedPositionalEmbedding(nn.Embedding):
-    """
-    This module learns positional embeddings up to a fixed maximum size.
-    """
-
-    def __init__(self, num_embeddings: int, embedding_dim: int):
-        # Florence2 is set up so that if padding_idx is specified then offset the embedding ids by 2
-        # and adjust num_embeddings appropriately. Other models don't have this hack
-        self.offset = 2
-        super().__init__(num_embeddings + self.offset, embedding_dim)
-
-    def __call__(self, input_ids: mx.array, past_key_values_length: int = 0):
-        """`input_ids' shape is expected to be [bsz x seqlen]."""
-
-        bsz, seq_len = input_ids.shape[:2]
-        positions = mx.arange(
-            past_key_values_length,
-            past_key_values_length + seq_len,
-            dtype=mx.int64,
-        )
-        positions = mx.expand_dims(positions, axis=0)
-
-        return super().__call__(positions + self.offset)
-
-
 class Florence2Attention(nn.Module):
     def __init__(
         self, config: TextConfig, is_decoder: bool = False, is_causal: bool = False
@@ -284,9 +259,9 @@ class Florence2Encoder(nn.Module):
 
         embed_dim = config.d_model
         self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
-
-        self.embed_positions = Florence2LearnedPositionalEmbedding(
-            config.max_position_embeddings, embed_dim
+        self.offset = 2
+        self.embed_positions = nn.Embedding(
+            config.max_position_embeddings + self.offset, embed_dim
         )
         self.layers = [
             Florence2EncoderLayer(config) for _ in range(config.encoder_layers)
@@ -306,7 +281,7 @@ class Florence2Encoder(nn.Module):
         if positions.ndim == 1:
             positions = mx.expand_dims(positions, axis=0)
 
-        embed_pos = self.embed_positions(positions)
+        embed_pos = self.embed_positions(positions + self.offset)
 
         hidden_states = inputs_embeds + embed_pos
         hidden_states = self.layernorm_embedding(hidden_states)
@@ -330,9 +305,9 @@ class Florence2Decoder(nn.Module):
         self.padding_idx = config.pad_token_id
         self.max_target_positions = config.max_position_embeddings
         self.embed_scale = math.sqrt(config.d_model) if config.scale_embedding else 1.0
-
-        self.embed_positions = Florence2LearnedPositionalEmbedding(
-            config.max_position_embeddings, config.d_model
+        self.offset = 2
+        self.embed_positions = nn.Embedding(
+            config.max_position_embeddings + self.offset, config.d_model
         )
         self.layers = [
             Florence2DecoderLayer(config) for _ in range(config.decoder_layers)
@@ -370,8 +345,15 @@ class Florence2Decoder(nn.Module):
             positions = mx.expand_dims(positions, axis=0)
 
         cache_length = cache[0][0].keys.shape[2] if cache[0][0].cache_length > 0 else 0
+        bsz, seq_len = inputs_embeds.shape[:2]
+        positions = mx.arange(
+            cache_length,
+            cache_length + seq_len,
+            dtype=mx.int64,
+        )
+        positions = mx.expand_dims(positions, axis=0)
 
-        embed_pos = self.embed_positions(positions, cache_length)
+        embed_pos = self.embed_positions(positions + self.offset)
 
         hidden_states = inputs_embeds + embed_pos
         hidden_states = self.layernorm_embedding(hidden_states)
