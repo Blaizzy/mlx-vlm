@@ -110,7 +110,6 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, position_ids, mrope_section)
 
     mrope_section = np.cumsum(mrope_section * 2)[:-1].tolist()
 
-    position_ids = position_ids.tolist()
     cos = cos[position_ids]
     sin = sin[position_ids]
 
@@ -127,7 +126,7 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, position_ids, mrope_section)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
 
-    return mx.array(q_embed), mx.array(k_embed)
+    return q_embed, k_embed
 
 
 class Attention(nn.Module):
@@ -182,7 +181,7 @@ class Attention(nn.Module):
             position_ids = mx.arange(0, L)
 
         position_ids = mx.expand_dims(position_ids, axis=0)
-        position_ids = np.tile(position_ids, (3, 1, 1))
+        position_ids = mx.tile(position_ids, (3, 1, 1))
 
         cos, sin = self.rotary_emb(values, kv_seq_len)
 
