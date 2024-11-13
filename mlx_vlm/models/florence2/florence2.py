@@ -21,6 +21,7 @@ class ModelConfig:
 
     vision_config: VisionConfig
     text_config: TextConfig
+    model_type: str = "florence2"
     vocab_size: int = 50265
     max_position_embeddings: int = 1024
     pad_token_id: int = 1
@@ -279,26 +280,25 @@ class Model(nn.Module):
 
         return x
 
-    def _merge_input_ids_with_image_features(
-        self, image_features, inputs_embeds=None, attention_mask=None
-    ):
-        """Merge text embeddings with image features."""
-        batch_size = image_features.shape[0]
-        image_token_len = image_features.shape[1]
-
-        # Create attention mask for image tokens
-        image_attention_mask = mx.ones((batch_size, image_token_len))
+    def _merge_input_ids_with_image_features(self, image_features, inputs_embeds=None):
+        batch_size, image_token_length, _ = image_features.shape
+        image_attention_mask = mx.ones((batch_size, image_token_length))
 
         if inputs_embeds is None:
             return image_features, image_attention_mask
 
-        # Merge embeddings and attention masks
-        merged_embeds = mx.concatenate([image_features, inputs_embeds], axis=1)
-        merged_attention_mask = mx.concatenate(
-            [image_attention_mask, attention_mask], axis=1
-        )
+        task_prefix_embeds = inputs_embeds
+        task_prefix_attention_mask = mx.ones((batch_size, task_prefix_embeds.shape[1]))
 
-        return merged_embeds, merged_attention_mask
+        if len(task_prefix_attention_mask.shape) == 3:
+            task_prefix_attention_mask = task_prefix_attention_mask[:, 0]
+
+        # Concatenate image features and task prefix embeddings
+        inputs_embeds = mx.concatenate([image_features, task_prefix_embeds], axis=1)
+        attention_mask = mx.concatenate(
+            [image_attention_mask, task_prefix_attention_mask], axis=1
+        )
+        return inputs_embeds, attention_mask
 
     def __call__(
         self,
@@ -312,6 +312,8 @@ class Model(nn.Module):
     ):
         """Forward pass."""
         attention_mask = None
+        decoder_inputs_embeds = None
+
         # Process image if provided
         if pixel_values is not None:
             image_features = self._encode_image(pixel_values)
@@ -319,11 +321,11 @@ class Model(nn.Module):
             # Get input embeddings if needed
             inputs_embeds = None
             if input_ids is not None:
-                inputs_embeds = self.language_model.shared(input_ids)
+                inputs_embeds = self.language_model.model.shared(input_ids)
 
             # Merge image features with text embeddings
             inputs_embeds, attention_mask = self._merge_input_ids_with_image_features(
-                image_features, inputs_embeds, decoder_attention_mask
+                image_features, inputs_embeds
             )
 
         # Handle decoder input IDs
@@ -332,14 +334,25 @@ class Model(nn.Module):
                 labels, self.config.pad_token_id, self.config.bos_token_id
             )
 
+        if decoder_input_ids is None and decoder_inputs_embeds is None:
+            decoder_start_token_id = getattr(
+                self.config, "decoder_start_token_id", 0
+            )  # 2 is common for many models
+            if decoder_start_token_id is None:
+                decoder_start_token_id = 0
+
+            decoder_input_ids = mx.array([decoder_start_token_id])[None, :]
+            decoder_inputs_embeds = self.language_model.model.shared(decoder_input_ids)
+            decoder_input_ids = None
+
         # Forward through language model
         outputs = self.language_model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
+            decoder_inputs_embeds=decoder_inputs_embeds,
             decoder_attention_mask=decoder_attention_mask,
-            labels=labels,
             cache=cache,
         )
 

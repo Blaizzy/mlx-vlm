@@ -552,7 +552,8 @@ class VisionModel(nn.Module):
 
         return x
 
-    def sanitize(self, weights):
+    @staticmethod
+    def sanitize(weights):
         sanitized_weights = {}
         for k, v in weights.items():
             if "position_ids" in k:
@@ -572,7 +573,9 @@ class VisionModel(nn.Module):
                     sanitized_weights[k] = v
             elif "blocks" in k:
                 if "dw.weight" in k:
-                    sanitized_weights[k] = v.transpose(0, 2, 3, 1)
+                    sanitized_weights[k] = (
+                        v.transpose(0, 2, 3, 1) if v.shape[1] < v.shape[-1] else v
+                    )
                 else:
                     sanitized_weights[k] = v
             else:
