@@ -881,7 +881,7 @@ def generate_step(
             if isinstance(model.language_model.n_kv_heads, int)
             else model.language_model.n_kv_heads
         )
-        if model.language_model.config.model_type == "florence2":
+        if model.config.model_type == "florence2":
             cache = [
                 (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
             ]
@@ -895,12 +895,20 @@ def generate_step(
 
     def _step(y, **kwargs):
         nonlocal repetition_context
-        outputs = model.language_model(
-            y[None],
-            cache=cache,
-            mask=mask,
-            **kwargs,
-        )
+        if "decoder_input_ids" in kwargs:
+            outputs = model.language_model(
+                cache=cache,
+                **kwargs,
+            )
+        else:
+
+            outputs = model.language_model(
+                y[None],
+                cache=cache,
+                mask=mask,
+                **kwargs,
+            )
+
         logits = outputs.logits[:, -1, :]
 
         if repetition_penalty:
@@ -918,6 +926,11 @@ def generate_step(
         return y, logprobs.squeeze(0)
 
     outputs = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
+
+    logits = outputs.logits[:, -1, :]
+    y, logprobs = sample(logits)
+    mx.async_eval(y)
+
     if outputs.cross_attention_states is not None:
         kwargs = {
             k: v
@@ -925,15 +938,19 @@ def generate_step(
                 ["cross_attention_states"], [outputs.cross_attention_states]
             )
         }
+    elif outputs.encoder_outputs is not None:
+        kwargs = {
+            "decoder_input_ids": y[None],
+            "encoder_outputs": outputs.encoder_outputs,
+        }
     else:
         kwargs = {}
 
-    logits = outputs.logits[:, -1, :]
-    y, logprobs = sample(logits)
-    mx.async_eval(y)
     while True:
         next_y, next_logprobs = _step(y, **kwargs)
         mx.async_eval(next_y)
+        if "decoder_input_ids" in kwargs:
+            kwargs["decoder_input_ids"] = next_y[None]
         yield y.item(), logprobs
         y, logprobs = next_y, next_logprobs
 
