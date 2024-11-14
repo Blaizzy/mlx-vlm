@@ -11,12 +11,14 @@ from ..base import KVCache, LanguageModelOutput, create_attention_mask
 
 @dataclass
 class TextConfig:
+    max_position_embeddings: int = 4096
     d_model: int = 3584
     n_heads: int = 28
     n_kv_heads: int = 4
     n_layers: int = 28
     mlp_ratio: int = 4
     max_sequence_length: int = 1024
+    act_output_multiplier: int = 0.5
     mlp_hidden_size: int = 37888
     vocab_size: int = 152064
     embedding_size: Optional[int] = 152064
@@ -26,11 +28,12 @@ class TextConfig:
     embedding_dropout: float = 0.1
     layer_norm_eps: float = 1e-5
     initializer_range: float = 0.02
-    use_cache: bool = True
     pad_token_id: int = -1
     rope: bool = True
     rope_theta: float = 1000000.0
     weight_tying: bool = False
+    rope_full_precision: bool = True
+    rope_impl: str = "interleave"
     additional_vocab_size: Optional[int] = 128
 
     @classmethod
@@ -45,110 +48,95 @@ class TextConfig:
 
 
 class RotaryEmbedding(nn.Module):
+    """
+    MLX implementation of Rotary positional embeddings (RoPE) without caching.
+    """
+
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
-        self.inv_freq = None
 
-    def _compute_inv_freq(self, seq_len):
+    def get_rotary_embedding(self, seq_len: int) -> Tuple[mx.array, mx.array]:
+        # Computing rotary embeddings
         dim = self.config.d_model // self.config.n_heads
         inv_freq = 1.0 / (self.config.rope_theta ** (mx.arange(0, dim, 2) / dim))
-        return inv_freq
+        seq = mx.arange(seq_len, dtype=mx.float32)
+        freqs = mx.einsum("i,j->ij", seq, inv_freq)
 
-    def _get_rotary_embedding(self, seq_len):
-        if self.inv_freq is None or self.inv_freq.shape[0] < seq_len:
-            self.inv_freq = self._compute_inv_freq(seq_len)
+        if self.config.rope_impl == "interleave":
+            # Simulate repeat_interleave
+            positions = mx.concatenate(
+                [freqs.reshape(-1, 1), freqs.reshape(-1, 1)], axis=1
+            ).reshape(seq_len, -1)
+        else:
+            positions = mx.concatenate([freqs, freqs], axis=-1)
 
-        t = mx.arange(seq_len)
-        freqs = mx.einsum("i,j->ij", t, self.inv_freq)
-        emb = mx.concat([freqs, freqs], axis=-1)
-        return emb.cos(), emb.sin()
+        pos_sin = mx.sin(positions)[None, None, :, :]
+        pos_cos = mx.cos(positions)[None, None, :, :]
+        return pos_sin, pos_cos
 
-    def rotate_half(self, x):
-        x1, x2 = mx.split(x, 2, axis=-1)
-        return mx.concat([-x2, x1], axis=-1)
+    def rotate_half(self, x: mx.array) -> mx.array:
+        B, nh, T, hs = x.shape
+        x = x.reshape(B, nh, T, 2, hs // 2)
+        x1, x2 = x[:, :, :, 0], x[:, :, :, 1]
+        return mx.concatenate([-x2, x1], axis=-1)
 
-    def apply_rotary_pos_emb(self, q, k, cos, sin):
-        q = (q * cos) + (self.rotate_half(q) * sin)
-        k = (k * cos) + (self.rotate_half(k) * sin)
-        return q, k
+    def rotate_every_two(self, x: mx.array) -> mx.array:
+        B, nh, T, hs = x.shape
+        x = x.reshape(B, nh, T, hs // 2, 2)
+        x1, x2 = x[:, :, :, :, 0], x[:, :, :, :, 1]
+        x = mx.stack([-x2, x1], axis=-1)
+        return x.reshape(B, nh, T, hs)
 
-    def __call__(self, q, k, seq_len):
-        cos, sin = self._get_rotary_embedding(seq_len)
-        return self.apply_rotary_pos_emb(q, k, cos, sin)
-
-
-class MolmoAttention(nn.Module):
-    def __init__(self, config: TextConfig):
-        super().__init__()
-        self.config = config
-        self.n_heads = config.n_heads
-        self.d_head = config.d_model // config.n_heads
-
-        self.q_proj = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.k_proj = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.v_proj = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.o_proj = nn.Linear(config.d_model, config.d_model, bias=False)
-
-        self.rotary_emb = RotaryEmbedding(config)
-        self.attention_dropout = nn.Dropout(config.attention_dropout)
+    def apply_rotary_pos_emb(
+        self, pos_sin: mx.array, pos_cos: mx.array, t: mx.array
+    ) -> mx.array:
+        if self.config.rope_impl == "interleave":
+            return (t * pos_cos) + (self.rotate_every_two(t) * pos_sin)
+        else:
+            return (t * pos_cos) + (self.rotate_half(t) * pos_sin)
 
     def __call__(
-        self,
-        x: mx.array,
-        attention_mask: Optional[mx.array] = None,
-        cache: Optional[Tuple[mx.array, mx.array]] = None,
-    ) -> mx.array:
-        batch_size, seq_len, _ = x.shape
-
-        q = (
-            self.q_proj(x)
-            .reshape(batch_size, seq_len, self.n_heads, self.d_head)
-            .transpose(0, 2, 1, 3)
-        )
-        k = (
-            self.k_proj(x)
-            .reshape(batch_size, seq_len, self.n_heads, self.d_head)
-            .transpose(0, 2, 1, 3)
-        )
-        v = (
-            self.v_proj(x)
-            .reshape(batch_size, seq_len, self.n_heads, self.d_head)
-            .transpose(0, 2, 1, 3)
+        self, q: mx.array, k: mx.array, position_ids: Optional[mx.array] = None
+    ) -> Tuple[mx.array, mx.array]:
+        # Handle precision
+        q_, k_ = (
+            (q.astype(mx.float32), k.astype(mx.float32))
+            if self.config.rope_full_precision
+            else (q, k)
         )
 
-        if cache is not None:
-            q, k = self.rotary_emb(q, k, cache.offset)
-            k, v = cache.update_and_fetch(k, v)
+        batch_size = q_.shape[0]
+        query_len, key_len = q_.shape[-2], k_.shape[-2]
+
+        if position_ids is not None:
+            freqs_cis_len = self.config.max_position_embeddings
         else:
-            if self.config.rope:
-                q, k = self.rotary_emb(q, k, k.shape[2])
+            freqs_cis_len = key_len
 
-        attn = mx.matmul(q, k.transpose(0, 1, 3, 2)) / math.sqrt(self.d_head)
+        pos_sin, pos_cos = self.get_rotary_embedding(freqs_cis_len)
+        pos_sin = pos_sin.astype(q_.dtype)
+        pos_cos = pos_cos.astype(q_.dtype)
 
-        if attention_mask is not None:
-            attn = attn + attention_mask
+        if position_ids is not None:
+            assert (
+                query_len == key_len
+            ), "Query and key lengths must be equal when using position IDs."
+            pos_sin = pos_sin[0, 0][position_ids].reshape(
+                batch_size, 1, key_len, pos_sin.shape[-1]
+            )
+            pos_cos = pos_cos[0, 0][position_ids].reshape(
+                batch_size, 1, key_len, pos_cos.shape[-1]
+            )
 
-        attn = mx.softmax(attn, axis=-1)
-        attn = self.attention_dropout(attn)
+        q_ = self.apply_rotary_pos_emb(
+            pos_sin[:, :, key_len - query_len : key_len, :],
+            pos_cos[:, :, key_len - query_len : key_len, :],
+            q_,
+        )
+        k_ = self.apply_rotary_pos_emb(pos_sin, pos_cos, k_)
 
-        output = mx.matmul(attn, v)
-        output = output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
-        output = self.o_proj(output)
-        return output
-
-
-class MolmoMLP(nn.Module):
-    def __init__(self, config: TextConfig):
-        super().__init__()
-        self.fc1 = nn.Linear(config.d_model, config.d_model * config.mlp_ratio)
-        self.fc2 = nn.Linear(config.d_model * config.mlp_ratio, config.d_model)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        x = self.fc1(x)
-        x = nn.silu(x)
-        x = self.fc2(x)
-        return x
+        return q_, k_
 
 
 class SwiGLU(nn.Module):
@@ -161,31 +149,33 @@ class MolmoBlock(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.attn_out = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.ff_out = nn.Linear(18944, config.d_model, bias=False)
-        self.rotary_emb = nn.RoPE(
-            config.d_model, traditional=False, base=config.rope_theta, scale=1
+        self.ff_out = nn.Linear(
+            int(config.act_output_multiplier * config.mlp_hidden_size),
+            config.d_model,
+            bias=False,
         )
+        self.rotary_emb = RotaryEmbedding(config)
         self.attn_norm = nn.RMSNorm(config.d_model, eps=config.layer_norm_eps)
         self.ff_norm = nn.RMSNorm(config.d_model, eps=config.layer_norm_eps)
-        self.att_proj = nn.Linear(config.d_model, 4608, bias=True)
-        self.ff_proj = nn.Linear(config.d_model, 37888, bias=False)
-        self.scale = 1 / math.sqrt(config.d_model)
-        self.n_heads = config.n_heads
-        self.d_head = config.d_model // config.n_heads
-        self.n_kv_heads = config.n_kv_heads
+        self.ff_proj = nn.Linear(config.d_model, config.mlp_hidden_size, bias=False)
         head_dim = config.d_model // config.n_heads
+        self.scale = head_dim**-0.5
+        self.n_heads = config.n_heads
+        self.n_kv_heads = config.n_kv_heads
         self.fused_dims = (
             config.d_model,
             config.n_kv_heads * head_dim,
             config.n_kv_heads * head_dim,
         )
+        self.att_proj = nn.Linear(config.d_model, sum(self.fused_dims), bias=True)
         self.act = SwiGLU()
 
-    def __call__(self, x, attention_mask=None, cache=None):
+    def __call__(self, x, mask=None, cache=None):
         batch_size, seq_len, D = x.shape
-        residual = x
-        x = self.attn_norm(x)
-        qkv = self.att_proj(x)
+        attn_in = self.attn_norm(x)
+
+        qkv = self.att_proj(attn_in)
+
         q, k, v = mx.split(
             qkv, [self.fused_dims[0], self.fused_dims[0] + self.fused_dims[1]], axis=-1
         )
@@ -201,29 +191,38 @@ class MolmoBlock(nn.Module):
         ).transpose(0, 2, 1, 3)
 
         # Apply rotary embeddings
+        position_ids = mx.arange(seq_len)
+
+        q, k = self.rotary_emb(q, k, position_ids)
         if cache is not None:
-            q = self.rotary_emb(q, cache.offset)
-            k = self.rotary_emb(k, cache.offset)
             k, v = cache.update_and_fetch(k, v)
-        else:
-            q = self.rotary_emb(q, k.shape[2])
-            k = self.rotary_emb(k, k.shape[2])
+
+        if mask is not None:
+            mask = mask[None, None, :, :]
+            mask = mask[:, :, :, : k.shape[-2]]
+
+        if self.n_heads != self.n_kv_heads:
+            assert self.n_heads % self.n_kv_heads == 0
+            repeats = self.n_heads // self.n_kv_heads
+            k = mx.repeat(k, repeats, axis=1)
+            v = mx.repeat(v, repeats, axis=1)
 
         # Perform attention
-        attn_output = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.scale, mask=attention_mask
-        )
-        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, D)
-        attn_output = self.attn_out(attn_output)
-        x = residual + attn_output
+        att = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
+        att = att.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, D)
+        att = self.attn_out(att)
+
+        # Add attention scores
+        # shape: (batch_size, seq_len, d_model)
+        x = x + att
 
         # Feed-forward layer
-        residual = x
+        og_x = x
         x = self.ff_norm(x)
         x = self.ff_proj(x)
         x = self.act(x)
         x = self.ff_out(x)
-        x = residual + x
+        x = og_x + x
 
         return x
 
@@ -287,9 +286,10 @@ class Molmo(nn.Module):
         if cache is None:
             cache = [None] * self.config.n_layers
 
-        mask = create_attention_mask(h)
+        if mask is None:
+            mask = create_attention_mask(h)
 
-        for i, (block, c) in enumerate(zip(self.blocks, cache)):
+        for block, c in zip(self.blocks, cache):
             h = block(h, mask, c)
 
         h = self.ln_f(h)
@@ -316,7 +316,6 @@ class LanguageModel(nn.Module):
         cache: Optional[List[Tuple[mx.array, mx.array]]] = None,
     ) -> LanguageModelOutput:
         outputs = self.model(input_ids, mask, cache, inputs_embeds)
-
         return outputs
 
     @staticmethod
