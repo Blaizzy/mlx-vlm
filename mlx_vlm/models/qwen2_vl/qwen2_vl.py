@@ -92,6 +92,10 @@ class Model(nn.Module):
     ):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         image_grid_thw = mx.array(image_grid_thw)
+
+        dtype = self.vision_tower.patch_embed.proj.weight.dtype
+        pixel_values = pixel_values.astype(dtype)
+
         input_embddings = self.get_input_embeddings(
             input_ids, pixel_values, image_grid_thw
         )
