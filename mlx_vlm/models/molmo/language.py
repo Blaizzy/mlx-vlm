@@ -75,10 +75,10 @@ class RotaryEmbedding(nn.Module):
         pos_cos = mx.cos(positions)[None, None, :, :]
         return pos_sin, pos_cos
 
-    def rotate_half(self, x: mx.array) -> mx.array:
-        B, nh, T, hs = x.shape
-        x = x.reshape(B, nh, T, 2, hs // 2)
-        x1, x2 = x[:, :, :, 0], x[:, :, :, 1]
+    def rotate_half(self, x):
+        """Rotates half the hidden dims of the input."""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
         return mx.concatenate([-x2, x1], axis=-1)
 
     def rotate_every_two(self, x: mx.array) -> mx.array:
@@ -99,12 +99,9 @@ class RotaryEmbedding(nn.Module):
     def __call__(
         self, q: mx.array, k: mx.array, position_ids: Optional[mx.array] = None
     ) -> Tuple[mx.array, mx.array]:
+
         # Handle precision
-        q_, k_ = (
-            (q.astype(mx.float32), k.astype(mx.float32))
-            if self.config.rope_full_precision
-            else (q, k)
-        )
+        q_, k_ = (q, k)
 
         batch_size = q_.shape[0]
         query_len, key_len = q_.shape[-2], k_.shape[-2]
@@ -115,8 +112,6 @@ class RotaryEmbedding(nn.Module):
             freqs_cis_len = key_len
 
         pos_sin, pos_cos = self.get_rotary_embedding(freqs_cis_len)
-        pos_sin = pos_sin.astype(q_.dtype)
-        pos_cos = pos_cos.astype(q_.dtype)
 
         if position_ids is not None:
             assert (
@@ -191,21 +186,15 @@ class MolmoBlock(nn.Module):
         ).transpose(0, 2, 1, 3)
 
         # Apply rotary embeddings
-        position_ids = mx.arange(seq_len)
+        if cache is not None and cache.offset > 0:
+            position_ids = mx.array([cache.offset])
+        else:
+            position_ids = mx.arange(seq_len)
 
         q, k = self.rotary_emb(q, k, position_ids)
+
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
-
-        if mask is not None:
-            mask = mask[None, None, :, :]
-            mask = mask[:, :, :, : k.shape[-2]]
-
-        if self.n_heads != self.n_kv_heads:
-            assert self.n_heads % self.n_kv_heads == 0
-            repeats = self.n_heads // self.n_kv_heads
-            k = mx.repeat(k, repeats, axis=1)
-            v = mx.repeat(v, repeats, axis=1)
 
         # Perform attention
         att = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
@@ -252,6 +241,50 @@ class Embedding(nn.Module):
         return mx.concat([self.embedding, self.new_embedding], axis=0)[x]
 
 
+def causal_attention_bias(seq_len: int) -> mx.array:
+    """
+    Create a causal attention bias matrix where future tokens cannot attend to past tokens.
+
+    Args:
+        seq_len: Length of the sequence
+
+    Returns:
+        mx.array: A (1, 1, seq_len, seq_len) shaped attention bias matrix where
+                 upper triangle values are set to negative infinity
+    """
+    # Create a sequence of indices
+    rows = mx.arange(seq_len)
+    cols = mx.arange(seq_len)
+
+    # Create a matrix where upper triangle should be masked
+    mask = rows[:, None] >= cols[None, :]
+
+    # Convert to float and set upper triangle to negative infinity
+    att_bias = mx.where(mask, 0.0, float("-inf"))
+
+    # Reshape to (1, 1, seq_len, seq_len) for broadcasting in attention computation
+    return att_bias.reshape(1, 1, seq_len, seq_len)
+
+
+def get_causal_attention_bias(seq_len: int) -> mx.array:
+    """
+    Retrieve or compute causal attention bias matrix.
+
+    Args:
+        cache: Dictionary to store/retrieve computed attention bias
+        seq_len: Length of the sequence
+
+    Returns:
+        mx.array: Causal attention bias matrix of shape (1, 1, seq_len, seq_len)
+    """
+    # Check if we have a cached bias matrix of sufficient size
+
+    # Generate new causal attention bias
+    causal_bias = causal_attention_bias(seq_len)
+
+    return causal_bias
+
+
 class Molmo(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -260,8 +293,6 @@ class Molmo(nn.Module):
         self.wte = Embedding(
             config.embedding_size, config.additional_vocab_size, config.d_model
         )
-
-        self.drop = nn.Dropout(config.embedding_dropout)
 
         self.blocks = [MolmoBlock(config) for _ in range(config.n_layers)]
 
@@ -273,9 +304,9 @@ class Molmo(nn.Module):
     def __call__(
         self,
         input_ids: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[List[Tuple[mx.array, mx.array]]] = None,
         inputs_embeds: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
+        cache: Optional[KVCache] = None,
     ) -> LanguageModelOutput:
 
         if inputs_embeds is None:
@@ -313,9 +344,9 @@ class LanguageModel(nn.Module):
         input_ids: mx.array,
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
-        cache: Optional[List[Tuple[mx.array, mx.array]]] = None,
+        cache: Optional[KVCache] = None,
     ) -> LanguageModelOutput:
-        outputs = self.model(input_ids, mask, cache, inputs_embeds)
+        outputs = self.model(input_ids, inputs_embeds, mask, cache)
         return outputs
 
     @staticmethod
