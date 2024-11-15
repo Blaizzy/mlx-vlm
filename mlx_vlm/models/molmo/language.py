@@ -241,50 +241,6 @@ class Embedding(nn.Module):
         return mx.concat([self.embedding, self.new_embedding], axis=0)[x]
 
 
-def causal_attention_bias(seq_len: int) -> mx.array:
-    """
-    Create a causal attention bias matrix where future tokens cannot attend to past tokens.
-
-    Args:
-        seq_len: Length of the sequence
-
-    Returns:
-        mx.array: A (1, 1, seq_len, seq_len) shaped attention bias matrix where
-                 upper triangle values are set to negative infinity
-    """
-    # Create a sequence of indices
-    rows = mx.arange(seq_len)
-    cols = mx.arange(seq_len)
-
-    # Create a matrix where upper triangle should be masked
-    mask = rows[:, None] >= cols[None, :]
-
-    # Convert to float and set upper triangle to negative infinity
-    att_bias = mx.where(mask, 0.0, float("-inf"))
-
-    # Reshape to (1, 1, seq_len, seq_len) for broadcasting in attention computation
-    return att_bias.reshape(1, 1, seq_len, seq_len)
-
-
-def get_causal_attention_bias(seq_len: int) -> mx.array:
-    """
-    Retrieve or compute causal attention bias matrix.
-
-    Args:
-        cache: Dictionary to store/retrieve computed attention bias
-        seq_len: Length of the sequence
-
-    Returns:
-        mx.array: Causal attention bias matrix of shape (1, 1, seq_len, seq_len)
-    """
-    # Check if we have a cached bias matrix of sufficient size
-
-    # Generate new causal attention bias
-    causal_bias = causal_attention_bias(seq_len)
-
-    return causal_bias
-
-
 class Molmo(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
