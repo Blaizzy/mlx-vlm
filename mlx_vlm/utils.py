@@ -171,12 +171,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         }
     if model_type == "molmo":
         intermediate_size = None
+        skip_vision = False
         if "vision_config" in config and "intermediate_size" in config["vision_config"]:
             intermediate_size = config["vision_config"]["intermediate_size"]
+            skip_vision = config["vision_config"].get("skip_vision", False)
 
         config["text_config"] = asdict(model_class.TextConfig())
         config["vision_config"] = asdict(model_class.VisionConfig())
         config["vision_config"]["intermediate_size"] = intermediate_size
+        config["vision_config"]["skip_vision"] = skip_vision
 
     model_config = model_class.ModelConfig.from_dict(config)
 
@@ -216,11 +219,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             lambda p, m: isinstance(m, (nn.Linear, nn.Embedding))
             and f"{p}.scales" in weights
         )
-        nn.quantize(
-            model,
-            **quantization,
-            class_predicate=class_predicate,
-        )
+        skip_vision = config.get("vision_config", {}).get("skip_vision", False)
+        if skip_vision:
+            _quantize_non_vision(model, **quantization)
+        else:
+            nn.quantize(
+                model,
+                **quantization,
+                class_predicate=class_predicate,
+            )
 
     model.load_weights(list(weights.items()))
     if not lazy:
@@ -504,8 +511,12 @@ def save_weights(
 
 
 def quantize_model(
-    model: nn.Module, config: dict, q_group_size: int, q_bits: int
-) -> Tuple:
+    model: nn.Module,
+    config: dict,
+    q_group_size: int,
+    q_bits: int,
+    skip_vision: bool = False,
+) -> Tuple[dict, dict]:
     """
     Applies quantization to the model weights.
 
@@ -514,43 +525,76 @@ def quantize_model(
         config (dict): Model configuration.
         q_group_size (int): Group size for quantization.
         q_bits (int): Bits per weight for quantization.
+        skip_vision (bool): Whether to skip quantizing vision model weights.
 
     Returns:
-        Tuple: Tuple containing quantized weights and config.
+        Tuple[dict, dict]: Tuple containing quantized weights and updated config.
     """
     quantized_config = copy.deepcopy(config)
-    vision_intermediate_size = (
-        model.config.vision_config.intermediate_size
-        if hasattr(model.config.vision_config, "intermediate_size")
-        else model.config.vision_config.hidden_size
-    )
-    divisor = 64
-    if any(vision_intermediate_size % size != 0 for size in [64, 128]):
+    quantized_config.setdefault("vision_config", {})
+
+    # Get vision model size
+    vision_size = _get_vision_size(model)
+
+    # Pad vision model if needed
+    if not skip_vision:
+        _pad_vision_model(model, vision_size)
+        if hasattr(model.config.vision_config, "intermediate_size"):
+            _update_vision_config(
+                quantized_config, vision_size, key="intermediate_size"
+            )
+        elif hasattr(model.config.vision_config, "hidden_size"):
+            _update_vision_config(quantized_config, vision_size, key="hidden_size")
+        else:
+            raise ValueError(
+                "No intermediate_size or hidden_size found in vision_config"
+            )
+
+    # Apply quantization
+    if skip_vision:
+        _quantize_non_vision(model, q_group_size, q_bits)
+        quantized_config["vision_config"]["skip_vision"] = True
+    else:
+        nn.quantize(model, q_group_size, q_bits)
+
+    # Update config and get weights
+    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
+    quantized_weights = dict(tree_flatten(model.parameters()))
+
+    return quantized_weights, quantized_config
+
+
+def _get_vision_size(model: nn.Module) -> int:
+    """Get vision model intermediate/hidden size."""
+    if hasattr(model.config.vision_config, "intermediate_size"):
+        return model.config.vision_config.intermediate_size
+    return model.config.vision_config.hidden_size
+
+
+def _pad_vision_model(model: nn.Module, vision_size: int, divisor: int = 64) -> None:
+    """Pad vision model layers to be divisible by divisor."""
+    if any(vision_size % size != 0 for size in [64, 128]):
         for name, module in model.named_modules():
             if isinstance(module, nn.Linear) and (
                 "vision_model" in name or "vision_tower" in name
             ):
                 out_features, in_features = module.weight.shape
 
-                # Calculate the padding needed for each dimension
-                new_out_features = (
+                new_out = (
                     ((out_features // divisor) + 1) * divisor
-                    if out_features % divisor != 0
+                    if out_features % divisor
                     else out_features
                 )
-                new_in_features = (
+                new_in = (
                     ((in_features // divisor) + 1) * divisor
-                    if in_features % divisor != 0
+                    if in_features % divisor
                     else in_features
                 )
 
-                # If padding is needed, proceed
-                if new_out_features != out_features or new_in_features != in_features:
-                    # Create new weight and bias tensors
-                    new_weight = mx.zeros((new_out_features, new_in_features))
-                    new_bias = mx.zeros((new_out_features))
+                if new_out != out_features or new_in != in_features:
+                    new_weight = mx.zeros((new_out, new_in))
+                    new_bias = mx.zeros((new_out))
 
-                    # Copy existing weights and biases to the new tensors
                     new_weight[:out_features, :in_features] = module.weight
                     module.weight = new_weight
 
@@ -558,31 +602,25 @@ def quantize_model(
                         new_bias[:out_features] = module.bias
                         module.bias = new_bias
 
-    # Ensure vision_config exists in quantized_config
-    quantized_config.setdefault("vision_config", {})
 
-    # Update intermediate_size
-    if hasattr(model.config.vision_config, "intermediate_size"):
-        quantized_config["vision_config"]["intermediate_size"] = (
-            ((vision_intermediate_size // divisor) + 1) * divisor
-            if vision_intermediate_size % divisor != 0
-            else vision_intermediate_size
-        )
-    elif hasattr(model.config.vision_config, "hidden_size"):
-        quantized_config["vision_config"]["hidden_size"] = (
-            ((vision_intermediate_size // divisor) + 1) * divisor
-            if vision_intermediate_size % divisor != 0
-            else vision_intermediate_size
-        )
-    else:
-        raise ValueError("No intermediate_size or hidden_size found in vision_config")
+def _update_vision_config(
+    config: dict, vision_size: int, divisor: int = 64, key: str = "intermediate_size"
+) -> None:
+    """Update vision config with padded sizes."""
+    config["vision_config"][key] = (
+        ((vision_size // divisor) + 1) * divisor
+        if vision_size % divisor != 0
+        else vision_size
+    )
 
-    print(quantized_config)
-    nn.quantize(model, q_group_size, q_bits)
-    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
-    quantized_weights = dict(tree_flatten(model.parameters()))
 
-    return quantized_weights, quantized_config
+def _quantize_non_vision(model: nn.Module, q_group_size: int, q_bits: int) -> None:
+    """Quantize only non-vision modules."""
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and not (
+            "vision_model" in name or "vision_tower" in name
+        ):
+            nn.quantize(module, q_group_size, q_bits)
 
 
 def save_config(
@@ -651,6 +689,7 @@ def convert(
     upload_repo: str = None,
     revision: Optional[str] = None,
     dequantize: bool = False,
+    skip_vision: bool = False,
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
@@ -666,7 +705,9 @@ def convert(
     if quantize:
         print("[INFO] Quantizing")
         model.load_weights(list(weights.items()))
-        weights, config = quantize_model(model, config, q_group_size, q_bits)
+        weights, config = quantize_model(
+            model, config, q_group_size, q_bits, skip_vision
+        )
 
     if dequantize:
         print("[INFO] Dequantizing")

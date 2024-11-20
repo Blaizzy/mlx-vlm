@@ -206,6 +206,41 @@ def _expand_token(token, batch_size: int):
     )
 
 
+def pad_to_multiple(x, target_size, pad_mode="edge", pad_value=0):
+    """
+    Pad the last dimension of input tensor to match target size.
+
+    Args:
+        x: Input tensor with shape [..., D]
+        target_size: Desired size for the last dimension
+        pad_mode: Padding mode ('constant', 'reflect', etc.)
+        pad_value: Value to use for constant padding
+
+    Returns:
+        Padded tensor with shape [..., target_size]
+    """
+    current_size = x.shape[-1]
+
+    # Return early if no padding needed
+    if current_size == target_size:
+        return x
+
+    # Ensure target size is larger
+    if current_size > target_size:
+        raise ValueError(
+            f"Current size {current_size} is larger than target size {target_size}"
+        )
+
+    # Calculate padding needed
+    pad_size = target_size - current_size
+
+    # Create padding configuration
+    # No padding for batch and channel dimensions (0,0), only pad the last dim
+    pad_config = [(0, 0)] * (len(x.shape) - 1) + [(0, pad_size)]
+
+    return mx.pad(x, pad_width=pad_config, mode=pad_mode, constant_values=pad_value)
+
+
 class VisionTransformer(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
@@ -272,16 +307,14 @@ class VisionTransformer(nn.Module):
         B, N, D = x.shape
 
         # (Optional) Due to quantization, pad around the image to match intermediate_size
-        if D != self.config.intermediate_size:
-            pad_size = (self.config.intermediate_size - D) // 2
-            pad_remainder = (self.config.intermediate_size - D) % 2
-            x = mx.pad(x, [(0, 0), (0, 0), (pad_size, pad_size + pad_remainder)])
+        x = pad_to_multiple(x, self.config.intermediate_size)
 
         x = self.patch_embedding(x)
 
         # class embeddings and positional embeddings
         expanded_class_emb = _expand_token(self.class_embedding, x.shape[0])
         expanded_class_emb = expanded_class_emb
+
         x = mx.concatenate([expanded_class_emb, x], axis=1)
         x = self.add_pos_emb(x, patch_num)
 
