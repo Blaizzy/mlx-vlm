@@ -12,8 +12,8 @@ from .vision import VisionConfig, VisionModel
 
 @dataclass
 class ModelConfig:
-    text_config: TextConfig = field(default_factory=TextConfig)
-    vision_config: VisionConfig = field(default_factory=VisionConfig)
+    text_config: TextConfig
+    vision_config: VisionConfig
     image_feature_dropout: float = 0.0
     image_pooling_h: int = 2
     image_pooling_w: int = 2
