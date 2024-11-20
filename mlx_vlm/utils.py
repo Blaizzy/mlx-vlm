@@ -169,10 +169,14 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config["text_config"] = {
             k: v for k, v in config.items() if k != "vision_config"
         }
-
     if model_type == "molmo":
+        intermediate_size = None
+        if "vision_config" in config and "intermediate_size" in config["vision_config"]:
+            intermediate_size = config["vision_config"]["intermediate_size"]
+
         config["text_config"] = asdict(model_class.TextConfig())
         config["vision_config"] = asdict(model_class.VisionConfig())
+        config["vision_config"]["intermediate_size"] = intermediate_size
 
     model_config = model_class.ModelConfig.from_dict(config)
 
@@ -573,6 +577,7 @@ def quantize_model(
     else:
         raise ValueError("No intermediate_size or hidden_size found in vision_config")
 
+    print(quantized_config)
     nn.quantize(model, q_group_size, q_bits)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
     quantized_weights = dict(tree_flatten(model.parameters()))

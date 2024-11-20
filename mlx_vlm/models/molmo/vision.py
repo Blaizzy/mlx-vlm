@@ -271,6 +271,12 @@ class VisionTransformer(nn.Module):
             patch_num = self.config.image_num_patch
         B, N, D = x.shape
 
+        # (Optional) Due to quantization, pad around the image to match intermediate_size
+        if D != self.config.intermediate_size:
+            pad_size = (self.config.intermediate_size - D) // 2
+            pad_remainder = (self.config.intermediate_size - D) % 2
+            x = mx.pad(x, [(0, 0), (0, 0), (pad_size, pad_size + pad_remainder)])
+
         x = self.patch_embedding(x)
 
         # class embeddings and positional embeddings
@@ -419,24 +425,3 @@ class VisionModel(nn.Module):
         image_features = self.image_projector(image_features)
 
         return image_features, cls_embed
-
-    @staticmethod
-    def sanitize(weights):
-        sanitized_weights = {}
-        for k, v in weights.items():
-            if "position_ids" in k:
-                # Remove unused position_ids
-                continue
-            elif "patch_embed.proj.weight" in k:
-                # PyTorch conv2d weight tensors have shape:
-                #   [out_channels, in_channels, kH, KW]
-                # MLX conv2d expects the weight be of shape:
-                #   [out_channels, kH, KW, in_channels]
-                if check_array_shape(v):
-                    sanitized_weights[k] = v
-                else:
-                    sanitized_weights[k] = v.transpose(0, 2, 3, 4, 1)
-            else:
-                sanitized_weights[k] = v
-
-        return sanitized_weights
