@@ -1023,7 +1023,7 @@ def generate(
     max_tokens: int = 100,
     verbose: bool = False,
     formatter: Optional[Callable] = None,
-    repetition_penalty: Optional[float] = None,
+    repetition_penalty: Optional[float] = 1.1,
     repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
     **kwargs,
