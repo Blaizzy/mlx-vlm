@@ -47,93 +47,6 @@ class TextConfig:
         )
 
 
-class RotaryEmbedding(nn.Module):
-    """
-    MLX implementation of Rotary positional embeddings (RoPE) without caching.
-    """
-
-    def __init__(self, config: TextConfig):
-        super().__init__()
-        self.config = config
-
-    def get_rotary_embedding(self, seq_len: int) -> Tuple[mx.array, mx.array]:
-        # Computing rotary embeddings
-        dim = self.config.d_model // self.config.n_heads
-        inv_freq = 1.0 / (self.config.rope_theta ** (mx.arange(0, dim, 2) / dim))
-        seq = mx.arange(seq_len, dtype=mx.float32)
-        freqs = mx.einsum("i,j->ij", seq, inv_freq)
-
-        if self.config.rope_impl == "interleave":
-            # Simulate repeat_interleave
-            positions = mx.concatenate(
-                [freqs.reshape(-1, 1), freqs.reshape(-1, 1)], axis=1
-            ).reshape(seq_len, -1)
-        else:
-            positions = mx.concatenate([freqs, freqs], axis=-1)
-
-        pos_sin = mx.sin(positions)[None, None, :, :]
-        pos_cos = mx.cos(positions)[None, None, :, :]
-        return pos_sin, pos_cos
-
-    def rotate_half(self, x):
-        """Rotates half the hidden dims of the input."""
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return mx.concatenate([-x2, x1], axis=-1)
-
-    def rotate_every_two(self, x: mx.array) -> mx.array:
-        B, nh, T, hs = x.shape
-        x = x.reshape(B, nh, T, hs // 2, 2)
-        x1, x2 = x[:, :, :, :, 0], x[:, :, :, :, 1]
-        x = mx.stack([-x2, x1], axis=-1)
-        return x.reshape(B, nh, T, hs)
-
-    def apply_rotary_pos_emb(
-        self, pos_sin: mx.array, pos_cos: mx.array, t: mx.array
-    ) -> mx.array:
-        if self.config.rope_impl == "interleave":
-            return (t * pos_cos) + (self.rotate_every_two(t) * pos_sin)
-        else:
-            return (t * pos_cos) + (self.rotate_half(t) * pos_sin)
-
-    def __call__(
-        self, q: mx.array, k: mx.array, position_ids: Optional[mx.array] = None
-    ) -> Tuple[mx.array, mx.array]:
-
-        # Handle precision
-        q_, k_ = (q, k)
-
-        batch_size = q_.shape[0]
-        query_len, key_len = q_.shape[-2], k_.shape[-2]
-
-        if position_ids is not None:
-            freqs_cis_len = self.config.max_position_embeddings
-        else:
-            freqs_cis_len = key_len
-
-        pos_sin, pos_cos = self.get_rotary_embedding(freqs_cis_len)
-
-        if position_ids is not None:
-            assert (
-                query_len == key_len
-            ), "Query and key lengths must be equal when using position IDs."
-            pos_sin = pos_sin[0, 0][position_ids].reshape(
-                batch_size, 1, key_len, pos_sin.shape[-1]
-            )
-            pos_cos = pos_cos[0, 0][position_ids].reshape(
-                batch_size, 1, key_len, pos_cos.shape[-1]
-            )
-
-        q_ = self.apply_rotary_pos_emb(
-            pos_sin[:, :, key_len - query_len : key_len, :],
-            pos_cos[:, :, key_len - query_len : key_len, :],
-            q_,
-        )
-        k_ = self.apply_rotary_pos_emb(pos_sin, pos_cos, k_)
-
-        return q_, k_
-
-
 class SwiGLU(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         x, gate = mx.split(x, 2, axis=-1)
@@ -149,11 +62,11 @@ class MolmoBlock(nn.Module):
             config.d_model,
             bias=False,
         )
-        self.rotary_emb = RotaryEmbedding(config)
         self.attn_norm = nn.RMSNorm(config.d_model, eps=config.layer_norm_eps)
         self.ff_norm = nn.RMSNorm(config.d_model, eps=config.layer_norm_eps)
         self.ff_proj = nn.Linear(config.d_model, config.mlp_hidden_size, bias=False)
         head_dim = config.d_model // config.n_heads
+        self.rotary_emb = nn.RoPE(head_dim, base=config.rope_theta)
         self.scale = head_dim**-0.5
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads
@@ -185,16 +98,13 @@ class MolmoBlock(nn.Module):
             batch_size, seq_len, self.n_kv_heads, D // self.n_heads
         ).transpose(0, 2, 1, 3)
 
-        # Apply rotary embeddings
-        if cache is not None and cache.offset > 0:
-            position_ids = mx.array([cache.offset])
-        else:
-            position_ids = mx.arange(seq_len)
-
-        q, k = self.rotary_emb(q, k, position_ids)
-
         if cache is not None:
+            q = self.rotary_emb(q, offset=cache.offset)
+            k = self.rotary_emb(k, offset=cache.offset)
             k, v = cache.update_and_fetch(k, v)
+        else:
+            q = self.rotary_emb(q)
+            k = self.rotary_emb(k)
 
         # Perform attention
         att = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
