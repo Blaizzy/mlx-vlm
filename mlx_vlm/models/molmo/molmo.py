@@ -4,8 +4,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
-from ..base import KVCache
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
@@ -52,44 +52,64 @@ class Model(nn.Module):
         batch_size, seq_len = input_ids.shape
 
         image_input_idx = kwargs.get("image_input_idx", None)
+        image_masks = kwargs.get("image_masks", None)
 
         if pixel_values is not None:
             assert (
-                mask is not None and image_input_idx is not None
-            ), "mask and image_input_idx must be provided when images are given"
+                image_masks is not None and image_input_idx is not None
+            ), "image_masks and image_input_idx must be provided when images are given"
+
+            dtype = self.vision_tower.image_vit.patch_embedding.weight.dtype
+            pixel_values = pixel_values.astype(dtype)
 
             # Process images
-            image_features, cls_embed = self.vision_tower(pixel_values, mask)
+            if pixel_values.ndim == 3:
+                pixel_values = mx.expand_dims(pixel_values, 1)
+                image_masks = (
+                    mx.expand_dims(image_masks, 1) if image_masks is not None else None
+                )
+                image_input_idx = (
+                    mx.expand_dims(image_input_idx, 1)
+                    if image_input_idx is not None
+                    else None
+                )
+
+            image_features, cls_embed = self.vision_tower(pixel_values, image_masks)
 
             # Insert image features into the input embeddings
-            input_embeddings = self.language_model.model.wte(input_ids)
+            image_input_idx = image_input_idx.swapaxes(0, 1)
+            image_features = image_features.swapaxes(0, 1)
             num_image, num_patch = image_features.shape[1:3]
+
+            assert image_input_idx.shape == (
+                batch_size,
+                num_image,
+                num_patch,
+            ), f"image_input_idx.shape: {image_input_idx.shape}, expected: {(batch_size, num_image, num_patch)}"
+
+            # Insert image features into the input embeddings
             image_features = image_features.reshape(
                 batch_size, num_image * num_patch, -1
             )
             image_input_idx = image_input_idx.reshape(batch_size, num_image * num_patch)
 
-            valid = image_input_idx >= 0
-            batch_idx = (
-                mx.arange(batch_size)
-                .reshape(-1, 1)
-                .repeat(image_features.shape[1], axis=1)
-            )
-            input_embeddings = mx.where(
-                (batch_idx[None, :] == mx.arange(batch_size)[:, None, None])
-                & (image_input_idx[None, :] == mx.arange(seq_len)[:, None, None]),
-                image_features,
-                input_embeddings,
-            )
+            valid = np.where(image_input_idx >= 0)[1].tolist()
+            batch_idx = mx.arange(batch_size)
+            batch_idx = mx.tile(batch_idx[:, None], [1, image_features.shape[1]])
+
+            input_embeddings = self.language_model.model.wte(input_ids)
+            input_embeddings[
+                batch_idx[valid], image_input_idx[valid]
+            ] += image_features[valid]
         else:
             input_embeddings = None
 
         # Forward pass through the language model
         logits = self.language_model(
             input_ids,
-            mask=None,
-            cache=cache,
             inputs_embeds=input_embeddings,
+            mask=mask,
+            cache=cache,
         )
 
         return logits

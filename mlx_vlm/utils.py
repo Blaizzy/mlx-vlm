@@ -787,20 +787,23 @@ def prepare_inputs(
         if "images" in inputs:
             inputs["pixel_values"] = inputs["images"]
             inputs.pop("images")
-        if "image_masks" in inputs:
-            inputs["attention_mask"] = inputs["image_masks"]
-            inputs.pop("image_masks")
 
         if isinstance(inputs["pixel_values"], list):
             pixel_values = inputs["pixel_values"]
         else:
             pixel_values = mx.array(inputs["pixel_values"])
         input_ids = mx.array(inputs["input_ids"])
-        mask = mx.array(inputs["attention_mask"])
+        mask = (
+            mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
+        )
 
         image_input_idx = inputs.get("image_input_idx", None)
         if image_input_idx is not None:
             image_input_idx = mx.array(image_input_idx)
+
+        image_masks = inputs.get("image_masks", None)
+        if image_masks is not None:
+            image_masks = mx.array(image_masks)
 
         image_sizes = inputs.get("image_sizes", None)
         if image_sizes is not None:
@@ -832,6 +835,7 @@ def prepare_inputs(
         aspect_ratio_mask,
         cross_attention_mask,
         image_input_idx,
+        image_masks,
     )
 
 
@@ -903,7 +907,7 @@ def generate_step(
         )
         cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
 
-    repetition_context = input_ids.tolist()[0]
+    repetition_context = input_ids.tolist()
 
     if repetition_context_size:
         repetition_context = repetition_context[-repetition_context_size:]
@@ -1074,6 +1078,7 @@ def generate(
                 "aspect_ratio_mask",
                 "cross_attention_mask",
                 "image_input_idx",
+                "image_masks",
             ],
             inputs[3:],
         )
