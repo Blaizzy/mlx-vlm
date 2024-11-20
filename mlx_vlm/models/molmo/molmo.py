@@ -64,12 +64,12 @@ class Model(nn.Module):
 
             # Process images
             if pixel_values.ndim == 3:
-                pixel_values = mx.expand_dims(pixel_values, 1)
+                pixel_values = mx.expand_dims(pixel_values, 0)
                 image_masks = (
-                    mx.expand_dims(image_masks, 1) if image_masks is not None else None
+                    mx.expand_dims(image_masks, 0) if image_masks is not None else None
                 )
                 image_input_idx = (
-                    mx.expand_dims(image_input_idx, 1)
+                    mx.expand_dims(image_input_idx, 0)
                     if image_input_idx is not None
                     else None
                 )
@@ -77,8 +77,6 @@ class Model(nn.Module):
             image_features, cls_embed = self.vision_tower(pixel_values, image_masks)
 
             # Insert image features into the input embeddings
-            image_input_idx = image_input_idx.swapaxes(0, 1)
-            image_features = image_features.swapaxes(0, 1)
             num_image, num_patch = image_features.shape[1:3]
 
             assert image_input_idx.shape == (
@@ -93,7 +91,7 @@ class Model(nn.Module):
             )
             image_input_idx = image_input_idx.reshape(batch_size, num_image * num_patch)
 
-            valid = np.where(image_input_idx >= 0)[1].tolist()
+            valid = np.where(image_input_idx >= 0)[0].tolist()
             batch_idx = mx.arange(batch_size)
             batch_idx = mx.tile(batch_idx[:, None], [1, image_features.shape[1]])
 
