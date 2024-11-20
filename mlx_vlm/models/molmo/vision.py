@@ -12,6 +12,7 @@ class VisionConfig:
     image_default_input_size: Tuple[int, int] = (336, 336)
     image_patch_size: int = 14
     image_pos_patch_size: int = 14
+    hidden_size: int = 18944
     image_emb_dim: int = 1024
     image_num_heads: int = 16
     image_num_key_value_heads: int = 16
@@ -31,6 +32,11 @@ class VisionConfig:
     vit_layers: Optional[List[int]] = field(default_factory=lambda: [-2, -9])
     image_pooling_2d: str = "attention-meanq"
     image_padding_embed: str = "pad_and_partial_pad"
+    intermediate_size: Optional[int] = None
+
+    def __post_init__(self):
+        if self.intermediate_size is None:
+            self.intermediate_size = self.image_patch_size * self.image_patch_size * 3
 
     @property
     def image_num_patch(self):
@@ -60,7 +66,7 @@ class MLP(nn.Module):
     def __init__(self, config: VisionConfig, input_dim: int):
         super().__init__()
         self.config = config
-        self.hidden_size = 18944
+        self.hidden_size = config.hidden_size
         self.w1 = nn.Linear(
             input_dim,
             self.hidden_size,
@@ -209,7 +215,7 @@ class VisionTransformer(nn.Module):
             (config.image_num_pos, config.image_emb_dim)
         )
         self.patch_embedding = nn.Linear(
-            config.image_patch_size * config.image_patch_size * 3,
+            config.intermediate_size,
             config.image_emb_dim,
             bias=False,
         )
