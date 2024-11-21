@@ -180,7 +180,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         }
     if model_type == "molmo":
         intermediate_size = None
-
         if "vision_config" in config and "intermediate_size" in config["vision_config"]:
             intermediate_size = config["vision_config"]["intermediate_size"]
 
@@ -226,14 +225,14 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
-        skip_non_divisible = config.get("vision_config", {}).get(
-            "skip_non_divisible", True
+        skip_vision_non_divisible = config.get("vision_config", {}).get(
+            "skip_vision_non_divisible", False
         )
         if skip_vision:
             class_predicate = lambda _, m: not (
                 "vision_model" in m.name or "vision_tower" in m.name
             )
-        elif skip_non_divisible:
+        elif skip_vision_non_divisible:
             class_predicate = (
                 lambda _, m: hasattr(m, "to_quantized") and m.weight.shape[-1] % 64 == 0
             )
