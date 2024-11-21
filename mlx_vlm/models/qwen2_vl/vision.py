@@ -53,38 +53,6 @@ def check_array_shape(arr):
         return False
 
 
-class Qwen2RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000):
-        super().__init__()
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        self.inv_freq = 1.0 / (
-            self.base
-            ** (mx.arange(0, self.dim, 2, dtype=mx.int64).astype(mx.float32) / self.dim)
-        )
-        self._set_cos_sin_cache(seq_len=max_position_embeddings, dtype=mx.float32)
-
-    def _set_cos_sin_cache(self, seq_len, dtype):
-        self.max_seq_len_cached = seq_len
-        t = mx.arange(self.max_seq_len_cached, dtype=mx.int64).astype(
-            self.inv_freq.dtype
-        )
-        freqs = mx.outer(t, self.inv_freq)
-        emb = mx.concatenate((freqs, freqs), axis=-1)
-        self.cos_cached = mx.cos(emb).astype(dtype)
-        self.sin_cached = mx.sin(emb).astype(dtype)
-
-    def __call__(self, x, seq_len=None):
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len, dtype=x.dtype)
-
-        return (
-            self.cos_cached[:seq_len].astype(x.dtype),
-            self.sin_cached[:seq_len].astype(x.dtype),
-        )
-
-
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -200,8 +168,7 @@ class Attention(nn.Module):
 
         q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
         k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
-
-        attention_mask = mx.ones((1, seq_length, seq_length))
+        attention_mask = mx.ones((1, seq_length, seq_length), dtype=x.dtype)
 
         for i in range(1, len(cu_seqlens)):
             start = int(cu_seqlens[i - 1])
