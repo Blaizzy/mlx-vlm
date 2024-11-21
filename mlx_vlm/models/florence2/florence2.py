@@ -49,7 +49,6 @@ class ModelConfig:
         )
 
 
-
 def shift_tokens_right(
     input_ids: mx.array, pad_token_id: int, decoder_start_token_id: int
 ) -> mx.array:
