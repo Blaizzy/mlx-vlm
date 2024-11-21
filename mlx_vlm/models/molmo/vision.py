@@ -1,5 +1,4 @@
 import inspect
-import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -114,6 +113,7 @@ class MultiHeadDotProductAttention(nn.Module):
         self.head_dim = config.image_head_dim
         self.num_key_value_heads = config.image_num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.scale = self.head_dim**-0.5
         self.is_vit_layer = is_vit_layer
 
         n_layers = (
@@ -161,9 +161,7 @@ class MultiHeadDotProductAttention(nn.Module):
             0, 2, 1, 3
         )
 
-        attn = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=1 / math.sqrt(self.head_dim)
-        )
+        attn = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
         out = attn.transpose(0, 2, 1, 3)
         out = self._merge_heads(out)
         out = self.wo(out)
@@ -264,7 +262,7 @@ class VisionTransformer(nn.Module):
         pos_emb = self.positional_embedding[1:]
 
         # Reshape into 2D grid
-        pos_emb_size = int(math.sqrt(pos_emb.shape[0]))
+        pos_emb_size = int(pos_emb.shape[0] ** 0.5)
         pos_emb = mx.reshape(pos_emb, (pos_emb_size, pos_emb_size, pos_emb.shape[1]))
 
         (patch_num_0, patch_num_1) = patch_num
