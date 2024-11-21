@@ -11,6 +11,7 @@ from ..base import KVCache, LanguageModelOutput, create_attention_mask
 
 @dataclass
 class TextConfig:
+    model_type: str = "molmo"
     max_position_embeddings: int = 4096
     d_model: int = 3584
     n_heads: int = 28
@@ -203,6 +204,11 @@ class LanguageModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
+        self.model_type = config.model_type
+        if self.model_type != "molmo":
+            raise ValueError(
+                f"Model type {self.model_type} not supported. Currently only 'molmo' is supported"
+            )
         self.model = Molmo(config)
 
     def __call__(

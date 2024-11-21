@@ -14,6 +14,7 @@ from .vision import VisionConfig, VisionModel
 class ModelConfig:
     text_config: TextConfig
     vision_config: VisionConfig
+    model_type: str = "molmo"
     image_feature_dropout: float = 0.0
     image_pooling_h: int = 2
     image_pooling_w: int = 2

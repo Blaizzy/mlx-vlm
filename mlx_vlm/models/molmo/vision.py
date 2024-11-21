@@ -9,6 +9,8 @@ import mlx.nn as nn
 
 @dataclass
 class VisionConfig:
+    model_type: str = "molmo"
+    num_channels: int = 3
     image_default_input_size: Tuple[int, int] = (336, 336)
     image_patch_size: int = 14
     image_pos_patch_size: int = 14
@@ -328,6 +330,11 @@ class VisionModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.model_type = config.model_type
+        if self.model_type != "molmo":
+            raise ValueError(
+                f"Model type {self.model_type} not supported. Currently only 'molmo' is supported"
+            )
         self.image_vit = VisionTransformer(config)
         self.num_prefix_tokens = 1
 
