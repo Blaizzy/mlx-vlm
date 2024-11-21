@@ -74,6 +74,7 @@ def get_message_json(
         "paligemma": "prompt_only",
         "florence2": "prompt_only",
         "mllama": "message_list_with_image",
+        "molmo": "prompt_only",
     }
 
     if num_images > 1 and model_name in [
@@ -147,7 +148,7 @@ def apply_chat_template(
     if return_messages:
         return messages
 
-    if config["model_type"] in ["paligemma", "florence2"]:
+    if config["model_type"] in ["paligemma", "molmo", "florence2"]:
         return messages[-1]
 
     if "chat_template" in processor.__dict__.keys():
