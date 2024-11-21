@@ -1,3 +1,4 @@
+import inspect
 import unittest
 
 import mlx.core as mx
@@ -63,8 +64,20 @@ class TestModels(unittest.TestCase):
         input_tensor = mx.random.uniform(
             shape=(batch_size, image_size[0], image_size[1], num_channels)
         )
+        if "image_masks" in inspect.signature(vision_tower.__call__).parameters:
+            input_tensor = input_tensor.transpose(0, 3, 1, 2)
+            image_masks = mx.ones((batch_size, num_channels, image_size[0]))
+            kwargs["image_masks"] = image_masks
 
-        hidden_states = vision_tower(input_tensor, output_hidden_states=True, **kwargs)
+        if (
+            "output_hidden_states"
+            in inspect.signature(vision_tower.__call__).parameters
+        ):
+            hidden_states = vision_tower(
+                input_tensor, output_hidden_states=True, **kwargs
+            )
+        else:
+            hidden_states = vision_tower(input_tensor, **kwargs)
 
         # Check vision hidden feature layer's shape matches the expected hidden size
         self.assertEqual(
@@ -793,6 +806,29 @@ class TestModels(unittest.TestCase):
         # Check output shape
         expected_shape = (batch_size, seq_length, model_config.vocab_size)
         self.assertEqual(output.logits.shape, expected_shape)
+
+    def test_molmo(self):
+        from mlx_vlm.models import molmo
+
+        text_config = molmo.TextConfig()
+        vision_config = molmo.VisionConfig()
+        config = molmo.ModelConfig(text_config=text_config, vision_config=vision_config)
+        model = molmo.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.n_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.d_model,
+            config.vision_config.num_channels,
+            (576, 588),
+        )
 
 
 if __name__ == "__main__":
