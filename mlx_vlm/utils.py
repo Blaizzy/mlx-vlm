@@ -862,9 +862,14 @@ def prepare_inputs(
         )
     else:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
-        inputs = processor.process(
-            text=prompts, images=images, padding=True, return_tensors="mlx"
-        )
+        if hasattr(processor, "process"):
+            inputs = processor.process(
+                text=prompts, images=images, padding=True, return_tensors="mlx"
+            )
+        else:
+            inputs = processor(
+                text=prompts, images=images, padding=True, return_tensors="mlx"
+            )
         if "images" in inputs:
             inputs["pixel_values"] = inputs["images"]
             inputs.pop("images")
@@ -993,7 +998,7 @@ def generate_step(
         else:
             cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
 
-    repetition_context = input_ids.tolist()
+    repetition_context = input_ids.reshape(-1).tolist()
 
     if repetition_context_size:
         repetition_context = repetition_context[-repetition_context_size:]
