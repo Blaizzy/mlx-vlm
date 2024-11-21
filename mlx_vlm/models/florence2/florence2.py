@@ -49,15 +49,6 @@ class ModelConfig:
         )
 
 
-def get_cosine_pos_embedding(seq_len: int, embed_dim: int) -> mx.array:
-    """Create cosine positional embeddings."""
-    factor = mx.log(10000.0) / (embed_dim // 2)
-    positions = mx.expand_dims(mx.arange(seq_len), 1)
-    freqs = mx.expand_dims(mx.exp(-mx.arange(0, embed_dim, 2) * factor), 0)
-    angles = positions * freqs
-    pos_embeddings = mx.concatenate([mx.sin(angles), mx.cos(angles)], axis=1)
-    return mx.reshape(pos_embeddings, (seq_len, embed_dim))
-
 
 def shift_tokens_right(
     input_ids: mx.array, pad_token_id: int, decoder_start_token_id: int
