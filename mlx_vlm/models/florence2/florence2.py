@@ -170,7 +170,7 @@ class Model(nn.Module):
         self.language_model = LanguageModel(config.text_config)
 
         # Image projection layers
-        image_dim = config.vision_config.embed_dims[-1]
+        image_dim = config.vision_config.dim_embed[-1]
         text_dim = config.text_config.d_model
         self.image_projection = mx.zeros((image_dim, text_dim))
 

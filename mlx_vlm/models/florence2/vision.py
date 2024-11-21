@@ -16,7 +16,7 @@ class VisionConfig:
     in_chans: int = 3
     num_classes: int = 1000
     depths: List[int] = field(default_factory=lambda: [1, 1, 9, 1])
-    embed_dims: List[int] = field(default_factory=lambda: [128, 256, 512, 1024])
+    dim_embed: List[int] = field(default_factory=lambda: [128, 256, 512, 1024])
     num_heads: List[int] = field(default_factory=lambda: [4, 8, 16, 32])
     num_groups: List[int] = field(default_factory=lambda: [4, 8, 16, 32])
     window_size: int = 12
@@ -32,6 +32,7 @@ class VisionConfig:
     conv_at_attn: bool = True
     conv_at_ffn: bool = True
     hidden_size: int = 768
+    image_size: Tuple[int, int] = (768, 768)
 
     @classmethod
     def from_dict(cls, params):
@@ -492,11 +493,17 @@ class VisionModel(nn.Module):
         super().__init__()
 
         self.num_classes = config.num_classes
-        self.embed_dims = config.embed_dims
+        self.model_type = config.model_type
+        self.dim_embed = config.dim_embed
         self.num_heads = config.num_heads
         self.num_groups = config.num_groups
-        self.num_stages = len(self.embed_dims)
+        self.num_stages = len(self.dim_embed)
         assert self.num_stages == len(self.num_heads) == len(self.num_groups)
+
+        if self.model_type not in ["davit", ""]:
+            raise ValueError(
+                f"Model type {self.model_type} not supported. Currently only 'davit' is supported"
+            )
 
         # Convert PyTorch's linspace to MLX equivalent
         total_blocks = sum(config.depths) * 2
@@ -514,8 +521,8 @@ class VisionModel(nn.Module):
                 patch_size=config.patch_size[i],
                 stride=config.patch_stride[i],
                 padding=config.patch_padding[i],
-                in_chans=config.in_chans if i == 0 else self.embed_dims[i - 1],
-                embed_dim=self.embed_dims[i],
+                in_chans=config.in_chans if i == 0 else self.dim_embed[i - 1],
+                embed_dim=self.dim_embed[i],
                 norm_layer=nn.LayerNorm,
                 pre_norm=config.patch_prenorm[i],
             )
@@ -525,7 +532,7 @@ class VisionModel(nn.Module):
             for j in range(config.depths[i]):
                 block.append(
                     Block(
-                        self.embed_dims[i],
+                        self.dim_embed[i],
                         config.num_heads[i],
                         config.num_groups[i],
                         config.window_size,

@@ -1,12 +1,12 @@
 import inspect
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, LanguageModelOutput, create_attention_mask
+from ..base import KVCache, LanguageModelOutput, SimpleKVCache, create_attention_mask
 
 
 @dataclass
@@ -345,6 +345,7 @@ class Florence2Decoder(nn.Module):
             positions = mx.expand_dims(positions, axis=0)
 
         cache_length = cache[0][0].keys.shape[2] if cache[0][0].cache_length > 0 else 0
+
         bsz, seq_len = inputs_embeds.shape[:2]
         positions = mx.arange(
             cache_length,
@@ -416,7 +417,7 @@ class Florence2LanguageModel(nn.Module):
             inputs_embeds = inputs_embeds * self.embed_scale
 
         if cache is None:
-            cache = [None] * len(self.decoder.layers)
+            cache = [(SimpleKVCache(), SimpleKVCache())] * len(self.decoder.layers)
 
         if encoder_outputs is None:
             encoder_outputs = self.encoder(
