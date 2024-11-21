@@ -73,6 +73,7 @@ def get_message_json(
         "pixtral": "message_list_with_image_type",
         "paligemma": "prompt_only",
         "mllama": "message_list_with_image",
+        "molmo": "prompt_only",
     }
 
     if num_images > 1 and model_name in [
@@ -146,7 +147,7 @@ def apply_chat_template(
     if return_messages:
         return messages
 
-    if config["model_type"] == "paligemma":
+    if config["model_type"] in ["paligemma", "molmo"]:
         return messages[-1]
 
     if "chat_template" in processor.__dict__.keys():
