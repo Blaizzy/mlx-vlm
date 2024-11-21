@@ -150,6 +150,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     model_class, model_type = get_model_and_args(config=config)
 
+    if "vision_config" in config:
+        skip_vision = config["vision_config"].get("skip_vision", False)
+        skip_vision_non_divisible = config["vision_config"].get(
+            "skip_vision_non_divisible", False
+        )
+    else:
+        skip_vision = False
+        skip_vision_non_divisible = False
+
     if model_type == "llava_bunny":
         vision_config = AutoConfig.from_pretrained(config["mm_vision_tower"])
         text_config = AutoConfig.from_pretrained(config["language_model"])
@@ -171,15 +180,16 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         }
     if model_type == "molmo":
         intermediate_size = None
-        skip_vision = False
+
         if "vision_config" in config and "intermediate_size" in config["vision_config"]:
             intermediate_size = config["vision_config"]["intermediate_size"]
-            skip_vision = config["vision_config"].get("skip_vision", False)
 
         config["text_config"] = asdict(model_class.TextConfig())
         config["vision_config"] = asdict(model_class.VisionConfig())
         config["vision_config"]["intermediate_size"] = intermediate_size
-        config["vision_config"]["skip_vision"] = skip_vision
+
+    config["vision_config"]["skip_vision"] = skip_vision
+    config["vision_config"]["skip_vision_non_divisible"] = skip_vision_non_divisible
 
     model_config = model_class.ModelConfig.from_dict(config)
 
@@ -215,19 +225,29 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized
-        class_predicate = (
-            lambda p, m: isinstance(m, (nn.Linear, nn.Embedding))
-            and f"{p}.scales" in weights
-        )
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
+        skip_non_divisible = config.get("vision_config", {}).get(
+            "skip_non_divisible", True
+        )
         if skip_vision:
-            _quantize_non_vision(model, **quantization)
-        else:
-            nn.quantize(
-                model,
-                **quantization,
-                class_predicate=class_predicate,
+            class_predicate = lambda _, m: not (
+                "vision_model" in m.name or "vision_tower" in m.name
             )
+        elif skip_non_divisible:
+            class_predicate = (
+                lambda _, m: hasattr(m, "to_quantized") and m.weight.shape[-1] % 64 == 0
+            )
+        else:
+            class_predicate = (
+                lambda p, m: isinstance(m, (nn.Linear, nn.Embedding))
+                and f"{p}.scales" in weights
+            )
+
+        nn.quantize(
+            model,
+            **quantization,
+            class_predicate=class_predicate,
+        )
 
     model.load_weights(list(weights.items()))
     if not lazy:
@@ -516,6 +536,7 @@ def quantize_model(
     q_group_size: int,
     q_bits: int,
     skip_vision: bool = False,
+    skip_vision_non_divisible: bool = False,
 ) -> Tuple[dict, dict]:
     """
     Applies quantization to the model weights.
@@ -536,8 +557,32 @@ def quantize_model(
     # Get vision model size
     vision_size = _get_vision_size(model)
 
-    # Pad vision model if needed
-    if not skip_vision:
+    # Apply quantization
+    if skip_vision:
+        # Quantize only non-vision modules
+        nn.quantize(
+            model,
+            q_group_size,
+            q_bits,
+            class_predicate=lambda x: not (
+                "vision_model" in x.name or "vision_tower" in x.name
+            ),
+        )
+        quantized_config["vision_config"]["skip_vision"] = skip_vision
+    elif skip_vision_non_divisible:
+        # Quantize only layers with to_quantized method and divisible by 64
+        nn.quantize(
+            model,
+            q_group_size,
+            q_bits,
+            class_predicate=lambda _, m: hasattr(m, "to_quantized")
+            and m.weight.shape[-1] % 64 == 0,
+        )
+        quantized_config["vision_config"][
+            "skip_vision_non_divisible"
+        ] = skip_vision_non_divisible
+    else:
+        # Pad vision model if needed
         _pad_vision_model(model, vision_size)
         if hasattr(model.config.vision_config, "intermediate_size"):
             _update_vision_config(
@@ -550,11 +595,6 @@ def quantize_model(
                 "No intermediate_size or hidden_size found in vision_config"
             )
 
-    # Apply quantization
-    if skip_vision:
-        _quantize_non_vision(model, q_group_size, q_bits)
-        quantized_config["vision_config"]["skip_vision"] = True
-    else:
         nn.quantize(model, q_group_size, q_bits)
 
     # Update config and get weights
@@ -604,23 +644,18 @@ def _pad_vision_model(model: nn.Module, vision_size: int, divisor: int = 64) -> 
 
 
 def _update_vision_config(
-    config: dict, vision_size: int, divisor: int = 64, key: str = "intermediate_size"
+    config: dict,
+    value: Union[int, bool],
+    divisor: int = 64,
+    key: str = "intermediate_size",
 ) -> None:
     """Update vision config with padded sizes."""
-    config["vision_config"][key] = (
-        ((vision_size // divisor) + 1) * divisor
-        if vision_size % divisor != 0
-        else vision_size
-    )
-
-
-def _quantize_non_vision(model: nn.Module, q_group_size: int, q_bits: int) -> None:
-    """Quantize only non-vision modules."""
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and not (
-            "vision_model" in name or "vision_tower" in name
-        ):
-            nn.quantize(module, q_group_size, q_bits)
+    if key in ["intermediate_size", "hidden_size"]:
+        config["vision_config"][key] = (
+            ((value // divisor) + 1) * divisor if value % divisor != 0 else value
+        )
+    else:
+        config["vision_config"][key] = value
 
 
 def save_config(
@@ -690,6 +725,7 @@ def convert(
     revision: Optional[str] = None,
     dequantize: bool = False,
     skip_vision: bool = False,
+    skip_vision_non_divisible: bool = False,
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
@@ -706,7 +742,7 @@ def convert(
         print("[INFO] Quantizing")
         model.load_weights(list(weights.items()))
         weights, config = quantize_model(
-            model, config, q_group_size, q_bits, skip_vision
+            model, config, q_group_size, q_bits, skip_vision, skip_vision_non_divisible
         )
 
     if dequantize:
