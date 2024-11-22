@@ -25,7 +25,7 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-from .models.base import BaseImageProcessor, KVCache
+from .models.base import BaseImageProcessor, KVCache, SimpleKVCache
 from .sample_utils import top_p_sampling
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
@@ -862,9 +862,14 @@ def prepare_inputs(
         )
     else:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
-        inputs = processor.process(
-            text=prompts, images=images, padding=True, return_tensors="mlx"
-        )
+        if hasattr(processor, "process"):
+            inputs = processor.process(
+                text=prompts, images=images, padding=True, return_tensors="mlx"
+            )
+        else:
+            inputs = processor(
+                text=prompts, images=images, padding=True, return_tensors="mlx"
+            )
         if "images" in inputs:
             inputs["pixel_values"] = inputs["images"]
             inputs.pop("images")
@@ -986,21 +991,34 @@ def generate_step(
             if isinstance(model.language_model.n_kv_heads, int)
             else model.language_model.n_kv_heads
         )
-        cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
+        if model.config.model_type == "florence2":
+            cache = [
+                (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
+            ]
+        else:
+            cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
 
-    repetition_context = input_ids.tolist()
+    repetition_context = input_ids.reshape(-1).tolist()
 
     if repetition_context_size:
         repetition_context = repetition_context[-repetition_context_size:]
 
     def _step(y, **kwargs):
         nonlocal repetition_context
-        outputs = model.language_model(
-            y[None],
-            cache=cache,
-            mask=mask,
-            **kwargs,
-        )
+        if "decoder_input_ids" in kwargs:
+            outputs = model.language_model(
+                cache=cache,
+                **kwargs,
+            )
+        else:
+
+            outputs = model.language_model(
+                y[None],
+                cache=cache,
+                mask=mask,
+                **kwargs,
+            )
+
         logits = outputs.logits[:, -1, :]
 
         if repetition_penalty:
@@ -1018,6 +1036,11 @@ def generate_step(
         return y, logprobs.squeeze(0)
 
     outputs = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
+
+    logits = outputs.logits[:, -1, :]
+    y, logprobs = sample(logits)
+    mx.async_eval(y)
+
     if outputs.cross_attention_states is not None:
         kwargs = {
             k: v
@@ -1025,15 +1048,19 @@ def generate_step(
                 ["cross_attention_states"], [outputs.cross_attention_states]
             )
         }
+    elif outputs.encoder_outputs is not None:
+        kwargs = {
+            "decoder_input_ids": y[None],
+            "encoder_outputs": outputs.encoder_outputs,
+        }
     else:
         kwargs = {}
 
-    logits = outputs.logits[:, -1, :]
-    y, logprobs = sample(logits)
-    mx.async_eval(y)
     while True:
         next_y, next_logprobs = _step(y, **kwargs)
         mx.async_eval(next_y)
+        if "decoder_input_ids" in kwargs:
+            kwargs["decoder_input_ids"] = next_y[None]
         yield y.item(), logprobs
         y, logprobs = next_y, next_logprobs
 
