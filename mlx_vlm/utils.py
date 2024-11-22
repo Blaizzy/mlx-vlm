@@ -829,6 +829,7 @@ def prepare_inputs(
     aspect_ratio_mask = None
     cross_attention_mask = None
     image_input_idx = None
+    image_masks = None
 
     if image_processor is not None:
         if not isinstance(prompts, list):
