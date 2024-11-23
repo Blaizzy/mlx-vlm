@@ -7,6 +7,7 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from huggingface_hub import snapshot_download
 
 from .language import LanguageModel, TextConfig
@@ -76,15 +77,8 @@ class Model(nn.Module):
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = input_ids == image_token_index
-        # image_indices = mx.where(image_positions)
-        image_features = image_features.astype(mx.float32)
-        pad_size = inputs_embeds.shape[1] - image_features.shape[1]
-        image_features = mx.pad(image_features, ((0, 0), (0, pad_size), (0, 0)))
-        inputs_embeds = mx.where(
-            image_positions[:, :, None], image_features, inputs_embeds
-        )
-
-        # TODO: Add video features
+        image_indices = np.where(image_positions)[1].tolist()
+        inputs_embeds[:, image_indices, :] = image_features
 
         return inputs_embeds
 
@@ -98,6 +92,10 @@ class Model(nn.Module):
     ):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         image_grid_thw = mx.array(image_grid_thw)
+
+        dtype = self.vision_tower.patch_embed.proj.weight.dtype
+        pixel_values = pixel_values.astype(dtype)
+
         input_embddings = self.get_input_embeddings(
             input_ids, pixel_values, image_grid_thw
         )

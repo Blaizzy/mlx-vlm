@@ -1,5 +1,6 @@
 import json
 import re
+from typing import Union
 
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
@@ -141,3 +142,86 @@ def parse_bbox(bbox_str, model_type="paligemma"):
         return objects
     if model_type == "qwen":
         return json.loads(bbox_str.replace("```json", "").replace("```", ""))
+
+
+def parse_points(points_str):
+    """Parse points from XML-like string into x and y coordinates"""
+    # Handle case where points_str is already a tuple
+    if isinstance(points_str, tuple):
+        return points_str
+
+    # Extract x and y coordinates from attributes
+    x_coords = []
+    y_coords = []
+
+    # Handle multi-point format
+    if 'x1="' in points_str:
+        i = 1
+        while True:
+            try:
+                x = float(points_str.split(f'x{i}="')[1].split('"')[0])
+                y = float(points_str.split(f'y{i}="')[1].split('"')[0])
+                x_coords.append(x)
+                y_coords.append(y)
+                i += 1
+            except IndexError:
+                break
+    # Handle single point format
+    elif 'x="' in points_str:
+        x = float(points_str.split('x="')[1].split('"')[0])
+        y = float(points_str.split('y="')[1].split('"')[0])
+        x_coords.append(x)
+        y_coords.append(y)
+
+    # Extract labels from points string
+    try:
+        labels = points_str.split('alt="')[1].split('">')[0].split(", ")
+        item_labels = labels  # Use the alt labels to maintain order
+    except IndexError:
+        # If no labels found, create numbered labels
+        item_labels = [f"Point {i+1}" for i in range(len(x_coords))]
+
+    return x_coords, y_coords, item_labels
+
+
+# Parse the points string
+def plot_locations(points: Union[str, tuple], image):
+    # Parse points
+    if isinstance(points, str):
+        x_coords, y_coords, item_labels = parse_points(points)
+    else:
+        x_coords, y_coords, item_labels = points
+
+    # Create figure and axis
+    plt.figure(figsize=(10, 8))
+
+    # Get image dimensions for normalization
+    img_width, img_height = image.size
+
+    # Normalize coordinates
+    x_norm = [(x / 100) * img_width for x in x_coords]
+    y_norm = [(y / 100) * img_height for y in y_coords]
+    if len(item_labels) != len(x_norm):
+        item_labels *= len(x_norm)
+
+    plt.imshow(image)
+
+    # Plot points with different colors for each label
+    colors = ["red", "blue", "green", "orange", "purple"]
+    for i, (x, y, label) in enumerate(zip(x_norm, y_norm, item_labels)):
+        color = colors[i % len(colors)]
+        plt.plot(x, y, "o", color=color, markersize=5, label=label)
+
+        # Add individual labels
+        plt.annotate(
+            label,
+            (x, y),
+            xytext=(0, 10),
+            textcoords="offset points",
+            ha="center",
+            color=color,
+        )
+
+    plt.title("Object Locations")
+    plt.legend()
+    plt.show()

@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import time
+from dataclasses import asdict
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -24,7 +25,7 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-from .models.base import BaseImageProcessor, KVCache
+from .models.base import BaseImageProcessor, KVCache, SimpleKVCache
 from .sample_utils import top_p_sampling
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
@@ -149,6 +150,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     model_class, model_type = get_model_and_args(config=config)
 
+    if "vision_config" in config:
+        skip_vision = config["vision_config"].get("skip_vision", False)
+        skip_vision_non_divisible = config["vision_config"].get(
+            "skip_vision_non_divisible", False
+        )
+    else:
+        skip_vision = False
+        skip_vision_non_divisible = False
+
     if model_type == "llava_bunny":
         vision_config = AutoConfig.from_pretrained(config["mm_vision_tower"])
         text_config = AutoConfig.from_pretrained(config["language_model"])
@@ -168,6 +178,17 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config["text_config"] = {
             k: v for k, v in config.items() if k != "vision_config"
         }
+    if model_type == "molmo":
+        intermediate_size = None
+        if "vision_config" in config and "intermediate_size" in config["vision_config"]:
+            intermediate_size = config["vision_config"]["intermediate_size"]
+
+        config["text_config"] = asdict(model_class.TextConfig())
+        config["vision_config"] = asdict(model_class.VisionConfig())
+        config["vision_config"]["intermediate_size"] = intermediate_size
+
+    config["vision_config"]["skip_vision"] = skip_vision
+    config["vision_config"]["skip_vision_non_divisible"] = skip_vision_non_divisible
 
     model_config = model_class.ModelConfig.from_dict(config)
 
@@ -203,10 +224,24 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized
-        class_predicate = (
-            lambda p, m: isinstance(m, (nn.Linear, nn.Embedding))
-            and f"{p}.scales" in weights
+        skip_vision = config.get("vision_config", {}).get("skip_vision", False)
+        skip_vision_non_divisible = config.get("vision_config", {}).get(
+            "skip_vision_non_divisible", False
         )
+        if skip_vision:
+            class_predicate = lambda _, m: not (
+                "vision_model" in m.name or "vision_tower" in m.name
+            )
+        elif skip_vision_non_divisible:
+            class_predicate = (
+                lambda _, m: hasattr(m, "to_quantized") and m.weight.shape[-1] % 64 == 0
+            )
+        else:
+            class_predicate = (
+                lambda p, m: isinstance(m, (nn.Linear, nn.Embedding))
+                and f"{p}.scales" in weights
+            )
+
         nn.quantize(
             model,
             **quantization,
@@ -495,8 +530,13 @@ def save_weights(
 
 
 def quantize_model(
-    model: nn.Module, config: dict, q_group_size: int, q_bits: int
-) -> Tuple:
+    model: nn.Module,
+    config: dict,
+    q_group_size: int,
+    q_bits: int,
+    skip_vision: bool = False,
+    skip_vision_non_divisible: bool = False,
+) -> Tuple[dict, dict]:
     """
     Applies quantization to the model weights.
 
@@ -505,43 +545,95 @@ def quantize_model(
         config (dict): Model configuration.
         q_group_size (int): Group size for quantization.
         q_bits (int): Bits per weight for quantization.
+        skip_vision (bool): Whether to skip quantizing vision model weights.
 
     Returns:
-        Tuple: Tuple containing quantized weights and config.
+        Tuple[dict, dict]: Tuple containing quantized weights and updated config.
     """
     quantized_config = copy.deepcopy(config)
-    vision_intermediate_size = (
-        model.config.vision_config.intermediate_size
-        if hasattr(model.config.vision_config, "intermediate_size")
-        else model.config.vision_config.hidden_size
-    )
-    divisor = 64
-    if any(vision_intermediate_size % size != 0 for size in [64, 128]):
+    quantized_config.setdefault("vision_config", {})
+
+    # Get vision model size
+    vision_size = _get_vision_size(model)
+
+    # Apply quantization
+    if skip_vision:
+        # Quantize only non-vision modules
+        nn.quantize(
+            model,
+            q_group_size,
+            q_bits,
+            class_predicate=lambda x: not (
+                "vision_model" in x.name or "vision_tower" in x.name
+            ),
+        )
+        quantized_config["vision_config"]["skip_vision"] = skip_vision
+    elif skip_vision_non_divisible:
+        # Quantize only layers with to_quantized method and divisible by 64
+        nn.quantize(
+            model,
+            q_group_size,
+            q_bits,
+            class_predicate=lambda _, m: hasattr(m, "to_quantized")
+            and m.weight.shape[-1] % 64 == 0,
+        )
+        quantized_config["vision_config"][
+            "skip_vision_non_divisible"
+        ] = skip_vision_non_divisible
+    else:
+        # Pad vision model if needed
+        _pad_vision_model(model, vision_size)
+        if hasattr(model.config.vision_config, "intermediate_size"):
+            _update_vision_config(
+                quantized_config, vision_size, key="intermediate_size"
+            )
+        elif hasattr(model.config.vision_config, "hidden_size"):
+            _update_vision_config(quantized_config, vision_size, key="hidden_size")
+        else:
+            raise ValueError(
+                "No intermediate_size or hidden_size found in vision_config"
+            )
+
+        nn.quantize(model, q_group_size, q_bits)
+
+    # Update config and get weights
+    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
+    quantized_weights = dict(tree_flatten(model.parameters()))
+
+    return quantized_weights, quantized_config
+
+
+def _get_vision_size(model: nn.Module) -> int:
+    """Get vision model intermediate/hidden size."""
+    if hasattr(model.config.vision_config, "intermediate_size"):
+        return model.config.vision_config.intermediate_size
+    return model.config.vision_config.hidden_size
+
+
+def _pad_vision_model(model: nn.Module, vision_size: int, divisor: int = 64) -> None:
+    """Pad vision model layers to be divisible by divisor."""
+    if any(vision_size % size != 0 for size in [64, 128]):
         for name, module in model.named_modules():
             if isinstance(module, nn.Linear) and (
                 "vision_model" in name or "vision_tower" in name
             ):
                 out_features, in_features = module.weight.shape
 
-                # Calculate the padding needed for each dimension
-                new_out_features = (
+                new_out = (
                     ((out_features // divisor) + 1) * divisor
-                    if out_features % divisor != 0
+                    if out_features % divisor
                     else out_features
                 )
-                new_in_features = (
+                new_in = (
                     ((in_features // divisor) + 1) * divisor
-                    if in_features % divisor != 0
+                    if in_features % divisor
                     else in_features
                 )
 
-                # If padding is needed, proceed
-                if new_out_features != out_features or new_in_features != in_features:
-                    # Create new weight and bias tensors
-                    new_weight = mx.zeros((new_out_features, new_in_features))
-                    new_bias = mx.zeros((new_out_features))
+                if new_out != out_features or new_in != in_features:
+                    new_weight = mx.zeros((new_out, new_in))
+                    new_bias = mx.zeros((new_out))
 
-                    # Copy existing weights and biases to the new tensors
                     new_weight[:out_features, :in_features] = module.weight
                     module.weight = new_weight
 
@@ -549,30 +641,20 @@ def quantize_model(
                         new_bias[:out_features] = module.bias
                         module.bias = new_bias
 
-    # Ensure vision_config exists in quantized_config
-    quantized_config.setdefault("vision_config", {})
 
-    # Update intermediate_size
-    if hasattr(model.config.vision_config, "intermediate_size"):
-        quantized_config["vision_config"]["intermediate_size"] = (
-            ((vision_intermediate_size // divisor) + 1) * divisor
-            if vision_intermediate_size % divisor != 0
-            else vision_intermediate_size
-        )
-    elif hasattr(model.config.vision_config, "hidden_size"):
-        quantized_config["vision_config"]["hidden_size"] = (
-            ((vision_intermediate_size // divisor) + 1) * divisor
-            if vision_intermediate_size % divisor != 0
-            else vision_intermediate_size
+def _update_vision_config(
+    config: dict,
+    value: Union[int, bool],
+    divisor: int = 64,
+    key: str = "intermediate_size",
+) -> None:
+    """Update vision config with padded sizes."""
+    if key in ["intermediate_size", "hidden_size"]:
+        config["vision_config"][key] = (
+            ((value // divisor) + 1) * divisor if value % divisor != 0 else value
         )
     else:
-        raise ValueError("No intermediate_size or hidden_size found in vision_config")
-
-    nn.quantize(model, q_group_size, q_bits)
-    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
-    quantized_weights = dict(tree_flatten(model.parameters()))
-
-    return quantized_weights, quantized_config
+        config["vision_config"][key] = value
 
 
 def save_config(
@@ -641,6 +723,8 @@ def convert(
     upload_repo: str = None,
     revision: Optional[str] = None,
     dequantize: bool = False,
+    skip_vision: bool = False,
+    skip_vision_non_divisible: bool = False,
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
@@ -656,7 +740,9 @@ def convert(
     if quantize:
         print("[INFO] Quantizing")
         model.load_weights(list(weights.items()))
-        weights, config = quantize_model(model, config, q_group_size, q_bits)
+        weights, config = quantize_model(
+            model, config, q_group_size, q_bits, skip_vision, skip_vision_non_divisible
+        )
 
     if dequantize:
         print("[INFO] Dequantizing")
@@ -742,6 +828,8 @@ def prepare_inputs(
     aspect_ratio_ids = None
     aspect_ratio_mask = None
     cross_attention_mask = None
+    image_input_idx = None
+    image_masks = None
 
     if image_processor is not None:
         if not isinstance(prompts, list):
@@ -775,18 +863,39 @@ def prepare_inputs(
         )
     else:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
-        inputs = processor(
-            text=prompts, images=images, padding=True, return_tensors="mlx"
-        )
+        if hasattr(processor, "process"):
+            inputs = processor.process(
+                text=prompts, images=images, padding=True, return_tensors="mlx"
+            )
+        else:
+            inputs = processor(
+                text=prompts, images=images, padding=True, return_tensors="mlx"
+            )
+        if "images" in inputs:
+            inputs["pixel_values"] = inputs["images"]
+            inputs.pop("images")
+
         if isinstance(inputs["pixel_values"], list):
             pixel_values = inputs["pixel_values"]
         else:
             pixel_values = mx.array(inputs["pixel_values"])
         input_ids = mx.array(inputs["input_ids"])
-        mask = mx.array(inputs["attention_mask"])
+        mask = (
+            mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
+        )
+
+        image_input_idx = inputs.get("image_input_idx", None)
+        if image_input_idx is not None:
+            image_input_idx = mx.array(image_input_idx)
+
+        image_masks = inputs.get("image_masks", None)
+        if image_masks is not None:
+            image_masks = mx.array(image_masks)
+
         image_sizes = inputs.get("image_sizes", None)
         if image_sizes is not None:
             image_sizes = mx.array(image_sizes)
+
         image_grid_thw = inputs.get("image_grid_thw", None)
         if image_grid_thw is not None:
             image_grid_thw = mx.array(image_grid_thw)
@@ -812,6 +921,8 @@ def prepare_inputs(
         aspect_ratio_ids,
         aspect_ratio_mask,
         cross_attention_mask,
+        image_input_idx,
+        image_masks,
     )
 
 
@@ -881,21 +992,34 @@ def generate_step(
             if isinstance(model.language_model.n_kv_heads, int)
             else model.language_model.n_kv_heads
         )
-        cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
+        if model.config.model_type == "florence2":
+            cache = [
+                (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
+            ]
+        else:
+            cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
 
-    repetition_context = input_ids.tolist()
+    repetition_context = input_ids.reshape(-1).tolist()
 
     if repetition_context_size:
         repetition_context = repetition_context[-repetition_context_size:]
 
     def _step(y, **kwargs):
         nonlocal repetition_context
-        outputs = model.language_model(
-            y[None],
-            cache=cache,
-            mask=mask,
-            **kwargs,
-        )
+        if "decoder_input_ids" in kwargs:
+            outputs = model.language_model(
+                cache=cache,
+                **kwargs,
+            )
+        else:
+
+            outputs = model.language_model(
+                y[None],
+                cache=cache,
+                mask=mask,
+                **kwargs,
+            )
+
         logits = outputs.logits[:, -1, :]
 
         if repetition_penalty:
@@ -913,6 +1037,11 @@ def generate_step(
         return y, logprobs.squeeze(0)
 
     outputs = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
+
+    logits = outputs.logits[:, -1, :]
+    y, logprobs = sample(logits)
+    mx.async_eval(y)
+
     if outputs.cross_attention_states is not None:
         kwargs = {
             k: v
@@ -920,15 +1049,19 @@ def generate_step(
                 ["cross_attention_states"], [outputs.cross_attention_states]
             )
         }
+    elif outputs.encoder_outputs is not None:
+        kwargs = {
+            "decoder_input_ids": y[None],
+            "encoder_outputs": outputs.encoder_outputs,
+        }
     else:
         kwargs = {}
 
-    logits = outputs.logits[:, -1, :]
-    y, logprobs = sample(logits)
-    mx.async_eval(y)
     while True:
         next_y, next_logprobs = _step(y, **kwargs)
         mx.async_eval(next_y)
+        if "decoder_input_ids" in kwargs:
+            kwargs["decoder_input_ids"] = next_y[None]
         yield y.item(), logprobs
         y, logprobs = next_y, next_logprobs
 
@@ -1011,8 +1144,8 @@ def generate(
     max_tokens: int = 100,
     verbose: bool = False,
     formatter: Optional[Callable] = None,
-    repetition_penalty: Optional[float] = None,
-    repetition_context_size: Optional[int] = None,
+    repetition_penalty: Optional[float] = 1.1,
+    repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
     **kwargs,
 ) -> str:
@@ -1046,7 +1179,10 @@ def generate(
         tokenizer = processor.tokenizer
 
     resize_shape = kwargs.pop("resize_shape", None)
-    image_token_index = model.config.image_token_index
+    if hasattr(model.config, "image_token_index"):
+        image_token_index = model.config.image_token_index
+    else:
+        image_token_index = None
 
     # Prepare inputs
     inputs = prepare_inputs(
@@ -1062,6 +1198,8 @@ def generate(
                 "aspect_ratio_ids",
                 "aspect_ratio_mask",
                 "cross_attention_mask",
+                "image_input_idx",
+                "image_masks",
             ],
             inputs[3:],
         )

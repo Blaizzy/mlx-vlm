@@ -49,6 +49,18 @@ def configure_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
     )
+    parser.add_argument(
+        "--skip-vision",
+        help="Skip vision quantization.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--skip-vision-non-divisible",
+        help="Skip layers that are not divisible by 64 in vision encoder.",
+        action="store_true",
+        default=False,
+    )
     return parser
 
 

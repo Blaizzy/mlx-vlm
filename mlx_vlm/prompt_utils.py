@@ -24,7 +24,12 @@ def get_message_json(
             return message
         if role == "user" and not skip_image_token:
             if isinstance(message["content"], list):
-                message["content"].extend([{"type": "image"}] * num_images)
+                if model_name == "pixtral":
+                    message["content"] = [{"type": "image"}] * num_images + message[
+                        "content"
+                    ]
+                else:
+                    message["content"].extend([{"type": "image"}] * num_images)
             else:
                 if model_name == "phi3_v":
                     message["content"] = f"{token_format}{message['content']}"
@@ -67,7 +72,9 @@ def get_message_json(
         "multi_modality": "message_with_image_token",
         "pixtral": "message_list_with_image_type",
         "paligemma": "prompt_only",
+        "florence2": "prompt_only",
         "mllama": "message_list_with_image",
+        "molmo": "prompt_only",
     }
 
     if num_images > 1 and model_name in [
@@ -141,7 +148,7 @@ def apply_chat_template(
     if return_messages:
         return messages
 
-    if config["model_type"] == "paligemma":
+    if config["model_type"] in ["paligemma", "molmo", "florence2"]:
         return messages[-1]
 
     if "chat_template" in processor.__dict__.keys():

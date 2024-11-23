@@ -1,3 +1,4 @@
+import inspect
 import unittest
 
 import mlx.core as mx
@@ -54,17 +55,36 @@ class TestModels(unittest.TestCase):
         num_channels,
         image_size: tuple,
         vision_feature_layer=-2,
+        channel_first=False,
         **kwargs,
     ):
         self.assertEqual(vision_tower.model_type, model_type)
 
         batch_size = 1
 
-        input_tensor = mx.random.uniform(
-            shape=(batch_size, image_size[0], image_size[1], num_channels)
-        )
+        if channel_first:
+            input_tensor = mx.random.uniform(
+                shape=(batch_size, num_channels, image_size[0], image_size[1])
+            )
+        else:
+            input_tensor = mx.random.uniform(
+                shape=(batch_size, image_size[0], image_size[1], num_channels)
+            )
 
-        hidden_states = vision_tower(input_tensor, output_hidden_states=True, **kwargs)
+        if "image_masks" in inspect.signature(vision_tower.__call__).parameters:
+            input_tensor = input_tensor.transpose(0, 3, 1, 2)
+            image_masks = mx.ones((batch_size, num_channels, image_size[0]))
+            kwargs["image_masks"] = image_masks
+
+        if (
+            "output_hidden_states"
+            in inspect.signature(vision_tower.__call__).parameters
+        ):
+            hidden_states = vision_tower(
+                input_tensor, output_hidden_states=True, **kwargs
+            )
+        else:
+            hidden_states = vision_tower(input_tensor, **kwargs)
 
         # Check vision hidden feature layer's shape matches the expected hidden size
         self.assertEqual(
@@ -793,6 +813,72 @@ class TestModels(unittest.TestCase):
         # Check output shape
         expected_shape = (batch_size, seq_length, model_config.vocab_size)
         self.assertEqual(output.logits.shape, expected_shape)
+
+    def test_molmo(self):
+        from mlx_vlm.models import molmo
+
+        text_config = molmo.TextConfig()
+        vision_config = molmo.VisionConfig()
+        config = molmo.ModelConfig(text_config=text_config, vision_config=vision_config)
+        model = molmo.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.n_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.d_model,
+            config.vision_config.num_channels,
+            (576, 588),
+        )
+
+    def test_florence2(self):
+        from mlx_vlm.models import florence2
+
+        text_config = florence2.TextConfig()
+        vision_config = florence2.VisionConfig(drop_path_rate=0.0)
+        config = florence2.ModelConfig(
+            text_config=text_config, vision_config=vision_config
+        )
+        model = florence2.Model(config)
+
+        # Create dummy data
+        batch_size = 1
+        seq_length = 590
+        # Create dummy text inputs
+        inputs_embeds = mx.zeros((batch_size, seq_length, config.text_config.d_model))
+
+        # Create dummy masks and embeddings
+        decoder_inputs_embeds = mx.zeros((batch_size, 1, config.text_config.d_model))
+
+        # Forward pass
+        output = model.language_model(
+            inputs_embeds=inputs_embeds,
+            decoder_inputs_embeds=decoder_inputs_embeds,
+        )
+
+        # Check output shape matches the example shape
+        self.assertEqual(
+            output.logits.shape, (batch_size, 1, config.text_config.vocab_size)
+        )
+        self.assertEqual(
+            output.encoder_outputs.shape,
+            (batch_size, seq_length, config.text_config.d_model),
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.dim_embed[-1],
+            config.vision_config.in_chans,
+            config.vision_config.image_size,
+            channel_first=True,
+        )
 
 
 if __name__ == "__main__":
