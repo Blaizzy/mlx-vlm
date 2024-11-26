@@ -103,7 +103,7 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
-        self.activation_fn = nn.GELU(approx='precise')
+        self.activation_fn = nn.GELU(approx="precise")
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=True)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=True)
 
