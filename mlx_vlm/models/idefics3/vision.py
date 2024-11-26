@@ -200,6 +200,7 @@ class VisionModel(nn.Module):
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
         x = self.embeddings(x)
+        x = x.astype(self.embeddings.patch_embedding.weight.dtype)
         encoder_outputs = self.encoder(
             x=x, output_hidden_states=output_hidden_states, mask=None
         )
