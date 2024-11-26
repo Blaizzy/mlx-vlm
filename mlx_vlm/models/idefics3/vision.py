@@ -177,7 +177,7 @@ class VisionEmbeddings(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         patch_embeddings = self.patch_embedding(x)
         patch_embeddings = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
-        position_ids = mx.array(np.arange(self.num_positions)[None, :])
+        position_ids = mx.array(mx.arange(self.num_positions)[None, :])
         embeddings = patch_embeddings
         embeddings += self.position_embedding(position_ids)
         return embeddings
