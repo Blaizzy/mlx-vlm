@@ -63,6 +63,7 @@ def get_message_json(
 
     model_to_format = {
         "idefics2": "message_list_with_image",
+        "idefics3": "message_list_with_image",
         "qwen2_vl": "message_list_with_image",
         "llava": "message_list_with_image",
         "llava_next": "message_list_with_image",
