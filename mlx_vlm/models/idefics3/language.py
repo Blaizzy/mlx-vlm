@@ -153,7 +153,7 @@ class LanguageModel(nn.Module):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
         else:
-            h = inputs_embeds
+            h = inputs_embeds.astype(self.norm.weight.dtype)
 
         mask = create_attention_mask(h)
 
