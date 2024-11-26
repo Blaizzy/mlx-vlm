@@ -60,7 +60,12 @@ class Idefics3Connector(nn.Module):
         x = x.reshape(bsz, height, width, embed_dim)
         x = x.reshape(bsz, height, int(width / scale_factor), embed_dim * scale_factor)
         x = x.transpose(0, 2, 1, 3)
-        x = x.reshape(bsz, int(width / scale_factor), int(height / scale_factor), embed_dim * (scale_factor**2))
+        x = x.reshape(
+            bsz,
+            int(width / scale_factor),
+            int(height / scale_factor),
+            embed_dim * (scale_factor**2),
+        )
         x = x.transpose(0, 2, 1, 3)
         x = x.reshape(bsz, int(seq / (scale_factor**2)), embed_dim * (scale_factor**2))
         return x
