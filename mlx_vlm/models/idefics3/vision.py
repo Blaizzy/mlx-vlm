@@ -100,23 +100,10 @@ class Attention(nn.Module):
         return self.out_proj(output)
 
 
-class FastGELUActivation(nn.Module):
-    """
-    Applies GELU approximation that is slower than QuickGELU but more accurate. See: https://github.com/hendrycks/GELUs
-    """
-
-    def __call__(self, input: mx.array) -> mx.array:
-        return (
-            0.5
-            * input
-            * (1.0 + mx.tanh(np.sqrt(2 / np.pi) * (input + 0.044715 * (input**3))))
-        )
-
-
 class MLP(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
-        self.activation_fn = FastGELUActivation()
+        self.activation_fn = nn.GELU(approx='precise')
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=True)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=True)
 
