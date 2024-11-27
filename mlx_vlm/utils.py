@@ -728,7 +728,7 @@ def convert(
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
-    model, config, processor = fetch_from_hub(model_path, lazy=False)
+    model, config, processor = fetch_from_hub(model_path, lazy=True)
 
     weights = dict(tree_flatten(model.parameters()))
     dtype = mx.float16 if quantize else getattr(mx, dtype)
