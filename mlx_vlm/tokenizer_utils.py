@@ -314,7 +314,8 @@ def load_tokenizer(model_path, return_tokenizer=True, tokenizer_config_extra={})
 
     tokenizer_file = model_path / "tokenizer.json"
     if tokenizer_file.exists():
-        tokenizer_content = json.load(tokenizer_file.open())
+        with open(tokenizer_file, "r") as f:
+            tokenizer_content = json.load(f)
         if "decoder" in tokenizer_content:
             if _is_spm_decoder(tokenizer_content["decoder"]):
                 detokenizer_class = SPMStreamingDetokenizer
