@@ -1,5 +1,6 @@
 import json
 from functools import partial
+from json import JSONDecodeError
 
 from transformers import AutoTokenizer
 
@@ -318,11 +319,7 @@ def load_tokenizer(model_path, return_tokenizer=True, tokenizer_config_extra={})
             try:
                 tokenizer_content = json.load(f)
             except JSONDecodeError as e:
-                raise JSONDecodeError(
-                    "Failed to parse tokenizer.json", 
-                    e.doc, 
-                    e.pos
-                )
+                raise JSONDecodeError("Failed to parse tokenizer.json", e.doc, e.pos)
         if "decoder" in tokenizer_content:
             if _is_spm_decoder(tokenizer_content["decoder"]):
                 detokenizer_class = SPMStreamingDetokenizer
