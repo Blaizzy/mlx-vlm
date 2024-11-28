@@ -1095,7 +1095,10 @@ def stream_generate(
         tokenizer = processor.tokenizer
 
     resize_shape = kwargs.pop("resize_shape", None)
-    image_token_index = model.config.image_token_index
+    if hasattr(model.config, "image_token_index"):
+        image_token_index = model.config.image_token_index
+    else:
+        image_token_index = None
 
     # Prepare inputs
     inputs = prepare_inputs(
