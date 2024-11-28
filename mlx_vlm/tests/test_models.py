@@ -355,6 +355,59 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
         )
 
+    def test_idefics3(self):
+        from mlx_vlm.models import idefics3
+
+        text_config = idefics3.TextConfig(
+            model_type="idefics3",
+            hidden_size=2048,
+            num_hidden_layers=24,
+            intermediate_size=8192,
+            num_attention_heads=32,
+            rms_norm_eps=1e-5,
+            vocab_size=49155,
+            num_key_value_heads=32,
+            rope_theta=273768.0,
+            rope_traditional=False,
+        )
+
+        vision_config = idefics3.VisionConfig(
+            model_type="idefics3",
+            num_hidden_layers=27,
+            hidden_size=1152,
+            intermediate_size=4304,
+            num_attention_heads=16,
+            image_size=384,
+            patch_size=14,
+            num_channels=3,
+            layer_norm_eps=1e-6,
+        )
+
+        config = idefics3.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="idefics3",
+            ignore_index=-100,
+            image_token_id=49153,
+        )
+
+        model = idefics3.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_model,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
     def test_paligemma(self):
         from mlx_vlm.models import paligemma
 
