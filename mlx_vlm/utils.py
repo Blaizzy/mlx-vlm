@@ -1102,7 +1102,19 @@ def stream_generate(
         image_processor, processor, image, prompt, image_token_index, resize_shape
     )
     input_ids, pixel_values, mask = inputs[:3]
-    kwargs = {k: v for k, v in zip(["image_grid_thw", "image_sizes"], inputs[3:])}
+    kwargs = {
+        k: v
+        for k, v in zip(
+            [
+                "image_grid_thw",
+                "image_sizes",
+                "aspect_ratio_ids",
+                "aspect_ratio_mask",
+                "cross_attention_mask",
+            ],
+            inputs[3:],
+        )
+    }
 
     detokenizer = processor.detokenizer
 
