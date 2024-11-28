@@ -24,7 +24,7 @@ def get_message_json(
             return message
         if role == "user" and not skip_image_token:
             if isinstance(message["content"], list):
-                if model_name == "pixtral":
+                if model_name in ["pixtral", "idefics3"]:
                     message["content"] = [{"type": "image"}] * num_images + message[
                         "content"
                     ]
