@@ -131,14 +131,15 @@ class Attention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
+    def __init__(self, dim, hidden_dim, model_type):
         super().__init__()
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
         self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.gelu = nn.GELU() if model_type == "gemma" else nn.GELU(approx="precise")
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.gelu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(self.gelu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class TransformerBlock(nn.Module):
@@ -148,7 +149,7 @@ class TransformerBlock(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.self_attn = Attention(config)
-        self.mlp = MLP(config.hidden_size, config.intermediate_size)
+        self.mlp = MLP(config.hidden_size, config.intermediate_size, config.model_type)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
