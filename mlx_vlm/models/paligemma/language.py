@@ -17,9 +17,13 @@ class TextConfig:
     num_attention_heads: int
     num_key_value_heads: int
     vocab_size: int
+    head_dim: int = 256
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000
     rope_traditional: bool = False
+    attn_logit_softcapping: Optional[float] = None
+    final_logit_softcapping: Optional[float] = None
+    query_pre_attn_scalar: Optional[float] = None
 
     @classmethod
     def from_dict(cls, params):
@@ -49,9 +53,19 @@ class Attention(nn.Module):
         dim = config.hidden_size
         self.n_heads = n_heads = config.num_attention_heads
         self.n_kv_heads = n_kv_heads = config.num_key_value_heads
-
-        head_dim = config.hidden_size // n_heads
-        self.scale = head_dim**-0.5
+        self.model_type = config.model_type
+        self.attn_logit_softcapping = config.attn_logit_softcapping
+        self.repeats = n_heads // n_kv_heads
+        head_dim = (
+            config.hidden_size // n_heads
+            if self.model_type == "gemma"
+            else config.head_dim
+        )
+        self.scale = (
+            head_dim**-0.5
+            if self.model_type == "gemma"
+            else 1.0 / (config.query_pre_attn_scalar**0.5)
+        )
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
@@ -87,9 +101,31 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
-        )
+        if self.model_type == "gemma2":
+            queries = queries * self.scale
+
+            if self.repeats > 1:
+                queries = queries.reshape(
+                    B, self.n_kv_heads, self.repeats, L, self.head_dim
+                )
+                keys = mx.expand_dims(keys, 2)
+                values = mx.expand_dims(values, 2)
+
+            scores = queries @ keys.swapaxes(-1, -2)
+            scores = mx.tanh(scores / self.attn_logit_softcapping)
+            scores *= self.attn_logit_softcapping
+
+            if mask is not None:
+                scores = scores + mask
+            scores = mx.softmax(scores, precise=True, axis=-1)
+            output = scores @ values
+            if self.repeats > 1:
+                output = output.reshape(B, self.n_heads, L, self.head_dim)
+        else:
+            output = mx.fast.scaled_dot_product_attention(
+                queries, keys, values, scale=self.scale, mask=mask
+            )
+
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -108,6 +144,7 @@ class MLP(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
+        self.model_type = config.model_type
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.self_attn = Attention(config)
@@ -117,6 +154,13 @@ class TransformerBlock(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.config = config
+        if config.model_type == "gemma2":
+            self.pre_feedforward_layernorm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+            self.post_feedforward_layernorm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
 
     def __call__(
         self,
@@ -124,10 +168,16 @@ class TransformerBlock(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
-        h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        out = h + r
+        if self.model_type == "gemma2":
+            r = self.self_attn(self.input_layernorm(x), mask, cache)
+            h = x + self.post_attention_layernorm(r)
+            r = self.mlp(self.pre_feedforward_layernorm(h))
+            out = h + self.post_feedforward_layernorm(r)
+        else:
+            r = self.self_attn(self.input_layernorm(x), mask, cache)
+            h = x + r
+            r = self.mlp(self.post_attention_layernorm(h))
+            out = h + r
         return out
 
 
@@ -174,8 +224,14 @@ class LanguageModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
+        self.final_logit_softcapping = config.final_logit_softcapping
         self.model_type = config.model_type
         self.model = GemmaModel(config)
+
+        if self.model_type not in ["gemma", "gemma2"]:
+            raise ValueError(
+                f"Model type {self.model_type} not supported. Currently only 'gemma' is supported"
+            )
 
     def __call__(
         self,
@@ -186,6 +242,10 @@ class LanguageModel(nn.Module):
     ):
         out = self.model(inputs, cache, inputs_embeds=inputs_embeds, mask=mask)
         out = self.model.embed_tokens.as_linear(out)
+
+        if self.model_type == "gemma2":
+            out = mx.tanh(out / self.final_logit_softcapping)
+            out = out * self.final_logit_softcapping
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
