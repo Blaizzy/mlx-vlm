@@ -59,6 +59,7 @@ def get_message_json(
             " ".join([f"<|image_{i+1}|>" for i in range(num_images)]),
         ),
         "prompt_only": lambda: prompt,
+        "prompt_with_image_token": lambda: "<image>" * num_images + prompt,
     }
 
     model_to_format = {
@@ -72,7 +73,7 @@ def get_message_json(
         "phi3_v": "message_with_numbered_image_tokens",
         "multi_modality": "message_with_image_token",
         "pixtral": "message_list_with_image_type",
-        "paligemma": "prompt_only",
+        "paligemma": "prompt_with_image_token",
         "florence2": "prompt_only",
         "mllama": "message_list_with_image",
         "molmo": "prompt_only",
