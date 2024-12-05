@@ -56,7 +56,7 @@ class Attention(nn.Module):
         self.model_type = config.model_type
         self.attn_logit_softcapping = config.attn_logit_softcapping
         self.repeats = n_heads // n_kv_heads
-        head_dim = (
+        self.head_dim = head_dim = (
             config.hidden_size // n_heads
             if self.model_type == "gemma"
             else config.head_dim
@@ -260,7 +260,11 @@ class LanguageModel(nn.Module):
 
     @property
     def head_dim(self):
-        return self.config.hidden_size // self.config.num_attention_heads
+        return (
+            self.config.hidden_size // self.config.num_attention_heads
+            if self.model_type == "gemma"
+            else self.config.head_dim
+        )
 
     @property
     def n_kv_heads(self):
