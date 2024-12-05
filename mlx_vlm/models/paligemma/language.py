@@ -101,7 +101,11 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        if self.model_type == "gemma2":
+        if self.model_type == "gemma":
+            output = mx.fast.scaled_dot_product_attention(
+                queries, keys, values, scale=self.scale, mask=mask
+            )
+        else:
             queries = queries * self.scale
 
             if self.repeats > 1:
@@ -121,10 +125,6 @@ class Attention(nn.Module):
             output = scores @ values
             if self.repeats > 1:
                 output = output.reshape(B, self.n_heads, L, self.head_dim)
-        else:
-            output = mx.fast.scaled_dot_product_attention(
-                queries, keys, values, scale=self.scale, mask=mask
-            )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -155,6 +155,7 @@ class TransformerBlock(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.config = config
+
         if config.model_type == "gemma2":
             self.pre_feedforward_layernorm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -169,16 +170,19 @@ class TransformerBlock(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
     ) -> mx.array:
-        if self.model_type == "gemma2":
-            r = self.self_attn(self.input_layernorm(x), mask, cache)
-            h = x + self.post_attention_layernorm(r)
-            r = self.mlp(self.pre_feedforward_layernorm(h))
-            out = h + self.post_feedforward_layernorm(r)
-        else:
-            r = self.self_attn(self.input_layernorm(x), mask, cache)
+        # Self attention block
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
+
+        if self.model_type == "gemma":
+            # Gemma: Post-attention residual connection then MLP
             h = x + r
             r = self.mlp(self.post_attention_layernorm(h))
             out = h + r
+        else:
+            # Gemma2: Normalized residual connections with pre/post norms
+            h = x + self.post_attention_layernorm(r)
+            r = self.mlp(self.pre_feedforward_layernorm(h))
+            out = h + self.post_feedforward_layernorm(r)
         return out
 
 
