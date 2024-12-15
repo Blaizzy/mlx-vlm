@@ -1,5 +1,6 @@
 import glob
 import inspect
+import math
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,10 +20,15 @@ from .vision import VisionConfig, VisionModel
 
 
 @dataclass
-class AlignerConfig:
-    cls: str
+class ProjectorConfig:
     model_type: str
-    params: dict
+    projector_type: str = "downsample_mlp_gelu"
+    input_dim: int = 1152
+    n_embed: int = 2048
+    depth: int = 2
+    mlp_ratio: int = 1
+    downsample_ratio: int = 2
+    token_pooling: bool = False
 
     @classmethod
     def from_dict(cls, params):
@@ -39,7 +45,7 @@ class AlignerConfig:
 class ModelConfig:
     text_config: TextConfig
     vision_config: VisionConfig
-    aligner_config: AlignerConfig
+    projector_config: ProjectorConfig
     model_type: str
     ignore_index: int = -100
     image_token_index: int = 100015
@@ -171,76 +177,94 @@ class ImageProcessor(BaseImageProcessor):
 
 
 class MlpProjector(nn.Module):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ProjectorConfig):
         super().__init__()
-
-        if config.aligner_config.params["projector_type"] == "mlp_gelu":
-            self.layers = [
-                nn.Linear(
-                    config.vision_config.hidden_size,
-                    config.text_config.hidden_size,
-                    bias=True,
-                )
-            ]
-            mlp_depth = config.aligner_config.params["depth"]
+        self.config = config
+        if config.projector_config.projector_type == "identity":
+            modules = nn.Identity()
+        elif config.projector_config.projector_type == "linear":
+            modules = nn.Linear(config.projector_config.input_dim, config.projector_config.n_embed)
+        elif config.projector_config.projector_type == "mlp_gelu":
+            mlp_depth = config.projector_config.depth
+            modules = [nn.Linear(config.projector_config.input_dim, config.projector_config.n_embed)]
             for _ in range(1, mlp_depth):
-                self.layers.append(nn.GELU())
-                self.layers.append(
-                    nn.Linear(
-                        config.text_config.hidden_size,
-                        config.text_config.hidden_size,
-                        bias=True,
-                    )
-                )
-        elif (
-            config.aligner_config.params["projector_type"]
-            == "low_high_hybrid_split_mlp_gelu"
-        ):
-            mlp_depth = config.aligner_config.params["depth"]
-            self.high_up_proj = nn.Linear(
-                config.vision_config.hidden_size, config.text_config.hidden_size // 2
-            )
-            self.low_up_proj = nn.Linear(
-                config.vision_config.hidden_size, config.text_config.hidden_size // 2
-            )
-
-            self.layers = []
-            for _ in range(1, mlp_depth):
-                self.layers.append(nn.GELU())
-                self.layers.append(
-                    nn.Linear(
-                        config.text_config.hidden_size, config.text_config.hidden_size
-                    )
-                )
-
+                modules.append(nn.GELU())
+                modules.append(nn.Linear(config.projector_config.n_embed, config.projector_config.n_embed))
+            modules = nn.Sequential(*modules)
+        elif config.projector_config.projector_type == "downsample_mlp_gelu":
+            mlp_depth = config.projector_config.depth
+            mlp_ratio = config.projector_config.mlp_ratio
+            modules = [nn.Linear(config.projector_config.input_dim * config.projector_config.downsample_ratio * config.projector_config.downsample_ratio,
+                               config.projector_config.n_embed * mlp_ratio)]
+            for _ in range(1, mlp_depth - 1):
+                modules.append(nn.GELU())
+                modules.append(nn.Linear(config.projector_config.n_embed * mlp_ratio, config.projector_config.n_embed * mlp_ratio))
+            modules.append(nn.GELU())
+            modules.append(nn.Linear(config.projector_config.n_embed * mlp_ratio, config.projector_config.n_embed))
+            modules = nn.Sequential(*modules)
         else:
-            projector_type = config.aligner_config.params["projector_type"]
-            raise ValueError(f"Unknown projector type: {projector_type}")
+            raise ValueError(f"Unknown projector type: {config.projector_config.projector_type}")
 
-    def __call__(self, x: Union[mx.array, Tuple]) -> mx.array:
+        if config.projector_config.token_pooling:
+            self.token_pooling_layer = nn.Linear(config.projector_config.input_dim * 4, config.projector_config.input_dim)
+        self.layers = modules
 
-        if isinstance(x, tuple):
-            high_x, low_x = x
+    def __call__(self, x):
+        if self.config.projector_config.token_pooling:
+            batch_size, wxh, channels = x.shape
+            w = h = int(math.sqrt(wxh))
+            x = mx.reshape(x, (batch_size, w, h, channels))
+            x = mx.transpose(x, (0, 3, 1, 2))  # B, C, H, W
 
-            high_x = self.high_up_proj(high_x)
-            low_x = self.low_up_proj(low_x)
+            # Implement unfold operation manually since MLX doesn't have unfold
+            patches = []
+            for i in range(0, h-1, 2):
+                for j in range(0, w-1, 2):
+                    patch = x[:, :, i:i+2, j:j+2]
+                    patches.append(patch)
 
-            B, D = high_x.shape[0], high_x.shape[-1]
-            high_x = high_x.reshape(B, -1, D)
+            patches = mx.stack(patches, axis=2)  # B, C, N_patches, 2, 2
+            batch_size, channels, n_patches, _, _ = patches.shape
 
-            x = mx.concatenate([high_x, low_x], axis=-1)
+            # Reshape and concatenate
+            patches = mx.reshape(patches, (batch_size, channels, n_patches, -1))
+            patches = mx.transpose(patches, (0, 2, 1, 3))
+            patches = mx.reshape(patches, (batch_size, n_patches, channels * 4))
+            x = self.token_pooling_layer(patches)
 
-        for layer in self.layers:
-            x = layer(x)
+        elif self.config.projector_config.projector_type == 'downsample_mlp_gelu':
+            bs, hw, input_dim = x.shape
+            h = w = int(math.sqrt(hw))
 
-        return x
+            # Compute padding
+            pad = 0 if h % self.config.projector_config.downsample_ratio == 0 else \
+                  self.config.projector_config.downsample_ratio - h % self.config.projector_config.downsample_ratio
 
+            x = mx.reshape(x, (bs, h, w, input_dim))
+            if pad > 0:
+                x = mx.pad(x, [(0, 0), (0, pad), (0, pad), (0, 0)], constant_values=0)
+
+            x = mx.transpose(x, (0, 3, 1, 2))  # B, C, H, W
+
+            # Manual implementation of unfold for downsampling
+            h_pad, w_pad = x.shape[2], x.shape[3]
+            ds = self.config.projector_config.downsample_ratio
+            patches = []
+
+            for i in range(0, h_pad-ds+1, ds):
+                for j in range(0, w_pad-ds+1, ds):
+                    patch = x[:, :, i:i+ds, j:j+ds]
+                    patches.append(mx.reshape(patch, (bs, -1)))
+
+            x = mx.stack(patches, axis=1)  # B, N_patches, C*ds*ds
+
+        return self.layers(x)
 
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.vision_model = VisionModel(config.vision_config)
+        self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config)
         self.aligner = MlpProjector(config)
         self.vision_feature_layer = config.select_layer
@@ -321,11 +345,11 @@ class Model(nn.Module):
 
         # Get the ouptut hidden states from the vision model
         if self.config.vision_config.cls == "HybridVisionTower":
-            hidden_states = self.vision_model(
+            hidden_states = self.vision_tower(
                 pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
             )
         else:
-            hidden_states, _, _ = self.vision_model(
+            hidden_states, _, _ = self.vision_tower(
                 pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
             )
 
@@ -417,3 +441,14 @@ class Model(nn.Module):
 
         model.load_weights(list(weights.items()))
         return model
+
+    @staticmethod
+    def sanitize(weights):
+        def transform_key(key):
+            if "language.model" in key:
+                key = key.replace("language.model", "language_model.model")
+            if "vision" in key:
+                key = key.replace("vision", "vision.vision_tower")
+            return key
+
+        return {transform_key(k): v for k, v in weights.items()}

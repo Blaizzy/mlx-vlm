@@ -7,16 +7,16 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import KVCache, LanguageModelOutput, create_attention_mask
-from mlx_lm.switch_layers import SwitchGLU
+from ..switch_layers import SwitchGLU
 
 
 @dataclass
 class TextConfig:
     model_type: str = "deepseek_v2"
     vocab_size: int = 102400
-    hidden_size: int = 4096
-    intermediate_size: int = 11008
-    moe_intermediate_size: int = 1407
+    hidden_size: int = 1280
+    intermediate_size: int = 6848
+    moe_intermediate_size: int = 896
     num_hidden_layers: int = 30
     num_attention_heads: int = 32
     num_key_value_heads: int = 32
@@ -37,9 +37,10 @@ class TextConfig:
     max_position_embeddings: int = 2048
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
+    rope_traditional: bool = False
     rope_scaling: Dict = None
     attention_bias: bool = False
-
+    attn_type: str = "DeepseekV2Attention"
 
     @classmethod
     def from_dict(cls, params):
@@ -52,6 +53,9 @@ class TextConfig:
         )
 
     def __post_init__(self):
+        if self.qk_nope_head_dim == 0:
+            self.attn_type = "LlamaAttention"
+
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
@@ -264,6 +268,59 @@ class DeepseekV2Attention(nn.Module):
         return self.o_proj(output)
 
 
+class LlamaAttention(nn.Module):
+    def __init__(self, config: TextConfig):
+        super().__init__()
+
+        dim = config.hidden_size
+        self.n_heads = n_heads = config.num_attention_heads
+        self.n_kv_heads = n_kv_heads = config.num_key_value_heads
+
+        self.head_dim = head_dim =  config.hidden_size // n_heads
+
+        self.scale = head_dim**-0.5
+        if config.attention_bias:
+            attention_bias = config.attention_bias
+        else:
+            attention_bias = False
+
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=attention_bias)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=attention_bias)
+
+        self.rope = nn.RoPE(dim, config.rope_theta, config.rope_traditional, config.rope_scaling)
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        B, L, D = x.shape
+
+        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+
+        # Prepare the queries, keys and values for the attention computation
+        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+
+        if cache is not None:
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
+            keys, values = cache.update_and_fetch(keys, values)
+        else:
+            queries = self.rope(queries)
+            keys = self.rope(keys)
+
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=self.scale, mask=mask
+        )
+
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(output)
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self, config: TextConfig, hidden_size: int = None, intermediate_size: int = None
@@ -282,6 +339,8 @@ class DeepseekV2MLP(nn.Module):
     def __call__(self, x):
         down_proj = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
+
+
 
 
 class MoEGate(nn.Module):
@@ -349,7 +408,8 @@ class DeepseekV2MoE(nn.Module):
 class DeepseekV2DecoderLayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
-        self.self_attn = DeepseekV2Attention(config)
+        self.attn_type = config.attn_type
+        self.self_attn = DeepseekV2Attention(config) if self.attn_type == "DeepseekV2Attention" else LlamaAttention(config)
         self.mlp = (
             DeepseekV2MoE(config)
             if (
@@ -429,7 +489,7 @@ class LanguageModel(nn.Module):
 
     def sanitize(self, weights):
         for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}"
+            prefix = f"language_model.model.layers.{l}"
             for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
                 for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:

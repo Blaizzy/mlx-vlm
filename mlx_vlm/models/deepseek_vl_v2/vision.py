@@ -27,10 +27,6 @@ class VisionConfig:
     cls: str = None
     params: dict = None
 
-    def __post_init__(self):
-        if "high_res_cfg" in self.params:
-            self.image_size = self.params["high_res_cfg"]["image_size"]
-
     @classmethod
     def from_dict(cls, params):
         return cls(
@@ -162,7 +158,7 @@ class Attention(nn.Module):
         self,
         dims: int,
         num_heads: int,
-        qkv_bias: bool = False,
+        qkv_bias: bool = True,
     ):
         super().__init__()
 

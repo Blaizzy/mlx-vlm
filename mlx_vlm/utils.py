@@ -207,6 +207,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             config["aligner_config"]
         )
 
+    if hasattr(model_config, "projector_config"):
+        model_config.projector_config = model_class.ProjectorConfig.from_dict(
+            config["projector_config"]
+        )
+
     model = model_class.Model(model_config)
 
     if hasattr(model, "sanitize"):
