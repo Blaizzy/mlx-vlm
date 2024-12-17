@@ -77,6 +77,7 @@ def get_message_json(
         "florence2": "prompt_only",
         "mllama": "message_list_with_image",
         "molmo": "prompt_only",
+        "deepseek_vl_v2": "message_with_image_token_new_line",
     }
 
     if num_images > 1 and model_name in [
@@ -146,6 +147,7 @@ def apply_chat_template(
                         messages.append(process_single_prompt(p, is_first))
     else:
         messages = [process_single_prompt(prompt)]
+
 
     if return_messages:
         return messages
