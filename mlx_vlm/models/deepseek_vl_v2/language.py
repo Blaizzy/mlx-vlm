@@ -20,8 +20,8 @@ class TextConfig:
     num_hidden_layers: int = 30
     num_attention_heads: int = 32
     num_key_value_heads: int = 32
-    n_shared_experts: Optional[int] = None
-    n_routed_experts: Optional[int] = None
+    n_shared_experts: Optional[int] = 2
+    n_routed_experts: Optional[int] = 64
     routed_scaling_factor: float = 1.0
     kv_lora_rank: int = 512
     q_lora_rank: int = 1536
@@ -29,15 +29,15 @@ class TextConfig:
     v_head_dim: int = 128
     qk_nope_head_dim: int = 128
     topk_method: str = "gready"
-    n_group: Optional[int] = None
-    topk_group: Optional[int] = None
-    num_experts_per_tok: Optional[int] = None
+    n_group: Optional[int] = 1
+    topk_group: Optional[int] = 1
+    num_experts_per_tok: Optional[int] = 6
     moe_layer_freq: int = 1
     first_k_dense_replace: int = 0
     max_position_embeddings: int = 2048
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
-    rope_traditional: bool = False
+    rope_traditional: bool = True
     rope_scaling: Dict = None
     attention_bias: bool = False
     attn_type: str = "DeepseekV2Attention"
@@ -59,13 +59,7 @@ class TextConfig:
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
-        if self.rope_scaling:
-            required_keys = {"factor", "type"}
-            if not all(key in self.rope_scaling for key in required_keys):
-                raise ValueError(f"rope_scaling must contain keys {required_keys}")
 
-            if self.rope_scaling["type"] != "linear":
-                raise ValueError("rope_scaling 'type' currently only supports 'linear'")
 
 
 def yarn_find_correction_dim(
@@ -261,8 +255,8 @@ class DeepseekV2Attention(nn.Module):
 
         queries = mx.concatenate([q_nope, q_pe], axis=-1)
 
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -276,7 +270,7 @@ class LlamaAttention(nn.Module):
         self.n_heads = n_heads = config.num_attention_heads
         self.n_kv_heads = n_kv_heads = config.num_key_value_heads
 
-        self.head_dim = head_dim =  config.hidden_size // n_heads
+        self.head_dim = head_dim = config.hidden_size // n_heads
 
         self.scale = head_dim**-0.5
         if config.attention_bias:
@@ -289,7 +283,18 @@ class LlamaAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=attention_bias)
 
-        self.rope = nn.RoPE(dim, config.rope_theta, config.rope_traditional, config.rope_scaling)
+        rope_scale = (
+            1 / config.rope_scaling["factor"]
+            if config.rope_scaling is not None
+            and config.rope_scaling["type"] == "linear"
+            else 1
+        )
+        self.rope = nn.RoPE(
+            head_dim,
+            traditional=config.rope_traditional,
+            base=config.rope_theta,
+            scale=rope_scale,
+        )
 
     def __call__(
         self,
@@ -451,9 +456,11 @@ class DeepseekV2Model(nn.Module):
     def __call__(
         self,
         x: mx.array,
+        mask: Optional[mx.array] = None,
         inputs_embeds: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
+
         if inputs_embeds is None:
             h = self.embed_tokens(x)
         else:
@@ -473,7 +480,7 @@ class DeepseekV2Model(nn.Module):
 class LanguageModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
-        self.args = config
+        self.config = config
         self.model_type = config.model_type
         self.model = DeepseekV2Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -481,21 +488,23 @@ class LanguageModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
+        mask: Optional[mx.array] = None,
         inputs_embeds=None,
         cache: Optional[Any] = None,
     ):
-        out = self.model(inputs, inputs_embeds, cache)
-        return self.lm_head(out)
+        out = self.model(inputs, mask, inputs_embeds, cache)
+        out = self.lm_head(out)
+        return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
-        for l in range(self.args.num_hidden_layers):
+        for l in range(self.config.num_hidden_layers):
             prefix = f"language_model.model.layers.{l}"
             for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
                 for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [
                             weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")
-                            for e in range(self.args.n_routed_experts)
+                            for e in range(self.config.n_routed_experts)
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
         return weights
@@ -503,3 +512,14 @@ class LanguageModel(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    @property
+    def head_dim(self):
+        if self.config.attn_type == "DeepseekV2Attention":
+            return self.config.qk_rope_head_dim
+        else:
+            return self.config.hidden_size // self.config.num_key_value_heads
+
+    @property
+    def n_kv_heads(self):
+        return self.config.num_key_value_heads

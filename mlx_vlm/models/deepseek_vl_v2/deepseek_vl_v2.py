@@ -17,11 +17,14 @@ from transformers.image_utils import to_numpy_array
 from ..base import expand2square
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
+from .processing_deepsek_vl_v2 import DeepseekVLV2Processor
 
+
+from transformers import AutoProcessor
+AutoProcessor.register("deepseek_vl_v2", DeepseekVLV2Processor)
 
 @dataclass
 class ProjectorConfig:
-    model_type: str
     projector_type: str = "downsample_mlp_gelu"
     input_dim: int = 1152
     n_embed: int = 2048
@@ -54,6 +57,8 @@ class ModelConfig:
     pad_id: int = 100001
     num_image_tokens: int = 576
     vocab_size: int = 32000
+    tile_tag: str = "2D"
+    global_view_pos: str = "head"
 
     @classmethod
     def from_dict(cls, params):
@@ -64,116 +69,6 @@ class ModelConfig:
                 if k in inspect.signature(cls).parameters
             }
         )
-
-
-class ImageProcessor(BaseImageProcessor):
-    model_input_names = ["pixel_values"]
-
-    def __init__(
-        self,
-        config,
-        image_size: int = 384,
-        min_size: int = 14,
-        image_mean: Union[Tuple[float, float, float], List[float]] = (
-            0.5,
-            0.5,
-            0.5,
-        ),
-        image_std: Union[Tuple[float, float, float], List[float]] = (
-            0.5,
-            0.5,
-            0.5,
-        ),
-        rescale_factor: float = 1.0 / 255.0,
-        do_normalize: bool = True,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        if "high_res_cfg" in config["vision_config"]["params"]:
-            self.image_size = config["vision_config"]["params"]["high_res_cfg"][
-                "image_size"
-            ]
-            self.image_mean = config["vision_config"]["params"]["high_res_cfg"][
-                "pixel_mean"
-            ]
-            self.image_std = config["vision_config"]["params"]["high_res_cfg"][
-                "pixel_std"
-            ]
-            self.do_normalize = False
-        else:
-            self.image_size = image_size
-            self.image_mean = image_mean
-            self.image_std = image_std
-            self.do_normalize = do_normalize
-
-        self.rescale_factor = rescale_factor
-        self.min_size = min_size
-
-        if image_mean is None:
-            self.background_color = (127, 127, 127)
-        else:
-            self.background_color = tuple([int(x * 255) for x in self.image_mean])
-
-    def resize(self, pil_img: Image) -> np.ndarray:
-        """
-
-        Args:
-            pil_img (PIL.Image): [H, W, 3] in PIL.Image in RGB
-
-        Returns:
-            x (np.ndarray): [3, self.image_size, self.image_size]
-        """
-
-        width, height = pil_img.size
-        max_size = max(width, height)
-
-        size = [
-            max(int(height / max_size * self.image_size), self.min_size),
-            max(int(width / max_size * self.image_size), self.min_size),
-        ]
-
-        if width <= 0 or height <= 0 or size[0] <= 0 or size[1] <= 0:
-            print(f"orig size = {pil_img.size}, new size = {size}")
-            raise ValueError("Invalid size!")
-
-        pil_img = pil_img.resize(size=tuple(size[::-1]), resample=Image.BICUBIC)
-
-        pil_img = expand2square(pil_img, self.background_color)
-        x = to_numpy_array(pil_img)
-
-        # [H, W, 3] -> [3, H, W]
-        x = np.transpose(x, (2, 0, 1))
-
-        return x
-
-    def preprocess(self, images, **kwargs) -> BatchFeature:
-        # resize and pad to [self.image_size, self.image_size]
-        # then convert from [H, W, 3] to [3, H, W]
-        images: List[np.ndarray] = [self.resize(image) for image in images]
-
-        # resacle from [0, 255] -> [0, 1]
-        images = [
-            self.rescale(
-                image=image,
-                scale=self.rescale_factor,
-                input_data_format="channels_first",
-            )
-            for image in images
-        ]
-
-        # normalize
-        if self.do_normalize:
-            images = [
-                self.normalize(
-                    image=image,
-                    mean=self.image_mean,
-                    std=self.image_std,
-                    input_data_format="channels_first",
-                )
-                for image in images
-            ]
-
-        return images
 
 
 class MlpProjector(nn.Module):
@@ -190,7 +85,6 @@ class MlpProjector(nn.Module):
             for _ in range(1, mlp_depth):
                 modules.append(nn.GELU())
                 modules.append(nn.Linear(config.projector_config.n_embed, config.projector_config.n_embed))
-            modules = nn.Sequential(*modules)
         elif config.projector_config.projector_type == "downsample_mlp_gelu":
             mlp_depth = config.projector_config.depth
             mlp_ratio = config.projector_config.mlp_ratio
@@ -201,7 +95,6 @@ class MlpProjector(nn.Module):
                 modules.append(nn.Linear(config.projector_config.n_embed * mlp_ratio, config.projector_config.n_embed * mlp_ratio))
             modules.append(nn.GELU())
             modules.append(nn.Linear(config.projector_config.n_embed * mlp_ratio, config.projector_config.n_embed))
-            modules = nn.Sequential(*modules)
         else:
             raise ValueError(f"Unknown projector type: {config.projector_config.projector_type}")
 
@@ -258,103 +151,203 @@ class MlpProjector(nn.Module):
 
             x = mx.stack(patches, axis=1)  # B, N_patches, C*ds*ds
 
-        return self.layers(x)
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.vision_tower = VisionModel(config.vision_config)
+        self.vision = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config)
-        self.aligner = MlpProjector(config)
+        self.projector = MlpProjector(config)
         self.vision_feature_layer = config.select_layer
         self.vision_feature_select_strategy = config.vision_feature_select_strategy
 
-    def add_image_token(
-        self,
-        image_indices: list,
-        input_ids: np.ndarray,
-        image_token_index: int,
-        num_image_tokens: int,
-        add_special_token: bool = False,
-    ):
-        """
-        Inserts image tokens into an array of input IDs at specified indices.
+        self.tile_tag = config.tile_tag
+        self.global_view_pos = config.global_view_pos
 
-        Args:
-            image_indices (List[int]): Indices where image tokens should be inserted.
-            input_ids (np.ndarray): Original array of input IDs, expected to be two-dimensional.
-            image_token_index (int): The ID used to represent an image token.
-            num_image_tokens (int): Number of image tokens to insert at each index.
-            add_special_token (bool): If True, adjusts the indices to include a special token.
+        # 用于format image token sequence的特殊token
+        embed_std = 1 / mx.sqrt(mx.array(config.projector_config.n_embed, dtype=mx.float32))
+        if self.tile_tag == "2D":
+            # <|view_separator|>, <|\n|>
+            self.image_newline = mx.array(mx.random.normal((config.projector_config.n_embed,)) * embed_std)
+            # fix the typo: view_seperater
+            self.view_separator = mx.array(mx.random.normal((config.projector_config.n_embed,)) * embed_std)
+        elif self.tile_tag == "1D":
+            # <|tile_x|>, <|tile_global|>
+            candidate_resolutions = config.candidate_resolutions
+            if len(candidate_resolutions) == 0:
+                raise ValueError(
+                    f"len(candidate_resolutions) should be larger than 0, but got {len(candidate_resolutions)}")
+            tile_variants_num = len(candidate_resolutions)
+            # self.tile_indicators = mx.array(mx.random(size=(tile_variants_num + 1, config.aligner.params.n_embed)) * embed_std)
+        else:
+            raise ValueError(f"tile tag should be either 1D or 2D, but got {self.tile_tag}")
 
-        Returns:
-            Tuple of (np.ndarray, np.ndarray):
-                - Updated array of input IDs with image tokens inserted.
-                - Array indicating the number of image tokens added at each position.
-        """
-        input_slices = []
 
-        start = 0
-        flat_input_ids = input_ids.flatten()
+    def process_image_features(self, images_embeds, images_spatial_crop, h, w, n_dim):
+        tile_index = 0
+        all_batch_features = []
 
-        for index in image_indices:
-            end = (index[0] + 1) if add_special_token else index[0]
+        for idx in range(images_spatial_crop.shape[0]):
+            images_in_this_batch = []
+            for jdx in range(images_spatial_crop.shape[1]):
+                # Extract global & local features
+                num_width_tiles, num_height_tiles = images_spatial_crop[idx, jdx]
+                if num_width_tiles == 0 or num_height_tiles == 0:
+                    break
 
-            input_slices.append(flat_input_ids[start:end])
-            input_slices.append(
-                np.full((num_image_tokens,), image_token_index, dtype=np.int64)
-            )
-            start = index[0] + 1  # Move start past the current image insertion point
+                num_tiles_in_image = num_width_tiles * num_height_tiles
 
-        input_slices.append(flat_input_ids[start:])
+                # Get global features [hw, D]
+                global_features = images_embeds[tile_index]
 
-        input_ids = np.concatenate(input_slices, axis=0)
-        num_image_tokens_array = np.array(
-            [num_image_tokens] * len(image_indices), dtype=np.int64
-        )
-        input_ids = input_ids.reshape(1, -1)
+                # Get local features [num_height_tiles * num_width_tiles, hw, D]
+                local_features = images_embeds[tile_index + 1:tile_index + 1 + int(num_tiles_in_image)]
 
-        return input_ids, num_image_tokens_array
+                tile_index += num_tiles_in_image + 1
+
+                # Format global and local features
+                if self.tile_tag == "2D":
+                    # ----------------- global view add newline -----------------
+                    # [hw, D] -> [h, w, D]
+                    global_features = mx.reshape(global_features, (h, w, n_dim))
+
+                    # [D] -> [h, 1, D]
+                    new_lines_in_global = mx.expand_dims(self.image_newline, axis=0)
+                    new_lines_in_global = mx.repeat(new_lines_in_global, repeats=h, axis=0)
+                    new_lines_in_global = mx.expand_dims(new_lines_in_global, axis=1)
+
+
+                    # cat([h, w, D], [h, 1, D], dim=1) -> [h, w + 1, D]
+                    global_features = mx.concatenate([global_features, new_lines_in_global], axis=1)
+
+                    # [h, w + 1, D] -> [h * (w + 1), D]
+                    global_features = mx.reshape(global_features, (-1, n_dim))
+
+                    # ----------------- local view add newline -----------------
+                    # Rearrange local features
+                    # [num_height_tiles * num_width_tiles, h * w, D] -> [num_height_tiles * h, num_width_tiles * w, D]
+                    local_features = mx.reshape(local_features,
+                        (num_height_tiles, num_width_tiles, h, w, n_dim))
+                    local_features = mx.transpose(local_features, (0, 2, 1, 3, 4))
+                    local_features = mx.reshape(local_features,
+                        (num_height_tiles * h, num_width_tiles * w, n_dim))
+
+                    # Create newlines for local features
+                    # [D] -> [num_height_tiles * h, 1, D]
+                    new_lines_in_local = mx.repeat(
+                        mx.expand_dims(self.image_newline, axis=0),
+                        repeats=num_height_tiles * h, axis=0
+                    )
+                    new_lines_in_local = mx.expand_dims(new_lines_in_local, axis=1)
+
+                    # [num_height_tiles * h, num_width_tiles * w + 1, D]
+                    local_features = mx.concatenate([local_features, new_lines_in_local], axis=1)
+
+                    # [(num_height_tiles * h) * (num_width_tiles * w + 1), D]
+                    local_features = mx.reshape(local_features, (-1, n_dim))
+
+                    # ----------------- merge global and local tiles -----------------
+                    view_separator = mx.expand_dims(self.view_separator, axis=0)
+
+                    if self.global_view_pos == "head":
+                        global_local_features = mx.concatenate(
+                            [global_features, view_separator, local_features],
+                            axis=0
+                        )
+                    else:
+                        global_local_features = mx.concatenate(
+                            [local_features, view_separator, global_features],
+                            axis=0
+                        )
+
+                else:
+                    # 1D processing (legacy path)
+                    global_features = mx.concatenate(
+                        [mx.expand_dims(self.tile_indicators[0], axis=0), global_features],
+                        axis=0
+                    )
+
+                    local_indicators = mx.expand_dims(
+                        self.tile_indicators[1:num_tiles_in_image + 1],
+                        axis=1
+                    )
+                    local_features = mx.concatenate([local_indicators, local_features], axis=1)
+                    local_features = mx.reshape(local_features, (-1, n_dim))
+
+                    if self.global_view_pos == "head":
+                        global_local_features = mx.concatenate(
+                            [global_features, local_features],
+                            axis=0
+                        )
+                    else:
+                        global_local_features = mx.concatenate(
+                            [local_features, global_features],
+                            axis=0
+                        )
+
+                images_in_this_batch.append(global_local_features)
+
+            if images_in_this_batch:
+                all_batch_features.append(mx.stack(images_in_this_batch))
+
+        return mx.stack(all_batch_features) if all_batch_features else None
 
     def get_input_embeddings(
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        images_spatial_crop: Optional[mx.array] = None,
+        image_seq_mask: Optional[mx.array] = None,
     ):
         if pixel_values is None:
-            return self.language_model(input_ids)
+            return self.language_model.model.embed_tokens(input_ids)
 
         image_token_index = self.config.image_token_index
         num_image_tokens = self.config.num_image_tokens
 
         image_token_mask = np.array(input_ids[0] == image_token_index).astype(bool)
         image_indices = np.nonzero(image_token_mask)
+        bs = pixel_values.shape[0]
+        max_n_images = pixel_values.shape[1]
 
-        input_ids, num_image_tokens = self.add_image_token(
-            image_indices=image_indices,
-            input_ids=np.array(input_ids),
-            image_token_index=image_token_index,
-            num_image_tokens=num_image_tokens,
-        )
+        batch_num_tiles = [0 for _ in range(bs)]
+        total_tiles = []
+        for idx in range(bs):
+            for jdx in range(max_n_images):
+                num_width_tiles, num_height_tiles = images_spatial_crop[idx][jdx]
+                if num_width_tiles == 0 or num_height_tiles == 0:
+                    break
+                batch_num_tiles[idx] += (1 + num_width_tiles * num_height_tiles)
+
+            total_tiles.append(pixel_values[idx, :int(batch_num_tiles[idx])])
 
         input_ids = mx.array(input_ids)
 
+        total_tiles = mx.concatenate(total_tiles, axis=0)
+        assert total_tiles.shape[0] == sum(batch_num_tiles)
+        if total_tiles.shape[0] == 0:
+            return self.language_model.model.embed_tokens(input_ids)
+
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
-
         # Get the ouptut hidden states from the vision model
-        if self.config.vision_config.cls == "HybridVisionTower":
-            hidden_states = self.vision_tower(
-                pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
-            )
-        else:
-            hidden_states, _, _ = self.vision_tower(
-                pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
-            )
+        hidden_states, _, _ = self.vision(
+            total_tiles.transpose(0, 2, 3, 1), output_hidden_states=True
+        )
 
         # Pass image features through the multi-modal projector
-        image_features = self.aligner(hidden_states)
+        image_features = self.projector(hidden_states)
+
+
+        _, hw, n_dim = image_features.shape
+        h = w = int(hw ** 0.5)
+
+        image_features = self.process_image_features(image_features, images_spatial_crop, h, w, n_dim)
+
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self._merge_input_ids_with_image_features(
@@ -387,13 +380,15 @@ class Model(nn.Module):
     def __call__(
         self,
         input_ids: mx.array,
-        pixel_values: mx.array,
-        mask: mx.array,
+        pixel_values: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
         cache=None,
         **kwargs,
     ):
 
-        input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
+        images_spatial_crop = kwargs.get("images_spatial_crop", None)
+        images_seq_mask = kwargs.get("images_seq_mask", None)
+        input_embeddings = self.get_input_embeddings(input_ids, pixel_values, images_spatial_crop, images_seq_mask)
         logits = self.language_model(
             input_ids, cache=cache, inputs_embeds=input_embeddings
         )
@@ -422,8 +417,8 @@ class Model(nn.Module):
         model_config = ModelConfig.from_dict(model_config)
 
         model_config.vision_config = VisionConfig.from_dict(model_config.vision_config)
-        model_config.aligner_config = AlignerConfig.from_dict(
-            model_config.aligner_config
+        model_config.projector_config = ProjectorConfig.from_dict(
+            model_config.projector_config
         )
         model_config.text_config = TextConfig.from_dict(model_config.text_config)
 
@@ -445,10 +440,15 @@ class Model(nn.Module):
     @staticmethod
     def sanitize(weights):
         def transform_key(key):
-            if "language.model" in key:
-                key = key.replace("language.model", "language_model.model")
+            if "language" in key:
+                if ".model" in key:
+                    key = key.replace("language.model", "language_model.model")
+                if ".lm_head" in key:
+                    key = key.replace("language", "language_model")
             if "vision" in key:
                 key = key.replace("vision", "vision.vision_tower")
+            if "view_seperator" in key:
+                key = key.replace("view_seperator", "view_separator")
             return key
 
         return {transform_key(k): v for k, v in weights.items()}

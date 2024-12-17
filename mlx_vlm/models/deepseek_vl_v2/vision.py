@@ -8,22 +8,20 @@ from typing import Dict, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from scipy.ndimage import zoom
-
-from .sam import SAMEncoder
 
 
 @dataclass
 class VisionConfig:
     model_type: str
-    num_hidden_layers: int = 24
-    hidden_size: int = 1024
-    intermediate_size: int = 4096
+    layers: int = 27
+    width: int = 1152
+    intermediate_size: int = 4304
     num_attention_heads: int = 16
     image_size: int = 384
     patch_size: int = 16
     num_channels: int = 3
     layer_norm_eps: float = 1e-5
+    mlp_ratio: float = 3.7362
     cls: str = None
     params: dict = None
 
@@ -40,7 +38,7 @@ class VisionConfig:
 
 @dataclass
 class MLPConfig:
-    hidden_size: int
+    width: int
     intermediate_size: int
 
 
@@ -108,7 +106,7 @@ class AttentionPoolLatent(nn.Module):
 
         self.norm = nn.LayerNorm(out_features)
         config = MLPConfig(
-            hidden_size=embed_dim, intermediate_size=int(embed_dim * mlp_ratio)
+            width=embed_dim, intermediate_size=int(embed_dim * mlp_ratio)
         )
         self.mlp = MLP(config)
 
@@ -194,25 +192,12 @@ class Attention(nn.Module):
         return self.proj(output)
 
 
-class FastGELUActivation(nn.Module):
-    """
-    Applies GELU approximation that is slower than QuickGELU but more accurate. See: https://github.com/hendrycks/GELUs
-    """
-
-    def __call__(self, input: mx.array) -> mx.array:
-        return (
-            0.5
-            * input
-            * (1.0 + mx.tanh(np.sqrt(2 / np.pi) * (input + 0.044715 * (input**3))))
-        )
-
-
 class MLP(nn.Module):
     def __init__(self, config: Union[VisionConfig, Dict], bias: bool = True):
         super().__init__()
-        self.activation_fn = FastGELUActivation()
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=bias)
-        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=bias)
+        self.activation_fn = nn.GELU(approx="precise")
+        self.fc1 = nn.Linear(config.width, config.intermediate_size, bias=bias)
+        self.fc2 = nn.Linear(config.intermediate_size, config.width, bias=bias)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.activation_fn(self.fc1(x))
@@ -223,9 +208,9 @@ class MLP(nn.Module):
 class EncoderLayer(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
-        self.embed_dim = config.hidden_size
+        self.embed_dim = config.width
         self.attn = Attention(
-            config.hidden_size, config.num_attention_heads, qkv_bias=True
+            config.width, config.num_attention_heads, qkv_bias=True
         )
         self.norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = MLP(config)
@@ -244,7 +229,7 @@ class VisionEmbeddings(nn.Module):
     def __init__(self, config: VisionConfig, norm_layer: bool = False):
         super().__init__()
         self.config = config
-        self.embed_dim = config.hidden_size
+        self.embed_dim = config.width
         self.image_size = config.image_size
         self.patch_size = config.patch_size
 
@@ -259,7 +244,7 @@ class VisionEmbeddings(nn.Module):
         self.num_positions = self.num_patches
 
         self.norm = (
-            nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+            nn.LayerNorm(config.width, eps=config.layer_norm_eps)
             if norm_layer
             else nn.Identity()
         )
@@ -286,20 +271,21 @@ class SigLipVisionModel(nn.Module):
         self.cls_token = None
         self.reg_token = None
         self.patch_embed = VisionEmbeddings(config)
-        self.norm_pre = nn.LayerNorm(config.hidden_size) if pre_norm else nn.Identity()
-        self.blocks = [EncoderLayer(config) for _ in range(config.num_hidden_layers)]
-        self.norm = nn.LayerNorm(config.hidden_size)
+        self.norm_pre = nn.LayerNorm(config.width) if pre_norm else nn.Identity()
+        self.blocks = [EncoderLayer(config) for _ in range(config.layers)]
+        self.norm = nn.LayerNorm(config.width)
         num_patches = self.patch_embed.num_patches
         embed_len = (
             num_patches if no_embed_class else num_patches + self.num_prefix_tokens
         )
-        self.pos_embed = mx.random.normal((embed_len, config.hidden_size))[None, :]
+        self.pos_embed = mx.random.normal((embed_len, config.width))[None, :]
 
         norm_layer = partial(nn.LayerNorm, eps=1e-5)
         self.attn_pool = AttentionPoolLatent(
-            config.hidden_size,
+            config.width,
             num_heads=config.num_attention_heads,
             norm_layer=norm_layer,
+            mlp_ratio=config.mlp_ratio,
         )
 
     def __call__(
@@ -324,66 +310,6 @@ class SigLipVisionModel(nn.Module):
         return pooler_output, x, encoder_states
 
 
-class HybridVisionModel(nn.Module):
-    def __init__(self, config: VisionConfig, resolution: str, ignore_head: bool = True):
-        super().__init__()
-
-        self.model_type = config.model_type
-        self.resolution = resolution
-        if self.model_type != "vision":
-            raise ValueError(f"Unsupported model type: {self.model_type}")
-
-        if resolution == "high":
-            self.vision_tower = SAMEncoder()
-        else:
-            self.vision_tower = SigLipVisionModel(config, ignore_head)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        if self.resolution == "high":
-            return self.vision_tower(x)
-        else:
-            return self.vision_tower(x)[0]
-
-
-def resize_image(image, size, antialias=True):
-    """
-    Resize an image using scipy.ndimage.zoom with an option for bicubic interpolation.
-
-    Args:
-        image (numpy.ndarray): The input image array.
-        size (tuple): The target size as (width, height).
-        antialias (bool): True to use bicubic interpolation, False to use nearest neighbor.
-
-    Returns:
-        numpy.ndarray: The resized image array.
-    """
-    # Ensure the image is an array and remove singleton dimensions
-    image = np.array(image[0])
-
-    # Calculate zoom factors for the spatial dimensions
-    # Note: size is expected as (width, height) but image.shape gives (height, width)
-    current_height, current_width = image.shape[:2]
-    width_factor = size[0] / current_width
-    height_factor = size[1] / current_height
-    zoom_factors = (height_factor, width_factor)  # Apply zoom to height and width
-
-    # Choose the interpolation order: 3 for bicubic, 0 for nearest
-    order = 3 if antialias else 0
-
-    # Apply zoom to the image. Handle both grayscale and color images.
-    if image.ndim == 2:  # Grayscale image
-        resized_image = zoom(image, zoom_factors, order=order)
-    elif image.ndim == 3:  # Color image
-        # Apply zoom separately for each channel
-        resized_channels = [
-            zoom(image[:, :, i], zoom_factors, order=order)
-            for i in range(image.shape[2])
-        ]
-        resized_image = np.stack(resized_channels, axis=2)
-
-    return resized_image
-
-
 class VisionModel(nn.Module):
     def __init__(self, config: VisionConfig, ignore_head: bool = True):
         super().__init__()
@@ -393,45 +319,12 @@ class VisionModel(nn.Module):
         if self.model_type != "vision":
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
-        if config.cls == "HybridVisionTower":
-            self.high_layer_norm = nn.LayerNorm(
-                config.params["high_res_cfg"]["output_dim"]
-            )
-            self.low_layer_norm = nn.LayerNorm(
-                config.params["low_res_cfg"]["output_dim"]
-            )
-
-            high_res_cfg = copy.deepcopy(config)
-            high_res_cfg.image_size = config.params["high_res_cfg"]["image_size"]
-            self.vision_tower_high = HybridVisionModel(
-                high_res_cfg, "high", ignore_head
-            )
-
-            low_res_cfg = copy.deepcopy(config)
-            low_res_cfg.image_size = config.params["low_res_cfg"]["image_size"]
-
-            self.vision_tower_low = HybridVisionModel(low_res_cfg, "low", ignore_head)
-            self.low_res_size = config.params["low_res_cfg"]["image_size"]
-            self.resize = lambda image: resize_image(
-                image, (self.low_res_size, self.low_res_size), antialias=True
-            )
-
-        else:
-            self.vision_tower = SigLipVisionModel(config, ignore_head)
+        self.vision_tower = SigLipVisionModel(config, ignore_head)
 
     def __call__(
         self, x: mx.array, output_hidden_states: Optional[bool] = None
     ) -> mx.array:
-        if self.config.cls == "HybridVisionTower":
-            high_images = x
-            low_images = mx.array(self.resize(np.array(x)))[None, :]
-
-            high_res = self.vision_tower_high(high_images)
-            low_res = self.vision_tower_low(low_images)
-
-            return (high_res, low_res)
-        else:
-            return self.vision_tower(x, output_hidden_states)
+        return self.vision_tower(x, output_hidden_states)
 
     def sanitize(self, weights):
         sanitized_weights = {}
