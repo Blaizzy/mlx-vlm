@@ -19,8 +19,8 @@ from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 from .processing_deepsek_vl_v2 import DeepseekVLV2Processor
 
-
 from transformers import AutoProcessor
+
 AutoProcessor.register("deepseek_vl_v2", DeepseekVLV2Processor)
 
 @dataclass
@@ -334,6 +334,7 @@ class Model(nn.Module):
 
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+
         # Get the ouptut hidden states from the vision model
         hidden_states, _, _ = self.vision(
             total_tiles.transpose(0, 2, 3, 1), output_hidden_states=True
