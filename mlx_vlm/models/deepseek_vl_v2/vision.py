@@ -20,7 +20,7 @@ class VisionConfig:
     image_size: int = 384
     patch_size: int = 16
     num_channels: int = 3
-    layer_norm_eps: float = 1e-5
+    layer_norm_eps: float = 1e-6
     mlp_ratio: float = 3.7362
     cls: str = None
     params: dict = None
