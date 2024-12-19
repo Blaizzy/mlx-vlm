@@ -187,7 +187,7 @@ class Model(nn.Module):
             raise ValueError(f"tile tag should be either 1D or 2D, but got {self.tile_tag}")
 
 
-    def process_image_features(self, images_embeds, images_spatial_crop, h, w, n_dim):
+    def process_image_features(self, input_embeds, images_embeds, images_spatial_crop, images_seq_mask, h, w, n_dim):
         tile_index = 0
         all_batch_features = []
 
@@ -292,9 +292,13 @@ class Model(nn.Module):
                 images_in_this_batch.append(global_local_features)
 
             if images_in_this_batch:
-                all_batch_features.append(mx.stack(images_in_this_batch))
+                images_in_this_batch = mx.concatenate(images_in_this_batch, axis=0)
+                # Find positions where images should be placed
+                image_indices = np.where(images_seq_mask[idx])[0].tolist()
+                # Directly assign the image features to those positions
+                input_embeds[idx, image_indices] = images_in_this_batch
 
-        return mx.stack(all_batch_features) if all_batch_features else None
+        return input_embeds
 
     def get_input_embeddings(
         self,
@@ -325,15 +329,13 @@ class Model(nn.Module):
 
             total_tiles.append(pixel_values[idx, :int(batch_num_tiles[idx])])
 
-        input_ids = mx.array(input_ids)
-
         total_tiles = mx.concatenate(total_tiles, axis=0)
         assert total_tiles.shape[0] == sum(batch_num_tiles)
         if total_tiles.shape[0] == 0:
             return self.language_model.model.embed_tokens(input_ids)
 
         # Get the input embeddings from the language model
-        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+        input_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
         hidden_states, _, _ = self.vision(
@@ -347,14 +349,9 @@ class Model(nn.Module):
         _, hw, n_dim = image_features.shape
         h = w = int(hw ** 0.5)
 
-        image_features = self.process_image_features(image_features, images_spatial_crop, h, w, n_dim)
+        image_features = self.process_image_features(input_embeds, image_features, images_spatial_crop, image_seq_mask, h, w, n_dim)
 
-
-        # Insert special image tokens in the input_ids
-        final_inputs_embeds = self._merge_input_ids_with_image_features(
-            image_features, inputs_embeds, input_ids
-        )
-        return final_inputs_embeds
+        return image_features
 
     def _merge_input_ids_with_image_features(
         self, image_features, inputs_embeds, input_ids

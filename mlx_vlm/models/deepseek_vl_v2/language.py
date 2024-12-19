@@ -192,30 +192,37 @@ class DeepseekV2Attention(nn.Module):
             bias=config.attention_bias,
         )
 
-        mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
-        scaling_factor = self.config.rope_scaling["factor"]
-        if mscale_all_dim:
-            mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-            self.scale = self.scale * mscale * mscale
+        if self.config.rope_scaling is None:
+            self.rope = nn.RoPE(
+                self.qk_rope_head_dim,
+                traditional=self.config.rope_traditional,
+                base=self.rope_theta,
+            )
+        else:
+            mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
+            scaling_factor = self.config.rope_scaling.get("factor", 1)
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+                self.scale = self.scale * mscale * mscale
 
-        rope_kwargs = {
-            key: self.config.rope_scaling[key]
-            for key in [
-                "original_max_position_embeddings",
-                "beta_fast",
-                "beta_slow",
-                "mscale",
-                "mscale_all_dim",
-            ]
-            if key in self.config.rope_scaling
-        }
-        self.rope = DeepseekV2YarnRotaryEmbedding(
-            dim=self.qk_rope_head_dim,
-            max_position_embeddings=self.max_position_embeddings,
-            scaling_factor=scaling_factor,
-            base=self.rope_theta,
-            **rope_kwargs,
-        )
+                rope_kwargs = {
+                    key: self.config.rope_scaling[key]
+                    for key in [
+                        "original_max_position_embeddings",
+                        "beta_fast",
+                        "beta_slow",
+                        "mscale",
+                        "mscale_all_dim",
+                    ]
+                    if key in self.config.rope_scaling
+                }
+                self.rope = DeepseekV2YarnRotaryEmbedding(
+                    dim=self.qk_rope_head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                    base=self.rope_theta,
+                    **rope_kwargs,
+                )
 
     def __call__(
         self,
@@ -516,7 +523,10 @@ class LanguageModel(nn.Module):
     @property
     def head_dim(self):
         if self.config.attn_type == "DeepseekV2Attention":
-            return self.config.qk_rope_head_dim
+            return (
+                self.config.qk_nope_head_dim + self.config.qk_rope_head_dim,
+                self.config.v_head_dim,
+            )
         else:
             return self.config.hidden_size // self.config.num_key_value_heads
 
