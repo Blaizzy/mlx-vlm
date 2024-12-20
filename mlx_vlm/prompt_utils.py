@@ -148,7 +148,6 @@ def apply_chat_template(
     else:
         messages = [process_single_prompt(prompt)]
 
-
     if return_messages:
         return messages
 

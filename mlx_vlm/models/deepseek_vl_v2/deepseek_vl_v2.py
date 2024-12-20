@@ -1,7 +1,7 @@
 import glob
 import inspect
-import math
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -11,17 +11,17 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 from PIL import Image
+from transformers import AutoProcessor
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 from transformers.image_utils import to_numpy_array
 
 from ..base import expand2square
 from .language import LanguageModel, TextConfig
-from .vision import VisionConfig, VisionModel
 from .processing_deepsek_vl_v2 import DeepseekVLV2Processor
-
-from transformers import AutoProcessor
+from .vision import VisionConfig, VisionModel
 
 AutoProcessor.register("deepseek_vl_v2", DeepseekVLV2Processor)
+
 
 @dataclass
 class ProjectorConfig:
@@ -78,28 +78,58 @@ class MlpProjector(nn.Module):
         if config.projector_config.projector_type == "identity":
             modules = nn.Identity()
         elif config.projector_config.projector_type == "linear":
-            modules = nn.Linear(config.projector_config.input_dim, config.projector_config.n_embed)
+            modules = nn.Linear(
+                config.projector_config.input_dim, config.projector_config.n_embed
+            )
         elif config.projector_config.projector_type == "mlp_gelu":
             mlp_depth = config.projector_config.depth
-            modules = [nn.Linear(config.projector_config.input_dim, config.projector_config.n_embed)]
+            modules = [
+                nn.Linear(
+                    config.projector_config.input_dim, config.projector_config.n_embed
+                )
+            ]
             for _ in range(1, mlp_depth):
                 modules.append(nn.GELU())
-                modules.append(nn.Linear(config.projector_config.n_embed, config.projector_config.n_embed))
+                modules.append(
+                    nn.Linear(
+                        config.projector_config.n_embed, config.projector_config.n_embed
+                    )
+                )
         elif config.projector_config.projector_type == "downsample_mlp_gelu":
             mlp_depth = config.projector_config.depth
             mlp_ratio = config.projector_config.mlp_ratio
-            modules = [nn.Linear(config.projector_config.input_dim * config.projector_config.downsample_ratio * config.projector_config.downsample_ratio,
-                               config.projector_config.n_embed * mlp_ratio)]
+            modules = [
+                nn.Linear(
+                    config.projector_config.input_dim
+                    * config.projector_config.downsample_ratio
+                    * config.projector_config.downsample_ratio,
+                    config.projector_config.n_embed * mlp_ratio,
+                )
+            ]
             for _ in range(1, mlp_depth - 1):
                 modules.append(nn.GELU())
-                modules.append(nn.Linear(config.projector_config.n_embed * mlp_ratio, config.projector_config.n_embed * mlp_ratio))
+                modules.append(
+                    nn.Linear(
+                        config.projector_config.n_embed * mlp_ratio,
+                        config.projector_config.n_embed * mlp_ratio,
+                    )
+                )
             modules.append(nn.GELU())
-            modules.append(nn.Linear(config.projector_config.n_embed * mlp_ratio, config.projector_config.n_embed))
+            modules.append(
+                nn.Linear(
+                    config.projector_config.n_embed * mlp_ratio,
+                    config.projector_config.n_embed,
+                )
+            )
         else:
-            raise ValueError(f"Unknown projector type: {config.projector_config.projector_type}")
+            raise ValueError(
+                f"Unknown projector type: {config.projector_config.projector_type}"
+            )
 
         if config.projector_config.token_pooling:
-            self.token_pooling_layer = nn.Linear(config.projector_config.input_dim * 4, config.projector_config.input_dim)
+            self.token_pooling_layer = nn.Linear(
+                config.projector_config.input_dim * 4, config.projector_config.input_dim
+            )
         self.layers = modules
 
     def __call__(self, x):
@@ -111,9 +141,9 @@ class MlpProjector(nn.Module):
 
             # Implement unfold operation manually since MLX doesn't have unfold
             patches = []
-            for i in range(0, h-1, 2):
-                for j in range(0, w-1, 2):
-                    patch = x[:, :, i:i+2, j:j+2]
+            for i in range(0, h - 1, 2):
+                for j in range(0, w - 1, 2):
+                    patch = x[:, :, i : i + 2, j : j + 2]
                     patches.append(patch)
 
             patches = mx.stack(patches, axis=2)  # B, C, N_patches, 2, 2
@@ -125,13 +155,17 @@ class MlpProjector(nn.Module):
             patches = mx.reshape(patches, (batch_size, n_patches, channels * 4))
             x = self.token_pooling_layer(patches)
 
-        elif self.config.projector_config.projector_type == 'downsample_mlp_gelu':
+        elif self.config.projector_config.projector_type == "downsample_mlp_gelu":
             bs, hw, input_dim = x.shape
             h = w = int(math.sqrt(hw))
 
             # Compute padding
-            pad = 0 if h % self.config.projector_config.downsample_ratio == 0 else \
-                  self.config.projector_config.downsample_ratio - h % self.config.projector_config.downsample_ratio
+            pad = (
+                0
+                if h % self.config.projector_config.downsample_ratio == 0
+                else self.config.projector_config.downsample_ratio
+                - h % self.config.projector_config.downsample_ratio
+            )
 
             x = mx.reshape(x, (bs, h, w, input_dim))
             if pad > 0:
@@ -144,9 +178,9 @@ class MlpProjector(nn.Module):
             ds = self.config.projector_config.downsample_ratio
             patches = []
 
-            for i in range(0, h_pad-ds+1, ds):
-                for j in range(0, w_pad-ds+1, ds):
-                    patch = x[:, :, i:i+ds, j:j+ds]
+            for i in range(0, h_pad - ds + 1, ds):
+                for j in range(0, w_pad - ds + 1, ds):
+                    patch = x[:, :, i : i + ds, j : j + ds]
                     patches.append(mx.reshape(patch, (bs, -1)))
 
             x = mx.stack(patches, axis=1)  # B, N_patches, C*ds*ds
@@ -154,6 +188,7 @@ class MlpProjector(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return x
+
 
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -169,25 +204,42 @@ class Model(nn.Module):
         self.global_view_pos = config.global_view_pos
 
         # 用于format image token sequence的特殊token
-        embed_std = 1 / mx.sqrt(mx.array(config.projector_config.n_embed, dtype=mx.float32))
+        embed_std = 1 / mx.sqrt(
+            mx.array(config.projector_config.n_embed, dtype=mx.float32)
+        )
         if self.tile_tag == "2D":
             # <|view_separator|>, <|\n|>
-            self.image_newline = mx.array(mx.random.normal((config.projector_config.n_embed,)) * embed_std)
+            self.image_newline = mx.array(
+                mx.random.normal((config.projector_config.n_embed,)) * embed_std
+            )
             # fix the typo: view_seperater
-            self.view_separator = mx.array(mx.random.normal((config.projector_config.n_embed,)) * embed_std)
+            self.view_separator = mx.array(
+                mx.random.normal((config.projector_config.n_embed,)) * embed_std
+            )
         elif self.tile_tag == "1D":
             # <|tile_x|>, <|tile_global|>
             candidate_resolutions = config.candidate_resolutions
             if len(candidate_resolutions) == 0:
                 raise ValueError(
-                    f"len(candidate_resolutions) should be larger than 0, but got {len(candidate_resolutions)}")
+                    f"len(candidate_resolutions) should be larger than 0, but got {len(candidate_resolutions)}"
+                )
             tile_variants_num = len(candidate_resolutions)
             # self.tile_indicators = mx.array(mx.random(size=(tile_variants_num + 1, config.aligner.params.n_embed)) * embed_std)
         else:
-            raise ValueError(f"tile tag should be either 1D or 2D, but got {self.tile_tag}")
+            raise ValueError(
+                f"tile tag should be either 1D or 2D, but got {self.tile_tag}"
+            )
 
-
-    def process_image_features(self, input_embeds, images_embeds, images_spatial_crop, images_seq_mask, h, w, n_dim):
+    def process_image_features(
+        self,
+        input_embeds,
+        images_embeds,
+        images_spatial_crop,
+        images_seq_mask,
+        h,
+        w,
+        n_dim,
+    ):
         tile_index = 0
         all_batch_features = []
 
@@ -205,7 +257,9 @@ class Model(nn.Module):
                 global_features = images_embeds[tile_index]
 
                 # Get local features [num_height_tiles * num_width_tiles, hw, D]
-                local_features = images_embeds[tile_index + 1:tile_index + 1 + int(num_tiles_in_image)]
+                local_features = images_embeds[
+                    tile_index + 1 : tile_index + 1 + int(num_tiles_in_image)
+                ]
 
                 tile_index += num_tiles_in_image + 1
 
@@ -217,12 +271,15 @@ class Model(nn.Module):
 
                     # [D] -> [h, 1, D]
                     new_lines_in_global = mx.expand_dims(self.image_newline, axis=0)
-                    new_lines_in_global = mx.repeat(new_lines_in_global, repeats=h, axis=0)
+                    new_lines_in_global = mx.repeat(
+                        new_lines_in_global, repeats=h, axis=0
+                    )
                     new_lines_in_global = mx.expand_dims(new_lines_in_global, axis=1)
 
-
                     # cat([h, w, D], [h, 1, D], dim=1) -> [h, w + 1, D]
-                    global_features = mx.concatenate([global_features, new_lines_in_global], axis=1)
+                    global_features = mx.concatenate(
+                        [global_features, new_lines_in_global], axis=1
+                    )
 
                     # [h, w + 1, D] -> [h * (w + 1), D]
                     global_features = mx.reshape(global_features, (-1, n_dim))
@@ -230,22 +287,28 @@ class Model(nn.Module):
                     # ----------------- local view add newline -----------------
                     # Rearrange local features
                     # [num_height_tiles * num_width_tiles, h * w, D] -> [num_height_tiles * h, num_width_tiles * w, D]
-                    local_features = mx.reshape(local_features,
-                        (num_height_tiles, num_width_tiles, h, w, n_dim))
+                    local_features = mx.reshape(
+                        local_features, (num_height_tiles, num_width_tiles, h, w, n_dim)
+                    )
                     local_features = mx.transpose(local_features, (0, 2, 1, 3, 4))
-                    local_features = mx.reshape(local_features,
-                        (num_height_tiles * h, num_width_tiles * w, n_dim))
+                    local_features = mx.reshape(
+                        local_features,
+                        (num_height_tiles * h, num_width_tiles * w, n_dim),
+                    )
 
                     # Create newlines for local features
                     # [D] -> [num_height_tiles * h, 1, D]
                     new_lines_in_local = mx.repeat(
                         mx.expand_dims(self.image_newline, axis=0),
-                        repeats=num_height_tiles * h, axis=0
+                        repeats=num_height_tiles * h,
+                        axis=0,
                     )
                     new_lines_in_local = mx.expand_dims(new_lines_in_local, axis=1)
 
                     # [num_height_tiles * h, num_width_tiles * w + 1, D]
-                    local_features = mx.concatenate([local_features, new_lines_in_local], axis=1)
+                    local_features = mx.concatenate(
+                        [local_features, new_lines_in_local], axis=1
+                    )
 
                     # [(num_height_tiles * h) * (num_width_tiles * w + 1), D]
                     local_features = mx.reshape(local_features, (-1, n_dim))
@@ -255,38 +318,38 @@ class Model(nn.Module):
 
                     if self.global_view_pos == "head":
                         global_local_features = mx.concatenate(
-                            [global_features, view_separator, local_features],
-                            axis=0
+                            [global_features, view_separator, local_features], axis=0
                         )
                     else:
                         global_local_features = mx.concatenate(
-                            [local_features, view_separator, global_features],
-                            axis=0
+                            [local_features, view_separator, global_features], axis=0
                         )
 
                 else:
                     # 1D processing (legacy path)
                     global_features = mx.concatenate(
-                        [mx.expand_dims(self.tile_indicators[0], axis=0), global_features],
-                        axis=0
+                        [
+                            mx.expand_dims(self.tile_indicators[0], axis=0),
+                            global_features,
+                        ],
+                        axis=0,
                     )
 
                     local_indicators = mx.expand_dims(
-                        self.tile_indicators[1:num_tiles_in_image + 1],
-                        axis=1
+                        self.tile_indicators[1 : num_tiles_in_image + 1], axis=1
                     )
-                    local_features = mx.concatenate([local_indicators, local_features], axis=1)
+                    local_features = mx.concatenate(
+                        [local_indicators, local_features], axis=1
+                    )
                     local_features = mx.reshape(local_features, (-1, n_dim))
 
                     if self.global_view_pos == "head":
                         global_local_features = mx.concatenate(
-                            [global_features, local_features],
-                            axis=0
+                            [global_features, local_features], axis=0
                         )
                     else:
                         global_local_features = mx.concatenate(
-                            [local_features, global_features],
-                            axis=0
+                            [local_features, global_features], axis=0
                         )
 
                 images_in_this_batch.append(global_local_features)
@@ -325,9 +388,9 @@ class Model(nn.Module):
                 num_width_tiles, num_height_tiles = images_spatial_crop[idx][jdx]
                 if num_width_tiles == 0 or num_height_tiles == 0:
                     break
-                batch_num_tiles[idx] += (1 + num_width_tiles * num_height_tiles)
+                batch_num_tiles[idx] += 1 + num_width_tiles * num_height_tiles
 
-            total_tiles.append(pixel_values[idx, :int(batch_num_tiles[idx])])
+            total_tiles.append(pixel_values[idx, : int(batch_num_tiles[idx])])
 
         total_tiles = mx.concatenate(total_tiles, axis=0)
         assert total_tiles.shape[0] == sum(batch_num_tiles)
@@ -345,11 +408,18 @@ class Model(nn.Module):
         # Pass image features through the multi-modal projector
         image_features = self.projector(hidden_states)
 
-
         _, hw, n_dim = image_features.shape
-        h = w = int(hw ** 0.5)
+        h = w = int(hw**0.5)
 
-        image_features = self.process_image_features(input_embeds, image_features, images_spatial_crop, image_seq_mask, h, w, n_dim)
+        image_features = self.process_image_features(
+            input_embeds,
+            image_features,
+            images_spatial_crop,
+            image_seq_mask,
+            h,
+            w,
+            n_dim,
+        )
 
         return image_features
 
@@ -386,7 +456,9 @@ class Model(nn.Module):
 
         images_spatial_crop = kwargs.get("images_spatial_crop", None)
         images_seq_mask = kwargs.get("images_seq_mask", None)
-        input_embeddings = self.get_input_embeddings(input_ids, pixel_values, images_spatial_crop, images_seq_mask)
+        input_embeddings = self.get_input_embeddings(
+            input_ids, pixel_values, images_spatial_crop, images_seq_mask
+        )
         logits = self.language_model(
             input_ids, cache=cache, inputs_embeds=input_embeddings
         )

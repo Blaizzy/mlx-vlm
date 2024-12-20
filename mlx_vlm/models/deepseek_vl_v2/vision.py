@@ -209,9 +209,7 @@ class EncoderLayer(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.embed_dim = config.width
-        self.attn = Attention(
-            config.width, config.num_attention_heads, qkv_bias=True
-        )
+        self.attn = Attention(config.width, config.num_attention_heads, qkv_bias=True)
         self.norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = MLP(config)
         self.norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)

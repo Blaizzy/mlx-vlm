@@ -1,4 +1,5 @@
 from .deepseek_vl_v2 import (
+    DeepseekVLV2Processor,
     LanguageModel,
     Model,
     ModelConfig,
@@ -6,5 +7,4 @@ from .deepseek_vl_v2 import (
     TextConfig,
     VisionConfig,
     VisionModel,
-    DeepseekVLV2Processor,
 )

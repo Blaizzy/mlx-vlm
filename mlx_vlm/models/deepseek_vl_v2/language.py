@@ -1,7 +1,7 @@
 import inspect
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union, Any
 import math
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -59,8 +59,6 @@ class TextConfig:
 
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
-
-
 
 
 def yarn_find_correction_dim(
@@ -334,6 +332,7 @@ class LlamaAttention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self, config: TextConfig, hidden_size: int = None, intermediate_size: int = None
@@ -352,8 +351,6 @@ class DeepseekV2MLP(nn.Module):
     def __call__(self, x):
         down_proj = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
-
-
 
 
 class MoEGate(nn.Module):
@@ -405,7 +402,9 @@ class MoEGate(nn.Module):
             bsz, seq_len = x.shape[:2]
 
             # Add bias correction
-            scores_for_choice = scores.reshape(bsz * seq_len, -1) + mx.expand_dims(self.e_score_correction_bias, 0)
+            scores_for_choice = scores.reshape(bsz * seq_len, -1) + mx.expand_dims(
+                self.e_score_correction_bias, 0
+            )
 
             # Calculate group scores using top-2 sum per group
             scores_reshaped = scores_for_choice.reshape(bsz * seq_len, self.n_group, -1)
@@ -470,7 +469,11 @@ class DeepseekV2DecoderLayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
         self.attn_type = config.attn_type
-        self.self_attn = DeepseekV2Attention(config) if self.attn_type == "DeepseekV2Attention" else LlamaAttention(config)
+        self.self_attn = (
+            DeepseekV2Attention(config)
+            if self.attn_type == "DeepseekV2Attention"
+            else LlamaAttention(config)
+        )
         self.mlp = (
             DeepseekV2MoE(config)
             if (
