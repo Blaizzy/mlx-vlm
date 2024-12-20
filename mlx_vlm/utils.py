@@ -144,6 +144,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(mx.load(wf))
 
+
     if "language_config" in config:
         config["text_config"] = config["language_config"]
         del config["language_config"]
@@ -178,6 +179,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config["text_config"] = {
             k: v for k, v in config.items() if k != "vision_config"
         }
+
     if model_type == "molmo":
         intermediate_size = None
         if "vision_config" in config and "intermediate_size" in config["vision_config"]:
@@ -835,6 +837,8 @@ def prepare_inputs(
     cross_attention_mask = None
     image_input_idx = None
     image_masks = None
+    images_spatial_crop = None
+    images_seq_mask = None
 
     if image_processor is not None:
         if not isinstance(prompts, list):
@@ -876,6 +880,7 @@ def prepare_inputs(
             inputs = processor(
                 text=prompts, images=images, padding=True, return_tensors="mlx"
             )
+
         if "images" in inputs:
             inputs["pixel_values"] = inputs["images"]
             inputs.pop("images")
@@ -917,6 +922,14 @@ def prepare_inputs(
         if cross_attention_mask is not None:
             cross_attention_mask = mx.array(cross_attention_mask)
 
+        images_spatial_crop = inputs.get("images_spatial_crop", None)
+        if images_spatial_crop is not None:
+            images_spatial_crop = mx.array(images_spatial_crop)
+
+        images_seq_mask = inputs.get("images_seq_mask", None)
+        if images_seq_mask is not None:
+            images_seq_mask = mx.array(images_seq_mask)
+
     return (
         input_ids,
         pixel_values,
@@ -928,6 +941,8 @@ def prepare_inputs(
         cross_attention_mask,
         image_input_idx,
         image_masks,
+        images_spatial_crop,
+        images_seq_mask,
     )
 
 
@@ -1119,6 +1134,8 @@ def stream_generate(
                 "aspect_ratio_ids",
                 "aspect_ratio_mask",
                 "cross_attention_mask",
+                "images_spatial_crop",
+                "images_seq_mask",
             ],
             inputs[3:],
         )
@@ -1192,26 +1209,34 @@ def generate(
     else:
         image_token_index = None
 
-    # Prepare inputs
-    inputs = prepare_inputs(
-        image_processor, processor, image, prompt, image_token_index, resize_shape
-    )
-    input_ids, pixel_values, mask = inputs[:3]
-    kwargs = {
-        k: v
-        for k, v in zip(
-            [
-                "image_grid_thw",
-                "image_sizes",
-                "aspect_ratio_ids",
-                "aspect_ratio_mask",
-                "cross_attention_mask",
-                "image_input_idx",
-                "image_masks",
-            ],
-            inputs[3:],
+    if image == []:
+        input_ids = prompt_tokens[None, :]
+        pixel_values = None
+        mask = None
+        kwargs = {}
+    else:
+        # Prepare inputs
+        inputs = prepare_inputs(
+            image_processor, processor, image, prompt, image_token_index, resize_shape
         )
-    }
+        input_ids, pixel_values, mask = inputs[:3]
+        kwargs = {
+            k: v
+            for k, v in zip(
+                [
+                    "image_grid_thw",
+                    "image_sizes",
+                    "aspect_ratio_ids",
+                    "aspect_ratio_mask",
+                    "cross_attention_mask",
+                    "image_input_idx",
+                    "image_masks",
+                    "images_spatial_crop",
+                    "images_seq_mask",
+                ],
+                inputs[3:],
+            )
+        }
 
     # Initialize timing and detokenizer
     tic = time.perf_counter()
