@@ -28,7 +28,7 @@ class TextConfig:
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
     qk_nope_head_dim: int = 128
-    topk_method: str = "gready"
+    topk_method: str = "greedy"
     n_group: Optional[int] = 1
     topk_group: Optional[int] = 1
     num_experts_per_tok: Optional[int] = 6
@@ -40,6 +40,7 @@ class TextConfig:
     rope_traditional: bool = True
     rope_scaling: Dict = None
     attention_bias: bool = False
+    scoring_func: str = "softmax"
     attn_type: str = "DeepseekV2Attention"
 
     @classmethod
@@ -359,35 +360,83 @@ class MoEGate(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
+        self.scoring_func = config.scoring_func
         self.top_k = config.num_experts_per_tok
         self.n_routed_experts = config.n_routed_experts
         self.routed_scaling_factor = config.routed_scaling_factor
         self.topk_method = config.topk_method
         self.n_group = config.n_group
         self.topk_group = config.topk_group
+        if self.topk_method == "noaux_tc":
+            self.e_score_correction_bias = mx.zeros((self.n_routed_experts))
         self.weight = mx.zeros((self.n_routed_experts, config.hidden_size))
 
     def __call__(self, x):
         gates = x @ self.weight.T
 
-        scores = mx.softmax(gates, axis=-1, precise=True)
+        if self.scoring_func == "softmax":
+            scores = mx.softmax(gates, axis=-1, precise=True)
+        elif self.scoring_func == "sigmoid":
+            scores = mx.sigmoid(gates)
+        else:
+            raise ValueError(f"Unknown scoring function: {self.scoring_func}")
 
-        if self.topk_method == "group_limited_greedy":
+        if self.topk_method == "greedy":
             bsz, seq_len = x.shape[:2]
             scores = scores.reshape(bsz, seq_len, self.n_group, -1)
             group_scores = scores.max(axis=-1)
+
+            # Get top-k groups
             k = self.n_group - self.topk_group
             group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-1)[..., :k]
             batch_idx = mx.expand_dims(mx.arange(bsz), (1, 2))
             seq_idx = mx.expand_dims(mx.arange(seq_len), (0, 2))
+
+            # Mask out top-k groups
             scores[batch_idx, seq_idx, group_idx] = 0.0
             scores = scores.reshape(bsz, seq_len, -1)
 
-        k = self.top_k
-        inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-        scores = mx.take_along_axis(scores, inds, axis=-1)
-        scores = scores * self.routed_scaling_factor
+            # Get top-k indices and weights
+            k = self.top_k
+            inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+            scores = mx.take_along_axis(scores, inds, axis=-1)
 
+        elif self.topk_method == "noaux_tc":
+            bsz, seq_len = x.shape[:2]
+
+            # Add bias correction
+            scores_for_choice = scores.reshape(bsz * seq_len, -1) + mx.expand_dims(self.e_score_correction_bias, 0)
+
+            # Calculate group scores using top-2 sum per group
+            scores_reshaped = scores_for_choice.reshape(bsz * seq_len, self.n_group, -1)
+            k = 2
+            group_scores_topk = mx.sort(scores_reshaped, axis=-1)[..., -k:]
+            group_scores = group_scores_topk.sum(axis=-1)
+
+            # Get top groups
+            k = self.n_group - self.topk_group
+            group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-1)[..., :k]
+
+            # Create mask for selected groups
+
+            group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-1)[..., :k]
+            batch_idx = mx.expand_dims(mx.arange(bsz), (1, 2))
+
+            seq_idx = mx.expand_dims(mx.arange(seq_len), (0, 2))
+            scores[batch_idx, seq_idx, group_idx] = 0.0
+
+            # Get top-k indices and weights
+            k = self.top_k
+            inds = mx.argpartition(scores, kth=-k, axis=-1)[..., -k:]
+
+            # Gather original scores for the selected indices
+            scores_flat = scores.reshape(bsz * seq_len, -1)
+            batch_idx = mx.expand_dims(mx.arange(bsz * seq_len), 1)
+            scores = mx.take(scores_flat, inds + batch_idx * scores_flat.shape[1])
+        else:
+            raise ValueError(f"Unknown topk method: {self.topk_method}")
+
+        scores = scores * self.routed_scaling_factor
         return inds, scores
 
 
