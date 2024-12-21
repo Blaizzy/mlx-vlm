@@ -5,7 +5,7 @@ from .prompt_utils import apply_chat_template
 from .utils import generate, get_model_path, load, load_config, load_image_processor
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
-DEFAULT_IMAGE = ["http://images.cocodataset.org/val2017/000000039769.jpg"]
+DEFAULT_IMAGE = []
 DEFAULT_PROMPT = "What are these?"
 DEFAULT_MAX_TOKENS = 100
 DEFAULT_TEMP = 0.5
