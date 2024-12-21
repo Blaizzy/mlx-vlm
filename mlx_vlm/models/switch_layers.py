@@ -1,4 +1,6 @@
-# Copyright © 2023-2024 Apple Inc.
+"""
+From https://github.com/ml-explore/mlx-examples/tree/main/llms/mlx_lm
+"""
 
 import math
 
