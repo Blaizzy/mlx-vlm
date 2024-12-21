@@ -373,11 +373,6 @@ class Model(nn.Module):
         if pixel_values is None:
             return self.language_model.model.embed_tokens(input_ids)
 
-        image_token_index = self.config.image_token_index
-        num_image_tokens = self.config.num_image_tokens
-
-        image_token_mask = np.array(input_ids[0] == image_token_index).astype(bool)
-        image_indices = np.nonzero(image_token_mask)
         bs = pixel_values.shape[0]
         max_n_images = pixel_values.shape[1]
 
@@ -401,7 +396,7 @@ class Model(nn.Module):
         input_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
-        hidden_states, _, _ = self.vision(
+        hidden_states, *_ = self.vision(
             total_tiles.transpose(0, 2, 3, 1), output_hidden_states=True
         )
 
@@ -423,27 +418,6 @@ class Model(nn.Module):
 
         return image_features
 
-    def _merge_input_ids_with_image_features(
-        self, image_features, inputs_embeds, input_ids
-    ):
-        image_token_index = self.config.image_token_index
-
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
-        text_segments = []
-        start_idx = 0
-
-        for position in image_positions:
-            text_segments.append(inputs_embeds[:, start_idx:position])
-            start_idx = position + 1
-
-        image_embeddings = mx.split(image_features, image_features.shape[0])
-        final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
-        final_embeddings += [inputs_embeds[:, start_idx:]]
-
-        # Create a final embedding of shape
-        # (1, num_image_patches*num_images + sequence_len, embed_dim)
-        return mx.concatenate(final_embeddings, axis=1)
 
     def __call__(
         self,
