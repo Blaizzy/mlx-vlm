@@ -1,21 +1,6 @@
-# Copyright (c) 2023-2024 DeepSeek.
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy of
-# this software and associated documentation files (the "Software"), to deal in
-# the Software without restriction, including without limitation the rights to
-# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
-# the Software, and to permit persons to whom the Software is furnished to do so,
-# subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
-# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
-# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
-# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+"""
+From https://github.com/deepseek-ai/DeepSeek-VL2
+"""
 
 import math
 from dataclasses import dataclass
@@ -130,6 +115,7 @@ class ImageTransform:
 class DeepseekVLV2Processor(ProcessorMixin):
     tokenizer_class = ("LlamaTokenizer", "LlamaTokenizerFast")
     attributes = ["tokenizer"]
+
 
     def __init__(
         self,
@@ -341,7 +327,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
                 )
             else:
                 best_width, best_height = self.image_size, self.image_size
-            # print(image.size, (best_width, best_height)) # check the select_best_resolutions func
 
             """process the global view"""
             global_view = ImageOps.pad(
@@ -392,7 +377,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
             tokenized_str += tokenized_image
             images_seq_mask += [True] * len(tokenized_image)
             num_image_tokens.append(len(tokenized_image))
-            # print(width_crop_num, height_crop_num, len(tokenized_image)) # test the correctness of the number of image-related tokens
 
         """process the last text split"""
         tokenized_sep = self.encode(text_splits[-1], bos=False, eos=False)
@@ -541,3 +525,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
             prepare = self.batchify([prepare])
 
         return prepare
+
+
+
