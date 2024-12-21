@@ -4,7 +4,7 @@ From https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
 
 import dataclasses
 from enum import IntEnum, auto
-from typing import Any, Dict, List
+from typing import Dict, List
 
 
 class SeparatorStyle(IntEnum):
@@ -67,7 +67,7 @@ class Conversation:
                     if role == "User":
                         ret += (
                             "<｜sft▁begin｜>\n" + message + self.sep
-                        )  # <｜sft▁begin｜>User Input<｜sft▁end｜>\nResponse<｜end▁of▁sentence｜>
+                        )
                     else:
                         ret += message + self.sep2
                 else:
@@ -191,24 +191,6 @@ def get_conv_template(name: str) -> Conversation:
     """Get a conversation template."""
     return conv_templates[name].copy()
 
-
-# register_conv_template(
-#     Conversation(
-#         name="deepseek",
-#         system_template="{system_message}",
-#         # system_message="You are a helpful assistant. Please answer truthfully and write out your "
-#         # "thinking step by step to be sure you get the right answer.",
-#         system_message="",
-#         roles=("User", "Assistant"),
-#         messages=(),
-#         offset=0,
-#         sep_style=SeparatorStyle.DeepSeek,
-#         sep="\n\n",
-#         sep2="<｜end▁of▁sentence｜>",
-#         stop_token_ids=[100001],
-#         stop_str=["User:", "<｜end▁of▁sentence｜>"]
-#     )
-# )
 register_conv_template(
     Conversation(
         name="deepseek",
@@ -226,21 +208,7 @@ register_conv_template(
         stop_str=["User:", "<｜end▁of▁sentence｜>"],
     )
 )
-# register_conv_template(
-#     Conversation(
-#         name="deepseekv2",
-#         system_template="{system_message}",
-#         system_message="",
-#         roles=("User", "Assistant"),
-#         messages=(),
-#         offset=0,
-#         sep_style=SeparatorStyle.DeepSeekV2,
-#         sep="\n<｜sft▁end｜>",
-#         sep2="<｜end▁of▁sentence｜>",
-#         stop_token_ids=[100001],
-#         stop_str=["User:", "<｜end▁of▁sentence｜>"]
-#     )
-# )
+
 register_conv_template(
     Conversation(
         name="deepseekv2",
