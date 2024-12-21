@@ -414,10 +414,8 @@ class MoEGate(nn.Module):
 
             # Get top groups
             k = self.n_group - self.topk_group
-            group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-1)[..., :k]
 
             # Create mask for selected groups
-
             group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-1)[..., :k]
             batch_idx = mx.expand_dims(mx.arange(bsz), (1, 2))
 
