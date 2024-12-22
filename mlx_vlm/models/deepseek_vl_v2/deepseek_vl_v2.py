@@ -483,12 +483,12 @@ class Model(nn.Module):
     @staticmethod
     def sanitize(weights):
         def transform_key(key):
-            if "language" in key:
+            if "language" in key and "language_model" not in key:
                 if ".model" in key:
                     key = key.replace("language.model", "language_model.model")
                 if ".lm_head" in key:
                     key = key.replace("language", "language_model")
-            if "vision" in key:
+            if "vision" in key and "vision_tower" not in key:
                 key = key.replace("vision", "vision.vision_tower")
             if "view_seperator" in key:
                 key = key.replace("view_seperator", "view_separator")
