@@ -77,6 +77,7 @@ def get_message_json(
         "florence2": "prompt_only",
         "mllama": "message_list_with_image",
         "molmo": "prompt_only",
+        "deepseek_vl_v2": "message_with_image_token_new_line",
     }
 
     if num_images > 1 and model_name in [
