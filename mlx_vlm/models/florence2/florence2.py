@@ -317,6 +317,9 @@ class Model(nn.Module):
             inputs_embeds, attention_mask = self._merge_input_ids_with_image_features(
                 image_features, inputs_embeds
             )
+        else:
+            inputs_embeds = None
+            attention_mask = None
 
         # Handle decoder input IDs
         if labels is not None and decoder_input_ids is None:
