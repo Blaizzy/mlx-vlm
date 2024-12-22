@@ -418,7 +418,6 @@ class Model(nn.Module):
 
         return image_features
 
-
     def __call__(
         self,
         input_ids: mx.array,

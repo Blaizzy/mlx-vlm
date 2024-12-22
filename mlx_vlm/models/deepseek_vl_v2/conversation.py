@@ -65,9 +65,7 @@ class Conversation:
             for i, (role, message) in enumerate(self.messages):
                 if message:
                     if role == "User":
-                        ret += (
-                            "<｜sft▁begin｜>\n" + message + self.sep
-                        )
+                        ret += "<｜sft▁begin｜>\n" + message + self.sep
                     else:
                         ret += message + self.sep2
                 else:
@@ -190,6 +188,7 @@ def register_conv_template(template: Conversation, override: bool = False):
 def get_conv_template(name: str) -> Conversation:
     """Get a conversation template."""
     return conv_templates[name].copy()
+
 
 register_conv_template(
     Conversation(

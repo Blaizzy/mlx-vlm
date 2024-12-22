@@ -116,7 +116,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
     tokenizer_class = ("LlamaTokenizer", "LlamaTokenizerFast")
     attributes = ["tokenizer"]
 
-
     def __init__(
         self,
         tokenizer: LlamaTokenizerFast,
@@ -525,6 +524,3 @@ class DeepseekVLV2Processor(ProcessorMixin):
             prepare = self.batchify([prepare])
 
         return prepare
-
-
-
