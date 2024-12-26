@@ -149,19 +149,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         skip_vision = False
         skip_vision_non_divisible = False
 
-    if model_type == "llava_bunny":
-        vision_config = AutoConfig.from_pretrained(config["mm_vision_tower"])
-        text_config = AutoConfig.from_pretrained(config["language_model"])
-        vision_config = vision_config.to_dict()
-        text_config = text_config.to_dict()
-        config["vision_config"] = {
-            **vision_config["vision_config"],
-            **config.get("vision_config", {}),
-        }
-        config["text_config"] = text_config
-        
-    if model_type == "idefics2":
-        config = AutoConfig.from_pretrained(model_path).to_dict()
+
     if model_type == "phi3_v":
         config["vision_config"] = config["img_processor"]
         config["text_config"] = {}
@@ -292,17 +280,37 @@ def load(
 
 
 def load_config(model_path: Union[str, Path]) -> dict:
+    """Load model configuration from a path or Hugging Face repo.
 
+    Args:
+        model_path: Local path or Hugging Face repo ID to load config from
+
+    Returns:
+        dict: The model configuration
+
+    Raises:
+        FileNotFoundError: If config.json is not found at the path
+    """
+
+    # Convert string path to Path object if needed
     if isinstance(model_path, str):
         model_path = get_model_path(model_path)
 
+    # First try loading directly with AutoConfig
     try:
-        with open(model_path / "config.json", "r") as f:
-            config = json.load(f)
+        config = AutoConfig.from_pretrained(model_path)
+        return config.to_dict()
+    except Exception as e:
+        pass
+
+    # Load from local config.json file
+    config_path = model_path / "config.json"
+    try:
+        with open(config_path, "r") as f:
+            return json.load(f)
     except FileNotFoundError:
-        logging.error(f"Config file not found in {model_path}")
+        print(f"Config file not found at {config_path}")
         raise
-    return config
 
 
 def load_image_processor(model_path: Union[str, Path]) -> BaseImageProcessor:
