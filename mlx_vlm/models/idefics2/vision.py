@@ -16,7 +16,7 @@ class VisionConfig:
     num_attention_heads: int
     image_size: int
     patch_size: int
-    layer_norm_eps: float
+    layer_norm_eps: float = 1e-6
     num_channels: int = 3
 
     @classmethod
@@ -217,7 +217,7 @@ class VisionModel(nn.Module):
         super().__init__()
         self.config = config
         self.model_type = config.model_type
-        if self.model_type != "idefics2":
+        if self.model_type not in ["idefics2", "idefics2_vision"]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
         self.embeddings = VisionEmbeddings(config)
         self.encoder = Encoder(config)
