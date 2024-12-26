@@ -35,12 +35,6 @@ MODEL_REMAPPING = {"llava-qwen2": "llava_bunny", "bunny-llama": "llava_bunny"}
 
 MAX_FILE_SIZE_GB = 5
 
-linear_class_predicate = (
-    lambda m: isinstance(m, nn.Linear)
-    and m.weight.shape[0]
-    != 8  # avoid quantizing gate layers, otherwise we have to re-quant and upload all the mixtral models
-)
-
 
 def get_model_and_args(config: dict):
     """
@@ -144,10 +138,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(mx.load(wf))
 
-    if "language_config" in config:
-        config["text_config"] = config["language_config"]
-        del config["language_config"]
-
     model_class, model_type = get_model_and_args(config=config)
 
     if "vision_config" in config:
@@ -169,6 +159,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             **config.get("vision_config", {}),
         }
         config["text_config"] = text_config
+        
     if model_type == "idefics2":
         config = AutoConfig.from_pretrained(model_path).to_dict()
     if model_type == "phi3_v":
