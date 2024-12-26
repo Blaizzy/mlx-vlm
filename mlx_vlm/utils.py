@@ -140,35 +140,18 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     model_class, model_type = get_model_and_args(config=config)
 
-    if "vision_config" in config:
-        skip_vision = config["vision_config"].get("skip_vision", False)
-        skip_vision_non_divisible = config["vision_config"].get(
-            "skip_vision_non_divisible", False
-        )
-    else:
-        skip_vision = False
-        skip_vision_non_divisible = False
+    # Initialize text and vision configs if not present
+    config.setdefault("text_config", {})
+    config.setdefault("vision_config", {})
 
+    # Get vision config settings with defaults
+    vision_config = config.get("vision_config", {})
+    skip_vision = vision_config.get("skip_vision", False)
+    skip_vision_non_divisible = vision_config.get("skip_vision_non_divisible", False)
 
-    if model_type == "phi3_v":
-        config["vision_config"] = config["img_processor"]
-        config["text_config"] = {}
     if model_type == "qwen2_vl":
-        config["text_config"] = {
-            k: v for k, v in config.items() if k != "vision_config"
-        }
-
-    if model_type == "molmo":
-        intermediate_size = None
-        if "vision_config" in config and "intermediate_size" in config["vision_config"]:
-            intermediate_size = config["vision_config"]["intermediate_size"]
-
-        config["text_config"] = asdict(model_class.TextConfig())
-        config["vision_config"] = asdict(model_class.VisionConfig())
-        config["vision_config"]["intermediate_size"] = intermediate_size
-
-    config["vision_config"]["skip_vision"] = skip_vision
-    config["vision_config"]["skip_vision_non_divisible"] = skip_vision_non_divisible
+        excluded_keys = {"vision_config", "text_config"}
+        config["text_config"] = dict(filter(lambda x: x[0] not in excluded_keys, config.items()))
 
     model_config = model_class.ModelConfig.from_dict(config)
 
@@ -208,11 +191,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         )
 
     if (quantization := config.get("quantization", None)) is not None:
-        # Handle legacy models which may not have everything quantized
-        skip_vision = config.get("vision_config", {}).get("skip_vision", False)
-        skip_vision_non_divisible = config.get("vision_config", {}).get(
-            "skip_vision_non_divisible", False
-        )
+        # Handle legacy models which may not have everything quantized`
         if skip_vision:
             class_predicate = lambda _, m: not (
                 "vision_model" in m.name or "vision_tower" in m.name
