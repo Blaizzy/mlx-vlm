@@ -132,7 +132,6 @@ class TestModels(unittest.TestCase):
             },
             hidden_size=1024,
             mm_hidden_size=1152,
-            mm_vision_tower="google/siglip-so400m-patch14-384",
             mm_projector_type="mlp2x_gelu",
             ignore_index=-100,
             image_token_index=-200,
