@@ -499,9 +499,9 @@ class TestModels(unittest.TestCase):
             params={},
         )
 
-        aligner_config = multi_modality.AlignerConfig(
+        projector_config = multi_modality.ProjectorConfig(
             cls="MlpProjector",
-            model_type="aligner",
+            model_type="projector",
             params={
                 "depth": 2,
                 "input_dim": 1024,
@@ -513,7 +513,7 @@ class TestModels(unittest.TestCase):
         config = multi_modality.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
-            aligner_config=aligner_config,
+            projector_config=projector_config,
             model_type="multi_modality",
             ignore_index=-100,
             image_token_index=100015,
