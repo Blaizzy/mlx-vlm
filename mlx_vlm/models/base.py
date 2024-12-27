@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 from PIL import Image
+from transformers.image_processing_utils import BaseImageProcessor as ImageProcessor
 from transformers.image_processing_utils import get_size_dict
 from transformers.image_utils import ChannelDimension, PILImageResampling
 
@@ -22,7 +23,7 @@ def expand2square(pil_img, background_color):
         return result
 
 
-class BaseImageProcessor(ABC):
+class BaseImageProcessor(ImageProcessor):
     def __init__(
         self,
         image_mean=(0.5, 0.5, 0.5),

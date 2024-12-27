@@ -10,10 +10,10 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 from PIL import Image
-from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
+from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import to_numpy_array
 
-from ..base import expand2square
+from ..base import BaseImageProcessor, expand2square
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
