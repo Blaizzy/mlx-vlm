@@ -261,7 +261,11 @@ def load(
         model = apply_lora_layers(model, adapter_path)
         model.eval()
 
+    image_processor = load_image_processor(model_path, **kwargs)
     processor = load_processor(model_path, True, **kwargs)
+
+    if image_processor is not None:
+        processor.image_processor = image_processor
 
     return model, processor
 
@@ -807,14 +811,12 @@ def resize_image(img, max_size):
 def process_image(img, resize_shape, image_processor):
     if isinstance(img, str):
         img = load_image(img)
-    if resize_shape is not None and image_processor is None:
+    if resize_shape is not None and not isinstance(image_processor, BaseImageProcessor):
         img = resize_image(img, resize_shape)
     return img
 
 
-def prepare_inputs(
-    image_processor, processor, images, prompts, image_token_index, resize_shape=None
-):
+def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=None):
     from transformers.image_utils import load_image
 
     mask = None
@@ -822,6 +824,9 @@ def prepare_inputs(
         images = [images]
 
     # Process images
+    image_processor = (
+        processor.image_processor if hasattr(processor, "image_processor") else None
+    )
     images = [process_image(img, resize_shape, image_processor) for img in images]
 
     image_grid_thw = None
@@ -834,7 +839,9 @@ def prepare_inputs(
     images_spatial_crop = None
     images_seq_mask = None
 
-    if image_processor is not None:
+    if hasattr(processor, "image_processor") and isinstance(
+        processor.image_processor, BaseImageProcessor
+    ):
         if not isinstance(prompts, list):
             prompts = [prompts]
 
@@ -858,7 +865,7 @@ def prepare_inputs(
 
         input_ids = mx.array(input_ids)
 
-        pixel_values = image_processor.preprocess(images=images)
+        pixel_values = processor.image_processor.preprocess(images=images)
         pixel_values = mx.array(np.stack(pixel_values))
 
         mask = mx.array([(ids != processor.pad_token_id) for ids in input_ids]).astype(
@@ -1103,7 +1110,9 @@ def stream_generate(
         Generator[Tuple[mx.array, mx.array]]: A generator producing text.
     """
 
-    if image_processor is not None:
+    if hasattr(processor, "image_processor") and isinstance(
+        processor.image_processor, BaseImageProcessor
+    ):
         tokenizer = processor
     else:
         tokenizer = processor.tokenizer
@@ -1115,9 +1124,7 @@ def stream_generate(
         image_token_index = None
 
     # Prepare inputs
-    inputs = prepare_inputs(
-        image_processor, processor, image, prompt, image_token_index, resize_shape
-    )
+    inputs = prepare_inputs(processor, image, prompt, image_token_index, resize_shape)
     input_ids, pixel_values, mask = inputs[:3]
     kwargs = {
         k: v
@@ -1158,7 +1165,6 @@ def generate(
     processor: PreTrainedTokenizer,
     image: str,
     prompt: str,
-    image_processor=None,
     temp: float = 0.0,
     max_tokens: int = 100,
     verbose: bool = False,
@@ -1190,7 +1196,9 @@ def generate(
         print("Image:", image, "\n")
         print("Prompt:", prompt)
 
-    if image_processor is not None:
+    if hasattr(processor, "image_processor") and isinstance(
+        processor.image_processor, BaseImageProcessor
+    ):
         prompt_tokens = mx.array(processor.encode(prompt))
         tokenizer = processor
     else:
@@ -1211,7 +1219,7 @@ def generate(
     else:
         # Prepare inputs
         inputs = prepare_inputs(
-            image_processor, processor, image, prompt, image_token_index, resize_shape
+            processor, image, prompt, image_token_index, resize_shape
         )
         input_ids, pixel_values, mask = inputs[:3]
         kwargs = {

@@ -68,8 +68,7 @@ def get_model_and_processors(model_path, adapter_path):
     model, processor = load(
         model_path, adapter_path=adapter_path, lazy=False, trust_remote_code=True
     )
-    image_processor = load_image_processor(model_path, trust_remote_code=True)
-    return model, processor, image_processor, config
+    return model, processor, config
 
 
 def main():
@@ -77,9 +76,7 @@ def main():
     if isinstance(args.image, str):
         args.image = [args.image]
 
-    model, processor, image_processor, config = get_model_and_processors(
-        args.model, args.adapter_path
-    )
+    model, processor, config = get_model_and_processors(args.model, args.adapter_path)
 
     prompt = codecs.decode(args.prompt, "unicode_escape")
 
@@ -97,7 +94,6 @@ def main():
         processor,
         args.image,
         prompt,
-        image_processor,
         args.temp,
         args.max_tokens,
         args.verbose,
