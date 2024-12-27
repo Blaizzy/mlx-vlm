@@ -152,7 +152,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     # Initialize model config and update it with module configs
     model_config = model_class.ModelConfig.from_dict(config)
-    modules = ["text", "vision", "perceiver", "aligner", "projector"]
+    modules = ["text", "vision", "perceiver", "projector"]
     model_config = update_module_configs(model_config, model_class, config, modules)
 
     model = model_class.Model(model_config)
