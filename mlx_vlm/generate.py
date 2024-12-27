@@ -64,11 +64,11 @@ def parse_arguments():
 
 def get_model_and_processors(model_path, adapter_path):
     model_path = get_model_path(model_path)
-    config = load_config(model_path)
+    config = load_config(model_path, trust_remote_code=True)
     model, processor = load(
-        model_path, {"trust_remote_code": True}, adapter_path=adapter_path
+        model_path, adapter_path=adapter_path, lazy=False, trust_remote_code=True
     )
-    image_processor = load_image_processor(model_path)
+    image_processor = load_image_processor(model_path, trust_remote_code=True)
     return model, processor, image_processor, config
 
 

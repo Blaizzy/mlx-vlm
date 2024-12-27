@@ -91,7 +91,7 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
     return model_path
 
 
-def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
+def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     """
     Load and initialize the model from a given path.
 
@@ -108,8 +108,7 @@ def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
         FileNotFoundError: If the weight files (.safetensors) are not found.
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
-
-    config = load_config(model_path)
+    config = load_config(model_path, **kwargs)
     quantization = config.get("quantization", None)
 
     weight_files = glob.glob(str(model_path / "*.safetensors"))
@@ -231,9 +230,9 @@ def get_class_predicate(skip_vision, skip_vision_non_divisible, weights):
 
 def load(
     path_or_hf_repo: str,
-    processor_config={},
     adapter_path: Optional[str] = None,
     lazy: bool = False,
+    **kwargs,
 ) -> Tuple[nn.Module, Union[PreTrainedTokenizer, PreTrainedTokenizerFast]]:
     """
     Load the model and tokenizer from a given path or a huggingface repository.
@@ -256,22 +255,23 @@ def load(
     """
     model_path = get_model_path(path_or_hf_repo)
 
-    model = load_model(model_path, lazy)
+    model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
         # TODO: Support more modules than just language_model
         model = apply_lora_layers(model, adapter_path)
         model.eval()
 
-    processor = load_processor(model_path, processor_config=processor_config)
+    processor = load_processor(model_path, True, **kwargs)
 
     return model, processor
 
 
-def load_config(model_path: Union[str, Path]) -> dict:
+def load_config(model_path: Union[str, Path], **kwargs) -> dict:
     """Load model configuration from a path or Hugging Face repo.
 
     Args:
         model_path: Local path or Hugging Face repo ID to load config from
+        **kwargs: Additional keyword arguments to pass to the config loader
 
     Returns:
         dict: The model configuration
@@ -286,9 +286,9 @@ def load_config(model_path: Union[str, Path]) -> dict:
 
     # First try loading directly with AutoConfig
     try:
-        config = AutoConfig.from_pretrained(model_path)
+        config = AutoConfig.from_pretrained(model_path, **kwargs)
         return config.to_dict()
-    except Exception as e:
+    except Exception:
         pass
 
     # Load from local config.json file
@@ -301,11 +301,15 @@ def load_config(model_path: Union[str, Path]) -> dict:
         raise
 
 
-def load_image_processor(model_path: Union[str, Path]) -> BaseImageProcessor:
+def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImageProcessor:
     if isinstance(model_path, str):
         model_path = get_model_path(model_path)
 
-    config = load_config(model_path)
+    if not kwargs:
+        config = load_config(model_path, trust_remote_code=True)
+    else:
+        config = load_config(model_path, **kwargs)
+
     model_class, _ = get_model_and_args(config)
     image_processor = None
 
@@ -323,9 +327,10 @@ def load_image_processor(model_path: Union[str, Path]) -> BaseImageProcessor:
 
 
 def load_processor(
-    model_path, processor_config={"trust_remote_code": True}, add_detokenizer=True
+    model_path, add_detokenizer=True, **kwargs
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
-    processor = AutoProcessor.from_pretrained(model_path, **processor_config)
+
+    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
         if "tokenizer" in processor.__dict__.keys():
@@ -336,11 +341,11 @@ def load_processor(
 
 
 def fetch_from_hub(
-    model_path: Path, lazy: bool = False
+    model_path: Path, lazy: bool = False, **kwargs
 ) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
-    model = load_model(model_path, lazy)
-    config = load_config(model_path)
-    processor = load_processor(model_path, add_detokenizer=False)
+    model = load_model(model_path, lazy, **kwargs)
+    config = load_config(model_path, **kwargs)
+    processor = load_processor(model_path, add_detokenizer=False, **kwargs)
     return model, config, processor
 
 
@@ -718,10 +723,13 @@ def convert(
     dequantize: bool = False,
     skip_vision: bool = False,
     skip_vision_non_divisible: bool = False,
+    trust_remote_code: bool = True,
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
-    model, config, processor = fetch_from_hub(model_path, lazy=True)
+    model, config, processor = fetch_from_hub(
+        model_path, lazy=True, trust_remote_code=trust_remote_code
+    )
 
     weights = dict(tree_flatten(model.parameters()))
     dtype = mx.float16 if quantize else getattr(mx, dtype)
