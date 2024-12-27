@@ -152,27 +152,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     model_config = model_class.ModelConfig.from_dict(config)
 
-    config = update_model_config(config)
+    config = custom_model_config(config)
 
-    model_config.vision_config = model_class.VisionConfig.from_dict(
-        config["vision_config"]
-    )
-
-    model_config.text_config = model_class.TextConfig.from_dict(config["text_config"])
-
-    if hasattr(model_config, "perceiver_config"):
-        model_config.perceiver_config = model_class.PerceiverConfig.from_dict(
-            config["perceiver_config"]
-        )
-    if hasattr(model_config, "aligner_config"):
-        model_config.aligner_config = model_class.AlignerConfig.from_dict(
-            config["aligner_config"]
-        )
-
-    if hasattr(model_config, "projector_config"):
-        model_config.projector_config = model_class.ProjectorConfig.from_dict(
-            config["projector_config"]
-        )
+    modules = ["text", "vision", "perceiver", "aligner", "projector"]
+    update_model_configs(model_config, model_class, config, modules)
 
     model = model_class.Model(model_config)
 
@@ -219,7 +202,24 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     return model
 
 
-def update_model_config(config):
+def update_model_configs(model_config, model_class, config, modules):
+    """Update model configs for different components like text, vision etc.
+
+    Args:
+        model_config: The model configuration object
+        model_class: The model class
+        config: The configuration dictionary
+    """
+    for config_name in modules:
+        config_attr = f"{config_name}_config"
+        if hasattr(model_config, config_attr):
+            config_class = getattr(model_class, f"{config_name.title()}Config")
+            setattr(
+                model_config, config_attr, config_class.from_dict(config[config_attr])
+            )
+
+
+def custom_model_config(config):
     warnings.simplefilter("always", DeprecationWarning)
     if "qwen2_vl" in config["model_type"]:
         warnings.warn(
