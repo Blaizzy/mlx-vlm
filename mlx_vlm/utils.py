@@ -150,12 +150,12 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     skip_vision = vision_config.get("skip_vision", False)
     skip_vision_non_divisible = vision_config.get("skip_vision_non_divisible", False)
 
-    model_config = model_class.ModelConfig.from_dict(config)
-
     config = custom_model_config(config)
 
+    # Initialize model config and update it with module configs
+    model_config = model_class.ModelConfig.from_dict(config)
     modules = ["text", "vision", "perceiver", "aligner", "projector"]
-    update_model_configs(model_config, model_class, config, modules)
+    model_config = update_module_configs(model_config, model_class, config, modules)
 
     model = model_class.Model(model_config)
 
@@ -170,19 +170,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized`
-        if skip_vision:
-            class_predicate = lambda _, m: not (
-                "vision_model" in m.name or "vision_tower" in m.name
-            )
-        elif skip_vision_non_divisible:
-            class_predicate = (
-                lambda _, m: hasattr(m, "to_quantized") and m.weight.shape[-1] % 64 == 0
-            )
-        else:
-            class_predicate = (
-                lambda p, m: isinstance(m, (nn.Linear, nn.Embedding))
-                and f"{p}.scales" in weights
-            )
+        class_predicate = get_class_predicate(
+            skip_vision, skip_vision_non_divisible, weights
+        )
 
         nn.quantize(
             model,
@@ -207,13 +197,17 @@ def sanitize_weights(model_obj, weights, config=None):
     return weights
 
 
-def update_model_configs(model_config, model_class, config, modules):
-    """Update model configs for different components like text, vision etc.
+def update_module_configs(model_config, model_class, config, modules):
+    """Updates configuration for model modules like text and vision modules.
 
     Args:
-        model_config: The model configuration object
-        model_class: The model class
-        config: The configuration dictionary
+        model_config: The model configuration object that will be updated
+        model_class: The model class containing component config classes
+        config: Dictionary containing configuration parameters
+        modules: List of module names to update configs for (e.g. ["text", "vision"])
+
+    Returns:
+        The updated model_config object
     """
     for config_name in modules:
         config_attr = f"{config_name}_config"
@@ -222,6 +216,7 @@ def update_model_configs(model_config, model_class, config, modules):
             setattr(
                 model_config, config_attr, config_class.from_dict(config[config_attr])
             )
+    return model_config
 
 
 def custom_model_config(config):
@@ -247,6 +242,18 @@ def custom_model_config(config):
         del config["language_config"]
 
     return config
+
+
+def get_class_predicate(skip_vision, skip_vision_non_divisible, weights):
+    if skip_vision:
+        return lambda _, m: not ("vision_model" in m.name or "vision_tower" in m.name)
+    elif skip_vision_non_divisible:
+        return lambda _, m: hasattr(m, "to_quantized") and m.weight.shape[-1] % 64 == 0
+    else:
+        return (
+            lambda p, m: isinstance(m, (nn.Linear, nn.Embedding))
+            and f"{p}.scales" in weights
+        )
 
 
 def load(
