@@ -229,7 +229,9 @@ class Model(nn.Module):
                 )
             tile_variants_num = len(candidate_resolutions)
             self.tile_indicators = mx.array(
-                mx.random.normal((tile_variants_num + 1, config.aligner.params.n_embed))
+                mx.random.normal(
+                    (tile_variants_num + 1, config.projector_config.n_embed)
+                )
                 * embed_std
             )
         else:
