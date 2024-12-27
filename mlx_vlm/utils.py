@@ -159,18 +159,14 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     model = model_class.Model(model_config)
 
-    if hasattr(model, "sanitize"):
-        weights = model.sanitize(weights)
-
-    if hasattr(model_class.VisionModel, "sanitize"):
-        weights = model_class.VisionModel(model_config.vision_config).sanitize(
-            weights=weights
-        )
-
-    if hasattr(model_class.LanguageModel, "sanitize"):
-        weights = model_class.LanguageModel(model_config.text_config).sanitize(
-            weights=weights
-        )
+    # Sanitize weights
+    weights = sanitize_weights(model, weights)
+    weights = sanitize_weights(
+        model_class.VisionModel, weights, model_config.vision_config
+    )
+    weights = sanitize_weights(
+        model_class.LanguageModel, weights, model_config.text_config
+    )
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized`
@@ -200,6 +196,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     model.eval()
     return model
+
+
+def sanitize_weights(model_obj, weights, config=None):
+    """Helper function to sanitize weights if the model has a sanitize method"""
+    if hasattr(model_obj, "sanitize"):
+        if config is not None:
+            model_obj = model_obj(config)
+        weights = model_obj.sanitize(weights)
+    return weights
 
 
 def update_model_configs(model_config, model_class, config, modules):
