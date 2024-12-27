@@ -62,6 +62,10 @@ class ModelConfig:
 
     @classmethod
     def from_dict(cls, params):
+        if "language_config" in params:
+            params["text_config"] = params["language_config"]
+            del params["language_config"]
+
         return cls(
             **{
                 k: v

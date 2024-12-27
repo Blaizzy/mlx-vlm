@@ -27,6 +27,12 @@ class ModelConfig:
 
     @classmethod
     def from_dict(cls, params):
+        # Copy text config parameters from root level
+        excluded_keys = {"vision_config"}
+        params["text_config"] = dict(
+            filter(lambda x: x[0] not in excluded_keys, params.items())
+        )
+
         return cls(
             **{
                 k: v

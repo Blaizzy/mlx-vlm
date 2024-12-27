@@ -150,8 +150,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     skip_vision = vision_config.get("skip_vision", False)
     skip_vision_non_divisible = vision_config.get("skip_vision_non_divisible", False)
 
-    config = custom_model_config(config)
-
     # Initialize model config and update it with module configs
     model_config = model_class.ModelConfig.from_dict(config)
     modules = ["text", "vision", "perceiver", "aligner", "projector"]
@@ -217,31 +215,6 @@ def update_module_configs(model_config, model_class, config, modules):
                 model_config, config_attr, config_class.from_dict(config[config_attr])
             )
     return model_config
-
-
-def custom_model_config(config):
-    warnings.simplefilter("always", DeprecationWarning)
-    if "qwen2_vl" in config["model_type"]:
-        warnings.warn(
-            "The Qwen2-VL config format is deprecated and will be standardized in v0.1.8",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        excluded_keys = {"vision_config", "text_config"}
-        config["text_config"] = dict(
-            filter(lambda x: x[0] not in excluded_keys, config.items())
-        )
-
-    if "language_config" in config:
-        warnings.warn(
-            "The 'language_config' field is deprecated and will be renamed to 'text_config' from v0.1.8",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        config["text_config"] = config["language_config"]
-        del config["language_config"]
-
-    return config
 
 
 def get_class_predicate(skip_vision, skip_vision_non_divisible, weights):
