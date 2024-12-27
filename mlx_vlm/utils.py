@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import time
+import warnings
 from dataclasses import asdict
 from io import BytesIO
 from pathlib import Path
@@ -149,11 +150,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     skip_vision = vision_config.get("skip_vision", False)
     skip_vision_non_divisible = vision_config.get("skip_vision_non_divisible", False)
 
-    if model_type == "qwen2_vl":
-        excluded_keys = {"vision_config", "text_config"}
-        config["text_config"] = dict(filter(lambda x: x[0] not in excluded_keys, config.items()))
-
     model_config = model_class.ModelConfig.from_dict(config)
+
+    config = update_model_config(config)
 
     model_config.vision_config = model_class.VisionConfig.from_dict(
         config["vision_config"]
@@ -218,6 +217,31 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     model.eval()
     return model
+
+
+def update_model_config(config):
+    warnings.simplefilter("always", DeprecationWarning)
+    if "qwen2_vl" in config["model_type"]:
+        warnings.warn(
+            "The Qwen2-VL config format is deprecated and will be standardized in v0.1.8",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        excluded_keys = {"vision_config", "text_config"}
+        config["text_config"] = dict(
+            filter(lambda x: x[0] not in excluded_keys, config.items())
+        )
+
+    if "language_config" in config:
+        warnings.warn(
+            "The 'language_config' field is deprecated and will be renamed to 'text_config' from v0.1.8",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        config["text_config"] = config["language_config"]
+        del config["language_config"]
+
+    return config
 
 
 def load(
