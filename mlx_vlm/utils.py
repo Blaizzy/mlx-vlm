@@ -817,9 +817,7 @@ def process_image(img, resize_shape, image_processor):
 
 
 def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=None):
-    from transformers.image_utils import load_image
 
-    mask = None
     if not isinstance(images, list):
         images = [images]
 
@@ -829,15 +827,7 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
     )
     images = [process_image(img, resize_shape, image_processor) for img in images]
 
-    image_grid_thw = None
-    image_sizes = None
-    aspect_ratio_ids = None
-    aspect_ratio_mask = None
-    cross_attention_mask = None
-    image_input_idx = None
-    image_masks = None
-    images_spatial_crop = None
-    images_seq_mask = None
+    model_inputs = {}
 
     if hasattr(processor, "image_processor") and isinstance(
         processor.image_processor, BaseImageProcessor
@@ -863,14 +853,13 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
             padding = [processor.pad_token_id] * (max_length - len(ids))
             input_ids.append(mx.array(ids + padding))
 
-        input_ids = mx.array(input_ids)
-
+        model_inputs["input_ids"] = mx.array(input_ids)
         pixel_values = processor.image_processor.preprocess(images=images)
-        pixel_values = mx.array(np.stack(pixel_values))
+        model_inputs["pixel_values"] = mx.array(np.stack(pixel_values))
+        model_inputs["mask"] = mx.array(
+            [(ids != processor.pad_token_id) for ids in input_ids]
+        ).astype(mx.int32)
 
-        mask = mx.array([(ids != processor.pad_token_id) for ids in input_ids]).astype(
-            mx.int32
-        )
     else:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
         if hasattr(processor, "process"):
@@ -890,61 +879,18 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
             pixel_values = inputs["pixel_values"]
         else:
             pixel_values = mx.array(inputs["pixel_values"])
-        input_ids = mx.array(inputs["input_ids"])
-        mask = (
+
+        model_inputs["input_ids"] = mx.array(inputs["input_ids"])
+        model_inputs["mask"] = (
             mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
         )
 
-        image_input_idx = inputs.get("image_input_idx", None)
-        if image_input_idx is not None:
-            image_input_idx = mx.array(image_input_idx)
+        # Convert inputs to model_inputs with mx.array if present
+        for key, value in inputs.items():
+            if key not in model_inputs and isinstance(value, mx.array):
+                model_inputs[key] = mx.array(value)
 
-        image_masks = inputs.get("image_masks", None)
-        if image_masks is not None:
-            image_masks = mx.array(image_masks)
-
-        image_sizes = inputs.get("image_sizes", None)
-        if image_sizes is not None:
-            image_sizes = mx.array(image_sizes)
-
-        image_grid_thw = inputs.get("image_grid_thw", None)
-        if image_grid_thw is not None:
-            image_grid_thw = mx.array(image_grid_thw)
-
-        aspect_ratio_ids = inputs.get("aspect_ratio_ids", None)
-        if aspect_ratio_ids is not None:
-            aspect_ratio_ids = mx.array(aspect_ratio_ids)
-
-        aspect_ratio_mask = inputs.get("aspect_ratio_mask", None)
-        if aspect_ratio_mask is not None:
-            aspect_ratio_mask = mx.array(aspect_ratio_mask)
-
-        cross_attention_mask = inputs.get("cross_attention_mask", None)
-        if cross_attention_mask is not None:
-            cross_attention_mask = mx.array(cross_attention_mask)
-
-        images_spatial_crop = inputs.get("images_spatial_crop", None)
-        if images_spatial_crop is not None:
-            images_spatial_crop = mx.array(images_spatial_crop)
-
-        images_seq_mask = inputs.get("images_seq_mask", None)
-        if images_seq_mask is not None:
-            images_seq_mask = mx.array(images_seq_mask)
-
-    return (
-        input_ids,
-        pixel_values,
-        mask,
-        image_grid_thw,
-        image_sizes,
-        aspect_ratio_ids,
-        aspect_ratio_mask,
-        cross_attention_mask,
-        image_input_idx,
-        image_masks,
-        images_spatial_crop,
-        images_seq_mask,
-    )
+    return model_inputs
 
 
 def generate_step(
@@ -1125,21 +1071,15 @@ def stream_generate(
 
     # Prepare inputs
     inputs = prepare_inputs(processor, image, prompt, image_token_index, resize_shape)
-    input_ids, pixel_values, mask = inputs[:3]
+    input_ids, pixel_values, mask = (
+        inputs["input_ids"],
+        inputs["pixel_values"],
+        inputs["mask"],
+    )
     kwargs = {
         k: v
-        for k, v in zip(
-            [
-                "image_grid_thw",
-                "image_sizes",
-                "aspect_ratio_ids",
-                "aspect_ratio_mask",
-                "cross_attention_mask",
-                "images_spatial_crop",
-                "images_seq_mask",
-            ],
-            inputs[3:],
-        )
+        for k, v in inputs.items()
+        if k not in ["input_ids", "pixel_values", "mask"]
     }
 
     detokenizer = processor.detokenizer
@@ -1221,23 +1161,15 @@ def generate(
         inputs = prepare_inputs(
             processor, image, prompt, image_token_index, resize_shape
         )
-        input_ids, pixel_values, mask = inputs[:3]
+        input_ids, pixel_values, mask = (
+            inputs["input_ids"],
+            inputs["pixel_values"],
+            inputs["mask"],
+        )
         kwargs = {
             k: v
-            for k, v in zip(
-                [
-                    "image_grid_thw",
-                    "image_sizes",
-                    "aspect_ratio_ids",
-                    "aspect_ratio_mask",
-                    "cross_attention_mask",
-                    "image_input_idx",
-                    "image_masks",
-                    "images_spatial_crop",
-                    "images_seq_mask",
-                ],
-                inputs[3:],
-            )
+            for k, v in inputs.items()
+            if k not in ["input_ids", "pixel_values", "mask"]
         }
 
     # Initialize timing and detokenizer
