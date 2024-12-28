@@ -814,7 +814,7 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
         )
         # Convert inputs to model_inputs with mx.array if present
         for key, value in inputs.items():
-            if key not in model_inputs and not isinstance(value, str):
+            if key not in model_inputs and not isinstance(value, (str, list)):
                 model_inputs[key] = mx.array(value)
 
     return model_inputs
