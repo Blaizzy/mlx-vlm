@@ -145,7 +145,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     # Get vision config settings with defaults
     vision_config = config.get("vision_config", {})
     skip_vision = vision_config.get("skip_vision", False)
-    skip_vision_non_divisible = vision_config.get("skip_vision_non_divisible", False)
 
     # Initialize model config and update it with module configs
     model_config = model_class.ModelConfig.from_dict(config)
@@ -165,9 +164,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized`
-        class_predicate = get_class_predicate(
-            skip_vision, skip_vision_non_divisible, weights
-        )
+        class_predicate = get_class_predicate(skip_vision, weights)
 
         nn.quantize(
             model,
@@ -214,16 +211,20 @@ def update_module_configs(model_config, model_class, config, modules):
     return model_config
 
 
-def get_class_predicate(skip_vision, skip_vision_non_divisible, weights):
+def get_class_predicate(skip_vision, weights=None):
     if skip_vision:
         return lambda _, m: not ("vision_model" in m.name or "vision_tower" in m.name)
-    elif skip_vision_non_divisible:
-        return lambda _, m: hasattr(m, "to_quantized") and m.weight.shape[-1] % 64 == 0
     else:
-        return (
-            lambda p, m: isinstance(m, (nn.Linear, nn.Embedding))
-            and f"{p}.scales" in weights
-        )
+        if weights:
+            return lambda p, m: (
+                hasattr(m, "to_quantized")
+                and m.weight.shape[-1] % 64 == 0
+                and f"{p}.scales" in weights
+            )
+        else:
+            return (
+                lambda _, m: hasattr(m, "to_quantized") and m.weight.shape[-1] % 64 == 0
+            )
 
 
 def load(
@@ -526,7 +527,6 @@ def quantize_model(
     q_group_size: int,
     q_bits: int,
     skip_vision: bool = False,
-    skip_vision_non_divisible: bool = False,
 ) -> Tuple[dict, dict]:
     """
     Applies quantization to the model weights.
@@ -544,9 +544,6 @@ def quantize_model(
     quantized_config = copy.deepcopy(config)
     quantized_config.setdefault("vision_config", {})
 
-    # Get vision model size
-    vision_size = _get_vision_size(model)
-
     # Apply quantization
     if skip_vision:
         # Quantize only non-vision modules
@@ -554,83 +551,24 @@ def quantize_model(
             model,
             q_group_size,
             q_bits,
-            class_predicate=lambda x: not (
-                "vision_model" in x.name or "vision_tower" in x.name
-            ),
+            class_predicate=get_class_predicate(skip_vision),
         )
         quantized_config["vision_config"]["skip_vision"] = skip_vision
-    elif skip_vision_non_divisible:
+
+    else:
         # Quantize only layers with to_quantized method and divisible by 64
         nn.quantize(
             model,
             q_group_size,
             q_bits,
-            class_predicate=lambda _, m: hasattr(m, "to_quantized")
-            and m.weight.shape[-1] % 64 == 0,
+            class_predicate=get_class_predicate(skip_vision),
         )
-        quantized_config["vision_config"][
-            "skip_vision_non_divisible"
-        ] = skip_vision_non_divisible
-    else:
-        # Pad vision model if needed
-        _pad_vision_model(model, vision_size)
-        if hasattr(model.config.vision_config, "intermediate_size"):
-            _update_vision_config(
-                quantized_config, vision_size, key="intermediate_size"
-            )
-        elif hasattr(model.config.vision_config, "hidden_size"):
-            _update_vision_config(quantized_config, vision_size, key="hidden_size")
-        else:
-            raise ValueError(
-                "No intermediate_size or hidden_size found in vision_config"
-            )
-
-        nn.quantize(model, q_group_size, q_bits)
 
     # Update config and get weights
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
     quantized_weights = dict(tree_flatten(model.parameters()))
 
     return quantized_weights, quantized_config
-
-
-def _get_vision_size(model: nn.Module) -> int:
-    """Get vision model intermediate/hidden size."""
-    if hasattr(model.config.vision_config, "intermediate_size"):
-        return model.config.vision_config.intermediate_size
-    return model.config.vision_config.hidden_size
-
-
-def _pad_vision_model(model: nn.Module, vision_size: int, divisor: int = 64) -> None:
-    """Pad vision model layers to be divisible by divisor."""
-    if any(vision_size % size != 0 for size in [64, 128]):
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Linear) and (
-                "vision_model" in name or "vision_tower" in name
-            ):
-                out_features, in_features = module.weight.shape
-
-                new_out = (
-                    ((out_features // divisor) + 1) * divisor
-                    if out_features % divisor
-                    else out_features
-                )
-                new_in = (
-                    ((in_features // divisor) + 1) * divisor
-                    if in_features % divisor
-                    else in_features
-                )
-
-                if new_out != out_features or new_in != in_features:
-                    new_weight = mx.zeros((new_out, new_in), dtype=module.weight.dtype)
-                    new_bias = mx.zeros((new_out), dtype=module.bias.dtype)
-
-                    new_weight[:out_features, :in_features] = module.weight
-                    module.weight = new_weight
-
-                    if hasattr(module, "bias"):
-                        new_bias[:out_features] = module.bias
-                        module.bias = new_bias
 
 
 def _update_vision_config(
@@ -846,7 +784,7 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
         model_inputs["input_ids"] = mx.array(input_ids)
         pixel_values = processor.image_processor.preprocess(images=images)
         model_inputs["pixel_values"] = mx.array(np.stack(pixel_values))
-        model_inputs["mask"] = mx.array(
+        model_inputs["attention_mask"] = mx.array(
             [(ids != processor.pad_token_id) for ids in input_ids]
         ).astype(mx.int32)
 
@@ -870,14 +808,13 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
         else:
             pixel_values = mx.array(inputs["pixel_values"])
 
-        model_inputs["input_ids"] = mx.array(inputs["input_ids"])
-        model_inputs["mask"] = (
+        model_inputs["pixel_values"] = pixel_values
+        model_inputs["attention_mask"] = (
             mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
         )
-
         # Convert inputs to model_inputs with mx.array if present
         for key, value in inputs.items():
-            if key not in model_inputs and isinstance(value, mx.array):
+            if key not in model_inputs and not isinstance(value, str):
                 model_inputs[key] = mx.array(value)
 
     return model_inputs
@@ -1154,7 +1091,7 @@ def generate(
         input_ids, pixel_values, mask = (
             inputs["input_ids"],
             inputs["pixel_values"],
-            inputs["mask"],
+            inputs["attention_mask"],
         )
         kwargs = {
             k: v
