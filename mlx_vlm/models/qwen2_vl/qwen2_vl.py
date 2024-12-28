@@ -79,8 +79,15 @@ class Model(nn.Module):
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = input_ids == image_token_index
-        image_indices = np.where(image_positions)[1].tolist()
-        inputs_embeds[:, image_indices, :] = image_features
+        if mx.sum(image_positions) == 0:
+            image_positions = input_ids == video_token_index
+
+        image_features = image_features.astype(mx.float32)
+        pad_size = inputs_embeds.shape[1] - image_features.shape[1]
+        image_features = mx.pad(image_features, ((0, 0), (0, pad_size), (0, 0)))
+        inputs_embeds = mx.where(
+            image_positions[:, :, None], image_features, inputs_embeds
+        )
 
         return inputs_embeds
 
