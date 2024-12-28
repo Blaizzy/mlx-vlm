@@ -5,8 +5,6 @@ import json
 import logging
 import shutil
 import time
-import warnings
-from dataclasses import asdict
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -18,7 +16,7 @@ import numpy as np
 import requests
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_unflatten
-from PIL import Image
+from PIL import Image, ImageOps
 from transformers import (
     AutoConfig,
     AutoProcessor,
@@ -278,31 +276,22 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
         **kwargs: Additional keyword arguments to pass to the config loader
 
     Returns:
-        dict: The model configuration
+        dict: Model configuration
 
     Raises:
         FileNotFoundError: If config.json is not found at the path
     """
-
-    # Convert string path to Path object if needed
     if isinstance(model_path, str):
         model_path = get_model_path(model_path)
 
-    # First try loading directly with AutoConfig
     try:
-        config = AutoConfig.from_pretrained(model_path, **kwargs)
-        return config.to_dict()
-    except Exception:
-        pass
-
-    # Load from local config.json file
-    config_path = model_path / "config.json"
-    try:
-        with open(config_path, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        print(f"Config file not found at {config_path}")
-        raise
+        return AutoConfig.from_pretrained(model_path, **kwargs).to_dict()
+    except ValueError:
+        try:
+            with open(model_path / "config.json", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"Config not found at {model_path}") from exc
 
 
 def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImageProcessor:
@@ -779,7 +768,7 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     if isinstance(image_source, BytesIO) or Path(image_source).is_file():
         # for base64 encoded images
         try:
-            return Image.open(image_source)
+            image = Image.open(image_source)
         except IOError as e:
             raise ValueError(
                 f"Failed to load image from {image_source} with error: {e}"
@@ -788,7 +777,7 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
         try:
             response = requests.get(image_source, stream=True, timeout=timeout)
             response.raise_for_status()
-            return Image.open(response.raw)
+            image = Image.open(response.raw)
         except Exception as e:
             raise ValueError(
                 f"Failed to load image from URL: {image_source} with error {e}"
@@ -797,6 +786,10 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
         raise ValueError(
             f"The image {image_source} must be a valid URL or existing file."
         )
+
+    image = ImageOps.exif_transpose(image)
+    image = image.convert("RGB")
+    return image
 
 
 def resize_image(img, max_size):
