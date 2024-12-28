@@ -772,30 +772,27 @@ def convert(
         upload_to_hub(mlx_path, upload_repo, hf_path)
 
 
-def load_image(image_source: Union[str, Path, BytesIO]):
+def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     """
     Helper function to load an image from either a URL or file.
     """
-    if isinstance(image_source, BytesIO):
+    if isinstance(image_source, BytesIO) or Path(image_source).is_file():
         # for base64 encoded images
         try:
             return Image.open(image_source)
         except IOError as e:
-            raise ValueError(f"Failed to load image from BytesIO with error: {e}")
+            raise ValueError(
+                f"Failed to load image from {image_source} with error: {e}"
+            ) from e
     elif image_source.startswith(("http://", "https://")):
         try:
-            response = requests.get(image_source, stream=True)
+            response = requests.get(image_source, stream=True, timeout=timeout)
             response.raise_for_status()
             return Image.open(response.raw)
         except Exception as e:
             raise ValueError(
                 f"Failed to load image from URL: {image_source} with error {e}"
-            )
-    elif Path(image_source).is_file():
-        try:
-            return Image.open(image_source)
-        except IOError as e:
-            raise ValueError(f"Failed to load image {image_source} with error: {e}")
+            ) from e
     else:
         raise ValueError(
             f"The image {image_source} must be a valid URL or existing file."
