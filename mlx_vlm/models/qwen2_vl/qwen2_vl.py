@@ -57,7 +57,10 @@ class Model(nn.Module):
     ):
 
         if pixel_values is None:
-            return self.language_model(input_ids)
+            return self.language_model.model.embed_tokens(input_ids)
+
+        dtype = self.vision_tower.patch_embed.proj.weight.dtype
+        pixel_values = pixel_values.astype(dtype)
 
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
@@ -97,10 +100,8 @@ class Model(nn.Module):
         **kwargs,
     ):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
-        image_grid_thw = mx.array(image_grid_thw)
-
-        dtype = self.vision_tower.patch_embed.proj.weight.dtype
-        pixel_values = pixel_values.astype(dtype)
+        if image_grid_thw is not None:
+            image_grid_thw = mx.array(image_grid_thw)
 
         input_embddings = self.get_input_embeddings(
             input_ids, pixel_values, image_grid_thw

@@ -131,7 +131,7 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
     ):
         if pixel_values is None:
-            return self.language_model(input_ids)
+            return self.language_model.model.embed_tokens(input_ids)
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 

@@ -8,7 +8,7 @@ import time
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Callable, Dict, Generator, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -963,9 +963,8 @@ def generate_step(
 def stream_generate(
     model: nn.Module,
     processor: PreTrainedTokenizer,
-    image: str,
     prompt: str,
-    image_processor=None,
+    image: Union[str, List[str]] = None,
     max_tokens: int = 100,
     **kwargs,
 ) -> Union[str, Generator[str, None, None]]:
@@ -986,8 +985,10 @@ def stream_generate(
     if hasattr(processor, "image_processor") and isinstance(
         processor.image_processor, BaseImageProcessor
     ):
+        prompt_tokens = mx.array(processor.encode(prompt))
         tokenizer = processor
     else:
+        prompt_tokens = mx.array(processor.tokenizer.encode(prompt))
         tokenizer = processor.tokenizer
 
     resize_shape = kwargs.pop("resize_shape", None)
@@ -997,17 +998,25 @@ def stream_generate(
         image_token_index = None
 
     # Prepare inputs
-    inputs = prepare_inputs(processor, image, prompt, image_token_index, resize_shape)
-    input_ids, pixel_values, mask = (
-        inputs["input_ids"],
-        inputs["pixel_values"],
-        inputs["mask"],
-    )
-    kwargs = {
-        k: v
-        for k, v in inputs.items()
-        if k not in ["input_ids", "pixel_values", "mask"]
-    }
+    if not image:
+        input_ids = prompt_tokens[None, :]
+        pixel_values = None
+        mask = None
+        kwargs = {}
+    else:
+        inputs = prepare_inputs(
+            processor, image, prompt, image_token_index, resize_shape
+        )
+        input_ids, pixel_values, mask = (
+            inputs["input_ids"],
+            inputs["pixel_values"],
+            inputs["attention_mask"],
+        )
+        kwargs = {
+            k: v
+            for k, v in inputs.items()
+            if k not in ["input_ids", "pixel_values", "mask"]
+        }
 
     detokenizer = processor.detokenizer
 
@@ -1030,8 +1039,8 @@ def stream_generate(
 def generate(
     model: nn.Module,
     processor: PreTrainedTokenizer,
-    image: str,
     prompt: str,
+    image: Union[str, List[str]] = None,
     temp: float = 0.0,
     max_tokens: int = 100,
     verbose: bool = False,
@@ -1078,7 +1087,7 @@ def generate(
     else:
         image_token_index = None
 
-    if image == []:
+    if not image:
         input_ids = prompt_tokens[None, :]
         pixel_values = None
         mask = None

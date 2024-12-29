@@ -92,11 +92,11 @@ def main():
     output = generate(
         model,
         processor,
-        args.image,
         prompt,
-        args.temp,
-        args.max_tokens,
-        args.verbose,
+        image=args.image,
+        temp=args.temp,
+        max_tokens=args.max_tokens,
+        verbose=args.verbose,
         **kwargs,
     )
     if not args.verbose:
