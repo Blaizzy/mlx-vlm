@@ -7,7 +7,7 @@ from .utils import generate, get_model_path, load, load_config, load_image_proce
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = []
 DEFAULT_PROMPT = "What are these?"
-DEFAULT_MAX_TOKENS = 100
+DEFAULT_MAX_TOKENS = 256
 DEFAULT_TEMP = 0.5
 DEFAULT_TOP_P = 1.0
 DEFAULT_SEED = 0
