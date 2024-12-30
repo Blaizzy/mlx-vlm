@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import time
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -33,6 +34,18 @@ from .trainer import apply_lora_layers
 MODEL_REMAPPING = {"llava-qwen2": "llava_bunny", "bunny-llama": "llava_bunny"}
 
 MAX_FILE_SIZE_GB = 5
+
+
+@dataclass
+class GenerationResult:
+    text: str
+    token: Optional[int]
+    logprobs: Optional[List[float]]
+    prompt_tokens: int
+    generation_tokens: int
+    prompt_tps: float
+    generation_tps: float
+    peak_memory: float
 
 
 def get_model_and_args(config: dict):
@@ -825,6 +838,7 @@ def generate_step(
     model: nn.Module,
     pixel_values,
     mask,
+    max_tokens: int = 256,
     temp: float = 0.0,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
@@ -951,13 +965,19 @@ def generate_step(
     else:
         kwargs = {}
 
+    n = 0
     while True:
-        next_y, next_logprobs = _step(y, **kwargs)
-        mx.async_eval(next_y)
-        if "decoder_input_ids" in kwargs:
-            kwargs["decoder_input_ids"] = next_y[None]
-        yield y.item(), logprobs
-        y, logprobs = next_y, next_logprobs
+        if n != max_tokens:
+            next_y, next_logprobs = _step(y, **kwargs)
+            mx.async_eval(next_y)
+            if "decoder_input_ids" in kwargs:
+                kwargs["decoder_input_ids"] = next_y[None]
+            yield y.item(), logprobs
+            y, logprobs = next_y, next_logprobs
+        if n == max_tokens:
+            break
+
+        n += 1
 
 
 def stream_generate(
@@ -965,7 +985,6 @@ def stream_generate(
     processor: PreTrainedTokenizer,
     prompt: str,
     image: Union[str, List[str]] = None,
-    max_tokens: int = 100,
     **kwargs,
 ) -> Union[str, Generator[str, None, None]]:
     """
@@ -981,59 +1000,68 @@ def stream_generate(
     Yields:
         Generator[Tuple[mx.array, mx.array]]: A generator producing text.
     """
-
-    if hasattr(processor, "image_processor") and isinstance(
-        processor.image_processor, BaseImageProcessor
-    ):
-        prompt_tokens = mx.array(processor.encode(prompt))
-        tokenizer = processor
-    else:
-        prompt_tokens = mx.array(processor.tokenizer.encode(prompt))
-        tokenizer = processor.tokenizer
+    tokenizer = processor if hasattr(processor, "encode") else processor.tokenizer
+    prompt_tokens = mx.array(tokenizer.encode(prompt))
 
     resize_shape = kwargs.pop("resize_shape", None)
-    if hasattr(model.config, "image_token_index"):
-        image_token_index = model.config.image_token_index
-    else:
-        image_token_index = None
+    image_token_index = getattr(model.config, "image_token_index", None)
 
-    # Prepare inputs
     if not image:
         input_ids = prompt_tokens[None, :]
-        pixel_values = None
-        mask = None
+        pixel_values = mask = None
         kwargs = {}
     else:
         inputs = prepare_inputs(
             processor, image, prompt, image_token_index, resize_shape
         )
-        input_ids, pixel_values, mask = (
-            inputs["input_ids"],
-            inputs["pixel_values"],
-            inputs["attention_mask"],
-        )
+        input_ids = inputs["input_ids"]
+        pixel_values = inputs["pixel_values"]
+        mask = inputs["attention_mask"]
         kwargs = {
             k: v
             for k, v in inputs.items()
-            if k not in ["input_ids", "pixel_values", "mask"]
+            if k not in ["input_ids", "pixel_values", "attention_mask"]
         }
 
     detokenizer = processor.detokenizer
-
     detokenizer.reset()
-    for (token, _), n in zip(
-        generate_step(input_ids, model, pixel_values, mask, **kwargs),
-        range(max_tokens),
+    tic = time.perf_counter()
+    for n, (token, logprobs) in enumerate(
+        generate_step(input_ids, model, pixel_values, mask, **kwargs)
     ):
+        if n == 0:
+            prompt_time = time.perf_counter() - tic
+            prompt_tps = input_ids.size / prompt_time
+            tic = time.perf_counter()
+
         if token == tokenizer.eos_token_id:
             break
+
         detokenizer.add_token(token)
 
         # Yield the last segment if streaming
-        yield detokenizer.last_segment
+        yield GenerationResult(
+            text=detokenizer.last_segment,
+            token=token,
+            logprobs=logprobs,
+            prompt_tokens=input_ids.size,
+            generation_tokens=n + 1,
+            prompt_tps=prompt_tps,
+            generation_tps=(n + 1) / (time.perf_counter() - tic),
+            peak_memory=mx.metal.get_peak_memory() / 1e9,
+        )
 
     detokenizer.finalize()
-    yield detokenizer.last_segment
+    yield GenerationResult(
+        text=detokenizer.last_segment,
+        token=token,
+        logprobs=logprobs,
+        prompt_tokens=input_ids.size,
+        generation_tokens=n + 1,
+        prompt_tps=prompt_tps,
+        generation_tps=(n + 1) / (time.perf_counter() - tic),
+        peak_memory=mx.metal.get_peak_memory() / 1e9,
+    )
 
 
 def generate(
@@ -1041,13 +1069,7 @@ def generate(
     processor: PreTrainedTokenizer,
     prompt: str,
     image: Union[str, List[str]] = None,
-    temp: float = 0.0,
-    max_tokens: int = 100,
     verbose: bool = False,
-    formatter: Optional[Callable] = None,
-    repetition_penalty: Optional[float] = 1.1,
-    repetition_context_size: Optional[int] = 20,
-    top_p: float = 1.0,
     **kwargs,
 ) -> str:
     """
@@ -1072,96 +1094,27 @@ def generate(
         print("Image:", image, "\n")
         print("Prompt:", prompt)
 
-    if hasattr(processor, "image_processor") and isinstance(
-        processor.image_processor, BaseImageProcessor
-    ):
-        prompt_tokens = mx.array(processor.encode(prompt))
-        tokenizer = processor
-    else:
-        prompt_tokens = mx.array(processor.tokenizer.encode(prompt))
-        tokenizer = processor.tokenizer
-
-    resize_shape = kwargs.pop("resize_shape", None)
-    if hasattr(model.config, "image_token_index"):
-        image_token_index = model.config.image_token_index
-    else:
-        image_token_index = None
-
-    if not image:
-        input_ids = prompt_tokens[None, :]
-        pixel_values = None
-        mask = None
-        kwargs = {}
-    else:
-        # Prepare inputs
-        inputs = prepare_inputs(
-            processor, image, prompt, image_token_index, resize_shape
-        )
-        input_ids, pixel_values, mask = (
-            inputs["input_ids"],
-            inputs["pixel_values"],
-            inputs["attention_mask"],
-        )
-        kwargs = {
-            k: v
-            for k, v in inputs.items()
-            if k not in ["input_ids", "pixel_values", "mask"]
-        }
-
-    # Initialize timing and detokenizer
-    tic = time.perf_counter()
-    detokenizer = processor.detokenizer
-    detokenizer.reset()
-
-    # Generate tokens
-    generator = generate_step(
-        input_ids,
-        model,
-        pixel_values,
-        mask,
-        temp,
-        repetition_penalty,
-        repetition_context_size,
-        top_p,
-        **kwargs,
-    )
-
-    for (token, prob), n in zip(generator, range(max_tokens)):
-
-        if n == 0:
-            prompt_time = time.perf_counter() - tic
-            tic = time.perf_counter()
-        # TODO: Fix <eos> as first token
-        # Handle special case for DeepSeek-vl-7b-chat and PaliGemma models
-        # These models may generate EOS token as the first token (n == 0)
-        # For all other cases, break the loop when EOS is encountered after the first token
-        if token == tokenizer.eos_token_id and n > 0:
-            break
-
-        detokenizer.add_token(token)
-
+    text = ""
+    last_response = None
+    for response in stream_generate(model, processor, prompt, image, **kwargs):
         if verbose:
-            if formatter:
-                # We have to finalize so that the prob corresponds to the last segment
-                detokenizer.finalize()
-                formatter(detokenizer.last_segment, prob.item())
-            else:
-                print(detokenizer.last_segment, end="", flush=True)
-
-    token_count = n + 1
-    detokenizer.finalize()
+            print(response.text, end="", flush=True)
+        text += response.text
+        last_response = response
 
     if verbose:
-        print(detokenizer.last_segment, flush=True)
-        gen_time = time.perf_counter() - tic
-        print("=" * 10)
-        if token_count == 0:
-            print("No tokens generated for this prompt")
+        print("\n" + "=" * 10)
+        if len(text) == 0:
+            print("No text generated for this prompt")
             return
-        prompt_tps = prompt_tokens.size / prompt_time
-        gen_tps = (token_count - 1) / gen_time
+        print(
+            f"Prompt: {last_response.prompt_tokens} tokens, "
+            f"{last_response.prompt_tps:.3f} tokens-per-sec"
+        )
+        print(
+            f"Generation: {last_response.generation_tokens} tokens, "
+            f"{last_response.generation_tps:.3f} tokens-per-sec"
+        )
+        print(f"Peak memory: {last_response.peak_memory:.3f} GB")
 
-        print(f"Prompt: {prompt_tps:.3f} tokens-per-sec")
-        print(f"Generation: {gen_tps:.3f} tokens-per-sec")
-
-    return detokenizer.text
+    return text
