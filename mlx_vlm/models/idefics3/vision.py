@@ -187,7 +187,11 @@ class VisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.model_type = config.model_type
-        if self.model_type != "siglip_vision_model" and self.model_type != "idefics3":
+        if self.model_type not in [
+            "siglip_vision_model",
+            "idefics3",
+            "idefics3_vision",
+        ]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
         self.embeddings = VisionEmbeddings(config)
