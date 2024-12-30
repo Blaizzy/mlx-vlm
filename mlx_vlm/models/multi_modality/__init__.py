@@ -1,9 +1,9 @@
 from .multi_modality import (
-    AlignerConfig,
     ImageProcessor,
     LanguageModel,
     Model,
     ModelConfig,
+    ProjectorConfig,
     TextConfig,
     VisionConfig,
     VisionModel,

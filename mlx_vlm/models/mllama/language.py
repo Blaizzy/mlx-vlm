@@ -80,12 +80,12 @@ class MllamaTextCrossAttention(nn.Module):
     ) -> mx.array:
 
         bsz, q_len, _ = hidden_states.shape
-        query_states = (
+        query = (
             self.q_proj(hidden_states)
             .reshape(bsz, q_len, self.num_heads, self.head_dim)
             .transpose(0, 2, 1, 3)
         )
-        query_states = self.q_norm(query_states)
+        query_states = self.q_norm(query)
 
         if cross_attention_states is not None:
             key_states = (
@@ -99,14 +99,11 @@ class MllamaTextCrossAttention(nn.Module):
                 .transpose(0, 2, 1, 3)
             )
             key_states = self.k_norm(key_states)
-            if cache is not None:
-                key_states, value_states = cache.update_and_fetch(
-                    key_states, value_states
-                )
+        elif cache is not None and cache.offset > 0:
+            key_states, value_states = cache.fetch()
         else:
-            raise ValueError(
-                "Cross attention states must be provided for cross attention layer."
-            )
+            key_states, value_states = mx.split(query, 2, axis=1)
+            key_states = self.k_norm(key_states)
 
         attn_output = mx.fast.scaled_dot_product_attention(
             query_states,
@@ -338,10 +335,6 @@ class MllamaTextModel(nn.Module):
 
         for idx, (decoder_layer, c) in enumerate(zip(self.layers, cache)):
             if idx in self.config.cross_attention_layers:
-                if cross_attention_states is None:
-                    raise ValueError(
-                        f"Cross attention states must be provided for layer {idx}"
-                    )
                 layer_outputs = decoder_layer(
                     hidden_states,
                     cross_attention_states=cross_attention_states,
