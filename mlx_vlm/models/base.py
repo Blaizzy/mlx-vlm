@@ -73,6 +73,9 @@ class KVCache:
         self.update(keys, values)
         return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
 
+    def fetch(self):
+        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+
     def update(self, keys, values):
         prev = self.offset
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
@@ -128,6 +131,9 @@ class SimpleKVCache:
         self.cache_length += keys.shape[2]
         return self.keys, self.values
 
+    def fetch(self):
+        return self.keys, self.values
+
     def update(self, keys, values):
         """Update cache with new key/value tensors without returning.
 
@@ -167,6 +173,9 @@ class RotatingKVCache:
         if append is not None:
             to_cat.append(append)
         return mx.concatenate(to_cat, axis=2)
+
+    def fetch(self):
+        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
 
     def update_and_fetch(self, keys, values):
         prev = self.offset
