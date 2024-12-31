@@ -1000,7 +1000,7 @@ def stream_generate(
     Yields:
         Generator[Tuple[mx.array, mx.array]]: A generator producing text.
     """
-    tokenizer = processor if hasattr(processor, "encode") else processor.tokenizer
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     prompt_tokens = mx.array(tokenizer.encode(prompt))
 
     resize_shape = kwargs.pop("resize_shape", None)
