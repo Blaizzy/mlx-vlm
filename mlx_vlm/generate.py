@@ -2,7 +2,7 @@ import argparse
 import codecs
 
 from .prompt_utils import apply_chat_template
-from .utils import generate, get_model_path, load, load_config, load_image_processor
+from .utils import generate, stream_generate, get_model_path, load, load_config, load_image_processor
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = []
@@ -50,6 +50,12 @@ def parse_arguments():
         help="Message to be processed by the model.",
     )
     parser.add_argument(
+        "--system",
+        type=str,
+        default=None,
+        help="System message for the model.",
+    )
+    parser.add_argument(
         "--max-tokens",
         type=int,
         default=DEFAULT_MAX_TOKENS,
@@ -58,6 +64,7 @@ def parse_arguments():
     parser.add_argument(
         "--temp", type=float, default=DEFAULT_TEMP, help="Temperature for sampling."
     )
+    parser.add_argument("--chat", action="store_true", help="Chat in multi-turn style.")
     parser.add_argument("--verbose", action="store_false", help="Detailed output.")
     return parser.parse_args()
 
@@ -89,18 +96,40 @@ def main():
         ), "Resize shape must be a tuple of two integers"
         kwargs["resize_shape"] = args.resize_shape
 
-    output = generate(
-        model,
-        processor,
-        prompt,
-        image=args.image,
-        temp=args.temp,
-        max_tokens=args.max_tokens,
-        verbose=args.verbose,
-        **kwargs,
-    )
-    if not args.verbose:
-        print(output)
+    if args.chat:
+        chat = []
+        if args.system:
+            chat.append({"role": "system", "content": args.system})
+        while     user := input("User:"):
+            chat.append({"role": "user", "content": user})
+            prompt = apply_chat_template(processor, config, chat, num_images=len(args.image))
+            response = ""
+            print("Assistant:", end="")
+            for chunk in stream_generate(
+                model, processor, prompt, args.image,
+                max_tokens=args.max_tokens,
+                temp=args.temp,
+                **kwargs,
+            ):
+                response += chunk.text
+                print(chunk.text, end="")
+
+            chat.append({"role": "assistant", "content": response})
+            print()
+
+    else:
+        output = generate(
+            model,
+            processor,
+            prompt,
+            image=args.image,
+            temp=args.temp,
+            max_tokens=args.max_tokens,
+            verbose=args.verbose,
+            **kwargs,
+        )
+        if not args.verbose:
+            print(output)
 
 
 if __name__ == "__main__":
