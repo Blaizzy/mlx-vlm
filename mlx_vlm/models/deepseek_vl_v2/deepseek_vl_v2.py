@@ -401,7 +401,7 @@ class Model(nn.Module):
             total_tiles.append(pixel_values[idx, : batch_num_tiles[idx]])
 
         total_tiles = mx.concatenate(total_tiles, axis=0)
-        assert total_tiles.shape[0] == sum(batch_num_tiles)
+
         if total_tiles.shape[0] == 0:
             return self.language_model.model.embed_tokens(input_ids)
 
