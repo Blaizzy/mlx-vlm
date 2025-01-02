@@ -64,7 +64,7 @@ formatted_prompt = apply_chat_template(
 )
 
 # Generate output
-output = generate(model, processor, image, formatted_prompt, verbose=False)
+output = generate(model, processor, formatted_prompt, image, verbose=False)
 print(output)
 ```
 
