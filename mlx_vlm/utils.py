@@ -666,7 +666,6 @@ def convert(
     revision: Optional[str] = None,
     dequantize: bool = False,
     skip_vision: bool = False,
-    skip_vision_non_divisible: bool = False,
     trust_remote_code: bool = True,
 ):
     print("[INFO] Loading")
@@ -686,7 +685,7 @@ def convert(
         print("[INFO] Quantizing")
         model.load_weights(list(weights.items()))
         weights, config = quantize_model(
-            model, config, q_group_size, q_bits, skip_vision, skip_vision_non_divisible
+            model, config, q_group_size, q_bits, skip_vision
         )
 
     if dequantize:
