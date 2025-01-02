@@ -102,7 +102,7 @@ formatted_prompt = apply_chat_template(
     processor, config, prompt, num_images=len(images)
 )
 
-output = generate(model, processor, images, formatted_prompt, verbose=False)
+output = generate(model, processor, formatted_prompt, images, verbose=False)
 print(output)
 ```
 
