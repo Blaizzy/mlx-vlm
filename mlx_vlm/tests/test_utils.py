@@ -3,6 +3,7 @@ import mlx.nn as nn
 
 from mlx_vlm.utils import (
     get_class_predicate,
+    prepare_inputs,
     quantize_model,
     sanitize_weights,
     update_module_configs,
@@ -145,3 +146,46 @@ def test_quantize_module():
 
     # Check config is updated correctly
     assert updated_config["vision_config"]["skip_vision"] is True
+
+
+def test_prepare_inputs():
+    """Test prepare_inputs function."""
+
+    # Mock processor
+    class MockProcessor:
+        def __init__(self):
+            self.tokenizer = type(
+                "DummyTokenizer", (), {"pad_token": None, "eos_token": "[EOS]"}
+            )()
+
+        def __call__(self, text=None, images=None, padding=None, return_tensors=None):
+            return {
+                "input_ids": mx.array([1, 2, 3]),
+                "pixel_values": mx.array([4, 5, 6]),
+                "attention_mask": mx.array([7, 8, 9]),
+            }
+
+    processor = MockProcessor()
+
+    # Test text-only input
+    inputs = prepare_inputs(
+        processor, prompts="test", images=None, image_token_index=None
+    )
+    assert "input_ids" in inputs
+    assert mx.array_equal(inputs["input_ids"], mx.array([1, 2, 3]))
+
+    # Test image-only input
+    image = mx.zeros((3, 224, 224))
+    inputs = prepare_inputs(
+        processor, prompts=None, images=image, image_token_index=None
+    )
+    assert "input_ids" in inputs
+    assert mx.array_equal(inputs["input_ids"], mx.array([1, 2, 3]))
+
+    # Test both text and image
+    image = mx.zeros((3, 224, 224))
+    inputs = prepare_inputs(
+        processor, prompts="test", images=image, image_token_index=None
+    )
+    assert "input_ids" in inputs
+    assert mx.array_equal(inputs["input_ids"], mx.array([1, 2, 3]))
