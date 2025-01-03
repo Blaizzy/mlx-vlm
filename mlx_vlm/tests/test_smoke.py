@@ -4,6 +4,7 @@ import platform
 import subprocess
 import sys
 import textwrap
+import time
 
 import mlx.core as mx
 import psutil
@@ -50,6 +51,7 @@ def parse_args():
     parser.add_argument(
         "--max-tokens", type=int, default=100, help="Maximum tokens to generate"
     )
+    parser.add_argument("--resize-shape", type=int, default=None, help="Resize shape")
     return parser.parse_args()
 
 
@@ -73,9 +75,13 @@ def get_device_info():
 def test_model_loading(model_path):
     try:
         console.print("[bold green]Loading model...")
+        start_time = time.time()
         model, processor = load(model_path, trust_remote_code=True)
         config = load_config(model_path, trust_remote_code=True)
-        console.print("[bold green]✓[/] Model loaded successfully")
+        end_time = time.time()
+        console.print(
+            f"[bold green]✓[/] Model loaded successfully in {end_time - start_time:.2f} seconds"
+        )
         return model, processor, config, False
     except Exception as e:
         console.print(f"[bold red]✗[/] Failed to load model: {str(e)}")
@@ -142,6 +148,9 @@ def main():
         "kwargs": {
             "temp": args.temperature,
             "max_tokens": args.max_tokens,
+            "resize_shape": (
+                (args.resize_shape, args.resize_shape) if args.resize_shape else None
+            ),
         },
     }
 
