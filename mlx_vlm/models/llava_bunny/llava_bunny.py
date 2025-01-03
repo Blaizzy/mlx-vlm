@@ -42,6 +42,16 @@ class ModelConfig:
 
     @classmethod
     def from_dict(cls, params):
+        if not params.get("text_config", {}):
+            # Copy text config parameters from root level
+            excluded_keys = {"vision_config"}
+            params["text_config"] = dict(
+                filter(lambda x: x[0] not in excluded_keys, params.items())
+            )
+        if not params.get("vision_config", {}).get("model_type", {}):
+            # Set default model type
+            params["vision_config"]["model_type"] = "siglip_vision_model"
+
         return cls(
             **{
                 k: v
