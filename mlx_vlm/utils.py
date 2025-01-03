@@ -409,7 +409,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         ```
 
         ```bash
-        python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temp 0.0
+        python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temp 0.0 --prompt "Describe this image." --image <path_to_image>
         ```
         """
     )
