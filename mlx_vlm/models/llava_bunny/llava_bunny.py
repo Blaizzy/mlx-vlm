@@ -35,7 +35,6 @@ class ModelConfig:
     auto_map: dict
     hidden_size: int
     mm_hidden_size: int
-    mm_vision_tower: str
     mm_projector_type: str = "mlp2x_gelu"
     ignore_index: int = -100
     image_token_index: int = -200
@@ -132,7 +131,7 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
     ):
         if pixel_values is None:
-            return self.language_model(input_ids)
+            return self.language_model.model.embed_tokens(input_ids)
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 

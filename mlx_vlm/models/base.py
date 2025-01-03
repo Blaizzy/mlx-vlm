@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 from PIL import Image
+from transformers.image_processing_utils import BaseImageProcessor as ImageProcessor
 from transformers.image_processing_utils import get_size_dict
 from transformers.image_utils import ChannelDimension, PILImageResampling
 
@@ -22,7 +23,7 @@ def expand2square(pil_img, background_color):
         return result
 
 
-class BaseImageProcessor(ABC):
+class BaseImageProcessor(ImageProcessor):
     def __init__(
         self,
         image_mean=(0.5, 0.5, 0.5),
@@ -70,6 +71,9 @@ class KVCache:
 
     def update_and_fetch(self, keys, values):
         self.update(keys, values)
+        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+
+    def fetch(self):
         return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
 
     def update(self, keys, values):
@@ -127,6 +131,9 @@ class SimpleKVCache:
         self.cache_length += keys.shape[2]
         return self.keys, self.values
 
+    def fetch(self):
+        return self.keys, self.values
+
     def update(self, keys, values):
         """Update cache with new key/value tensors without returning.
 
@@ -166,6 +173,9 @@ class RotatingKVCache:
         if append is not None:
             to_cat.append(append)
         return mx.concatenate(to_cat, axis=2)
+
+    def fetch(self):
+        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
 
     def update_and_fetch(self, keys, values):
         prev = self.offset

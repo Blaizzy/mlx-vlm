@@ -62,6 +62,10 @@ class ModelConfig:
 
     @classmethod
     def from_dict(cls, params):
+        if "language_config" in params:
+            params["text_config"] = params["language_config"]
+            del params["language_config"]
+
         return cls(
             **{
                 k: v
@@ -224,7 +228,12 @@ class Model(nn.Module):
                     f"len(candidate_resolutions) should be larger than 0, but got {len(candidate_resolutions)}"
                 )
             tile_variants_num = len(candidate_resolutions)
-            # self.tile_indicators = mx.array(mx.random(size=(tile_variants_num + 1, config.aligner.params.n_embed)) * embed_std)
+            self.tile_indicators = mx.array(
+                mx.random.normal(
+                    (tile_variants_num + 1, config.projector_config.n_embed)
+                )
+                * embed_std
+            )
         else:
             raise ValueError(
                 f"tile tag should be either 1D or 2D, but got {self.tile_tag}"
