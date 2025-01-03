@@ -46,7 +46,7 @@ def parse_arguments():
     parser.add_argument(
         "--resize-shape",
         type=int,
-        nargs=2,
+        nargs="+",
         default=None,
         help="Resize shape for the image.",
     )
@@ -98,10 +98,14 @@ def main():
 
     kwargs = {}
     if args.resize_shape is not None:
-        assert (
-            len(args.resize_shape) == 2
-        ), "Resize shape must be a tuple of two integers"
-        kwargs["resize_shape"] = args.resize_shape
+        resize_shape = args.resize_shape
+        if len(resize_shape) not in [1, 2]:
+            raise ValueError("Resize shape must be 1 or 2 integers")
+        kwargs["resize_shape"] = (
+            (resize_shape[0], resize_shape[0])
+            if len(resize_shape) == 1
+            else resize_shape
+        )
 
     if args.chat:
         chat = []

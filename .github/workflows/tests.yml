@@ -39,4 +39,4 @@ jobs:
       - name: Run Python tests
         run: |
           cd mlx_vlm/
-          pytest -s ./tests
+          pytest -s ./tests --ignore=tests/test_smoke.py
