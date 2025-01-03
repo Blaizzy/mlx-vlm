@@ -1,6 +1,12 @@
 import argparse
+import json
+import platform
+import subprocess
+import sys
+import textwrap
 
 import mlx.core as mx
+import psutil
 from rich.console import Console
 from rich.panel import Panel
 from tqdm import tqdm
@@ -8,6 +14,7 @@ from tqdm import tqdm
 from mlx_vlm import generate, load
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_config
+from mlx_vlm.version import __version__
 
 # Initialize console
 console = Console()
@@ -43,6 +50,23 @@ def parse_args():
         "--max-tokens", type=int, default=100, help="Maximum tokens to generate"
     )
     return parser.parse_args()
+
+
+def get_device_info():
+    # Disable tokenizers parallelism to avoid deadlocks after forking
+    import os
+
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    try:
+        data = subprocess.check_output(
+            ["system_profiler", "SPDisplaysDataType", "-json"], text=True
+        )
+        device_info = json.loads(data)
+        return device_info
+    except Exception as e:
+        print(f"Could not retrieve GPU information: {e}")
+        return None
 
 
 def test_model_loading(model_path):
@@ -162,6 +186,29 @@ def main():
     console.print(Panel("\n".join(results), title="Results", style=panel_style))
     console.print(
         f"[bold {'green' if success else 'red'}]{'All' if success else 'Some'} models tested {'successfully' if success else 'failed to test'}"
+    )
+
+    print("\n")
+    console.print(
+        Panel(
+            title="System Information",
+            renderable=textwrap.dedent(
+                f"""{platform.machine() == 'arm64' and f'''
+            OS:          {platform.system()}
+            MAC OS:      v{platform.mac_ver()[0]}
+            Python:      v{sys.version.split()[0]}
+            MLX:         v{mx.__version__}
+            MLX-VLM:     v{__version__}
+
+            Hardware:
+            • Chip:      {get_device_info()['SPDisplaysDataType'][0]['_name']}
+            • RAM:       {psutil.virtual_memory().total / (1024 ** 3):.1f} GB
+            • CPU Cores: {psutil.cpu_count(logical=False)}
+            • GPU Cores: {get_device_info()['SPDisplaysDataType'][0]['sppci_cores']}
+            ''' or 'Not running on Apple Silicon'}"""
+            ),
+            style="bold blue",
+        )
     )
 
 
