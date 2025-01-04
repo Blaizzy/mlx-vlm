@@ -25,6 +25,8 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
+from mlx_vlm.models.cache import VLMFeatureCache
+
 from .models.base import BaseImageProcessor, KVCache, SimpleKVCache
 from .sample_utils import top_p_sampling
 from .tokenizer_utils import load_tokenizer
@@ -1007,6 +1009,11 @@ def stream_generate(
 
     resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)
+
+    features_cache = VLMFeatureCache("./cache")
+    image_features = features_cache.load_features(str(image[0]))
+    if hasattr(model, "image_features"):
+        kwargs["merged_features"] = image_features["image_features"]
 
     if not image:
         input_ids = prompt_tokens[None, :]
