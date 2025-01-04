@@ -118,11 +118,13 @@ def test_generation(
 
         output = generate(**generate_args)
 
-        # Deepseek-vl2-tiny outputs are empty on VLM generation
+        # Deepseek-vl2-tiny and ShowUI outputs are empty on VLM generation
         # Paligemma outputs are empty on language-only generation
         # So we skip the assertion for these models
-        if ("deepseek-vl2-tiny" not in model_path and vision_language) or (
-            "paligemma" not in model_path and not vision_language
+        if (
+            not any(x in model_path for x in ["deepseek-vl2-tiny", "ShowUI"])
+            and vision_language
+            or ("paligemma" not in model_path and not vision_language)
         ):
             assert isinstance(output, str) and len(output) > 0
 
