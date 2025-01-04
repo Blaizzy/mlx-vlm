@@ -4,6 +4,7 @@ import platform
 import subprocess
 import sys
 import textwrap
+import time
 
 import mlx.core as mx
 import psutil
@@ -50,6 +51,7 @@ def parse_args():
     parser.add_argument(
         "--max-tokens", type=int, default=100, help="Maximum tokens to generate"
     )
+    parser.add_argument("--resize-shape", type=int, default=None, help="Resize shape")
     return parser.parse_args()
 
 
@@ -73,9 +75,13 @@ def get_device_info():
 def test_model_loading(model_path):
     try:
         console.print("[bold green]Loading model...")
+        start_time = time.time()
         model, processor = load(model_path, trust_remote_code=True)
         config = load_config(model_path, trust_remote_code=True)
-        console.print("[bold green]✓[/] Model loaded successfully")
+        end_time = time.time()
+        console.print(
+            f"[bold green]✓[/] Model loaded successfully in {end_time - start_time:.2f} seconds"
+        )
         return model, processor, config, False
     except Exception as e:
         console.print(f"[bold red]✗[/] Failed to load model: {str(e)}")
@@ -112,11 +118,13 @@ def test_generation(
 
         output = generate(**generate_args)
 
-        # Deepseek-vl2-tiny outputs are empty on VLM generation
+        # Deepseek-vl2-tiny and ShowUI outputs are empty on VLM generation
         # Paligemma outputs are empty on language-only generation
         # So we skip the assertion for these models
-        if ("deepseek-vl2-tiny" not in model_path and vision_language) or (
-            "paligemma" not in model_path and not vision_language
+        if (
+            not any(x in model_path for x in ["deepseek-vl2-tiny", "ShowUI"])
+            and vision_language
+            or ("paligemma" not in model_path and not vision_language)
         ):
             assert isinstance(output, str) and len(output) > 0
 
@@ -142,6 +150,9 @@ def main():
         "kwargs": {
             "temp": args.temperature,
             "max_tokens": args.max_tokens,
+            "resize_shape": (
+                (args.resize_shape, args.resize_shape) if args.resize_shape else None
+            ),
         },
     }
 

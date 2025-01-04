@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -226,7 +226,9 @@ def update_module_configs(model_config, model_class, config, modules):
 
 def get_class_predicate(skip_vision, weights=None):
     if skip_vision:
-        return lambda _, m: not ("vision_model" in m.name or "vision_tower" in m.name)
+        return lambda p, m: hasattr(m, "to_quantized") and not (
+            "vision_model" in p or "vision_tower" in p
+        )
     else:
         if weights:
             return lambda p, m: (
