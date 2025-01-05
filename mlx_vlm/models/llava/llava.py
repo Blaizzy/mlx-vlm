@@ -76,12 +76,34 @@ class Model(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
-        *_, hidden_states = self.vision_tower(
-            pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
+        *_, hidden_states, all_attn = self.vision_tower(
+            pixel_values.transpose(0, 2, 3, 1),
+            output_hidden_states=True,
+            output_attn=True,
         )
+        # Get the attention from the desired layer
+        all_attn = all_attn[self.vision_feature_layer]
 
         # Select the hidden states from the desired layer
         selected_image_feature = hidden_states[self.vision_feature_layer]
+
+        k_tokens = selected_image_feature.shape[1] // 2
+        cls_idx = 0  # self.config.image_token_index
+        # print(all_attn.shape)
+        # print(all_attn[:, :, cls_idx+1:, cls_idx].shape)
+        attn_rec = mx.sum(all_attn[:, :, cls_idx + 1 :, cls_idx], axis=1)
+        # print(attn_rec.shape)
+        topk_idx = mx.argsort(attn_rec, axis=1)[:, -k_tokens:]
+        # Create CLS token indices array
+        # Shape: (B, 1)
+        batch_size = pixel_values.shape[0]
+        cls_indices = mx.full((batch_size, 1), cls_idx, dtype=mx.int32)
+
+        # Concat with CLS token index
+        # Add 1 to account for the offset after CLS token
+        dominant_idx = mx.concatenate([cls_indices, topk_idx + cls_idx + 1], axis=1)
+
+        # print(dominant_idx, dominant_idx.shape)
 
         if self.vision_feature_select_strategy == "default":
             selected_image_feature = selected_image_feature[:, 1:]
@@ -92,6 +114,11 @@ class Model(nn.Module):
                 "Unexpected feature selection strategy: "
                 f"{self.vision_feature_select_strategy}"
             )
+        # print("Before take", selected_image_feature.shape)
+        selected_image_feature = mx.take(selected_image_feature, dominant_idx, axis=1)[
+            0
+        ]
+        # print("After take", selected_image_feature.shape)
 
         # Pass image features through the multi-modal projector
         image_features = self.multi_modal_projector(selected_image_feature)
@@ -140,6 +167,7 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
+
         input_embddings = self.get_input_embeddings(input_ids, pixel_values)
         logits = self.language_model(
             input_ids, cache=cache, inputs_embeds=input_embddings
