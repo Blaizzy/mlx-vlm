@@ -86,6 +86,7 @@ class Model(nn.Module):
 
         # Select the hidden states from the desired layer
         selected_image_feature = hidden_states[self.vision_feature_layer]
+        batch_size, seq_len = selected_image_feature.shape[:2]
 
         k_tokens = selected_image_feature.shape[1] // 2
         cls_idx = 0  # self.config.image_token_index
@@ -96,7 +97,6 @@ class Model(nn.Module):
         topk_idx = mx.argsort(attn_rec, axis=1)[:, -k_tokens:]
         # Create CLS token indices array
         # Shape: (B, 1)
-        batch_size = pixel_values.shape[0]
         cls_indices = mx.full((batch_size, 1), cls_idx, dtype=mx.int32)
 
         # Concat with CLS token index
