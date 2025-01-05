@@ -95,6 +95,10 @@ class Model(nn.Module):
         attn_rec = mx.sum(all_attn[:, :, cls_idx + 1 :, cls_idx], axis=1)
         # print(attn_rec.shape)
         topk_idx = mx.argsort(attn_rec, axis=1)[:, -k_tokens:]
+        # use this to plot the dominant attention map
+        # https://github.com/dvlab-research/VisionZip/blob/demo-chat/llava/model/multimodal_encoder/clip_encoder.py#L62
+        # https://github.com/dvlab-research/VisionZip/blob/demo-chat/llava/serve/gradio_web_server.py#L424
+
         # Create CLS token indices array
         # Shape: (B, 1)
         cls_indices = mx.full((batch_size, 1), cls_idx, dtype=mx.int32)
