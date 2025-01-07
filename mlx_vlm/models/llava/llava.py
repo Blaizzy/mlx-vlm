@@ -64,10 +64,93 @@ class Model(nn.Module):
         self.vision_feature_layer = config.vision_feature_layer
         self.vision_feature_select_strategy = config.vision_feature_select_strategy
 
+    def get_topk_tokens(self, image_feature, attn, dominant_tokens_ratio=None):
+        batch_size, seq_len = image_feature.shape[:2]
+
+        k_tokens = (
+            int(image_feature.shape[1] * dominant_tokens_ratio)
+            if dominant_tokens_ratio is not None
+            else None
+        )  # keep 25% of the visual tokens
+        if k_tokens is None:
+            return image_feature
+        cls_idx = 0  # self.config.image_token_index
+
+        attn_rec = mx.sum(attn[:, :, cls_idx + 1 :, cls_idx], axis=1)
+
+        topk_idx = mx.argsort(attn_rec, axis=1)[:, -k_tokens:]
+        # use this to plot the dominant attention map
+        # https://github.com/dvlab-research/VisionZip/blob/demo-chat/llava/model/multimodal_encoder/clip_encoder.py#L62
+        # https://github.com/dvlab-research/VisionZip/blob/demo-chat/llava/serve/gradio_web_server.py#L424
+
+        # Create CLS token indices array
+        # Shape: (B, 1)
+        cls_indices = mx.full((batch_size, 1), cls_idx, dtype=mx.int32)
+
+        # Concat with CLS token index
+        # Add 1 to account for the offset after CLS token
+        dominant_idx = mx.concatenate([cls_indices, topk_idx + cls_idx + 1], axis=1)
+
+        image_feature = mx.take(image_feature, dominant_idx, axis=1)[0]
+        return image_feature
+
+    def merge_similar_visual_tokens(self, image_feature, visual_token_ratio):
+        # Skip CLS token (first token)
+        tokens = image_feature[:, 1:]
+        batch_size, num_tokens, hidden_dim = tokens.shape
+
+        # Calculate target number of tokens
+        target_tokens = max(1, int(num_tokens * visual_token_ratio))
+
+        while num_tokens > target_tokens:
+            # Calculate similarities between adjacent tokens
+            tokens_a = tokens[:, :-1]  # all except last
+            tokens_b = tokens[:, 1:]  # all except first
+
+            # Calculate cosine similarity
+            a_norm = mx.sqrt(mx.sum(tokens_a * tokens_a, axis=-1, keepdims=True))
+            b_norm = mx.sqrt(mx.sum(tokens_b * tokens_b, axis=-1, keepdims=True))
+            similarities = mx.sum(tokens_a * tokens_b, axis=-1)
+            similarities = similarities / (a_norm.squeeze(-1) * b_norm.squeeze(-1))
+
+            # Sort similarities and get indices of pairs to merge
+            # We'll merge about 20% of remaining excess tokens in each iteration
+            num_to_merge = max(1, int((num_tokens - target_tokens) * 0.2))
+            merge_indices = mx.argsort(similarities, axis=-1)[:, -num_to_merge:]
+
+            # Create a list to track which indices to merge
+            to_merge = set(merge_indices[0].tolist())
+
+            # Merge selected pairs
+            new_tokens = []
+            i = 0
+            while i < num_tokens:
+                if i < num_tokens - 1 and i in to_merge:
+                    # Merge this token with the next one
+                    merged = (tokens[:, i : i + 1] + tokens[:, i + 1 : i + 2]) / 2
+                    new_tokens.append(merged)
+                    i += 2
+                elif i > 0 and (i - 1) in to_merge:
+                    # Skip this token as it was merged in the previous step
+                    i += 1
+                else:
+                    # Keep this token as is
+                    new_tokens.append(tokens[:, i : i + 1])
+                    i += 1
+
+            # Update tokens
+            tokens = mx.concatenate(new_tokens, axis=1)
+            num_tokens = tokens.shape[1]
+
+        # Reattach CLS token
+        return mx.concatenate([image_feature[:, :1], tokens], axis=1)
+
     def get_input_embeddings(
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        merge_similar_tokens_ratio: Optional[float] = 1,
+        filter_topk_tokens_ratio: Optional[float] = 1,
     ):
         if pixel_values is None:
             return self.language_model.model.embed_tokens(input_ids)
@@ -86,28 +169,16 @@ class Model(nn.Module):
 
         # Select the hidden states from the desired layer
         selected_image_feature = hidden_states[self.vision_feature_layer]
-        batch_size, seq_len = selected_image_feature.shape[:2]
 
-        k_tokens = selected_image_feature.shape[1] // 2
-        cls_idx = 0  # self.config.image_token_index
-        # print(all_attn.shape)
-        # print(all_attn[:, :, cls_idx+1:, cls_idx].shape)
-        attn_rec = mx.sum(all_attn[:, :, cls_idx + 1 :, cls_idx], axis=1)
-        # print(attn_rec.shape)
-        topk_idx = mx.argsort(attn_rec, axis=1)[:, -k_tokens:]
-        # use this to plot the dominant attention map
-        # https://github.com/dvlab-research/VisionZip/blob/demo-chat/llava/model/multimodal_encoder/clip_encoder.py#L62
-        # https://github.com/dvlab-research/VisionZip/blob/demo-chat/llava/serve/gradio_web_server.py#L424
+        #  Select dominant tokens
+        selected_image_feature = self.get_topk_tokens(
+            selected_image_feature, all_attn, filter_topk_tokens_ratio
+        )
 
-        # Create CLS token indices array
-        # Shape: (B, 1)
-        cls_indices = mx.full((batch_size, 1), cls_idx, dtype=mx.int32)
-
-        # Concat with CLS token index
-        # Add 1 to account for the offset after CLS token
-        dominant_idx = mx.concatenate([cls_indices, topk_idx + cls_idx + 1], axis=1)
-
-        # print(dominant_idx, dominant_idx.shape)
+        #  Merge similar tokens
+        selected_image_feature = self.merge_similar_visual_tokens(
+            selected_image_feature, merge_similar_tokens_ratio
+        )
 
         if self.vision_feature_select_strategy == "default":
             selected_image_feature = selected_image_feature[:, 1:]
@@ -118,11 +189,6 @@ class Model(nn.Module):
                 "Unexpected feature selection strategy: "
                 f"{self.vision_feature_select_strategy}"
             )
-        # print("Before take", selected_image_feature.shape)
-        selected_image_feature = mx.take(selected_image_feature, dominant_idx, axis=1)[
-            0
-        ]
-        # print("After take", selected_image_feature.shape)
 
         # Pass image features through the multi-modal projector
         image_features = self.multi_modal_projector(selected_image_feature)
@@ -141,12 +207,6 @@ class Model(nn.Module):
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
-
-        if len(image_positions) != num_images:
-            raise ValueError(
-                f"The number of image tokens ({len(image_positions)}) does not "
-                f" match the number of image inputs ({num_images})."
-            )
 
         text_segments = []
         start_idx = 0
@@ -171,8 +231,14 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-
-        input_embddings = self.get_input_embeddings(input_ids, pixel_values)
+        merge_similar_tokens_ratio = kwargs.get("merge_similar_tokens_ratio", 1)
+        filter_topk_tokens_ratio = kwargs.get("filter_topk_tokens_ratio", 1)
+        input_embddings = self.get_input_embeddings(
+            input_ids,
+            pixel_values,
+            merge_similar_tokens_ratio,
+            filter_topk_tokens_ratio,
+        )
         logits = self.language_model(
             input_ids, cache=cache, inputs_embeds=input_embddings
         )
