@@ -1010,10 +1010,10 @@ def stream_generate(
     resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)
 
-    features_cache = VLMFeatureCache("./cache")
-    image_features = features_cache.load_features(str(image[0]))
-    if hasattr(model, "image_features"):
-        kwargs["merged_features"] = image_features["image_features"]
+    # features_cache = VLMFeatureCache("./cache")
+    # image_features = features_cache.load_features(str(image[0]))
+    # if hasattr(model, "image_features"):
+    #     kwargs["merged_features"] = image_features["image_features"]
 
     if not image:
         input_ids = prompt_tokens[None, :]
@@ -1105,6 +1105,9 @@ def generate(
 
     text = ""
     last_response = None
+    merge_similar_tokens_ratio = kwargs.get("merge_similar_tokens_ratio", 1)
+    filter_topk_tokens_ratio = kwargs.get("filter_topk_tokens_ratio", 1)
+
     for response in stream_generate(model, processor, prompt, image, **kwargs):
         if verbose:
             print(response.text, end="", flush=True)
@@ -1116,8 +1119,12 @@ def generate(
         if len(text) == 0:
             print("No text generated for this prompt")
             return
+
+        total_tokens = (
+            last_response.prompt_tokens * merge_similar_tokens_ratio
+        ) * filter_topk_tokens_ratio
         print(
-            f"Prompt: {last_response.prompt_tokens} tokens, "
+            f"Prompt: {int(total_tokens)} tokens, "
             f"{last_response.prompt_tps:.3f} tokens-per-sec"
         )
         print(
