@@ -94,7 +94,9 @@ class Model(nn.Module):
         image_feature = mx.take(image_feature, dominant_idx, axis=1)[0]
         return image_feature
 
-    def merge_similar_visual_tokens(self, image_feature, visual_token_ratio):
+    def merge_similar_visual_tokens(
+        self, image_feature, visual_token_ratio, merge_ratio=0.4
+    ):
         # Skip CLS token (first token)
         tokens = image_feature[:, 1:]
         batch_size, num_tokens, hidden_dim = tokens.shape
@@ -114,8 +116,8 @@ class Model(nn.Module):
             similarities = similarities / (a_norm.squeeze(-1) * b_norm.squeeze(-1))
 
             # Sort similarities and get indices of pairs to merge
-            # We'll merge about 20% of remaining excess tokens in each iteration
-            num_to_merge = max(1, int((num_tokens - target_tokens) * 0.2))
+            # We'll merge about 50% of remaining excess tokens in each iteration
+            num_to_merge = max(1, int((num_tokens - target_tokens) * merge_ratio))
             merge_indices = mx.argsort(similarities, axis=-1)[:, -num_to_merge:]
 
             # Create a list to track which indices to merge
@@ -183,7 +185,7 @@ class Model(nn.Module):
         if self.vision_feature_select_strategy == "default":
             selected_image_feature = selected_image_feature[:, 1:]
         elif self.vision_feature_select_strategy == "full":
-            selected_image_feature = selected_image_feature
+            pass  # Keep full image features without modification
         else:
             raise ValueError(
                 "Unexpected feature selection strategy: "
