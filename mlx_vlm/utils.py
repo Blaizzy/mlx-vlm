@@ -423,7 +423,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
 
     api = HfApi()
     api.create_repo(repo_id=upload_repo, exist_ok=True)
-    api.upload_folder(
+    api.upload_large_folder(
         folder_path=path,
         repo_id=upload_repo,
         repo_type="model",
