@@ -89,27 +89,21 @@ class Dataset:
         image_token_index = self.config["image_token_index"]
 
         inputs = prepare_inputs(
-            self.image_processor,
             self.processor,
             images,
             prompts,
             image_token_index,
             self.image_resize_shape,
         )
-        input_ids, pixel_values, mask = inputs[:3]
+        input_ids = inputs["input_ids"]
+        pixel_values = inputs["pixel_values"]
+        mask = inputs["attention_mask"]
         kwargs = {
             k: v
-            for k, v in zip(
-                [
-                    "image_grid_thw",
-                    "image_sizes",
-                    "aspect_ratio_ids",
-                    "aspect_ratio_mask",
-                    "cross_attention_mask",
-                ],
-                inputs[3:],
-            )
+            for k, v in inputs.items()
+            if k not in ["input_ids", "pixel_values", "attention_mask"]
         }
+
         if mask is None:
             mask = mx.ones_like(input_ids)
 
@@ -226,16 +220,11 @@ class Trainer:
 
         input_ids = input_ids[:, :-1]
 
-        kwargs = {}
-        image_keys = [
-            "image_grid_thw",
-            "image_sizes",
-            "aspect_ratio_ids",
-            "aspect_ratio_mask",
-            "cross_attention_mask",
-        ]
-        if any(key in batch for key in image_keys):
-            kwargs = {key: batch[key] for key in image_keys if key in batch}
+        kwargs = {
+            k: v
+            for k, v in batch.items()
+            if k not in ["input_ids", "pixel_values", "attention_mask"]
+        }
 
         # Forward pass
         outputs = model(input_ids, pixel_values, attention_mask, **kwargs)
