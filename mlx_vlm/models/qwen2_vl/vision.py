@@ -88,7 +88,7 @@ class VisionRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (
             self.theta ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
         )
-        seq = mx.arange(seqlen, dtype=inv_freq.dtype)
+        seq = mx.arange(seqlen.tolist(), dtype=inv_freq.dtype)
         freqs = mx.outer(seq, inv_freq)
         return freqs
 
