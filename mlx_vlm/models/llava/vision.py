@@ -84,7 +84,7 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(value_input_dims, value_dims, bias=bias)
         self.out_proj = nn.Linear(value_dims, value_output_dims, bias=bias)
 
-    def __call__(self, queries, keys, values, mask=None):
+    def __call__(self, queries, keys, values, mask=None, output_attn=False):
         queries = self.q_proj(queries)
         keys = self.k_proj(keys)
         values = self.v_proj(values)
@@ -96,12 +96,15 @@ class Attention(nn.Module):
         keys = keys.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
 
-        output = mx.fast.scaled_dot_product_attention(
+        attn = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
         )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        output = attn.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return self.out_proj(output)
+        if output_attn:
+            return self.out_proj(output), attn
+        else:
+            return self.out_proj(output)
 
 
 class MLP(nn.Module):
@@ -128,13 +131,15 @@ class EncoderLayer(nn.Module):
         self.mlp = MLP(config)
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
 
-    def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
+    def __call__(
+        self, x: mx.array, mask: Optional[mx.array] = None, output_attn: bool = False
+    ) -> mx.array:
         y = self.layer_norm1(x)
-        y = self.self_attn(y, y, y, mask)
+        y, attn = self.self_attn(y, y, y, mask, output_attn=output_attn)
         x = x + y
         y = self.layer_norm2(x)
         y = self.mlp(y)
-        return x + y
+        return x + y, attn
 
 
 class Encoder(nn.Module):
@@ -207,20 +212,24 @@ class ClipVisionModel(nn.Module):
         self,
         x: mx.array,
         output_hidden_states: Optional[bool] = None,
+        output_attn: bool = False,
     ) -> mx.array:
         x = self.embeddings(x)
         if self.config.model_type == "clip_vision_model":
             x = self.pre_layrnorm(x)
 
         encoder_states = (x,) if output_hidden_states else None
+        all_attn = () if output_attn else None
 
         for l in self.encoder.layers:
-            x = l(x, mask=None)
+            x, attn = l(x, mask=None, output_attn=output_attn)
             if output_hidden_states:
                 encoder_states = encoder_states + (x,)
+            if output_attn:
+                all_attn = all_attn + (attn,)
 
         pooler_output = self.post_layernorm(x[:, 0, :])
-        return pooler_output, x, encoder_states
+        return pooler_output, x, encoder_states, all_attn
 
 
 class VisionModel(nn.Module):
@@ -234,9 +243,12 @@ class VisionModel(nn.Module):
         self.vision_model = ClipVisionModel(config)
 
     def __call__(
-        self, x: mx.array, output_hidden_states: Optional[bool] = None
+        self,
+        x: mx.array,
+        output_hidden_states: Optional[bool] = None,
+        output_attn: bool = False,
     ) -> mx.array:
-        return self.vision_model(x, output_hidden_states)
+        return self.vision_model(x, output_hidden_states, output_attn)
 
     def sanitize(self, weights):
         sanitized_weights = {}

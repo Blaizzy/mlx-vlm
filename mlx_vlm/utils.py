@@ -25,6 +25,8 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
+from mlx_vlm.models.cache import VLMFeatureCache
+
 from .models.base import BaseImageProcessor, KVCache, SimpleKVCache
 from .sample_utils import top_p_sampling
 from .tokenizer_utils import load_tokenizer
@@ -421,7 +423,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
 
     api = HfApi()
     api.create_repo(repo_id=upload_repo, exist_ok=True)
-    api.upload_folder(
+    api.upload_large_folder(
         folder_path=path,
         repo_id=upload_repo,
         repo_type="model",
@@ -1008,6 +1010,11 @@ def stream_generate(
     resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)
 
+    # features_cache = VLMFeatureCache("./cache")
+    # image_features = features_cache.load_features(str(image[0]))
+    # if hasattr(model, "image_features"):
+    #     kwargs["merged_features"] = image_features["image_features"]
+
     if not image:
         input_ids = prompt_tokens[None, :]
         pixel_values = mask = None
@@ -1098,6 +1105,9 @@ def generate(
 
     text = ""
     last_response = None
+    merge_similar_tokens_ratio = kwargs.get("merge_similar_tokens_ratio", 1)
+    filter_topk_tokens_ratio = kwargs.get("filter_topk_tokens_ratio", 1)
+
     for response in stream_generate(model, processor, prompt, image, **kwargs):
         if verbose:
             print(response.text, end="", flush=True)
@@ -1109,8 +1119,12 @@ def generate(
         if len(text) == 0:
             print("No text generated for this prompt")
             return
+
+        total_tokens = (
+            last_response.prompt_tokens * merge_similar_tokens_ratio
+        ) * filter_topk_tokens_ratio
         print(
-            f"Prompt: {last_response.prompt_tokens} tokens, "
+            f"Prompt: {int(total_tokens)} tokens, "
             f"{last_response.prompt_tps:.3f} tokens-per-sec"
         )
         print(

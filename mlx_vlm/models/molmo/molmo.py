@@ -43,19 +43,32 @@ class Model(nn.Module):
         self.language_model = LanguageModel(config.text_config)
         self.vision_tower = VisionModel(config.vision_config)
 
-    def __call__(
-        self,
-        input_ids: mx.array,
-        pixel_values: mx.array,
-        mask: mx.array,
-        cache=None,
-        **kwargs,
-    ) -> Dict[str, Union[mx.array, List[Tuple[mx.array, mx.array]]]]:
+    def merge_features(self, input_ids: mx.array, image_features: mx.array, **kwargs):
+        image_input_idx = kwargs.get("image_input_idx", None)
+        if image_input_idx is not None and image_input_idx.ndim == 2:
+            image_input_idx = mx.expand_dims(image_input_idx, 0)
+        elif image_input_idx is None:
+            raise ValueError("image_input_idx must be provided")
+
+        batch_size, seq_len = input_ids.shape
+        num_image, num_patch = image_input_idx.shape[1:3]
+        image_input_idx = image_input_idx.reshape(batch_size, num_image * num_patch)
+
+        valid = np.where(image_input_idx >= 0)[0].tolist()
+        batch_idx = mx.arange(batch_size)
+        batch_idx = mx.tile(batch_idx[:, None], [1, image_features.shape[1]])
+
+        input_embeddings = self.language_model.model.wte(input_ids)
+        input_embeddings[batch_idx[valid], image_input_idx[valid]] += image_features[
+            valid
+        ]
+        return input_embeddings
+
+    def encode_image(self, input_ids: mx.array, pixel_values: mx.array, **kwargs):
         if input_ids.ndim == 1:
             input_ids = input_ids[None, :]
 
         batch_size, seq_len = input_ids.shape
-
         image_input_idx = kwargs.get("image_input_idx", None)
         image_masks = kwargs.get("image_masks", None)
 
@@ -94,18 +107,33 @@ class Model(nn.Module):
             image_features = image_features.reshape(
                 batch_size, num_image * num_patch, -1
             )
-            image_input_idx = image_input_idx.reshape(batch_size, num_image * num_patch)
-
-            valid = np.where(image_input_idx >= 0)[0].tolist()
-            batch_idx = mx.arange(batch_size)
-            batch_idx = mx.tile(batch_idx[:, None], [1, image_features.shape[1]])
-
-            input_embeddings = self.language_model.model.wte(input_ids)
-            input_embeddings[
-                batch_idx[valid], image_input_idx[valid]
-            ] += image_features[valid]
+            input_embeddings = self.merge_features(
+                input_ids, image_features, image_input_idx=image_input_idx
+            )
         else:
             input_embeddings = None
+
+        return input_embeddings, image_features
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        pixel_values: mx.array,
+        mask: mx.array,
+        cache=None,
+        **kwargs,
+    ) -> Dict[str, Union[mx.array, List[Tuple[mx.array, mx.array]]]]:
+        input_ids = input_ids[None, :]
+        image_features = kwargs.get("image_features", None)
+        merged_features = kwargs.get("merged_features", None)
+        if image_features is None:
+            input_embeddings, image_features = self.encode_image(
+                input_ids, pixel_values, **kwargs
+            )
+        elif merged_features is None:
+            input_embeddings = self.merge_features(input_ids, **kwargs)
+        else:
+            input_embeddings = merged_features
 
         # Forward pass through the language model
         logits = self.language_model(

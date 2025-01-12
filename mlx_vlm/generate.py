@@ -73,6 +73,19 @@ def parse_arguments():
     )
     parser.add_argument("--chat", action="store_true", help="Chat in multi-turn style.")
     parser.add_argument("--verbose", action="store_false", help="Detailed output.")
+    parser.add_argument(
+        "--merge-similar-tokens-ratio",
+        type=float,
+        default=1.0,
+        help="Ratio of visual tokens to keep during merging similar tokens (between 0.1 and 1.0).",
+        choices=[x / 10 for x in range(1, 11)],
+    )
+    parser.add_argument(
+        "--filter-topk-tokens-ratio",
+        type=float,
+        help="Ratio of visual tokens to keep during filtering topk tokens (between 0.1 and 1.0).",
+        choices=[x / 10 for x in range(1, 11)],
+    )
     return parser.parse_args()
 
 
@@ -106,6 +119,19 @@ def main():
             if len(resize_shape) == 1
             else resize_shape
         )
+
+    kwargs["merge_similar_tokens_ratio"] = args.merge_similar_tokens_ratio
+    if args.filter_topk_tokens_ratio is None:
+        # If merge ratio is specified but filter ratio isn't, automatically set filter ratio
+        if args.merge_similar_tokens_ratio < 0.9:
+            # For aggressive merging (ratio < 0.9), keep 90% of tokens
+            kwargs["filter_topk_tokens_ratio"] = 0.90
+        else:
+            # For light merging (ratio >= 0.9), keep all tokens
+            kwargs["filter_topk_tokens_ratio"] = 1.0
+    else:
+        # Use explicitly provided filter ratio
+        kwargs["filter_topk_tokens_ratio"] = args.filter_topk_tokens_ratio
 
     if args.chat:
         chat = []
