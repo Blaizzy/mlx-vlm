@@ -4,7 +4,7 @@ import gradio as gr
 
 from mlx_vlm import load
 
-from .prompt_utils import apply_chat_template
+from .prompt_utils import get_chat_template, get_message_json
 from .utils import load, load_config, load_image_processor, stream_generate
 
 
@@ -28,17 +28,40 @@ image_processor = load_image_processor(args.model)
 
 
 def chat(message, history, temperature, max_tokens):
-    chat = []
-    if len(message["files"]) >= 1:
-        chat.append({"role": "user", "content": message["text"]})
-    else:
-        raise gr.Error("Please upload an image. Text only chat is not supported.")
+    if config["model_type"] != "paligemma":
+        if len(message["files"]) >= 1:
+            chat_history = []
+            for item in history:
+                chat_history.append({"role": "user", "content": item[0]})
+                if item[1] is not None:
+                    chat_history.append({"role": "assistant", "content": item[1]})
 
-    file = message["files"][-1]
-    if model.config.model_type != "paligemma":
-        prompt = apply_chat_template(processor, config, chat)
+            chat_history.append({"role": "user", "content": message["text"]})
+
+            messages = []
+            for i, m in enumerate(chat_history):
+                skip_token = True
+                if i == len(chat_history) - 1 and m["role"] == "user":
+                    skip_token = False
+                messages.append(
+                    get_message_json(
+                        config["model_type"],
+                        m["content"],
+                        role=m["role"],
+                        skip_image_token=skip_token,
+                    )
+                )
+
+            messages = get_chat_template(
+                processor, messages, add_generation_prompt=True
+            )
+
+        else:
+            raise gr.Error("Please upload an image. Text only chat is not supported.")
     else:
-        prompt = message.text
+        messages = message["text"]
+
+    files = message["files"][-1]["path"]
 
     response = ""
     for chunk in stream_generate(
