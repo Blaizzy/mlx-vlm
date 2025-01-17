@@ -22,9 +22,14 @@ class ModelConfig:
     vision_config: VisionConfig
     model_type: str
     ignore_index: int = -100
-    image_token_id: int = 128257
     vocab_size: int = 128259
     scale_factor: int = 2
+    image_token_id: int = 49153
+    image_token_index: Optional[int] = None
+
+    def __post_init__(self):
+        if self.image_token_index is None:
+            self.image_token_index = self.image_token_id
 
     @classmethod
     def from_dict(cls, params):
@@ -93,7 +98,7 @@ class Model(nn.Module):
         pixel_attention_mask: Optional[mx.array] = None,
     ):
         if pixel_values is None:
-            return self.language_model(input_ids)
+            return self.language_model.embed_tokens(input_ids)
 
         inputs_embeds = self.language_model.embed_tokens(input_ids)
 
@@ -111,7 +116,7 @@ class Model(nn.Module):
         return final_inputs_embeds
 
     def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
-        image_token_index = self.config.image_token_id
+        image_token_index = self.config.image_token_index
         num_images, num_image_patches, embed_dim = image_features.shape
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1

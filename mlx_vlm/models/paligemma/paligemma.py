@@ -18,7 +18,7 @@ class ModelConfig:
     text_config: TextConfig
     vision_config: VisionConfig
     model_type: str
-    vocab_size: int
+    vocab_size: int = 257152
     ignore_index: int = -100
     image_token_index: int = 257152
     hidden_size: int = 2048
@@ -66,7 +66,7 @@ class Model(nn.Module):
         mask: Optional[mx.array] = None,
     ):
         if pixel_values is None:
-            return self.language_model(input_ids)
+            return self.language_model.model.embed_tokens(input_ids), None
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 

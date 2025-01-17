@@ -47,15 +47,15 @@ class TestDataset(unittest.TestCase):
 
         mock_get_prompt.return_value = "Mocked prompt"
 
-        mock_prepare_inputs.return_value = (
-            mx.array([1, 2, 3]),  # input_ids
-            mx.array(
+        mock_prepare_inputs.return_value = {
+            "input_ids": mx.array([1, 2, 3]),  # input_ids
+            "pixel_values": mx.array(
                 [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]]
             ),  # pixel_values
-            mx.array([1, 1, 1]),  # mask
-            (1, 1, 1),  # image_grid_thw
-            [224, 224],  # image_sizes
-        )
+            "attention_mask": mx.array([1, 1, 1]),  # mask
+            "image_grid_thw": (1, 1, 1),  # image_grid_thw
+            "image_sizes": [224, 224],  # image_sizes
+        }
 
         result = dataset[0]
 

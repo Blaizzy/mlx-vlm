@@ -10,16 +10,16 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 from PIL import Image
-from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
+from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import to_numpy_array
 
-from ..base import expand2square
+from ..base import BaseImageProcessor, expand2square
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
 
 @dataclass
-class AlignerConfig:
+class ProjectorConfig:
     cls: str
     model_type: str
     params: dict
@@ -39,7 +39,7 @@ class AlignerConfig:
 class ModelConfig:
     text_config: TextConfig
     vision_config: VisionConfig
-    aligner_config: AlignerConfig
+    projector_config: ProjectorConfig
     model_type: str
     ignore_index: int = -100
     image_token_index: int = 100015
@@ -51,6 +51,10 @@ class ModelConfig:
 
     @classmethod
     def from_dict(cls, params):
+        if "aligner_config" in params:
+            params["projector_config"] = params["aligner_config"]
+            del params["aligner_config"]
+
         return cls(
             **{
                 k: v
@@ -174,7 +178,7 @@ class MlpProjector(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
 
-        if config.aligner_config.params["projector_type"] == "mlp_gelu":
+        if config.projector_config.params["projector_type"] == "mlp_gelu":
             self.layers = [
                 nn.Linear(
                     config.vision_config.hidden_size,
@@ -182,7 +186,7 @@ class MlpProjector(nn.Module):
                     bias=True,
                 )
             ]
-            mlp_depth = config.aligner_config.params["depth"]
+            mlp_depth = config.projector_config.params["depth"]
             for _ in range(1, mlp_depth):
                 self.layers.append(nn.GELU())
                 self.layers.append(
@@ -193,10 +197,10 @@ class MlpProjector(nn.Module):
                     )
                 )
         elif (
-            config.aligner_config.params["projector_type"]
+            config.projector_config.params["projector_type"]
             == "low_high_hybrid_split_mlp_gelu"
         ):
-            mlp_depth = config.aligner_config.params["depth"]
+            mlp_depth = config.projector_config.params["depth"]
             self.high_up_proj = nn.Linear(
                 config.vision_config.hidden_size, config.text_config.hidden_size // 2
             )
@@ -214,7 +218,7 @@ class MlpProjector(nn.Module):
                 )
 
         else:
-            projector_type = config.aligner_config.params["projector_type"]
+            projector_type = config.projector_config.params["projector_type"]
             raise ValueError(f"Unknown projector type: {projector_type}")
 
     def __call__(self, x: Union[mx.array, Tuple]) -> mx.array:
@@ -299,7 +303,7 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
     ):
         if pixel_values is None:
-            return self.language_model(input_ids)
+            return self.language_model.model.embed_tokens(input_ids)
 
         image_token_index = self.config.image_token_index
         num_image_tokens = self.config.num_image_tokens
@@ -398,8 +402,8 @@ class Model(nn.Module):
         model_config = ModelConfig.from_dict(model_config)
 
         model_config.vision_config = VisionConfig.from_dict(model_config.vision_config)
-        model_config.aligner_config = AlignerConfig.from_dict(
-            model_config.aligner_config
+        model_config.projector_config = ProjectorConfig.from_dict(
+            model_config.projector_config
         )
         model_config.text_config = TextConfig.from_dict(model_config.text_config)
 

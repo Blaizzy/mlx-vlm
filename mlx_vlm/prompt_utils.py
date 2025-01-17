@@ -24,7 +24,7 @@ def get_message_json(
             return message
         if role == "user" and not skip_image_token:
             if isinstance(message["content"], list):
-                if model_name == "pixtral":
+                if model_name in ["pixtral", "idefics3"]:
                     message["content"] = [{"type": "image"}] * num_images + message[
                         "content"
                     ]
@@ -59,6 +59,7 @@ def get_message_json(
             " ".join([f"<|image_{i+1}|>" for i in range(num_images)]),
         ),
         "prompt_only": lambda: prompt,
+        "prompt_with_image_token": lambda: "<image>" * num_images + prompt,
     }
 
     model_to_format = {
@@ -72,10 +73,11 @@ def get_message_json(
         "phi3_v": "message_with_numbered_image_tokens",
         "multi_modality": "message_with_image_token",
         "pixtral": "message_list_with_image_type",
-        "paligemma": "prompt_only",
+        "paligemma": "prompt_with_image_token",
         "florence2": "prompt_only",
         "mllama": "message_list_with_image",
         "molmo": "prompt_only",
+        "deepseek_vl_v2": "message_with_image_token_new_line",
     }
 
     if num_images > 1 and model_name in [

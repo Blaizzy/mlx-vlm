@@ -132,7 +132,6 @@ class TestModels(unittest.TestCase):
             },
             hidden_size=1024,
             mm_hidden_size=1152,
-            mm_vision_tower="google/siglip-so400m-patch14-384",
             mm_projector_type="mlp2x_gelu",
             ignore_index=-100,
             image_token_index=-200,
@@ -499,9 +498,9 @@ class TestModels(unittest.TestCase):
             params={},
         )
 
-        aligner_config = multi_modality.AlignerConfig(
+        projector_config = multi_modality.ProjectorConfig(
             cls="MlpProjector",
-            model_type="aligner",
+            model_type="projector",
             params={
                 "depth": 2,
                 "input_dim": 1024,
@@ -513,7 +512,7 @@ class TestModels(unittest.TestCase):
         config = multi_modality.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
-            aligner_config=aligner_config,
+            projector_config=projector_config,
             model_type="multi_modality",
             ignore_index=-100,
             image_token_index=100015,
@@ -931,6 +930,35 @@ class TestModels(unittest.TestCase):
             config.vision_config.in_chans,
             config.vision_config.image_size,
             channel_first=True,
+        )
+
+    def test_deepseek_vl_v2(self):
+        from mlx_vlm.models import deepseek_vl_v2
+
+        text_config = deepseek_vl_v2.TextConfig()
+        vision_config = deepseek_vl_v2.VisionConfig(model_type="vision")
+        projector_config = deepseek_vl_v2.ProjectorConfig()
+        config = deepseek_vl_v2.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            projector_config=projector_config,
+            model_type="deepseek_v2",
+        )
+        model = deepseek_vl_v2.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision,
+            config.vision_config.model_type,
+            config.vision_config.width,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
         )
 
 
