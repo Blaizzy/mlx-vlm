@@ -142,9 +142,14 @@ class Model(nn.Module):
         cache: Optional[mx.array] = None,
         **kwargs,
     ):
-        input_embeddings, final_attention_mask_4d = self.get_input_embeddings(
+        prefill_step_size = kwargs.pop("prefill_step_size", 256)
+        inputs_embeds, final_attention_mask_4d = self.get_input_embeddings(
             input_ids, pixel_values, mask
         )
+        if pixel_values is None:
+            inputs_embeds = self.prefill(
+                inputs_embeds, cache=cache, prefill_step_size=prefill_step_size
+            )
 
         logits = self.language_model(
             inputs=input_ids,
@@ -153,42 +158,3 @@ class Model(nn.Module):
             mask=final_attention_mask_4d,
         )
         return logits
-
-    @staticmethod
-    def from_pretrained(path_or_hf_repo: str):
-        path = Path(path_or_hf_repo)
-        if not path.exists():
-            path = Path(
-                snapshot_download(
-                    repo_id=path_or_hf_repo,
-                    allow_patterns=[
-                        "*.json",
-                        "*.safetensors",
-                        "*.py",
-                        "tokenizer.model",
-                        "*.tiktoken",
-                    ],
-                )
-            )
-
-        with open(path / "config.json", "r") as f:
-            config = json.load(f)
-
-        model_config = ModelConfig.from_dict(config)
-        model_config.vision_config = VisionConfig.from_dict(config["vision_config"])
-        model_config.text_config = TextConfig.from_dict(config["text_config"])
-
-        model = Model(model_config)
-        weight_files = glob.glob(str(path / "*.safetensors"))
-        if not weight_files:
-            raise FileNotFoundError(f"No safetensors found in {path}")
-
-        weights = {}
-        for wf in weight_files:
-            weights.update(mx.load(wf))
-
-        weights = model.sanitize(weights=weights)
-
-        weights = VisionModel(model_config.vision_config).sanitize(weights=weights)
-        model.load_weights(list(weights.items()))
-        return model

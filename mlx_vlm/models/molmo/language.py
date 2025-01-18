@@ -79,7 +79,7 @@ class MolmoBlock(nn.Module):
         self.act = SwiGLU()
 
     def __call__(self, x, mask=None, cache=None):
-        batch_size, seq_len, D = x.shape
+        batch_size, seq_len, D = x.shape[:3]
         attn_in = self.attn_norm(x)
 
         qkv = self.att_proj(attn_in)
@@ -184,7 +184,7 @@ class Molmo(nn.Module):
             cache = [None] * self.config.n_layers
 
         if mask is None:
-            mask = create_attention_mask(h)
+            mask = create_attention_mask(h, cache)
 
         for block, c in zip(self.blocks, cache):
             h = block(h, mask, c)
@@ -212,7 +212,7 @@ class LanguageModel(nn.Module):
 
     def __call__(
         self,
-        input_ids: mx.array,
+        input_ids: mx.array = None,
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,

@@ -22,6 +22,7 @@ class TextConfig:
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = False
+    sliding_window: int = None
 
     @classmethod
     def from_dict(cls, params):
@@ -51,9 +52,9 @@ class Attention(nn.Module):
         super().__init__()
 
         dim = config.hidden_size
+        self.config = config
         self.n_heads = n_heads = config.num_attention_heads
         self.n_kv_heads = n_kv_heads = config.num_key_value_heads
-
         self.repeats = n_heads // n_kv_heads
 
         head_dim = config.hidden_size // n_heads
@@ -88,7 +89,8 @@ class Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
     ) -> mx.array:
-        B, L, D = x.shape
+
+        B, L, D = x.shape[:3]
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
@@ -101,6 +103,12 @@ class Attention(nn.Module):
             queries = self.rope(queries, offset=cache.offset)
             keys = self.rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
+            if self.config.sliding_window:
+                print(self.config.sliding_window)
+                keys = keys[:, :, self.config.sliding_window :, :]
+                values = values[:, :, self.config.sliding_window :, :]
+                if mask is not None:
+                    mask = mask[:, self.config.sliding_window :]
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)
@@ -164,9 +172,10 @@ class Llama(nn.Module):
 
     def __call__(
         self,
-        inputs: mx.array,
+        inputs: mx.array = None,
         cache=None,
         inputs_embeds=None,
+        mask: Optional[mx.array] = None,
     ):
         # for passing merged input embeddings
         if inputs_embeds is None:
@@ -174,10 +183,11 @@ class Llama(nn.Module):
         else:
             h = inputs_embeds
 
-        mask = create_attention_mask(h)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        # if mask is None:
+        mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -200,12 +210,12 @@ class LanguageModel(nn.Module):
 
     def __call__(
         self,
-        inputs: mx.array,
+        inputs: mx.array = None,
         cache=None,
         inputs_embeds=None,
         mask: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache, inputs_embeds)
+        out = self.model(inputs, cache, inputs_embeds, mask)
         if self.config.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:

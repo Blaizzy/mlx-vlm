@@ -9,7 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
-from ..base import KVCache
+from ..base import BaseModel, KVCache
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
@@ -36,7 +36,7 @@ class ModelConfig:
         )
 
 
-class Model(nn.Module):
+class Model(BaseModel):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -60,6 +60,7 @@ class Model(nn.Module):
         aspect_ratio_ids = kwargs.pop("aspect_ratio_ids", None)
         aspect_ratio_mask = kwargs.pop("aspect_ratio_mask", None)
         cross_attention_mask = kwargs.pop("cross_attention_mask", None)
+        prefill_step_size = kwargs.pop("prefill_step_size", 256)
 
         inputs_embeds = None
 
@@ -111,6 +112,11 @@ class Model(nn.Module):
                 :, :, cache_position
             ]
 
+        if pixel_values is None:
+            inputs_embeds = self.prefill(
+                inputs_embeds, cache=cache, prefill_step_size=prefill_step_size
+            )
+
         # Process language input
         outputs = self.language_model(
             input_ids=input_ids,
@@ -157,46 +163,6 @@ class Model(nn.Module):
         cross_attention_mask *= full_text_row_masked_out_mask
 
         return cross_attention_mask, full_text_row_masked_out_mask
-
-    @staticmethod
-    def from_pretrained(path_or_hf_repo: str):
-        path = Path(path_or_hf_repo)
-        if not path.exists():
-            path = Path(
-                snapshot_download(
-                    repo_id=path_or_hf_repo,
-                    allow_patterns=[
-                        "*.json",
-                        "*.safetensors",
-                        "*.py",
-                        "tokenizer.model",
-                        "*.tiktoken",
-                    ],
-                )
-            )
-
-        with open(path / "config.json", "r") as f:
-            model_config = json.load(f)
-
-        model_config = ModelConfig.from_dict(model_config)
-
-        model_config.vision_config = VisionConfig.from_dict(model_config.vision_config)
-        model_config.text_config = TextConfig.from_dict(model_config)
-
-        model = Model(model_config)
-        weight_files = glob.glob(str(path / "*.safetensors"))
-        if not weight_files:
-            raise FileNotFoundError(f"No safetensors found in {path}")
-
-        weights = {}
-        for wf in weight_files:
-            weights.update(mx.load(wf))
-
-        weights = VisionModel.sanitize(weights)
-        weights = LanguageModel.sanitize(weights)
-
-        model.load_weights(list(weights.items()))
-        return model
 
     def sanitize(self, weights):
         def transform_key(key):

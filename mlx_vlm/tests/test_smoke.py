@@ -130,8 +130,11 @@ def test_generation(
 
         console.print(f"[bold green]✓[/] {test_type} generation successful")
         return False
-    except Exception as e:
-        console.print(f"[bold red]✗[/] {test_type} generation failed: {str(e)}")
+    except:
+        import traceback
+
+        console.print(f"[bold red]✗[/] {test_type} generation failed:")
+        console.print(traceback.format_exc())
         return True
 
 

@@ -25,7 +25,9 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-from .models.base import BaseImageProcessor, KVCache, SimpleKVCache
+from mlx_vlm.models.cache import VLMFeatureCache
+
+from .models.base import BaseImageProcessor, KVCache, RotatingKVCache, SimpleKVCache
 from .sample_utils import top_p_sampling
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
@@ -421,7 +423,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
 
     api = HfApi()
     api.create_repo(repo_id=upload_repo, exist_ok=True)
-    api.upload_folder(
+    api.upload_large_folder(
         folder_path=path,
         repo_id=upload_repo,
         repo_type="model",
@@ -841,11 +843,12 @@ def generate_step(
     mask,
     *,
     max_tokens: int = 256,
-    temp: float = 0.0,
+    temperature: float = 0.0,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
     logit_bias: Optional[Dict[int, float]] = None,
+    max_kv_size: Optional[int] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -863,6 +866,7 @@ def generate_step(
         top_p (float, optional): Nulceus sampling, higher means model considers
           more less likely words.
         logit_bias (dictionary, optional): Additive logit bias.
+        max_kv_size (int, optional): Set the maximum key-value cache size.
 
     Yields:
         Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
@@ -876,13 +880,13 @@ def generate_step(
             logits[:, indices] += values
         logprobs = logits - mx.logsumexp(logits)
 
-        if temp == 0:
+        if temperature == 0:
             token = mx.argmax(logits, axis=-1)
         else:
             if top_p > 0 and top_p < 1.0:
-                token = top_p_sampling(logits, top_p, temp)
+                token = top_p_sampling(logits, top_p, temperature)
             else:
-                token = mx.random.categorical(logits * (1 / temp))
+                token = mx.random.categorical(logits * (1 / temperature))
 
         return token, logprobs
 
@@ -907,7 +911,18 @@ def generate_step(
                 (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
             ]
         else:
-            cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
+            if max_kv_size is None:
+                cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
+            else:
+                cache = [
+                    RotatingKVCache(
+                        model.language_model.head_dim,
+                        n,
+                        max_size=max_kv_size,
+                        keep=max_kv_size // 2 if pixel_values is None else 4,
+                    )
+                    for n in kv_heads
+                ]
 
     repetition_context = input_ids.reshape(-1).tolist()
 
@@ -1098,6 +1113,9 @@ def generate(
 
     text = ""
     last_response = None
+    merge_similar_tokens_ratio = kwargs.get("merge_similar_tokens_ratio", 1)
+    filter_topk_tokens_ratio = kwargs.get("filter_topk_tokens_ratio", 1)
+
     for response in stream_generate(model, processor, prompt, image, **kwargs):
         if verbose:
             print(response.text, end="", flush=True)
@@ -1109,8 +1127,12 @@ def generate(
         if len(text) == 0:
             print("No text generated for this prompt")
             return
+
+        total_tokens = (
+            last_response.prompt_tokens * merge_similar_tokens_ratio
+        ) * filter_topk_tokens_ratio
         print(
-            f"Prompt: {last_response.prompt_tokens} tokens, "
+            f"Prompt: {int(total_tokens)} tokens, "
             f"{last_response.prompt_tps:.3f} tokens-per-sec"
         )
         print(

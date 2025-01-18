@@ -69,10 +69,38 @@ def parse_arguments():
         help="Maximum number of tokens to generate.",
     )
     parser.add_argument(
-        "--temp", type=float, default=DEFAULT_TEMP, help="Temperature for sampling."
+        "--temperature",
+        type=float,
+        default=DEFAULT_TEMP,
+        help="Temperature for sampling.",
     )
     parser.add_argument("--chat", action="store_true", help="Chat in multi-turn style.")
     parser.add_argument("--verbose", action="store_false", help="Detailed output.")
+    parser.add_argument(
+        "--merge-similar-tokens-ratio",
+        type=float,
+        default=1.0,
+        help="Ratio of visual tokens to keep during merging similar tokens (between 0.1 and 1.0).",
+        choices=[x / 10 for x in range(1, 11)],
+    )
+    parser.add_argument(
+        "--filter-topk-tokens-ratio",
+        type=float,
+        help="Ratio of visual tokens to keep during filtering topk tokens (between 0.1 and 1.0).",
+        choices=[x / 10 for x in range(1, 11)],
+    )
+    parser.add_argument(
+        "--max-kv-size",
+        type=int,
+        default=None,
+        help="Set the maximum key-value cache size",
+    )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=256,
+        help="Set the prefill step size",
+    )
     return parser.parse_args()
 
 
@@ -97,6 +125,9 @@ def main():
     prompt = apply_chat_template(processor, config, prompt, num_images=len(args.image))
 
     kwargs = {}
+
+    if args.max_kv_size is not None:
+        kwargs["max_kv_size"] = args.max_kv_size
     if args.resize_shape is not None:
         resize_shape = args.resize_shape
         if len(resize_shape) not in [1, 2]:
@@ -106,6 +137,19 @@ def main():
             if len(resize_shape) == 1
             else resize_shape
         )
+
+    kwargs["merge_similar_tokens_ratio"] = args.merge_similar_tokens_ratio
+    if args.filter_topk_tokens_ratio is None:
+        # If merge ratio is specified but filter ratio isn't, automatically set filter ratio
+        if args.merge_similar_tokens_ratio < 0.9:
+            # For aggressive merging (ratio < 0.9), keep 90% of tokens
+            kwargs["filter_topk_tokens_ratio"] = 0.90
+        else:
+            # For light merging (ratio >= 0.9), keep all tokens
+            kwargs["filter_topk_tokens_ratio"] = 1.0
+    else:
+        # Use explicitly provided filter ratio
+        kwargs["filter_topk_tokens_ratio"] = args.filter_topk_tokens_ratio
 
     if args.chat:
         chat = []
@@ -124,7 +168,7 @@ def main():
                 prompt,
                 args.image,
                 max_tokens=args.max_tokens,
-                temp=args.temp,
+                temperature=args.temperature,
                 **kwargs,
             ):
                 response += chunk.text
@@ -139,7 +183,7 @@ def main():
             processor,
             prompt,
             image=args.image,
-            temp=args.temp,
+            temperature=args.temperature,
             max_tokens=args.max_tokens,
             verbose=args.verbose,
             **kwargs,
