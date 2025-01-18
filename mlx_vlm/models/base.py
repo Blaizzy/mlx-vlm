@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
+import mlx.nn as nn
 from PIL import Image
 from transformers.image_processing_utils import BaseImageProcessor as ImageProcessor
 from transformers.image_processing_utils import get_size_dict
@@ -148,7 +149,7 @@ class SimpleKVCache:
 
 class RotatingKVCache:
 
-    def __init__(self, head_dim, n_kv_heads, max_size, keep=0, step=256):
+    def __init__(self, head_dim, n_kv_heads, max_size, keep=4, step=256):
         self.n_kv_heads = n_kv_heads
         if isinstance(head_dim, int):
             self.k_head_dim = self.v_head_dim = head_dim
@@ -271,3 +272,39 @@ class LanguageModelOutput:
     logits: mx.array
     cross_attention_states: Optional[List[mx.array]] = None
     encoder_outputs: Optional[List[mx.array]] = None
+
+
+class BaseModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.vision_tower = None
+        self.language_model = None
+
+    def prefill(self, input_embeds, cache=None, prefill_step_size=256, **kwargs):
+        # Process input in batches for better parallelization
+        num_batches = (
+            input_embeds.shape[1] + prefill_step_size - 1
+        ) // prefill_step_size
+
+        if num_batches > 1:
+            # Pre-allocate slices for better memory efficiency
+            slices = [
+                input_embeds[:, i * prefill_step_size : (i + 1) * prefill_step_size, :]
+                for i in range(num_batches - 1)
+            ]
+
+            # Process all full-sized batches in parallel
+            for slice in slices:
+                mask = create_attention_mask(slice, cache)
+                self.language_model(inputs_embeds=slice, cache=cache, mask=mask)
+                if cache is not None:
+                    mx.eval([c.state for c in cache])
+                mx.metal.clear_cache()
+
+            # Return remaining slice
+            remaining_embeds = input_embeds[
+                :, (num_batches - 1) * prefill_step_size :, :
+            ]
+            return remaining_embeds
+
+        return input_embeds
