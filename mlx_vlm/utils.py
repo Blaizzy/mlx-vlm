@@ -27,7 +27,7 @@ from transformers import (
 
 from mlx_vlm.models.cache import VLMFeatureCache
 
-from .models.base import BaseImageProcessor, KVCache, SimpleKVCache
+from .models.base import BaseImageProcessor, KVCache, RotatingKVCache, SimpleKVCache
 from .sample_utils import top_p_sampling
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
@@ -909,7 +909,10 @@ def generate_step(
                 (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
             ]
         else:
-            cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
+            cache = [
+                RotatingKVCache(model.language_model.head_dim, n, max_size=256)
+                for n in kv_heads
+            ]
 
     repetition_context = input_ids.reshape(-1).tolist()
 
