@@ -139,18 +139,30 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        merge_similar_tokens_ratio: Optional[float] = 1,
+        filter_topk_tokens_ratio: Optional[float] = 1,
     ):
         if pixel_values is None:
             return self.language_model.model.embed_tokens(input_ids)
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        *_, hidden_state = self.vision_tower(
-            pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
+        *_, hidden_state, all_attn = self.vision_tower(
+            pixel_values.transpose(0, 2, 3, 1),
+            output_hidden_states=True,
+            output_attn=True,
         )
 
         image_features = hidden_state[-1].astype(pixel_values.dtype)
         assert image_features.shape[-2] == 729
+
+        image_features = self.get_topk_tokens(
+            image_features, all_attn, filter_topk_tokens_ratio
+        )
+
+        image_features = self.merge_similar_visual_tokens(
+            image_features, merge_similar_tokens_ratio
+        )
 
         image_features = self.mm_projector(image_features)
 
@@ -192,58 +204,23 @@ class Model(nn.Module):
         cache: Optional[Tuple[mx.array, mx.array]] = None,
         **kwargs,
     ):
-        input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
+        prefill_step_size = kwargs.pop("prefill_step_size", 256)
+        merge_similar_tokens_ratio = kwargs.get("merge_similar_tokens_ratio", 1)
+        filter_topk_tokens_ratio = kwargs.get("filter_topk_tokens_ratio", 1)
+        inputs_embeds = self.get_input_embeddings(
+            input_ids,
+            pixel_values,
+            merge_similar_tokens_ratio,
+            filter_topk_tokens_ratio,
+        )
+        if pixel_values is None:
+            inputs_embeds = self.prefill(
+                inputs_embeds, cache=cache, prefill_step_size=prefill_step_size
+            )
         logits = self.language_model(
-            inputs=input_ids, cache=cache, inputs_embeds=input_embeddings, mask=mask
+            inputs=input_ids, cache=cache, inputs_embeds=inputs_embeds, mask=mask
         )
         return logits
-
-    @staticmethod
-    def from_pretrained(path_or_hf_repo: str):
-        path = Path(path_or_hf_repo)
-        if not path.exists():
-            path = Path(
-                snapshot_download(
-                    repo_id=path_or_hf_repo,
-                    allow_patterns=[
-                        "*.json",
-                        "*.safetensors",
-                        "*.py",
-                        "tokenizer.model",
-                        "*.tiktoken",
-                    ],
-                )
-            )
-
-        with open(path / "config.json", "r") as f:
-            config = json.load(f)
-
-        siglip_config = AutoConfig.from_pretrained(config["mm_vision_tower"])
-        text_config = AutoConfig.from_pretrained(config["language_model"])
-        siglip_config = siglip_config.to_dict()
-        text_config = text_config.to_dict()
-        config["vision_config"] = siglip_config["vision_config"]
-        config["text_config"] = text_config
-
-        model_config = ModelConfig.from_dict(config)
-        model_config.vision_config = VisionConfig.from_dict(config["vision_config"])
-        model_config.text_config = TextConfig.from_dict(config["text_config"])
-
-        model = Model(model_config)
-        weight_files = glob.glob(str(path / "*.safetensors"))
-        if not weight_files:
-            raise FileNotFoundError(f"No safetensors found in {path}")
-
-        weights = {}
-        for wf in weight_files:
-            weights.update(mx.load(wf))
-
-        weights = model.sanitize(weights=weights)
-
-        weights = VisionModel(model_config.vision_config).sanitize(weights=weights)
-        weights = LanguageModel(model_config.text_config).sanitize(weights=weights)
-        model.load_weights(list(weights.items()))
-        return model
 
     def sanitize(self, weights):
         weights = {

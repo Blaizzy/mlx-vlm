@@ -83,7 +83,7 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(value_input_dims, value_dims, bias=bias)
         self.out_proj = nn.Linear(value_dims, value_output_dims, bias=bias)
 
-    def __call__(self, queries, keys, values, mask=None):
+    def __call__(self, queries, keys, values, mask=None, output_attn=False):
         queries = self.q_proj(queries)
         keys = self.k_proj(keys)
         values = self.v_proj(values)
@@ -95,11 +95,15 @@ class Attention(nn.Module):
         keys = keys.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
 
-        output = mx.fast.scaled_dot_product_attention(
+        attn = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
         )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.out_proj(output)
+        output = attn.transpose(0, 2, 1, 3).reshape(B, L, -1)
+
+        if output_attn:
+            return self.out_proj(output), attn
+        else:
+            return self.out_proj(output)
 
 
 class MHA(nn.Module):
@@ -124,7 +128,7 @@ class MHA(nn.Module):
         self.in_proj = nn.Linear(dims, dims * 3, bias=bias)
         self.out_proj = nn.Linear(dims, dims, bias=bias)
 
-    def __call__(self, queries: mx.array, kv: mx.array, mask=None):
+    def __call__(self, queries: mx.array, kv: mx.array, mask=None, output_attn=False):
         B, L, D = queries.shape
 
         qkv = self.in_proj(queries)
@@ -137,11 +141,15 @@ class MHA(nn.Module):
         keys = keys.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
 
-        output = mx.fast.scaled_dot_product_attention(
+        attn = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
         )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.out_proj(output)
+        output = attn.transpose(0, 2, 1, 3).reshape(B, L, -1)
+
+        if output_attn:
+            return self.out_proj(output), attn
+        else:
+            return self.out_proj(output)
 
 
 class MLP(nn.Module):
@@ -170,11 +178,11 @@ class EncoderLayer(nn.Module):
 
     def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
         y = self.layer_norm1(x)
-        y = self.self_attn(y, y, y, mask)
+        y, attn = self.self_attn(y, y, y, mask)
         x = x + y
         y = self.layer_norm2(x)
         y = self.mlp(y)
-        return x + y
+        return x + y, attn
 
 
 class Encoder(nn.Module):
@@ -225,19 +233,22 @@ class SigLipVisionModel(nn.Module):
         self,
         x: mx.array,
         output_hidden_states: Optional[bool] = None,
+        output_attn: Optional[bool] = None,
     ) -> mx.array:
         x = self.embeddings(x)
 
         encoder_states = (x,) if output_hidden_states else None
 
         for l in self.encoder.layers:
-            x = l(x, mask=None)
+            x, attn = l(x, mask=None, output_attn=output_attn)
             if output_hidden_states:
                 encoder_states = encoder_states + (x,)
+            if output_attn:
+                all_attn = all_attn + (attn,)
 
         pooler_output = self.post_layernorm(x[:, 0, :])
         pooler_output = self.head(pooler_output)
-        return pooler_output, x, encoder_states
+        return pooler_output, x, encoder_states, all_attn
 
 
 class SigLipMultiheadAttentionPoolingHead(nn.Module):

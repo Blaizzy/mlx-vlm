@@ -177,12 +177,17 @@ class Phi3V(nn.Module):
         pixel_values=None,
         image_sizes=None,
         cache=None,
+        **kwargs,
     ):
+        prefill_step_size = kwargs.pop("prefill_step_size", 256)
+
         h = self.embed_tokens(inputs)
         p = np.argwhere(inputs < 0).tolist()
 
         if pixel_values is not None:
             h = self.vision_embed_tokens(pixel_values, h, image_sizes, p)
+        else:
+            h = self.prefill(h, cache=cache, prefill_step_size=prefill_step_size)
 
         mask = create_attention_mask(h)
 
@@ -212,6 +217,7 @@ class Model(nn.Module):
         image_sizes=None,
         **kwargs,
     ):
+
         out = self.model(inputs, pixel_values, image_sizes, cache)
         logits = self.lm_head(out).astype(self.lm_head.weight.dtype)
         return LanguageModelOutput(logits=logits)
