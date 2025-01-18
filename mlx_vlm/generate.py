@@ -69,7 +69,10 @@ def parse_arguments():
         help="Maximum number of tokens to generate.",
     )
     parser.add_argument(
-        "--temp", type=float, default=DEFAULT_TEMP, help="Temperature for sampling."
+        "--temperature",
+        type=float,
+        default=DEFAULT_TEMP,
+        help="Temperature for sampling.",
     )
     parser.add_argument("--chat", action="store_true", help="Chat in multi-turn style.")
     parser.add_argument("--verbose", action="store_false", help="Detailed output.")
@@ -165,7 +168,7 @@ def main():
             processor,
             prompt,
             image=args.image,
-            temp=args.temp,
+            temperature=args.temperature,
             max_tokens=args.max_tokens,
             verbose=args.verbose,
             **kwargs,

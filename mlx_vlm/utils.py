@@ -843,11 +843,12 @@ def generate_step(
     mask,
     *,
     max_tokens: int = 256,
-    temp: float = 0.0,
+    temperature: float = 0.0,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
     logit_bias: Optional[Dict[int, float]] = None,
+    max_size: Optional[int] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -878,13 +879,13 @@ def generate_step(
             logits[:, indices] += values
         logprobs = logits - mx.logsumexp(logits)
 
-        if temp == 0:
+        if temperature == 0:
             token = mx.argmax(logits, axis=-1)
         else:
             if top_p > 0 and top_p < 1.0:
-                token = top_p_sampling(logits, top_p, temp)
+                token = top_p_sampling(logits, top_p, temperature)
             else:
-                token = mx.random.categorical(logits * (1 / temp))
+                token = mx.random.categorical(logits * (1 / temperature))
 
         return token, logprobs
 
@@ -909,10 +910,13 @@ def generate_step(
                 (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
             ]
         else:
-            cache = [
-                RotatingKVCache(model.language_model.head_dim, n, max_size=256)
-                for n in kv_heads
-            ]
+            if max_size is None:
+                cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
+            else:
+                cache = [
+                    RotatingKVCache(model.language_model.head_dim, n, max_size=max_size)
+                    for n in kv_heads
+                ]
 
     repetition_context = input_ids.reshape(-1).tolist()
 
@@ -1012,11 +1016,6 @@ def stream_generate(
 
     resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)
-
-    # features_cache = VLMFeatureCache("./cache")
-    # image_features = features_cache.load_features(str(image[0]))
-    # if hasattr(model, "image_features"):
-    #     kwargs["merged_features"] = image_features["image_features"]
 
     if not image:
         input_ids = prompt_tokens[None, :]
