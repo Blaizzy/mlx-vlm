@@ -10,6 +10,7 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 
+from ..base import BaseModel
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
@@ -42,7 +43,7 @@ class ModelConfig:
         )
 
 
-class Model(nn.Module):
+class Model(BaseModel):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -99,15 +100,23 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
+        prefill_step_size = kwargs.pop("prefill_step_size", 256)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         if image_grid_thw is not None:
             image_grid_thw = mx.array(image_grid_thw)
 
-        input_embddings = self.get_input_embeddings(
+        inputs_embeds = self.get_input_embeddings(
             input_ids, pixel_values, image_grid_thw
         )
 
-        logits = self.language_model(None, cache=cache, inputs_embeds=input_embddings)
+        if pixel_values is None:
+            inputs_embeds = self.prefill(
+                inputs_embeds, cache=cache, prefill_step_size=prefill_step_size
+            )
+
+        logits = self.language_model(
+            input_ids=input_ids, cache=cache, inputs_embeds=inputs_embeds
+        )
         return logits
 
     @staticmethod

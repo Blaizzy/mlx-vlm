@@ -10,6 +10,7 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 
+from ..base import BaseModel
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
@@ -36,7 +37,7 @@ class ModelConfig:
         )
 
 
-class Model(nn.Module):
+class Model(BaseModel):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -50,7 +51,7 @@ class Model(nn.Module):
         elif image_input_idx is None:
             raise ValueError("image_input_idx must be provided")
 
-        batch_size, seq_len = input_ids.shape
+        batch_size, seq_len = input_ids.shape[:2]
         num_image, num_patch = image_input_idx.shape[1:3]
         image_input_idx = image_input_idx.reshape(batch_size, num_image * num_patch)
 
@@ -126,14 +127,19 @@ class Model(nn.Module):
         input_ids = input_ids[None, :]
         image_features = kwargs.get("image_features", None)
         merged_features = kwargs.get("merged_features", None)
-        if image_features is None:
-            input_embeddings, image_features = self.encode_image(
+        if pixel_values is None:
+            inputs_embeds = self.language_model.model.wte(input_ids)[0]
+        elif image_features is None:
+            inputs_embeds, image_features = self.encode_image(
                 input_ids, pixel_values, **kwargs
             )
         elif merged_features is None:
-            input_embeddings = self.merge_features(input_ids, **kwargs)
+            inputs_embeds = self.merge_features(input_ids, **kwargs)
         else:
-            input_embeddings = merged_features
+            inputs_embeds = merged_features
+
+        if pixel_values is None:
+            inputs_embeds = self.prefill(inputs_embeds, cache=cache)
 
         # Forward pass through the language model
         logits = self.language_model(

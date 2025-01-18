@@ -100,6 +100,7 @@ class Model(nn.Module):
 
         # Pass image features through the multi-modal projector
         image_features = self.multi_modal_projector(selected_image_feature)
+        print("image_features.shape", image_features.shape)
         if self.image_newline is not None:
             self.image_newline = np.array(self.image_newline)[None, None, :]
             self.image_newline = np.broadcast_to(
