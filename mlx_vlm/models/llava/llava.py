@@ -164,6 +164,7 @@ class Model(BaseModel):
             inputs_embeds = self.prefill(
                 inputs_embeds, cache=cache, prefill_step_size=prefill_step_size
             )
+            self.config.text_config.sliding_window = 4096
 
         logits = self.language_model(
             input_ids, cache=cache, inputs_embeds=inputs_embeds
