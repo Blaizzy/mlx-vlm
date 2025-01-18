@@ -92,7 +92,7 @@ class Attention(nn.Module):
 
         offset = cache.offset if cache else 0
 
-        if mask is not None:
+        if mask is not None and keys.shape[-2] == 1:
             mask = mask[..., : keys.shape[-2]]
 
         queries = self.rotary_emb(queries, offset=offset)
@@ -160,19 +160,21 @@ class Qwen2Model(nn.Module):
 
     def __call__(
         self,
-        inputs: mx.array,
+        input_ids: mx.array,
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
     ):
         if inputs_embeds is None:
-            h = self.embed_tokens(inputs)
+            h = self.embed_tokens(input_ids)
         else:
             h = inputs_embeds
 
-        mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        if mask is None:
+            mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -195,12 +197,12 @@ class LanguageModel(nn.Module):
 
     def __call__(
         self,
-        inputs: mx.array,
+        input_ids: mx.array = None,
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+        out = self.model(input_ids, cache=cache, inputs_embeds=inputs_embeds, mask=mask)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:

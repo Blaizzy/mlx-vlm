@@ -10,6 +10,7 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 
+from ..base import BaseModel
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
@@ -54,7 +55,7 @@ class LlavaMultiModalProjector(nn.Module):
         return x
 
 
-class Model(nn.Module):
+class Model(BaseModel):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -225,6 +226,29 @@ class Model(nn.Module):
         # (1, num_image_patches*num_images + sequence_len, embed_dim)
         return mx.concatenate(final_embeddings, axis=1)
 
+    # def prefill(self, input_embeds, cache=None, prefill_step_size=512, **kwargs):
+    #     # Process input in batches for better parallelization
+    #     num_batches = (input_embeds.shape[1] + prefill_step_size - 1) // prefill_step_size
+    #     if num_batches > 1:
+    #         # Pre-allocate slices for better memory efficiency
+    #         slices = [
+    #             input_embeds[:, i*prefill_step_size:(i+1)*prefill_step_size, :]
+    #             for i in range(num_batches-1)
+    #         ]
+
+    #         # Process all full-sized batches in parallel
+    #         for slice in slices:
+    #             self.language_model(inputs_embeds=slice, cache=cache)
+    #             if cache is not None:
+    #                 mx.eval([c.state for c in cache])
+    #             mx.metal.clear_cache()
+
+    #         # Return remaining slice
+    #         remaining_embeds = input_embeds[:, (num_batches-1)*prefill_step_size:, :]
+    #         return remaining_embeds
+
+    #     return input_embeds
+
     def __call__(
         self,
         input_ids: mx.array,
@@ -235,14 +259,17 @@ class Model(nn.Module):
     ):
         merge_similar_tokens_ratio = kwargs.get("merge_similar_tokens_ratio", 1)
         filter_topk_tokens_ratio = kwargs.get("filter_topk_tokens_ratio", 1)
-        input_embddings = self.get_input_embeddings(
+        inputs_embeds = self.get_input_embeddings(
             input_ids,
             pixel_values,
             merge_similar_tokens_ratio,
             filter_topk_tokens_ratio,
         )
+        if pixel_values is None:
+            inputs_embeds = self.prefill(input_embddings, cache=cache)
+
         logits = self.language_model(
-            input_ids, cache=cache, inputs_embeds=input_embddings
+            input_ids, cache=cache, inputs_embeds=inputs_embeds
         )
         return logits
 
