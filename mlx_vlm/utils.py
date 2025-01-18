@@ -848,7 +848,7 @@ def generate_step(
     repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
     logit_bias: Optional[Dict[int, float]] = None,
-    max_size: Optional[int] = None,
+    max_kv_size: Optional[int] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -866,6 +866,7 @@ def generate_step(
         top_p (float, optional): Nulceus sampling, higher means model considers
           more less likely words.
         logit_bias (dictionary, optional): Additive logit bias.
+        max_kv_size (int, optional): Set the maximum key-value cache size.
 
     Yields:
         Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
@@ -910,11 +911,16 @@ def generate_step(
                 (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
             ]
         else:
-            if max_size is None:
+            if max_kv_size is None:
                 cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
             else:
                 cache = [
-                    RotatingKVCache(model.language_model.head_dim, n, max_size=max_size)
+                    RotatingKVCache(
+                        model.language_model.head_dim,
+                        n,
+                        max_size=max_kv_size,
+                        keep=max_kv_size // 2 if pixel_values is None else 4,
+                    )
                     for n in kv_heads
                 ]
 

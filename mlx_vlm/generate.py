@@ -89,6 +89,18 @@ def parse_arguments():
         help="Ratio of visual tokens to keep during filtering topk tokens (between 0.1 and 1.0).",
         choices=[x / 10 for x in range(1, 11)],
     )
+    parser.add_argument(
+        "--max-kv-size",
+        type=int,
+        default=None,
+        help="Set the maximum key-value cache size",
+    )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=256,
+        help="Set the prefill step size",
+    )
     return parser.parse_args()
 
 
@@ -113,6 +125,9 @@ def main():
     prompt = apply_chat_template(processor, config, prompt, num_images=len(args.image))
 
     kwargs = {}
+
+    if args.max_kv_size is not None:
+        kwargs["max_kv_size"] = args.max_kv_size
     if args.resize_shape is not None:
         resize_shape = args.resize_shape
         if len(resize_shape) not in [1, 2]:
@@ -153,7 +168,7 @@ def main():
                 prompt,
                 args.image,
                 max_tokens=args.max_tokens,
-                temp=args.temp,
+                temperature=args.temperature,
                 **kwargs,
             ):
                 response += chunk.text
