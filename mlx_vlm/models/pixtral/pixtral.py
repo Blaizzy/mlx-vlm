@@ -68,6 +68,7 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        **kwargs,
     ):
         if pixel_values is None:
             return self.language_model.model.embed_tokens(input_ids)
@@ -96,11 +97,24 @@ class Model(nn.Module):
         # Pass pixel_values as list of images, as each image is individually run through conv2d and position encoding
         # Reference code from transformers: https://github.com/huggingface/transformers/blob/main/src/transformers/models/pixtral/modeling_pixtral.py#L479C9-L479C21
         # and mistral_inference: https://github.com/mistralai/mistral-inference/blob/main/src/mistral_inference/vision_encoder.py#L85
-        *_, hidden_states = self.vision_tower(
-            [pv.transpose(0, 2, 3, 1) for pv in pixel_values], output_hidden_states=True
+        *_, hidden_states, all_attns = self.vision_tower(
+            [pv.transpose(0, 2, 3, 1) for pv in pixel_values],
+            output_hidden_states=True,
+            output_attentions=True,
         )
         # Select the hidden states from the desired layer
         selected_image_feature = hidden_states[self.vision_feature_layer]
+
+        if all_attns:
+            attn = all_attns[self.vision_feature_layer]
+            vision_filter_ratio = kwargs.get("vision_filter_ratio", 1.0)
+            vision_merge_ratio = kwargs.get("vision_merge_ratio", 1.0)
+            selected_image_feature = self.filter_topk_vision_tokens(
+                selected_image_feature, attn, vision_filter_ratio
+            )
+            selected_image_feature = self.merge_similar_vision_tokens(
+                selected_image_feature, vision_merge_ratio
+            )
 
         # Pass image features through the multi-modal projector
         image_features = self.multi_modal_projector(selected_image_feature)
@@ -144,7 +158,7 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        input_embddings = self.get_input_embeddings(input_ids, pixel_values)
+        input_embddings = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
         logits = self.language_model(
             input_ids, cache=cache, inputs_embeds=input_embddings
         )

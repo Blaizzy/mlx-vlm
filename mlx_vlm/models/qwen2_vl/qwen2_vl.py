@@ -96,13 +96,25 @@ class Model(BaseModel):
         self, image_features, inputs_embeds, input_ids
     ):
         image_token_index = self.config.image_token_index
+        num_images, num_image_patches, embed_dim = image_features.shape
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = input_ids == image_token_index
-        image_indices = np.where(image_positions)[1].tolist()
-        inputs_embeds[:, image_indices, :] = image_features
+        image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
 
-        return inputs_embeds
+        text_segments = []
+        start_idx = 0
+
+        for position in image_positions:
+            text_segments.append(inputs_embeds[:, start_idx:position])
+            start_idx = position + 1
+
+        image_embeddings = mx.split(image_features, image_features.shape[0])
+        final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
+        final_embeddings += [inputs_embeds[:, start_idx:]]
+
+        # Create a final embedding of shape
+        # (1, num_image_patches*num_images + sequence_len, embed_dim)
+        return mx.concatenate(final_embeddings, axis=1)
 
     def __call__(
         self,

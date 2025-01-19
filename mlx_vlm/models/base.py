@@ -286,22 +286,20 @@ class BaseModel(nn.Module):
 
     def filter_topk_vision_tokens(self, image_feature, attn, vision_filter_ratio=None):
         batch_size, seq_len = image_feature.shape[:2]
-
         k_tokens = (
             int(image_feature.shape[1] * vision_filter_ratio)
             if vision_filter_ratio is not None
             else None
         )  # keep 25% of the visual tokens
-        if k_tokens is None:
+
+        if k_tokens is None or k_tokens == seq_len:
             return image_feature
+
         cls_idx = 0  # self.config.image_token_index
 
         attn_rec = mx.sum(attn[:, :, cls_idx + 1 :, cls_idx], axis=1)
 
         topk_idx = mx.argsort(attn_rec, axis=1)[:, -k_tokens:]
-        # use this to plot the dominant attention map
-        # https://github.com/dvlab-research/VisionZip/blob/demo-chat/llava/model/multimodal_encoder/clip_encoder.py#L62
-        # https://github.com/dvlab-research/VisionZip/blob/demo-chat/llava/serve/gradio_web_server.py#L424
 
         # Create CLS token indices array
         # Shape: (B, 1)

@@ -1112,7 +1112,6 @@ def generate(
         if len(text) == 0:
             print("No text generated for this prompt")
             return
-
         total_tokens = (
             last_response.prompt_tokens * vision_merge_ratio
         ) * vision_filter_ratio
