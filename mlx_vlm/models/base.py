@@ -284,12 +284,12 @@ class BaseModel(nn.Module):
         self.vision_tower = None
         self.language_model = None
 
-    def get_topk_tokens(self, image_feature, attn, dominant_tokens_ratio=None):
+    def filter_topk_vision_tokens(self, image_feature, attn, vision_filter_ratio=None):
         batch_size, seq_len = image_feature.shape[:2]
 
         k_tokens = (
-            int(image_feature.shape[1] * dominant_tokens_ratio)
-            if dominant_tokens_ratio is not None
+            int(image_feature.shape[1] * vision_filter_ratio)
+            if vision_filter_ratio is not None
             else None
         )  # keep 25% of the visual tokens
         if k_tokens is None:
@@ -314,15 +314,15 @@ class BaseModel(nn.Module):
         image_feature = mx.take(image_feature, dominant_idx, axis=1)[0]
         return image_feature
 
-    def merge_similar_visual_tokens(
-        self, image_feature, visual_token_ratio, merge_ratio=0.4
+    def merge_similar_vision_tokens(
+        self, image_feature, vision_merge_ratio, merge_rate=0.4
     ):
         # Skip CLS token (first token)
         tokens = image_feature[:, 1:]
         batch_size, num_tokens, hidden_dim = tokens.shape
 
         # Calculate target number of tokens
-        target_tokens = max(1, int(num_tokens * visual_token_ratio))
+        target_tokens = max(1, int(num_tokens * vision_merge_ratio))
 
         while num_tokens > target_tokens:
             # Calculate similarities between adjacent tokens
@@ -337,7 +337,7 @@ class BaseModel(nn.Module):
 
             # Sort similarities and get indices of pairs to merge
             # We'll merge about 50% of remaining excess tokens in each iteration
-            num_to_merge = max(1, int((num_tokens - target_tokens) * merge_ratio))
+            num_to_merge = max(1, int((num_tokens - target_tokens) * merge_rate))
             merge_indices = mx.argsort(similarities, axis=-1)[:, -num_to_merge:]
 
             # Create a list to track which indices to merge

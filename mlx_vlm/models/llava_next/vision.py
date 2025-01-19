@@ -192,18 +192,20 @@ class ClipVisionModel(nn.Module):
         self,
         x: mx.array,
         output_hidden_states: Optional[bool] = None,
+        output_attn: bool = False,
     ) -> mx.array:
         x = self.embeddings(x)
         x = self.pre_layrnorm(x)
 
         encoder_states = (x,) if output_hidden_states else None
-        attns = tuple()
+        all_attns = () if output_attn else None
 
         for l in self.encoder.layers:
             x, attn = l(x, mask=None)
             if output_hidden_states:
                 encoder_states = encoder_states + (x,)
-            attns = attns + (attn,)
+            if output_attn:
+                all_attns = all_attns + (attn,)
 
         pooler_output = self.post_layernorm(x[:, 0, :])
         return pooler_output, x, encoder_states, attns

@@ -96,12 +96,12 @@ class Attention(nn.Module):
         keys = keys.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
 
-        output = mx.fast.scaled_dot_product_attention(
+        attn = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
         )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        output = attn.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return self.out_proj(output)
+        return self.out_proj(output), attn
 
 
 class MLP(nn.Module):
@@ -130,11 +130,11 @@ class EncoderLayer(nn.Module):
 
     def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
         y = self.layer_norm1(x)
-        y = self.self_attn(y, y, y, mask)
+        y, attn = self.self_attn(y, y, y, mask)
         x = x + y
         y = self.layer_norm2(x)
         y = self.mlp(y)
-        return x + y
+        return x + y, attn
 
 
 class Encoder(nn.Module):
@@ -207,17 +207,21 @@ class ClipVisionModel(nn.Module):
         self,
         x: mx.array,
         output_hidden_states: Optional[bool] = None,
+        output_attn: Optional[bool] = None,
     ) -> mx.array:
         x = self.embeddings(x)
         if self.config.model_type == "clip_vision_model":
             x = self.pre_layrnorm(x)
 
         encoder_states = (x,) if output_hidden_states else None
+        all_attns = () if output_attn else None
 
         for l in self.encoder.layers:
-            x = l(x, mask=None)
+            x, attn = l(x, mask=None)
             if output_hidden_states:
                 encoder_states = encoder_states + (x,)
+            if output_attn:
+                all_attns = all_attns + (attn,)
 
         pooler_output = self.post_layernorm(x[:, 0, :])
         return pooler_output, x, encoder_states
