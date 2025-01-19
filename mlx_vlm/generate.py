@@ -86,6 +86,7 @@ def parse_arguments():
     parser.add_argument(
         "--vision-filter-ratio",
         type=float,
+        default=1.0,
         help="Ratio of vision tokens to keep during filtering topk tokens (between 0.1 and 1.0).",
         choices=[x / 10 for x in range(1, 11)],
     )

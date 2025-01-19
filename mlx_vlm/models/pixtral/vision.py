@@ -303,9 +303,12 @@ class VisionModel(nn.Module):
         self.vision_model = PixtralVisionModel(config)
 
     def __call__(
-        self, x: List[mx.array], output_hidden_states: Optional[bool] = None
+        self,
+        x: List[mx.array],
+        output_hidden_states: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
     ) -> mx.array:
-        return self.vision_model(x, output_hidden_states)
+        return self.vision_model(x, output_hidden_states, output_attentions)
 
     def sanitize(self, weights):
         sanitized_weights = {}
