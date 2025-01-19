@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
+import mlx.nn as nn
 from PIL import Image
 from transformers.image_processing_utils import BaseImageProcessor as ImageProcessor
 from transformers.image_processing_utils import get_size_dict
@@ -97,6 +98,10 @@ class KVCache:
         self.keys[..., prev : self.offset, :] = keys
         self.values[..., prev : self.offset, :] = values
 
+    @property
+    def state(self):
+        return self.keys, self.values
+
 
 class SimpleKVCache:
     """A simple key-value cache for transformer attention layers.
@@ -148,7 +153,7 @@ class SimpleKVCache:
 
 class RotatingKVCache:
 
-    def __init__(self, head_dim, n_kv_heads, max_size, keep=0, step=256):
+    def __init__(self, head_dim, n_kv_heads, max_size, keep=None, step=256):
         self.n_kv_heads = n_kv_heads
         if isinstance(head_dim, int):
             self.k_head_dim = self.v_head_dim = head_dim
@@ -156,7 +161,7 @@ class RotatingKVCache:
             self.k_head_dim, self.v_head_dim = head_dim
         else:
             raise ValueError("head_dim must be an int or a tuple of two ints")
-        self.keep = keep
+        self.keep = keep if keep is not None else step // 2
         self.keys = None
         self.values = None
         self.offset = 0
@@ -271,3 +276,122 @@ class LanguageModelOutput:
     logits: mx.array
     cross_attention_states: Optional[List[mx.array]] = None
     encoder_outputs: Optional[List[mx.array]] = None
+
+
+class BaseModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.vision_tower = None
+        self.language_model = None
+
+    def prefill(self, input_embeds, cache=None, prefill_step_size=256):
+        # Process input in batches for better parallelization
+        num_batches = (
+            input_embeds.shape[1] + prefill_step_size - 1
+        ) // prefill_step_size
+
+        if num_batches > 1:
+            # Pre-allocate slices for better memory efficiency
+            slices = [
+                input_embeds[:, i * prefill_step_size : (i + 1) * prefill_step_size, :]
+                for i in range(num_batches - 1)
+            ]
+
+            # Process all full-sized batches in parallel
+            for slice in slices:
+                mask = create_attention_mask(slice, cache)
+                self.language_model(inputs_embeds=slice, cache=cache, mask=mask)
+                if cache is not None:
+                    mx.eval([c.state for c in cache])
+                mx.metal.clear_cache()
+
+            # Return remaining slice
+            remaining_embeds = input_embeds[
+                :, (num_batches - 1) * prefill_step_size :, :
+            ]
+            return remaining_embeds
+
+        return input_embeds
+
+    def get_topk_tokens(self, image_feature, attn, dominant_tokens_ratio=None):
+        batch_size, seq_len = image_feature.shape[:2]
+
+        k_tokens = (
+            int(image_feature.shape[1] * dominant_tokens_ratio)
+            if dominant_tokens_ratio is not None
+            else None
+        )  # keep 25% of the visual tokens
+        if k_tokens is None:
+            return image_feature
+        cls_idx = 0  # self.config.image_token_index
+
+        attn_rec = mx.sum(attn[:, :, cls_idx + 1 :, cls_idx], axis=1)
+
+        topk_idx = mx.argsort(attn_rec, axis=1)[:, -k_tokens:]
+        # use this to plot the dominant attention map
+        # https://github.com/dvlab-research/VisionZip/blob/demo-chat/llava/model/multimodal_encoder/clip_encoder.py#L62
+        # https://github.com/dvlab-research/VisionZip/blob/demo-chat/llava/serve/gradio_web_server.py#L424
+
+        # Create CLS token indices array
+        # Shape: (B, 1)
+        cls_indices = mx.full((batch_size, 1), cls_idx, dtype=mx.int32)
+
+        # Concat with CLS token index
+        # Add 1 to account for the offset after CLS token
+        dominant_idx = mx.concatenate([cls_indices, topk_idx + cls_idx + 1], axis=1)
+
+        image_feature = mx.take(image_feature, dominant_idx, axis=1)[0]
+        return image_feature
+
+    def merge_similar_visual_tokens(
+        self, image_feature, visual_token_ratio, merge_ratio=0.4
+    ):
+        # Skip CLS token (first token)
+        tokens = image_feature[:, 1:]
+        batch_size, num_tokens, hidden_dim = tokens.shape
+
+        # Calculate target number of tokens
+        target_tokens = max(1, int(num_tokens * visual_token_ratio))
+
+        while num_tokens > target_tokens:
+            # Calculate similarities between adjacent tokens
+            tokens_a = tokens[:, :-1]  # all except last
+            tokens_b = tokens[:, 1:]  # all except first
+
+            # Calculate cosine similarity
+            a_norm = mx.sqrt(mx.sum(tokens_a * tokens_a, axis=-1, keepdims=True))
+            b_norm = mx.sqrt(mx.sum(tokens_b * tokens_b, axis=-1, keepdims=True))
+            similarities = mx.sum(tokens_a * tokens_b, axis=-1)
+            similarities = similarities / (a_norm.squeeze(-1) * b_norm.squeeze(-1))
+
+            # Sort similarities and get indices of pairs to merge
+            # We'll merge about 50% of remaining excess tokens in each iteration
+            num_to_merge = max(1, int((num_tokens - target_tokens) * merge_ratio))
+            merge_indices = mx.argsort(similarities, axis=-1)[:, -num_to_merge:]
+
+            # Create a list to track which indices to merge
+            to_merge = set(merge_indices[0].tolist())
+
+            # Merge selected pairs
+            new_tokens = []
+            i = 0
+            while i < num_tokens:
+                if i < num_tokens - 1 and i in to_merge:
+                    # Merge this token with the next one
+                    merged = (tokens[:, i : i + 1] + tokens[:, i + 1 : i + 2]) / 2
+                    new_tokens.append(merged)
+                    i += 2
+                elif i > 0 and (i - 1) in to_merge:
+                    # Skip this token as it was merged in the previous step
+                    i += 1
+                else:
+                    # Keep this token as is
+                    new_tokens.append(tokens[:, i : i + 1])
+                    i += 1
+
+            # Update tokens
+            tokens = mx.concatenate(new_tokens, axis=1)
+            num_tokens = tokens.shape[1]
+
+        # Reattach CLS token
+        return mx.concatenate([image_feature[:, :1], tokens], axis=1)
