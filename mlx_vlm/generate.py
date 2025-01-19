@@ -69,10 +69,26 @@ def parse_arguments():
         help="Maximum number of tokens to generate.",
     )
     parser.add_argument(
-        "--temp", type=float, default=DEFAULT_TEMP, help="Temperature for sampling."
+        "--temperature",
+        type=float,
+        default=DEFAULT_TEMP,
+        help="Temperature for sampling.",
     )
     parser.add_argument("--chat", action="store_true", help="Chat in multi-turn style.")
     parser.add_argument("--verbose", action="store_false", help="Detailed output.")
+    parser.add_argument(
+        "--vision-merge-ratio",
+        type=float,
+        default=1.0,
+        help="Ratio of vision tokens to keep during merging similar tokens (between 0.1 and 1.0).",
+        choices=[x / 10 for x in range(1, 11)],
+    )
+    parser.add_argument(
+        "--vision-filter-ratio",
+        type=float,
+        help="Ratio of vision tokens to keep during filtering topk tokens (between 0.1 and 1.0).",
+        choices=[x / 10 for x in range(1, 11)],
+    )
     return parser.parse_args()
 
 
@@ -97,15 +113,19 @@ def main():
     prompt = apply_chat_template(processor, config, prompt, num_images=len(args.image))
 
     kwargs = {}
+    if args.max_kv_size is not None:
+        kwargs["max_kv_size"] = args.max_kv_size
     if args.resize_shape is not None:
-        resize_shape = args.resize_shape
-        if len(resize_shape) not in [1, 2]:
+        if len(args.resize_shape) not in [1, 2]:
             raise ValueError("Resize shape must be 1 or 2 integers")
         kwargs["resize_shape"] = (
-            (resize_shape[0], resize_shape[0])
-            if len(resize_shape) == 1
-            else resize_shape
+            (args.resize_shape[0],) * 2
+            if len(args.resize_shape) == 1
+            else tuple(args.resize_shape)
         )
+
+    kwargs["vision_merge_ratio"] = args.vision_merge_ratio
+    kwargs["vision_filter_ratio"] = args.vision_filter_ratio
 
     if args.chat:
         chat = []
@@ -124,7 +144,7 @@ def main():
                 prompt,
                 args.image,
                 max_tokens=args.max_tokens,
-                temp=args.temp,
+                temperature=args.temperature,
                 **kwargs,
             ):
                 response += chunk.text
@@ -139,7 +159,7 @@ def main():
             processor,
             prompt,
             image=args.image,
-            temp=args.temp,
+            temperature=args.temperature,
             max_tokens=args.max_tokens,
             verbose=args.verbose,
             **kwargs,
