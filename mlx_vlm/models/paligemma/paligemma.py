@@ -9,6 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
+from ..base import BaseModel
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
@@ -49,7 +50,7 @@ class PaliGemmaMultiModalProjector(nn.Module):
         return output
 
 
-class Model(nn.Module):
+class Model(BaseModel):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.model_type = config.model_type
@@ -64,18 +65,32 @@ class Model(nn.Module):
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
+        **kwargs,
     ):
         if pixel_values is None:
             return self.language_model.model.embed_tokens(input_ids), None
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        hidden_state, _, _ = self.vision_tower(
+        hidden_state, _, _, all_attns = self.vision_tower(
             pixel_values.transpose(0, 2, 3, 1).astype(inputs_embeds.dtype),
             output_hidden_states=True,
+            output_attentions=True,
         )
 
         image_features = hidden_state[None, :].astype(pixel_values.dtype)
+
+        if all_attns:
+            attn = all_attns[-1]
+            vision_filter_ratio = kwargs.get("vision_filter_ratio", 1.0)
+            vision_merge_ratio = kwargs.get("vision_merge_ratio", 1.0)
+            image_features = self.filter_topk_vision_tokens(
+                image_features, attn, vision_filter_ratio
+            )
+            image_features = self.merge_similar_vision_tokens(
+                image_features, vision_merge_ratio
+            )
+
         image_features = self.multi_modal_projector(image_features)
 
         final_inputs_embeds, final_attention_mask_4d = (
@@ -143,7 +158,7 @@ class Model(nn.Module):
         **kwargs,
     ):
         input_embeddings, final_attention_mask_4d = self.get_input_embeddings(
-            input_ids, pixel_values, mask
+            input_ids, pixel_values, mask, **kwargs
         )
 
         logits = self.language_model(

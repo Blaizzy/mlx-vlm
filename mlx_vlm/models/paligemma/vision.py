@@ -94,11 +94,11 @@ class Attention(nn.Module):
         keys = keys.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
 
-        output = mx.fast.scaled_dot_product_attention(
+        attn = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
         )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.out_proj(output)
+        output = attn.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.out_proj(output), attn
 
 
 class MLP(nn.Module):
@@ -127,10 +127,10 @@ class EncoderLayer(nn.Module):
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
 
     def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
-        r = self.self_attn(self.layer_norm1(x), mask)
+        r, attn = self.self_attn(self.layer_norm1(x), mask)
         h = x + r
         r = self.mlp(self.layer_norm2(h))
-        return h + r
+        return h + r, attn
 
 
 class Encoder(nn.Module):
@@ -141,19 +141,23 @@ class Encoder(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        output_hidden_states: Optional[bool] = None,
         mask: Optional[mx.array] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
     ) -> mx.array:
         encoder_states = (x,) if output_hidden_states else None
+        all_attns = () if output_attentions else None
         h = x
         for l in self.layers:
-            x = l(x, mask=mask)
+            x, attn = l(x, mask=mask)
             if output_hidden_states:
                 encoder_states = encoder_states + (x,)
+            if output_attentions:
+                all_attns = all_attns + (attn,)
 
             h = x[0]
 
-        return (h, encoder_states)
+        return (h, encoder_states, all_attns)
 
 
 class VisionEmbeddings(nn.Module):
@@ -195,16 +199,17 @@ class SigLipVisionModel(nn.Module):
         self,
         x: mx.array,
         output_hidden_states: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
     ) -> mx.array:
         x = self.embeddings(x)
 
-        encoder_outputs = self.encoder(
+        h, encoder_states, all_attns = self.encoder(
             x=x, output_hidden_states=output_hidden_states, mask=None
         )
 
-        pooler_output = self.post_layernorm(encoder_outputs[0])
+        pooler_output = self.post_layernorm(h)
 
-        return pooler_output, x, encoder_outputs[-1]
+        return pooler_output, x, encoder_states, all_attns
 
 
 class VisionModel(nn.Module):
@@ -217,9 +222,12 @@ class VisionModel(nn.Module):
         self.vision_model = SigLipVisionModel(config)
 
     def __call__(
-        self, x: mx.array, output_hidden_states: Optional[bool] = None
+        self,
+        x: mx.array,
+        output_hidden_states: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
     ) -> mx.array:
-        return self.vision_model(x, output_hidden_states)
+        return self.vision_model(x, output_hidden_states, output_attentions)
 
     def sanitize(self, weights):
         sanitized_weights = {}
