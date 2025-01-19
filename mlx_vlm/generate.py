@@ -113,8 +113,6 @@ def main():
     prompt = apply_chat_template(processor, config, prompt, num_images=len(args.image))
 
     kwargs = {}
-    if args.max_kv_size is not None:
-        kwargs["max_kv_size"] = args.max_kv_size
     if args.resize_shape is not None:
         if len(args.resize_shape) not in [1, 2]:
             raise ValueError("Resize shape must be 1 or 2 integers")
