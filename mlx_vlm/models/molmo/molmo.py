@@ -10,6 +10,7 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 
+from ..base import BaseModel
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
@@ -36,7 +37,7 @@ class ModelConfig:
         )
 
 
-class Model(nn.Module):
+class Model(BaseModel):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -79,7 +80,9 @@ class Model(nn.Module):
                     else None
                 )
 
-            image_features, cls_embed = self.vision_tower(pixel_values, image_masks)
+            image_features, cls_embed, all_attns = self.vision_tower(
+                pixel_values, image_masks, output_attentions=True
+            )
 
             # Insert image features into the input embeddings
             num_image, num_patch = image_features.shape[1:3]
@@ -94,7 +97,27 @@ class Model(nn.Module):
             image_features = image_features.reshape(
                 batch_size, num_image * num_patch, -1
             )
+
             image_input_idx = image_input_idx.reshape(batch_size, num_image * num_patch)
+
+            all_attns = all_attns.reshape(batch_size, num_image * num_patch, -1)
+            print("all_attns", all_attns.shape)
+            print("image_features", image_features.shape)
+            print("image_input_idx", image_input_idx.shape)
+            if all_attns is not None:
+                attn = all_attns[None, ...]
+                vision_filter_ratio = kwargs.get("vision_filter_ratio", 1.0)
+                vision_merge_ratio = kwargs.get("vision_merge_ratio", 1.0)
+                image_features, filter_mask = self.filter_topk_vision_tokens(
+                    image_features, attn, vision_filter_ratio
+                )
+                image_input_idx = mx.take(image_input_idx, filter_mask[0], axis=1)
+
+                image_features, merge_mask = self.merge_similar_vision_tokens(
+                    image_features, vision_merge_ratio
+                )
+                merge_mask = mx.array(np.where(merge_mask > 0)[1])
+                image_input_idx = mx.take(image_input_idx, merge_mask, axis=1)
 
             valid = np.where(image_input_idx >= 0)[0].tolist()
             batch_idx = mx.arange(batch_size)

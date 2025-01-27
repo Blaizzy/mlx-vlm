@@ -310,7 +310,7 @@ class BaseModel(nn.Module):
         dominant_idx = mx.concatenate([cls_indices, topk_idx + cls_idx + 1], axis=1)
 
         image_feature = mx.take(image_feature, dominant_idx, axis=1)[0]
-        return image_feature
+        return image_feature, dominant_idx
 
     def merge_similar_vision_tokens(
         self, image_feature, vision_merge_ratio, merge_rate=0.4
@@ -321,6 +321,9 @@ class BaseModel(nn.Module):
 
         # Calculate target number of tokens
         target_tokens = max(1, int(num_tokens * vision_merge_ratio))
+
+        # Create a mask of the same shape as tokens, initialized to True
+        mask = mx.ones((batch_size, num_tokens))
 
         while num_tokens > target_tokens:
             # Calculate similarities between adjacent tokens
@@ -343,12 +346,14 @@ class BaseModel(nn.Module):
 
             # Merge selected pairs
             new_tokens = []
+            new_mask = []
             i = 0
             while i < num_tokens:
                 if i < num_tokens - 1 and i in to_merge:
                     # Merge this token with the next one
                     merged = (tokens[:, i : i + 1] + tokens[:, i + 1 : i + 2]) / 2
                     new_tokens.append(merged)
+                    new_mask.append(mask[:, i : i + 1])  # Keep mask from first token
                     i += 2
                 elif i > 0 and (i - 1) in to_merge:
                     # Skip this token as it was merged in the previous step
@@ -356,11 +361,19 @@ class BaseModel(nn.Module):
                 else:
                     # Keep this token as is
                     new_tokens.append(tokens[:, i : i + 1])
+                    new_mask.append(mask[:, i : i + 1])
                     i += 1
 
-            # Update tokens
+            # Update tokens and mask
             tokens = mx.concatenate(new_tokens, axis=1)
+            mask = mx.concatenate(new_mask, axis=1)
             num_tokens = tokens.shape[1]
 
-        # Reattach CLS token
-        return mx.concatenate([image_feature[:, :1], tokens], axis=1)
+        # Add back CLS token
+        cls_mask = mx.ones((batch_size, 1), dtype=mx.bool_)
+        return mx.concatenate([image_feature[:, :1], tokens], axis=1), mx.concatenate(
+            [cls_mask, mask], axis=1
+        )
+
+    def merge_vision_patches(self, image_feature, vision_merge_ratio, merge_rate=0.4):
+        pass

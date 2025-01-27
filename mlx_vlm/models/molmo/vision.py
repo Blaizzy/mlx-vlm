@@ -165,7 +165,7 @@ class MultiHeadDotProductAttention(nn.Module):
         out = attn.transpose(0, 2, 1, 3)
         out = self._merge_heads(out)
         out = self.wo(out)
-        return out
+        return out, attn
 
 
 class ResidualAttentionBlock(nn.Module):
@@ -180,9 +180,10 @@ class ResidualAttentionBlock(nn.Module):
         self.ffn_norm = nn.LayerNorm(config.image_emb_dim, eps=config.image_norm_eps)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = x + self.attention(self.attention_norm(x))
+        h, attn = self.attention(self.attention_norm(x))
+        x = x + h
         x = x + self.feed_forward(self.ffn_norm(x))
-        return x
+        return x, attn
 
 
 class ResidualAttentionBlocks(nn.Module):
@@ -194,10 +195,12 @@ class ResidualAttentionBlocks(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         h = []
+        attns = []
         for block in self.resblocks:
-            x = block(x)
+            x, attn = block(x)
             h.append(x)
-        return h
+            attns.append(attn)
+        return h, attns
 
 
 def _expand_token(token, batch_size: int):
@@ -320,8 +323,8 @@ class VisionTransformer(nn.Module):
 
         x = self.pre_ln(x)
 
-        hidden_states = self.transformer(x)
-        return hidden_states
+        hidden_states, attn = self.transformer(x)
+        return hidden_states, attn
 
 
 class VisionModel(nn.Module):
@@ -340,7 +343,9 @@ class VisionModel(nn.Module):
         self.image_projector = MLP(config, config.image_emb_dim)
         self.pad_embed = mx.zeros((2, config.image_emb_dim * 2))
 
-    def encode_image(self, images: mx.array) -> mx.array:
+    def encode_image(
+        self, images: mx.array, output_attentions: Optional[bool] = False
+    ) -> mx.array:
         """
         : param images: (batch_size, num_crops, num_patch, n_pixels)
         """
@@ -353,7 +358,7 @@ class VisionModel(nn.Module):
 
         # Output all hidden states
         images = reshaped_images
-        image_features = self.image_vit(images)
+        image_features, all_attns = self.image_vit(images)
 
         if cfg.vit_layers is not None:
             features = []
@@ -373,15 +378,21 @@ class VisionModel(nn.Module):
 
         cls_embed = mx.reshape(cls_embed, (B, T, -1)) if cls_embed is not None else None
 
-        return image_features, cls_embed
+        if output_attentions:
+            return image_features, cls_embed, all_attns
+        else:
+            return image_features, cls_embed
 
     def __call__(
-        self, images: mx.array, image_masks: mx.array
+        self,
+        images: mx.array,
+        image_masks: mx.array,
+        output_attentions: Optional[bool] = None,
     ) -> Tuple[mx.array, Optional[mx.array]]:
         cfg = self.config
 
         batch_size, num_image = images.shape[:2]
-        image_features, cls_embed = self.encode_image(images)
+        image_features, cls_embed, _ = self.encode_image(images, output_attentions=True)
 
         if cfg.image_padding_embed:
             assert image_masks is not None
@@ -448,18 +459,31 @@ class VisionModel(nn.Module):
             ),
         )
 
+        all_attns = None
         if cfg.image_pooling_2d == "attention-meanq":
             query = mx.mean(image_features, axis=-2, keepdims=True)
-            image_features = self.image_pooling_2d(query, image_features)
+            image_features, all_attns = self.image_pooling_2d(query, image_features)
         elif cfg.image_pooling_2d not in {"none", "stack"}:
-            image_features = self.image_pooling_2d(
+            image_features, all_attns = self.image_pooling_2d(
                 image_features[:, :1, :], image_features
             )
 
+        if all_attns is None:
+            raise ValueError("Attention is None")
+
         h, w = cfg.llm_patches_per_crop
+
         image_features = mx.reshape(image_features, (batch_size, num_image, h * w, -1))
 
-        # # MLP layer to map the feature
+        all_attns = all_attns.reshape(
+            all_attns.shape[0], -1, all_attns.shape[1] * all_attns.shape[-1]
+        )
+        all_attns = mx.reshape(all_attns, (batch_size, num_image, h * w, -1))
+
+        # MLP layer to map the feature
         image_features = self.image_projector(image_features)
 
-        return image_features, cls_embed
+        if output_attentions:
+            return image_features, cls_embed, all_attns
+        else:
+            return image_features, cls_embed
