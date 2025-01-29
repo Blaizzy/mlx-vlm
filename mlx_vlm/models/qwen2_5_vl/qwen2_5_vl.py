@@ -114,7 +114,7 @@ class Model(nn.Module):
             input_ids, pixel_values, image_grid_thw
         )
 
-        logits = self.language_model(None, cache=cache, inputs_embeds=input_embddings)
+        logits = self.language_model(None, cache=cache, inputs_embeds=inputs_embeds)
         return logits
 
     @staticmethod
