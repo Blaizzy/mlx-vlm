@@ -298,16 +298,11 @@ class VisionModel(nn.Module):
             self.window_size // self.spatial_merge_size // self.patch_size
         )
 
-        for grid_t, grid_h, grid_w in grid_thw:
+        for grid_t, grid_h, grid_w in grid_thw.tolist():
             llm_grid_h = grid_h // self.spatial_merge_size
             llm_grid_w = grid_w // self.spatial_merge_size
 
-            grid_t = int(grid_t)
-            llm_grid_h = int(llm_grid_h)
-            llm_grid_w = int(llm_grid_w)
-
-            # Replace torch.arange with np.arange
-            index = np.arange(grid_t * llm_grid_h * llm_grid_w).reshape(
+            index = mx.arange(grid_t * llm_grid_h * llm_grid_w).reshape(
                 grid_t, llm_grid_h, llm_grid_w
             )
 
@@ -317,7 +312,7 @@ class VisionModel(nn.Module):
             num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
 
             # Replace F.pad with np.pad
-            index_padded = np.pad(
+            index_padded = mx.pad(
                 index,
                 ((0, 0), (0, pad_h), (0, pad_w)),
                 mode="constant",
@@ -333,7 +328,7 @@ class VisionModel(nn.Module):
             )
 
             # Replace permute with np.transpose
-            index_padded = np.transpose(index_padded, (0, 1, 3, 2, 4)).reshape(
+            index_padded = mx.transpose(index_padded, (0, 1, 3, 2, 4)).reshape(
                 grid_t,
                 num_windows_h * num_windows_w,
                 vit_merger_window_size,
@@ -341,22 +336,26 @@ class VisionModel(nn.Module):
             )
 
             # Replace torch operations with numpy
-            seqlens = np.sum(index_padded != -100, axis=(2, 3)).reshape(-1)
+            seqlens = mx.sum(index_padded != -100, axis=(2, 3)).reshape(-1)
             index_padded = index_padded.reshape(-1)
-            index_new = index_padded[index_padded != -100]
+            index = np.where(index_padded != -100)[
+                0
+            ].tolist()  # [i for i, x in enumerate(index_padded) if x != -100]
+            index_new = index_padded[index]
 
             window_index.append(index_new + window_index_id)
             cu_seqlens_tmp = (
-                np.cumsum(seqlens, axis=0) * self.spatial_merge_unit
+                mx.cumsum(seqlens, axis=0) * self.spatial_merge_unit
                 + cu_window_seqlens[-1]
             )
             cu_window_seqlens.extend(cu_seqlens_tmp.tolist())
             window_index_id += int(grid_t * llm_grid_h * llm_grid_w)
 
         # Replace torch.cat with np.concatenate
-        window_index = np.concatenate(window_index, axis=0)
+        window_index = mx.concatenate(window_index, axis=0)
+        cu_window_seqlens = mx.array(cu_window_seqlens)
 
-        return mx.array(window_index), mx.array(cu_window_seqlens)
+        return window_index, cu_window_seqlens
 
     def __call__(
         self,
@@ -369,10 +368,6 @@ class VisionModel(nn.Module):
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
         window_index, cu_window_seqlens = self.get_window_index(grid_thw)
 
-        # Get unique consecutive values in MLX
-        cu_window_seqlens = mx.array(cu_window_seqlens)
-
-        # Get unique consecutive values using numpy
         # Get indices of first occurrence of each unique value
         seen = set()
         idx = []
