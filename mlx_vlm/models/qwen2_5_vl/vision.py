@@ -9,7 +9,7 @@ import numpy as np
 
 @dataclass
 class VisionConfig:
-    model_type: str = "qwen2_vl"
+    model_type: str = "qwen2_5_vl"
     depth: int = 32
     hidden_size: int = 1280
     intermediate_size: int = 3420
@@ -23,6 +23,7 @@ class VisionConfig:
     layer_norm_eps: float = 1e-6
     spatial_patch_size: int = 14
     spatial_merge_size: int = 2
+    tokens_per_second: int = 2
     temporal_patch_size: int = 2
     window_size: int = 112
     patch_size: int = 14
@@ -93,7 +94,7 @@ class VisionRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (
             self.theta ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
         )
-        seq = mx.arange(seqlen.tolist(), dtype=inv_freq.dtype)
+        seq = mx.arange(seqlen.item(), dtype=inv_freq.dtype)
         freqs = mx.outer(seq, inv_freq)
         return freqs
 
@@ -173,12 +174,14 @@ class Attention(nn.Module):
 
         q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
         k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
-        attention_mask = mx.ones((1, seq_length, seq_length), dtype=x.dtype)
+        attention_mask = mx.full(
+            (1, seq_length, seq_length), mx.finfo(q.dtype).min, dtype=q.dtype
+        )
 
         for i in range(1, len(cu_seqlens)):
             start = int(cu_seqlens[i - 1])
             end = int(cu_seqlens[i])
-            attention_mask[start:end, start:end] = 0
+            attention_mask[..., start:end, start:end] = 0
 
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
@@ -254,8 +257,7 @@ class VisionModel(nn.Module):
     def rot_pos_emb(self, grid_thw):
         pos_ids = []
 
-        for t, h, w in grid_thw:
-            h, w = int(h), int(w)  # Ensure h and w are integers
+        for t, h, w in grid_thw.tolist():
             hpos_ids = mx.expand_dims(mx.arange(h), 1)
             hpos_ids = mx.repeat(hpos_ids, w, axis=1)
             hpos_ids = hpos_ids.reshape(
@@ -284,10 +286,9 @@ class VisionModel(nn.Module):
         pos_ids = mx.concatenate(pos_ids, axis=0)
         max_grid_size = mx.max(grid_thw[:, 1:])
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+        rotary_pos_emb = rotary_pos_emb_full[pos_ids]
 
-        rotary_pos_emb_full = rotary_pos_emb_full[pos_ids]
-
-        return rotary_pos_emb_full.reshape(pos_ids.shape[0], -1)
+        return rotary_pos_emb.reshape(pos_ids.shape[0], -1)
 
     def get_window_index(self, grid_thw):
         window_index = []
@@ -381,7 +382,6 @@ class VisionModel(nn.Module):
                 idx.append(i)
 
         idx = mx.array(idx, dtype=mx.int32)
-        idx = mx.argsort(idx)
         cu_window_seqlens = cu_window_seqlens[idx]
 
         seq_len, _ = hidden_states.shape
