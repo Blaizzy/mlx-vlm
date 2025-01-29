@@ -19,8 +19,8 @@ class TextConfig:
     rms_norm_eps: float
     vocab_size: int
     num_key_value_heads: Optional[int] = None
-    max_position_embeddings: Optional[int] = 32768
-    rope_theta: float = 1000000
+    max_position_embeddings: Optional[int] = 128000
+    rope_theta: float = 1000000.0
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = True

@@ -20,7 +20,11 @@ class ModelConfig:
     vision_config: VisionConfig
     model_type: str
     ignore_index: int = -100
-    image_token_index: int = 151655
+    image_token_id: int = 151655
+    video_token_id: int = 151656
+    vision_start_token_id: int = 151652
+    vision_end_token_id: int = 151653
+    vision_token_id: int = 151654
     vision_feature_select_strategy: str = "default"
     vision_feature_layer: int = -2
     vocab_size: int = 32000
@@ -82,13 +86,12 @@ class Model(nn.Module):
     def _merge_input_ids_with_image_features(
         self, image_features, inputs_embeds, input_ids
     ):
-        image_token_index = self.config.image_token_index
+        image_token_id = self.config.image_token_id
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = input_ids == image_token_index
+        image_positions = input_ids == image_token_id
         image_indices = np.where(image_positions)[1].tolist()
         inputs_embeds[:, image_indices, :] = image_features
-
         return inputs_embeds
 
     def __call__(
@@ -100,10 +103,14 @@ class Model(nn.Module):
         **kwargs,
     ):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
+        second_per_grid_ts = kwargs.pop("second_per_grid_ts", None)
+        video_grid_thw = kwargs.pop("video_grid_thw", None)
+        position_ids = kwargs.pop("position_ids", None)
+
         if image_grid_thw is not None:
             image_grid_thw = mx.array(image_grid_thw)
 
-        input_embddings = self.get_input_embeddings(
+        inputs_embeds = self.get_input_embeddings(
             input_ids, pixel_values, image_grid_thw
         )
 
