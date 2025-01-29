@@ -61,15 +61,15 @@ class TestModels(unittest.TestCase):
         self.assertEqual(vision_tower.model_type, model_type)
 
         batch_size = 1
-
-        if channel_first:
-            input_tensor = mx.random.uniform(
-                shape=(batch_size, num_channels, image_size[0], image_size[1])
-            )
+        if model_type == "qwen2_5_vl":
+            input_tensor = mx.random.uniform(shape=(image_size[0], image_size[1]))
         else:
-            input_tensor = mx.random.uniform(
-                shape=(batch_size, image_size[0], image_size[1], num_channels)
+            shape = (
+                (batch_size, num_channels, image_size[0], image_size[1])
+                if channel_first
+                else (batch_size, image_size[0], image_size[1], num_channels)
             )
+            input_tensor = mx.random.uniform(shape=shape)
 
         if "image_masks" in inspect.signature(vision_tower.__call__).parameters:
             input_tensor = input_tensor.transpose(0, 3, 1, 2)
@@ -794,6 +794,76 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
             vision_feature_layer=-1,
             grid_thw=mx.ones((1, 3)),  # image temporals shape (num_images, 3)
+        )
+
+    def test_qwen2_5_vl(self):
+        from mlx_vlm.models import qwen2_5_vl
+
+        text_config = qwen2_5_vl.TextConfig(
+            model_type="qwen2_5_vl",
+            hidden_size=1280,
+            num_hidden_layers=32,
+            intermediate_size=3420,
+            num_attention_heads=16,
+            rms_norm_eps=1e-6,
+            vocab_size=32000,
+            num_key_value_heads=16,
+            max_position_embeddings=128000,
+            rope_theta=1000000.0,
+            rope_traditional=False,
+            rope_scaling=None,
+            tie_word_embeddings=True,
+        )
+
+        vision_config = qwen2_5_vl.VisionConfig(
+            model_type="qwen2_5_vl",
+            depth=32,
+            hidden_size=1280,
+            intermediate_size=3420,
+            out_hidden_size=1536,
+            num_heads=16,
+            image_size=384,
+            vocab_size=32000,
+            mlp_ratio=4.0,
+            in_channels=3,
+            layer_norm_eps=1e-6,
+            spatial_patch_size=14,
+            spatial_merge_size=2,
+            tokens_per_second=2,
+            temporal_patch_size=2,
+            window_size=112,
+            patch_size=14,
+            fullatt_block_indexes=[7, 15, 23, 31],
+        )
+
+        config = qwen2_5_vl.ModelConfig(
+            model_type="qwen2_5_vl",
+            text_config=text_config,
+            vision_config=vision_config,
+            image_token_id=151655,
+            video_token_id=151656,
+            vocab_size=32000,
+        )
+
+        model = qwen2_5_vl.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.out_hidden_size,
+            config.vision_config.in_channels,
+            (140, 1176),
+            vision_feature_layer=-1,
+            grid_thw=mx.array(
+                [[1, 10, 14]], dtype=mx.int64
+            ),  # image temporals shape (num_images, 3)
         )
 
     def test_mllama(self):

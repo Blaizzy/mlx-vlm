@@ -66,6 +66,7 @@ def get_message_json(
         "idefics2": "message_list_with_image",
         "idefics3": "message_list_with_image",
         "qwen2_vl": "message_list_with_image",
+        "qwen2_5_vl": "message_list_with_image",
         "llava": "message_list_with_image",
         "llava_next": "message_list_with_image",
         "llava-qwen2": "message_with_image_token_new_line",
