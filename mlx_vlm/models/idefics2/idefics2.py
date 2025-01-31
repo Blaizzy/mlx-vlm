@@ -43,8 +43,9 @@ class ModelConfig:
     perceiver_config: PerceiverConfig
     model_type: str
     ignore_index: int = -100
-    image_token_index: int = 32001
+    image_token_id: int = 32001
     vocab_size: int = 151936
+    image_token_index: Optional[int] = None
 
     @classmethod
     def from_dict(cls, params):
@@ -55,6 +56,10 @@ class ModelConfig:
                 if k in inspect.signature(cls).parameters
             }
         )
+
+    def __post_init__(self):
+        if self.image_token_index is None:
+            self.image_token_index = self.image_token_id
 
 
 class Idefics2PerceiverAttention(nn.Module):
@@ -219,9 +224,7 @@ class Model(nn.Module):
         pooler_output, embeddings, hidden_state = self.vision_model(
             pixel_values[0].transpose(0, 2, 3, 1), output_hidden_states=True
         )
-
-        image_features = pooler_output[None, :].astype(pixel_values.dtype)
-
+        image_features = pooler_output.astype(pixel_values.dtype)
         image_features = self.connector(image_features, mask=None)
 
         final_inputs_embeds = self._prepare_inputs_for_multimodal(
@@ -231,25 +234,21 @@ class Model(nn.Module):
 
     def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
         image_token_index = self.config.image_token_index
-        num_images, num_image_patches, embed_dim = image_features.shape
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
+        image_positions = np.where(input_ids == image_token_index)[1].tolist()
+        num_images, _, vision_hidden_size = image_features.shape
 
-        text_segments = []
-        start_idx = 0
+        reshaped_image_hidden_states = image_features.reshape(-1, vision_hidden_size)
 
-        for position in image_positions:
-            text_segments.append(inputs_embeds[:, start_idx:position])
-            start_idx = position + 1
+        # cast to the dtype of the input_embeds to support quantized models
+        reshaped_image_hidden_states = reshaped_image_hidden_states.astype(
+            inputs_embeds.dtype
+        )
 
-        image_embeddings = mx.split(image_features, image_features.shape[0])
-        final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
-        final_embeddings += [inputs_embeds[:, start_idx:]]
+        inputs_embeds[:, image_positions, :] = reshaped_image_hidden_states
 
-        # Create a final embedding of shape
-        # (1, num_image_patches*num_images + sequence_len, embed_dim)
-        return mx.concatenate(final_embeddings, axis=1)
+        return inputs_embeds
 
     def __call__(
         self,

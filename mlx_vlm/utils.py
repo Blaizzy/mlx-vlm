@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -226,7 +226,9 @@ def update_module_configs(model_config, model_class, config, modules):
 
 def get_class_predicate(skip_vision, weights=None):
     if skip_vision:
-        return lambda _, m: not ("vision_model" in m.name or "vision_tower" in m.name)
+        return lambda p, m: hasattr(m, "to_quantized") and not (
+            "vision_model" in p or "vision_tower" in p
+        )
     else:
         if weights:
             return lambda p, m: (
@@ -409,7 +411,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         ```
 
         ```bash
-        python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temp 0.0
+        python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temp 0.0 --prompt "Describe this image." --image <path_to_image>
         ```
         """
     )
@@ -666,7 +668,6 @@ def convert(
     revision: Optional[str] = None,
     dequantize: bool = False,
     skip_vision: bool = False,
-    skip_vision_non_divisible: bool = False,
     trust_remote_code: bool = True,
 ):
     print("[INFO] Loading")
@@ -686,7 +687,7 @@ def convert(
         print("[INFO] Quantizing")
         model.load_weights(list(weights.items()))
         weights, config = quantize_model(
-            model, config, q_group_size, q_bits, skip_vision, skip_vision_non_divisible
+            model, config, q_group_size, q_bits, skip_vision
         )
 
     if dequantize:
@@ -838,6 +839,7 @@ def generate_step(
     model: nn.Module,
     pixel_values,
     mask,
+    *,
     max_tokens: int = 256,
     temp: float = 0.0,
     repetition_penalty: Optional[float] = None,
@@ -1009,7 +1011,6 @@ def stream_generate(
     if not image:
         input_ids = prompt_tokens[None, :]
         pixel_values = mask = None
-        kwargs = {}
     else:
         inputs = prepare_inputs(
             processor, image, prompt, image_token_index, resize_shape
@@ -1017,11 +1018,12 @@ def stream_generate(
         input_ids = inputs["input_ids"]
         pixel_values = inputs["pixel_values"]
         mask = inputs["attention_mask"]
-        kwargs = {
+        data_kwargs = {
             k: v
             for k, v in inputs.items()
             if k not in ["input_ids", "pixel_values", "attention_mask"]
         }
+        kwargs.update(data_kwargs)
 
     detokenizer = processor.detokenizer
     detokenizer.reset()
