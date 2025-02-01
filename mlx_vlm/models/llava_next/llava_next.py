@@ -100,6 +100,8 @@ class Model(nn.Module):
 
         # Pass image features through the multi-modal projector
         image_features = self.multi_modal_projector(selected_image_feature)
+
+        # Add a newline token to the image features
         if self.image_newline is not None:
             self.image_newline = np.array(self.image_newline)[None, None, :]
             self.image_newline = np.broadcast_to(
@@ -120,18 +122,22 @@ class Model(nn.Module):
         image_token_index = self.config.image_token_index
         num_images, num_image_patches, embed_dim = image_features.shape
 
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
-        num_images, _, vision_hidden_size = image_features.shape
+        image_positions = np.where(input_ids == image_token_index)[1].tolist()
 
-        reshaped_image_hidden_states = image_features.reshape(-1, vision_hidden_size)
+        text_segments = []
+        start_idx = 0
 
-        # cast to the dtype of the input_embeds to support quantized models
-        reshaped_image_hidden_states = reshaped_image_hidden_states.astype(
-            inputs_embeds.dtype
-        )
-        inputs_embeds[:, image_positions, :] = reshaped_image_hidden_states
-        return inputs_embeds
+        for position in image_positions:
+            text_segments.append(inputs_embeds[:, start_idx:position])
+            start_idx = position + 1
+
+        image_embeddings = mx.split(image_features, image_features.shape[0])
+        final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
+        final_embeddings += [inputs_embeds[:, start_idx:]]
+
+        # Create a final embedding of shape
+        # (1, num_image_patches*num_images + sequence_len, embed_dim)
+        return mx.concatenate(final_embeddings, axis=1)
 
     def __call__(
         self,
