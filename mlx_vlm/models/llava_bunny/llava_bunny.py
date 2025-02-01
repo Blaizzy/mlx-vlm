@@ -161,6 +161,8 @@ class Model(nn.Module):
 
     def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
         image_token_index = self.config.image_token_index
+        num_images, num_image_patches, embed_dim = image_features.shape
+
         batch_size, seq_length, embed_dim = inputs_embeds.shape
         num_images, num_image_patches, _ = image_features.shape
 
@@ -183,6 +185,8 @@ class Model(nn.Module):
         # Create a final embedding of shape
         # (batch_size, num_image_patches + sequence_len, embed_dim)
         return mx.concatenate(final_embeddings, axis=0)
+
+        # Create a final embedding of shape
 
     def __call__(
         self,
