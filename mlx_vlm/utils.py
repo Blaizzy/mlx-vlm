@@ -1008,22 +1008,27 @@ def stream_generate(
     resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)
 
-    if not image:
-        input_ids = prompt_tokens[None, :]
-        pixel_values = mask = None
+    if kwargs.get("pixel_values") is None:
+        if not image:
+            input_ids = prompt_tokens[None, :]
+            pixel_values = mask = None
+        else:
+            inputs = prepare_inputs(
+                processor, image, prompt, image_token_index, resize_shape
+            )
+            input_ids = inputs["input_ids"]
+            pixel_values = inputs["pixel_values"]
+            mask = inputs["attention_mask"]
+            data_kwargs = {
+                k: v
+                for k, v in inputs.items()
+                if k not in ["input_ids", "pixel_values", "attention_mask"]
+            }
+            kwargs.update(data_kwargs)
     else:
-        inputs = prepare_inputs(
-            processor, image, prompt, image_token_index, resize_shape
-        )
-        input_ids = inputs["input_ids"]
-        pixel_values = inputs["pixel_values"]
-        mask = inputs["attention_mask"]
-        data_kwargs = {
-            k: v
-            for k, v in inputs.items()
-            if k not in ["input_ids", "pixel_values", "attention_mask"]
-        }
-        kwargs.update(data_kwargs)
+        input_ids = kwargs.pop("input_ids")
+        pixel_values = kwargs.pop("pixel_values")
+        mask = kwargs.pop("mask")
 
     detokenizer = processor.detokenizer
     detokenizer.reset()
@@ -1093,11 +1098,20 @@ def generate(
 
     if verbose:
         print("=" * 10)
-        print("Image:", image, "\n")
+        if image is not None:
+            input_path = image
+        elif kwargs.get("video") is not None:
+            input_path = kwargs.get("video")
+        else:
+            input_path = None
+
+        print(f"Files: {input_path}", "\n")
+
         print("Prompt:", prompt)
 
     text = ""
     last_response = None
+
     for response in stream_generate(model, processor, prompt, image, **kwargs):
         if verbose:
             print(response.text, end="", flush=True)
