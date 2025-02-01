@@ -82,7 +82,7 @@ def get_message_json(
         "message_with_numbered_image_tokens": lambda: handle_image_token(
             " ".join([f"<|image_{i+1}|>" for i in range(num_images)])
         ),
-        "prompt_only": prompt,
+        "prompt_only": lambda: prompt,
         "prompt_with_image_token": lambda: "<image>" * num_images + prompt,
         "message_video_with_text": handle_video_with_text,
     }
@@ -96,12 +96,12 @@ def get_message_json(
         "llava_next": "message_list_with_image",
         "mllama": "message_list_with_image",
         # Models that can handle both image and video formats
-        "qwen2_vl": lambda: (
+        "qwen2_vl": (
             "message_video_with_text"
             if kwargs.get("video")
             else "message_list_with_image"
         ),
-        "qwen2_5_vl": lambda: (
+        "qwen2_5_vl": (
             "message_video_with_text"
             if kwargs.get("video")
             else "message_list_with_image"
