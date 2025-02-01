@@ -16,8 +16,7 @@ import numpy as np
 import requests
 from PIL import Image
 
-from mlx_vlm import load
-from mlx_vlm.utils import generate, load_image
+from .utils import generate, load, load_image
 
 # This is a beta version of the video generation script.
 # It is not fully tested and may not work as expected.

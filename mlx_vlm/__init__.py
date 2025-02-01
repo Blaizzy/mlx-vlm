@@ -8,3 +8,4 @@ from .utils import (
     quantize_model,
 )
 from .version import __version__
+from .video_generate import VideoFrameExtractor, process_vision_info
