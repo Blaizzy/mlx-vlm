@@ -121,6 +121,11 @@ MLX-VLM also supports video analysis such as captioning, summarization, and more
 The following models support video chat:
 
 1. Qwen2-VL
+2. Qwen2.5-VL
+3. Idefics3
+4. LLaVA
+
+With more coming soon.
 
 ### Usage Examples
 
