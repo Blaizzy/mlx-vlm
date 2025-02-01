@@ -161,28 +161,20 @@ class Model(nn.Module):
 
     def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
         image_token_index = self.config.image_token_index
-        batch_size, seq_length, embed_dim = inputs_embeds.shape
-        num_images, num_image_patches, _ = image_features.shape
+        num_images, num_image_patches, embed_dim = image_features.shape
 
-        # Positions of <image> tokens in input_ids for each batch
-        image_positions = mx.argmax(input_ids == image_token_index, axis=1)
+        # Positions of <image> tokens in input_ids, assuming batch size is 1
+        image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
+        num_images, _, vision_hidden_size = image_features.shape
 
-        final_embeddings = []
-        for b in range(batch_size):
-            text_segments = []
-            start_idx = 0
-            position = int(image_positions[b].item())
+        reshaped_image_hidden_states = image_features.reshape(-1, vision_hidden_size)
 
-            text_segments.append(inputs_embeds[b : b + 1, start_idx:position])
-            text_segments.append(image_features[b : b + 1])
-            text_segments.append(inputs_embeds[b : b + 1, position + 1 :])
-
-            batch_embeddings = mx.concatenate(text_segments, axis=1)
-            final_embeddings.append(batch_embeddings)
-
-        # Create a final embedding of shape
-        # (batch_size, num_image_patches + sequence_len, embed_dim)
-        return mx.concatenate(final_embeddings, axis=0)
+        # cast to the dtype of the input_embeds to support quantized models
+        reshaped_image_hidden_states = reshaped_image_hidden_states.astype(
+            inputs_embeds.dtype
+        )
+        inputs_embeds[:, image_positions, :] = reshaped_image_hidden_states
+        return inputs_embeds
 
     def __call__(
         self,

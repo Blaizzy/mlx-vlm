@@ -110,27 +110,16 @@ class Model(nn.Module):
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
+        num_images, _, vision_hidden_size = image_features.shape
 
-        if len(image_positions) != num_images:
-            raise ValueError(
-                f"The number of image tokens ({len(image_positions)}) does not "
-                f" match the number of image inputs ({num_images})."
-            )
+        reshaped_image_hidden_states = image_features.reshape(-1, vision_hidden_size)
 
-        text_segments = []
-        start_idx = 0
-
-        for position in image_positions:
-            text_segments.append(inputs_embeds[:, start_idx:position])
-            start_idx = position + 1
-
-        image_embeddings = mx.split(image_features, image_features.shape[0])
-        final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
-        final_embeddings += [inputs_embeds[:, start_idx:]]
-
-        # Create a final embedding of shape
-        # (1, num_image_patches*num_images + sequence_len, embed_dim)
-        return mx.concatenate(final_embeddings, axis=1)
+        # cast to the dtype of the input_embeds to support quantized models
+        reshaped_image_hidden_states = reshaped_image_hidden_states.astype(
+            inputs_embeds.dtype
+        )
+        inputs_embeds[:, image_positions, :] = reshaped_image_hidden_states
+        return inputs_embeds
 
     def __call__(
         self,
