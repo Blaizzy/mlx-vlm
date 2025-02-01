@@ -100,6 +100,8 @@ class Model(nn.Module):
 
         # Pass image features through the multi-modal projector
         image_features = self.multi_modal_projector(selected_image_feature)
+
+        # Add a newline token to the image features
         if self.image_newline is not None:
             self.image_newline = np.array(self.image_newline)[None, None, :]
             self.image_newline = np.broadcast_to(
@@ -118,9 +120,10 @@ class Model(nn.Module):
         self, image_features, inputs_embeds, input_ids
     ):
         image_token_index = self.config.image_token_index
+        num_images, num_image_patches, embed_dim = image_features.shape
 
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
+        image_positions = np.where(input_ids == image_token_index)[1].tolist()
+
         text_segments = []
         start_idx = 0
 

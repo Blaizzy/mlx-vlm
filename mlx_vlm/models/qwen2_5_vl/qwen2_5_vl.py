@@ -87,9 +87,12 @@ class Model(nn.Module):
         self, image_features, inputs_embeds, input_ids
     ):
         image_token_id = self.config.image_token_id
-
+        video_token_id = self.config.video_token_id
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = input_ids == image_token_id
+        if mx.sum(image_positions) == 0:
+            image_positions = input_ids == video_token_id
+
         image_indices = np.where(image_positions)[1].tolist()
         inputs_embeds[:, image_indices, :] = image_features
         return inputs_embeds
@@ -106,13 +109,12 @@ class Model(nn.Module):
         second_per_grid_ts = kwargs.pop("second_per_grid_ts", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         position_ids = kwargs.pop("position_ids", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if image_grid_thw is not None:
             image_grid_thw = mx.array(image_grid_thw)
 
-        inputs_embeds = self.get_input_embeddings(
-            input_ids, pixel_values, image_grid_thw
-        )
+        inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
 
         logits = self.language_model(None, cache=cache, inputs_embeds=inputs_embeds)
         return logits

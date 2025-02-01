@@ -1,5 +1,5 @@
 def get_message_json(
-    model_name, prompt, role="user", skip_image_token=False, num_images=1
+    model_name, prompt, role="user", skip_image_token=False, num_images=1, **kwargs
 ):
     """
     Get the appropriate JSON message based on the specified model.
@@ -16,69 +16,111 @@ def get_message_json(
     """
     model_name = model_name.lower()
 
-    def create_message(role, prompt):
-        return {"role": role, "content": prompt}
+    # Base message creation
+    def create_text_message(text):
+        return {"type": "text", "text": text}
 
-    def add_image_tokens(message, token_format):
-        if role == "system":
-            return message
+    def create_text_content_message(text):
+        return {"type": "text", "content": text}
+
+    def create_video_message(video_path, max_pixels=224 * 224, fps=1):
+        return {
+            "type": "video",
+            "video": video_path,
+            "max_pixels": max_pixels,
+            "fps": fps,
+        }
+
+    # Message format handlers
+    def handle_list_with_image():
+        content = [create_text_message(prompt)]
         if role == "user" and not skip_image_token:
-            if isinstance(message["content"], list):
-                if model_name in ["pixtral", "idefics3"]:
-                    message["content"] = [{"type": "image"}] * num_images + message[
-                        "content"
-                    ]
-                else:
-                    message["content"].extend([{"type": "image"}] * num_images)
-            else:
-                if model_name == "phi3_v":
-                    message["content"] = f"{token_format}{message['content']}"
-                else:
-                    message["content"] = (
-                        f"{token_format * num_images}{message['content']}"
-                    )
-        if role == "assistant" and model_name == "pixtral":
+            image_tokens = [{"type": "image"}] * num_images
+            content = (
+                image_tokens + content
+                if model_name in ["pixtral", "idefics3"]
+                else content + image_tokens
+            )
+        return {"role": role, "content": content}
+
+    def handle_list_with_image_type():
+        message = {"role": role, "content": [create_text_content_message(prompt)]}
+        if role == "user" and not skip_image_token:
+            message["content"] = [{"type": "image"}] * num_images + message["content"]
+        if role == "assistant":
             message["content"] = message["content"][0]["content"]
         return message
 
+    def handle_image_token(token_format):
+        content = prompt
+        if role != "system" and role == "user" and not skip_image_token:
+            prefix = (
+                token_format * num_images if model_name != "phi3_v" else token_format
+            )
+            content = f"{prefix}{content}"
+        return {"role": role, "content": content}
+
+    def handle_video_with_text():
+        return {
+            "role": "user",
+            "content": [
+                create_video_message(
+                    kwargs["video"],
+                    kwargs.get("max_pixels", 224 * 224),
+                    kwargs.get("fps", 1),
+                ),
+                create_text_message(prompt),
+            ],
+        }
+
+    # Message format mapping
     message_formats = {
-        "message_list_with_image": lambda: add_image_tokens(
-            {"role": role, "content": [{"type": "text", "text": prompt}]}, ""
-        ),
-        "message_list_with_image_type": lambda: add_image_tokens(
-            {"role": role, "content": [{"type": "text", "content": prompt}]}, ""
-        ),
-        "message_with_image_token": lambda: add_image_tokens(
-            create_message(role, prompt), "<image>"
-        ),
-        "message_with_image_token_new_line": lambda: add_image_tokens(
-            create_message(role, prompt), "<image>\n"
-        ),
-        "message_with_numbered_image_tokens": lambda: add_image_tokens(
-            create_message(role, prompt),
-            " ".join([f"<|image_{i+1}|>" for i in range(num_images)]),
+        "message_list_with_image": handle_list_with_image,
+        "message_list_with_image_type": handle_list_with_image_type,
+        "message_with_image_token": lambda: handle_image_token("<image>"),
+        "message_with_image_token_new_line": lambda: handle_image_token("<image>\n"),
+        "message_with_numbered_image_tokens": lambda: handle_image_token(
+            " ".join([f"<|image_{i+1}|>" for i in range(num_images)])
         ),
         "prompt_only": lambda: prompt,
         "prompt_with_image_token": lambda: "<image>" * num_images + prompt,
+        "message_video_with_text": handle_video_with_text,
     }
 
+    # Model to format mapping
     model_to_format = {
+        # Models using message_list_with_image format
         "idefics2": "message_list_with_image",
         "idefics3": "message_list_with_image",
-        "qwen2_vl": "message_list_with_image",
-        "qwen2_5_vl": "message_list_with_image",
         "llava": "message_list_with_image",
         "llava_next": "message_list_with_image",
+        "mllama": "message_list_with_image",
+        # Models that can handle both image and video formats
+        "qwen2_vl": (
+            "message_video_with_text"
+            if kwargs.get("video")
+            else "message_list_with_image"
+        ),
+        "qwen2_5_vl": (
+            "message_video_with_text"
+            if kwargs.get("video")
+            else "message_list_with_image"
+        ),
+        # Models using message_with_image_token_new_line format
         "llava-qwen2": "message_with_image_token_new_line",
         "bunny-llama": "message_with_image_token_new_line",
+        # Models using message_with_numbered_image_tokens format
         "phi3_v": "message_with_numbered_image_tokens",
+        # Models using message_with_image_token format
         "multi_modality": "message_with_image_token",
-        "pixtral": "message_list_with_image_type",
-        "paligemma": "prompt_with_image_token",
-        "florence2": "prompt_only",
-        "mllama": "message_list_with_image",
-        "molmo": "prompt_only",
         "deepseek_vl_v2": "message_with_image_token_new_line",
+        # Models using message_list_with_image_type format
+        "pixtral": "message_list_with_image_type",
+        # Models using prompt_with_image_token format
+        "paligemma": "prompt_with_image_token",
+        # Models using prompt_only format
+        "florence2": "prompt_only",
+        "molmo": "prompt_only",
     }
 
     if num_images > 1 and model_name in [
@@ -100,6 +142,25 @@ def get_message_json(
         raise ValueError(f"Unsupported model: {model_name}")
 
 
+def get_chat_template(processor, messages, add_generation_prompt, tokenize=False):
+    if "chat_template" in processor.__dict__.keys():
+        return processor.apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+        )
+    elif "tokenizer" in processor.__dict__.keys():
+        return processor.tokenizer.apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+        )
+    else:
+        raise ValueError(
+            "Error: processor does not have 'chat_template' or 'tokenizer' attribute."
+        )
+
+
 def apply_chat_template(
     processor,
     config,
@@ -107,6 +168,7 @@ def apply_chat_template(
     add_generation_prompt=True,
     return_messages=False,
     num_images=1,
+    **kwargs,
 ):
     config = config if isinstance(config, dict) else config.__dict__
 
@@ -117,6 +179,7 @@ def apply_chat_template(
                 p,
                 skip_image_token=not is_first,
                 num_images=num_images,
+                **kwargs,
             )
         elif isinstance(p, dict) and "role" in p:
             return get_message_json(
@@ -125,6 +188,7 @@ def apply_chat_template(
                 p["role"],
                 skip_image_token=not is_first,
                 num_images=num_images,
+                **kwargs,
             )
         else:
             raise ValueError("Invalid prompt type")
@@ -155,21 +219,4 @@ def apply_chat_template(
     if config["model_type"] in ["paligemma", "molmo", "florence2"]:
         return messages[-1]
 
-    if "chat_template" in processor.__dict__.keys():
-        return processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-
-    elif "tokenizer" in processor.__dict__.keys():
-        return processor.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-
-    else:
-        raise ValueError(
-            "Error: processor does not have 'chat_template' or 'tokenizer' attribute."
-        )
+    return get_chat_template(processor, messages, add_generation_prompt)
