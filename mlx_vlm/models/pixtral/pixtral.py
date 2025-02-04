@@ -75,29 +75,20 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get number of images
-        num_images = len(pixel_values[0])
-
         # Get the ouptut hidden states from the vision model
         if isinstance(pixel_values, list):
-            if input_ids.shape[0] == 1:  # Batch size is 1
-                pixel_values = mx.concatenate(
-                    [mx.array(pv) for pv in pixel_values[0]], axis=1
-                )[None, ...]
-            else:  # Batch size is greater than 1
-                pixel_values = mx.concatenate(
-                    [mx.array(pv) for pv in pixel_values], axis=0
-                )
+            pixel_values = mx.concatenate(
+                [mx.array(pv)[None, ...] for pv in pixel_values], axis=0
+            )
         if pixel_values.ndim == 3:
             pixel_values = pixel_values[None, ...]
-
-        pixel_values = mx.split(pixel_values, num_images, axis=2)
 
         # Pass pixel_values as list of images, as each image is individually run through conv2d and position encoding
         # Reference code from transformers: https://github.com/huggingface/transformers/blob/main/src/transformers/models/pixtral/modeling_pixtral.py#L479C9-L479C21
         # and mistral_inference: https://github.com/mistralai/mistral-inference/blob/main/src/mistral_inference/vision_encoder.py#L85
         *_, hidden_states = self.vision_tower(
-            [pv.transpose(0, 2, 3, 1) for pv in pixel_values], output_hidden_states=True
+            [pv[None, ...].transpose(0, 2, 3, 1) for pv in pixel_values],
+            output_hidden_states=True,
         )
         # Select the hidden states from the desired layer
         selected_image_feature = hidden_states[self.vision_feature_layer]
@@ -118,7 +109,7 @@ class Model(nn.Module):
         num_images, num_image_patches, embed_dim = image_features.shape
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
+        image_positions = np.where(input_ids == image_token_index)[1].tolist()
 
         text_segments = []
         start_idx = 0
