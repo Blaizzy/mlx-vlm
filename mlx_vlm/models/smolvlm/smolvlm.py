@@ -10,6 +10,7 @@ from ..idefics3 import (
     VisionModel,
 )
 
+
 class Model(Idefics3Model):
     def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
         # Assumes bs == 1

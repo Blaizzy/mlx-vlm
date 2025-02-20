@@ -22,9 +22,7 @@ def main():
     parser.add_argument(
         "--prompt", default="Describe this video.", help="Text prompt for the model"
     )
-    parser.add_argument(
-        "--system", type=str, required=False, help="System prompt"
-    )
+    parser.add_argument("--system", type=str, required=False, help="System prompt")
     parser.add_argument(
         "--temp", type=float, default=0.7, help="Temperature for generation"
     )
@@ -59,12 +57,15 @@ def main():
         }
     ]
     if args.system:
-        messages.insert(0, {
-            "role": "system",
-            "content": [
-                {"type": "text", "text": args.video},
-            ],
-        })
+        messages.insert(
+            0,
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": args.video},
+                ],
+            },
+        )
 
     inputs = processor.apply_chat_template(
         messages,

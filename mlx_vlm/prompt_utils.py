@@ -1,5 +1,6 @@
 from functools import partial
 
+
 def get_message_json(
     model_name, prompt, role="user", skip_image_token=False, num_images=1, **kwargs
 ):
@@ -34,15 +35,11 @@ def get_message_json(
         }
 
     # Message format handlers
-    def handle_list_with_image(image_first = False):
+    def handle_list_with_image(image_first=False):
         content = [create_text_message(prompt)]
         if role == "user" and not skip_image_token:
             image_tokens = [{"type": "image"}] * num_images
-            content = (
-                image_tokens + content
-                if image_first
-                else content + image_tokens
-            )
+            content = image_tokens + content if image_first else content + image_tokens
         return {"role": role, "content": content}
 
     def handle_list_with_image_type():
@@ -78,7 +75,9 @@ def get_message_json(
     # Message format mapping
     message_formats = {
         "message_list_with_image": handle_list_with_image,
-        "message_list_with_image_first": partial(handle_list_with_image, image_first=True),
+        "message_list_with_image_first": partial(
+            handle_list_with_image, image_first=True
+        ),
         "message_list_with_image_type": handle_list_with_image_type,
         "message_with_image_token": lambda: handle_image_token("<image>"),
         "message_with_image_token_new_line": lambda: handle_image_token("<image>\n"),
