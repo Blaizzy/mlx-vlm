@@ -1,14 +1,9 @@
 import mlx.core as mx
 import numpy as np
 
+from ..idefics3 import LanguageModel
 from ..idefics3 import Model as Idefics3Model
-from ..idefics3 import (
-    LanguageModel,
-    ModelConfig,
-    TextConfig,
-    VisionConfig,
-    VisionModel,
-)
+from ..idefics3 import ModelConfig, TextConfig, VisionConfig, VisionModel
 
 
 class Model(Idefics3Model):

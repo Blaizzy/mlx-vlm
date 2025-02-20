@@ -1,5 +1,6 @@
 import argparse
 import logging
+
 import mlx.core as mx
 
 from .utils import generate, load
