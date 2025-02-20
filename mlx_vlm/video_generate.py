@@ -474,7 +474,7 @@ def main():
     kwargs = {}
     if is_video_model(model):
 
-        # Checke if video is image or video
+        # Check if video is image or video
         if is_video_file(args.video):
             messages = [
                 {
