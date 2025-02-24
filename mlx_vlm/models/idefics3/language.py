@@ -13,13 +13,13 @@ from ..base import KVCache, LanguageModelOutput, create_attention_mask
 class TextConfig:
     model_type: str
     hidden_size: int
-    num_hidden_layers: int
     intermediate_size: int
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
     num_key_value_heads: int
     rope_theta: float = 1000000.0
+    num_hidden_layers: int = 32
     rope_traditional: bool = False
     tie_word_embeddings: bool = False
 
