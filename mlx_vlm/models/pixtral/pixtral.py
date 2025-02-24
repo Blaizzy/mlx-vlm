@@ -75,7 +75,7 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the ouptut hidden states from the vision model
+        # Get the output hidden states from the vision model
         if isinstance(pixel_values, list):
             pixel_values = mx.concatenate(
                 [mx.array(pv)[None, ...] for pv in pixel_values], axis=0
@@ -87,7 +87,7 @@ class Model(nn.Module):
         # Reference code from transformers: https://github.com/huggingface/transformers/blob/main/src/transformers/models/pixtral/modeling_pixtral.py#L479C9-L479C21
         # and mistral_inference: https://github.com/mistralai/mistral-inference/blob/main/src/mistral_inference/vision_encoder.py#L85
         *_, hidden_states = self.vision_tower(
-            [pv[None, ...].transpose(0, 2, 3, 1) for pv in pixel_values],
+            pixel_values.transpose(0, 2, 3, 1),
             output_hidden_states=True,
         )
         # Select the hidden states from the desired layer
