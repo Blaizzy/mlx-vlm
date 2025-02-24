@@ -411,7 +411,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         ```
 
         ```bash
-        python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temp 0.0 --prompt "Describe this image." --image <path_to_image>
+        python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temperature 0.0 --prompt "Describe this image." --image <path_to_image>
         ```
         """
     )
@@ -841,7 +841,7 @@ def generate_step(
     mask,
     *,
     max_tokens: int = 256,
-    temp: float = 0.0,
+    temperature: float = 0.0,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
@@ -854,7 +854,7 @@ def generate_step(
     Args:
         prompt (mx.array): The input prompt.
         model (nn.Module): The model to use for generation.
-        temp (float): The temperature for sampling, if 0 the argmax is used.
+        temperature (float): The temperature for sampling, if 0 the argmax is used.
           Default: ``0``.
         repetition_penalty (float, optional): The penalty factor for repeating
           tokens.
@@ -876,13 +876,13 @@ def generate_step(
             logits[:, indices] += values
         logprobs = logits - mx.logsumexp(logits)
 
-        if temp == 0:
+        if temperature == 0:
             token = mx.argmax(logits, axis=-1)
         else:
             if top_p > 0 and top_p < 1.0:
-                token = top_p_sampling(logits, top_p, temp)
+                token = top_p_sampling(logits, top_p, temperature)
             else:
-                token = mx.random.categorical(logits * (1 / temp))
+                token = mx.random.categorical(logits * (1 / temperature))
 
         return token, logprobs
 
@@ -1086,7 +1086,7 @@ def generate(
        model (nn.Module): The language model.
        tokenizer (PreTrainedTokenizer): The tokenizer.
        prompt (str): The string prompt.
-       temp (float): The temperature for sampling (default 0).
+       temperature (float): The temperature for sampling (default 0).
        max_tokens (int): The maximum number of tokens (default 100).
        verbose (bool): If ``True``, print tokens and timing information
            (default ``False``).
