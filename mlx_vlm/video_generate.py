@@ -440,7 +440,7 @@ def main():
         "--prompt", default="Describe this video.", help="Text prompt for the model"
     )
     parser.add_argument(
-        "--temp", type=float, default=0.7, help="Temperature for generation"
+        "--temperature", type=float, default=0.7, help="Temperature for generation"
     )
     parser.add_argument(
         "--max-tokens",
@@ -474,7 +474,7 @@ def main():
     kwargs = {}
     if is_video_model(model):
 
-        # Checke if video is image or video
+        # Check if video is image or video
         if is_video_file(args.video):
             messages = [
                 {
@@ -583,7 +583,7 @@ def main():
     kwargs["input_ids"] = input_ids
     kwargs["pixel_values"] = pixel_values
     kwargs["mask"] = mask
-    kwargs["temp"] = args.temp
+    kwargs["temperature"] = args.temperature
     kwargs["max_tokens"] = args.max_tokens
 
     response = generate(

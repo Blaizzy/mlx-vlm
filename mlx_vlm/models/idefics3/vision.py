@@ -10,11 +10,11 @@ import numpy as np
 @dataclass
 class VisionConfig:
     model_type: str
-    num_hidden_layers: int
     hidden_size: int
-    intermediate_size: int
     num_attention_heads: int
     patch_size: int
+    num_hidden_layers: int = 12
+    intermediate_size: int = 3072
     image_size: int = 224
     num_channels: int = 3
     layer_norm_eps: float = 1e-6
@@ -191,6 +191,7 @@ class VisionModel(nn.Module):
             "siglip_vision_model",
             "idefics3",
             "idefics3_vision",
+            "smolvlm_vision",
         ]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
 

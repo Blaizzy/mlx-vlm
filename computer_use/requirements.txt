@@ -1,0 +1,2 @@
+SpeechRecognition>=3.12.0
+mlx-whisper>=0.4.1
