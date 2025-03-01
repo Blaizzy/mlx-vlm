@@ -582,9 +582,9 @@ def play_audio(path):
 def main():
     print("[bold blue]Screen Navigation Assistant[/bold blue]")
     print("Press Ctrl+C to quit")
-    model, processor = load("/Users/prince_canuma/Qwen2.5-VL-7B-Instruct-4bit")
+    model, processor = load("mlx-community/Qwen2.5-VL-7B-Instruct-4bit")
     gui_agent, gui_processor = load(
-        "/Users/prince_canuma/ShowUI-2B-bf16",
+        "mlx-community/ShowUI-2B-bf16",
         processor_kwargs={"min_pixels": min_pixels, "max_pixels": max_pixels},
     )
 
@@ -596,11 +596,11 @@ def main():
     mic = sr.Microphone(sample_rate=16000)
     past_actions = []
     counter = 0
-    play_audio("/Users/prince_canuma/ask_voice.wav")
+    play_audio("./audio/ask_voice.wav")
     input("Press Enter to start listening...")
     query = listen(mlx_whisper, mic, r)
     # Play audio confirmation sound
-    play_audio("/Users/prince_canuma/ok.wav")
+    play_audio("./audio/ok.wav")
 
     try:
         while True:
@@ -619,7 +619,7 @@ def main():
                 action in past_actions[-1].lower()
                 for action in ["finished", "call_user", "wait"]
             ):
-                play_audio("/Users/prince_canuma/ask_voice_2.wav")
+                play_audio("./audio/ask_voice_2.wav")
                 input("Press Enter to start listening...")
                 query = listen(mlx_whisper, mic, r)
                 past_actions = []

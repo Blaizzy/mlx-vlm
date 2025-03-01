@@ -560,17 +560,17 @@ def play_audio(path):
 def main():
     print("[bold blue]Screen Navigation Assistant[/bold blue]")
     print("Type 'exit' to quit")
-    model, processor = load("/Users/prince_canuma/Qwen2.5-VL-7B-Instruct-4bit")
+    model, processor = load("mlx-community/Qwen2.5-VL-7B-Instruct-4bit")
     gui_agent, gui_processor = load(
-        "/Users/prince_canuma/ShowUI-2B-bf16",
+        "mlx-community/ShowUI-2B-bf16",
         processor_kwargs={"min_pixels": min_pixels, "max_pixels": max_pixels},
     )
 
     past_actions = []
-    play_audio("/Users/prince_canuma/ask.wav")
+    play_audio("./audio/ask.wav")
     query = Prompt.ask("\nWhat would you like me to do?")
     counter = 0
-    play_audio("/Users/prince_canuma/ok.wav")
+    play_audio("./audio/ok.wav")
     while True:
         if query.lower() == "exit":
             break
@@ -586,7 +586,7 @@ def main():
             action in past_actions[-1].lower()
             for action in ["finished", "call_user", "wait"]
         ):
-            play_audio("/Users/prince_canuma/ask_2.wav")
+            play_audio("./audio/ask_2.wav")
             query = Prompt.ask("\nWhat would you like me to do?")
             past_actions = []
 
