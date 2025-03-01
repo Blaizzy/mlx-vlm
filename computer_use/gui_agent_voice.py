@@ -1,8 +1,10 @@
-# Take a screenshot of the screen
 import os
 import time
 
 import mlx.core as mx
+import mlx_whisper
+import numpy as np
+import speech_recognition as sr
 from PIL import ImageGrab
 from utils import draw_point, update_navigation_history
 
@@ -139,7 +141,7 @@ def process_command(model, processor, query, past_actions=[]):
     time.sleep(1)
     # Take and resize screenshot
     screenshot = ImageGrab.grab()
-    # screenshot = screenshot.resize((1512, 982)) # Comment this out to use a different resolution
+    screenshot = screenshot.resize((1512, 982))
 
     messages = [
         {
@@ -162,10 +164,10 @@ def process_command(model, processor, query, past_actions=[]):
     response = generate(
         model,
         processor,
-        screenshot,
         prompt,
-        temp=0.1,
-        max_new_tokens=1000,
+        screenshot,
+        temperature=0.1,
+        max_tokens=1000,
         verbose=False,
     )
     mx.metal.clear_cache()
@@ -216,22 +218,49 @@ def process_command(model, processor, query, past_actions=[]):
 
 def main():
     print("\033[34mScreen Navigation Assistant\033[0m")
-    print("Type 'exit' to quit")
+    print("Press Ctrl+C to quit")
     model, processor = load(
         "mlx-community/ShowUI-2B-bf16",
         {"min_pixels": min_pixels, "max_pixels": max_pixels},
     )
 
+    r = sr.Recognizer()
+    mic = sr.Microphone(sample_rate=16000)
     past_actions = []
-    while True:
-        query = input("What would you like me to do?")
-        if query.lower() == "exit":
-            break
 
-        try:
-            past_actions = process_command(model, processor, query, past_actions)
-        except Exception as e:
-            print(f"\033[31mError:\033[0m {str(e)}")
+    try:
+        while True:
+            # Wait for a click to start listening
+            input("Press Enter to start listening...")
+            with mic as source:
+                print("Listening...")
+                r.adjust_for_ambient_noise(source)
+                audio = r.listen(source)
+                # Convert audio to numpy array
+                audio_data = (
+                    np.frombuffer(audio.get_raw_data(), dtype=np.int16).astype(
+                        np.float32
+                    )
+                    / 32768.0
+                )
+
+                # Process audio with Apple MLXWhisper model
+                query = mlx_whisper.transcribe(
+                    audio_data, path_or_hf_repo="mlx-community/whisper-large-v3-turbo"
+                )["text"]
+
+                # Print the transcribed text
+                print(f"\nHeard: {query}")
+
+                try:
+                    past_actions = process_command(
+                        model, processor, query, past_actions
+                    )
+                except Exception as e:
+                    print(f"\033[31mError:\033[0m {str(e)}")
+
+    except KeyboardInterrupt:
+        print("\033[31mStopped listening.\033[0m")
 
 
 if __name__ == "__main__":
