@@ -511,7 +511,7 @@ def process_command(model, processor, gui_agent, gui_processor, query, past_acti
         for action in ["finished", "call_user", "wait"]
     ):
         past_actions.append(planner_response)
-        play_audio("/Users/prince_canuma/task_completed.wav")
+        play_audio("./audio/task_completed.wav")
         print("Task completed successfully!")
         screenshot = ImageGrab.grab()
         screenshot = screenshot.resize((1512, 982))
@@ -562,7 +562,7 @@ def main():
     print("Type 'exit' to quit")
     model, processor = load("mlx-community/Qwen2.5-VL-7B-Instruct-4bit")
     gui_agent, gui_processor = load(
-        "mlx-community/ShowUI-2B-bf16",
+        "mlx-community/ShowUI-2B-bf16-bf16",
         processor_kwargs={"min_pixels": min_pixels, "max_pixels": max_pixels},
     )
 
