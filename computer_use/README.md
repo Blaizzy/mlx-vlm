@@ -16,8 +16,12 @@ A powerful tool that leverages Vision Language Models (VLMs) to enable AI-driven
 </p>
 
 ## 🤖 Current Implementation Status
-The current implementation is a GUI Agent (Level 1) with basic visual understanding and action capabilities. We're developing Level 2 (Autonomous GUI Agent) with enhanced memory, planning, reasoning, and human-in-the-loop functionality.
-*Community help is more than welcome!* We're looking for contributors to help us reach Level 2 capabilities faster. Join us in building the future of computer automation.
+The project now supports both Level 1 (GUI Agent) and Level 2 (Autonomous GUI Agent) capabilities:
+
+- **Level 1 (GUI Agent)**: Basic visual understanding and action capabilities
+- **Level 2 (Autonomous GUI Agent)**: Enhanced memory, planning, reasoning, and human-in-the-loop functionality
+
+*Community help is more than welcome!* We're looking for contributors to help us enhance these capabilities further. Join us in building the future of computer automation.
 
 
 ## 🔍 Overview
@@ -39,6 +43,8 @@ By processing screenshots and visual information from your screen, the system un
 - **Natural Language Control**: Simple, human-like instructions to control your computer
 - **Privacy-Focused**: All processing happens locally on your device
 - **Customizable**: Adapt to your specific workflow and preferences
+- **Autonomous Operation**: Level 2 agent can plan and execute multi-step tasks with minimal supervision
+- **Voice Control**: Hands-free operation with voice commands using local speech recognition
 
 ## 🚀 Getting Started
 
@@ -73,25 +79,39 @@ By processing screenshots and visual information from your screen, the system un
 
 ### Quick Start
 
-Launch the application with:
+Launch the standard application with:
 
 ```bash
 python main.py
 ```
 
-### Voice Control Interface
+### Autonomous GUI Agent
 
-For hands-free operation, you can use the voice-enabled interface:
+For enhanced autonomous operation with planning capabilities:
 
 ```bash
-python main_voice.py
+python autonomous_gui_agent.py
 ```
 
-This launches a voice-controlled version of Computer Use that:
+This launches the Level 2 autonomous agent that can:
+- Plan and execute multi-step tasks
+- Maintain context across actions
+- Make decisions based on visual feedback
+- Request human assistance when needed
+
+### Voice Control Interface
+
+For hands-free operation, you can use the voice-enabled autonomous agent:
+
+```bash
+python autonomous_gui_agent_voice.py
+```
+
+This launches a voice-controlled version that:
 - Listens for your voice commands using your Mac's microphone
-- Converts speech to text using local speech recognition using [mlx-whisper](https://github.com/ml-explore/mlx-examples).
+- Converts speech to text using local speech recognition using [mlx-whisper](https://github.com/ml-explore/mlx-examples)
 - Processes your commands and executes them visually
-- Provides voice feedback on actions taken (comming soon)
+- Provides audio feedback on actions taken
 
 Voice commands work just like text commands, so you can say things like:
 
@@ -101,10 +121,8 @@ Control your Mac with natural language instructions like:
 
 ```
 "Open Safari and navigate to apple.com"
-"Find the document I was working on yesterday and open it"
-"Take a screenshot of this window and save it to my Desktop"
-"Organize my Downloads folder by file type"
-"Reply to the most recent email from my boss"
+"Open the notifications tab and click on the first notification"
+"Open the email app and reply to the most recent email"
 ```
 
 ## ⚙️ How It Works
@@ -116,7 +134,7 @@ Control your Mac with natural language instructions like:
    - Application context
    - System status
 3. **Instruction Processing**: Your natural language commands are interpreted
-4. **Action Planning**: The system determines the sequence of actions needed (comming soon)
+4. **Action Planning**: The system determines the sequence of actions needed
 5. **Execution**: Actions are performed through macOS APIs or simulated inputs (click, scroll, etc)
 
 ## 🔒 Privacy & Security
