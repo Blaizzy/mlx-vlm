@@ -162,10 +162,10 @@ def process_command(model, processor, query, past_actions=[]):
     response = generate(
         model,
         processor,
-        screenshot,
         prompt,
-        temp=0.1,
-        max_new_tokens=1000,
+        screenshot,
+        temperature=0.1,
+        max_tokens=1000,
         verbose=False,
     )
     mx.metal.clear_cache()
