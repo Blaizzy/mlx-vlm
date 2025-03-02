@@ -1,0 +1,28 @@
+Query,Response,Screenshot Path
+Click on Explore,"{'action': 'CLICK', 'value': None, 'position': [211.68, 294.59999999999997]}",screenshots/screenshot_20241210-191351.png
+Click on notifications,"{'action': 'CLICK', 'value': None, 'position': [241.92000000000002, 333.88000000000005]}",screenshots/screenshot_20241210-191519.png
+Click on Profile,"{'action': 'CLICK', 'value': None, 'position': [196.56, 746.32]}",screenshots/screenshot_20241210-192437.png
+Click on the Image that Philipp posted,"{'action': 'CLICK', 'value': None, 'position': [589.6800000000001, 569.56]}",screenshots/screenshot_20241210-193535.png
+Select text on the screen,"{'action': 'CLICK', 'value': None, 'position': [740.88, 314.24]}",screenshots/screenshot_20241210-193911.png
+Click on show posts,"{'action': 'CLICK', 'value': None, 'position': [680.4, 343.7]}",screenshots/screenshot_20241210-194314.png
+Search youtube,"{'action': 'CLICK', 'value': None, 'position': [1179.3600000000001, 98.2]}",screenshots/screenshot_20241210-195055.png
+Click on the BMW X3 video,"{'action': 'CLICK', 'value': None, 'position': [1300.32, 559.7399999999999]}",screenshots/screenshot_20241210-195145.png
+Click on notifications,"{'action': 'CLICK', 'value': None, 'position': [257.04, 333.88000000000005]}",screenshots/screenshot_20241210-230354.png
+Click on notifications,"{'action': 'CLICK', 'value': None, 'position': [468.71999999999997, 196.4]}",screenshots/screenshot_20241210-230553.png
+Click on notifications,"{'action': 'CLICK', 'value': None, 'position': [468.71999999999997, 196.4]}",screenshots/screenshot_20241210-230651.png
+Click on notifications,"{'action': 'CLICK', 'value': None, 'position': [468.71999999999997, 196.4]}",screenshots/screenshot_20241210-230730.png
+Click on notifications,"{'action': 'CLICK', 'value': None, 'position': [512.0, 299.52]}",screenshots/screenshot_20241210-230923.png
+Click on notifications,"{'action': 'CLICK', 'value': None, 'position': [793.6, 288.0]}",screenshots/screenshot_20241210-230958.png
+Click on Home,"{'action': 'CLICK', 'value': None, 'position': [742.4, 187.20000000000002]}",screenshots/screenshot_20241210-231015.png
+Click on Elon Musk,"{'action': 'CLICK', 'value': None, 'position': [1239.84, 1040.92]}",screenshots/screenshot_20241210-231058.png
+Click on Elon Musk's profile,"{'action': 'CLICK', 'value': None, 'position': [1058.3999999999999, 1060.5600000000002]}",screenshots/screenshot_20241210-231133.png
+Click on Elon Musks profile,"{'action': 'CLICK', 'value': None, 'position': [1058.3999999999999, 1060.5600000000002]}",screenshots/screenshot_20241210-231212.png
+Click on Nikita,"{'action': 'CLICK', 'value': None, 'position': [1028.16, 510.64000000000004]}",screenshots/screenshot_20241210-231321.png
+Click on Explore,"{'action': 'CLICK', 'value': None, 'position': [423.36, 549.9200000000001]}",screenshots/screenshot_20241210-231404.png
+Click on Explore,"{'action': 'CLICK', 'value': None, 'position': [211.68, 274.96000000000004]}",screenshots/screenshot_20241210-231511.png
+Click on Home,"{'action': 'CLICK', 'value': None, 'position': [181.44, 225.86]}",screenshots/screenshot_20241210-231527.png
+Click on Rohan Pauls profile,"{'action': 'CLICK', 'value': None, 'position': [483.84000000000003, 549.9200000000001]}",screenshots/screenshot_20241210-231552.png
+cClick on Home,"{'action': 'CLICK', 'value': None, 'position': [393.12, 432.08]}",screenshots/screenshot_20241210-231719.png
+Click on Home,"{'action': 'CLICK', 'value': None, 'position': [196.56, 216.04]}",screenshots/screenshot_20241210-231751.png
+Click on notifications,"{'action': 'CLICK', 'value': None, 'position': [153.6, 273.6]}",screenshots/screenshot_20241211-101202.png
+Click on Home,"{'action': 'CLICK', 'value': None, 'position': [166.4, 172.79999999999998]}",screenshots/screenshot_20241211-101219.png

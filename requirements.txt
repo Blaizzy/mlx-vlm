@@ -2,8 +2,9 @@ mlx>=0.22.0
 datasets>=2.19.1
 tqdm>=4.66.2
 numpy>=1.23.4
-transformers>=4.47.1
+transformers>=4.49.0
 scipy==1.13.1
 gradio>=4.44.0
 Pillow>=10.3.0
 requests>=2.31.0
+opencv-python==4.10.0.84

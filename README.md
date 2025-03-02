@@ -1,3 +1,4 @@
+[![Upload Python Package](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml/badge.svg)](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml)
 # MLX-VLM
 
 MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) on your Mac using MLX.
@@ -111,6 +112,29 @@ print(output)
 ```sh
 python -m mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Compare these images" --image path/to/image1.jpg path/to/image2.jpg
 ```
+
+## Video Understanding
+
+MLX-VLM also supports video analysis such as captioning, summarization, and more, with select models.
+
+### Supported Models
+
+The following models support video chat:
+
+1. Qwen2-VL
+2. Qwen2.5-VL
+3. Idefics3
+4. LLaVA
+
+With more coming soon.
+
+### Usage Examples
+
+#### Command Line
+```sh
+python -m mlx_vlm.video_generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --max-pixels 224 224 --fps 1.0
+```
+
 
 These examples demonstrate how to use multiple images with MLX-VLM for more complex visual reasoning tasks.
 

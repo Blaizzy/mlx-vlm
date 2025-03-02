@@ -52,7 +52,7 @@ def check_array_shape(arr):
 def position_ids_in_meshgrid(patch_embeds_list, max_width):
     positions = []
     for patch in patch_embeds_list:
-        height, width = patch.shape[1], patch.shape[2]
+        height, width = patch.shape[0], patch.shape[1]
         h_grid, v_grid = mx.meshgrid(mx.arange(height), mx.arange(width), indexing="ij")
         h_grid = h_grid.reshape(-1, 1)
         v_grid = v_grid.reshape(-1, 1)
@@ -257,12 +257,8 @@ class PixtralVisionModel(nn.Module):
         output_hidden_states: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
     ) -> mx.array:
-        B, H, W, C = x[0].shape
-        patch_embeds_list = [self.patch_conv(img) for img in x]
-
-        patch_embeds = mx.concatenate(
-            [p.reshape(B, -1, p.shape[-1]) for p in patch_embeds_list], axis=1
-        )
+        patch_embeds_list = self.patch_conv(x)
+        patch_embeds = patch_embeds_list.reshape(1, -1, patch_embeds_list.shape[-1])
 
         patch_embeds = self.ln_pre(patch_embeds)
 
@@ -274,7 +270,7 @@ class PixtralVisionModel(nn.Module):
         position_embedding = self.patch_positional_embedding(patch_embeds, position_ids)
 
         mask = generate_block_attention_mask(
-            [p.shape[2] * p.shape[1] for p in patch_embeds_list], patch_embeds
+            [p.shape[1] * p.shape[0] for p in patch_embeds_list], patch_embeds
         )
 
         encoder_states = (patch_embeds,) if output_hidden_states else None

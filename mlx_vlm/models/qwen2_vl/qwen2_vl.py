@@ -22,6 +22,7 @@ class ModelConfig:
     model_type: str
     ignore_index: int = -100
     image_token_index: int = 151655
+    video_token_index: int = 151656
     vision_feature_select_strategy: str = "default"
     vision_feature_layer: int = -2
     vocab_size: int = 32000
@@ -96,25 +97,21 @@ class Model(BaseModel):
         self, image_features, inputs_embeds, input_ids
     ):
         image_token_index = self.config.image_token_index
-        num_images, num_image_patches, embed_dim = image_features.shape
+        video_token_index = self.config.video_token_index
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
+        image_positions = input_ids == image_token_index
+        if mx.sum(image_positions) == 0:
+            image_positions = input_ids == video_token_index
 
-        text_segments = []
-        start_idx = 0
+        image_features = image_features.astype(mx.float32)
+        pad_size = inputs_embeds.shape[1] - image_features.shape[1]
+        image_features = mx.pad(image_features, ((0, 0), (0, pad_size), (0, 0)))
+        inputs_embeds = mx.where(
+            image_positions[:, :, None], image_features, inputs_embeds
+        )
 
-        for position in image_positions:
-            text_segments.append(inputs_embeds[:, start_idx:position])
-            start_idx = position + 1
-
-        image_embeddings = mx.split(image_features, image_features.shape[0])
-        final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
-        final_embeddings += [inputs_embeds[:, start_idx:]]
-
-        # Create a final embedding of shape
-        # (1, num_image_patches*num_images + sequence_len, embed_dim)
-        return mx.concatenate(final_embeddings, axis=1)
+        return inputs_embeds
 
     def __call__(
         self,
@@ -124,6 +121,7 @@ class Model(BaseModel):
         cache=None,
         **kwargs,
     ):
+
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         if image_grid_thw is not None:
             image_grid_thw = mx.array(image_grid_thw)
