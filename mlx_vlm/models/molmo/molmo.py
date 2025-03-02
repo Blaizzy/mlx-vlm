@@ -113,9 +113,11 @@ class Model(BaseModel):
                 )
                 image_input_idx = mx.take(image_input_idx, filter_mask[0], axis=1)
 
-                image_features, merge_mask = self.merge_similar_vision_tokens(
-                    image_features, vision_merge_ratio
-                )
+                if vision_merge_ratio < 1:
+                    print(
+                        "Operation skipped: Molmo architecture does not support vision token merging"
+                    )
+
                 merge_mask = mx.array(np.where(merge_mask > 0)[1])
                 image_input_idx = mx.take(image_input_idx, merge_mask, axis=1)
 

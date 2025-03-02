@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -284,7 +284,9 @@ class BaseModel(nn.Module):
         self.vision_tower = None
         self.language_model = None
 
-    def filter_topk_vision_tokens(self, image_feature, attn, vision_filter_ratio=None):
+    def filter_topk_vision_tokens(
+        self, image_feature, attn, vision_filter_ratio=None
+    ) -> Tuple[mx.array, mx.array]:
         batch_size, seq_len = image_feature.shape[:2]
         k_tokens = (
             int(image_feature.shape[1] * vision_filter_ratio)
@@ -293,7 +295,7 @@ class BaseModel(nn.Module):
         )  # keep 25% of the visual tokens
 
         if k_tokens is None or k_tokens == seq_len:
-            return image_feature
+            return image_feature, None
 
         cls_idx = 0  # self.config.image_token_index
 
@@ -314,13 +316,16 @@ class BaseModel(nn.Module):
 
     def merge_similar_vision_tokens(
         self, image_feature, vision_merge_ratio, merge_rate=0.4
-    ):
+    ) -> Tuple[mx.array, mx.array]:
         # Skip CLS token (first token)
         tokens = image_feature[:, 1:]
         batch_size, num_tokens, hidden_dim = tokens.shape
 
         # Calculate target number of tokens
         target_tokens = max(1, int(num_tokens * vision_merge_ratio))
+
+        if num_tokens == target_tokens:
+            return image_feature, None
 
         # Create a mask of the same shape as tokens, initialized to True
         mask = mx.ones((batch_size, num_tokens))
@@ -376,4 +381,7 @@ class BaseModel(nn.Module):
         )
 
     def merge_vision_patches(self, image_feature, vision_merge_ratio, merge_rate=0.4):
+        """
+        Merge vision patches based on the vision_merge_ratio and merge_rate.
+        """
         pass

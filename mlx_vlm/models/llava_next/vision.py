@@ -208,7 +208,7 @@ class ClipVisionModel(nn.Module):
                 all_attns = all_attns + (attn,)
 
         pooler_output = self.post_layernorm(x[:, 0, :])
-        return pooler_output, x, encoder_states, attns
+        return pooler_output, x, encoder_states, all_attns
 
 
 class VisionModel(nn.Module):
@@ -222,9 +222,12 @@ class VisionModel(nn.Module):
         self.vision_model = ClipVisionModel(config)
 
     def __call__(
-        self, x: mx.array, output_hidden_states: Optional[bool] = None
+        self,
+        x: mx.array,
+        output_hidden_states: Optional[bool] = None,
+        output_attn: bool = False,
     ) -> mx.array:
-        return self.vision_model(x, output_hidden_states)
+        return self.vision_model(x, output_hidden_states, output_attn)
 
     def sanitize(self, weights):
         sanitized_weights = {}

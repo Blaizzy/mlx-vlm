@@ -187,12 +187,12 @@ class Attention(nn.Module):
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        output = mx.fast.scaled_dot_product_attention(
+        attn = mx.fast.scaled_dot_product_attention(
             q, k, v, scale=self.scale, mask=attention_mask
         )
-        output = output.transpose(0, 2, 1, 3)
+        output = attn.transpose(0, 2, 1, 3)
         output = output.reshape(seq_length, -1)
-        return self.proj(output)
+        return self.proj(output), attn
 
 
 class MLP(nn.Module):
@@ -216,13 +216,14 @@ class Qwen2VLVisionBlock(nn.Module):
         self.mlp = MLP(dim=config.hidden_size, hidden_dim=config.intermediate_size)
 
     def __call__(self, hidden_states, cu_seqlens, rotary_pos_emb) -> mx.array:
-        hidden_states = hidden_states + self.attn(
+        x, attn = self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
             rotary_pos_emb=rotary_pos_emb,
         )
+        hidden_states += x
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
-        return hidden_states
+        return hidden_states, attn
 
 
 class VisionModel(nn.Module):
@@ -362,6 +363,7 @@ class VisionModel(nn.Module):
         hidden_states: mx.array,
         grid_thw: mx.array,
         output_hidden_states: Optional[bool] = None,
+        output_attn: Optional[bool] = None,
     ) -> mx.array:
 
         hidden_states = self.patch_embed(hidden_states)
@@ -407,6 +409,7 @@ class VisionModel(nn.Module):
         cu_seqlens = mx.pad(cu_seqlens, (1, 0), mode="constant", constant_values=0)
 
         encoder_states = (hidden_states,) if output_hidden_states else None
+        all_attns = () if output_attn else None
 
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
@@ -414,17 +417,20 @@ class VisionModel(nn.Module):
             else:
                 cu_seqlens_now = cu_window_seqlens
 
-            hidden_states = blk(
+            hidden_states, attn = blk(
                 hidden_states, cu_seqlens=cu_seqlens_now, rotary_pos_emb=rotary_pos_emb
             )
 
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
 
+            if output_attn:
+                all_attns = all_attns + (attn,)
+
         hidden_states = self.merger(hidden_states)
         reverse_indices = mx.argsort(window_index, axis=0)
         hidden_states = hidden_states[reverse_indices, :]
-        return hidden_states
+        return hidden_states, all_attns
 
     def sanitize(self, weights):
         sanitized_weights = {}

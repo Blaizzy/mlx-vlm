@@ -156,7 +156,7 @@ class PositionalEmbeddingCosine1D(nn.Module):
         return pos_embeds
 
 
-class Model(nn.Module):
+class Model(BaseModel):
     """Florence-2 model for conditional generation."""
 
     def __init__(self, config: ModelConfig):

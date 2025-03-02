@@ -100,7 +100,7 @@ class Model(BaseModel):
             attn = all_attns[self.vision_feature_layer]
             vision_filter_ratio = kwargs.get("vision_filter_ratio", 1.0)
             vision_merge_ratio = kwargs.get("vision_merge_ratio", 1.0)
-            selected_image_feature = self.filter_topk_vision_tokens(
+            selected_image_feature, _ = self.filter_topk_vision_tokens(
                 selected_image_feature, attn, vision_filter_ratio
             )
             selected_image_feature = self.merge_similar_vision_tokens(

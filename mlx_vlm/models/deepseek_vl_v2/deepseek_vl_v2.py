@@ -15,7 +15,7 @@ from transformers import AutoProcessor
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 from transformers.image_utils import to_numpy_array
 
-from ..base import expand2square
+from ..base import BaseModel, expand2square
 from .language import LanguageModel, TextConfig
 from .processing_deepsek_vl_v2 import DeepseekVLV2Processor
 from .vision import VisionConfig, VisionModel
@@ -194,7 +194,7 @@ class MlpProjector(nn.Module):
         return x
 
 
-class Model(nn.Module):
+class Model(BaseModel):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config

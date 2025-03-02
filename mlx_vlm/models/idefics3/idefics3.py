@@ -12,6 +12,7 @@ import numpy as np
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig
 
+from ..base import BaseModel
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
@@ -81,7 +82,7 @@ class Idefics3Connector(nn.Module):
         return image_hidden_states
 
 
-class Model(nn.Module):
+class Model(BaseModel):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.model_type = config.model_type

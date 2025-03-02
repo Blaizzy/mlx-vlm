@@ -200,7 +200,7 @@ class Idefics2Connector(nn.Module):
         return x
 
 
-class Model(nn.Module):
+class Model(BaseModel):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.model_type = config.model_type

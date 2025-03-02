@@ -22,7 +22,7 @@ from transformers.image_transforms import (
 )
 from transformers.image_utils import to_numpy_array
 
-from ..base import BaseImageProcessor
+from ..base import BaseImageProcessor, BaseModel
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
@@ -125,7 +125,7 @@ class SigLipVisionTower(nn.Module):
         return self.vision_tower(x, output_hidden_states)
 
 
-class Model(nn.Module):
+class Model(BaseModel):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.model_type = config.model_type
