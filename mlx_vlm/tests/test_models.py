@@ -5,6 +5,15 @@ import mlx.core as mx
 from mlx.utils import tree_map
 
 
+def get_hidden_states(vision_output):
+    if vision_output.hidden_states is not None:
+        return vision_output.hidden_states
+    elif vision_output.encoder_states is not None:
+        return vision_output.encoder_states[-1]
+    else:
+        return vision_output.pooler_output
+
+
 class TestModels(unittest.TestCase):
 
     def language_test_runner(self, model, model_type, vocab_size, num_layers):
@@ -61,6 +70,7 @@ class TestModels(unittest.TestCase):
         self.assertEqual(vision_tower.model_type, model_type)
 
         batch_size = 1
+        all_attentions = None
         if model_type == "qwen2_5_vl":
             input_tensor = mx.random.uniform(shape=(image_size[0], image_size[1]))
         else:
@@ -80,16 +90,34 @@ class TestModels(unittest.TestCase):
             "output_hidden_states"
             in inspect.signature(vision_tower.__call__).parameters
         ):
-            hidden_states = vision_tower(
+            vision_output = vision_tower(
                 input_tensor, output_hidden_states=True, **kwargs
             )
+
+            hidden_states = get_hidden_states(vision_output)
+        elif "output_attentions" in inspect.signature(vision_tower.__call__).parameters:
+            vision_output = vision_tower(input_tensor, output_attentions=True, **kwargs)
+            hidden_states = get_hidden_states(vision_output)
+            all_attentions = vision_output.attentions
+
         else:
-            hidden_states = vision_tower(input_tensor, **kwargs)
+            vision_output = vision_tower(input_tensor, **kwargs)
+            hidden_states = get_hidden_states(vision_output)
+
+        print("hidden_states", len(hidden_states))
 
         # Check vision hidden feature layer's shape matches the expected hidden size
         self.assertEqual(
             hidden_states[vision_feature_layer].shape[-1], vision_hidden_size
         )
+
+        if "output_attentions" in inspect.signature(vision_tower.__call__).parameters:
+            if all_attentions is not None:
+                config = vision_tower.config.__dict__
+                if len(all_attentions) > 1:  # TODO: Fix this test for Molmo
+                    self.assertEqual(
+                        len(all_attentions), config.get("num_hidden_layers", None)
+                    )
 
     def test_llava_bunny(self):
         from mlx_vlm.models import llava_bunny

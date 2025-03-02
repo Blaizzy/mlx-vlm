@@ -5,6 +5,8 @@ from typing import List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import VisionModelOutput
+
 
 @dataclass
 class VisionConfig:
@@ -483,7 +485,4 @@ class VisionModel(nn.Module):
         # MLP layer to map the feature
         image_features = self.image_projector(image_features)
 
-        if output_attentions:
-            return image_features, cls_embed, all_attns
-        else:
-            return image_features, cls_embed
+        return VisionModelOutput(hidden_states=image_features, attentions=all_attns)

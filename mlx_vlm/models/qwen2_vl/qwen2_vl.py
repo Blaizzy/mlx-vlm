@@ -69,15 +69,21 @@ class Model(BaseModel):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
-        hidden_states, all_attns = self.vision_tower(
-            pixel_values, image_grid_thw, output_hidden_states=False, output_attn=True
+        vision_output = self.vision_tower(
+            pixel_values,
+            image_grid_thw,
+            output_hidden_states=False,
+            output_attentions=True,
         )
+
+        hidden_states = vision_output.hidden_states
+        all_attentions = vision_output.attentions
 
         if hidden_states.ndim == 2:
             hidden_states = hidden_states[None, :, :]
 
-        if all_attns:
-            attn = all_attns[-1]
+        if all_attentions:
+            attn = all_attentions[-1]
             vision_filter_ratio = kwargs.get("vision_filter_ratio", 1.0)
             vision_merge_ratio = kwargs.get("vision_merge_ratio", 1.0)
             hidden_states = self.filter_topk_vision_tokens(

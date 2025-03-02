@@ -83,11 +83,13 @@ class Model(BaseModel):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
-        *_, hidden_states, all_attns = self.vision_tower(
+        vision_output = self.vision_tower(
             pixel_values[0].transpose(0, 2, 3, 1),
             output_hidden_states=True,
-            output_attn=True,
+            output_attentions=True,
         )
+        hidden_states = vision_output.encoder_states
+        all_attns = vision_output.attentions
 
         # Select the hidden states from the desired layer
         selected_image_feature = hidden_states[self.vision_feature_layer]

@@ -409,9 +409,10 @@ class Model(BaseModel):
         input_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
-        hidden_states, *_ = self.vision(
+        vision_output = self.vision(
             total_tiles.transpose(0, 2, 3, 1), output_hidden_states=True
         )
+        hidden_states = vision_output.encoder_states
 
         # Pass image features through the multi-modal projector
         image_features = self.projector(hidden_states)

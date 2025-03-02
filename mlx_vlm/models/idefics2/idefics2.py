@@ -12,6 +12,7 @@ import numpy as np
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig
 
+from ..base import BaseModel
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
@@ -221,10 +222,10 @@ class Model(BaseModel):
 
         inputs_embeds = self.language_model.embed_tokens(input_ids)
 
-        pooler_output, embeddings, hidden_state = self.vision_model(
+        vision_output = self.vision_model(
             pixel_values[0].transpose(0, 2, 3, 1), output_hidden_states=True
         )
-        image_features = pooler_output.astype(pixel_values.dtype)
+        image_features = vision_output.pooler_output.astype(pixel_values.dtype)
         image_features = self.connector(image_features, mask=None)
 
         final_inputs_embeds = self._prepare_inputs_for_multimodal(

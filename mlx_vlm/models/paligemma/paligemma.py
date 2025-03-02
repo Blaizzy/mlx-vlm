@@ -72,11 +72,14 @@ class Model(BaseModel):
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        hidden_state, _, _, all_attns = self.vision_tower(
+        vision_output = self.vision_tower(
             pixel_values.transpose(0, 2, 3, 1).astype(inputs_embeds.dtype),
             output_hidden_states=True,
             output_attentions=True,
         )
+
+        hidden_state = vision_output.pooler_output
+        all_attns = vision_output.attentions
 
         image_features = hidden_state[None, :].astype(pixel_values.dtype)
 

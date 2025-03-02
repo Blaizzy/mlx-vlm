@@ -6,6 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import VisionModelOutput
+
 
 @dataclass
 class VisionConfig:
@@ -225,23 +227,27 @@ class SigLipVisionModel(nn.Module):
         self,
         x: mx.array,
         output_hidden_states: Optional[bool] = None,
-        output_attn: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
     ) -> mx.array:
         x = self.embeddings(x)
 
         encoder_states = (x,) if output_hidden_states else None
-        all_attns = () if output_attn else None
+        all_attentions = () if output_attentions else None
 
         for l in self.encoder.layers:
             x, attn = l(x, mask=None)
             if output_hidden_states:
                 encoder_states = encoder_states + (x,)
-            if output_attn:
-                all_attns = all_attns + (attn,)
+            if output_attentions:
+                all_attentions = all_attentions + (attn,)
 
         pooler_output = self.post_layernorm(x[:, 0, :])
         pooler_output = self.head(pooler_output)
-        return pooler_output, x, encoder_states
+        return VisionModelOutput(
+            pooler_output=pooler_output,
+            encoder_states=encoder_states,
+            attentions=all_attentions,
+        )
 
 
 class SigLipMultiheadAttentionPoolingHead(nn.Module):

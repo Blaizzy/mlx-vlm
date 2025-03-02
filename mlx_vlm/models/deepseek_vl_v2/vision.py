@@ -9,6 +9,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import VisionModelOutput
+
 
 @dataclass
 class VisionConfig:
@@ -305,7 +307,9 @@ class SigLipVisionModel(nn.Module):
 
         if not self.ignore_head:
             pooler_output = self.attn_pool(pooler_output)
-        return pooler_output, x, encoder_states
+        return VisionModelOutput(
+            pooler_output=pooler_output, encoder_states=encoder_states
+        )
 
 
 class VisionModel(nn.Module):

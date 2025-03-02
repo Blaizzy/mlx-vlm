@@ -5,6 +5,8 @@ from typing import List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import VisionModelOutput
+
 
 @dataclass
 class VisionConfig:
@@ -285,7 +287,11 @@ class PixtralVisionModel(nn.Module):
             if output_attentions:
                 all_attns = all_attns + (attn,)
 
-        return patch_embeds, encoder_states, all_attns
+        return VisionModelOutput(
+            hidden_states=patch_embeds,
+            encoder_states=encoder_states,
+            attentions=all_attns,
+        )
 
 
 class VisionModel(nn.Module):

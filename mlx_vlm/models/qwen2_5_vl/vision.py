@@ -6,6 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import VisionModelOutput
+
 
 @dataclass
 class VisionConfig:
@@ -363,7 +365,7 @@ class VisionModel(nn.Module):
         hidden_states: mx.array,
         grid_thw: mx.array,
         output_hidden_states: Optional[bool] = None,
-        output_attn: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
     ) -> mx.array:
 
         hidden_states = self.patch_embed(hidden_states)
@@ -409,7 +411,7 @@ class VisionModel(nn.Module):
         cu_seqlens = mx.pad(cu_seqlens, (1, 0), mode="constant", constant_values=0)
 
         encoder_states = (hidden_states,) if output_hidden_states else None
-        all_attns = () if output_attn else None
+        all_attentions = () if output_attentions else None
 
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
@@ -424,13 +426,13 @@ class VisionModel(nn.Module):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
 
-            if output_attn:
-                all_attns = all_attns + (attn,)
+            if output_attentions:
+                all_attentions = all_attentions + (attn,)
 
         hidden_states = self.merger(hidden_states)
         reverse_indices = mx.argsort(window_index, axis=0)
         hidden_states = hidden_states[reverse_indices, :]
-        return hidden_states, all_attns
+        return VisionModelOutput(hidden_states=hidden_states, attentions=all_attentions)
 
     def sanitize(self, weights):
         sanitized_weights = {}

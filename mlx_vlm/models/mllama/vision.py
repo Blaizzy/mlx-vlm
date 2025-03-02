@@ -5,6 +5,8 @@ from typing import List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import VisionModelOutput
+
 
 @dataclass
 class VisionConfig:
@@ -440,7 +442,7 @@ class VisionModel(nn.Module):
             [hidden_state, intermediate_hidden_states], axis=-1
         )
 
-        return hidden_state
+        return VisionModelOutput(hidden_states=hidden_state)
 
     @staticmethod
     def sanitize(weights):

@@ -70,12 +70,12 @@ class Model(BaseModel):
                     "`aspect_ratio_ids` must be provided if `pixel_values` is provided"
                 )
 
-            vision_outputs = self.vision_tower(
+            vision_output = self.vision_tower(
                 pixel_values=pixel_values,
                 aspect_ratio_ids=aspect_ratio_ids,
                 aspect_ratio_mask=aspect_ratio_mask,
             )
-            cross_attention_states = vision_outputs[0]
+            cross_attention_states = vision_output.hidden_states[0]
 
             cross_attention_states = self.multi_modal_projector(
                 cross_attention_states

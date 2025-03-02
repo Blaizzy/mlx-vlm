@@ -278,6 +278,14 @@ class LanguageModelOutput:
     encoder_outputs: Optional[List[mx.array]] = None
 
 
+@dataclass
+class VisionModelOutput:
+    hidden_states: Optional[mx.array] = None
+    encoder_states: Optional[List[mx.array]] = None
+    attentions: Optional[List[mx.array]] = None
+    pooler_output: Optional[mx.array] = None
+
+
 class BaseModel(nn.Module):
     def __init__(self):
         super().__init__()

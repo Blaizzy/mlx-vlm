@@ -145,11 +145,11 @@ class Model(BaseModel):
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        *_, hidden_state = self.vision_tower(
+        vision_output = self.vision_tower(
             pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
         )
 
-        image_features = hidden_state[-1].astype(pixel_values.dtype)
+        image_features = vision_output.encoder_states[-1].astype(pixel_values.dtype)
         assert image_features.shape[-2] == 729
 
         image_features = self.mm_projector(image_features)

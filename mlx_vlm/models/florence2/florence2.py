@@ -11,6 +11,7 @@ import mlx.nn as nn
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_map
 
+from ..base import BaseModel
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
@@ -207,7 +208,8 @@ class Model(BaseModel):
         # Get vision features
         if extract_features:
             batch_size, C, H, W = pixel_values.shape
-            x = self.vision_tower(pixel_values)
+            vision_output = self.vision_tower(pixel_values)
+            x = vision_output.hidden_states
         else:
             x = pixel_values
             batch_size = pixel_values.shape[0]

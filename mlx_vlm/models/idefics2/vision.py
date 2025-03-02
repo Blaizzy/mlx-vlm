@@ -6,6 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import VisionModelOutput
+
 
 @dataclass
 class VisionConfig:
@@ -247,7 +249,9 @@ class VisionModel(nn.Module):
 
         pooler_output = self.post_layernorm(encoder_outputs[0])
 
-        return pooler_output, x, encoder_outputs[-1]
+        return VisionModelOutput(
+            pooler_output=pooler_output, encoder_states=encoder_outputs
+        )
 
     def sanitize(self, weights):
         sanitized_weights = {}

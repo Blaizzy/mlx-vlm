@@ -8,6 +8,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import VisionModelOutput
+
 
 @dataclass
 class VisionConfig:
@@ -210,7 +212,9 @@ class ClipModel(nn.Module):
                 encoder_states = encoder_states + (x,)
 
         pooler_output = self.post_layernorm(x[:, 0, :])
-        return pooler_output, x, encoder_states
+        return VisionModelOutput(
+            pooler_output=pooler_output, hidden_states=x, encoder_states=encoder_states
+        )
 
 
 class ClipVModel(nn.Module):
@@ -264,7 +268,8 @@ class VisionModel(nn.Module):
         img_sizes = (img_sizes // 336).tolist()
         img_features = self.img_processor.vision_model(
             img_embeds.reshape(-1, *img_embeds.shape[2:]).transpose(0, 2, 3, 1), True
-        )[-1][-2][:, 1:]
+        )
+        image_features = img_features.encoder_states[-1][-2][:, 1:]
         img_features = img_features.reshape(B, -1, *img_features.shape[1:])
         C, H = self.image_dim_out, int(img_features.shape[2] ** 0.5)
         output_imgs, output_len = [], []

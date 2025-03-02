@@ -103,9 +103,10 @@ class Model(BaseModel):
 
         inputs_embeds = self.language_model.embed_tokens(input_ids)
 
-        pooler_output, embeddings, hidden_state = self.vision_model(
+        vision_output = self.vision_model(
             pixel_values[0].transpose(0, 2, 3, 1), output_hidden_states=True
         )
+        pooler_output = vision_output.pooler_output
 
         image_features = pooler_output.astype(pixel_values.dtype)
         image_features = self.connector(image_features)

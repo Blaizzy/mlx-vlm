@@ -80,9 +80,11 @@ class Model(BaseModel):
                     else None
                 )
 
-            image_features, cls_embed, all_attns = self.vision_tower(
+            vision_output = self.vision_tower(
                 pixel_values, image_masks, output_attentions=True
             )
+            image_features = vision_output.hidden_states
+            all_attns = vision_output.attentions
 
             # Insert image features into the input embeddings
             num_image, num_patch = image_features.shape[1:3]
@@ -101,9 +103,7 @@ class Model(BaseModel):
             image_input_idx = image_input_idx.reshape(batch_size, num_image * num_patch)
 
             all_attns = all_attns.reshape(batch_size, num_image * num_patch, -1)
-            print("all_attns", all_attns.shape)
-            print("image_features", image_features.shape)
-            print("image_input_idx", image_input_idx.shape)
+
             if all_attns is not None:
                 attn = all_attns[None, ...]
                 vision_filter_ratio = kwargs.get("vision_filter_ratio", 1.0)

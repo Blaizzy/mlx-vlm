@@ -6,6 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import VisionModelOutput
+
 
 @dataclass
 class VisionConfig:
@@ -203,13 +205,16 @@ class SigLipVisionModel(nn.Module):
     ) -> mx.array:
         x = self.embeddings(x)
 
-        h, encoder_states, all_attns = self.encoder(
+        h, encoder_states, all_attentions = self.encoder(
             x=x, output_hidden_states=output_hidden_states, mask=None
         )
 
         pooler_output = self.post_layernorm(h)
-
-        return pooler_output, x, encoder_states, all_attns
+        return VisionModelOutput(
+            pooler_output=pooler_output,
+            encoder_states=encoder_states,
+            attentions=all_attentions,
+        )
 
 
 class VisionModel(nn.Module):

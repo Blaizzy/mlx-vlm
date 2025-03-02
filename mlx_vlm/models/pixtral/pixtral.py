@@ -88,11 +88,15 @@ class Model(BaseModel):
         # Pass pixel_values as list of images, as each image is individually run through conv2d and position encoding
         # Reference code from transformers: https://github.com/huggingface/transformers/blob/main/src/transformers/models/pixtral/modeling_pixtral.py#L479C9-L479C21
         # and mistral_inference: https://github.com/mistralai/mistral-inference/blob/main/src/mistral_inference/vision_encoder.py#L85
-        *_, hidden_states, all_attns = self.vision_tower(
+        vision_output = self.vision_tower(
             pixel_values.transpose(0, 2, 3, 1),
             output_hidden_states=True,
             output_attentions=True,
         )
+
+        hidden_states = vision_output.encoder_states
+        all_attns = vision_output.attentions
+
         # Select the hidden states from the desired layer
         selected_image_feature = hidden_states[self.vision_feature_layer]
 

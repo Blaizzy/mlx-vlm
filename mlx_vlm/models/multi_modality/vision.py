@@ -10,6 +10,7 @@ import mlx.nn as nn
 import numpy as np
 from scipy.ndimage import zoom
 
+from ..base import VisionModelOutput
 from .sam import SAMEncoder
 
 
@@ -325,7 +326,9 @@ class SigLipVisionModel(nn.Module):
 
         if not self.ignore_head:
             pooler_output = self.attn_pool(pooler_output)
-        return pooler_output, x, encoder_states
+        return VisionModelOutput(
+            pooler_output=pooler_output, hidden_states=x, encoder_states=encoder_states
+        )
 
 
 class HybridVisionModel(nn.Module):
@@ -346,7 +349,7 @@ class HybridVisionModel(nn.Module):
         if self.resolution == "high":
             return self.vision_tower(x)
         else:
-            return self.vision_tower(x)[0]
+            return self.vision_tower(x).pooler_output
 
 
 def resize_image(image, size, antialias=True):

@@ -72,9 +72,15 @@ class Model(BaseModel):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
-        hidden_states, all_attns = self.vision_tower(
-            pixel_values, image_grid_thw, output_hidden_states=False, output_attn=True
+        vision_output = self.vision_tower(
+            pixel_values,
+            image_grid_thw,
+            output_hidden_states=False,
+            output_attentions=True,
         )
+
+        hidden_states = vision_output.hidden_states
+        all_attns = vision_output.attentions
 
         if hidden_states.ndim == 2:
             hidden_states = hidden_states[None, :, :]
