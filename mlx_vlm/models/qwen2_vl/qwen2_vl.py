@@ -86,10 +86,10 @@ class Model(BaseModel):
             attn = all_attentions[-1]
             vision_filter_ratio = kwargs.get("vision_filter_ratio", 1.0)
             vision_merge_ratio = kwargs.get("vision_merge_ratio", 1.0)
-            hidden_states = self.filter_topk_vision_tokens(
+            hidden_states, _ = self.filter_topk_vision_tokens(
                 hidden_states, attn, vision_filter_ratio
             )
-            hidden_states = self.merge_similar_vision_tokens(
+            hidden_states, _ = self.merge_similar_vision_tokens(
                 hidden_states, vision_merge_ratio
             )
 
@@ -129,11 +129,14 @@ class Model(BaseModel):
     ):
 
         image_grid_thw = kwargs.pop("image_grid_thw", None)
-        if image_grid_thw is not None:
-            image_grid_thw = mx.array(image_grid_thw)
+        video_grid_thw = kwargs.pop("video_grid_thw", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+
+        if grid_thw is not None:
+            grid_thw = mx.array(grid_thw)
 
         input_embddings = self.get_input_embeddings(
-            input_ids, pixel_values, image_grid_thw, **kwargs
+            input_ids, pixel_values, grid_thw, **kwargs
         )
 
         logits = self.language_model(None, cache=cache, inputs_embeds=input_embddings)
