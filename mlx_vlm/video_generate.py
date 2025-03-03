@@ -454,7 +454,20 @@ def main():
         help="Select the model to use",
     )
     parser.add_argument("--verbose", action="store_false", help="Print verbose output")
-
+    parser.add_argument(
+        "--vision-merge-ratio",
+        type=float,
+        default=1.0,
+        help="Ratio of vision tokens to keep during merging similar tokens (between 0.1 and 1.0).",
+        choices=[x / 10 for x in range(1, 11)],
+    )
+    parser.add_argument(
+        "--vision-filter-ratio",
+        type=float,
+        default=1.0,
+        help="Ratio of vision tokens to keep during filtering topk tokens (between 0.1 and 1.0).",
+        choices=[x / 10 for x in range(1, 11)],
+    )
     args = parser.parse_args()
 
     print(f"\033[32mLoading model:\033[0m {args.model}")
@@ -529,7 +542,6 @@ def main():
             kwargs["video_grid_thw"] = mx.array(inputs["video_grid_thw"])
         if inputs.get("image_grid_thw", None) is not None:
             kwargs["image_grid_thw"] = mx.array(inputs["image_grid_thw"])
-
     else:
         if is_video_file(args.video):
             if len(args.video) > 1:
@@ -585,6 +597,8 @@ def main():
     kwargs["mask"] = mask
     kwargs["temperature"] = args.temperature
     kwargs["max_tokens"] = args.max_tokens
+    kwargs["vision_merge_ratio"] = args.vision_merge_ratio
+    kwargs["vision_filter_ratio"] = args.vision_filter_ratio
 
     response = generate(
         model,
