@@ -511,7 +511,7 @@ def process_command(model, processor, gui_agent, gui_processor, query, past_acti
         for action in ["finished", "call_user", "wait"]
     ):
         past_actions.append(planner_response)
-        play_audio("/Users/prince_canuma/task_completed.wav")
+        play_audio("./audio/task_completed.wav")
         print("Task completed successfully!")
         screenshot = ImageGrab.grab()
         screenshot = screenshot.resize((1512, 982))
