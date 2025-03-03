@@ -562,7 +562,7 @@ def main():
     print("Type 'exit' to quit")
     model, processor = load("mlx-community/Qwen2.5-VL-7B-Instruct-4bit")
     gui_agent, gui_processor = load(
-        "mlx-community/ShowUI-2B-bf16-bf16",
+        "mlx-community/ShowUI-2B-bf16",
         processor_kwargs={"min_pixels": min_pixels, "max_pixels": max_pixels},
     )
 
