@@ -1109,6 +1109,9 @@ def generate(
 
         print("Prompt:", prompt)
 
+    vision_merge_ratio = kwargs.get("vision_merge_ratio", 1.0)
+    vision_filter_ratio = kwargs.get("vision_filter_ratio", 1.0)
+
     text = ""
     last_response = None
 
@@ -1123,8 +1126,11 @@ def generate(
         if len(text) == 0:
             print("No text generated for this prompt")
             return
+        total_tokens = (
+            last_response.prompt_tokens * vision_merge_ratio
+        ) * vision_filter_ratio
         print(
-            f"Prompt: {last_response.prompt_tokens} tokens, "
+            f"Prompt: {int(total_tokens)} tokens, "
             f"{last_response.prompt_tps:.3f} tokens-per-sec"
         )
         print(

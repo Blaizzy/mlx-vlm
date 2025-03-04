@@ -10,6 +10,7 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 
+from ..base import BaseModel
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
@@ -43,7 +44,7 @@ class ModelConfig:
         )
 
 
-class Model(nn.Module):
+class Model(BaseModel):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -55,6 +56,7 @@ class Model(nn.Module):
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
         image_grid_thw: Optional[mx.array] = None,
+        **kwargs,
     ):
 
         if pixel_values is None:
@@ -67,12 +69,29 @@ class Model(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
-        hidden_states = self.vision_tower(
-            pixel_values, image_grid_thw, output_hidden_states=False
+        vision_output = self.vision_tower(
+            pixel_values,
+            image_grid_thw,
+            output_hidden_states=False,
+            output_attentions=True,
         )
+
+        hidden_states = vision_output.hidden_states
+        all_attentions = vision_output.attentions
 
         if hidden_states.ndim == 2:
             hidden_states = hidden_states[None, :, :]
+
+        if all_attentions:
+            attn = all_attentions[-1]
+            vision_filter_ratio = kwargs.get("vision_filter_ratio", 1.0)
+            vision_merge_ratio = kwargs.get("vision_merge_ratio", 1.0)
+            hidden_states, _ = self.filter_topk_vision_tokens(
+                hidden_states, attn, vision_filter_ratio
+            )
+            hidden_states, _ = self.merge_similar_vision_tokens(
+                hidden_states, vision_merge_ratio
+            )
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self._merge_input_ids_with_image_features(
@@ -110,11 +129,14 @@ class Model(nn.Module):
     ):
 
         image_grid_thw = kwargs.pop("image_grid_thw", None)
-        if image_grid_thw is not None:
-            image_grid_thw = mx.array(image_grid_thw)
+        video_grid_thw = kwargs.pop("video_grid_thw", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+
+        if grid_thw is not None:
+            grid_thw = mx.array(grid_thw)
 
         input_embddings = self.get_input_embeddings(
-            input_ids, pixel_values, image_grid_thw
+            input_ids, pixel_values, grid_thw, **kwargs
         )
 
         logits = self.language_model(None, cache=cache, inputs_embeds=input_embddings)

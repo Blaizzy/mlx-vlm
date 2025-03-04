@@ -5,6 +5,8 @@ from typing import List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import VisionModelOutput
+
 
 @dataclass
 class VisionConfig:
@@ -153,11 +155,11 @@ class Attention(nn.Module):
             attn_weights = attn_weights + mask
 
         attn_weights = mx.softmax(attn_weights, axis=-1)
-        output = mx.matmul(attn_weights, values)
+        attn = mx.matmul(attn_weights, values)
 
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        output = attn.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return self.o_proj(output)
+        return self.o_proj(output), attn
 
 
 class MLP(nn.Module):
@@ -191,11 +193,11 @@ class EncoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
     ) -> mx.array:
         y = self.attention_norm(x)
-        y = self.attention(y, y, y, position_embeddings, mask)
+        y, attn = self.attention(y, y, y, position_embeddings, mask)
         x = x + y
         y = self.ffn_norm(x)
         y = self.feed_forward(y)
-        return x + y
+        return x + y, attn
 
 
 class Encoder(nn.Module):
@@ -255,6 +257,7 @@ class PixtralVisionModel(nn.Module):
         self,
         x: List[mx.array],
         output_hidden_states: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
     ) -> mx.array:
         patch_embeds_list = self.patch_conv(x)
         patch_embeds = patch_embeds_list.reshape(1, -1, patch_embeds_list.shape[-1])
@@ -273,15 +276,22 @@ class PixtralVisionModel(nn.Module):
         )
 
         encoder_states = (patch_embeds,) if output_hidden_states else None
+        all_attns = () if output_attentions else None
 
         for l in self.transformer.layers:
-            patch_embeds = l(
+            patch_embeds, attn = l(
                 patch_embeds, mask=mask, position_embeddings=position_embedding
             )
             if output_hidden_states:
                 encoder_states = encoder_states + (patch_embeds,)
+            if output_attentions:
+                all_attns = all_attns + (attn,)
 
-        return patch_embeds, encoder_states
+        return VisionModelOutput(
+            hidden_states=patch_embeds,
+            encoder_states=encoder_states,
+            attentions=all_attns,
+        )
 
 
 class VisionModel(nn.Module):
@@ -295,9 +305,12 @@ class VisionModel(nn.Module):
         self.vision_model = PixtralVisionModel(config)
 
     def __call__(
-        self, x: List[mx.array], output_hidden_states: Optional[bool] = None
+        self,
+        x: List[mx.array],
+        output_hidden_states: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
     ) -> mx.array:
-        return self.vision_model(x, output_hidden_states)
+        return self.vision_model(x, output_hidden_states, output_attentions)
 
     def sanitize(self, weights):
         sanitized_weights = {}

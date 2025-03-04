@@ -5,6 +5,8 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import VisionModelOutput
+
 
 @dataclass
 class VisionConfig:
@@ -179,12 +181,12 @@ class Attention(nn.Module):
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        output = mx.fast.scaled_dot_product_attention(
+        attn = mx.fast.scaled_dot_product_attention(
             q, k, v, scale=self.scale, mask=attention_mask
         )
-        output = output.transpose(0, 2, 1, 3)
+        output = attn.transpose(0, 2, 1, 3)
         output = output.reshape(seq_length, -1)
-        return self.proj(output)
+        return self.proj(output), attn
 
 
 class MLP(nn.Module):
@@ -211,13 +213,14 @@ class Qwen2VLVisionBlock(nn.Module):
         self.mlp = MLP(dim=config.embed_dim, hidden_dim=mlp_hidden_dim)
 
     def __call__(self, hidden_states, cu_seqlens, rotary_pos_emb) -> mx.array:
-        hidden_states = hidden_states + self.attn(
+        x, attn = self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
             rotary_pos_emb=rotary_pos_emb,
         )
+        hidden_states += x
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
-        return hidden_states
+        return hidden_states, attn
 
 
 class VisionModel(nn.Module):
@@ -286,6 +289,7 @@ class VisionModel(nn.Module):
         hidden_states: mx.array,
         grid_thw: mx.array,
         output_hidden_states: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
     ) -> mx.array:
 
         hidden_states = self.patch_embed(hidden_states)
@@ -307,15 +311,20 @@ class VisionModel(nn.Module):
         cu_seqlens = mx.pad(cu_seqlens, (1, 0), mode="constant", constant_values=0)
 
         encoder_states = (hidden_states,) if output_hidden_states else None
+        all_attentions = () if output_attentions else None
 
         for blk in self.blocks:
-            hidden_states = blk(
+            hidden_states, attn = blk(
                 hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
             )
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
+            if output_attentions:
+                all_attentions = all_attentions + (attn,)
 
-        return self.merger(hidden_states)
+        return VisionModelOutput(
+            hidden_states=self.merger(hidden_states), attentions=all_attentions
+        )
 
     def sanitize(self, weights):
         sanitized_weights = {}

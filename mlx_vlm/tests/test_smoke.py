@@ -52,6 +52,12 @@ def parse_args():
         "--max-tokens", type=int, default=100, help="Maximum tokens to generate"
     )
     parser.add_argument("--resize-shape", type=int, default=None, help="Resize shape")
+    parser.add_argument(
+        "--vision-filter-ratio", type=float, default=0.8, help="Vision filter ratio"
+    )
+    parser.add_argument(
+        "--vision-merge-ratio", type=float, default=0.8, help="Vision merge ratio"
+    )
     return parser.parse_args()
 
 

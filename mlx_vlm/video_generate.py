@@ -466,7 +466,7 @@ def main():
             "Warning: The model selected doesn't natively support video inputs. Performance may be degraded."
         )
 
-    if isinstance(args.max_pixels, tuple):
+    if isinstance(args.max_pixels, tuple) or isinstance(args.max_pixels, list):
         max_pixels = args.max_pixels[0] * args.max_pixels[1]
     else:
         max_pixels = args.max_pixels
@@ -529,7 +529,6 @@ def main():
             kwargs["video_grid_thw"] = mx.array(inputs["video_grid_thw"])
         if inputs.get("image_grid_thw", None) is not None:
             kwargs["image_grid_thw"] = mx.array(inputs["image_grid_thw"])
-
     else:
         if is_video_file(args.video):
             if len(args.video) > 1:

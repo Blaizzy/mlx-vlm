@@ -9,7 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
-from ..base import KVCache
+from ..base import BaseModel, KVCache
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
@@ -36,7 +36,7 @@ class ModelConfig:
         )
 
 
-class Model(nn.Module):
+class Model(BaseModel):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -70,12 +70,12 @@ class Model(nn.Module):
                     "`aspect_ratio_ids` must be provided if `pixel_values` is provided"
                 )
 
-            vision_outputs = self.vision_tower(
+            vision_output = self.vision_tower(
                 pixel_values=pixel_values,
                 aspect_ratio_ids=aspect_ratio_ids,
                 aspect_ratio_mask=aspect_ratio_mask,
             )
-            cross_attention_states = vision_outputs[0]
+            cross_attention_states = vision_output.hidden_states[0]
 
             cross_attention_states = self.multi_modal_projector(
                 cross_attention_states

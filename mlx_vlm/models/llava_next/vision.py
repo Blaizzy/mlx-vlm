@@ -7,6 +7,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import VisionModelOutput
+
 
 @dataclass
 class VisionConfig:
@@ -96,12 +98,12 @@ class Attention(nn.Module):
         keys = keys.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
 
-        output = mx.fast.scaled_dot_product_attention(
+        attn = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
         )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        output = attn.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return self.out_proj(output)
+        return self.out_proj(output), attn
 
 
 class MLP(nn.Module):
@@ -130,11 +132,11 @@ class EncoderLayer(nn.Module):
 
     def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
         y = self.layer_norm1(x)
-        y = self.self_attn(y, y, y, mask)
+        y, attn = self.self_attn(y, y, y, mask)
         x = x + y
         y = self.layer_norm2(x)
         y = self.mlp(y)
-        return x + y
+        return x + y, attn
 
 
 class Encoder(nn.Module):
@@ -192,19 +194,27 @@ class ClipVisionModel(nn.Module):
         self,
         x: mx.array,
         output_hidden_states: Optional[bool] = None,
+        output_attentions: bool = False,
     ) -> mx.array:
         x = self.embeddings(x)
         x = self.pre_layrnorm(x)
 
         encoder_states = (x,) if output_hidden_states else None
+        all_attentions = () if output_attentions else None
 
         for l in self.encoder.layers:
-            x = l(x, mask=None)
+            x, attn = l(x, mask=None)
             if output_hidden_states:
                 encoder_states = encoder_states + (x,)
+            if output_attentions:
+                all_attentions = all_attentions + (attn,)
 
         pooler_output = self.post_layernorm(x[:, 0, :])
-        return pooler_output, x, encoder_states
+        return VisionModelOutput(
+            pooler_output=pooler_output,
+            encoder_states=encoder_states,
+            attentions=all_attentions,
+        )
 
 
 class VisionModel(nn.Module):
@@ -218,9 +228,12 @@ class VisionModel(nn.Module):
         self.vision_model = ClipVisionModel(config)
 
     def __call__(
-        self, x: mx.array, output_hidden_states: Optional[bool] = None
+        self,
+        x: mx.array,
+        output_hidden_states: Optional[bool] = None,
+        output_attentions: bool = False,
     ) -> mx.array:
-        return self.vision_model(x, output_hidden_states)
+        return self.vision_model(x, output_hidden_states, output_attentions)
 
     def sanitize(self, weights):
         sanitized_weights = {}

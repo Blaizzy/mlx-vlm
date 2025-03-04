@@ -10,6 +10,7 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 
+from ..base import BaseModel
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
@@ -46,7 +47,7 @@ class ModelConfig:
         )
 
 
-class Model(nn.Module):
+class Model(BaseModel):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -58,6 +59,7 @@ class Model(nn.Module):
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
         image_grid_thw: Optional[mx.array] = None,
+        **kwargs,
     ):
 
         if pixel_values is None:
@@ -70,12 +72,30 @@ class Model(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
-        hidden_states = self.vision_tower(
-            pixel_values, image_grid_thw, output_hidden_states=False
+        vision_output = self.vision_tower(
+            pixel_values,
+            image_grid_thw,
+            output_hidden_states=False,
+            output_attentions=True,
         )
+
+        hidden_states = vision_output.hidden_states
+        all_attns = vision_output.attentions
 
         if hidden_states.ndim == 2:
             hidden_states = hidden_states[None, :, :]
+
+        if all_attns:
+            attn = all_attns[-1]
+
+            vision_filter_ratio = kwargs.get("vision_filter_ratio", 1.0)
+            vision_merge_ratio = kwargs.get("vision_merge_ratio", 1.0)
+            hidden_states, _ = self.filter_topk_vision_tokens(
+                hidden_states, attn, vision_filter_ratio
+            )
+            hidden_states, _ = self.merge_similar_vision_tokens(
+                hidden_states, vision_merge_ratio
+            )
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self._merge_input_ids_with_image_features(
@@ -88,6 +108,7 @@ class Model(nn.Module):
     ):
         image_token_id = self.config.image_token_id
         video_token_id = self.config.video_token_id
+
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = input_ids == image_token_id
         if mx.sum(image_positions) == 0:
@@ -114,7 +135,9 @@ class Model(nn.Module):
         if image_grid_thw is not None:
             image_grid_thw = mx.array(image_grid_thw)
 
-        inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
+        inputs_embeds = self.get_input_embeddings(
+            input_ids, pixel_values, grid_thw, **kwargs
+        )
 
         logits = self.language_model(None, cache=cache, inputs_embeds=inputs_embeds)
         return logits

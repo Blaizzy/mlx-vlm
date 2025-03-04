@@ -15,7 +15,7 @@ DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = []
 DEFAULT_PROMPT = "What are these?"
 DEFAULT_MAX_TOKENS = 256
-DEFAULT_TEMP = 0.5
+DEFAULT_TEMPERATURE = 0.5
 DEFAULT_TOP_P = 1.0
 DEFAULT_SEED = 0
 
@@ -71,12 +71,25 @@ def parse_arguments():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=DEFAULT_TEMP,
+        default=DEFAULT_TEMPERATURE,
         help="Temperature for sampling.",
     )
     parser.add_argument("--chat", action="store_true", help="Chat in multi-turn style.")
     parser.add_argument("--verbose", action="store_false", help="Detailed output.")
-
+    parser.add_argument(
+        "--vision-merge-ratio",
+        type=float,
+        default=1.0,
+        help="Ratio of vision tokens to keep during merging similar tokens (between 0.1 and 1.0).",
+        choices=[x / 10 for x in range(1, 11)],
+    )
+    parser.add_argument(
+        "--vision-filter-ratio",
+        type=float,
+        default=1.0,
+        help="Ratio of vision tokens to keep during filtering topk tokens (between 0.1 and 1.0).",
+        choices=[x / 10 for x in range(1, 11)],
+    )
     return parser.parse_args()
 
 
