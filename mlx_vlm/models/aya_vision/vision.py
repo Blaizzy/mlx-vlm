@@ -416,7 +416,9 @@ class VisionEmbeddings(nn.Module):
 
         return resulted_positional_embeddings
 
-    def __call__(self, x: mx.array, spatial_shapes: mx.array) -> mx.array:
+    def __call__(
+        self, x: mx.array, spatial_shapes: Optional[mx.array] = None
+    ) -> mx.array:
         batch_size = x.shape[0]
         patch_embeddings = self.patch_embedding(x)
         patch_embeddings = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
@@ -443,14 +445,6 @@ class VisionEmbeddings(nn.Module):
 class SigLipVisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
-        self.model_type = config.model_type
-        if self.model_type not in [
-            "siglip_vision_model",
-            "idefics3",
-            "idefics3_vision",
-            "smolvlm_vision",
-        ]:
-            raise ValueError(f"Unsupported model type: {self.model_type}")
 
         self.embeddings = VisionEmbeddings(config)
         self.encoder = Encoder(config)
@@ -474,12 +468,16 @@ class SigLipVisionModel(nn.Module):
 class VisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
+        self.model_type = config.model_type
+        if self.model_type not in ["siglip_vision_model"]:
+            raise ValueError(f"Unsupported model type: {self.model_type}")
+
         self.vision_model = SigLipVisionModel(config)
 
     def __call__(
         self,
         x: mx.array,
-        spatial_shapes: mx.array,
+        spatial_shapes: Optional[mx.array] = None,
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
         return self.vision_model(x, spatial_shapes, output_hidden_states)
