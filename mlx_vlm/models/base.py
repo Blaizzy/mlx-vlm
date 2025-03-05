@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
+from mlx_lm.models.cache import RotatingKVCache
 from PIL import Image
 from transformers.image_processing_utils import BaseImageProcessor as ImageProcessor
 from transformers.image_processing_utils import get_size_dict

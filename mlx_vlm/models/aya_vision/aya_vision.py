@@ -72,7 +72,7 @@ class AyaVisionMultiModalProjector(nn.Module):
         hidden_states = self.linear_1(image_features)
 
         # Split along last dimension and apply SwiGLU
-        x, gate = hidden_states.chunk(2, dim=-1)
+        x, gate = mx.split(hidden_states, 2, axis=-1)
         hidden_states = self.act(gate) * x
 
         hidden_states = self.linear_2(hidden_states)
@@ -116,6 +116,7 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        **kwargs,
     ):
         if pixel_values is None:
             return self.language_model.model.embed_tokens(input_ids)
@@ -123,9 +124,12 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
+        spatial_shapes = kwargs.get("spatial_shapes", None)
         # Get the ouptut hidden states from the vision model
         *_, hidden_states = self.vision_tower(
-            pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
+            pixel_values.transpose(0, 2, 3, 1),
+            spatial_shapes=spatial_shapes,
+            output_hidden_states=True,
         )
 
         # Select the hidden states from the desired layer
@@ -154,11 +158,10 @@ class Model(nn.Module):
         self, image_features, inputs_embeds, input_ids
     ):
         image_token_index = self.config.image_token_index
-        num_images, num_image_patches, embed_dim = image_features.shape
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
-        num_images, _, vision_hidden_size = image_features.shape
+        num_images, _, _, vision_hidden_size = image_features.shape
 
         reshaped_image_hidden_states = image_features.reshape(-1, vision_hidden_size)
 
@@ -177,7 +180,8 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        input_embddings = self.get_input_embeddings(input_ids, pixel_values)
+
+        input_embddings = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
         logits = self.language_model(
             input_ids, cache=cache, inputs_embeds=input_embddings
         )

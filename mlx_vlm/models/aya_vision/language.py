@@ -4,9 +4,9 @@ from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import RotatingKVCache
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 
-from ..base import KVCache, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
 
 
 @dataclass
@@ -98,7 +98,7 @@ class Attention(nn.Module):
                 mask = mask[..., -key_len:]
 
         output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            queries, keys, values, scale=self.scale, mask=mask
         )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
@@ -160,17 +160,20 @@ class CohereModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
+        inputs_embeds: mx.array = None,
         mask: mx.array = None,
         cache=None,
     ):
-        h = self.embed_tokens(inputs)
+        if inputs_embeds is None:
+            h = self.embed_tokens(inputs)
+        else:
+            h = inputs_embeds
 
         if cache is None:
             cache = [None] * len(self.layers)
 
-        if mask is None:
-            j = self.config.sliding_window_pattern
-            mask = create_attention_mask(h, cache[j - 1 : j])
+        j = self.config.sliding_window_pattern
+        mask = create_attention_mask(h, cache[j - 1 : j])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -188,13 +191,14 @@ class LanguageModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
+        inputs_embeds: mx.array = None,
         mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, inputs_embeds, mask, cache)
         out = self.model.embed_tokens.as_linear(out)
         out = out * self.model.config.logit_scale
-        return out
+        return LanguageModelOutput(logits=out)
 
     def make_cache(self):
         caches = []
@@ -213,3 +217,11 @@ class LanguageModel(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    @property
+    def head_dim(self):
+        return self.model.config.head_dim
+
+    @property
+    def n_kv_heads(self):
+        return self.model.config.num_key_value_heads

@@ -344,9 +344,11 @@ class VisionEmbeddings(nn.Module):
         self.image_size = config.image_size
         self.patch_size = config.patch_size
 
-        self.patch_embedding = nn.Linear(
-            config.num_channels * self.patch_size * self.patch_size,
+        self.patch_embedding = nn.Conv2d(
+            config.num_channels,
             config.hidden_size,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
         )
 
         self.num_patches = (self.image_size // self.patch_size) ** 2
@@ -415,21 +417,26 @@ class VisionEmbeddings(nn.Module):
         return resulted_positional_embeddings
 
     def __call__(self, x: mx.array, spatial_shapes: mx.array) -> mx.array:
-        # Apply patch embeddings to already patchified pixel values
-        target_dtype = self.patch_embedding.weight.dtype
-        patch_embeds = self.patch_embedding(x.astype(target_dtype))
+        batch_size = x.shape[0]
+        patch_embeddings = self.patch_embedding(x)
+        patch_embeddings = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
+        if spatial_shapes is None:
+            position_ids = mx.array(np.arange(self.num_positions)[None, :])
+            embeddings = patch_embeddings
+            embeddings += self.position_embedding(position_ids)
 
-        # Get positional resized and padded positional embeddings
-        positional_embeddings = self.position_embedding.weight.reshape(
-            self.position_embedding_size, self.position_embedding_size, -1
-        )
+        else:
+            # Get positional resized and padded positional embeddings
+            positional_embeddings = self.position_embedding.weight.reshape(
+                self.position_embedding_size, self.position_embedding_size, -1
+            )
 
-        resized_positional_embeddings = self.resize_positional_embeddings(
-            positional_embeddings, spatial_shapes, max_length=x.shape[1]
-        )
+            resized_positional_embeddings = self.resize_positional_embeddings(
+                positional_embeddings, spatial_shapes, max_length=x.shape[1]
+            )
 
-        # Add positional embeddings to patch embeddings
-        embeddings = patch_embeds + resized_positional_embeddings
+            # Add positional embeddings to patch embeddings
+            embeddings = patch_embeds + resized_positional_embeddings
         return embeddings
 
 
@@ -483,9 +490,15 @@ class VisionModel(nn.Module):
             if "position_ids" in k:
                 # Remove unused position_ids
                 continue
-            if "patch_embedding.weight" in k:
-                if v.ndim == 4:
-                    sanitized_weights[k] = v.reshape(v.shape[0], -1)
+            elif "patch_embedding.weight" in k:
+                # PyTorch conv2d weight tensors have shape:
+                #   [out_channels, in_channels, kH, KW]
+                # MLX conv2d expects the weight be of shape:
+                #   [out_channels, kH, KW, in_channels]
+                if check_array_shape(v):
+                    sanitized_weights[k] = v
+                else:
+                    sanitized_weights[k] = v.transpose(0, 2, 3, 1)
             else:
                 sanitized_weights[k] = v
 
