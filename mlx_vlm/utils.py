@@ -803,7 +803,9 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
         ).astype(mx.int32)
 
     else:
-        processor.tokenizer.pad_token = processor.tokenizer.eos_token
+        if hasattr(processor, "tokenizer"):
+            processor.tokenizer.pad_token = processor.tokenizer.eos_token
+
         if hasattr(processor, "process"):
             inputs = processor.process(
                 text=prompts, images=images, padding=True, return_tensors="mlx"
