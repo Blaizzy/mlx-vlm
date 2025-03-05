@@ -111,9 +111,6 @@ class Model(nn.Module):
         position_ids = kwargs.pop("position_ids", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
-        if image_grid_thw is not None:
-            image_grid_thw = mx.array(image_grid_thw)
-
         inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
 
         logits = self.language_model(None, cache=cache, inputs_embeds=inputs_embeds)
