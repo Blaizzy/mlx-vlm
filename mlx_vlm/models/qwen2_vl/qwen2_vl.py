@@ -54,7 +54,7 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        image_grid_thw: Optional[mx.array] = None,
+        grid_thw: Optional[mx.array] = None,
     ):
 
         if pixel_values is None:
@@ -68,7 +68,7 @@ class Model(nn.Module):
 
         # Get the ouptut hidden states from the vision model
         hidden_states = self.vision_tower(
-            pixel_values, image_grid_thw, output_hidden_states=False
+            pixel_values, grid_thw, output_hidden_states=False
         )
 
         if hidden_states.ndim == 2:
@@ -110,12 +110,10 @@ class Model(nn.Module):
     ):
 
         image_grid_thw = kwargs.pop("image_grid_thw", None)
-        if image_grid_thw is not None:
-            image_grid_thw = mx.array(image_grid_thw)
+        video_grid_thw = kwargs.pop("video_grid_thw", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
-        input_embddings = self.get_input_embeddings(
-            input_ids, pixel_values, image_grid_thw
-        )
+        input_embddings = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
 
         logits = self.language_model(None, cache=cache, inputs_embeds=input_embddings)
         return logits
