@@ -23,51 +23,53 @@ def parse_arguments():
 
 args = parse_arguments()
 config = load_config(args.model)
-model, processor = load(args.model, {"trust_remote_code": True})
+model, processor = load(args.model, processor_kwargs={"trust_remote_code": True})
 image_processor = load_image_processor(args.model)
 
 
 def chat(message, history, temperature, max_tokens):
     if config["model_type"] != "paligemma":
-        if len(message["files"]) >= 1:
-            chat_history = []
-            for item in history:
-                chat_history.append({"role": "user", "content": item[0]})
-                if item[1] is not None:
-                    chat_history.append({"role": "assistant", "content": item[1]})
+        chat_history = []
+        for item in history:
+            chat_history.append({"role": "user", "content": item[0]})
+            if item[1] is not None:
+                chat_history.append({"role": "assistant", "content": item[1]})
 
-            chat_history.append({"role": "user", "content": message["text"]})
+        chat_history.append({"role": "user", "content": message["text"]})
 
-            messages = []
-            for i, m in enumerate(chat_history):
-                skip_token = True
-                if i == len(chat_history) - 1 and m["role"] == "user":
-                    skip_token = False
-                messages.append(
-                    get_message_json(
-                        config["model_type"],
-                        m["content"],
-                        role=m["role"],
-                        skip_image_token=skip_token,
-                    )
+        messages = []
+        for i, m in enumerate(chat_history):
+            skip_token = True
+            if i == len(chat_history) - 1 and m["role"] == "user":
+                skip_token = False
+            messages.append(
+                get_message_json(
+                    config["model_type"],
+                    m["content"],
+                    role=m["role"],
+                    skip_image_token=skip_token,
                 )
-
-            messages = get_chat_template(
-                processor, messages, add_generation_prompt=True
             )
 
-        else:
-            raise gr.Error("Please upload an image. Text only chat is not supported.")
+        messages = get_chat_template(processor, messages, add_generation_prompt=True)
+
     else:
         messages = message["text"]
 
-    files = message["files"][-1]["path"]
+    files = ""
+    if "files" in message and len(message["files"]) > 0:
+        files = message["files"][-1]
 
     response = ""
     for chunk in stream_generate(
-        model, processor, file, prompt, image_processor, max_tokens, temp=temperature
+        model,
+        processor,
+        messages,
+        files,
+        max_tokens=max_tokens,
+        temperature=temperature,
     ):
-        response += chunk
+        response += chunk.text
         yield response
 
 

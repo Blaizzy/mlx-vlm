@@ -94,6 +94,7 @@ def get_message_json(
         # Models using message_list_with_image format
         "idefics2": "message_list_with_image",
         "idefics3": "message_list_with_image_first",
+        "aya_vision": "message_list_with_image_first",
         "smolvlm": "message_list_with_image_first",
         "llava": "message_list_with_image",
         "llava_next": "message_list_with_image",
@@ -145,18 +146,22 @@ def get_message_json(
         raise ValueError(f"Unsupported model: {model_name}")
 
 
-def get_chat_template(processor, messages, add_generation_prompt, tokenize=False):
+def get_chat_template(
+    processor, messages, add_generation_prompt, tokenize=False, **kwargs
+):
     if "chat_template" in processor.__dict__.keys():
         return processor.apply_chat_template(
             messages,
             tokenize=tokenize,
             add_generation_prompt=add_generation_prompt,
+            **kwargs,
         )
     elif "tokenizer" in processor.__dict__.keys():
         return processor.tokenizer.apply_chat_template(
             messages,
             tokenize=tokenize,
             add_generation_prompt=add_generation_prompt,
+            **kwargs,
         )
     else:
         raise ValueError(
@@ -173,6 +178,7 @@ def apply_chat_template(
     num_images=1,
     **kwargs,
 ):
+
     config = config if isinstance(config, dict) else config.__dict__
 
     def process_single_prompt(p, is_first=True):
