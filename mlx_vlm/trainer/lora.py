@@ -12,11 +12,11 @@ class LoRaLayer(nn.Module):
         rank: int,
         alpha: float = 0.1,
         dropout: float = 0.0,
+        name: str = None,
     ):
         super().__init__()
 
-        self.original_layer = linear
-
+        self.base_layer = linear
         self.dropout = nn.Dropout(p=dropout)
 
         output_dims, input_dims = linear.weight.shape
@@ -25,17 +25,37 @@ class LoRaLayer(nn.Module):
 
         std_dev = 1 / math.sqrt(rank)
 
-        self.A = mx.random.uniform(
-            low=-std_dev,
-            high=std_dev,
-            shape=(input_dims, rank),
-        )
-        self.B = mx.zeros((rank, output_dims))
+        # Create A and B as submodules with the specified name prefix
+        if name is not None:
+            setattr(
+                self,
+                f"lora_A.{name}.weight",
+                mx.random.uniform(
+                    low=-std_dev,
+                    high=std_dev,
+                    shape=(input_dims, rank),
+                ),
+            )
+            setattr(self, f"lora_B.{name}.weight", mx.zeros((rank, output_dims)))
+            self.lora_name = name  # Store name for __call__
+        else:
+            self.A = mx.random.uniform(
+                low=-std_dev,
+                high=std_dev,
+                shape=(input_dims, rank),
+            )
+            self.B = mx.zeros((rank, output_dims))
+
         self.alpha = alpha
 
     def __call__(self, x):
-        y = self.original_layer(x)
-        lora_update = (self.dropout(x) @ self.A) @ self.B
+        y = self.base_layer(x)
+        if hasattr(self, "lora_name"):
+            A = getattr(self, f"lora_A.{self.lora_name}")
+            B = getattr(self, f"lora_B.{self.lora_name}")
+            lora_update = (self.dropout(x) @ A) @ B
+        else:
+            lora_update = (self.dropout(x) @ self.A) @ self.B
         return y + (self.alpha * lora_update).astype(x.dtype)
 
 

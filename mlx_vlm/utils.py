@@ -168,12 +168,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     # Sanitize weights
     weights = sanitize_weights(model, weights)
-    weights = sanitize_weights(
-        model_class.VisionModel, weights, model_config.vision_config
-    )
-    weights = sanitize_weights(
-        model_class.LanguageModel, weights, model_config.text_config
-    )
+    if hasattr(model_class, "VisionModel"):
+        weights = sanitize_weights(
+            model_class.VisionModel, weights, model_config.vision_config
+        )
+
+    if hasattr(model_class, "LanguageModel"):
+        weights = sanitize_weights(
+            model_class.LanguageModel, weights, model_config.text_config
+        )
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized`
@@ -184,7 +187,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             **quantization,
             class_predicate=class_predicate,
         )
-
+    # for name, module in model.named_modules():
+    #     if "layers" in name:
+    #         print(name, module.parameters().keys())
     model.load_weights(list(weights.items()))
     if not lazy:
         mx.eval(model.parameters())

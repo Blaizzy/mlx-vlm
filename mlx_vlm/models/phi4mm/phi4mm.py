@@ -6,14 +6,18 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.su_rope import SuScaledRotaryEmbedding
+from transformers import AutoProcessor
 
-from ..base import BaseModelArgs, create_attention_mask
+from ..base import BaseModelConfig, create_attention_mask
 from .multimodal import Phi4MMImageAudioEmbedding
-from .processing_phi4mm import InputMode
+from .processing_phi4mm import InputMode, Phi4MMProcessor
+from .vision import VisionConfig
+
+AutoProcessor.register("phi4mm", Phi4MMProcessor)
 
 
 @dataclass
-class ModelArgs(BaseModelArgs):
+class ModelConfig(BaseModelConfig):
     model_type: str
     hidden_size: int
     num_hidden_layers: int
@@ -29,6 +33,12 @@ class ModelArgs(BaseModelArgs):
     max_position_embeddings: int = 131072
     original_max_position_embeddings: int = 4096
     tie_word_embeddings: bool = False
+    embd_layer: Optional[Dict[str, str]] = None
+    image_size: Optional[int] = 224
+    patch_size: Optional[int] = 14
+    audio_processor: Optional[Dict[str, Any]] = None
+    vision_lora: Optional[Dict[str, Any]] = None
+    speech_lora: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -47,41 +57,41 @@ class ModelArgs(BaseModelArgs):
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, config: ModelConfig):
         super().__init__()
 
-        dim = args.hidden_size
-        self.n_heads = n_heads = args.num_attention_heads
-        assert args.num_key_value_heads is not None
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
-        self.num_hidden_layers = args.num_hidden_layers
+        dim = config.hidden_size
+        self.n_heads = n_heads = config.num_attention_heads
+        assert config.num_key_value_heads is not None
+        self.n_kv_heads = n_kv_heads = config.num_key_value_heads
+        self.num_hidden_layers = config.num_hidden_layers
 
-        self.head_dim = head_dim = args.hidden_size // n_heads
+        self.head_dim = head_dim = config.hidden_size // n_heads
         self.scale = head_dim**-0.5
 
         op_size = n_heads * head_dim + 2 * (n_kv_heads * head_dim)
         self.qkv_proj = nn.Linear(dim, op_size, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        rope_dim = int(head_dim * args.partial_rotary_factor)
-        if args.rope_scaling and args.rope_scaling["type"] in ["longrope", "su"]:
+        rope_dim = int(head_dim * config.partial_rotary_factor)
+        if config.rope_scaling and config.rope_scaling["type"] in ["longrope", "su"]:
             self.rope = SuScaledRotaryEmbedding(
                 rope_dim,
-                base=args.rope_theta,
-                max_position_embeddings=args.max_position_embeddings,
-                original_max_position_embeddings=args.original_max_position_embeddings,
-                short_factor=args.rope_scaling["short_factor"],
-                long_factor=args.rope_scaling["long_factor"],
+                base=config.rope_theta,
+                max_position_embeddings=config.max_position_embeddings,
+                original_max_position_embeddings=config.original_max_position_embeddings,
+                short_factor=config.rope_scaling["short_factor"],
+                long_factor=config.rope_scaling["long_factor"],
             )
         else:
             rope_scale = 1.0
-            if args.rope_scaling and args.rope_scaling["type"] == "linear":
-                assert isinstance(args.rope_scaling["factor"], float)
-                rope_scale = 1 / args.rope_scaling["factor"]
+            if config.rope_scaling and config.rope_scaling["type"] == "linear":
+                assert isinstance(config.rope_scaling["factor"], float)
+                rope_scale = 1 / config.rope_scaling["factor"]
             self.rope = nn.RoPE(
                 rope_dim,
-                traditional=args.rope_traditional,
-                base=args.rope_theta,
+                traditional=config.rope_traditional,
+                base=config.rope_theta,
                 scale=rope_scale,
             )
 
@@ -132,17 +142,16 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, config: ModelConfig):
         super().__init__()
-        self.num_attention_heads = args.num_attention_heads
-        self.hidden_size = args.hidden_size
-        self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size)
-        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.self_attn = Attention(config)
+        self.mlp = MLP(config.hidden_size, config.intermediate_size)
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
-            args.hidden_size, eps=args.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps
         )
-        self.args = args
 
     def __call__(
         self,
@@ -158,26 +167,71 @@ class TransformerBlock(nn.Module):
 
 
 class Phi4Model(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, config: ModelConfig):
         super().__init__()
-        self.args = args
-        self.vocab_size = args.vocab_size
-        self.num_hidden_layers = args.num_hidden_layers
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.num_hidden_layers = config.num_hidden_layers
         assert self.vocab_size > 0
-        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_tokens_extend = None
-        if isinstance(args.embd_layer, dict):
+        if isinstance(config.embd_layer, dict):
             embedding_config = {
-                "embedding_cls": args.embd_layer["embedding_cls"],
-                **args.embd_layer,
+                "embedding_cls": config.embd_layer["embedding_cls"],
+                **config.embd_layer,
             }
             self.embed_tokens_extend = Phi4MMImageAudioEmbedding(
-                args, **embedding_config
+                config, **embedding_config
             )
         self.layers = [
-            TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
+            TransformerBlock(config=config) for _ in range(config.num_hidden_layers)
         ]
-        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # LoRA related settings
+        assert getattr(config, "vision_lora", None) is not None
+        import re
+
+        from ...trainer.utils import LoRaLayer, set_module_by_name
+
+        for name, module in self.named_modules():
+
+            if isinstance(module, nn.Linear) or isinstance(module, nn.QuantizedLinear):
+                if re.match(config.vision_lora["layer"], name):
+                    # print(f"Applying Vision LoRA to {name}")
+                    lora_layer = LoRaLayer(
+                        module,
+                        config.vision_lora["r"],
+                        config.vision_lora["lora_alpha"],
+                        config.vision_lora["dp"],
+                        "vision",
+                    )
+                    set_module_by_name(self, name, lora_layer)
+
+        self.config.vision_lora["r"] = config.vision_lora["r"]
+        self.config.vision_lora["lora_alpha"] = config.vision_lora["lora_alpha"]
+        self.config.vision_lora["layer"] = config.vision_lora["layer"]
+        self.config.vision_lora["dp"] = config.vision_lora["dp"]
+
+        assert getattr(config, "speech_lora", None) is not None
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear) or isinstance(module, nn.QuantizedLinear):
+                if re.match(config.speech_lora["layer"], name):
+                    # print(f"Applying Speech LoRA to {name}")
+                    lora_layer = LoRaLayer(
+                        module,
+                        config.speech_lora["r"],
+                        config.speech_lora["lora_alpha"],
+                        config.speech_lora["dp"],
+                        "speech",
+                    )
+                    name = name.replace(".base_layer", "")
+                    set_module_by_name(self, name, lora_layer)
+
+        self.config.speech_lora["r"] = config.speech_lora["r"]
+        self.config.speech_lora["lora_alpha"] = config.speech_lora["lora_alpha"]
+        self.config.speech_lora["layer"] = config.speech_lora["layer"]
+        self.config.speech_lora["dp"] = config.speech_lora["dp"]
 
     def __call__(
         self,
@@ -234,13 +288,13 @@ class Phi4Model(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, config: ModelConfig):
         super().__init__()
-        self.model_type = args.model_type
-        self.model = Phi4Model(args)
-        if not args.tie_word_embeddings:
-            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-        self.args = args
+        self.model_type = config.model_type
+        self.model = Phi4Model(config)
+        if not config.tie_word_embeddings:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.config = config
 
     def __call__(
         self,
@@ -251,7 +305,7 @@ class Model(nn.Module):
         **kwargs,
     ):
         out = self.model(input_ids, pixel_values, mask, cache, **kwargs)
-        if self.args.tie_word_embeddings:
+        if self.config.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)

@@ -12,22 +12,26 @@ import inspect
 from dataclasses import dataclass
 from typing import Optional
 
-import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
 
 
 @dataclass
 class VisionConfig:
-    model_type: str
-    hidden_size: int
-    num_attention_heads: int
-    patch_size: int
+    model_type: str = "phi4mm"
+    hidden_size: int = 768
+    num_attention_heads: int = 12
+    patch_size: int = 14
     num_hidden_layers: int = 12
     intermediate_size: int = 3072
     image_size: int = 224
     num_channels: int = 3
     layer_norm_eps: float = 1e-6
+    vocab_size: int = 32000
+    attention_dropout: float = 0.0
+    pad_token_id: int = 1
+    bos_token_id: int = 49406
+    eos_token_id: int = 49407
+    img_processor: Optional[dict] = None
 
     @classmethod
     def from_dict(cls, params):
@@ -197,9 +201,7 @@ class SigLIPVisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.model_type = config.model_type
-        if self.model_type not in [
-            "siglip_vision_model",
-        ]:
+        if self.model_type not in ["siglip_vision_model", "phi4mm"]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
         self.embeddings = VisionEmbeddings(config)
@@ -223,8 +225,11 @@ class SigLIPVisionModel(nn.Module):
 class VisionModel(nn.Module):
     """Image embedding."""
 
-    def __init__(self, config, **kwargs):
+    def __init__(self, config: VisionConfig = None, **kwargs):
         super().__init__()
+
+        if config is None:
+            config = VisionConfig()
 
         # Get hidden size
         hidden_size = config.n_embd if hasattr(config, "n_embd") else config.hidden_size
@@ -240,7 +245,7 @@ class VisionModel(nn.Module):
             self.embd_drop = embd_drop  # Store as attribute, applied in forward
 
         # Load SigLIP model
-        self.img_processor = VisionModel(config)
+        self.img_processor = SigLIPVisionModel(config)
 
         # Get positional embedding shape
         L, D = 576, 1024  # Assuming default values, would be from pe_weight.size()

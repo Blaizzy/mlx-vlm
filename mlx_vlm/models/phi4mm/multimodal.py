@@ -3,8 +3,9 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from audio import AudioModel
-from vision import VisionModel
+
+from .audio import AudioModel
+from .vision import VisionModel
 
 # Special token ids for different modalities
 _IMAGE_SPECIAL_TOKEN_ID = 200010  # '<|endoftext10|>'
@@ -34,7 +35,7 @@ class Phi4MMImageAudioEmbedding(nn.Module):
 
         # Create embedding layers for different modalities
         self.image_embd_layer_kwargs = kwargs.get("image_embd_layer", {})
-        self.image_embed = VisionModel(config, **self.image_embd_layer_kwargs)
+        self.image_embed = VisionModel(**self.image_embd_layer_kwargs)
 
         self.audio_embd_layer_kwargs = kwargs.get("audio_embd_layer", {})
         self.audio_embed = AudioModel(config, **self.audio_embd_layer_kwargs)
