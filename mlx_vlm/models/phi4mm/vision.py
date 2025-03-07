@@ -21,7 +21,7 @@ class VisionConfig:
     hidden_size: int = 768
     num_attention_heads: int = 12
     patch_size: int = 14
-    num_hidden_layers: int = 12
+    num_hidden_layers: int = 27
     intermediate_size: int = 3072
     image_size: int = 224
     num_channels: int = 3
@@ -197,6 +197,77 @@ class VisionEmbeddings(nn.Module):
         return embeddings
 
 
+class MHA(nn.Module):
+    def __init__(
+        self,
+        dims: int,
+        num_heads: int,
+        bias: bool = True,
+    ):
+        super().__init__()
+
+        if (dims % num_heads) != 0:
+            raise ValueError(
+                "The input feature dimensions should be divisible by the "
+                f"number of heads ({dims} % {num_heads}) != 0"
+            )
+
+        self.num_heads = num_heads
+        head_dim = dims // num_heads
+        self.scale = head_dim**-0.5
+
+        self.in_proj = nn.Linear(dims, dims * 3, bias=bias)
+        self.out_proj = nn.Linear(dims, dims, bias=bias)
+
+    def __call__(self, queries: mx.array, kv: mx.array, mask=None):
+        B, L, D = queries.shape
+
+        qkv = self.in_proj(queries)
+        _, keys, values = mx.split(qkv, 3, axis=-1)
+
+        num_heads = self.num_heads
+        B, L, D = queries.shape
+        _, S, _ = keys.shape
+        queries = queries.reshape(B, L, num_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
+
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=self.scale, mask=mask
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.out_proj(output)
+
+
+class SigLipMultiheadAttentionPoolingHead(nn.Module):
+
+    def __init__(self, config: VisionConfig):
+        super().__init__()
+
+        self.probe = mx.ones(
+            (
+                1,
+                1,
+                config.hidden_size,
+            )
+        )
+        self.attention = MHA(
+            config.hidden_size, num_heads=config.num_attention_heads, bias=True
+        )
+        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.mlp = MLP(config)
+        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
+
+    def __call__(self, x: mx.array):
+        x = self.attention(self.probe, x)[0]
+
+        residual = x
+        x = self.layernorm(x)
+        x = residual + self.mlp(x)
+
+        return self.out_proj(x[:, 0])
+
+
 class SigLIPVisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
@@ -207,6 +278,7 @@ class SigLIPVisionModel(nn.Module):
         self.embeddings = VisionEmbeddings(config)
         self.encoder = Encoder(config)
         self.post_layernorm = nn.LayerNorm(config.hidden_size)
+        self.head = SigLipMultiheadAttentionPoolingHead(config)
 
     def __call__(
         self,
@@ -219,6 +291,7 @@ class SigLIPVisionModel(nn.Module):
             x=x, output_hidden_states=output_hidden_states, mask=None
         )
         pooler_output = self.post_layernorm(encoder_outputs[0])
+        pooler_output = self.head(pooler_output)
         return pooler_output, x, encoder_outputs[-1]
 
 
@@ -317,7 +390,7 @@ class VisionModel(nn.Module):
             ]
             for _ in range(1, depth):
                 layers.extend([nn.GELU(), nn.Linear(dim_projection, dim_projection)])
-            self.img_projection = nn.Sequential(layers)
+            self.img_projection = layers
         elif projection_cls == "mlp":
             # Follow llava-v1.5's implementation
             dim_projection = hidden_size
@@ -325,7 +398,7 @@ class VisionModel(nn.Module):
             layers = [nn.Linear(image_dim_out, dim_projection)]
             for _ in range(1, depth):
                 layers.extend([nn.GELU(), nn.Linear(dim_projection, dim_projection)])
-            self.img_projection = nn.Sequential(layers)
+            self.img_projection = layers
         else:
             raise NotImplementedError(f"projection_cls = {projection_cls}")
 
@@ -895,6 +968,20 @@ class VisionModel(nn.Module):
             if "position_ids" in k:
                 # Remove unused position_ids
                 continue
+            if "model.embed_tokens_extend.image_embed.img_processor.head" in k:
+                if "attention.in_proj_weight" in k:
+                    new_k = k.replace(
+                        "attention.in_proj_weight", "attention.in_proj.weight"
+                    )
+                    sanitized_weights[new_k] = v
+                if "attention.in_proj_bias" in k:
+                    new_k = k.replace(
+                        "attention.in_proj_bias", "attention.in_proj.bias"
+                    )
+                    sanitized_weights[new_k] = v
+                if "attention.out_proj.weight" in k:
+                    new_k = k.replace("attention.out_proj.weight", "out_proj.weight")
+                    sanitized_weights[new_k] = v
             elif "patch_embedding.weight" in k:
                 # PyTorch conv2d weight tensors have shape:
                 #   [out_channels, in_channels, kH, KW]

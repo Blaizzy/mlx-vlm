@@ -314,3 +314,8 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    def sanitize(self, weights):
+        weights = self.model.embed_tokens_extend.image_embed.sanitize(weights)
+        weights = self.model.embed_tokens_extend.audio_embed.sanitize(weights)
+        return weights

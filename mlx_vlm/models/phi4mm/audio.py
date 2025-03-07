@@ -1,5 +1,4 @@
-import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -8,145 +7,493 @@ import mlx.nn as nn
 _AUDIO_SPECIAL_TOKEN_ID = 200011  # '<|endoftext11|>'
 
 
-class ConformerConvModule(nn.Module):
-    """Conformer convolution module implementation."""
+class DepthWiseSeperableConv1d(nn.Module):
 
-    def __init__(self, dim, expansion_factor=2, kernel_size=31, dropout=0.0):
+    def __init__(
+        self,
+        input_dim,
+        depthwise_seperable_out_channel,
+        kernel_size,
+        depthwise_multiplier,
+        padding=0,
+    ):
         super().__init__()
 
-        inner_dim = dim * expansion_factor
-        padding = (kernel_size - 1) // 2
+        self.dw_conv = nn.Conv1d(
+            input_dim,
+            input_dim * depthwise_multiplier,
+            kernel_size,
+            1,
+            padding=padding,
+            groups=input_dim,
+        )
 
-        self.net = [
-            nn.LayerNorm(dim),
-            nn.Linear(dim, inner_dim * 2),
-            nn.GLU(axis=-1),
-            nn.Conv1d(
-                inner_dim,
-                inner_dim,
-                kernel_size=kernel_size,
-                padding=padding,
-                bias=False,
-                groups=inner_dim,
-            ),
-            nn.BatchNorm(inner_dim),
-            nn.SiLU(),
-            nn.Conv1d(inner_dim, dim, kernel_size=1),
-            nn.Dropout(dropout),
-        ]
+        if depthwise_seperable_out_channel != 0:
+            self.pw_conv = nn.Conv1d(
+                input_dim * depthwise_multiplier,
+                depthwise_seperable_out_channel,
+                1,
+                1,
+                0,
+            )
+        else:
+            self.pw_conv = nn.Identity()
+        self.depthwise_seperable_out_channel = depthwise_seperable_out_channel
 
     def __call__(self, x):
-        # Expected input: (batch_size, seq_len, channels)
-
-        # Apply layer norm
-        x = self.net[0](x)
-
-        # Linear projection
-        x = self.net[1](x)
-
-        # GLU activation
-        x = self.net[2](x)
-
-        # Transpose for depthwise conv: (batch_size, channels, seq_len)
-        x = mx.transpose(x, (0, 2, 1))
-
-        # Depthwise convolution
-        x = self.net[3](x)
-
-        # Batch normalization
-        x = self.net[4](x)
-
-        # SiLU activation
-        x = self.net[5](x)
-
-        # Pointwise convolution
-        x = self.net[6](x)
-
-        # Transpose back: (batch_size, seq_len, channels)
-        x = mx.transpose(x, (0, 2, 1))
-
-        # Dropout
-        if self.net[7].p > 0:
-            x = self.net[7](x)
-
+        """
+        Args:
+            x: torch.Tensor
+                input tensor
+        """
+        x = self.dw_conv(x)
+        if self.depthwise_seperable_out_channel != 0:
+            x = self.pw_conv(x)
         return x
+
+
+class BatchNorm1d(nn.Module):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+
+        # Learnable parameters
+        self.weight = mx.ones((num_features,))
+        self.bias = mx.zeros((num_features,))
+
+        # Running statistics
+        self.running_mean = mx.zeros((num_features,))
+        self.running_var = mx.ones((num_features,))
+
+    def __call__(self, x):
+        # x shape: (batch_size, num_features, seq_len)
+        # Compute statistics along batch and sequence dimensions
+        mean = mx.mean(x, axis=(0, 2), keepdims=True)
+        var = mx.var(x, axis=(0, 2), keepdims=True)
+
+        # Update running statistics
+        self.running_mean = (
+            1 - self.momentum
+        ) * self.running_mean + self.momentum * mean.squeeze()
+        self.running_var = (
+            1 - self.momentum
+        ) * self.running_var + self.momentum * var.squeeze()
+
+        # Normalize
+        x_norm = (x - mean) / mx.sqrt(var + self.eps)
+
+        # Apply learnable parameters
+        return self.weight.reshape(1, -1, 1) * x_norm + self.bias.reshape(1, -1, 1)
+
+
+# TODO: Improve using GLU class
+class GLUPointWiseConv(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        output_dim,
+        kernel_size,
+        glu_type="sigmoid",
+        bias_in_glu=True,
+        causal=False,
+    ):
+        super().__init__()
+
+        self.glu_type = glu_type
+        self.output_dim = output_dim
+        self.bias_in_glu = bias_in_glu
+        if causal:
+            self.ext_pw_conv_1d = nn.Conv1d(
+                input_dim, output_dim * 2, kernel_size, 1, padding=(kernel_size - 1)
+            )
+        else:
+            self.ext_pw_conv_1d = nn.Conv1d(
+                input_dim,
+                output_dim * 2,
+                kernel_size,
+                1,
+                padding=(kernel_size - 1) // 2,
+            )
+
+        if glu_type == "sigmoid":
+            self.glu_act = nn.Sigmoid()
+        elif glu_type == "relu":
+            self.glu_act = nn.ReLU()
+        elif glu_type == "gelu":
+            self.glu_act = nn.GELU()
+        elif glu_type == "swish":
+            self.glu_act = nn.SiLU()
+        else:
+            raise ValueError(f"Unsupported activation type {self.glu_act}")
+
+        if bias_in_glu:
+            self.b1 = mx.zeros((1, output_dim, 1))
+            self.b2 = mx.zeros((1, output_dim, 1))
+
+    def __call__(self, x):
+        # to be consistent with GLULinear, we assume the input always has the #channel (#dim) in the last dimension of the tensor, so need to switch the dimension first for 1D-Conv case
+        x = x.transpose((0, 2, 1))
+        x = self.ext_pw_conv_1d(x)
+        if self.glu_type == "bilinear":
+            if self.bias_in_glu:
+                x = (x[:, 0 : self.output_dim, :] + self.b1) * (
+                    x[:, self.output_dim : self.output_dim * 2, :] + self.b2
+                )
+            else:
+                x = (x[:, 0 : self.output_dim, :]) * (
+                    x[:, self.output_dim : self.output_dim * 2, :]
+                )
+        else:
+            if self.bias_in_glu:
+                x = (x[:, 0 : self.output_dim, :] + self.b1) * self.glu_act(
+                    x[:, self.output_dim : self.output_dim * 2, :] + self.b2
+                )
+            else:
+                x = (x[:, 0 : self.output_dim, :]) * self.glu_act(
+                    x[:, self.output_dim : self.output_dim * 2, :]
+                )
+
+        x = x.transpose((0, 2, 1))
+        return x
+
+
+class ConformerConvModule(nn.Module):
+
+    def __init__(
+        self,
+        input_dim,
+        ext_pw_out_channel,
+        depthwise_seperable_out_channel,
+        ext_pw_kernel_size,
+        kernel_size,
+        depthwise_multiplier,
+        dropout_rate,
+        causal=False,
+        batch_norm=False,
+        chunk_se=0,
+        chunk_size=18,
+        activation="relu",
+        glu_type="sigmoid",
+        bias_in_glu=True,
+        linear_glu_in_convm=False,
+        export=False,
+    ):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(input_dim)
+        self.input_dim = input_dim
+        self.ext_pw_out_channel = ext_pw_out_channel
+        self.ext_pw_kernel_size = ext_pw_kernel_size
+        self.depthwise_seperable_out_channel = depthwise_seperable_out_channel
+        self.glu_type = glu_type
+        self.bias_in_glu = bias_in_glu
+        self.linear_glu_in_convm = linear_glu_in_convm
+        self.causal = causal
+
+        self._add_ext_pw_layer()
+
+        self.batch_norm = batch_norm
+        self.kernel_size = kernel_size
+
+        if batch_norm:
+
+            self.bn_layer = BatchNorm1d(input_dim)
+
+        if activation == "relu":
+            self.act = nn.ReLU()
+        elif activation == "gelu":
+            self.act = nn.GELU()
+        elif activation == "swish":
+            self.act = nn.SiLU()
+        else:
+            raise ValueError(f"Activation function {activation} not supported")
+
+        self.dropout = nn.Dropout(dropout_rate)
+        self.export = export
+
+        if causal:
+            if export:  # Inference only.
+                padding = (
+                    0  # A cache is concatenated to the left. No padding in the kernel.
+                )
+            else:
+                # Training only. Padding will be added symmetrically on both sides.
+                # After convolution, clip off kernel_size-1 points on the right.
+                padding = kernel_size - 1
+        else:
+            padding = (kernel_size - 1) // 2
+
+        self.dw_sep_conv_1d = DepthWiseSeperableConv1d(
+            input_dim,
+            depthwise_seperable_out_channel,
+            kernel_size,
+            depthwise_multiplier,
+            padding=padding,
+        )
+
+        if depthwise_seperable_out_channel != 0:
+            if input_dim != depthwise_seperable_out_channel:
+                self.ln2 = nn.Linear(depthwise_seperable_out_channel, input_dim)
+        else:
+            if depthwise_multiplier != 1:
+                self.ln2 = nn.Linear(input_dim * depthwise_multiplier, input_dim)
+
+    def _add_ext_pw_layer(self):
+        """
+        This function is an extension of __init__ function
+        and dedicated to the convolution module creation
+        of the conformer.
+        """
+        self.ln1 = self.glu = self.bn_layer = self.ext_pw_conv_1d = (
+            nn.Identity()
+        )  # jit hacks.
+        self.squeeze_excitation = nn.Identity()  # jit.
+        self.apply_ln1 = self.fix_len1 = False  # jit.
+
+        if self.ext_pw_out_channel != 0:
+            if self.causal:
+                self.ext_pw_conv_1d = nn.Conv1d(
+                    self.input_dim,
+                    self.ext_pw_out_channel,
+                    self.ext_pw_kernel_size,
+                    1,
+                    padding=(self.ext_pw_kernel_size - 1),
+                )
+                if self.ext_pw_kernel_size > 1:
+                    self.fix_len1 = True
+                else:
+                    self.fix_len1 = False
+            else:
+                self.ext_pw_conv_1d = nn.Conv1d(
+                    self.input_dim,
+                    self.ext_pw_out_channel,
+                    self.ext_pw_kernel_size,
+                    1,
+                    padding=(self.ext_pw_kernel_size - 1) // 2,
+                )
+                self.fix_len1 = False
+
+            if self.linear_glu_in_convm:
+                self.glu = GLULinear(
+                    self.input_dim,
+                    self.ext_pw_out_channel,
+                    self.glu_type,
+                    self.bias_in_glu,
+                )
+            else:
+                self.glu = GLUPointWiseConv(
+                    self.input_dim,
+                    self.ext_pw_out_channel,
+                    self.ext_pw_kernel_size,
+                    self.glu_type,
+                    self.bias_in_glu,
+                    self.causal,
+                )
+
+            if self.input_dim != self.ext_pw_out_channel:
+                self.apply_ln1 = True
+                self.ln1 = nn.Linear(self.ext_pw_out_channel, self.input_dim)
+            else:
+                self.apply_ln1 = False
+        else:
+            self.pw_conv_simplify_w = mx.ones((3,))
+            self.pw_conv_simplify_b = mx.zeros((3,))
+
+    def __call__(self, x):
+        """ConvModule Forward.
+        Args:
+            x: torch.Tensor
+                input tensor.
+        """
+        x = self.layer_norm(x)
+
+        if self.ext_pw_out_channel != 0:
+            x = self.glu(x)
+            if self.causal and self.ext_pw_kernel_size > 1:
+                x = x[:, : -(self.ext_pw_kernel_size - 1), :]
+            if self.apply_ln1:
+                x = self.ln1(x)
+        else:
+            x_0 = x * self.pw_conv_simplify_w[0] + self.pw_conv_simplify_b[0]
+            x_1 = x * self.pw_conv_simplify_w[1] + self.pw_conv_simplify_b[1]
+            x = x_0 + x_1
+
+        x = x.transpose((0, 2, 1))
+
+        x = self.dw_sep_conv_1d(x)
+        if self.causal and self.kernel_size > 1:
+            x = x[:, :, : -(self.kernel_size - 1)]
+        if hasattr(self, "ln2"):
+            x = x.transpose((0, 2, 1))
+            x = self.ln2(x)
+            x = x.transpose((0, 2, 1))
+        if self.batch_norm:
+            x = self.bn_layer(x)
+        x = self.act(x)
+
+        if self.ext_pw_out_channel != 0:
+            x = self.ext_pw_conv_1d(x)
+            if self.fix_len1:
+                x = x[:, :, : -(self.ext_pw_kernel_size - 1)]
+
+            if self.apply_ln1:
+                x = x.transpose((0, 2, 1))
+                x = self.ln1(x)
+                x = x.transpose((0, 2, 1))
+
+            x = x.transpose((0, 2, 1))
+        else:
+            x = x.unsqueeze(1).transpose((0, 1, 3, 2))
+            x = x * self.pw_conv_simplify_w[2] + self.pw_conv_simplify_b[2]
+            x = x.squeeze(1)
+
+        x = self.dropout(x)
+        return x
+
+
+class GLU(nn.Module):
+    """Implement Gated Linear Unit (GLU) module"""
+
+    def __init__(self, dim: int = -1, act_name: str = "sigmoid") -> None:
+        super().__init__()
+        self.dim = dim
+        self.act_name = act_name.lower()
+
+        if self.act_name == "relu":
+            self.act_fn = nn.ReLU()
+        elif self.act_name == "gelu":
+            self.act_fn = nn.GELU()
+        elif self.act_name == "swish":
+            self.act_fn = nn.SiLU()
+        elif self.act_name == "sigmoid":
+            self.act_fn = nn.Sigmoid()
+        else:
+            self.act_fn = nn.Identity()
+
+    def __call__(self, x: mx.array) -> mx.array:
+        half_x, gate = mx.split(x, 2, axis=self.dim)
+        return half_x * self.act_fn(gate)
+
+
+class GLULinear(nn.Module):
+    """Linear + GLU module
+    Args:
+        input_dim: int
+            input size
+        output_dim: int
+            output size.
+        glu_type:
+            activation function name used in glu module.
+            default "sigmoid" (swish function).
+        bias_in_glu: bool, optional
+            If True, the addtive bias is added. Default False.
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        output_dim,
+        glu_type="sigmoid",
+        bias_in_glu=True,
+    ):
+        super().__init__()
+        self.linear = nn.Linear(input_dim, output_dim * 2, bias_in_glu)
+        self.glu_act = GLU(-1, glu_type)
+
+    def __call__(self, x):
+        """GLULinear forward
+        Args:
+            x: torch.Tensor
+                inpute tensor.
+        """
+        x = self.linear(x)
+        return self.glu_act(x)
 
 
 class FeedForward(nn.Module):
     """Feed Forward module for Conformer."""
 
-    def __init__(self, dim, hidden_dim, dropout=0.0):
+    def __init__(
+        self,
+        d_model,
+        d_inner,
+        dropout_rate,
+        activation="sigmoid",
+        bias_in_glu=True,
+    ):
         super().__init__()
-
+        self.layer_norm = nn.LayerNorm(d_model)
+        module = GLULinear(d_model, d_inner, bias_in_glu=True)
         self.net = [
-            nn.LayerNorm(dim),
-            nn.Linear(dim, hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-            nn.Dropout(dropout),
+            module,
+            nn.Dropout(dropout_rate),
+            nn.Linear(d_inner, d_model),
+            nn.Dropout(dropout_rate),
         ]
 
     def __call__(self, x):
         # Layer normalization
-        x = self.net[0](x)
-
-        # Linear projection to hidden dim
-        x = self.net[1](x)
-
-        # SiLU activation
-        x = self.net[2](x)
-
-        # Dropout
-        if self.net[3].p > 0:
-            x = self.net[3](x)
-
-        # Linear projection back to original dim
-        x = self.net[4](x)
-
-        # Dropout
-        if self.net[5].p > 0:
-            x = self.net[5](x)
-
+        x = self.layer_norm(x)
+        for layer in self.net:
+            x = layer(x)
         return x
 
 
 class ConformerAttention(nn.Module):
     """Multi-headed attention module for Conformer."""
 
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
+    def __init__(
+        self,
+        n_head,
+        n_feat,
+        dropout_rate,
+        attention_inner_dim=-1,
+        glu_type="swish",
+        bias_in_glu=True,
+        use_pt_scaled_dot_product_attention=False,
+        n_value=-1,
+        group_size: int = 1,
+    ):
         super().__init__()
 
-        inner_dim = dim_head * heads
+        if n_value == -1:
+            n_value = n_feat
+        if attention_inner_dim == -1:
+            attention_inner_dim = n_feat
+        assert attention_inner_dim % n_head == 0
 
-        self.heads = heads
-        self.scale = dim_head**-0.5
+        # We assume d_v always equals d_k
+        self.d_k = attention_inner_dim // n_head
+        self.scale = self.d_k**-0.5
+        self.h = n_head
+        assert n_head % group_size == 0, "group_size must divide n_head"
+        self.g = group_size
+        self.h_k = n_head // group_size
 
-        self.norm = nn.LayerNorm(dim)
-        self.qkv_proj = nn.Linear(dim, inner_dim * 3, bias=True)
-        self.output_proj = nn.Linear(inner_dim, dim, bias=True)
-        self.dropout = dropout
+        self.linear_q = nn.Linear(n_feat, attention_inner_dim)
+        self.linear_k = nn.Linear(n_feat, attention_inner_dim // group_size)
+        self.linear_v = nn.Linear(n_feat, attention_inner_dim // group_size)
+        self.linear_out = nn.Linear(attention_inner_dim // group_size, n_feat)
+        self.dropout = dropout_rate
 
-    def __call__(self, x, mask=None):
-        # Apply layer normalization
-        x = self.norm(x)
-
-        # Project to query, key, value
-        qkv = self.qkv_proj(x)
-
-        # Split into q, k, v
-        q, k, v = mx.split(qkv, 3, axis=-1)
-
-        # Reshape for multi-head attention
-        batch_size, seq_len, _ = x.shape
-        q = mx.reshape(q, (batch_size, seq_len, self.heads, -1))
-        k = mx.reshape(k, (batch_size, seq_len, self.heads, -1))
-        v = mx.reshape(v, (batch_size, seq_len, self.heads, -1))
-
-        # Transpose to (batch_size, heads, seq_len, dim_head)
-        q = mx.transpose(q, (0, 2, 1, 3))
-        k = mx.transpose(k, (0, 2, 1, 3))
-        v = mx.transpose(v, (0, 2, 1, 3))
+    def __call__(self, query, key, value, mask=None):
+        batch_size, seq_len, _ = query.shape
+        q = (
+            self.linear_q(query)
+            .reshape((batch_size, seq_len, self.heads, -1))
+            .transpose((0, 2, 1, 3))
+        )
+        k = (
+            self.linear_k(key)
+            .reshape((batch_size, seq_len, self.heads, -1))
+            .transpose((0, 2, 1, 3))
+        )
+        v = (
+            self.linear_v(value)
+            .reshape((batch_size, seq_len, self.heads, -1))
+            .transpose((0, 2, 1, 3))
+        )
 
         # Compute attention scores
         attention_scores = mx.matmul(q, mx.transpose(k, (0, 1, 3, 2))) * self.scale
@@ -165,59 +512,106 @@ class ConformerAttention(nn.Module):
             attention_weights = nn.Dropout(self.dropout)(attention_weights)
 
         # Apply attention weights to values
-        context = mx.matmul(attention_weights, v)
+        context = mx.matamul(attention_weights, v)
 
         # Transpose and reshape back
-        context = mx.transpose(context, (0, 2, 1, 3))
-        context = mx.reshape(context, (batch_size, seq_len, -1))
+        context = context.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
 
         # Final projection
-        output = self.output_proj(context)
+        output = self.linear_out(context)
 
         return output
 
 
-class ConformerBlock(nn.Module):
+class ConformerEncoderLayer(nn.Module):
     """A single Conformer block."""
 
     def __init__(
         self,
-        dim,
-        dim_head=64,
-        heads=8,
-        ff_mult=4,
-        conv_expansion_factor=2,
-        conv_kernel_size=31,
-        dropout=0.0,
+        d_model=512,
+        ext_pw_out_channel=0,
+        depthwise_seperable_out_channel=256,
+        depthwise_multiplier=1,
+        n_head=4,
+        d_ffn=2048,
+        ext_pw_kernel_size=1,
+        kernel_size=3,
+        dropout_rate=0.1,
+        causal=False,
+        batch_norm=False,
+        activation="relu",
+        chunk_se=0,
+        chunk_size=18,
+        conv_activation="relu",
+        conv_glu_type="sigmoid",
+        bias_in_glu=True,
+        linear_glu_in_convm=False,
+        attention_innner_dim=-1,
+        attention_glu_type="swish",
+        activation_checkpointing="",
+        export=False,
+        use_pt_scaled_dot_product_attention=False,
+        attn_group_sizes: int = 1,
     ):
         super().__init__()
 
-        self.ff1 = FeedForward(dim, dim * ff_mult, dropout)
-        self.attn = ConformerAttention(dim, heads, dim_head, dropout)
-        self.conv = ConformerConvModule(
-            dim, conv_expansion_factor, conv_kernel_size, dropout
+        self.feed_forward_in = FeedForward(
+            d_model=d_model,
+            d_inner=d_ffn,
+            dropout_rate=dropout_rate,
+            activation=activation,
+            bias_in_glu=bias_in_glu,
         )
-        self.ff2 = FeedForward(dim, dim * ff_mult, dropout)
 
-        self.norm = nn.LayerNorm(dim)
+        self.self_attn = ConformerAttention(
+            n_head,
+            d_model,
+            dropout_rate,
+            attention_innner_dim,
+            attention_glu_type,
+            bias_in_glu,
+            use_pt_scaled_dot_product_attention=use_pt_scaled_dot_product_attention,
+            group_size=attn_group_sizes,
+        )
+        self.conv = ConformerConvModule(
+            d_model,
+            ext_pw_out_channel,
+            depthwise_seperable_out_channel,
+            ext_pw_kernel_size,
+            kernel_size,
+            depthwise_multiplier,
+            dropout_rate,
+            causal,
+            batch_norm,
+            chunk_se,
+            chunk_size,
+            conv_activation,
+            conv_glu_type,
+            bias_in_glu,
+            linear_glu_in_convm,
+            export=export,
+        )
+        self.feed_forward_out = FeedForward(
+            d_model=d_model,
+            d_inner=d_ffn,
+            dropout_rate=dropout_rate,
+            activation=activation,
+            bias_in_glu=bias_in_glu,
+        )
+
+        self.layer_norm_att = nn.LayerNorm(d_model)
+        self.layer_norm = nn.LayerNorm(d_model)
 
     def __call__(self, x, mask=None):
-        # First feed-forward module (with 0.5 scaling)
-        x = x + 0.5 * self.ff1(x)
+        x = x + 0.5 * self.feed_forward_in(x)
+        norm_x = self.layer_norm_att(x)
 
-        # Self-attention module
-        x = x + self.attn(x, mask)
-
-        # Convolution module
+        x = x + self.self_attn(norm_x, mask)
         x = x + self.conv(x)
+        x = x + 0.5 * self.feed_forward_out(x)
 
-        # Second feed-forward module (with 0.5 scaling)
-        x = x + 0.5 * self.ff2(x)
-
-        # Final layer norm
-        x = self.norm(x)
-
-        return x
+        out = self.layer_norm(x)
+        return out
 
 
 class ConformerEncoder(nn.Module):
@@ -225,16 +619,44 @@ class ConformerEncoder(nn.Module):
 
     def __init__(
         self,
-        input_size=80,  # Mel frequency bins
-        attention_dim=512,
-        attention_heads=8,
+        input_size,
+        chunk_size,
+        left_chunk,
+        num_lang=None,
+        attention_dim=256,
+        attention_heads=4,
         linear_units=2048,
-        num_blocks=12,
+        num_blocks=6,
         dropout_rate=0.1,
-        positional_dropout_rate=0.1,
-        attention_dropout_rate=0.1,
-        input_layer="conv2d",
-        **kwargs,
+        input_layer="nemo_conv",
+        causal=True,
+        batch_norm=False,
+        cnn_out=-1,
+        cnn_layer_norm=False,
+        ext_pw_out_channel=0,
+        ext_pw_kernel_size=1,
+        depthwise_seperable_out_channel=256,
+        depthwise_multiplier=1,
+        chunk_se=0,
+        kernel_size=3,
+        activation="relu",
+        conv_activation="relu",
+        conv_glu_type="sigmoid",
+        bias_in_glu=True,
+        linear_glu_in_convm=False,
+        attention_glu_type="swish",
+        export=False,
+        extra_layer_output_idx=-1,
+        extra_multi_layer_output_idxs=[],
+        activation_checkpointing="",
+        relative_attention_bias_args=None,
+        time_reduction=4,
+        use_pt_scaled_dot_product_attention=False,
+        nemo_conv_settings=None,
+        conv2d_extra_padding: Literal["feat", "feat_time", "none", True] = "none",
+        replication_pad_for_subsample_embedding=False,
+        attention_group_size=1,
+        encoder_embedding_config=None,
     ):
         super().__init__()
 
@@ -270,13 +692,31 @@ class ConformerEncoder(nn.Module):
         # In a complete implementation, we would use a proper positional encoding here
 
         # Conformer blocks
-        self.blocks = [
-            ConformerBlock(
-                dim=attention_dim,
-                dim_head=attention_dim // attention_heads,
-                heads=attention_heads,
-                ff_mult=linear_units // attention_dim,
-                dropout=dropout_rate,
+        self.encoders = [
+            ConformerEncoderLayer(
+                d_model=attention_dim,
+                ext_pw_out_channel=ext_pw_out_channel,
+                depthwise_seperable_out_channel=depthwise_seperable_out_channel,
+                depthwise_multiplier=depthwise_multiplier,
+                n_head=attention_heads,
+                d_ffn=linear_units,
+                ext_pw_kernel_size=ext_pw_kernel_size,
+                kernel_size=kernel_size,
+                dropout_rate=dropout_rate,
+                causal=causal,
+                batch_norm=batch_norm,
+                activation=activation,
+                chunk_se=chunk_se,
+                chunk_size=chunk_size,
+                conv_activation=conv_activation,
+                conv_glu_type=conv_glu_type,
+                bias_in_glu=bias_in_glu,
+                linear_glu_in_convm=linear_glu_in_convm,
+                attention_glu_type=attention_glu_type,
+                # activation_checkpointing=attn_checkpointing(activation_checkpointing, i),
+                export=export,
+                use_pt_scaled_dot_product_attention=use_pt_scaled_dot_product_attention,
+                attn_group_sizes=attention_group_size,
             )
             for _ in range(num_blocks)
         ]
@@ -336,8 +776,8 @@ class ConformerEncoder(nn.Module):
             x = self.embed[0](x)
 
         # Apply Conformer blocks
-        for block in self.blocks:
-            x = block(x, mask)
+        for encoder in self.encoders:
+            x = encoder(x, mask)
 
         # Final normalization
         x = self.norm(x)
@@ -375,9 +815,6 @@ class AudioModel(nn.Module):
 
             # Create encoder
             self.encoder = ConformerEncoder(**encoder_config)
-
-            # Initialize placeholder for post_init
-            self.encoder.post_init({})
 
             audio_dim_out = encoder_config["attention_dim"]
             n_mels = encoder_config["input_size"]
@@ -576,3 +1013,6 @@ class AudioModel(nn.Module):
             hidden_states = nn.Dropout(self.embd_drop)(hidden_states)
 
         return hidden_states
+
+    def sanitize(self, weights):
+        return weights
