@@ -71,9 +71,9 @@ class Model(nn.Module):
         self.model_type = config.model_type
         self.config = config
 
-        self.vision_model = VisionModel(config.vision_config)
+        self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config)
-        self.multimodal_projector = Gemma3MultiModalProjector(config)
+        self.multi_modal_projector = Gemma3MultiModalProjector(config)
 
     def get_input_embeddings(
         self,
