@@ -1,16 +1,16 @@
-# Copyright © 2023-2024 Apple Inc.
-
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.su_rope import SuScaledRotaryEmbedding
 from transformers import AutoProcessor
 
-from ..base import BaseModelConfig, create_attention_mask
+from ...trainer.utils import LoRaLayer, set_module_by_name
+from ..base import BaseModelConfig, LanguageModelOutput, create_attention_mask
 from .multimodal import Phi4MMImageAudioEmbedding
 from .processing_phi4mm import InputMode, Phi4MMProcessor
+from .su_rope import SuScaledRotaryEmbedding
 from .vision import VisionConfig
 
 AutoProcessor.register("phi4mm", Phi4MMProcessor)
@@ -39,6 +39,8 @@ class ModelConfig(BaseModelConfig):
     audio_processor: Optional[Dict[str, Any]] = None
     vision_lora: Optional[Dict[str, Any]] = None
     speech_lora: Optional[Dict[str, Any]] = None
+    resid_pdrop: float = 0.0
+    sliding_window: int = 262144
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -57,7 +59,7 @@ class ModelConfig(BaseModelConfig):
 
 
 class Attention(nn.Module):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, bias: bool = False):
         super().__init__()
 
         dim = config.hidden_size
@@ -70,8 +72,8 @@ class Attention(nn.Module):
         self.scale = head_dim**-0.5
 
         op_size = n_heads * head_dim + 2 * (n_kv_heads * head_dim)
-        self.qkv_proj = nn.Linear(dim, op_size, bias=False)
-        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
+        self.qkv_proj = nn.Linear(dim, op_size, bias=bias)
+        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=bias)
 
         rope_dim = int(head_dim * config.partial_rotary_factor)
         if config.rope_scaling and config.rope_scaling["type"] in ["longrope", "su"]:
@@ -122,8 +124,13 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
+        # if mask is not None:
+        #     key_len = keys.shape[-2]
+        #     if mask.shape[-1] != key_len:
+        #         mask = mask[..., -key_len:]
+
         output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            queries, keys, values, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -188,12 +195,11 @@ class Phi4Model(nn.Module):
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        if not config.tie_word_embeddings:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
         # LoRA related settings
         assert getattr(config, "vision_lora", None) is not None
-        import re
-
-        from ...trainer.utils import LoRaLayer, set_module_by_name
-
         for name, module in self.named_modules():
 
             if isinstance(module, nn.Linear) or isinstance(module, nn.QuantizedLinear):
@@ -236,12 +242,12 @@ class Phi4Model(nn.Module):
     def __call__(
         self,
         input_ids: mx.array,
-        pixel_values: mx.array,
-        mask: mx.array,
+        pixel_values: mx.array = None,
+        mask: mx.array = None,
         cache=None,
         **kwargs,
     ):
-        input_mode = kwargs.pop("input_mode", None)
+        input_mode = kwargs.pop("input_mode", 0)
         if isinstance(input_mode, mx.array):
             assert len(input_mode) == 1
             input_mode = input_mode[0].item()
@@ -254,7 +260,7 @@ class Phi4Model(nn.Module):
             self.set_lora_adapter("speech")
             audio_projection_mode = "speech"
         elif input_mode == InputMode.LANGUAGE:
-            self.unset_lora_adapter()
+            # self.unset_lora_adapter()
             audio_projection_mode = "speech"
         else:
             raise ValueError(f"Invalid input_mode: {input_mode}")
@@ -275,8 +281,7 @@ class Phi4Model(nn.Module):
         else:
             h = self.embed_tokens(input_ids)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
+        mask = create_attention_mask(h, cache)
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -284,16 +289,27 @@ class Phi4Model(nn.Module):
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
 
-        return self.norm(h)
+        out = self.norm(h)
+        if self.config.tie_word_embeddings:
+            out = self.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
+        return LanguageModelOutput(logits=out)
+
+    @property
+    def head_dim(self):
+        return self.config.hidden_size // self.config.num_attention_heads
+
+    @property
+    def n_kv_heads(self):
+        return self.config.num_key_value_heads
 
 
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.model_type = config.model_type
-        self.model = Phi4Model(config)
-        if not config.tie_word_embeddings:
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.language_model = Phi4Model(config)
         self.config = config
 
     def __call__(
@@ -304,18 +320,30 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        out = self.model(input_ids, pixel_values, mask, cache, **kwargs)
-        if self.config.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.lm_head(out)
+        out = self.language_model(input_ids, pixel_values, mask, cache, **kwargs)
         return out
 
-    @property
-    def layers(self):
-        return self.model.layers
-
     def sanitize(self, weights):
-        weights = self.model.embed_tokens_extend.image_embed.sanitize(weights)
-        weights = self.model.embed_tokens_extend.audio_embed.sanitize(weights)
+        sanitized_weights = {}
+        for k, v in weights.items():
+            new_k = k
+            if k.startswith("model"):
+                new_k = k.replace("model.", "language_model.")
+            if "lm_head" in k:
+                new_k = k.replace("lm_head.", "language_model.lm_head.")
+            sanitized_weights[new_k] = v
+        weights = sanitized_weights
+
+        for k, v in weights.items():
+            if "lora_A.vision.weight" in k:
+                weights[k] = v.swapaxes(1, 0)
+            elif "lora_B.vision.weight" in k:
+                weights[k] = v.swapaxes(1, 0)
+            elif "lora_A.speech.weight" in k:
+                weights[k] = v.swapaxes(1, 0)
+            elif "lora_B.speech.weight" in k:
+                weights[k] = v.swapaxes(1, 0)
+
+        weights = self.language_model.embed_tokens_extend.image_embed.sanitize(weights)
+        weights = self.language_model.embed_tokens_extend.audio_embed.sanitize(weights)
         return weights

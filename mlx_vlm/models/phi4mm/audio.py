@@ -1,10 +1,756 @@
-from typing import Any, Dict, Literal, Optional, Tuple
+import math
+from typing import Any, Dict, Literal, Optional, Tuple, Union
 
+import backoff
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 # Special token id for audio
 _AUDIO_SPECIAL_TOKEN_ID = 200011  # '<|endoftext11|>'
+
+
+@backoff.on_exception(backoff.expo, Exception, max_tries=10)
+def np_loadtxt_with_retry(filepath):
+    """np.loadtxt with retry
+    Args:
+        filepath: str
+            file path to the numpy array.
+    """
+    result = np.loadtxt(filepath, dtype="f")
+    return result
+
+
+def check_array_shape(arr):
+    shape = arr.shape
+
+    # Check if the shape has 4 dimensions
+    if len(shape) != 4:
+        return False
+
+    out_channels, kH, KW, _ = shape
+
+    # Check if out_channels is the largest, and kH and KW are the same
+    if (out_channels >= kH) and (out_channels >= KW) and (kH == KW):
+        return True
+    else:
+        return False
+
+
+class T5RelativeAttentionLogitBias(nn.Module):
+    def __init__(self, num_heads, num_buckets=-1, max_distance=1000, symmetric=False):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+        self.symmetric = symmetric
+        self._skip_bucketing = self.num_buckets < 0
+        if self._skip_bucketing:
+            self.num_buckets = max_distance
+        else:
+            raise NotImplementedError(
+                "T5 attention bias with bucketed positions is not yet tested"
+            )
+        if not self.symmetric:
+            self.num_buckets *= 2
+        self.bias_values = nn.Embedding(self.num_buckets, self.num_heads)
+
+    def forward(self, x):
+        # instantiate bias compatible with shape of x
+        maxpos = x.size(1)
+        context_position = mx.arange(maxpos, dtype=mx.int64)[:, None]
+        memory_position = mx.arange(maxpos, dtype=mx.int64)[None, :]
+        relative_position = memory_position - context_position
+        # clipping to a maximum distance using ops that play well with ONNX export
+        relative_position = relative_position.masked_fill(
+            relative_position < -self.max_distance, -self.max_distance
+        )
+        relative_position = relative_position.masked_fill(
+            relative_position > self.max_distance - 1, self.max_distance - 1
+        )
+
+        # mapping from relative position to index in the bias parameter
+        if self._skip_bucketing:
+            bias_idx = relative_position
+        else:
+            bias_idx = self._bucket_relative_position(relative_position)
+        if self.symmetric:
+            bias_idx = bias_idx.abs()
+        else:
+            bias_idx += self.num_buckets // 2
+
+        t5_rel_att_bias = self.bias_values(bias_idx)  # [L, L, H]
+        t5_rel_att_bias = t5_rel_att_bias.permute(2, 0, 1).unsqueeze(0)  # [1, H, L, L]
+
+        return t5_rel_att_bias
+
+    def _bucket_relative_position(self, relative_position):
+        # this is a placeholder (isn't tested, likely buggy) using HuggingFace implem as a reference
+        # this also needs to be extended to support asymmetric +/- ve positions
+        relative_buckets = 0
+        if not self.causal:
+            num_buckets //= 2
+            relative_buckets += (relative_position > 0).to(mx.int64) * num_buckets
+            relative_position = mx.abs(relative_position)
+        else:
+            relative_position = -mx.min(
+                relative_position, mx.zeros_like(relative_position)
+            )
+        # now relative_position is in the range [0, inf)
+
+        # half of the buckets are for exact increments in positions
+        max_exact = num_buckets // 2
+        is_small = relative_position < max_exact
+
+        # The other half of the buckets are for logarithmically bigger bins in positions up to max_distance
+        relative_position_if_large = max_exact + (
+            mx.log(relative_position.float() / max_exact)
+            / math.log(self.max_distance / max_exact)
+            * (num_buckets - max_exact)
+        ).to(mx.int64)
+        relative_position_if_large = mx.min(
+            relative_position_if_large,
+            mx.full_like(relative_position_if_large, num_buckets - 1),
+        )
+
+        relative_buckets += mx.where(
+            is_small, relative_position, relative_position_if_large
+        )
+        return relative_buckets
+
+
+class CausalConv1D(nn.Conv1d):
+    """
+    A causal version of nn.Conv1d where each step would have limited access to locations on its right or left
+    All arguments are the same as nn.Conv1d except padding.
+    If padding is set None, then paddings are set automatically to make it a causal convolution where each location would not see any steps on its right.
+    If padding is set as a list (size of 2), then padding[0] would be used as left padding and padding[1] as right padding.
+    It would make it possible to control the number of steps to be accessible on the right and left.
+    This mode is not supported when stride > 1. padding[0]+padding[1] should be equal to (kernel_size - 1).
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: Union[str, int] = 0,
+        dilation: int = 1,
+        groups: int = 1,
+        bias: bool = True,
+        padding_mode: str = "zeros",
+        device=None,
+        dtype=None,
+    ) -> None:
+        self.cache_drop_size = None
+        if padding is None:
+            self._left_padding = kernel_size - 1
+            self._right_padding = stride - 1
+        else:
+            if stride != 1 and padding != kernel_size - 1:
+                raise ValueError("No striding allowed for non-symmetric convolutions!")
+            if isinstance(padding, int):
+                self._left_padding = padding
+                self._right_padding = padding
+            elif (
+                isinstance(padding, list)
+                and len(padding) == 2
+                and padding[0] + padding[1] == kernel_size - 1
+            ):
+                self._left_padding = padding[0]
+                self._right_padding = padding[1]
+            else:
+                raise ValueError(f"Invalid padding param: {padding}!")
+
+        self._max_cache_len = self._left_padding
+
+        super().__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=0,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+
+    def update_cache(self, x, cache=None):
+        if cache is None:
+            new_x = mx.pad(x, pad=(self._left_padding, self._right_padding))
+            next_cache = cache
+        else:
+            new_x = mx.pad(x, pad=(0, self._right_padding))
+            new_x = mx.cat([cache, new_x], dim=-1)
+            if self.cache_drop_size > 0:
+                next_cache = new_x[:, :, : -self.cache_drop_size]
+            else:
+                next_cache = new_x
+            next_cache = next_cache[:, :, -cache.size(-1) :]
+        return new_x, next_cache
+
+    def __call__(self, x, cache=None):
+        x, cache = self.update_cache(x, cache=cache)
+        x = super().__call__(x)
+        if cache is None:
+            return x
+        else:
+            return x, cache
+
+
+class CausalConv2D(nn.Conv2d):
+    """
+    A causal version of nn.Conv2d where each location in the 2D matrix would have no access to locations on its right or down
+    All arguments are the same as nn.Conv2d except padding which should be set as None
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: Union[str, int] = 0,
+        dilation: int = 1,
+        groups: int = 1,
+        bias: bool = True,
+    ) -> None:
+        if padding is not None:
+            raise ValueError("Argument padding should be set to None for CausalConv2D.")
+        self._left_padding = kernel_size - 1
+        self._right_padding = stride - 1
+
+        padding = 0
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+            bias,
+        )
+
+    def __call__(
+        self,
+        x,
+    ):
+        if self.training:
+            x = mx.pad(
+                x,
+                pad=(
+                    (self._left_padding, self._right_padding),
+                    (self._left_padding, self._right_padding),
+                ),
+            )
+        else:
+            x = mx.pad(
+                x,
+                pad=(self._left_padding, self._right_padding, 0, 0),
+            )
+        x = super().__call__(x)
+        return x
+
+
+def calc_length(lengths, all_paddings, kernel_size, stride, ceil_mode, repeat_num=1):
+    """Calculates the output length of a Tensor passed through a convolution or max pooling layer"""
+    add_pad: float = all_paddings - kernel_size
+    one: float = 1.0
+    for i in range(repeat_num):
+        lengths = (lengths + add_pad) / stride + one
+        if ceil_mode:
+            lengths = mx.ceil(mx.array(lengths))
+        else:
+            lengths = mx.floor(mx.array(lengths))
+    return lengths.astype(mx.int32)
+
+
+class NemoConvSubsampling(nn.Module):
+
+    def __init__(
+        self,
+        feat_in,
+        feat_out,
+        subsampling_factor=4,
+        subsampling="dw_striding",
+        conv_channels=256,
+        subsampling_conv_chunking_factor=1,
+        activation=nn.ReLU(),
+        is_causal=False,
+    ):
+        super().__init__()
+        self._subsampling = subsampling
+        self._conv_channels = conv_channels
+        self._feat_in = feat_in
+        self._feat_out = feat_out
+
+        if subsampling_factor % 2 != 0:
+            raise ValueError("Sampling factor should be a multiply of 2!")
+        self._sampling_num = int(math.log(subsampling_factor, 2))
+        self.subsampling_factor = subsampling_factor
+        self.is_causal = is_causal
+        self.subsampling_causal_cond = subsampling in (
+            "dw_striding",
+            "striding",
+            "striding_conv1d",
+        )
+
+        if (
+            subsampling_conv_chunking_factor != -1
+            and subsampling_conv_chunking_factor != 1
+            and subsampling_conv_chunking_factor % 2 != 0
+        ):
+            raise ValueError(
+                "subsampling_conv_chunking_factor should be -1, 1, or a power of 2"
+            )
+        self.subsampling_conv_chunking_factor = subsampling_conv_chunking_factor
+
+        in_channels = 1
+        layers = []
+
+        if subsampling == "dw_striding":
+            self._stride = 2
+            self._kernel_size = 3
+            self._ceil_mode = False
+
+            if self.is_causal:
+                self._left_padding = self._kernel_size - 1
+                self._right_padding = self._stride - 1
+                self._max_cache_len = subsampling_factor + 1
+            else:
+                self._left_padding = (self._kernel_size - 1) // 2
+                self._right_padding = (self._kernel_size - 1) // 2
+                self._max_cache_len = 0
+
+            # Layer 1
+            if self.is_causal:
+                layers.append(
+                    CausalConv2D(
+                        in_channels=in_channels,
+                        out_channels=conv_channels,
+                        kernel_size=self._kernel_size,
+                        stride=self._stride,
+                        padding=None,
+                    )
+                )
+            else:
+                layers.append(
+                    nn.Conv2d(
+                        in_channels=in_channels,
+                        out_channels=conv_channels,
+                        kernel_size=self._kernel_size,
+                        stride=self._stride,
+                        padding=self._left_padding,
+                    )
+                )
+            in_channels = conv_channels
+            layers.append(activation)
+
+            for i in range(self._sampling_num - 1):
+                if self.is_causal:
+                    layers.append(
+                        CausalConv2D(
+                            in_channels=in_channels,
+                            out_channels=in_channels,
+                            kernel_size=self._kernel_size,
+                            stride=self._stride,
+                            padding=None,
+                            groups=in_channels,
+                        )
+                    )
+                else:
+                    layers.append(
+                        nn.Conv2d(
+                            in_channels=in_channels,
+                            out_channels=in_channels,
+                            kernel_size=self._kernel_size,
+                            stride=self._stride,
+                            padding=self._left_padding,
+                            groups=in_channels,
+                        )
+                    )
+
+                layers.append(
+                    nn.Conv2d(
+                        in_channels=in_channels,
+                        out_channels=conv_channels,
+                        kernel_size=1,
+                        stride=1,
+                        padding=0,
+                        groups=1,
+                    )
+                )
+                layers.append(activation)
+                in_channels = conv_channels
+
+        elif subsampling == "striding":
+            self._stride = 2
+            self._kernel_size = 3
+            self._ceil_mode = False
+
+            if self.is_causal:
+                self._left_padding = self._kernel_size - 1
+                self._right_padding = self._stride - 1
+                self._max_cache_len = subsampling_factor + 1
+            else:
+                self._left_padding = (self._kernel_size - 1) // 2
+                self._right_padding = (self._kernel_size - 1) // 2
+                self._max_cache_len = 0
+
+            for i in range(self._sampling_num):
+                if self.is_causal:
+                    layers.append(
+                        CausalConv2D(
+                            in_channels=in_channels,
+                            out_channels=conv_channels,
+                            kernel_size=self._kernel_size,
+                            stride=self._stride,
+                            padding=None,
+                        )
+                    )
+                else:
+                    layers.append(
+                        nn.Conv2d(
+                            in_channels=in_channels,
+                            out_channels=conv_channels,
+                            kernel_size=self._kernel_size,
+                            stride=self._stride,
+                            padding=self._left_padding,
+                        )
+                    )
+                layers.append(activation)
+                in_channels = conv_channels
+
+        elif subsampling == "striding_conv1d":
+            in_channels = feat_in
+
+            self._stride = 2
+            self._kernel_size = 5
+            self._ceil_mode = False
+
+            if self.is_causal:
+                self._left_padding = self._kernel_size - 1
+                self._right_padding = self._stride - 1
+                self._max_cache_len = subsampling_factor + 1
+            else:
+                self._left_padding = (self._kernel_size - 1) // 2
+                self._right_padding = (self._kernel_size - 1) // 2
+                self._max_cache_len = 0
+
+            for i in range(self._sampling_num):
+                if self.is_causal:
+                    layers.append(
+                        CausalConv1D(
+                            in_channels=in_channels,
+                            out_channels=(
+                                feat_out
+                                if self._sampling_num == i + 1
+                                else conv_channels
+                            ),
+                            kernel_size=self._kernel_size,
+                            stride=self._stride,
+                            padding=None,
+                        )
+                    )
+                else:
+                    layers.append(
+                        nn.Conv1d(
+                            in_channels=in_channels,
+                            out_channels=(
+                                feat_out
+                                if self._sampling_num == i + 1
+                                else conv_channels
+                            ),
+                            kernel_size=self._kernel_size,
+                            stride=self._stride,
+                            padding=self._left_padding,
+                        )
+                    )
+                layers.append(activation)
+                in_channels = conv_channels
+
+        elif subsampling == "dw_striding_conv1d":
+            in_channels = feat_in
+
+            self._stride = 2
+            self._kernel_size = 5
+            self._ceil_mode = False
+
+            self._left_padding = (self._kernel_size - 1) // 2
+            self._right_padding = (self._kernel_size - 1) // 2
+
+            # Layer 1
+            layers.extend(
+                [
+                    nn.Conv1d(
+                        in_channels=in_channels,
+                        out_channels=in_channels,
+                        kernel_size=self._kernel_size,
+                        stride=self._stride,
+                        padding=self._left_padding,
+                        groups=in_channels,
+                    ),
+                    nn.Conv1d(
+                        in_channels=in_channels,
+                        out_channels=(
+                            feat_out if self._sampling_num == 1 else conv_channels
+                        ),
+                        kernel_size=1,
+                        stride=1,
+                        padding=0,
+                        groups=1,
+                    ),
+                ]
+            )
+            in_channels = conv_channels
+            layers.append(activation)
+
+            for i in range(self._sampling_num - 1):
+                layers.extend(
+                    [
+                        nn.Conv1d(
+                            in_channels=in_channels,
+                            out_channels=in_channels,
+                            kernel_size=self._kernel_size,
+                            stride=self._stride,
+                            padding=self._left_padding,
+                            groups=in_channels,
+                        ),
+                        nn.Conv1d(
+                            in_channels=in_channels,
+                            out_channels=(
+                                feat_out
+                                if self._sampling_num == i + 2
+                                else conv_channels
+                            ),
+                            kernel_size=1,
+                            stride=1,
+                            padding=0,
+                            groups=1,
+                        ),
+                    ]
+                )
+                layers.append(activation)
+                in_channels = conv_channels
+
+        else:
+            raise ValueError(f"Not valid sub-sampling: {subsampling}!")
+
+        if subsampling in ["dw_striding", "striding"]:
+            in_length = mx.array(feat_in, dtype=mx.float32)
+            out_length = calc_length(
+                lengths=in_length,
+                all_paddings=self._left_padding + self._right_padding,
+                kernel_size=self._kernel_size,
+                stride=self._stride,
+                ceil_mode=self._ceil_mode,
+                repeat_num=self._sampling_num,
+            )
+            self.out = nn.Linear(conv_channels * int(out_length), feat_out)
+            self.conv2d_subsampling = True
+        elif subsampling in ["striding_conv1d", "dw_striding_conv1d"]:
+            self.out = None
+            self.conv2d_subsampling = False
+        else:
+            raise ValueError(f"Not valid sub-sampling: {subsampling}!")
+
+        self.conv = layers
+
+    def get_sampling_frames(self):
+        return [1, self.subsampling_factor]
+
+    def get_streaming_cache_size(self):
+        return [0, self.subsampling_factor + 1]
+
+    def forward(self, x, mask):
+        """
+        Forward method for NeMo subsampling.
+        Args:
+            x[Batch, Time, Filters]: torch.Tensor
+                input tensor
+            x_mask: torch.Tensor
+                input mask
+        Returns:
+            x: torch.Tensor
+                Resulting tensor from subsampling (B, T // time_reduction_factor, feat_out)
+            pad_mask: torch.Tensor
+                tensor of padded hidden state sequences (B, 1, T // time_reduction_factor)
+        """
+        # Unsqueeze Channel Axis
+        if self.conv2d_subsampling:
+            x = x.unsqueeze(1)
+        # Transpose to Channel First mode
+        else:
+            x = x.transpose(1, 2)
+
+        # split inputs if chunking_factor is set
+        if self.subsampling_conv_chunking_factor != -1 and self.conv2d_subsampling:
+            if self.subsampling_conv_chunking_factor == 1:
+                # if subsampling_conv_chunking_factor is 1, we split only if needed
+                # avoiding a bug / feature limiting indexing of tensors to 2**31
+                # see https://github.com/pytorch/pytorch/issues/80020
+                x_ceil = 2**31 / self._conv_channels * self._stride * self._stride
+                if mx.numel(x) > x_ceil:
+                    need_to_split = True
+                else:
+                    need_to_split = False
+            else:
+                # if subsampling_conv_chunking_factor > 1 we always split
+                need_to_split = True
+
+            if need_to_split:
+                x, success = self.conv_split_by_batch(x)
+                if not success:  # if unable to split by batch, try by channel
+                    if self._subsampling == "dw_striding":
+                        x = self.conv_split_by_channel(x)
+                    else:
+                        for conv in self.conv:
+                            x = conv(x)  # try anyway
+            else:
+                for conv in self.conv:
+                    x = conv(x)
+        else:
+            for conv in self.conv:
+                x = conv(x)
+
+        # Flatten Channel and Frequency Axes
+        if self.conv2d_subsampling:
+            b, c, t, f = x.size()
+            x = self.out(x.transpose(1, 2).reshape(b, t, -1))
+        # Transpose to Channel Last mode
+        else:
+            x = x.transpose(1, 2)
+
+        if mask is None:
+            return x, None
+
+        max_audio_length = x.shape[1]
+        feature_lens = mask.sum(1)
+        padding_length = mx.ceil(feature_lens / self.subsampling_factor)
+        if self.is_causal and self.subsampling_causal_cond:
+            feature_lens_remainder = feature_lens % self.subsampling_factor
+            padding_length[feature_lens_remainder != 1] += 1
+        pad_mask = mx.arange(0, max_audio_length, device=x.device).expand(
+            padding_length.size(0), -1
+        ) < padding_length.unsqueeze(1)
+        return x, pad_mask.unsqueeze(1)
+
+    def conv_split_by_batch(self, x):
+        """Tries to split input by batch, run conv and concat results"""
+        b, _, _, _ = x.size()
+        if b == 1:  # can't split if batch size is 1
+            return x, False
+
+        if self.subsampling_conv_chunking_factor > 1:
+            cf = self.subsampling_conv_chunking_factor
+        else:
+            # avoiding a bug / feature limiting indexing of tensors to 2**31
+            # see https://github.com/pytorch/pytorch/issues/80020
+            x_ceil = 2**31 / self._conv_channels * self._stride * self._stride
+            p = math.ceil(math.log(mx.numel(x) / x_ceil, 2))
+            cf = 2**p
+
+        new_batch_size = b // cf
+        if new_batch_size == 0:  # input is too big
+            return x, False
+
+        out_chunks = []
+        for chunk in mx.split(x, new_batch_size, 0):
+            for conv in self.conv:
+                chunk = conv(chunk)
+            out_chunks.append(chunk)
+
+        return mx.cat(out_chunks, 0), True
+
+    def conv_split_by_channel(self, x):
+        """For dw convs, tries to split input by time, run conv and concat results"""
+        x = self.conv[0](x)  # full conv2D
+        x = self.conv[1](x)  # activation
+
+        for i in range(self._sampling_num - 1):
+            _, c, t, _ = x.size()
+
+            if self.subsampling_conv_chunking_factor > 1:
+                cf = self.subsampling_conv_chunking_factor
+            else:
+                # avoiding a bug / feature limiting indexing of tensors to 2**31
+                # see https://github.com/pytorch/pytorch/issues/80020
+                p = math.ceil(math.log(mx.numel(x) / 2**31, 2))
+                cf = 2**p
+
+            new_c = int(c // cf)
+            if new_c == 0:
+                new_c = 1
+
+            new_t = int(t // cf)
+            if new_t == 0:
+                new_t = 1
+
+            x = self.channel_chunked_conv(
+                self.conv[i * 3 + 2], new_c, x
+            )  # conv2D, depthwise
+
+            # splitting pointwise convs by time
+            x = mx.cat(
+                [self.conv[i * 3 + 3](chunk) for chunk in mx.split(x, new_t, 2)], 2
+            )  # conv2D, pointwise
+            x = self.conv[i * 3 + 4](x)  # activation
+        return x
+
+    def channel_chunked_conv(self, conv, chunk_size, x):
+        """Performs channel chunked convolution"""
+
+        ind = 0
+        out_chunks = []
+        for chunk in mx.split(x, chunk_size, 1):
+            step = chunk.size()[1]
+
+            if self.is_causal:
+                chunk = mx.pad(
+                    chunk,
+                    pad=(
+                        self._kernel_size - 1,
+                        self._stride - 1,
+                        self._kernel_size - 1,
+                        self._stride - 1,
+                    ),
+                )
+                ch_out = mx.conv2d(
+                    chunk,
+                    conv.weight[ind : ind + step, :, :, :],
+                    bias=conv.bias[ind : ind + step],
+                    stride=self._stride,
+                    padding=0,
+                    groups=step,
+                )
+            else:
+                ch_out = mx.conv2d(
+                    chunk,
+                    conv.weight[ind : ind + step, :, :, :],
+                    bias=conv.bias[ind : ind + step],
+                    stride=self._stride,
+                    padding=self._left_padding,
+                    groups=step,
+                )
+            out_chunks.append(ch_out)
+            ind += step
+
+        return mx.cat(out_chunks, 1)
+
+    def change_subsampling_conv_chunking_factor(
+        self, subsampling_conv_chunking_factor: int
+    ):
+        if (
+            subsampling_conv_chunking_factor != -1
+            and subsampling_conv_chunking_factor != 1
+            and subsampling_conv_chunking_factor % 2 != 0
+        ):
+            raise ValueError(
+                "subsampling_conv_chunking_factor should be -1, 1, or a power of 2"
+            )
+        self.subsampling_conv_chunking_factor = subsampling_conv_chunking_factor
 
 
 class DepthWiseSeperableConv1d(nn.Module):
@@ -614,6 +1360,54 @@ class ConformerEncoderLayer(nn.Module):
         return out
 
 
+class MeanVarianceNormLayer(nn.Module):
+    """Mean/variance normalization layer.
+    Will substract mean and multiply input by inverted standard deviation.
+    Typically used as a very first layer in a model.
+    Args:
+        input_size: int
+            layer input size.
+    """
+
+    def __init__(self, input_size):
+        super().__init__()
+        self.input_size = input_size
+        self.global_mean = mx.array(mx.zeros(input_size))
+        self.global_invstd = mx.array(mx.ones(input_size))
+
+    def forward(self, input_: mx.array) -> mx.array:
+        """MeanVarianceNormLayer Forward
+        Args:
+            input_: torch.Tensor
+                input tensor.
+        """
+        return (input_ - self.global_mean) * self.global_invstd
+
+    def load_mean_invstd(self, mean_file, invstd_file, cuside_features=False):
+        """Load feature mean and variance used for normalization.
+        Args:
+            mean_file: str
+                path to the feature mean statistics file.
+            invstd_file: str
+                path to the features inverted standard deviation
+                 statistics file.
+            cuside_features: bool
+                Boolean that indicates CUSIDE is being used.
+                The statistics of CUSIDE features are copied
+                from the normal features
+        """
+        self.global_mean.data = mx.array(np_loadtxt_with_retry(mean_file))
+        self.global_invstd.data = mx.array(np_loadtxt_with_retry(invstd_file))
+
+        if cuside_features:
+            self.global_mean.data = mx.cat(
+                (self.global_mean.data, self.global_mean.data), 0
+            )
+            self.global_invstd.data = mx.cat(
+                (self.global_invstd.data, self.global_invstd.data), 0
+            )
+
+
 class ConformerEncoder(nn.Module):
     """Conformer encoder for audio processing."""
 
@@ -661,32 +1455,40 @@ class ConformerEncoder(nn.Module):
         super().__init__()
 
         self.input_size = input_size
+        self.input_layer = input_layer
+        self.chunk_size = chunk_size
+        self.left_chunk = left_chunk
         self.attention_dim = attention_dim
+        self.num_heads = attention_heads
+        self.attention_group_size = attention_group_size
+        self.time_reduction = time_reduction
+        self.nemo_conv_settings = nemo_conv_settings
+        self.encoder_embedding_config = encoder_embedding_config
 
-        # Input layer
-        if input_layer == "conv2d":
-            self.embed = [
-                nn.Conv2d(1, attention_dim // 4, kernel_size=3, stride=2, padding=1),
-                nn.ReLU(),
-                nn.Conv2d(
-                    attention_dim // 4,
-                    attention_dim // 2,
-                    kernel_size=3,
-                    stride=2,
-                    padding=1,
-                ),
-                nn.ReLU(),
-                nn.Conv2d(
-                    attention_dim // 2,
-                    attention_dim,
-                    kernel_size=3,
-                    stride=2,
-                    padding=1,
-                ),
-                nn.ReLU(),
-            ]
+        if self.input_layer == "nemo_conv":
+            default_nemo_conv_settings = {
+                "subsampling": "dw_striding",
+                "subsampling_factor": self.time_reduction,
+                "feat_in": input_size,
+                "feat_out": attention_dim,
+                "conv_channels": 256,
+                "subsampling_conv_chunking_factor": 1,
+                "activation": nn.ReLU(),
+                "is_causal": False,
+            }
+            # Override any of the defaults with the incoming, user settings
+            if nemo_conv_settings:
+                default_nemo_conv_settings.update(nemo_conv_settings)
+                for i in ["subsampling_factor", "feat_in", "feat_out"]:
+                    assert (
+                        i not in nemo_conv_settings
+                    ), "{i} should be specified outside of the NeMo dictionary"
+
+            self.embed = NemoConvSubsampling(
+                **default_nemo_conv_settings,
+            )
         else:
-            self.embed = [nn.Linear(input_size, attention_dim)]
+            raise ValueError("unknown input_layer: " + input_layer)
 
         # Positional encoding - using sinusoidal positional embedding
         # In a complete implementation, we would use a proper positional encoding here
@@ -721,12 +1523,59 @@ class ConformerEncoder(nn.Module):
             for _ in range(num_blocks)
         ]
 
-        self.norm = nn.LayerNorm(attention_dim)
+        if not hasattr(self, "encoder_embedding"):
+            self.encoder_embedding = MeanVarianceNormLayer(
+                self.encoder_embedding_config["input_size"]
+            )
 
-    def post_init(self, init_model=None):
+        self.relative_attention_bias_type = (
+            relative_attention_bias_args.get("type")
+            if relative_attention_bias_args
+            else None
+        )
+        if self.relative_attention_bias_type == "t5":
+            assert (
+                self.num_heads % self.attention_group_size == 0
+            ), "attention_group_size must divide n_head"
+            self.relative_attention_bias_layer = T5RelativeAttentionLogitBias(
+                self.num_heads // self.attention_group_size,
+                max_distance=relative_attention_bias_args.get(
+                    "t5_bias_max_distance", 1000
+                ),
+                symmetric=relative_attention_bias_args.get("t5_bias_symmetric", False),
+            )
+        else:
+            raise NotImplementedError
+
+    def post_init(self, init_model_config=None):
         """Initialize model weights from a pretrained model."""
-        # In a complete implementation, this would load weights from a checkpoint
-        pass
+
+        pretrained_speech_encoder_path = init_model_config.get(
+            "pretrained_speech_encoder_path", None
+        )
+        if pretrained_speech_encoder_path:
+            import torch
+
+            model_state = torch.load(pretrained_speech_encoder_path, map_location="cpu")
+            encoder_state_dict = {}
+            for k, v in model_state.items():
+                if "encoder." in k:
+                    tmp_k = k.replace("encoder.", "")
+                    encoder_state_dict[tmp_k] = v
+
+            if hasattr(self, "encoder_embedding"):
+                del self.encoder_embedding
+            self.load_weights(list(encoder_state_dict.items()))
+
+        if not hasattr(self, "encoder_embedding"):
+            self.encoder_embedding = MeanVarianceNormLayer(
+                self.encoder_embedding_config["input_size"]
+            )
+
+        mean_file = init_model_config.get("mean_file", None)
+        invstd_file = init_model_config.get("invstd_file", None)
+        if mean_file is not None and invstd_file is not None:
+            self.encoder_embedding.load_mean_invstd(mean_file, invstd_file)
 
     def __call__(self, x, mask=None):
         """
@@ -1015,4 +1864,33 @@ class AudioModel(nn.Module):
         return hidden_states
 
     def sanitize(self, weights):
-        return weights
+        sanitized_weights = {}
+        for k, v in weights.items():
+            if (
+                "embed.conv" in k
+                and k.endswith("weight")
+                and any(f"embed.conv.{i}" in k for i in range(9))
+            ):
+                # Check if the weight tensor is already in the correct format
+                if check_array_shape(v):
+                    sanitized_weights[k] = v
+                else:
+                    # PyTorch conv2d weight tensors have shape:
+                    #   [out_channels, in_channels, kH, KW]
+                    # MLX conv2d expects the weight be of shape:
+                    #   [out_channels, kH, KW, in_channels]
+                    sanitized_weights[k] = v.transpose(0, 2, 3, 1)
+            elif (
+                "ext_pw_conv_1d" in k
+                or "depthwise_seperable_conv_1d" in k
+                or "dw_sep_conv_1d" in k
+            ) and k.endswith("weight"):
+                # Check if the weight tensor is already in the correct format
+                if check_array_shape(v):
+                    sanitized_weights[k] = v
+                else:
+                    sanitized_weights[k] = v.transpose(0, 2, 1)
+            else:
+                sanitized_weights[k] = v
+
+        return sanitized_weights

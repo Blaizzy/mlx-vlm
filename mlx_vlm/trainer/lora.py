@@ -36,7 +36,7 @@ class LoRaLayer(nn.Module):
                     shape=(input_dims, rank),
                 ),
             )
-            setattr(self, f"lora_B.{name}.weight", mx.zeros((rank, output_dims)))
+            setattr(self, f"lora_B.{name}.weight", mx.ones((rank, output_dims)))
             self.lora_name = name  # Store name for __call__
         else:
             self.A = mx.random.uniform(
@@ -44,19 +44,20 @@ class LoRaLayer(nn.Module):
                 high=std_dev,
                 shape=(input_dims, rank),
             )
-            self.B = mx.zeros((rank, output_dims))
+            self.B = mx.ones((rank, output_dims))
 
         self.alpha = alpha
 
     def __call__(self, x):
         y = self.base_layer(x)
-        if hasattr(self, "lora_name"):
-            A = getattr(self, f"lora_A.{self.lora_name}")
-            B = getattr(self, f"lora_B.{self.lora_name}")
-            lora_update = (self.dropout(x) @ A) @ B
-        else:
-            lora_update = (self.dropout(x) @ self.A) @ self.B
-        return y + (self.alpha * lora_update).astype(x.dtype)
+        return y
+        # if hasattr(self, "lora_name"):
+        #     A = getattr(self, f"lora_A.{self.lora_name}.weight")
+        #     B = getattr(self, f"lora_B.{self.lora_name}.weight")
+        #     lora_update = (self.dropout(x) @ A) @ B
+        # else:
+        #     lora_update = (self.dropout(x) @ self.A) @ self.B
+        # return y + (self.alpha * lora_update).astype(x.dtype)
 
 
 def replace_lora_with_linear(model):

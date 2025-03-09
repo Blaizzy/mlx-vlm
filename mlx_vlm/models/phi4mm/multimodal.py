@@ -129,7 +129,7 @@ class Phi4MMImageAudioEmbedding(nn.Module):
 
         # Handle backward compatibility for special token IDs
         # Replace compatible token ranges with standard tokens
-        new_input_ids = input_ids.copy()
+        new_input_ids = input_ids
 
         # Create masks for different token ranges
         image_mask = (input_ids >= _COMPATIBLE_IMAGE_SPECIAL_TOKEN_ID_RANGE[0]) & (

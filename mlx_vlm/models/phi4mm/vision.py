@@ -18,12 +18,12 @@ import numpy as np
 @dataclass
 class VisionConfig:
     model_type: str = "phi4mm"
-    hidden_size: int = 768
+    hidden_size: int = 1152
     num_attention_heads: int = 12
     patch_size: int = 14
     num_hidden_layers: int = 27
-    intermediate_size: int = 3072
-    image_size: int = 224
+    intermediate_size: int = 4304
+    image_size: int = 448
     num_channels: int = 3
     layer_norm_eps: float = 1e-6
     vocab_size: int = 32000
@@ -256,7 +256,6 @@ class SigLipMultiheadAttentionPoolingHead(nn.Module):
         )
         self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.mlp = MLP(config)
-        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
 
     def __call__(self, x: mx.array):
         x = self.attention(self.probe, x)[0]
@@ -265,7 +264,24 @@ class SigLipMultiheadAttentionPoolingHead(nn.Module):
         x = self.layernorm(x)
         x = residual + self.mlp(x)
 
-        return self.out_proj(x[:, 0])
+        return x[:, 0]
+
+
+class ReflectionPad2d(nn.Module):
+    def __init__(self, padding):
+        super().__init__()
+        self.padding = padding
+
+    def __call__(self, x):
+        return mx.pad(
+            x,
+            (
+                (0, 0),
+                (0, 0),
+                (self.padding[0], self.padding[1]),
+                (self.padding[0], self.padding[1]),
+            ),
+        )
 
 
 class SigLIPVisionModel(nn.Module):
@@ -321,12 +337,13 @@ class VisionModel(nn.Module):
         self.img_processor = SigLIPVisionModel(config)
 
         # Get positional embedding shape
-        L, D = 576, 1024  # Assuming default values, would be from pe_weight.size()
+        per_weight = self.img_processor.embeddings.position_embedding.weight
+        L, D = per_weight.shape
         H = int(math.sqrt(L))
         assert H**2 == L
 
         if H % 2 != 0:
-            self.img_processor_padding = True  # Placeholder for padding operation
+            self.img_processor_padding = ReflectionPad2d((0, 1, 0, 1))
             H += 1
 
         image_dim_out = D
@@ -350,7 +367,7 @@ class VisionModel(nn.Module):
         )
         if self.image_token_compression_cls == "avg_pool_2d":
             # Simple avg pooling, not a full implementation
-            self.image_token_compression = True  # Placeholder for actual implementation
+            self.image_token_compression = nn.AvgPool2d(kernel_size=2, stride=2)
             self.base_feat_height_reduction = 1
             self.base_feat_height_target = self.base_feat_height_target // 2
         elif self.image_token_compression_cls is None:
@@ -381,7 +398,7 @@ class VisionModel(nn.Module):
         if projection_cls == "linear":
             self.img_projection = nn.Linear(image_dim_out, hidden_size)
         elif projection_cls == "mlp" and self.use_hd_transform:
-            dim_projection = hidden_size
+            dim_projection = 3072
             depth = 2
             layers = [
                 nn.Linear(
@@ -393,7 +410,7 @@ class VisionModel(nn.Module):
             self.img_projection = layers
         elif projection_cls == "mlp":
             # Follow llava-v1.5's implementation
-            dim_projection = hidden_size
+            dim_projection = 3072
             depth = 2
             layers = [nn.Linear(image_dim_out, dim_projection)]
             for _ in range(1, depth):
@@ -974,14 +991,14 @@ class VisionModel(nn.Module):
                         "attention.in_proj_weight", "attention.in_proj.weight"
                     )
                     sanitized_weights[new_k] = v
-                if "attention.in_proj_bias" in k:
+                elif "attention.in_proj_bias" in k:
                     new_k = k.replace(
                         "attention.in_proj_bias", "attention.in_proj.bias"
                     )
                     sanitized_weights[new_k] = v
-                if "attention.out_proj.weight" in k:
-                    new_k = k.replace("attention.out_proj.weight", "out_proj.weight")
-                    sanitized_weights[new_k] = v
+
+                else:
+                    sanitized_weights[k] = v
             elif "patch_embedding.weight" in k:
                 # PyTorch conv2d weight tensors have shape:
                 #   [out_channels, in_channels, kH, KW]

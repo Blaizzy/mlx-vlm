@@ -145,11 +145,11 @@ class MHA(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config: VisionConfig):
+    def __init__(self, config: VisionConfig, bias: bool = True):
         super().__init__()
         self.activation_fn = nn.GELU(approx="fast")
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=bias)
+        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=bias)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.activation_fn(self.fc1(x))
@@ -165,7 +165,7 @@ class EncoderLayer(nn.Module):
             config.hidden_size, config.num_attention_heads, bias=True
         )
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, bias=True)
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
 
     def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
@@ -253,7 +253,7 @@ class SigLipMultiheadAttentionPoolingHead(nn.Module):
             )
         )
         self.attention = MHA(
-            config.hidden_size, num_heads=config.num_attention_heads, bias=True
+            config.hidden_size, num_heads=config.num_attention_heads, bias=False
         )
         self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.mlp = MLP(config)

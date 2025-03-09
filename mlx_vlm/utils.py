@@ -187,9 +187,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             **quantization,
             class_predicate=class_predicate,
         )
-    # for name, module in model.named_modules():
-    #     if "layers" in name:
-    #         print(name, module.parameters().keys())
     model.load_weights(list(weights.items()))
     if not lazy:
         mx.eval(model.parameters())
@@ -820,6 +817,11 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
                 text=prompts, images=images, padding=True, return_tensors="mlx"
             )
 
+        # For Phi4MM
+        if "input_image_embeds" in inputs:
+            inputs["pixel_values"] = inputs["input_image_embeds"]
+            inputs.pop("input_image_embeds")
+
         if "images" in inputs:
             inputs["pixel_values"] = inputs["images"]
             inputs.pop("images")
@@ -836,7 +838,8 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
         # Convert inputs to model_inputs with mx.array if present
         for key, value in inputs.items():
             if key not in model_inputs and not isinstance(value, (str, list)):
-                model_inputs[key] = mx.array(value)
+                if value is not None:
+                    model_inputs[key] = mx.array(value)
 
     return model_inputs
 
