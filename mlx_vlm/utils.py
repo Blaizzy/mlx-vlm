@@ -168,12 +168,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     # Sanitize weights
     weights = sanitize_weights(model, weights)
-    weights = sanitize_weights(
-        model_class.VisionModel, weights, model_config.vision_config
-    )
-    weights = sanitize_weights(
-        model_class.LanguageModel, weights, model_config.text_config
-    )
+    if hasattr(model_class, "VisionModel"):
+        weights = sanitize_weights(
+            model_class.VisionModel, weights, model_config.vision_config
+        )
+
+    if hasattr(model_class, "LanguageModel"):
+        weights = sanitize_weights(
+            model_class.LanguageModel, weights, model_config.text_config
+        )
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized`
@@ -184,7 +187,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             **quantization,
             class_predicate=class_predicate,
         )
-
     model.load_weights(list(weights.items()))
     if not lazy:
         mx.eval(model.parameters())
@@ -815,6 +817,11 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
                 text=prompts, images=images, padding=True, return_tensors="mlx"
             )
 
+        # For Phi4MM
+        if "input_image_embeds" in inputs:
+            inputs["pixel_values"] = inputs["input_image_embeds"]
+            inputs.pop("input_image_embeds")
+
         if "images" in inputs:
             inputs["pixel_values"] = inputs["images"]
             inputs.pop("images")
@@ -831,7 +838,8 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
         # Convert inputs to model_inputs with mx.array if present
         for key, value in inputs.items():
             if key not in model_inputs and not isinstance(value, (str, list)):
-                model_inputs[key] = mx.array(value)
+                if value is not None:
+                    model_inputs[key] = mx.array(value)
 
     return model_inputs
 
