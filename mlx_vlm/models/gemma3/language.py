@@ -5,7 +5,8 @@ from typing import Optional, Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput, RotatingKVCache, create_attention_mask
+
+from ..base import LanguageModelOutput, RotatingKVCache, create_attention_mask, KVCache
 
 
 @dataclass
@@ -103,6 +104,7 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
+        # Sliding window
         if self.is_sliding and mask is not None:
             key_len = keys.shape[-2]
             if mask.shape[-1] != key_len:
@@ -188,9 +190,9 @@ class GemmaModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        if mask is None:
-            j = self.config.sliding_window_size
-            mask = create_attention_mask(h, cache[j - 1: j])
+        # Sliding window
+        j = self.config.sliding_window_size
+        mask = create_attention_mask(h, cache[j - 1: j])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -236,3 +238,26 @@ class LanguageModel(nn.Module):
     @property
     def n_kv_heads(self):
         return self.config.num_key_value_heads
+
+    def make_cache(self):
+        caches = []
+        for i in range(self.config.num_hidden_layers):
+            if (
+                i % self.config.sliding_window_size
+                == self.config.sliding_window_size - 1
+            ):
+                caches.append(KVCache(
+                    head_dim=self.config.head_dim,
+                    n_kv_heads=self.config.num_key_value_heads,
+                ))
+            else:
+                caches.append(
+                    RotatingKVCache(
+                        max_size=self.config.sliding_window,
+                        keep=0,
+                        head_dim=self.config.head_dim,
+                        n_kv_heads=self.config.num_key_value_heads,
+                    )
+                )
+        return caches
+
