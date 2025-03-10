@@ -5,7 +5,7 @@ from typing import Optional, Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, RotatingKVCache, create_attention_mask
 
 
 @dataclass
@@ -19,11 +19,10 @@ class TextConfig:
     rms_norm_eps: float = 1.0e-6
     vocab_size: int = 262144
     num_key_value_heads: int = 4
-    rope_global_base_freq: float = 1000000.0
-    rope_local_base_freq: float = 10000.0
+    rope_global_base_freq: float = 1_000_000.0
+    rope_local_base_freq: float = 10_000.0
     rope_traditional: bool = False
     query_pre_attn_scalar: float = 0.0625
-    final_logit_softcapping: float = 30.0
     sliding_window: int = 1024
     mm_tokens_per_image: int = 256
 
@@ -62,8 +61,7 @@ class Attention(nn.Module):
         self.head_dim = head_dim = config.head_dim
         self.layer_idx = layer_idx
 
-        # self.scale = 1.0 / (config.query_pre_attn_scalar**0.5)
-        self.scale = config.query_pre_attn_scalar     # for sdpa
+        self.scale = config.query_pre_attn_scalar 
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
@@ -86,7 +84,7 @@ class Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        B, L, D = x.shape
+        B, L, _ = x.shape
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
 
@@ -95,7 +93,6 @@ class Attention(nn.Module):
 
         queries = self.q_norm(queries)
         keys = self.k_norm(keys)
-
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -106,7 +103,7 @@ class Attention(nn.Module):
             keys = self.rope(keys)
 
         output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            queries, keys, values, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -120,6 +117,7 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
     def __call__(self, x) -> mx.array:
+        #This should not be GELU approx, jax.nn.gelu
         return self.down_proj(nn.gelu_approx(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -140,7 +138,6 @@ class TransformerBlock(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        # self.config = config
 
     def __call__(
         self,
@@ -148,8 +145,7 @@ class TransformerBlock(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        ln = self.input_layernorm(x)
-        r = self.self_attn(ln, mask, cache)
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + self.post_attention_layernorm(r)
         r = self.mlp(self.pre_feedforward_layernorm(h))
         out = h + self.post_feedforward_layernorm(r)
@@ -176,7 +172,7 @@ class GemmaModel(nn.Module):
         cache=None,
     ):
         h = self.embed_tokens(inputs)
-        h = h * (self.args.hidden_size**0.5) #should be done in f16, not bf16
+        h = h * (self.args.hidden_size**0.5) #persistent precision issue in scaling
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -194,7 +190,6 @@ class LanguageModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
-        self.final_logit_softcapping = config.final_logit_softcapping
         self.model_type = config.model_type
         self.model = GemmaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -208,8 +203,6 @@ class LanguageModel(nn.Module):
     ):
         out = self.model(inputs, mask, cache)
         out = self.lm_head(out)
-        out = mx.tanh(out / self.final_logit_softcapping)
-        out = out * self.final_logit_softcapping
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
