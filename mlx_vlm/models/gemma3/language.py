@@ -61,7 +61,7 @@ class Attention(nn.Module):
         self.head_dim = head_dim = config.head_dim
         self.layer_idx = layer_idx
 
-        self.scale = config.query_pre_attn_scalar 
+        self.scale = config.query_pre_attn_scalar
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
@@ -168,11 +168,16 @@ class GemmaModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
+        inputs_embeds: mx.array = None,
         mask: mx.array = None,
         cache=None,
     ):
-        h = self.embed_tokens(inputs)
-        h = h * (self.config.hidden_size**0.5) #persistent precision issue in scaling
+        if inputs_embeds is None:
+            h = self.embed_tokens(inputs)
+        else:
+            h = inputs_embeds
+
+        h *= (self.config.hidden_size**0.5) #persistent precision issue in scaling
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -201,7 +206,7 @@ class LanguageModel(nn.Module):
         inputs_embeds=None,
         mask: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, inputs_embeds, mask, cache)
         out = self.lm_head(out)
         return LanguageModelOutput(logits=out)
 
