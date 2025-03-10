@@ -172,7 +172,7 @@ class GemmaModel(nn.Module):
         cache=None,
     ):
         h = self.embed_tokens(inputs)
-        h = h * (self.args.hidden_size**0.5) #persistent precision issue in scaling
+        h = h * (self.config.hidden_size**0.5) #persistent precision issue in scaling
 
         if cache is None:
             cache = [None] * len(self.layers)

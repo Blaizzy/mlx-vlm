@@ -48,21 +48,22 @@ class Gemma3MultiModalProjector(nn.Module):
         self.kernel_size = self.patches_per_image // self.tokens_per_side
         self.avg_pool = nn.AvgPool2d(kernel_size=self.kernel_size, stride=self.kernel_size)
 
-    def forward(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array) -> mx.array:
         b, _, l = x.shape
 
-        reshaped_vision_outputs = x.transpose(1, 2)
+        reshaped_vision_outputs = x.transpose(0, 2, 1)
         reshaped_vision_outputs = reshaped_vision_outputs.reshape(b, l, self.patches_per_image, self.patches_per_image)
-        reshaped_vision_outputs = reshaped_vision_outputs.contiguous()
 
+        # Transpose to place h, w in indices 1, 2
+        reshaped_vision_outputs = reshaped_vision_outputs.transpose(0, 2, 3, 1)
         pooled_vision_outputs = self.avg_pool(reshaped_vision_outputs)
-        pooled_vision_outputs = pooled_vision_outputs.flatten(2)
-        pooled_vision_outputs = pooled_vision_outputs.transpose(1, 2)
+        pooled_vision_outputs = pooled_vision_outputs.transpose(0, 3, 1, 2).flatten(2)
+        pooled_vision_outputs = pooled_vision_outputs.transpose(0, 2, 1)
 
         normed_vision_outputs = self.mm_soft_emb_norm(pooled_vision_outputs)
 
         projected_vision_outputs = mx.einsum("btm,md->btd", normed_vision_outputs, self.mm_input_projection_weight)
-        return projected_vision_outputs.type_as(x)
+        return projected_vision_outputs.astype(x.dtype)
 
 
 class Model(nn.Module):
@@ -110,11 +111,13 @@ class Model(nn.Module):
         scaled_image_features = image_features / (self.config.hidden_size**0.5)
         final_embedding = mx.zeros((batch_size, sequence_length, embed_dim))
 
+        pad_token_id = self.config.pad_token_id
+        pad_token_id = pad_token_id if pad_token_id is not None else 0
         text_mask = (input_ids != self.config.image_token_index) & (
-            input_ids != self.config.pad_token_id
+            input_ids != pad_token_id
         )
         image_mask = input_ids == self.config.image_token_index
-        pad_mask = input_ids == self.config.pad_token_id
+        pad_mask = input_ids == pad_token_id
 
         # expand masks to match embedding dimension
         text_mask_expanded = mx.expand_dims(text_mask, -1)
