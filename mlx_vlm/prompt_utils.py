@@ -95,7 +95,7 @@ def get_message_json(
         # Models using message_list_with_image format
         "idefics2": "message_list_with_image",
         "idefics3": "message_list_with_image_first",
-        "gemma3": "prompt_with_image_token",
+        "gemma3": "prompt_with_start_image_token",
         "smolvlm": "message_list_with_image_first",
         "llava": "message_list_with_image",
         "llava_next": "message_list_with_image",
