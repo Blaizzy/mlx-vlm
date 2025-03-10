@@ -25,6 +25,7 @@ class TextConfig:
     query_pre_attn_scalar: float = 0.0625
     sliding_window: int = 1024
     mm_tokens_per_image: int = 256
+    sliding_window_size: int = 6
 
     @classmethod
     def from_dict(cls, params):
@@ -70,7 +71,7 @@ class Attention(nn.Module):
 
         self.q_norm = RMSNorm(dims=head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(dims=head_dim, eps=config.rms_norm_eps)
-        self.is_sliding = (layer_idx + 1) % 6 != 0
+        self.is_sliding = (layer_idx + 1) % config.sliding_window_size != 0
 
         self.rope = nn.RoPE(
             head_dim,
@@ -101,6 +102,11 @@ class Attention(nn.Module):
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)
+
+        if self.is_sliding and mask is not None:
+            key_len = keys.shape[-2]
+            if mask.shape[-1] != key_len:
+                mask = mask[..., -key_len:]
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
@@ -183,7 +189,8 @@ class GemmaModel(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            mask = create_attention_mask(h, cache[6 - 1 : 6])
+            j = self.config.sliding_window_size
+            mask = create_attention_mask(h, cache[j - 1: j])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)

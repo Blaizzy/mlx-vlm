@@ -86,6 +86,7 @@ def get_message_json(
         ),
         "prompt_only": lambda: prompt,
         "prompt_with_image_token": lambda: "<image>" * num_images + prompt,
+        "prompt_with_start_image_token": lambda:  prompt + "<start_of_image>" * num_images,
         "message_video_with_text": handle_video_with_text,
     }
 
