@@ -210,7 +210,7 @@ class VisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.model_type = config.model_type
-        if self.model_type not in ["siglip_vision_model", "gemma3"]:
+        if self.model_type not in ["siglip_vision_model", "gemma3", "gemma3_vision"]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
         self.vision_model = SigLipVisionModel(config)
