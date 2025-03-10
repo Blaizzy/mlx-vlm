@@ -210,7 +210,7 @@ class VisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.model_type = config.model_type
-        if self.model_type not in ["siglip_vision_model", "gemma3_vision"]:
+        if self.model_type not in ["siglip_vision_model", "gemma3"]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
         self.vision_model = SigLipVisionModel(config)
@@ -223,10 +223,7 @@ class VisionModel(nn.Module):
     def sanitize(self, weights):
         sanitized_weights = {}
         for k, v in weights.items():
-            if "position_ids" in k:
-                # Remove unused position_ids
-                continue
-            elif "patch_embedding.weight" in k:
+            if "patch_embedding.weight" in k:
                 # PyTorch conv2d weight tensors have shape:
                 #   [out_channels, in_channels, kH, KW]
                 # MLX conv2d expects the weight be of shape:
