@@ -1,4 +1,3 @@
-
 import time
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -14,8 +13,10 @@ from .utils import (
     load_image,
     prepare_inputs,
     process_image,
-    apply_repetition_penalty
+    apply_repetition_penalty,
+    stream_generate as single_stream_generate
 )
+from .batch_processor import fix_processor_for_batch, get_model_type, batch_preprocess_images
 
 def create_detokenizer(processor):
     """Create a new detokenizer instance compatible with the given processor."""
@@ -215,139 +216,31 @@ def batch_generate_step(
 def batch_stream_generate(
     model: nn.Module,
     processor: PreTrainedTokenizer,
-    prompts: List[str],
-    images: Optional[List[Union[str, List[str]]]] = None,
+    prompt: str,
+    images: Optional[List[str]] = None,
     **kwargs
-):
+) -> str:
     """
-    Stream generation for a batch of inputs.
-
+    Stream generate text for a single prompt with multiple images.
+    
     Args:
         model: The vision-language model
         processor: The tokenizer/processor
-        prompts: List of text prompts
-        images: List of image paths or image objects
+        prompt: The prompt string
+        images: Optional list of image paths
         **kwargs: Additional generation arguments
-
-    Yields:
-        BatchedGenerationResult for each generation step
+        
+    Returns:
+        Generated text response
     """
-    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    batch_size = len(prompts)
-
-    detokenizers = [create_detokenizer(processor) for _ in range(batch_size)]
-    for detokenizer in detokenizers:
-        detokenizer.reset()
-
-    resize_shape = kwargs.pop("resize_shape", None)
-    image_token_index = getattr(model.config, "image_token_index", None)
-    max_tokens = kwargs.get("max_tokens", 256)
-
-    # Check if pixel values are provided directly
-    if kwargs.get("pixel_values") is None:
-        if not images:
-            # Text-only mode
-            encodings = tokenizer(prompts, padding=True, return_tensors="np")
-            input_ids = mx.array(encodings["input_ids"])
-            pixel_values = None
-            mask = mx.array(encodings["attention_mask"]) if "attention_mask" in encodings else None
-        else:
-            # Ensure images is a list of lists (for multi-image support)
-            if len(images) != batch_size:
-                raise ValueError(f"Expected {batch_size} images, got {len(images)}")
-
-            # Format input images correctly
-            if not all(isinstance(img, list) for img in images) and all(isinstance(img, str) or not isinstance(img, list) for img in images):
-                # Convert single images to lists
-                images = [[img] if not isinstance(img, list) else img for img in images]
-
-            # Prepare inputs for each prompt/image pair
-            all_inputs = []
-            for i in range(batch_size):
-                inputs = prepare_inputs(
-                    processor,
-                    images[i],
-                    prompts[i],
-                    image_token_index,
-                    resize_shape
-                )
-                all_inputs.append(inputs)
-
-            # Combine into batched inputs
-            batch_inputs = {}
-            for key in all_inputs[0].keys():
-                batch_inputs[key] = mx.stack([inp[key] for inp in all_inputs])
-
-            input_ids = batch_inputs["input_ids"]
-            pixel_values = batch_inputs["pixel_values"]
-            mask = batch_inputs["attention_mask"]
-
-            # Add additional kwargs
-            data_kwargs = {
-                k: v
-                for k, v in batch_inputs.items()
-                if k not in ["input_ids", "pixel_values", "attention_mask"]
-            }
-            kwargs.update(data_kwargs)
-    else:
-        # Use provided inputs
-        input_ids = kwargs.pop("input_ids")
-        pixel_values = kwargs.pop("pixel_values")
-        mask = kwargs.pop("mask", None)
-
-    # Start generation
-    tic = time.perf_counter()
-    result = BatchedGenerationResult(batch_size)
-
-    active_indices = list(range(batch_size))
-    completed_tokens = [False] * batch_size
-
-    for n, (tokens, logprobs) in enumerate(
-        batch_generate_step(input_ids, model, pixel_values, mask, **kwargs)
-    ):
-        if n == 0:
-            prompt_time = time.perf_counter() - tic
-            prompt_tps = input_ids.size / prompt_time
-            result.prompt_tokens = input_ids.shape[1]
-            result.prompt_tps = prompt_tps
-            tic = time.perf_counter()
-
-        # Process each token in the batch
-        still_active = []
-        for i, token in enumerate(tokens.tolist()):
-            if i in active_indices and not completed_tokens[i]:
-                batch_idx = active_indices[i]
-
-                # Check for EOS token
-                if token == tokenizer.eos_token_id:
-                    completed_tokens[batch_idx] = True
-                else:
-                    # Add token to detokenizer
-                    detokenizers[batch_idx].add_token(token)
-                    result.texts[batch_idx] = detokenizers[batch_idx].text
-                    result.tokens[batch_idx] = token
-                    result.logprobs[batch_idx] = logprobs[i].tolist()
-                    still_active.append(batch_idx)
-
-        active_indices = still_active
-        result.generation_tokens = n + 1
-        result.generation_tps = (n + 1) / (time.perf_counter() - tic)
-        result.peak_memory = mx.metal.get_peak_memory() / 1e9 if hasattr(mx, "metal") else 0
-
-        # Yield intermediate results
-        yield result
-
-        # Break if all sequences completed
-        if not active_indices:
-            break
-
-    # Finalize all detokenizers
-    for i, detokenizer in enumerate(detokenizers):
-        detokenizer.finalize()
-        result.texts[i] = detokenizer.text
-
-    yield result
-
+    text = ""
+    last_response = None
+    
+    for response in single_stream_generate(model, processor, prompt, images, **kwargs):
+        text += response.text
+        last_response = response
+    
+    return text
 
 def batch_generate(
     model: nn.Module,
@@ -373,6 +266,10 @@ def batch_generate(
     Returns:
         List of generated text responses
     """
+    # Fix processor configuration for batch processing
+    processor = fix_processor_for_batch(processor, model.config)
+    model_type = get_model_type(model.config)
+    
     # Format inputs to lists
     if isinstance(prompts, str):
         prompts = [prompts]
@@ -394,64 +291,51 @@ def batch_generate(
                 elif len(images) > batch_size:
                     # Truncate extra images
                     images = images[:batch_size]
+            
+        # Preprocess images based on model type
+        for i in range(len(images)):
+            images[i] = batch_preprocess_images(processor, model_type, images[i])
 
     # Format prompts using chat template if needed
     if format_prompts:
         config = model.config.__dict__ if hasattr(model.config, "__dict__") else model.config
         formatted_prompts = []
-
         for i, prompt in enumerate(prompts):
-            img_count = len(images[i]) if images is not None and i < len(images) else 0
-            prompt_msgs = [[{"role": "user", "content": prompt}]]
-
-            formatted_prompt = apply_chat_template(
-                processor,
-                config,
-                prompt_msgs[0],
-                add_generation_prompt=True,
-                tokenize=False,
-                num_images=img_count
-            )
+            num_images = len(images[i]) if images is not None else 0
+            if isinstance(prompt, str):
+                messages = [{"role": "user", "content": prompt}]
+            else:
+                messages = prompt
+            formatted_prompt = apply_chat_template(processor, config, messages, num_images=num_images)
             formatted_prompts.append(formatted_prompt)
-
         prompts = formatted_prompts
 
-    if verbose:
-        print("=" * 10)
-        if images is not None:
-            print(f"Processing batch of {batch_size} inputs with images")
-        else:
-            print(f"Processing batch of {batch_size} text inputs")
-
-    # Collect all generated texts
-    texts = [""] * batch_size
-    last_result = None
-
-    for result in batch_stream_generate(model, processor, prompts, images, **kwargs):
-        texts = result.texts
+    # Generate responses for each prompt
+    responses = []
+    for i in range(batch_size):
         if verbose:
-            # Print incremental output for each batch item
-            for i, text in enumerate(texts):
-                if text and text != texts[i]:
-                    print(f"[Batch {i}] {text}", end="", flush=True)
-        last_result = result
-
-    if verbose:
-        print("\n" + "=" * 10)
-        if len(texts) == 0:
-            print("No text generated for this batch")
-            return []
-
-        print(
-            f"Prompt: {last_result.prompt_tokens} tokens, "
-            f"{last_result.prompt_tps:.3f} tokens-per-sec"
+            print(f"\nGenerating response {i+1}/{batch_size}...")
+            print(f"Prompt: {prompts[i]}")
+            if images is not None:
+                print(f"Images: {images[i]}")
+        
+        current_images = images[i] if images is not None else None
+        current_prompt = prompts[i]
+        
+        # For single image case, unpack from list
+        if current_images and len(current_images) == 1:
+            current_images = current_images[0]
+            
+        response = batch_stream_generate(
+            model,
+            processor,
+            current_prompt,
+            current_images,
+            **kwargs
         )
-        print(
-            f"Generation: {last_result.generation_tokens} tokens, "
-            f"{last_result.generation_tps:.3f} tokens-per-sec"
-        )
-
-        if hasattr(mx, "metal"):
-            print(f"Peak memory: {last_result.peak_memory:.3f} GB")
-
-    return texts
+        responses.append(response)
+        
+        if verbose:
+            print(f"Response: {response}")
+    
+    return responses
