@@ -1031,6 +1031,48 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
         )
 
+    def test_gemma3(self):
+        from mlx_vlm.models import gemma3
+
+        text_config = gemma3.TextConfig(
+            model_type="gemma3",
+            hidden_size=2048,
+            num_hidden_layers=18,
+            intermediate_size=16384,
+            num_attention_heads=8,
+            rms_norm_eps=1e-6,
+            vocab_size=257216,
+        )
+        vision_config = gemma3.VisionConfig(
+            model_type="gemma3",
+            image_size=224,
+            patch_size=14,
+            num_channels=3,
+            num_hidden_layers=18,
+            hidden_size=2048,
+            intermediate_size=16384,
+            num_attention_heads=8,
+        )
+        config = gemma3.ModelConfig(text_config=text_config, vision_config=vision_config, model_type="gemma3")
+        model = gemma3.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
+
+
 
 if __name__ == "__main__":
     unittest.main()
