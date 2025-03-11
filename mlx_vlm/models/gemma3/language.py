@@ -17,7 +17,7 @@ class TextConfig:
     num_attention_heads: int = 8
     head_dim: int = 256
     rms_norm_eps: float = 1.0e-6
-    vocab_size: int = 262144
+    vocab_size: int = 262208
     num_key_value_heads: int = 4
     rope_global_base_freq: float = 1_000_000.0
     rope_local_base_freq: float = 10_000.0
@@ -65,7 +65,7 @@ class Attention(nn.Module):
         self.head_dim = head_dim = config.head_dim
         self.layer_idx = layer_idx
 
-        self.scale = config.query_pre_attn_scalar ** -0.5
+        self.scale = config.query_pre_attn_scalar 
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
@@ -270,3 +270,5 @@ class LanguageModel(nn.Module):
                     )
                 )
         return caches
+
+
