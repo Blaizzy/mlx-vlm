@@ -28,7 +28,6 @@ class TextConfig:
     mm_tokens_per_image: int = 256
     sliding_window_pattern: int = 6
 
-
     @classmethod
     def from_dict(cls, params):
         return cls(
