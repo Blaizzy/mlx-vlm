@@ -1,6 +1,6 @@
 import inspect
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -24,8 +24,10 @@ class TextConfig:
     rope_traditional: bool = False
     query_pre_attn_scalar: float = 0.0625
     sliding_window: int = 1024
+    rope_scaling: Optional[Dict[str, Union[float, List[float]]]] = None
     mm_tokens_per_image: int = 256
-    sliding_window_size: int = 6
+    sliding_window_pattern: int = 6
+
 
     @classmethod
     def from_dict(cls, params):
@@ -73,7 +75,7 @@ class Attention(nn.Module):
 
         self.q_norm = RMSNorm(dims=head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(dims=head_dim, eps=config.rms_norm_eps)
-        self.is_sliding = (layer_idx + 1) % config.sliding_window_size != 0
+        self.is_sliding = (layer_idx + 1) % config.sliding_window_pattern != 0
 
         self.rope = nn.RoPE(
             head_dim,
@@ -113,7 +115,7 @@ class Attention(nn.Module):
         if self.is_sliding and mask is not None:
             key_len = keys.shape[-2]
             if mask.shape[-1] != key_len:
-                mask = mask[..., -key_len:]
+                mask = mask[..., :key_len]
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
@@ -197,7 +199,7 @@ class GemmaModel(nn.Module):
             cache = [None] * len(self.layers)
 
         # Sliding window
-        j = self.config.sliding_window_size
+        j = self.config.sliding_window_pattern
         mask = create_attention_mask(h, cache[j - 1 : j])
 
         for layer, c in zip(self.layers, cache):
@@ -238,7 +240,6 @@ class LanguageModel(nn.Module):
     def layers(self):
         return self.model.layers
 
-    # TODO: verify this
     @property
     def head_dim(self):
         return self.config.head_dim
@@ -251,8 +252,8 @@ class LanguageModel(nn.Module):
         caches = []
         for i in range(self.config.num_hidden_layers):
             if (
-                i % self.config.sliding_window_size
-                == self.config.sliding_window_size - 1
+                i % self.config.sliding_window_pattern
+                == self.config.sliding_window_pattern - 1
             ):
                 caches.append(
                     KVCache(
