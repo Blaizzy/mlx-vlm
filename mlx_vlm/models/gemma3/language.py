@@ -65,7 +65,7 @@ class Attention(nn.Module):
         self.head_dim = head_dim = config.head_dim
         self.layer_idx = layer_idx
 
-        self.scale = config.query_pre_attn_scalar
+        self.scale = config.query_pre_attn_scalar ** -0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
