@@ -171,6 +171,57 @@ def create_attention_mask(h: mx.array, cache: Optional[Any] = None):
         mask = None
     return mask
 
+class BatchedKVCache:
+    """Key-value cache that supports batched generation."""
+
+    def __init__(self, head_dim, n_kv_heads, batch_size=1):
+        """
+        Initialize a batched key-value cache.
+
+        Args:
+            head_dim: Dimension of each attention head
+            n_kv_heads: Number of key-value heads
+            batch_size: Number of sequences in the batch
+        """
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
+        self.batch_size = batch_size
+        self.keys = None
+        self.values = None
+        self.offset = 0
+        self.step = this_mod  # Dynamic step size for efficiency
+
+    def update_and_fetch(self, keys, values):
+        """
+        Update the cache with new keys and values and return the full cache.
+
+        Args:
+            keys: New key tensors [batch_size, n_heads, seq_len, head_dim]
+            values: New value tensors [batch_size, n_heads, seq_len, head_dim]
+
+        Returns:
+            Tuple of (cached_keys, cached_values)
+        """
+        prev = self.offset
+        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
+            n_steps = (self.step + keys.shape[2] - 1) // self.step
+            shape = (self.batch_size, self.n_kv_heads, n_steps * self.step, self.head_dim)
+            new_k = mx.zeros(shape, keys.dtype)
+            new_v = mx.zeros(shape, values.dtype)
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = self.keys[..., :prev, :]
+                    self.values = self.values[..., :prev, :]
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                self.values = mx.concatenate([self.values, new_v], axis=2)
+            else:
+                self.keys, self.values = new_k, new_v
+
+        self.offset += keys.shape[2]
+        self.keys[:, :, prev : self.offset, :] = keys
+        self.values[:, :, prev : self.offset, :] = values
+        return self.keys[:, :, : self.offset, :], self.values[:, :, : self.offset, :]
+
 
 @dataclass
 class LanguageModelOutput:
