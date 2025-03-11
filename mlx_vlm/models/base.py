@@ -189,7 +189,7 @@ class BatchedKVCache:
         self.keys = None
         self.values = None
         self.offset = 0
-        self.step = this_mod  # Dynamic step size for efficiency
+        self.step = 256  # Set a default step size for efficiency
 
     def update_and_fetch(self, keys, values):
         """

@@ -1,15 +1,12 @@
 import mlx_vlm
 
 # Load model
-model, processor = mlx_vlm.load("mlx-community/Qwen2-VL-2B-Instruct-4bit")
+model, processor = mlx_vlm.load("mlx-community/llava-interleave-qwen-0.5b-bf16")
 
 # Batch of prompts and images
 prompts = [
     "Describe this image in detail.",
-    # "What's happening in this picture?",
-    # "What can you tell me about this scene?"
 ]
-
 images = [
     "examples/images/cats.jpg",
 ]

@@ -17,6 +17,18 @@ from .utils import (
     apply_repetition_penalty
 )
 
+def create_detokenizer(processor):
+    """Create a new detokenizer instance compatible with the given processor."""
+    if hasattr(processor, "tokenizer"):
+        tokenizer = processor.tokenizer
+    else:
+        tokenizer = processor
+
+    if hasattr(processor, "detokenizer"):
+        detokenizer_class = type(processor.detokenizer)
+        return detokenizer_class(tokenizer)
+    else:
+        raise ValueError("Processor does not have a detokenizer attribute")
 
 class BatchedGenerationResult:
     """Container for batched generation results."""
@@ -223,8 +235,7 @@ def batch_stream_generate(
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     batch_size = len(prompts)
 
-    # Prepare detokenizers for each sequence in the batch
-    detokenizers = [processor.detokenizer.copy() for _ in range(batch_size)]
+    detokenizers = [create_detokenizer(processor) for _ in range(batch_size)]
     for detokenizer in detokenizers:
         detokenizer.reset()
 
