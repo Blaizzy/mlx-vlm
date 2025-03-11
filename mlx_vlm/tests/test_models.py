@@ -1053,7 +1053,9 @@ class TestModels(unittest.TestCase):
             intermediate_size=16384,
             num_attention_heads=8,
         )
-        config = gemma3.ModelConfig(text_config=text_config, vision_config=vision_config, model_type="gemma3")
+        config = gemma3.ModelConfig(
+            text_config=text_config, vision_config=vision_config, model_type="gemma3"
+        )
         model = gemma3.Model(config)
 
         self.language_test_runner(
@@ -1070,8 +1072,6 @@ class TestModels(unittest.TestCase):
             config.vision_config.num_channels,
             (config.vision_config.image_size, config.vision_config.image_size),
         )
-
-
 
 
 if __name__ == "__main__":

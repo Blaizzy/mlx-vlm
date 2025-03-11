@@ -9,7 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
-from .language import LanguageModel, TextConfig, RMSNorm
+from .language import LanguageModel, RMSNorm, TextConfig
 from .vision import VisionConfig, VisionModel
 
 
@@ -38,21 +38,29 @@ class ModelConfig:
 class Gemma3MultiModalProjector(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.mm_input_projection_weight = mx.ones((config.vision_config.hidden_size, config.text_config.hidden_size))
+        self.mm_input_projection_weight = mx.ones(
+            (config.vision_config.hidden_size, config.text_config.hidden_size)
+        )
 
         self.mm_soft_emb_norm = RMSNorm(
             config.vision_config.hidden_size, eps=config.vision_config.layer_norm_eps
         )
-        self.patches_per_image = int(config.vision_config.image_size // config.vision_config.patch_size)
+        self.patches_per_image = int(
+            config.vision_config.image_size // config.vision_config.patch_size
+        )
         self.tokens_per_side = int(config.text_config.mm_tokens_per_image**0.5)
         self.kernel_size = self.patches_per_image // self.tokens_per_side
-        self.avg_pool = nn.AvgPool2d(kernel_size=self.kernel_size, stride=self.kernel_size)
+        self.avg_pool = nn.AvgPool2d(
+            kernel_size=self.kernel_size, stride=self.kernel_size
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
         b, _, l = x.shape
 
         reshaped_vision_outputs = x.transpose(0, 2, 1)
-        reshaped_vision_outputs = reshaped_vision_outputs.reshape(b, l, self.patches_per_image, self.patches_per_image)
+        reshaped_vision_outputs = reshaped_vision_outputs.reshape(
+            b, l, self.patches_per_image, self.patches_per_image
+        )
 
         # Transpose to place h, w in indices 1, 2
         reshaped_vision_outputs = reshaped_vision_outputs.transpose(0, 2, 3, 1)
@@ -62,7 +70,9 @@ class Gemma3MultiModalProjector(nn.Module):
 
         normed_vision_outputs = self.mm_soft_emb_norm(pooled_vision_outputs)
 
-        projected_vision_outputs = mx.einsum("btm,md->btd", normed_vision_outputs, self.mm_input_projection_weight)
+        projected_vision_outputs = mx.einsum(
+            "btm,md->btd", normed_vision_outputs, self.mm_input_projection_weight
+        )
         return projected_vision_outputs.astype(x.dtype)
 
 

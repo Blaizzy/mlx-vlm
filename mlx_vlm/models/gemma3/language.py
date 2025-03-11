@@ -1,12 +1,11 @@
 import inspect
 from dataclasses import dataclass
-from typing import Optional, Any
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
-
-from ..base import LanguageModelOutput, RotatingKVCache, create_attention_mask, KVCache
+from ..base import KVCache, LanguageModelOutput, RotatingKVCache, create_attention_mask
 
 
 @dataclass
@@ -47,8 +46,10 @@ class RMSNorm(nn.Module):
 
     def __call__(self, x):
         orig_dtype = x.dtype
-        #casting to match exactly
-        output = mx.fast.rms_norm(x.astype(mx.float32), 1.0 + self.weight.astype(mx.float32), self.eps)
+        # casting to match exactly
+        output = mx.fast.rms_norm(
+            x.astype(mx.float32), 1.0 + self.weight.astype(mx.float32), self.eps
+        )
         return output.astype(orig_dtype)
 
 
@@ -77,7 +78,11 @@ class Attention(nn.Module):
         self.rope = nn.RoPE(
             head_dim,
             traditional=config.rope_traditional,
-            base= config.rope_local_base_freq if self.is_sliding else config.rope_global_base_freq,
+            base=(
+                config.rope_local_base_freq
+                if self.is_sliding
+                else config.rope_global_base_freq
+            ),
         )
 
     def __call__(
@@ -125,7 +130,7 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
     def __call__(self, x) -> mx.array:
-        #This should not be GELU approx, jax.nn.gelu
+        # This should not be GELU approx, jax.nn.gelu
         return self.down_proj(nn.gelu_approx(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -169,7 +174,8 @@ class GemmaModel(nn.Module):
         assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
-            TransformerBlock(config=config, layer_idx=layer_idx) for layer_idx in range(config.num_hidden_layers)
+            TransformerBlock(config=config, layer_idx=layer_idx)
+            for layer_idx in range(config.num_hidden_layers)
         ]
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -185,14 +191,14 @@ class GemmaModel(nn.Module):
         else:
             h = inputs_embeds
 
-        h *= (self.config.hidden_size**0.5) #persistent precision issue in scaling
+        h *= self.config.hidden_size**0.5  # persistent precision issue in scaling
 
         if cache is None:
             cache = [None] * len(self.layers)
 
         # Sliding window
         j = self.config.sliding_window_size
-        mask = create_attention_mask(h, cache[j - 1: j])
+        mask = create_attention_mask(h, cache[j - 1 : j])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -221,7 +227,9 @@ class LanguageModel(nn.Module):
 
     def sanitize(self, weights):
         if "lm_head.weight" not in weights:
-            weights["language_model.lm_head.weight"] = weights["language_model.model.embed_tokens.weight"]
+            weights["language_model.lm_head.weight"] = weights[
+                "language_model.model.embed_tokens.weight"
+            ]
         return {
             k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
         }
@@ -246,10 +254,12 @@ class LanguageModel(nn.Module):
                 i % self.config.sliding_window_size
                 == self.config.sliding_window_size - 1
             ):
-                caches.append(KVCache(
-                    head_dim=self.config.head_dim,
-                    n_kv_heads=self.config.num_key_value_heads,
-                ))
+                caches.append(
+                    KVCache(
+                        head_dim=self.config.head_dim,
+                        n_kv_heads=self.config.num_key_value_heads,
+                    )
+                )
             else:
                 caches.append(
                     RotatingKVCache(
@@ -260,4 +270,3 @@ class LanguageModel(nn.Module):
                     )
                 )
         return caches
-

@@ -1,5 +1,6 @@
-from mlx_vlm import load, apply_chat_template, generate
 import mlx.core as mx
+
+from mlx_vlm import apply_chat_template, generate, load
 
 # gg-hf-g/gemma-3-4b-it-pr
 # to be updated!
@@ -8,10 +9,11 @@ model, processor = load("/Users/pedro/code/hf/apple/mlx/models/gemma-3-4b-it-new
 url = "https://media.istockphoto.com/id/1192867753/photo/cow-in-berchida-beach-siniscola.jpg?s=612x612&w=0&k=20&c=v0hjjniwsMNfJSuKWZuIn8pssmD5h5bSN1peBd1CmH4="
 messages = [
     {
-        "role": "user", "content": [
+        "role": "user",
+        "content": [
             {"type": "text", "text": "What can you say about this image ?"},
             {"type": "image", "url": url},
-        ]
+        ],
     },
 ]
 
