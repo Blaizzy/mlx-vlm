@@ -9,4 +9,5 @@ from .utils import (
     quantize_model,
     stream_generate,
 )
+from .batched_utils import batch_generate, batch_stream_generate, BatchedGenerationResult
 from .version import __version__
