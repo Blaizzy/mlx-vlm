@@ -13,8 +13,10 @@ class LoRaLayer(nn.Module):
         alpha: float = 0.1,
         dropout: float = 0.0,
         name: str = None,
+        disable_adapter: bool = False,
     ):
         super().__init__()
+        self.disable_adapter = disable_adapter
 
         self.base_layer = linear
         self.dropout = nn.Dropout(p=dropout)
@@ -50,14 +52,17 @@ class LoRaLayer(nn.Module):
 
     def __call__(self, x):
         y = self.base_layer(x)
-        return y
-        # if hasattr(self, "lora_name"):
-        #     A = getattr(self, f"lora_A.{self.lora_name}.weight")
-        #     B = getattr(self, f"lora_B.{self.lora_name}.weight")
-        #     lora_update = (self.dropout(x) @ A) @ B
-        # else:
-        #     lora_update = (self.dropout(x) @ self.A) @ self.B
-        # return y + (self.alpha * lora_update).astype(x.dtype)
+
+        if self.disable_adapter:
+            return y
+
+        if hasattr(self, "lora_name"):
+            A = getattr(self, f"lora_A.{self.lora_name}.weight")
+            B = getattr(self, f"lora_B.{self.lora_name}.weight")
+            lora_update = (self.dropout(x) @ A) @ B
+        else:
+            lora_update = (self.dropout(x) @ self.A) @ self.B
+        return y + (self.alpha * lora_update).astype(x.dtype)
 
 
 def replace_lora_with_linear(model):
