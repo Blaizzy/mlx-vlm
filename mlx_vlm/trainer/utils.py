@@ -1,5 +1,7 @@
 import json
+import re
 from pathlib import Path
+from typing import Dict, List, Optional
 
 import mlx.nn as nn
 from mlx.utils import tree_flatten
@@ -21,15 +23,59 @@ def get_module_by_name(model, name):
 def set_module_by_name(model, name, new_module):
     parts = name.split(".")
     module = model
+
     for part in parts[:-1]:
         if part.isdigit():
             module = module[int(part)]
         else:
             module = getattr(module, part)
+
     if parts[-1].isdigit():
-        module[int(parts[-1])] = new_module
+        if isinstance(module[int(parts[-1])], LoRaLayer):
+            # Keep existing LoRA layer and add new one
+            existing_lora = module[int(parts[-1])]
+            if hasattr(new_module, "lora_name"):
+                # Add new named LoRA
+                setattr(
+                    existing_lora,
+                    f"lora_A.{new_module.lora_name}.weight",
+                    getattr(new_module, f"lora_A.{new_module.lora_name}.weight"),
+                )
+                setattr(
+                    existing_lora,
+                    f"lora_B.{new_module.lora_name}.weight",
+                    getattr(new_module, f"lora_B.{new_module.lora_name}.weight"),
+                )
+                existing_lora.lora_name = new_module.lora_name
+            else:
+                # Add unnamed LoRA
+                existing_lora.A = new_module.A
+                existing_lora.B = new_module.B
+        else:
+            module[int(parts[-1])] = new_module
     else:
-        setattr(module, parts[-1], new_module)
+        if isinstance(getattr(module, parts[-1]), LoRaLayer):
+            # Keep existing LoRA layer and add new one
+            existing_lora = getattr(module, parts[-1])
+            if hasattr(new_module, "lora_name"):
+                # Add new named LoRA
+                setattr(
+                    existing_lora,
+                    f"lora_A.{new_module.lora_name}.weight",
+                    getattr(new_module, f"lora_A.{new_module.lora_name}.weight"),
+                )
+                setattr(
+                    existing_lora,
+                    f"lora_B.{new_module.lora_name}.weight",
+                    getattr(new_module, f"lora_B.{new_module.lora_name}.weight"),
+                )
+                existing_lora.lora_name = new_module.lora_name
+            else:
+                # Add unnamed LoRA
+                existing_lora.A = new_module.A
+                existing_lora.B = new_module.B
+        else:
+            setattr(module, parts[-1], new_module)
 
 
 def get_peft_model(
@@ -125,7 +171,15 @@ def print_trainable_parameters(model):
     )
 
 
-def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
+def get_layer_linear_modules(model_layer, pattern):
+    return [
+        name for name in find_all_linear_names(model_layer) if re.match(pattern, name)
+    ]
+
+
+def apply_lora_layers(
+    model: nn.Module, adapter_path: str, config: Optional[Dict[str, str]] = None
+) -> nn.Module:
     """
     Apply LoRA layers to the model.
 
@@ -142,19 +196,44 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
         raise FileNotFoundError(f"The adapter path does not exist: {adapter_path}")
 
     # Check if the adapter has lora params in the config (adapter_config.json)
-    with open(adapter_path / "adapter_config.json", "r") as f:
-        config = json.load(f)
-        if "rank" not in config:
-            raise ValueError("The adapter does not have lora params in the config")
+    if config is None:
+        with open(adapter_path / "adapter_config.json", "r") as f:
+            config = json.load(f)
+            if "rank" not in config:
+                raise ValueError("The adapter does not have lora params in the config")
 
     # TODO: add lora params to the config and load them here
-    list_of_modules = find_all_linear_names(model.language_model.model)
-    if config is not None:
-        model = get_peft_model(model, list_of_modules, **config)
+    list_of_linear_modules = []
+    target_pattern = config.get("layers", None)
+
+    if target_pattern is not None:
+        for layer in target_pattern:
+
+            if hasattr(model, "language_model"):
+                model_layers = model.language_model.model.layers
+            else:
+                model_layers = model.model.layers
+
+            if layer in model_layers:
+                # Only target self attention and MLP projection layers
+                list_of_linear_modules.extend(
+                    get_layer_linear_modules(model_layers[layer], target_pattern)
+                )
+            else:
+                raise ValueError(f"Layer {layer} not found in the model")
+
+    if len(list_of_linear_modules) == 0 and model.language_model is not None:
+        list_of_linear_modules = find_all_linear_names(model.language_model.model)
     else:
-        model = get_peft_model(model, list_of_modules)
+        raise ValueError("No linear modules found in the model")
+
+    if config is not None:
+        model = get_peft_model(model, list_of_linear_modules, **config)
+    else:
+        model = get_peft_model(model, list_of_linear_modules)
 
     # TODO: Use custom adapter name
+
     model.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
 
     return model
