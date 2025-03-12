@@ -266,8 +266,6 @@ class LanguageModel(nn.Module):
                     RotatingKVCache(
                         max_size=self.config.sliding_window,
                         keep=0,
-                        head_dim=self.config.head_dim,
-                        n_kv_heads=self.config.num_key_value_heads,
                     )
                 )
         return caches
