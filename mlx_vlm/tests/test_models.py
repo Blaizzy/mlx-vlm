@@ -1031,6 +1031,39 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
         )
 
+    def test_aya_vision(self):
+        from mlx_vlm.models import aya_vision
+
+        text_config = aya_vision.TextConfig(model_type="aya_vision")
+        vision_config = aya_vision.VisionConfig(
+            model_type="siglip_vision_model",
+            hidden_size=1152,
+            num_attention_heads=16,
+            patch_size=14,
+            num_hidden_layers=27,
+        )
+        config = aya_vision.ModelConfig(
+            model_type="aya_vision",
+            text_config=text_config,
+            vision_config=vision_config,
+        )
+        model = aya_vision.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
     def test_gemma3(self):
         from mlx_vlm.models import gemma3
 
