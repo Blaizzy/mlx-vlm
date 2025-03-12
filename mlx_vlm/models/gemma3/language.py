@@ -47,7 +47,8 @@ class RMSNorm(nn.Module):
 
     def __call__(self, x):
         orig_dtype = x.dtype
-        # casting to match exactly
+        # Llama does x.to(float16) * w whilst Gemma3 is (x * w).to(float16)
+        # TODO: Investigate precision issues when using bfloat16 (Prince Canuma)
         output = mx.fast.rms_norm(
             x.astype(mx.float32), 1.0 + self.weight.astype(mx.float32), self.eps
         )
