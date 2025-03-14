@@ -86,6 +86,8 @@ def get_message_json(
         ),
         "prompt_only": lambda: prompt,
         "prompt_with_image_token": lambda: "<image>" * num_images + prompt,
+        "prompt_with_start_image_token": lambda: prompt
+        + "<start_of_image>" * num_images,
         "message_video_with_text": handle_video_with_text,
     }
 
@@ -95,6 +97,7 @@ def get_message_json(
         "idefics2": "message_list_with_image",
         "idefics3": "message_list_with_image_first",
         "aya_vision": "message_list_with_image_first",
+        "gemma3": "prompt_with_start_image_token",
         "smolvlm": "message_list_with_image_first",
         "llava": "message_list_with_image",
         "llava_next": "message_list_with_image",
@@ -225,7 +228,7 @@ def apply_chat_template(
     if return_messages:
         return messages
 
-    if config["model_type"] in ["paligemma", "molmo", "florence2"]:
+    if config["model_type"] in ["paligemma", "molmo", "florence2", "gemma3"]:
         return messages[-1]
 
     return get_chat_template(processor, messages, add_generation_prompt)
