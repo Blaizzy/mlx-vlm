@@ -40,19 +40,13 @@ class TextConfig:
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dims: int, eps: float = 1e-6):
+    def __init__(self, dims: int, eps: float = 1e-5):
         super().__init__()
         self.weight = mx.ones((dims,))
         self.eps = eps
 
     def __call__(self, x):
-        orig_dtype = x.dtype
-        # Llama does x.to(float16) * w whilst Gemma3 is (x * w).to(float16)
-        # TODO: Investigate precision issues when using bfloat16 (Prince Canuma)
-        output = mx.fast.rms_norm(
-            x.astype(mx.float32), 1.0 + self.weight.astype(mx.float32), self.eps
-        )
-        return output.astype(orig_dtype)
+        return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
 
 
 class Attention(nn.Module):
@@ -112,10 +106,8 @@ class Attention(nn.Module):
             keys = self.rope(keys)
 
         # Sliding window
-        if self.is_sliding and mask is not None:
-            key_len = keys.shape[-2]
-            if mask.shape[-1] != key_len:
-                mask = mask[..., :key_len]
+        if mask is not None and mask.shape[-1] != keys.shape[-2]:
+            mask = mask[..., -keys.shape[-2] :]
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
@@ -167,7 +159,7 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class GemmaModel(nn.Module):
+class Gemma3Model(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
@@ -193,16 +185,27 @@ class GemmaModel(nn.Module):
         else:
             h = inputs_embeds
 
-        h *= self.config.hidden_size**0.5  # persistent precision issue in scaling
+        h *= mx.array(self.config.hidden_size**0.5, mx.bfloat16).astype(h.dtype)
 
         if cache is None:
             cache = [None] * len(self.layers)
 
-        # Sliding window
-        j = self.config.sliding_window_pattern
-        mask = create_attention_mask(h, cache[j - 1 : j])
+        if mask is None:
+            j = self.config.sliding_window_pattern
+            full_mask = create_attention_mask(h, cache[j - 1 : j])
+            sliding_window_mask = create_attention_mask(h, cache)
 
-        for layer, c in zip(self.layers, cache):
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
+            is_sliding = (
+                i % self.config.sliding_window_pattern
+                == self.config.sliding_window_pattern - 1
+            )
+
+            if mask is None and is_sliding:
+                mask = sliding_window_mask
+            elif mask is None:
+                mask = full_mask
+
             h = layer(h, mask, c)
 
         return self.norm(h)
@@ -213,7 +216,7 @@ class LanguageModel(nn.Module):
         super().__init__()
         self.config = config
         self.model_type = config.model_type
-        self.model = GemmaModel(config)
+        self.model = Gemma3Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(
