@@ -186,8 +186,6 @@ class Model(nn.Module):
         # (batch_size, num_image_patches + sequence_len, embed_dim)
         return mx.concatenate(final_embeddings, axis=0)
 
-        # Create a final embedding of shape
-
     def __call__(
         self,
         input_ids: mx.array,
@@ -198,7 +196,10 @@ class Model(nn.Module):
     ):
         input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
         logits = self.language_model(
-            inputs=input_ids, cache=cache, inputs_embeds=input_embeddings, mask=mask
+            inputs=input_ids,
+            cache=cache,
+            inputs_embeds=input_embeddings,
+            mask=None,  # TODO: add mask
         )
         return logits
 
