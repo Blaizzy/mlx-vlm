@@ -83,15 +83,18 @@ class Model(nn.Module):
         # Select the hidden states from the desired layer
         selected_image_feature = hidden_states[self.vision_feature_layer]
 
-        if self.vision_feature_select_strategy == "default":
-            selected_image_feature = selected_image_feature[:, 1:]
-        elif self.vision_feature_select_strategy == "full":
-            selected_image_feature = selected_image_feature
+        if isinstance(self.vision_feature_layer, int):
+            if self.vision_feature_select_strategy == "default":
+                selected_image_feature = selected_image_feature[:, 1:]
+
         else:
-            raise ValueError(
-                "Unexpected feature selection strategy: "
-                f"{self.vision_feature_select_strategy}"
-            )
+            hs_pool = [
+                hidden_states[layer_idx] for layer_idx in self.vision_feature_layer
+            ]
+            # For default; crop CLS from each hidden state in the hidden state pool
+            if self.vision_feature_select_strategy == "default":
+                hs_pool = [hs[:, 1:] for hs in hs_pool]
+            selected_image_feature = mx.concatenate(hs_pool, axis=-1)
 
         # Pass image features through the multi-modal projector
         image_features = self.multi_modal_projector(selected_image_feature)
@@ -106,10 +109,9 @@ class Model(nn.Module):
         self, image_features, inputs_embeds, input_ids
     ):
         image_token_index = self.config.image_token_index
-        num_images, num_image_patches, embed_dim = image_features.shape
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
+        image_positions = np.where(input_ids == image_token_index)[1].tolist()
         num_images, _, vision_hidden_size = image_features.shape
 
         reshaped_image_hidden_states = image_features.reshape(-1, vision_hidden_size)
@@ -118,6 +120,16 @@ class Model(nn.Module):
         reshaped_image_hidden_states = reshaped_image_hidden_states.astype(
             inputs_embeds.dtype
         )
+
+        # Pad image_positions to match the length of reshaped_image_hidden_states
+        num_positions_needed = len(image_positions)
+
+        if reshaped_image_hidden_states.shape[0] > num_positions_needed:
+            # TODO: Think about how to handle this case
+            raise ValueError(
+                "Llava model supports only one image per input. Please check your input_ids and pixel_values."
+            )
+
         inputs_embeds[:, image_positions, :] = reshaped_image_hidden_states
         return inputs_embeds
 
@@ -131,7 +143,7 @@ class Model(nn.Module):
     ):
         input_embddings = self.get_input_embeddings(input_ids, pixel_values)
         logits = self.language_model(
-            input_ids, cache=cache, inputs_embeds=input_embddings
+            input_ids, mask=mask, cache=cache, inputs_embeds=input_embddings
         )
         return logits
 

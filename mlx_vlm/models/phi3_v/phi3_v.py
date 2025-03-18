@@ -176,6 +176,7 @@ class Phi3V(nn.Module):
         inputs: mx.array,
         pixel_values=None,
         image_sizes=None,
+        mask: Optional[mx.array] = None,
         cache=None,
     ):
         h = self.embed_tokens(inputs)
@@ -184,10 +185,11 @@ class Phi3V(nn.Module):
         if pixel_values is not None:
             h = self.vision_embed_tokens(pixel_values, h, image_sizes, p)
 
-        mask = create_attention_mask(h)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        if mask is None:
+            mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -212,7 +214,7 @@ class Model(nn.Module):
         image_sizes=None,
         **kwargs,
     ):
-        out = self.model(inputs, pixel_values, image_sizes, cache)
+        out = self.model(inputs, pixel_values, image_sizes, mask=mask, cache=cache)
         logits = self.lm_head(out).astype(self.lm_head.weight.dtype)
         return LanguageModelOutput(logits=logits)
 
