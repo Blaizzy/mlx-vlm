@@ -222,11 +222,11 @@ class LanguageModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
-        inputs_embeds=None,
+        inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
+        cache=None,
     ):
-        out = self.model(inputs, inputs_embeds, mask, cache)
+        out = self.model(inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache)
         out = self.lm_head(out)
         return LanguageModelOutput(logits=out)
 

@@ -928,7 +928,6 @@ def generate_step(
             outputs = model.language_model(
                 y[None],
                 cache=cache,
-                mask=mask,
                 **kwargs,
             )
 

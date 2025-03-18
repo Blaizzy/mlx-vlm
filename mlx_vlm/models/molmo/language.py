@@ -184,7 +184,7 @@ class Molmo(nn.Module):
             cache = [None] * self.config.n_layers
 
         if mask is None:
-            mask = create_attention_mask(h)
+            mask = create_attention_mask(h, cache)
 
         for block, c in zip(self.blocks, cache):
             h = block(h, mask, c)
