@@ -677,7 +677,7 @@ def convert(
     )
 
     weights = dict(tree_flatten(model.parameters()))
-    dtype = mx.float16 if quantize else getattr(mx, dtype)
+    dtype = getattr(mx, dtype)
     weights = {k: v.astype(dtype) for k, v in weights.items()}
 
     if quantize and dequantize:
