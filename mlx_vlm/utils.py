@@ -701,9 +701,11 @@ def convert(
     del model
     save_weights(mlx_path, weights, donate_weights=True)
 
-    py_files = glob.glob(str(model_path / "*.py"))
-    for file in py_files:
-        shutil.copy(file, mlx_path)
+    # Copy Python and JSON files from the model path to the MLX path
+    for pattern in ["*.py", "*.json"]:
+        files = glob.glob(str(model_path / pattern))
+        for file in files:
+            shutil.copy(file, mlx_path)
 
     processor.save_pretrained(mlx_path)
 
