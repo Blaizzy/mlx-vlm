@@ -810,7 +810,9 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
 
         if hasattr(processor, "process"):
             inputs = processor.process(
-                text=prompts, images=images, padding=True, return_tensors="mlx"
+                text=prompts,
+                images=images,
+                padding=True,
             )
         else:
             inputs = processor(text=prompts, images=images, padding=True)
