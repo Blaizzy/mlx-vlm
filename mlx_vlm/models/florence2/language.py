@@ -70,7 +70,6 @@ class Florence2Attention(nn.Module):
         self,
         hidden_states,
         key_value_states=None,
-        # cache: Optional[Tuple[mx.array, mx.array]] = None,
         cache: Optional[KVCache] = None,
         attention_mask=None,
         layer_head_mask=None,
