@@ -130,6 +130,7 @@ def get_message_json(
         "deepseek_vl_v2": "message_with_image_token_new_line",
         # Models using message_list_with_image_type format
         "pixtral": "message_list_with_image_type",
+        "mistral3": "message_list_with_image_type",
         # Models using prompt_with_image_token format
         "paligemma": "prompt_with_image_token",
         # Models using prompt_only format

@@ -11,7 +11,30 @@ import numpy as np
 
 from ..pixtral import LanguageModel
 from ..pixtral import Model as PixtralModel
-from ..pixtral import ModelConfig, TextConfig, VisionConfig, VisionModel
+from ..pixtral import TextConfig, VisionConfig, VisionModel
+
+
+@dataclass
+class ModelConfig:
+    text_config: TextConfig
+    vision_config: VisionConfig
+    model_type: str
+    ignore_index: int = -100
+    image_token_index: int = 10
+    vision_feature_select_strategy: str = "full"
+    vision_feature_layer: int = -1
+    vocab_size: int = 32000
+    spatial_merge_size: int = 2
+
+    @classmethod
+    def from_dict(cls, params):
+        return cls(
+            **{
+                k: v
+                for k, v in params.items()
+                if k in inspect.signature(cls).parameters
+            }
+        )
 
 
 class Mistral3PatchMerger(nn.Module):
@@ -38,14 +61,17 @@ class Mistral3PatchMerger(nn.Module):
 
         tokens_per_image = [h * w for h, w in image_sizes]
         d = image_features.shape[-1]
-
+        image_features = image_features.astype(mx.bfloat16)
         permuted_tensor = []
         for image_index, image_tokens in enumerate(
-            image_features.split(tokens_per_image)
+            mx.split(image_features, tokens_per_image)
         ):
             # Reshape image_tokens into a 2D grid
             h, w = image_sizes[image_index]
-            image_grid = image_tokens.view(h, w, d).permute(2, 0, 1).unsqueeze(0)
+            h = int(h)
+            w = int(w)
+
+            image_grid = image_tokens.reshape(h, w, d).transpose(2, 0, 1)[None, ...]
             # Implement unfold manually since mlx doesn't have unfold
             b, c, h, w = image_grid.shape
             patches = []
@@ -61,7 +87,7 @@ class Mistral3PatchMerger(nn.Module):
                     ]
                     patches.append(patch.reshape(b, -1))
             grid = mx.concatenate(patches, axis=1).transpose()
-            grid = grid.view(d * self.spatial_merge_size**2, -1).t()
+            grid = grid.reshape(d * self.spatial_merge_size**2, -1).T
             permuted_tensor.append(grid)
 
         image_features = mx.concatenate(permuted_tensor, axis=0)
@@ -76,11 +102,11 @@ class Mistral3MultiModalProjector(nn.Module):
         self.norm = nn.RMSNorm(config.vision_config.hidden_size)
         self.patch_merger = Mistral3PatchMerger(config)
         self.linear_1 = nn.Linear(
-            config.vision_config.hidden_size, config.text_config.hidden_size, bias=True
+            config.vision_config.hidden_size, config.text_config.hidden_size, bias=False
         )
         self.gelu = nn.GELU()
         self.linear_2 = nn.Linear(
-            config.text_config.hidden_size, config.text_config.hidden_size, bias=True
+            config.text_config.hidden_size, config.text_config.hidden_size, bias=False
         )
 
     def __call__(self, x: mx.array, image_sizes: mx.array) -> mx.array:
