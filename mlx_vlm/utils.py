@@ -813,9 +813,12 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
                 text=prompts,
                 images=images,
                 padding=True,
+                return_tensors="pt",
             )
         else:
-            inputs = processor(text=prompts, images=images, padding=True)
+            inputs = processor(
+                text=prompts, images=images, padding=True, return_tensors="pt"
+            )
 
         if "images" in inputs:
             inputs["pixel_values"] = inputs["images"]

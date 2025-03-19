@@ -509,7 +509,11 @@ def main():
         if args.max_frames is not None:
             video_inputs = video_inputs[: args.max_frames]
         inputs = processor(
-            text=[text], images=image_inputs, videos=video_inputs, padding=True
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
         )
 
         input_ids = mx.array(inputs["input_ids"])
@@ -565,7 +569,9 @@ def main():
             processor.image_processor.do_image_splitting = False
 
         # Process inputs
-        inputs = processor(text=text, images=[img for img in frames])
+        inputs = processor(
+            text=text, images=[img for img in frames], padding=True, return_tensors="pt"
+        )
 
         input_ids = mx.array(inputs["input_ids"])
         pixel_values = mx.array(inputs["pixel_values"])
