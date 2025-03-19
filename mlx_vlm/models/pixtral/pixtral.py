@@ -68,6 +68,7 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        **kwargs,
     ):
         if pixel_values is None:
             return self.language_model.model.embed_tokens(input_ids)
@@ -135,7 +136,7 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        input_embddings = self.get_input_embeddings(input_ids, pixel_values)
+        input_embddings = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
         logits = self.language_model(
             input_ids, cache=cache, inputs_embeds=input_embddings
         )
