@@ -145,10 +145,15 @@ def prepare_dataset(
             return example
         dataset = dataset.map(rename_image_column)
 
-    if "messages" not in dataset.column_names:
-        raise ValueError("Dataset must have a 'messages' column")
     if "images" not in dataset.column_names:
         raise ValueError("Dataset must have an 'images' column")
+    
+    if "messages" in dataset.column_names:
+        messages_key = "messages"
+    elif "conversations" in dataset.column_names:
+        messages_key = "conversations"
+    else:
+        raise ValueError("Dataset must have either a 'messages' or 'conversations' column")
 
     if args.apply_chat_template:
         logger.info(f"\033[32mApplying chat template to the dataset\033[0m")
@@ -157,17 +162,17 @@ def prepare_dataset(
                 conversations = apply_chat_template(
                     config=config,
                     processor=processor,
-                    prompt=examples["messages"],
+                    prompt=examples[messages_key],
                     return_messages=True,
                 )
-                examples["messages"] = [
+                examples[messages_key] = [
                     json.dumps(item, ensure_ascii=False) for item in conversations
                 ]
             else:
-                examples["messages"] = apply_chat_template(
+                examples[messages_key] = apply_chat_template(
                     config=config,
                     processor=processor,
-                    prompt=examples["messages"],
+                    prompt=examples[messages_key],
                     return_messages=True,
                 )
             return examples
