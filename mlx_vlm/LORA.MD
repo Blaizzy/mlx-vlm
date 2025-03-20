@@ -11,6 +11,7 @@
 
 ## Supported Models
 - Qwen2
+- Qwen2.5
 - LLaVA (except for LLaVA-Next)
 - Pixtral
 - Idefics 2
@@ -27,7 +28,7 @@
 To use the script, run it from the command line with the desired arguments:
 
 ```
-python lora.py --dataset /path/to/your/dataset [other options]
+python -m mlx_vlm.lora --dataset /path/to/your/dataset [other options]
 ```
 
 ## Dataset format
@@ -48,6 +49,7 @@ Support for other formats and column names will be added soon.
 The script accepts the following command-line arguments:
 
 - `--model_path`: Path to the pre-trained model (default: "mlx-community/Qwen2-VL-2B-Instruct-bf16")
+- `--full-weight-training`: Enable full weight training instead of LoRA. When this flag is set, all LoRA settings (lora-alpha, lora-rank, lora-dropout) will be ignored. (default: "False")
 - `--dataset`: Path to your dataset (required)
 - `--learning_rate`: Learning rate for the optimizer (default: 1e-4)
 - `--batch_size`: Batch size for training (default: 1)
@@ -61,7 +63,7 @@ The script accepts the following command-line arguments:
 Here's an example of how to run the script with custom parameters:
 
 ```
-python lora.py --dataset /path/to/your/dataset --model_path /path/to/your/model --epochs 2 --batch_size 4 --learning_rate 5e-5
+python -m mlx_vlm.lora --dataset /path/to/your/dataset --model_path /path/to/your/model --epochs 2 --batch_size 4 --learning_rate 5e-5
 ```
 
 ## Output

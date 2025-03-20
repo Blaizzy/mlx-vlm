@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from .prompt_utils import apply_chat_template
 from .trainers import Trainer, save_adapter
-from trainers.datasets import SFTDataset
+from .trainers.datasets import SFTDataset
 from .trainers.utils import find_all_linear_names, get_trainable_model
 from .utils import load, load_image_processor
 
@@ -30,6 +30,23 @@ def main(args):
 
     logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
     dataset = load_dataset(args.dataset, split=args.split)
+
+    def transform_to_messages(example):
+        # Create a messages list with user question and assistant response
+        messages = [
+            {"role": "user", "content": example["question"]},
+            {"role": "assistant", "content": example["output"]}
+        ]
+        example["messages"] = messages
+        return example
+    
+    dataset = dataset.map(transform_to_messages)
+
+    if "images" not in dataset.column_names and "image" in dataset.column_names:
+        def rename_image_column(example):
+            example["images"] = example["image"]
+            return example
+        dataset = dataset.map(rename_image_column)
 
     if "messages" not in dataset.column_names:
         raise ValueError("Dataset must have a 'messages' column")

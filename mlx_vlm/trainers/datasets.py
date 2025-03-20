@@ -1,7 +1,13 @@
 import warnings
+import logging
 import json
 
 import mlx.core as mx
+
+from ..prompt_utils import apply_chat_template
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def get_prompt(model_type, processor, conversation):
@@ -107,3 +113,61 @@ class SFTDataset:
             "attention_mask": mask,
             **kwargs,
         }
+    
+
+def prepare_dataset(
+    dataset,
+    config,
+    processor,
+    args,
+    promtp_field: str = "question",
+    completion_field: str = "output",
+    image_field: str = "image"
+):
+    def transform_to_messages(example):
+        messages = [
+            {"role": "user", "content": example[promtp_field]},
+            {"role": "assistant", "content": example[completion_field]}
+        ]
+        example["messages"] = messages
+        return example
+    
+    dataset = dataset.map(transform_to_messages)
+
+    if "images" not in dataset.column_names and image_field in dataset.column_names:
+        def rename_image_column(example):
+            example["images"] = example[image_field]
+            return example
+        dataset = dataset.map(rename_image_column)
+
+    if "messages" not in dataset.column_names:
+        raise ValueError("Dataset must have a 'messages' column")
+    if "images" not in dataset.column_names:
+        raise ValueError("Dataset must have an 'images' column")
+
+    if args.apply_chat_template:
+        logger.info(f"\033[32mApplying chat template to the dataset\033[0m")
+
+        def process_data(examples):
+            if config["model_type"] == "pixtral":
+                conversations = apply_chat_template(
+                    config=config,
+                    processor=processor,
+                    prompt=examples["messages"],
+                    return_messages=True,
+                )
+                examples["messages"] = [
+                    json.dumps(item, ensure_ascii=False) for item in conversations
+                ]
+            else:
+                examples["messages"] = apply_chat_template(
+                    config=config,
+                    processor=processor,
+                    prompt=examples["messages"],
+                    return_messages=True,
+                )
+            return examples
+
+        dataset = dataset.map(process_data)
+    
+    return dataset
