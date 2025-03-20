@@ -127,10 +127,13 @@ class TestTrainer(unittest.TestCase):
             mock_grads,
         )
 
-        loss = self.trainer.train_step(mock_batch)
+        train_loss = self.trainer.train_step(mock_batch)
 
         self.mock_optimizer.update.assert_called_once_with(self.mock_model, mock_grads)
-        self.assertEqual(loss, mock_loss)
+        self.assertEqual(train_loss, mock_loss)
+
+        valid_loss = self.trainer.evaluate(mock_batch)
+        self.assertEqual(valid_loss, mock_loss)
 
 
 if __name__ == "__main__":
