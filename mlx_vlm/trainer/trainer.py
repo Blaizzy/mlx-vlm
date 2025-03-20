@@ -12,6 +12,7 @@ from mlx.utils import tree_flatten, tree_map
 @dataclass
 class TrainingArgs:
     batch_size: int = field(default=4, metadata={"help": "Minibatch size."})
+    
     iters: int = field(default=100, metadata={"help": "Iterations to train for."})
     val_batches: int = field(
         default=25,

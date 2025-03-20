@@ -7,7 +7,8 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 from .prompt_utils import apply_chat_template
-from .trainer import Dataset, Trainer, save_adapter
+from .trainer import Trainer, save_adapter
+from trainer.datasets import SFTDataset
 from .trainer.utils import find_all_linear_names, get_peft_model
 from .utils import load, load_image_processor
 
@@ -60,7 +61,7 @@ def main(args):
 
         dataset = dataset.map(process_data)
 
-    dataset = Dataset(
+    dataset = SFTDataset(
         dataset,
         config,
         processor,
@@ -124,6 +125,11 @@ if __name__ == "__main__":
         type=str,
         default="mlx-community/Qwen2-VL-2B-Instruct-bf16",
         help="Path to the pre-trained model",
+    )
+    parser.add_argument(
+        "--full-weight-training",
+        action="store_true",
+        help="Enable full weight training instead of LoRA. When this flag is set, all LoRA settings (lora-alpha, lora-rank, lora-dropout) will be ignored."
     )
     parser.add_argument(
         "--dataset", type=str, required=True, help="Path to the dataset"

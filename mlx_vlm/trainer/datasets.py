@@ -24,7 +24,7 @@ def get_prompt(model_type, processor, conversation):
     return prompt
 
 
-class Dataset:
+class SFTDataset:
     def __init__(
         self,
         hf_dataset,
