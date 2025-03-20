@@ -42,7 +42,7 @@ class SFTDataset:
         take=None,
         split=None,
         image_resize_shape=None,
-        images_key: str = "images",
+        images_key: str = "image",
         messages_key: str = "messages"
     ):
         if split is not None:
@@ -130,7 +130,7 @@ def prepare_dataset(
     args,
     promtp_field: str = "question",
     completion_field: str = "output",
-    image_field: str = "image",
+    new_image_field: str = "image",
     messages_field: str = "messages"
 ):
     if messages_field in dataset.column_names:
@@ -141,7 +141,7 @@ def prepare_dataset(
         raise ValueError("Dataset must have either a 'messages' or 'conversations' column")
 
     needs_message_transform = messages_key not in dataset.column_names
-    needs_image_transform = image_field in dataset.column_names and "images" not in dataset.column_names
+    needs_image_fiel_renaming = new_image_field in dataset.column_names and "images" not in dataset.column_names
     
     if needs_message_transform:
         def transform_to_messages(example):
@@ -153,11 +153,8 @@ def prepare_dataset(
             return example
         dataset = dataset.map(transform_to_messages)
 
-    if needs_image_transform:
-        def rename_image_column(example):
-            example["images"] = example[image_field]
-            return example
-        dataset = dataset.map(rename_image_column)
+    if needs_image_fiel_renaming:
+        image_field = new_image_field
 
     if "images" not in dataset.column_names:
         raise ValueError("Dataset must have an 'images' column")
@@ -213,7 +210,7 @@ def prepare_dataset(
 
         dataset = dataset.map(process_data)
 
-    return dataset, messages_key, "images"
+    return dataset, messages_key, image_field
 
 
 def load_and_prepare_dataset(
