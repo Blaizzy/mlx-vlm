@@ -114,7 +114,7 @@ class MLXVisionChat:
             self.model,
             pixel_values,
             mask,
-            temp=self.temperature,
+            temperature=self.temperature,
         )
 
         # Use print instead of rprint to avoid rich console's automatic newlines
