@@ -7,9 +7,9 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 from .prompt_utils import apply_chat_template
-from .trainer import Trainer, save_adapter
-from trainer.datasets import SFTDataset
-from .trainer.utils import find_all_linear_names, get_trainable_model
+from .trainers import Trainer, save_adapter
+from trainers.datasets import SFTDataset
+from .trainers.utils import find_all_linear_names, get_trainable_model
 from .utils import load, load_image_processor
 
 logging.basicConfig(level=logging.INFO)

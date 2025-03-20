@@ -161,6 +161,19 @@ class Trainer:
             mx.eval(self.model, self.optimizer.state)
             total_loss += loss
         return total_loss / len(dataloader)
+    
+    @mx.compile
+    def evaluate(self, dataloader, num_batches=-1):
+        total_loss = 0
+        batch_count = 0
+        for i, batch in enumerate(dataloader):
+            if num_batches > 0 and i >= num_batches:
+                break
+            loss = self.loss_fn(self.model, batch)
+            total_loss += loss
+            batch_count += 1
+        
+        return total_loss / batch_count if batch_count > 0 else 0
 
 
 def save_adapter(

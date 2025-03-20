@@ -4,7 +4,8 @@ from unittest.mock import MagicMock, Mock, patch
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_vlm.trainer.trainer import Dataset, Trainer
+from mlx_vlm.trainers.sft_trainer import Trainer
+from mlx_vlm.trainers.datasets import SFTDataset
 
 
 class TestDataset(unittest.TestCase):
@@ -15,7 +16,7 @@ class TestDataset(unittest.TestCase):
         self.mock_image_processor = MagicMock()
 
     def test_dataset_initialization(self):
-        dataset = Dataset(
+        dataset = SFTDataset(
             self.mock_hf_dataset,
             self.mock_config,
             self.mock_processor,
@@ -32,7 +33,7 @@ class TestDataset(unittest.TestCase):
     @patch("mlx_vlm.trainer.trainer.get_prompt")
     @patch("mlx_vlm.utils.prepare_inputs")
     def test_dataset_getitem(self, mock_prepare_inputs, mock_get_prompt):
-        dataset = Dataset(
+        dataset = SFTDataset(
             self.mock_hf_dataset,
             self.mock_config,
             self.mock_processor,
