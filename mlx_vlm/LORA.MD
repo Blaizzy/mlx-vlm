@@ -48,7 +48,7 @@ Support for other formats and column names will be added soon.
 
 The script accepts the following command-line arguments:
 
-- `--model_path`: Path to the pre-trained model (default: "mlx-community/Qwen2-VL-2B-Instruct-bf16")
+- `--model_path`: Path to the pre-trained model (default: "mlx-community/Qwen2.5-VL-2B-Instruct-bf16")
 - `--full-weight-training`: Enable full weight training instead of LoRA. When this flag is set, all LoRA settings (lora-alpha, lora-rank, lora-dropout) will be ignored. (default: "False")
 - `--dataset`: Path to your dataset (required)
 - `--learning_rate`: Learning rate for the optimizer (default: 1e-4)

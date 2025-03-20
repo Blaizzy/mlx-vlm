@@ -6,9 +6,8 @@ import mlx.optimizers as optim
 from datasets import load_dataset
 from tqdm import tqdm
 
-from .prompt_utils import apply_chat_template
 from .trainers import Trainer, save_adapter
-from .trainers.datasets import SFTDataset
+from .trainers.datasets import SFTDataset, prepare_dataset
 from .trainers.utils import find_all_linear_names, get_trainable_model
 from .utils import load, load_image_processor
 
@@ -31,52 +30,12 @@ def main(args):
     logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
     dataset = load_dataset(args.dataset, split=args.split)
 
-    def transform_to_messages(example):
-        # Create a messages list with user question and assistant response
-        messages = [
-            {"role": "user", "content": example["question"]},
-            {"role": "assistant", "content": example["output"]}
-        ]
-        example["messages"] = messages
-        return example
-    
-    dataset = dataset.map(transform_to_messages)
-
-    if "images" not in dataset.column_names and "image" in dataset.column_names:
-        def rename_image_column(example):
-            example["images"] = example["image"]
-            return example
-        dataset = dataset.map(rename_image_column)
-
-    if "messages" not in dataset.column_names:
-        raise ValueError("Dataset must have a 'messages' column")
-    if "images" not in dataset.column_names:
-        raise ValueError("Dataset must have an 'images' column")
-
-    if args.apply_chat_template:
-        logger.info(f"\033[32mApplying chat template to the dataset\033[0m")
-
-        def process_data(examples):
-            if config["model_type"] == "pixtral":
-                conversations = apply_chat_template(
-                    config=config,
-                    processor=processor,
-                    prompt=examples["messages"],
-                    return_messages=True,
-                )
-                examples["messages"] = [
-                    json.dumps(item, ensure_ascii=False) for item in conversations
-                ]
-            else:
-                examples["messages"] = apply_chat_template(
-                    config=config,
-                    processor=processor,
-                    prompt=examples["messages"],
-                    return_messages=True,
-                )
-            return examples
-
-        dataset = dataset.map(process_data)
+    dataset = prepare_dataset(
+        dataset=dataset,
+        config=config,
+        processor=processor,
+        args=args
+    )
 
     dataset = SFTDataset(
         dataset,
@@ -141,7 +100,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model-path",
         type=str,
-        default="mlx-community/Qwen2-VL-2B-Instruct-bf16",
+        default="mlx-community/Qwen2.5-VL-2B-Instruct-bf16",
         help="Path to the pre-trained model",
     )
     parser.add_argument(

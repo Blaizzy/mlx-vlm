@@ -124,17 +124,20 @@ def prepare_dataset(
     completion_field: str = "output",
     image_field: str = "image"
 ):
-    def transform_to_messages(example):
-        messages = [
-            {"role": "user", "content": example[promtp_field]},
-            {"role": "assistant", "content": example[completion_field]}
-        ]
-        example["messages"] = messages
-        return example
+    needs_message_transform = "messages" not in dataset.column_names
+    needs_image_transform = "images" not in dataset.column_names and image_field in dataset.column_names
     
-    dataset = dataset.map(transform_to_messages)
+    if needs_message_transform:
+        def transform_to_messages(example):
+            messages = [
+                {"role": "user", "content": example[promtp_field]},
+                {"role": "assistant", "content": example[completion_field]}
+            ]
+            example["messages"] = messages
+            return example
+        dataset = dataset.map(transform_to_messages)
 
-    if "images" not in dataset.column_names and image_field in dataset.column_names:
+    if needs_image_transform:
         def rename_image_column(example):
             example["images"] = example[image_field]
             return example
@@ -147,7 +150,6 @@ def prepare_dataset(
 
     if args.apply_chat_template:
         logger.info(f"\033[32mApplying chat template to the dataset\033[0m")
-
         def process_data(examples):
             if config["model_type"] == "pixtral":
                 conversations = apply_chat_template(
