@@ -72,6 +72,46 @@ def get_peft_model(
     return model
 
 
+def get_trainable_model(
+    model, 
+    linear_layers, 
+    full_weight_training=False,
+    rank=10, 
+    alpha=0.1, 
+    dropout=0.1, 
+    freeze=True, 
+    verbose=True
+):
+    if full_weight_training:
+        if verbose:
+            print("Using full weight training (all parameters will be trained)")
+            print_trainable_parameters(model.language_model)
+        return model
+    else:
+        if freeze:
+            freeze_model(model)
+
+        for name, module in model.language_model.named_modules():
+            if isinstance(module, nn.Linear) or isinstance(module, nn.QuantizedLinear):
+                if name.split(".")[-1] in linear_layers:
+                    lora_layer = LoRaLayer(module, rank, alpha, dropout)
+                    set_module_by_name(model.language_model, name, lora_layer)
+
+        model.config.lora = {}
+        model.config.lora["rank"] = rank
+        model.config.lora["alpha"] = alpha
+        model.config.lora["dropout"] = dropout
+
+        if verbose:
+            print("Using LoRA training with the following parameters:")
+            print(f"  Rank: {rank}")
+            print(f"  Alpha: {alpha}")
+            print(f"  Dropout: {dropout}")
+            print_trainable_parameters(model.language_model)
+
+        return model
+
+
 def freeze_model(model):
     for name, module in model.named_modules():
         name = name.split(".")[0]

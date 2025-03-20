@@ -9,7 +9,7 @@ from tqdm import tqdm
 from .prompt_utils import apply_chat_template
 from .trainer import Trainer, save_adapter
 from trainer.datasets import SFTDataset
-from .trainer.utils import find_all_linear_names, get_peft_model
+from .trainer.utils import find_all_linear_names, get_trainable_model
 from .utils import load, load_image_processor
 
 logging.basicConfig(level=logging.INFO)
@@ -71,12 +71,13 @@ def main(args):
 
     logger.info(f"\033[32mSetting up LoRA\033[0m")
     list_of_modules = find_all_linear_names(model.language_model)
-    model = get_peft_model(
+    model = get_trainable_model(
         model,
         list_of_modules,
         rank=args.lora_rank,
         alpha=args.lora_alpha,
         dropout=args.lora_dropout,
+        full_weight_training=args.full_weight_training
     )
 
     logger.info(f"\033[32mSetting up optimizer\033[0m")
