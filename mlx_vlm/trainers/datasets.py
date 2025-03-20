@@ -1,3 +1,4 @@
+from typing import Optional, Any
 import warnings
 import logging
 import json
@@ -181,9 +182,9 @@ def load_and_prepare_dataset(
     args,
     processor,
     image_processor,
-    path: str,
-    split: str,
-    image_resize_shape,
+    image_resize_shape: Optional[Any] = None,
+    path: Optional[str] = None,
+    split: Optional[str] = None,
     type: str = "sft"
 ):
     logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
