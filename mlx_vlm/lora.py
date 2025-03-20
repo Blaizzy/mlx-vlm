@@ -104,6 +104,9 @@ if __name__ == "__main__":
         "--split", type=str, default="train", help="Split to use for training"
     )
     parser.add_argument(
+        "--dataset-config", type=str, default=None, help="Use a individual configuration from the dataset"
+    )
+    parser.add_argument(
         "--image-resize-shape",
         type=int,
         nargs=2,

@@ -42,6 +42,8 @@ class SFTDataset:
         take=None,
         split=None,
         image_resize_shape=None,
+        images_key: str = "images",
+        messages_key: str = "messages"
     ):
         if split is not None:
             self.dataset = hf_dataset[split]
@@ -53,6 +55,8 @@ class SFTDataset:
         self.config = config
         self.image_processor = image_processor
         self.image_resize_shape = image_resize_shape
+        self.images_key = images_key
+        self.messages_key = messages_key
 
     def __len__(self):
         return len(self.dataset)
@@ -62,8 +66,10 @@ class SFTDataset:
 
         item = self.dataset[idx]
 
-        images = item["images"]
-        conversations = item["messages"]
+        images = item[self.images_key]
+        if isinstance(images, list) and len(images) > 0 and isinstance(images[0], list):
+            images = [img for sublist in images for img in sublist]
+        conversations = item[self.messages_key]
         prompts = []
 
         if isinstance(conversations, list) and isinstance(conversations[0], list):
@@ -124,10 +130,18 @@ def prepare_dataset(
     args,
     promtp_field: str = "question",
     completion_field: str = "output",
-    image_field: str = "image"
+    image_field: str = "image",
+    messages_field: str = "messages"
 ):
-    needs_message_transform = "messages" not in dataset.column_names
-    needs_image_transform = "images" not in dataset.column_names and image_field in dataset.column_names
+    if messages_field in dataset.column_names:
+        messages_key = messages_field
+    elif "conversations" in dataset.column_names:
+        messages_key = "conversations"
+    else:
+        raise ValueError("Dataset must have either a 'messages' or 'conversations' column")
+
+    needs_message_transform = messages_key not in dataset.column_names
+    needs_image_transform = image_field in dataset.column_names and "images" not in dataset.column_names
     
     if needs_message_transform:
         def transform_to_messages(example):
@@ -148,12 +162,32 @@ def prepare_dataset(
     if "images" not in dataset.column_names:
         raise ValueError("Dataset must have an 'images' column")
     
-    if "messages" in dataset.column_names:
-        messages_key = "messages"
-    elif "conversations" in dataset.column_names:
-        messages_key = "conversations"
-    else:
-        raise ValueError("Dataset must have either a 'messages' or 'conversations' column")
+    first_example = dataset[0]
+    first_message = first_example[messages_key][0] if len(first_example[messages_key]) > 0 else None
+    needs_format_conversion = False
+    if first_message and "from" in first_message and "value" in first_message and "role" not in first_message:
+        needs_format_conversion = True
+    if needs_format_conversion:
+        logger.info(f"\033[32mConverting message format from 'from/value' to 'role/content'\033[0m")
+        def transform_conversation_format(example):
+            transformed_messages = []
+            for msg in example[messages_key]:
+                if "from" in msg and "value" in msg:
+                    if msg["from"] == "human":
+                        role = "user"
+                    elif msg["from"] in ["assistant", "gpt"]:
+                        role = "assistant"
+                    elif msg["from"] == "system":
+                        role = "system"
+                    else:
+                        role = msg["from"]
+                    transformed_messages.append({"role": role, "content": msg["value"]})
+                else:
+                    transformed_messages.append(msg)
+            
+            example[messages_key] = transformed_messages
+            return example
+        dataset = dataset.map(transform_conversation_format)
 
     if args.apply_chat_template:
         logger.info(f"\033[32mApplying chat template to the dataset\033[0m")
@@ -178,8 +212,8 @@ def prepare_dataset(
             return examples
 
         dataset = dataset.map(process_data)
-    
-    return dataset
+
+    return dataset, messages_key, "images"
 
 
 def load_and_prepare_dataset(
@@ -193,10 +227,10 @@ def load_and_prepare_dataset(
     type: str = "sft"
 ):
     logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
-    loaded_dataset = load_dataset(args.dataset, split=args.split)
+    loaded_dataset = load_dataset(args.dataset, name=args.dataset_config, split=args.split)
 
     logger.info(f"\033[32mPreparing and maping dataset\033[0m")
-    prepared_dataset = prepare_dataset(
+    prepared_dataset, messages_key, image_field = prepare_dataset(
         dataset=loaded_dataset,
         config=config,
         processor=processor,
@@ -209,7 +243,9 @@ def load_and_prepare_dataset(
             config,
             processor,
             image_processor=image_processor,
-            image_resize_shape=args.image_resize_shape
+            image_resize_shape=args.image_resize_shape,
+            messages_key=messages_key,
+            images_key=image_field
         )
     else:
         raise ValueError("training type musst be 'sft',")
