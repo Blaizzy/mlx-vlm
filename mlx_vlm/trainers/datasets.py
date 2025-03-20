@@ -138,9 +138,8 @@ def prepare_dataset(
     elif "conversations" in dataset.column_names:
         messages_key = "conversations"
     else:
-        raise ValueError("Dataset must have either a 'messages' or 'conversations' column")
+        needs_message_transform = True
 
-    needs_message_transform = messages_key not in dataset.column_names
     needs_image_fiel_renaming = new_image_field in dataset.column_names and "images" not in dataset.column_names
     
     if needs_message_transform:
@@ -156,7 +155,7 @@ def prepare_dataset(
     if needs_image_fiel_renaming:
         image_field = new_image_field
 
-    if "images" not in dataset.column_names:
+    if "images" not in dataset.column_names and new_image_field not in dataset.column_names:
         raise ValueError("Dataset must have an 'images' column")
     
     first_example = dataset[0]
