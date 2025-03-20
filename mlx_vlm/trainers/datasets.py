@@ -4,6 +4,7 @@ import json
 
 import mlx.core as mx
 
+from datasets import load_dataset
 from ..prompt_utils import apply_chat_template
 
 logging.basicConfig(level=logging.INFO)
@@ -173,3 +174,36 @@ def prepare_dataset(
         dataset = dataset.map(process_data)
     
     return dataset
+
+
+def load_and_prepare_dataset(
+    config,
+    args,
+    processor,
+    image_processor,
+    path: str,
+    split: str,
+    image_resize_shape,
+    type: str = "sft"
+):
+    logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
+    loaded_dataset = load_dataset(args.dataset, split=args.split)
+
+    logger.info(f"\033[32mPreparing and maping dataset\033[0m")
+    prepared_dataset = prepare_dataset(
+        dataset=loaded_dataset,
+        config=config,
+        processor=processor,
+        args=args
+    )
+
+    if type == "sft": # will be args.train_type later for dpo and so on
+        return SFTDataset(
+            prepared_dataset,
+            config,
+            processor,
+            image_processor=image_processor,
+            image_resize_shape=args.image_resize_shape
+        )
+    else:
+        raise ValueError("training type musst be 'sft',")

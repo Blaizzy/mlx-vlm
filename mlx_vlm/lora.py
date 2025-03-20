@@ -7,7 +7,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 from .trainers import Trainer, save_adapter
-from .trainers.datasets import SFTDataset, prepare_dataset
+from .trainers.datasets import SFTDataset, load_and_prepare_dataset
 from .trainers.utils import find_all_linear_names, get_trainable_model
 from .utils import load, load_image_processor
 
@@ -27,22 +27,11 @@ def main(args):
     config = model.config.__dict__
     image_processor = load_image_processor(args.model_path)
 
-    logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
-    dataset = load_dataset(args.dataset, split=args.split)
-
-    dataset = prepare_dataset(
-        dataset=dataset,
+    dataset = load_and_prepare_dataset(
         config=config,
+        args=args,
         processor=processor,
-        args=args
-    )
-
-    dataset = SFTDataset(
-        dataset,
-        config,
-        processor,
         image_processor=image_processor,
-        image_resize_shape=args.image_resize_shape,
     )
 
     logger.info(f"\033[32mSetting up LoRA\033[0m")
