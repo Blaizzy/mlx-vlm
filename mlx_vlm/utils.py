@@ -677,7 +677,7 @@ def convert(
     )
 
     weights = dict(tree_flatten(model.parameters()))
-    dtype = mx.float16 if quantize else getattr(mx, dtype)
+    dtype = getattr(mx, dtype)
     weights = {k: v.astype(dtype) for k, v in weights.items()}
 
     if quantize and dequantize:
@@ -701,9 +701,11 @@ def convert(
     del model
     save_weights(mlx_path, weights, donate_weights=True)
 
-    py_files = glob.glob(str(model_path / "*.py"))
-    for file in py_files:
-        shutil.copy(file, mlx_path)
+    # Copy Python and JSON files from the model path to the MLX path
+    for pattern in ["*.py", "*.json"]:
+        files = glob.glob(str(model_path / pattern))
+        for file in files:
+            shutil.copy(file, mlx_path)
 
     processor.save_pretrained(mlx_path)
 
@@ -808,11 +810,14 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
 
         if hasattr(processor, "process"):
             inputs = processor.process(
-                text=prompts, images=images, padding=True, return_tensors="mlx"
+                text=prompts,
+                images=images,
+                padding=True,
+                return_tensors="pt",
             )
         else:
             inputs = processor(
-                text=prompts, images=images, padding=True, return_tensors="mlx"
+                text=prompts, images=images, padding=True, return_tensors="pt"
             )
 
         if "images" in inputs:
@@ -928,7 +933,6 @@ def generate_step(
             outputs = model.language_model(
                 y[None],
                 cache=cache,
-                mask=mask,
                 **kwargs,
             )
 

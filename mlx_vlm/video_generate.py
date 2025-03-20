@@ -513,7 +513,7 @@ def main():
             images=image_inputs,
             videos=video_inputs,
             padding=True,
-            return_tensors="np",
+            return_tensors="pt",
         )
 
         input_ids = mx.array(inputs["input_ids"])
@@ -570,12 +570,19 @@ def main():
 
         # Process inputs
         inputs = processor(
-            text=text, images=[img for img in frames], return_tensors="np"
+            text=text, images=[img for img in frames], padding=True, return_tensors="pt"
         )
 
         input_ids = mx.array(inputs["input_ids"])
         pixel_values = mx.array(inputs["pixel_values"])
         mask = mx.array(inputs["attention_mask"])
+        for key, value in inputs.items():
+            if key not in [
+                "input_ids",
+                "pixel_values",
+                "attention_mask",
+            ] and not isinstance(value, (str, list)):
+                kwargs[key] = mx.array(value)
 
     logger.info("\033[32mGenerating response...\033[0m")
 
