@@ -2,9 +2,26 @@ import json
 from pathlib import Path
 
 import mlx.nn as nn
+import mlx.core as mx
 from mlx.utils import tree_flatten
 
 from .lora import LoRaLayer
+
+
+def grad_checkpoint(layer):
+    """
+    Update all instances of type(layer) to use gradient checkpointing.
+    """
+    fn = type(layer).__call__
+
+    def checkpointed_fn(model, *args, **kwargs):
+        def inner_fn(params, *args, **kwargs):
+            model.update(params)
+            return fn(model, *args, **kwargs)
+
+        return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
+
+    type(layer).__call__ = checkpointed_fn
 
 
 def get_module_by_name(model, name):
