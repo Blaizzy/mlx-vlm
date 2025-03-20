@@ -150,6 +150,7 @@ def prepare_dataset(
             ]
             example["messages"] = messages
             return example
+        messages_key = messages_field
         dataset = dataset.map(transform_to_messages)
 
     if needs_image_fiel_renaming:
