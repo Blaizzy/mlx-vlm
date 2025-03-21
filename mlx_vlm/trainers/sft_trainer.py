@@ -149,15 +149,7 @@ class Trainer:
                 lambda g: mx.clip(g, -self.clip_gradients, self.clip_gradients), grads
             )
 
-        # Update parameters based on whether we're using LoRA or full training
-        if hasattr(self.model, 'trainable_parameters'):
-            # LoRA mode - update only trainable parameters
-            trainable_params = self.model.trainable_parameters(self.model)
-            self.optimizer.update(trainable_params, grads)
-        else:
-            # Full weight training - update all parameters
-            self.optimizer.update(self.model.parameters(), grads)
-
+        self.optimizer.update(self.model, grads)
         return loss
 
     @mx.compile

@@ -50,7 +50,7 @@ def set_module_by_name(model, name, new_module):
 
 
 def get_peft_model(
-    model, linear_layers=None, rank=10, alpha=0.1, dropout=0.1, freeze=True, verbose=True
+    model, linear_layers=None, rank=10, alpha=0.1, dropout=0.1, freeze=True, verbose=False
 ):
     if linear_layers is None:
         linear_layers = find_all_linear_names(model.language_model)
