@@ -1034,7 +1034,9 @@ def stream_generate(
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     add_special_tokens = not hasattr(processor, "chat_template")
-    prompt_tokens = mx.array(tokenizer.encode(prompt, add_special_tokens=add_special_tokens))
+    prompt_tokens = mx.array(
+        tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+    )
 
     resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)
