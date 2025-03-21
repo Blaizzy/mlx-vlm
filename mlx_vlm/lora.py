@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from .trainers import Trainer, save_adapter
 from .trainers.datasets import SFTDataset, load_and_prepare_dataset
-from .trainers.utils import find_all_linear_names, get_trainable_model
+from .trainers.utils import get_peft_model, print_trainable_parameters
 from .utils import load, load_image_processor
 
 logging.basicConfig(level=logging.INFO)
@@ -34,15 +34,17 @@ def main(args):
         image_processor=image_processor,
     )
 
+    if args.full_weight_training:
+        logger.info(f"\033[32mUsing full weight training (all parameters will be trained)\033[0m")
+        print_trainable_parameters(model.language_model)
+
+
     logger.info(f"\033[32mSetting up LoRA\033[0m")
-    list_of_modules = find_all_linear_names(model.language_model)
-    model = get_trainable_model(
+    model = get_peft_model(
         model,
-        list_of_modules,
         rank=args.lora_rank,
         alpha=args.lora_alpha,
-        dropout=args.lora_dropout,
-        full_weight_training=args.full_weight_training
+        dropout=args.lora_dropout
     )
 
     logger.info(f"\033[32mSetting up optimizer\033[0m")
