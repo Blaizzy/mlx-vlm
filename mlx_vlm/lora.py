@@ -36,6 +36,7 @@ def main(args):
 
     if args.full_weight_training:
         logger.info(f"\033[32mUsing full weight training (all parameters will be trained)\033[0m")
+        model.unfreeze()
     else:
         logger.info(f"\033[32mSetting up LoRA\033[0m")
         model = get_peft_model(
