@@ -71,7 +71,7 @@ def parse_arguments():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=DEFAULT_TEMP,
+        default=DEFAULT_TEMPERATURE,
         help="Temperature for sampling.",
     )
     parser.add_argument("--chat", action="store_true", help="Chat in multi-turn style.")
