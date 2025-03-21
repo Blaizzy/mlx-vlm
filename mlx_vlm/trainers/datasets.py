@@ -133,6 +133,7 @@ def prepare_dataset(
     new_image_field: str = "image",
     messages_field: str = "messages"
 ):
+    needs_message_transform = False
     if messages_field in dataset.column_names:
         messages_key = messages_field
     elif "conversations" in dataset.column_names:
