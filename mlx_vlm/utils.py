@@ -760,6 +760,40 @@ def process_image(img, resize_shape, image_processor):
     return img
 
 
+def process_inputs(processor, images, prompts, return_tensors="mlx"):
+    if hasattr(processor, "process"):
+        inputs = processor.process(
+            text=prompts,
+            images=images,
+            padding=True,
+            return_tensors=return_tensors,
+        )
+    else:
+        inputs = processor(
+            text=prompts, images=images, padding=True, return_tensors=return_tensors
+        )
+    return inputs
+
+
+def process_inputs_with_fallback(processor, images, prompts, return_tensors="mlx"):
+    try:
+        inputs = process_inputs(
+            processor, images, prompts, return_tensors=return_tensors
+        )
+    except Exception as e:
+        try:
+            print(
+                f"\033[33mWarning\033[0m: Failed to process inputs with error: {e}",
+                "Trying to process inputs with return_tensors='pt'",
+            )
+            inputs = process_inputs(processor, images, prompts, return_tensors="pt")
+        except Exception as e:
+            raise ValueError(
+                f"Failed to process inputs with error: {e}. Please install PyTorch and try again."
+            )
+    return inputs
+
+
 def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=None):
 
     if not isinstance(images, list):
@@ -808,17 +842,7 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
         if hasattr(processor, "tokenizer"):
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-        if hasattr(processor, "process"):
-            inputs = processor.process(
-                text=prompts,
-                images=images,
-                padding=True,
-                return_tensors="pt",
-            )
-        else:
-            inputs = processor(
-                text=prompts, images=images, padding=True, return_tensors="pt"
-            )
+        inputs = process_inputs_with_fallback(processor, images, prompts)
 
         if "images" in inputs:
             inputs["pixel_values"] = inputs["images"]

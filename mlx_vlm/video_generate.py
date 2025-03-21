@@ -16,7 +16,7 @@ import numpy as np
 import requests
 from PIL import Image
 
-from .utils import generate, load, load_image
+from .utils import generate, load, load_image, process_inputs_with_fallback
 
 # This is a beta version of the video generation script.
 # It is not fully tested and may not work as expected.
@@ -569,8 +569,10 @@ def main():
             processor.image_processor.do_image_splitting = False
 
         # Process inputs
-        inputs = processor(
-            text=text, images=[img for img in frames], padding=True, return_tensors="pt"
+        inputs = process_inputs_with_fallback(
+            processor,
+            images=[img for img in frames],
+            prompts=text,
         )
 
         input_ids = mx.array(inputs["input_ids"])

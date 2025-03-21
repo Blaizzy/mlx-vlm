@@ -202,9 +202,9 @@ class Gemma3Model(nn.Module):
             )
 
             if mask is None and is_sliding:
-                mask = sliding_window_mask
-            elif mask is None:
                 mask = full_mask
+            elif mask is None:
+                mask = sliding_window_mask
 
             h = layer(h, mask, c)
 
