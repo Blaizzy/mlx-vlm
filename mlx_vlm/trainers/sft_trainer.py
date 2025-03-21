@@ -106,7 +106,7 @@ class Trainer:
         }
 
         # Forward pass
-        outputs = model(input_ids, pixel_values, attention_mask, **kwargs)
+        outputs = model(input_ids=input_ids, pixel_values=pixel_values, attention_mask=attention_mask, **kwargs)
 
         # Cast to float32
         logits = outputs.logits.astype(mx.float32)

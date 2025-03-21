@@ -136,6 +136,7 @@ class Model(nn.Module):
         self,
         input_ids: mx.array,
         pixel_values: mx.array,
+        attention_mask: Optional[mx.array] = None,
         cache=None,
         **kwargs,
     ):
