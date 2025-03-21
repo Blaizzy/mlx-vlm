@@ -1,5 +1,4 @@
 import json
-import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Union
@@ -10,130 +9,10 @@ import numpy as np
 from mlx.utils import tree_flatten, tree_map
 
 
-def get_prompt(model_type, processor, conversation):
-    if model_type == "paligemma":
-        return conversation
-
-    if "chat_template" in processor.__dict__.keys():
-        prompt = processor.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-    elif "tokenizer" in processor.__dict__.keys():
-        prompt = processor.tokenizer.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-
-    return prompt
-
-
-class Dataset:
-    def __init__(
-        self,
-        hf_dataset,
-        config,
-        processor,
-        image_processor=None,
-        take=None,
-        split=None,
-        image_resize_shape=None,
-    ):
-        if split is not None:
-            self.dataset = hf_dataset[split]
-        else:
-            self.dataset = hf_dataset
-        if take is not None:
-            self.dataset = self.dataset.take(take)
-        self.processor = processor
-        self.config = config
-        self.image_processor = image_processor
-        self.image_resize_shape = image_resize_shape
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        from mlx_vlm.utils import prepare_inputs
-
-        item = self.dataset[idx]
-
-        images = item["images"]
-        conversations = item["messages"]
-        prompts = []
-
-        if isinstance(conversations, list) and isinstance(conversations[0], list):
-            for conversation in conversations:
-                if self.config["model_type"] == "pixtral":
-                    conversation = [json.loads(i) for i in conversation]
-                    if len(conversations) > 1:
-                        warnings.warn(
-                            "Pixtral batch processing is not supported yet. Set batch size to 1."
-                        )
-
-                prompt = get_prompt(
-                    self.config["model_type"], self.processor, conversation
-                )
-                prompts.append(prompt)
-
-        else:
-            if self.config["model_type"] == "pixtral":
-                conversations = [json.loads(i) for i in conversations]
-            prompt = get_prompt(
-                self.config["model_type"], self.processor, conversations
-            )
-            prompts.append(prompt)
-
-        image_token_index = self.config["image_token_index"]
-
-        inputs = prepare_inputs(
-            self.processor,
-            images,
-            prompts,
-            image_token_index,
-            self.image_resize_shape,
-        )
-        input_ids = inputs["input_ids"]
-        pixel_values = inputs["pixel_values"]
-        mask = inputs["attention_mask"]
-        kwargs = {
-            k: v
-            for k, v in inputs.items()
-            if k not in ["input_ids", "pixel_values", "attention_mask"]
-        }
-
-        if mask is None:
-            mask = mx.ones_like(input_ids)
-
-        return {
-            "pixel_values": pixel_values,
-            "input_ids": input_ids,
-            "attention_mask": mask,
-            **kwargs,
-        }
-
-
-def grad_checkpoint(layer):
-    """
-    Update all instances of type(layer) to use gradient checkpointing.
-    """
-    fn = type(layer).__call__
-
-    def checkpointed_fn(model, *args, **kwargs):
-        def inner_fn(params, *args, **kwargs):
-            model.update(params)
-            return fn(model, *args, **kwargs)
-
-        return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
-
-    type(layer).__call__ = checkpointed_fn
-
-
 @dataclass
 class TrainingArgs:
     batch_size: int = field(default=4, metadata={"help": "Minibatch size."})
+    
     iters: int = field(default=100, metadata={"help": "Iterations to train for."})
     val_batches: int = field(
         default=25,
@@ -227,9 +106,7 @@ class Trainer:
         }
 
         # Forward pass
-        outputs = model(input_ids, pixel_values, attention_mask, **kwargs)
-
-        # Cast to float32
+        outputs = model(input_ids=input_ids, pixel_values=pixel_values, attention_mask=attention_mask, **kwargs)
         logits = outputs.logits.astype(mx.float32)
 
         # Ensure logits and labels have the same sequence length
@@ -242,8 +119,10 @@ class Trainer:
                 return logits[:, -labels.shape[1] :, :]
             return logits
 
+        # alignment
         logits = align_logits_with_labels(logits, labels)
-
+        
+        # length_mask
         length_mask = mx.arange(input_ids.shape[1])[None, :] < lengths[:, None]
 
         # Compute loss only on non-padded tokens
@@ -261,17 +140,24 @@ class Trainer:
         return ce
 
     def train_step(self, batch):
-        loss_and_grad_fn = nn.value_and_grad(self.model, self.loss_fn)
-        loss, grads = loss_and_grad_fn(self.model, batch)
-
-        # Add gradient clipping
+        # Compute forward pass and loss
+        loss = self.loss_fn(self.model, batch)
+        
+        # Manually compute gradients for each module to avoid reshape errors
+        grads = {}
+        for name, param in self.model.trainable_parameters().items():
+            # Compute gradient for this parameter
+            param_grad = mx.grad(lambda p: self.loss_fn(self.model, batch))(param)
+            grads[name] = param_grad
+        
+        # Apply gradient clipping if needed
         if self.clip_gradients is not None:
             grads = tree_map(
                 lambda g: mx.clip(g, -self.clip_gradients, self.clip_gradients), grads
             )
-
+        
+        # Update model
         self.optimizer.update(self.model, grads)
-
         return loss
 
     @mx.compile
@@ -282,6 +168,19 @@ class Trainer:
             mx.eval(self.model, self.optimizer.state)
             total_loss += loss
         return total_loss / len(dataloader)
+    
+    @mx.compile
+    def evaluate(self, dataloader, num_batches=-1):
+        total_loss = 0
+        batch_count = 0
+        for i, batch in enumerate(dataloader):
+            if num_batches > 0 and i >= num_batches:
+                break
+            loss = self.loss_fn(self.model, batch)
+            total_loss += loss
+            batch_count += 1
+        
+        return total_loss / batch_count if batch_count > 0 else 0
 
 
 def save_adapter(
@@ -294,3 +193,11 @@ def save_adapter(
             json.dump(model.config.lora, f)
     flattened_tree = tree_flatten(model.trainable_parameters())
     mx.save_safetensors(str(adapter_file), dict(flattened_tree))
+
+
+def save_full_model(model: nn.Module, save_path: Union[str, Path]):
+    path = Path(save_path)
+    path.mkdir(exist_ok=True, parents=True)
+    with open(path / "config.json", "w") as f:
+        json.dump(model.config.to_dict(), f)
+    mx.save_safetensors(str(path / "model.safetensors"), dict(tree_flatten(model.parameters())))

@@ -2,9 +2,26 @@ import json
 from pathlib import Path
 
 import mlx.nn as nn
+import mlx.core as mx
 from mlx.utils import tree_flatten
 
 from .lora import LoRaLayer
+
+
+def grad_checkpoint(layer):
+    """
+    Update all instances of type(layer) to use gradient checkpointing.
+    """
+    fn = type(layer).__call__
+
+    def checkpointed_fn(model, *args, **kwargs):
+        def inner_fn(params, *args, **kwargs):
+            model.update(params)
+            return fn(model, *args, **kwargs)
+
+        return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
+
+    type(layer).__call__ = checkpointed_fn
 
 
 def get_module_by_name(model, name):
@@ -33,8 +50,11 @@ def set_module_by_name(model, name, new_module):
 
 
 def get_peft_model(
-    model, linear_layers, rank=10, alpha=0.1, dropout=0.1, freeze=True, verbose=True
+    model, linear_layers=None, rank=10, alpha=0.1, dropout=0.1, freeze=True, verbose=False
 ):
+    if linear_layers is None:
+        linear_layers = find_all_linear_names(model.language_model)
+    
     if freeze:
         freeze_model(model)
 
@@ -50,7 +70,12 @@ def get_peft_model(
     model.config.lora["dropout"] = dropout
 
     if verbose:
-        print_trainable_parameters(model.language_model)
+        if verbose:
+            print("Using LoRA training with the following parameters:")
+            print(f"  Rank: {rank}")
+            print(f"  Alpha: {alpha}")
+            print(f"  Dropout: {dropout}")
+            print_trainable_parameters(model.language_model)
 
     return model
 
