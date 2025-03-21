@@ -37,15 +37,14 @@ def main(args):
     if args.full_weight_training:
         logger.info(f"\033[32mUsing full weight training (all parameters will be trained)\033[0m")
         print_trainable_parameters(model.language_model)
-
-
-    logger.info(f"\033[32mSetting up LoRA\033[0m")
-    model = get_peft_model(
-        model,
-        rank=args.lora_rank,
-        alpha=args.lora_alpha,
-        dropout=args.lora_dropout
-    )
+    else:
+        logger.info(f"\033[32mSetting up LoRA\033[0m")
+        model = get_peft_model(
+            model,
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout
+        )
 
     logger.info(f"\033[32mSetting up optimizer\033[0m")
     optimizer = optim.Adam(learning_rate=args.learning_rate)
