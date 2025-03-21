@@ -156,7 +156,6 @@ def create_additive_causal_mask(N: int, offset: int = 0):
 
 def create_attention_mask(h: mx.array, cache: Optional[Any] = None):
     T = h.shape[1]
-    print(cache)
     if T > 1:
         if cache is not None and cache[0] is not None:
             c = cache[0]
