@@ -1,13 +1,11 @@
 import argparse
-import json
 import logging
 
 import mlx.optimizers as optim
-from datasets import load_dataset
 from tqdm import tqdm
 
 from .trainers import Trainer, save_adapter, save_full_model
-from .trainers.datasets import SFTDataset, load_and_prepare_dataset
+from .trainers.datasets import load_and_prepare_dataset
 from .trainers.utils import get_peft_model, print_trainable_parameters
 from .utils import load, load_image_processor
 
@@ -36,7 +34,6 @@ def main(args):
 
     if args.full_weight_training:
         logger.info(f"\033[32mUsing full weight training (all parameters will be trained)\033[0m")
-        model.unfreeze()
     else:
         logger.info(f"\033[32mSetting up LoRA\033[0m")
         model = get_peft_model(

@@ -107,8 +107,6 @@ class Trainer:
 
         # Forward pass
         outputs = model(input_ids=input_ids, pixel_values=pixel_values, attention_mask=attention_mask, **kwargs)
-
-        # Cast to float32
         logits = outputs.logits.astype(mx.float32)
 
         # Ensure logits and labels have the same sequence length
@@ -121,8 +119,10 @@ class Trainer:
                 return logits[:, -labels.shape[1] :, :]
             return logits
 
+        # alignment
         logits = align_logits_with_labels(logits, labels)
-
+        
+        # length_mask
         length_mask = mx.arange(input_ids.shape[1])[None, :] < lengths[:, None]
 
         # Compute loss only on non-padded tokens
@@ -140,15 +140,23 @@ class Trainer:
         return ce
 
     def train_step(self, batch):
-        loss_and_grad_fn = nn.value_and_grad(self.model, self.loss_fn)
-        loss, grads = loss_and_grad_fn(self.model, batch)
-
-        # Add gradient clipping
+        # Compute forward pass and loss
+        loss = self.loss_fn(self.model, batch)
+        
+        # Manually compute gradients for each module to avoid reshape errors
+        grads = {}
+        for name, param in self.model.trainable_parameters().items():
+            # Compute gradient for this parameter
+            param_grad = mx.grad(lambda p: self.loss_fn(self.model, batch))(param)
+            grads[name] = param_grad
+        
+        # Apply gradient clipping if needed
         if self.clip_gradients is not None:
             grads = tree_map(
                 lambda g: mx.clip(g, -self.clip_gradients, self.clip_gradients), grads
             )
-
+        
+        # Update model
         self.optimizer.update(self.model, grads)
         return loss
 
