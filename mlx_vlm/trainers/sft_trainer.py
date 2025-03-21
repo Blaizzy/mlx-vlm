@@ -149,7 +149,14 @@ class Trainer:
                 lambda g: mx.clip(g, -self.clip_gradients, self.clip_gradients), grads
             )
 
-        self.optimizer.update(self.model, grads)
+        # Update parameters based on whether we're using LoRA or full training
+        if hasattr(self.model, 'trainable_parameters'):
+            # LoRA mode - update only trainable parameters
+            trainable_params = self.model.trainable_parameters(self.model)
+            self.optimizer.update(trainable_params, grads)
+        else:
+            # Full weight training - update all parameters
+            self.optimizer.update(self.model.parameters(), grads)
 
         return loss
 
@@ -186,3 +193,11 @@ def save_adapter(
             json.dump(model.config.lora, f)
     flattened_tree = tree_flatten(model.trainable_parameters())
     mx.save_safetensors(str(adapter_file), dict(flattened_tree))
+
+
+def save_full_model(model: nn.Module, save_path: Union[str, Path]):
+    path = Path(save_path)
+    path.mkdir(exist_ok=True, parents=True)
+    with open(path / "config.json", "w") as f:
+        json.dump(model.config.to_dict(), f)
+    mx.save_safetensors(str(path / "model.safetensors"), dict(tree_flatten(model.parameters())))
