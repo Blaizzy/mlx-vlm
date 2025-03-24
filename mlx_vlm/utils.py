@@ -338,7 +338,6 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 def load_processor(
     model_path, add_detokenizer=True, **kwargs
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
-
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
@@ -753,7 +752,10 @@ def resize_image(img, max_size):
 
 
 def process_image(img, resize_shape, image_processor):
-    if isinstance(img, str):
+    # load image if not already loaded
+    if isinstance(img, Image.Image):
+        img = img
+    elif isinstance(img, str):
         img = load_image(img)
     if resize_shape is not None and not isinstance(image_processor, BaseImageProcessor):
         img = resize_image(img, resize_shape)
@@ -795,7 +797,6 @@ def process_inputs_with_fallback(processor, images, prompts, return_tensors="mlx
 
 
 def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=None):
-
     if not isinstance(images, list):
         images = [images]
 
@@ -953,7 +954,6 @@ def generate_step(
                 **kwargs,
             )
         else:
-
             outputs = model.language_model(
                 y[None],
                 cache=cache,
