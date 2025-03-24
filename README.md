@@ -57,6 +57,7 @@ config = load_config(model_path)
 
 # Prepare input
 image = ["http://images.cocodataset.org/val2017/000000039769.jpg"]
+# image = [Image.open("...")] can also be used with PIL.Image.Image objects
 prompt = "Describe this image."
 
 # Apply chat template
