@@ -4,7 +4,7 @@ import logging
 import mlx.optimizers as optim
 from tqdm import tqdm
 
-from .trainers import Trainer, save_adapter, save_full_model
+from .trainers import TrainingArgs, TrainingCallback, save_adapter, save_full_model, train
 from .trainers.datasets import load_and_prepare_dataset
 from .trainers.utils import get_peft_model, print_trainable_parameters
 from .utils import load, load_image_processor
@@ -48,42 +48,70 @@ def main(args):
     logger.info(f"\033[32mSetting up optimizer\033[0m")
     optimizer = optim.Adam(learning_rate=args.learning_rate)
 
-    logger.info(f"\033[32mSetting up trainer\033[0m")
-    trainer = Trainer(model, optimizer)
-
+    logger.info(f"\033[32mSetting up training arguments\033[0m")
+    
+    # Convert existing args to TrainingArgs
+    training_args = TrainingArgs(
+        batch_size=args.batch_size,
+        iters=args.steps,
+        steps_per_report=args.print_every,
+        adapter_file=args.output_path,
+    )
+    
+    # Create a custom TrainingCallback for tqdm progress bar
+    class CustomTrainingCallback(TrainingCallback):
+        def __init__(self, total_iters):
+            self.progress_bar = tqdm(total=total_iters, position=0, leave=True)
+            
+        def on_train_loss_report(self, train_info):
+            self.progress_bar.update(train_info["iteration"] - self.progress_bar.n)
+            self.progress_bar.set_postfix({
+                "Loss": f"{train_info['train_loss']:.4f}",
+                "LR": f"{train_info['learning_rate']:.2e}",
+                "Tokens/sec": f"{train_info['tokens_per_second']:.0f}"
+            })
+            
+            # Log additional information
+            custom_print({
+                "Step": train_info["iteration"],
+                "Loss": f"{train_info['train_loss']:.4f}",
+                "Learning Rate": f"{train_info['learning_rate']:.2e}",
+                "Tokens/sec": f"{train_info['tokens_per_second']:.0f}"
+            })
+            
+        def on_val_loss_report(self, val_info):
+            # Log validation results
+            custom_print({
+                "Step": val_info["iteration"],
+                "Val Loss": f"{val_info['val_loss']:.4f}",
+                "Val Time": f"{val_info['val_time']:.2f}s"
+            })
+    
     model.train()
-
-    # Training loop
+    
     logger.info(f"\033[32mTraining model\033[0m")
-    for epoch in range(args.epochs):
-        if args.steps == 0:
-            args.steps = len(dataset) // args.batch_size
-
-        progress_bar = tqdm(range(args.steps), position=0, leave=True)
-        for i in progress_bar:
-            loss = trainer.train_step(
-                dataset[i * args.batch_size : (i + 1) * args.batch_size]
-            )
-            # Update progress bar
-            progress_bar.update(1)
-            progress_bar.set_postfix(
-                {"Epoch": epoch, "Step": i, "Loss": f"{loss.item():.4f}"}
-            )
-
-            if i % args.print_every == 0:
-                # Log additional information
-                custom_print(
-                    {
-                        "Epoch": epoch,
-                        "Step": i,
-                        "Loss": f"{loss.item():.4f}",
-                    }
-                )
-
+    callback = CustomTrainingCallback(training_args.iters)
+    
+    # Use the functional train approach instead of manual loop
+    train(
+        model=model,
+        tokenizer=processor,
+        optimizer=optimizer,
+        dataset=dataset,
+        args=training_args,
+        training_callback=callback,
+        train_on_completions=getattr(args, 'train_on_completions', False),
+        assistant_id=getattr(args, 'assistant_id', 77091),
+        clip_gradients=getattr(args, 'clip_gradients', None)
+    )
+    
+    # Save model weights
     if args.full_weight_training:
         save_full_model(model, args.output_path)
     else:
         save_adapter(model, args.output_path)
+    
+    logger.info(f"\033[32mTraining complete. Model saved to {args.output_path}\033[0m")
 
 
 if __name__ == "__main__":
@@ -133,7 +161,7 @@ if __name__ == "__main__":
         "--epochs", type=int, default=1, help="Number of epochs to train"
     )
     parser.add_argument(
-        "--steps", type=int, default=0, help="Number of steps per epoch"
+        "--steps", type=int, default=1000, help="Number of steps per epoch"
     )
     parser.add_argument(
         "--print-every", type=int, default=10, help="Print loss every n steps"

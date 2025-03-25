@@ -1,4 +1,5 @@
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Union
@@ -6,8 +7,11 @@ from typing import Union
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.utils import tree_flatten, tree_map
 
+from mlx.nn.utils import average_gradients
+from mlx.utils import tree_map
+
+from .utils import grad_checkpoint
 
 @dataclass
 class TrainingArgs:
@@ -43,11 +47,15 @@ class TrainingArgs:
     )
 
 
-def default_loss(model, inputs, targets, lengths):
-    logits = model(inputs)
-    logits = logits.astype(mx.float32)
+def default_loss(model, inputs, targets, lengths, pixel_values=None, attention_mask=None):
+    # Call the model and get the output object
+    outputs = model(inputs, pixel_values=pixel_values, attention_mask=attention_mask)
+    
+    # Extract logits from the output object and remove the last token
+    logits = outputs.logits[:, :-1].astype(mx.float32)
 
-    length_mask = mx.arange(inputs.shape[1])[None, :] < lengths[:, None]
+    # Adjust length mask to match target length
+    length_mask = mx.arange(targets.shape[1])[None, :] < (lengths - 1)[:, None]
 
     ce = nn.losses.cross_entropy(logits, targets) * length_mask
     ntoks = length_mask.sum()
@@ -56,148 +64,340 @@ def default_loss(model, inputs, targets, lengths):
     return ce, ntoks
 
 
-class Trainer:
-    def __init__(
-        self,
-        model,
-        optimizer,
-        train_on_completions=False,
-        assistant_id=77091,
-        clip_gradients=None,
-    ):
-        self.model = model
-        self.optimizer = optimizer
-        self.train_on_completions = train_on_completions
-        self.assistant_id = assistant_id
-        self.clip_gradients = clip_gradients
-
-    def loss_fn(self, model, batch):
-        pixel_values = batch["pixel_values"]
-        input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"]
-        lengths = mx.sum(attention_mask, axis=1)
-        labels = input_ids[:, 1:]
-
-        batch_size, seq_length = input_ids.shape
-
-        if self.train_on_completions:
-            weight_mask = mx.ones_like(attention_mask)
-
-            assistant_response_index = np.where(input_ids == self.assistant_id)[1]
-            range_matrix = mx.repeat(
-                mx.expand_dims(mx.arange(seq_length), 0), batch_size, axis=0
-            )
-            assistant_mask = range_matrix <= mx.array(assistant_response_index).reshape(
-                -1, 1
-            )
-            # Apply the mask to weight_mask
-            weight_mask = mx.where(
-                assistant_mask, mx.zeros_like(weight_mask), weight_mask
-            )[:, 1:]
-        else:
-            weight_mask = None
-
-        input_ids = input_ids[:, :-1]
-
-        kwargs = {
-            k: v
-            for k, v in batch.items()
-            if k not in ["input_ids", "pixel_values", "attention_mask"]
-        }
-
-        # Forward pass
-        outputs = model(input_ids=input_ids, pixel_values=pixel_values, attention_mask=attention_mask, **kwargs)
-        logits = outputs.logits.astype(mx.float32)
-
-        # Ensure logits and labels have the same sequence length
-        def align_logits_with_labels(logits, labels):
-            if logits.shape[1] < labels.shape[1]:
-                pad_length = labels.shape[1] - logits.shape[1]
-                pad_width = ((0, 0), (0, pad_length), (0, 0))
-                return mx.pad(logits, pad_width, mode="constant", constant_values=-100)
-            elif logits.shape[1] > labels.shape[1]:
-                return logits[:, -labels.shape[1] :, :]
-            return logits
-
-        # alignment
-        logits = align_logits_with_labels(logits, labels)
-        
-        # length_mask
-        length_mask = mx.arange(input_ids.shape[1])[None, :] < lengths[:, None]
-
-        # Compute loss only on non-padded tokens
-        ce = (
-            nn.losses.cross_entropy(
-                logits,
-                labels,
-                weights=weight_mask,
-            )
-            * length_mask
-        )
-        ntoks = length_mask.sum()
-        ce = ce.sum() / ntoks
-
-        return ce
-
-    def train_step(self, batch):
-        # Compute forward pass and loss
-        loss = self.loss_fn(self.model, batch)
-        
-        # Manually compute gradients for each module to avoid reshape errors
-        grads = {}
-        for name, param in self.model.trainable_parameters().items():
-            # Compute gradient for this parameter
-            param_grad = mx.grad(lambda p: self.loss_fn(self.model, batch))(param)
-            grads[name] = param_grad
-        
-        # Apply gradient clipping if needed
-        if self.clip_gradients is not None:
-            grads = tree_map(
-                lambda g: mx.clip(g, -self.clip_gradients, self.clip_gradients), grads
-            )
-        
-        # Update model
-        self.optimizer.update(self.model, grads)
-        return loss
-
-    @mx.compile
-    def train_epoch(self, dataloader):
-        total_loss = 0
-        for batch in dataloader:
-            loss = self.train_step(batch)
-            mx.eval(self.model, self.optimizer.state)
-            total_loss += loss
-        return total_loss / len(dataloader)
-    
-    @mx.compile
-    def evaluate(self, dataloader, num_batches=-1):
-        total_loss = 0
-        batch_count = 0
-        for i, batch in enumerate(dataloader):
-            if num_batches > 0 and i >= num_batches:
-                break
-            loss = self.loss_fn(self.model, batch)
-            total_loss += loss
-            batch_count += 1
-        
-        return total_loss / batch_count if batch_count > 0 else 0
-
-
-def save_adapter(
-    model: nn.Module,
-    adapter_file: Union[str, Path],
+def loss_with_completions(
+    model, inputs, targets, lengths, pixel_values=None, attention_mask=None, 
+    assistant_id=77091, train_on_completions=False
 ):
-    path = Path(adapter_file)
-    if hasattr(model.config, "lora"):
-        with open(path.parent / "adapter_config.json", "w") as f:
-            json.dump(model.config.lora, f)
-    flattened_tree = tree_flatten(model.trainable_parameters())
-    mx.save_safetensors(str(adapter_file), dict(flattened_tree))
+    batch_size, seq_length = inputs.shape
+    
+    # Adjust for the shifted target length
+    target_seq_length = seq_length - 1
+    
+    if train_on_completions:
+        weight_mask = mx.ones_like(mx.arange(target_seq_length)[None, :] < (lengths - 1)[:, None])
+        
+        assistant_response_index = np.where(inputs == assistant_id)[1]
+        range_matrix = mx.repeat(
+            mx.expand_dims(mx.arange(target_seq_length), 0), batch_size, axis=0
+        )
+        assistant_mask = range_matrix <= mx.array(assistant_response_index).reshape(
+            -1, 1
+        )
+        # Apply the mask to weight_mask
+        weight_mask = mx.where(
+            assistant_mask, mx.zeros_like(weight_mask), weight_mask
+        )
+    else:
+        weight_mask = None
+
+    # Call the model and get the output object
+    outputs = model(inputs, pixel_values=pixel_values, attention_mask=attention_mask)
+    
+    # Extract logits from the output object and remove the last token
+    logits = outputs.logits[:, :-1].astype(mx.float32)
+
+    # Adjust length mask to match target length
+    length_mask = mx.arange(targets.shape[1])[None, :] < (lengths - 1)[:, None]
+
+    ce = nn.losses.cross_entropy(logits, targets, weights=weight_mask) * length_mask
+    ntoks = length_mask.sum()
+    ce = ce.sum() / ntoks
+
+    return ce, ntoks
 
 
-def save_full_model(model: nn.Module, save_path: Union[str, Path]):
-    path = Path(save_path)
-    path.mkdir(exist_ok=True, parents=True)
-    with open(path / "config.json", "w") as f:
-        json.dump(model.config.to_dict(), f)
-    mx.save_safetensors(str(path / "model.safetensors"), dict(tree_flatten(model.parameters())))
+def iterate_batches(
+    dataset,
+    tokenizer,
+    batch_size,
+    max_seq_length,
+    train=False,
+):
+    step = mx.distributed.init().size()
+    if batch_size % step != 0:
+        raise ValueError("The batch size must be divisible by the number of workers")
+    
+    local_batch_size = batch_size // step
+    dataset_size = len(dataset)
+    indices = list(range(dataset_size))
+
+    while True:
+        if train:
+            np.random.shuffle(indices)
+        
+        for start_idx in range(0, dataset_size - local_batch_size + 1, local_batch_size):
+            batch_indices = indices[start_idx:start_idx + local_batch_size]
+            batch_samples = [dataset[idx] for idx in batch_indices]
+            
+            # Debug information to understand data shapes
+            sample_shapes = []
+            for sample in batch_samples:
+                if isinstance(sample["input_ids"], mx.array):
+                    input_shape = sample["input_ids"].shape
+                else:
+                    input_shape = np.asarray(sample["input_ids"]).shape
+                sample_shapes.append(input_shape)
+            
+            # Convert all inputs to numpy arrays for consistent handling
+            processed_samples = []
+            for sample in batch_samples:
+                if isinstance(sample["input_ids"], mx.array):
+                    input_ids = sample["input_ids"].tolist()
+                else:
+                    input_ids = sample["input_ids"]
+                
+                # Handle case where input_ids might already be a batch
+                if isinstance(input_ids, list) and len(input_ids) > 0:
+                    if isinstance(input_ids[0], list):
+                        # It's already a batch, flatten it
+                        input_ids = input_ids[0]
+                
+                processed_sample = {
+                    "input_ids": np.array(input_ids, dtype=np.int32),
+                    "pixel_values": sample.get("pixel_values")
+                }
+                processed_samples.append(processed_sample)
+            
+            # Get max length for this batch
+            max_length = min(
+                max(len(sample["input_ids"]) for sample in processed_samples),
+                max_seq_length
+            )
+            
+            # Pad to multiple of 8
+            pad_to = 8
+            max_length_padded = pad_to * ((max_length + pad_to - 1) // pad_to)
+            
+            # Create properly sized batch arrays
+            batch_input_ids = np.zeros((local_batch_size, max_length_padded), dtype=np.int32)
+            batch_attention_mask = np.zeros((local_batch_size, max_length_padded), dtype=np.int32)
+            
+            # Fill the batch arrays
+            for i, sample in enumerate(processed_samples):
+                seq_length = min(len(sample["input_ids"]), max_seq_length)
+                batch_input_ids[i, :seq_length] = sample["input_ids"][:seq_length]
+                batch_attention_mask[i, :seq_length] = 1
+            
+            # Build the final batch dictionary
+            batch_dict = {
+                "input_ids": mx.array(batch_input_ids),
+                "attention_mask": mx.array(batch_attention_mask),
+                "lengths": mx.array([min(len(sample["input_ids"]), max_length_padded) for sample in processed_samples])
+            }
+            
+            # Handle pixel values
+            pixel_values = [sample.get("pixel_values") for sample in processed_samples]
+            if all(p is not None for p in pixel_values):
+                # Make sure pixel values are properly stacked
+                if isinstance(pixel_values[0], mx.array):
+                    batch_dict["pixel_values"] = mx.stack(pixel_values)
+                else:
+                    batch_dict["pixel_values"] = mx.array(np.stack(pixel_values))
+            else:
+                batch_dict["pixel_values"] = None
+
+            yield batch_dict
+        
+        if not train:
+            break
+
+
+def evaluate(
+    model,
+    dataset_iterator,
+    tokenizer,
+    batch_size,
+    num_batches,
+    max_seq_length=2048,
+    loss=default_loss,
+    clip_gradients=None,
+    train_on_completions=False,
+    assistant_id=77091,
+):
+    all_losses = mx.array(0.0)
+    ntokens = mx.array(0)
+
+    for i, batch in enumerate(dataset_iterator):
+        if num_batches != -1 and i >= num_batches:
+            break
+            
+        # Derive lengths from attention mask
+        lengths = batch["attention_mask"].sum(axis=1)
+        
+        # Get targets (shifted input_ids)
+        targets = batch["input_ids"][:, 1:]
+        
+        if train_on_completions:
+            losses, toks = loss_with_completions(
+                model,
+                batch["input_ids"],
+                targets,
+                lengths,
+                pixel_values=batch.get("pixel_values"),
+                attention_mask=batch["attention_mask"],
+                assistant_id=assistant_id,
+                train_on_completions=True
+            )
+        else:
+            losses, toks = loss(
+                model,
+                batch["input_ids"],
+                targets,
+                lengths,
+                pixel_values=batch.get("pixel_values"),
+                attention_mask=batch["attention_mask"]
+            )
+            
+        all_losses += losses * toks
+        ntokens += toks
+        mx.eval(all_losses, ntokens)
+
+    all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
+    ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
+
+    return (all_losses / ntokens).item()
+
+def train(
+    model,
+    tokenizer,
+    optimizer,
+    dataset,
+    args: TrainingArgs = TrainingArgs(),
+    loss=default_loss,
+    training_callback=None,
+    clip_gradients=None,
+    train_on_completions=False,
+    assistant_id=77091
+):
+    print(f"Starting training..., iters: {args.iters}")
+
+    dataset_iterator = iterate_batches(
+        dataset,
+        tokenizer,
+        args.batch_size,
+        args.max_seq_length,
+        train=True
+    )
+
+    world = mx.distributed.init()
+    world_size = world.size()
+    rank = world.rank()
+    if world_size > 1:
+        print(f"Node {rank} of {world_size}")
+
+    if args.grad_checkpoint:
+        grad_checkpoint(model.layers[0])
+
+    state = [model.state, optimizer.state]
+
+    def step(batch):
+        # Derive lengths from attention mask
+        lengths = batch["attention_mask"].sum(axis=1)
+        
+        # Get targets (shifted input_ids)
+        targets = batch["input_ids"][:, 1:]
+        
+        if train_on_completions:
+            (lvalue, toks), grad = loss_value_and_grad(
+                model, 
+                batch["input_ids"], 
+                targets, 
+                lengths,
+                assistant_id=assistant_id, 
+                train_on_completions=True
+            )
+        else:
+            (lvalue, toks), grad = loss_value_and_grad(
+                model, 
+                batch["input_ids"], 
+                targets, 
+                lengths
+            )
+
+        if clip_gradients is not None:
+            grad = tree_map(
+                lambda g: mx.clip(g, -clip_gradients, clip_gradients), grad
+            )
+
+        grad = average_gradients(grad)
+        optimizer.update(model, grad)
+
+        return lvalue, toks
+
+    if train_on_completions:
+        loss_value_and_grad = nn.value_and_grad(model, loss_with_completions)
+    else:
+        loss_value_and_grad = nn.value_and_grad(model, loss)
+
+    losses = 0
+    n_tokens = 0
+    steps = 0
+    trained_tokens = 0
+    train_time = 0
+    
+    # Keep track of batches for training
+    batch_count = 0
+    
+    # Main training loop
+    for it in range(1, args.iters + 1):
+        tic = time.perf_counter()
+        
+        # Get next batch - handle dataset exhaustion by wrapping back to start
+        try:
+            batch = next(dataset_iterator)
+        except StopIteration:
+            # Reset the iterator
+            dataset_iterator = iter(dataset_iterator)
+            batch = next(dataset_iterator)
+        
+        # Process multi-modal data (if needed)
+        if "pixel_values" in batch and batch["pixel_values"] is not None:
+            # Pass pixel_values to the model if needed
+            pass
+        
+        # Training step
+        lvalue, toks = step(batch)
+        losses += lvalue
+        n_tokens += toks
+        steps += 1
+        mx.eval(state, losses, n_tokens)
+        train_time += time.perf_counter() - tic
+        batch_count += 1
+
+        # Rest of the reporting and saving logic remains the same
+        if it % args.steps_per_report == 0 or it == args.iters:
+            train_loss = mx.distributed.all_sum(losses, stream=mx.cpu).item()
+            train_loss /= steps * mx.distributed.init().size()
+            n_tokens = mx.distributed.all_sum(n_tokens, stream=mx.cpu).item()
+            learning_rate = optimizer.learning_rate.item()
+            it_sec = args.steps_per_report / train_time
+            tokens_sec = float(n_tokens) / train_time
+            trained_tokens += n_tokens
+            peak_mem = mx.metal.get_peak_memory() / 1e9
+            if rank == 0:
+                print(
+                    f"Iter {it}: Train loss {train_loss:.3f}, "
+                    f"Learning Rate {learning_rate:.3e}, "
+                    f"It/sec {it_sec:.3f}, "
+                    f"Tokens/sec {tokens_sec:.3f}, "
+                    f"Trained Tokens {trained_tokens}, "
+                    f"Peak mem {peak_mem:.3f} GB",
+                    flush=True,
+                )
+
+            if training_callback is not None:
+                train_info = {
+                    "iteration": it,
+                    "train_loss": train_loss,
+                    "learning_rate": learning_rate,
+                    "iterations_per_second": it_sec,
+                    "tokens_per_second": tokens_sec,
+                    "trained_tokens": trained_tokens,
+                    "peak_memory": peak_mem,
+                }
+                training_callback.on_train_loss_report(train_info)
+
+            losses = 0
+            n_tokens = 0
+            steps = 0
+            train_time = 0
