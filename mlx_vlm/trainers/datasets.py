@@ -96,31 +96,34 @@ class SFTDataset:
 
         image_token_index = self.config["image_token_index"]
 
-        inputs = prepare_inputs(
-            self.processor,
-            images,
-            prompts,
-            image_token_index,
-            self.image_resize_shape,
-        )
-        input_ids = inputs["input_ids"]
-        pixel_values = inputs["pixel_values"]
-        mask = inputs["attention_mask"]
-        kwargs = {
-            k: v
-            for k, v in inputs.items()
-            if k not in ["input_ids", "pixel_values", "attention_mask"]
-        }
+        try:
+            inputs = prepare_inputs(
+                self.processor,
+                images,
+                prompts,
+                image_token_index,
+                self.image_resize_shape,
+            )
 
-        if mask is None:
-            mask = mx.ones_like(input_ids)
+            input_ids = inputs["input_ids"]
+            pixel_values = inputs["pixel_values"]
+            mask = inputs["attention_mask"]
+            kwargs = {
+                k: v
+                for k, v in inputs.items()
+                if k not in ["input_ids", "pixel_values", "attention_mask"]
+            }
 
-        return {
-            "pixel_values": pixel_values,
-            "input_ids": input_ids,
-            "attention_mask": mask,
-            **kwargs,
-        }
+            return {
+                "pixel_values": pixel_values,
+                "input_ids": input_ids,
+                "attention_mask": mask,
+                **kwargs,
+            }
+
+        except Exception as e:
+            print(f"Skipping sample at index {idx} due to error: {e}")
+            return self.__getitem__((idx + 1) % len(self))
     
 
 def prepare_dataset(

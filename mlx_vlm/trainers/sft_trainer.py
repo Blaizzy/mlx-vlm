@@ -299,18 +299,18 @@ def train(
         
         if train_on_completions:
             (lvalue, toks), grad = loss_value_and_grad(
-                model, 
-                batch["input_ids"], 
-                targets, 
+                model,
+                batch["input_ids"],
+                targets,
                 lengths,
                 assistant_id=assistant_id, 
                 train_on_completions=True
             )
         else:
             (lvalue, toks), grad = loss_value_and_grad(
-                model, 
-                batch["input_ids"], 
-                targets, 
+                model,
+                batch["input_ids"],
+                targets,
                 lengths
             )
 
