@@ -1,17 +1,18 @@
+import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 from transformers import AutoProcessor
 
-from ...trainer.utils import LoRaLayer, set_module_by_name
+from ...trainer.utils import LoRaLayer, apply_lora_layers, set_module_by_name
+from ...utils import get_model_path
 from ..base import BaseModelConfig, LanguageModelOutput, create_attention_mask
 from .multimodal import Phi4MMImageAudioEmbedding
 from .processing_phi4mm import InputMode, Phi4MMProcessor
 from .su_rope import SuScaledRotaryEmbedding
-from .vision import VisionConfig
 
 AutoProcessor.register("phi4mm", Phi4MMProcessor)
 
@@ -143,10 +144,10 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        if mask is not None:
-            key_len = keys.shape[-2]
-            if mask.shape[-1] != key_len:
-                mask = mask[..., :key_len]
+        # if mask is not None:
+        #     key_len = keys.shape[-2]
+        #     if mask.shape[-1] != key_len:
+        #         mask = mask[..., -key_len:]
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
@@ -276,7 +277,7 @@ class Phi4Model(nn.Module):
         input_mode = InputMode(input_mode)
 
         if input_mode in [InputMode.VISION_SPEECH, InputMode.VISION]:
-            # self.set_lora_adapter("vision")
+            self.set_lora_adapter("vision")
             audio_projection_mode = "vision"
         elif input_mode == InputMode.SPEECH:
             # self.set_lora_adapter("speech")
@@ -287,11 +288,13 @@ class Phi4Model(nn.Module):
         else:
             raise ValueError(f"Invalid input_mode: {input_mode}")
 
-        if pixel_values is None:
+        if input_embeds is None and pixel_values is not None:
             h = self.embed_tokens_extend(
                 input_ids=input_ids,
                 input_embeds=None,
-                input_image_embeds=kwargs.pop("input_image_embeds", None),
+                input_image_embeds=kwargs.pop(
+                    "input_image_embeds", pixel_values.transpose(0, 1, 3, 4, 2)
+                ),
                 input_audio_embeds=kwargs.pop("input_audio_embeds", None),
                 image_sizes=kwargs.pop("image_sizes", None),
                 image_attention_mask=kwargs.pop("image_attention_mask", None),
@@ -300,8 +303,7 @@ class Phi4Model(nn.Module):
                 audio_projection_mode=audio_projection_mode,
                 wte=self.embed_tokens,
             )
-
-        if input_embeds is None:
+        elif input_embeds is None and pixel_values is None:
             h = self.embed_tokens(input_ids)
             h = self.pad_embeddings(h, self.config.pad_token_id)
         else:
@@ -310,8 +312,8 @@ class Phi4Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
+        # if mask is None:
+        mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -346,13 +348,31 @@ class Phi4Model(nn.Module):
     def n_kv_heads(self):
         return self.config.num_key_value_heads
 
-    # def set_lora_adapter(self, adapter_name):
-    #     for name, module in self.parameters():
-    #         if isinstance(module, LoRaLayer):
-    #             if "lora_A." + adapter_name + ".weight" in name:
-    #                 module.disable_adapter = False
-    #             if "lora_B." + adapter_name + ".weight" in name:
-    #                 module.disable_adapter = False
+    def set_lora_adapter(self, adapter_name):
+        if adapter_name == "vision":
+            path = get_model_path("microsoft/Phi-4-multimodal-instruct")
+            adapter_path = path / "vision-lora/adapter_model.safetensors"
+            adapter_config = path / "vision-lora/adapter_config.json"
+
+        elif adapter_name == "speech":
+            path = get_model_path("microsoft/Phi-4-multimodal-instruct")
+            adapter_path = path / "speech-lora/adapter_model.safetensors"
+            adapter_config = path / "speech-lora/adapter_config.json"
+        else:
+            raise ValueError(f"Invalid adapter_name: {adapter_name}")
+
+        with open(adapter_config, "r") as f:
+            adapter_config = json.load(f)
+
+        self.load_weights(str(adapter_path), strict=False)
+        self.eval()
+        for module in self.layers:
+            for name, module in module.named_modules():
+                if isinstance(module, LoRaLayer):
+                    if "lora_A." + adapter_name + ".weight" in name:
+                        module.disable_adapter = False
+                    if "lora_B." + adapter_name + ".weight" in name:
+                        module.disable_adapter = False
 
     def unset_lora_adapter(self):
         for module in self.layers:
@@ -382,7 +402,7 @@ class Model(nn.Module):
         **kwargs,
     ):
         out = self.language_model(
-            input_ids, pixel_values, mask=mask, cache=cache, **kwargs
+            input_ids, pixel_values=pixel_values, mask=mask, cache=cache, **kwargs
         )
         return out
 
