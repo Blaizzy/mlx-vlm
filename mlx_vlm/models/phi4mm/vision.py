@@ -308,7 +308,7 @@ class SigLIPVisionModel(nn.Module):
         )
         pooler_output = self.post_layernorm(encoder_outputs[0])
         pooler_output = self.head(pooler_output)
-        return pooler_output, x, encoder_outputs[-1]
+        return pooler_output, x, encoder_outputs
 
 
 class VisionModel(nn.Module):
@@ -450,7 +450,7 @@ class VisionModel(nn.Module):
                 img_processor_output = self.img_processor(
                     img_embeds,
                     output_hidden_states=True,
-                    patch_attention_mask=attention_mask,
+                    # patch_attention_mask=attention_mask,
                 )
             else:
                 img_processor_output = self.img_processor(
@@ -461,14 +461,14 @@ class VisionModel(nn.Module):
                 img_processor_output = self.img_processor(
                     img_embeds,
                     output_hidden_states=True,
-                    patch_attention_mask=attention_mask,
+                    # patch_attention_mask=attention_mask,
                 )
             else:
                 img_processor_output = self.img_processor(
                     img_embeds, output_hidden_states=True
                 )
 
-        img_feature = img_processor_output.hidden_states[LAYER_IDX]
+        img_feature = img_processor_output[-1][LAYER_IDX]
 
         if TYPE_FEATURE == "patch":
             patch_feature = img_feature
@@ -625,7 +625,7 @@ class VisionModel(nn.Module):
         input_ids = mx.reshape(input_ids, (-1, input_shape[-1]))
 
         # Find positions of image tokens
-        positions = mx.nonzero(input_ids == _IMAGE_SPECIAL_TOKEN_ID)
+        positions = mx.array(np.nonzero(input_ids == _IMAGE_SPECIAL_TOKEN_ID)[0])
 
         # Default values for fake image forward and selection
         fake_image_forward = False
@@ -699,7 +699,7 @@ class VisionModel(nn.Module):
 
                     h = h // base_resolution
                     w = w // base_resolution
-                    B_ = h * w
+                    B_ = (h * w).tolist()
 
                     # Process global image feature (first crop)
                     global_img_feature = img_features[_bs, :1]
@@ -901,8 +901,10 @@ class VisionModel(nn.Module):
                 # Project image features
                 img_set_tensor = []
                 for _output_img in output_imgs:
-                    img_feature_proj = self.img_projection(_output_img)
-                    img_set_tensor.append(img_feature_proj)
+                    h = _output_img
+                    for img_proj in self.img_projection:
+                        h = img_proj(h)
+                    img_set_tensor.append(h)
 
                 select = True
             else:
@@ -945,24 +947,29 @@ class VisionModel(nn.Module):
                 # Create a new hidden states tensor with image embeddings inserted
                 # This is a more functional approach compared to PyTorch's in-place operations
 
-                # Extract all positions where we need to insert image embeddings
-                pos_indices = mx.nonzero(input_ids == _IMAGE_SPECIAL_TOKEN_ID)
+                # Find positions of image tokens in the input sequence
+                pos_indices = np.nonzero(input_ids == _IMAGE_SPECIAL_TOKEN_ID)
+                batch_indices, seq_indices = pos_indices
 
-                # Flatten and merge all image embeddings
+                # Combine all image embeddings into a single tensor
                 merged_img_tensor = mx.concatenate(
-                    [tensor.squeeze(0) for tensor in img_set_tensor], axis=0
+                    [img.reshape(-1, img.shape[-1]) for img in img_set_tensor]
                 )
 
-                # Create a new hidden_states with image embeddings inserted
-                new_hidden_states = mx.copy(hidden_states)
+                # Initialize new hidden states with the original values
+                new_hidden_states = hidden_states.tolist()
 
-                # Replace the positions with image embeddings
-                for i, (batch_idx, seq_idx) in enumerate(pos_indices):
-                    new_hidden_states = mx.indexed_update(
-                        new_hidden_states,
-                        ((batch_idx, seq_idx),),
-                        mx.expand_dims(merged_img_tensor[i], axis=0),
-                    )
+                # Update hidden states with image embeddings
+                for i in range(len(batch_indices)):
+                    b_idx, s_idx = int(batch_indices[i]), int(seq_indices[i])
+                    img_embedding = merged_img_tensor[i].tolist()
+                    # Update the Python list directly
+                    new_hidden_states[b_idx][s_idx] = img_embedding
+
+                # Convert back to mx.array
+                new_hidden_states = mx.array(
+                    new_hidden_states, dtype=hidden_states.dtype
+                )
 
                 hidden_states = new_hidden_states
             else:
