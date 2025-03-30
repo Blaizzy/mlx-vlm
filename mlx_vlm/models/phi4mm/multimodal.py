@@ -167,7 +167,7 @@ class Phi4MMImageAudioEmbedding(nn.Module):
                 image_attention_mask=image_attention_mask,
             )
 
-        if input_audio_embeds is not None:
+        if input_audio_embeds is not None and input_audio_embeds.shape[0] > 0:
             audio_hidden_states = self.audio_embed(
                 input_ids=input_ids,
                 input_embeds=input_audio_embeds,
@@ -179,7 +179,9 @@ class Phi4MMImageAudioEmbedding(nn.Module):
 
         # Merge image and audio hidden states
         # For non-image-audio tokens, we use the token from the audio hidden states
-        if input_image_embeds is not None and input_audio_embeds is not None:
+        if input_image_embeds is not None and (
+            input_audio_embeds is not None and input_audio_embeds.shape[0] > 0
+        ):
             # Create mask for selecting between image and audio hidden states
             image_mask_expanded = mx.expand_dims(image_position_mask, -1)
             non_image_mask_expanded = mx.expand_dims(non_image_position_mask, -1)
@@ -196,7 +198,7 @@ class Phi4MMImageAudioEmbedding(nn.Module):
             )
         elif input_image_embeds is not None:
             hidden_states = image_hidden_states
-        elif input_audio_embeds is not None:
+        elif input_audio_embeds is not None and input_audio_embeds.shape[0] > 0:
             hidden_states = audio_hidden_states
         else:
             # If no special embeddings are provided, just use the word embeddings
