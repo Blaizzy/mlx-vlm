@@ -3,33 +3,31 @@ import warnings
 import logging
 import json
 
-import mlx.core as mx
-
 from datasets import load_dataset
 from ..prompt_utils import apply_chat_template
+from mlx_vlm.utils import prepare_inputs
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 def get_prompt(model_type, processor, conversation):
     if model_type == "paligemma":
         return conversation
 
-    if "chat_template" in processor.__dict__.keys():
-        prompt = processor.apply_chat_template(
+    if hasattr(processor, "apply_chat_template"):
+        return processor.apply_chat_template(
             conversation,
             tokenize=False,
             add_generation_prompt=False,
         )
-    elif "tokenizer" in processor.__dict__.keys():
-        prompt = processor.tokenizer.apply_chat_template(
+    elif hasattr(processor, "tokenizer"):
+        return processor.tokenizer.apply_chat_template(
             conversation,
             tokenize=False,
             add_generation_prompt=False,
         )
-
-    return prompt
+    else:
+        raise ValueError("Processor has no chat template method available.")
 
 
 class SFTDataset:
@@ -45,12 +43,10 @@ class SFTDataset:
         images_key: str = "image",
         messages_key: str = "messages"
     ):
-        if split is not None:
-            self.dataset = hf_dataset[split]
-        else:
-            self.dataset = hf_dataset
+        self.dataset = hf_dataset[split] if split is not None else hf_dataset
         if take is not None:
             self.dataset = self.dataset.take(take)
+
         self.processor = processor
         self.config = config
         self.image_processor = image_processor
@@ -62,67 +58,69 @@ class SFTDataset:
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        from mlx_vlm.utils import prepare_inputs
-
         item = self.dataset[idx]
 
+        # Flatten image structure if needed
         images = item[self.images_key]
-        if isinstance(images, list) and len(images) > 0 and isinstance(images[0], list):
+        if isinstance(images, list) and images and isinstance(images[0], list):
             images = [img for sublist in images for img in sublist]
+
+        # Handle conversation format
         conversations = item[self.messages_key]
         prompts = []
 
-        if isinstance(conversations, list) and isinstance(conversations[0], list):
-            for conversation in conversations:
-                if self.config["model_type"] == "pixtral":
-                    conversation = [json.loads(i) for i in conversation]
-                    if len(conversations) > 1:
-                        warnings.warn(
-                            "Pixtral batch processing is not supported yet. Set batch size to 1."
-                        )
+        # For Pixtral, we decode JSON strings
+        if self.config["model_type"] == "pixtral":
+            if isinstance(conversations[0], str):
+                conversations = [json.loads(c) for c in conversations]
+            else:
+                conversations = [conversations]
 
-                prompt = get_prompt(
-                    self.config["model_type"], self.processor, conversation
-                )
+        # Single conversation (ideal)
+        if isinstance(conversations, list) and isinstance(conversations[0], dict):
+            prompt = get_prompt(self.config["model_type"], self.processor, conversations)
+            prompts.append(prompt)
+
+        # Multiple conversations per sample (not typical, but handled)
+        elif isinstance(conversations, list) and isinstance(conversations[0], list):
+            warnings.warn(
+                "Multiple conversations detected in one sample — assuming batch size = 1"
+            )
+            for convo in conversations:
+                prompt = get_prompt(self.config["model_type"], self.processor, convo)
                 prompts.append(prompt)
 
         else:
-            if self.config["model_type"] == "pixtral":
-                conversations = [json.loads(i) for i in conversations]
-            prompt = get_prompt(
-                self.config["model_type"], self.processor, conversations
-            )
-            prompts.append(prompt)
+            raise ValueError(f"Unexpected format in 'messages': {type(conversations)}")
 
-        image_token_index = self.config["image_token_index"]
-
+        # Prepare model inputs
         try:
             inputs = prepare_inputs(
                 self.processor,
                 images,
                 prompts,
-                image_token_index,
+                self.config["image_token_index"],
                 self.image_resize_shape,
             )
 
             input_ids = inputs["input_ids"]
             pixel_values = inputs["pixel_values"]
-            mask = inputs["attention_mask"]
-            kwargs = {
-                k: v
-                for k, v in inputs.items()
+            attention_mask = inputs["attention_mask"]
+
+            other_inputs = {
+                k: v for k, v in inputs.items()
                 if k not in ["input_ids", "pixel_values", "attention_mask"]
             }
 
             return {
                 "pixel_values": pixel_values,
                 "input_ids": input_ids,
-                "attention_mask": mask,
-                **kwargs,
+                "attention_mask": attention_mask,
+                **other_inputs,
             }
 
         except Exception as e:
-            print(f"Skipping sample at index {idx} due to error: {e}")
+            logger.warning(f"Skipping sample at index {idx} due to error: {e}")
             return self.__getitem__((idx + 1) % len(self))
     
 
