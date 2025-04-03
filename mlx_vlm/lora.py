@@ -5,7 +5,7 @@ import mlx.optimizers as optim
 from tqdm import tqdm
 
 from .trainers import TrainingArgs, TrainingCallback, save_adapter, save_full_model, train
-from .trainers.datasets import load_and_prepare_dataset
+from .trainers.dataset import load_and_prepare_dataset
 from .trainers.utils import get_peft_model, print_trainable_parameters
 from .utils import load, load_image_processor
 

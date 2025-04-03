@@ -122,7 +122,69 @@ class SFTDataset:
         except Exception as e:
             logger.warning(f"Skipping sample at index {idx} due to error: {e}")
             return self.__getitem__((idx + 1) % len(self))
+
+
+# class DPOORPODataset:
+#     def __init__(
+#         self,
+#         hf_dataset,
+#         config,
+#         processor,
+#         image_processor=None,
+#         take=None,
+#         split=None,
+#         image_resize_shape=None,
+#         images_key: str = "image",
+#         messages_key: str = "messages",
+#         chosen_key: str = "chosen",
+#         rejected_key: str = "rejected"
+#     ):
+#         self.dataset = hf_dataset[split] if split is not None else hf_dataset
+#         if take is not None:
+#             self.dataset = self.dataset.take(take)
+
+#         self.processor = processor
+#         self.config = config
+#         self.image_processor = image_processor
+#         self.image_resize_shape = image_resize_shape
+#         self.images_key = images_key
+#         self.messages_key = messages_key
+#         self.chosen_key = chosen_key
+#         self.rejected_key = rejected_key
     
+#     def __len__(self):
+#         return len(self.dataset)
+
+
+# class GRPODataset:
+#     def __init__(
+#         self,
+#         hf_dataset,
+#         config,
+#         processor,
+#         image_processor=None,
+#         take=None,
+#         split=None,
+#         image_resize_shape=None,
+#         images_key: str = "image",
+#         prompt_key: str = "prompt",
+#         answer_key: str = "answer"
+#     ):
+#         self.dataset = hf_dataset[split] if split is not None else hf_dataset
+#         if take is not None:
+#             self.dataset = self.dataset.take(take)
+
+#         self.processor = processor
+#         self.config = config
+#         self.image_processor = image_processor
+#         self.image_resize_shape = image_resize_shape
+#         self.images_key = images_key
+#         self.prompt_key = prompt_key
+#         self.answer_key = answer_key
+    
+#     def __len__(self):
+#         return len(self.dataset)
+
 
 def prepare_dataset(
     dataset,

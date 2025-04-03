@@ -5,7 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_vlm.trainers.sft_trainer import Trainer
-from mlx_vlm.trainers.datasets import SFTDataset
+from mlx_vlm.trainers.dataset import SFTDataset
 
 
 class TestDataset(unittest.TestCase):
