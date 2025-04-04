@@ -5,7 +5,6 @@ import json
 
 from datasets import load_dataset
 from ..prompt_utils import apply_chat_template
-from mlx_vlm.utils import prepare_inputs
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -95,6 +94,7 @@ class SFTDataset:
 
         # Prepare model inputs
         try:
+            from ..utils import prepare_inputs
             inputs = prepare_inputs(
                 self.processor,
                 images,

@@ -55,7 +55,7 @@ def main(args):
         batch_size=args.batch_size,
         iters=args.steps,
         steps_per_report=args.print_every,
-        adapter_file=args.output_path,
+        adapter_file=args.output_path
     )
     
     # Create a custom TrainingCallback for tqdm progress bar
