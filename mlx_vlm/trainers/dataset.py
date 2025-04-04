@@ -197,6 +197,7 @@ def prepare_dataset(
     messages_field: str = "messages"
 ):
     needs_message_transform = False
+
     if messages_field in dataset.column_names:
         messages_key = messages_field
     elif "conversations" in dataset.column_names:
@@ -204,8 +205,6 @@ def prepare_dataset(
     else:
         needs_message_transform = True
 
-    needs_image_fiel_renaming = new_image_field in dataset.column_names and "images" not in dataset.column_names
-    
     if needs_message_transform:
         def transform_to_messages(example):
             messages = [
@@ -214,20 +213,19 @@ def prepare_dataset(
             ]
             example["messages"] = messages
             return example
+
         messages_key = messages_field
         dataset = dataset.map(transform_to_messages)
 
-    if needs_image_fiel_renaming:
-        image_field = new_image_field
+    if new_image_field not in dataset.column_names:
+        raise ValueError(f"Dataset must have a '{new_image_field}' column")
 
-    if "images" not in dataset.column_names and new_image_field not in dataset.column_names:
-        raise ValueError("Dataset must have an 'images' column")
-    
     first_example = dataset[0]
     first_message = first_example[messages_key][0] if len(first_example[messages_key]) > 0 else None
     needs_format_conversion = False
     if first_message and "from" in first_message and "value" in first_message and "role" not in first_message:
         needs_format_conversion = True
+
     if needs_format_conversion:
         logger.info(f"\033[32mConverting message format from 'from/value' to 'role/content'\033[0m")
         def transform_conversation_format(example):
@@ -245,9 +243,10 @@ def prepare_dataset(
                     transformed_messages.append({"role": role, "content": msg["value"]})
                 else:
                     transformed_messages.append(msg)
-            
+
             example[messages_key] = transformed_messages
             return example
+
         dataset = dataset.map(transform_conversation_format)
 
     if args.apply_chat_template:
@@ -274,7 +273,7 @@ def prepare_dataset(
 
         dataset = dataset.map(process_data)
 
-    return dataset, messages_key, image_field
+    return dataset, messages_key, new_image_field
 
 
 def load_and_prepare_dataset(
