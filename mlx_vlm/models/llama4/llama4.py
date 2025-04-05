@@ -23,9 +23,7 @@ class ModelConfig:
     vision_config: VisionConfig
     model_type: str
     ignore_index: int = -100
-    vocab_size: int = 128259
-    scale_factor: int = 2
-    image_token_id: int = 49153
+    image_token_id: int = 200092
     image_token_index: Optional[int] = None
 
     def __post_init__(self):
@@ -52,7 +50,7 @@ class Model(nn.Module):
         self.language_model = LanguageModel(config.text_config)
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = (
-            self.config.pad_token_id if self.config.pad_token_id is not None else -1
+            config.pad_token_id if config.pad_token_id is not None else -1
         )
 
     def set_input_embeddings(self, value):
