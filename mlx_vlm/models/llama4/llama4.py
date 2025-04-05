@@ -126,7 +126,7 @@ class Model(nn.Module):
 
         return inputs_embeds
 
-    def forward(
+    def __call__(
         self,
         input_ids: mx.array,
         pixel_values: mx.array,
