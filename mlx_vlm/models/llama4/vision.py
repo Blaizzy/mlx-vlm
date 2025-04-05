@@ -184,8 +184,8 @@ def vision_apply_rotary_emb(
     key: mx.array,
     freqs_ci: mx.array,
 ) -> Tuple[mx.array, mx.array]:
-    query_ = view_as_complex(query.float().reshape(*query.shape[:-1], -1, 2))
-    key_ = view_as_complex(key.float().reshape(*key.shape[:-1], -1, 2))
+    query_ = view_as_complex(query.astype(mx.float32).reshape(*query.shape[:-1], -1, 2))
+    key_ = view_as_complex(key.astype(mx.float32).reshape(*key.shape[:-1], -1, 2))
     freqs_ci = reshape_for_broadcast(freqs_ci=freqs_ci, query=query_)
     query_out = view_as_real(query_ * freqs_ci).flatten(3)
     key_out = view_as_real(key_ * freqs_ci).flatten(3)
@@ -467,7 +467,7 @@ class Llama4UnfoldConvolution(nn.Module):
         return hidden_states
 
 
-class Llama4VisionRotaryEmbedding(nn.Module):
+class Llama4VisionRotaryEmbedding:
     def __init__(self, config):
         super().__init__()
         idx = config.image_size // config.patch_size
@@ -479,7 +479,10 @@ class Llama4VisionRotaryEmbedding(nn.Module):
         freq_dim = config.hidden_size // config.num_attention_heads // 2
         rope_freq = 1.0 / (
             config.rope_theta
-            ** (mx.arange(0, freq_dim, 2)[: (freq_dim // 2)].float() / freq_dim)
+            ** (
+                mx.arange(0, freq_dim, 2, dtype=mx.float32)[: (freq_dim // 2)]
+                / freq_dim
+            )
         )
 
         # ((frequencies_y + 1)[..., None] * rope_freq[None, None, :]).repeat_interleave(2, dim=-1)
@@ -487,10 +490,10 @@ class Llama4VisionRotaryEmbedding(nn.Module):
         freqs_x = mx.tile(freqs_x_expanded, (1, 1, 2))
         freqs_y_expanded = (frequencies_y + 1)[..., None] * rope_freq[None, None, :]
         freqs_y = mx.tile(freqs_y_expanded, (1, 1, 2))
-        freqs = (
-            mx.concatenate([freqs_x, freqs_y], axis=-1).float().contiguous()[..., ::2]
-        )
-        freqs = freqs.masked_fill(img_idx.reshape(-1, 1, 1) < 0, 0)
+        freqs = mx.concatenate([freqs_x, freqs_y], axis=-1).astype(mx.float32)[..., ::2]
+        # Replaced masked_fill with where
+        mask = img_idx.reshape(-1, 1, 1) < 0
+        freqs = mx.where(mask, mx.zeros_like(freqs), freqs)
         freq_cis = view_as_complex(mx.stack([mx.cos(freqs), mx.sin(freqs)], axis=-1))
         self.freqs_ci = freq_cis  # idx**2, idx**2, idx * 2
 
@@ -513,13 +516,8 @@ class VisionModel(nn.Module):
         self.scale = config.hidden_size**-0.5
 
         self.patch_embedding = Llama4UnfoldConvolution(config)
-
-        self.class_embedding = mx.array(
-            self.scale * mx.random.randint(0, self.hidden_size)
-        )
-        self.positional_embedding_vlm = mx.array(
-            self.scale * mx.random.randint(self.num_patches, self.hidden_size)
-        )
+        self.class_embedding = mx.ones((self.hidden_size,))
+        self.positional_embedding_vlm = mx.ones((self.num_patches, self.hidden_size))
         self.rotary_embedding = Llama4VisionRotaryEmbedding(config)
 
         # layer norms
@@ -529,7 +527,6 @@ class VisionModel(nn.Module):
         # encoders
         self.model = Llama4VisionEncoder(config)
         self.vision_adapter = Llama4VisionPixelShuffleMLP(config)
-        self.post_init()
 
     def get_input_embeddings(self):
         """

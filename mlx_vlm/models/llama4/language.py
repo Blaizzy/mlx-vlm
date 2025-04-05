@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.rope_utils import initialize_rope
 
 from ..base import LanguageModelOutput, create_attention_mask
 
@@ -35,6 +36,17 @@ class TextConfig:
     bos_token_id: int = 200000
     eos_token_id: list = None
     pad_token_id: int = 200018
+    attention_chunk_size: int = 8192
+    attention_bias: bool = False
+    interleave_moe_layer_step: int = 1
+    no_rope_layers: list = 4
+    output_router_logits: bool = False
+    router_aux_loss_coef: float = 0.001
+    router_jitter_noise: float = 0.0
+    attn_temperature_tuning: int = 4
+    floor_scale: float = 8192
+    attn_scale: float = 0.1
+    moe_layers: list = None
 
     @classmethod
     def from_dict(cls, params):
@@ -49,6 +61,13 @@ class TextConfig:
     def __post_init__(self):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
+
+        if self.moe_layers is None:
+            self.moe_layers = [
+                i
+                for i in range(self.num_hidden_layers)
+                if i % self.interleave_moe_layer_step == 0
+            ]
 
 
 def bmm(a: mx.array, b: mx.array) -> mx.array:
@@ -389,10 +408,12 @@ class Llama4TextModel(nn.Module):
         This can just be appplied over the already created attention mask
         """
         block_pos = mx.abs(
-            (mx.arange(seq_len).unsqueeze(0) // attention_chunk_size)
-            - (mx.arange(seq_len).unsqueeze(1) // attention_chunk_size)
+            (mx.expand_dims(mx.arange(seq_len), 0) // attention_chunk_size)
+            - (mx.expand_dims(mx.arange(seq_len), 1) // attention_chunk_size)
         )
-        token_pos = mx.arange(seq_len).unsqueeze(0) - mx.arange(seq_len).unsqueeze(1)
+        token_pos = mx.expand_dims(mx.arange(seq_len), 0) - mx.expand_dims(
+            mx.arange(seq_len), 1
+        )
         mask = (block_pos == 0) & (token_pos <= 0)
         return mask
 
@@ -465,7 +486,7 @@ class LanguageModel(nn.Module):
     def get_decoder(self):
         return self.model
 
-    def forward(
+    def __call__(
         self,
         input_ids: mx.array = None,
         mask: Optional[mx.array] = None,
