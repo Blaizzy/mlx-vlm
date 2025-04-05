@@ -5,8 +5,9 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 
-from ..base import KVCache, LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
 
 
 @dataclass
@@ -416,7 +417,7 @@ class Llama4TextModel(nn.Module):
             cache = [None] * len(self.layers)
 
         if chunk_size := self.config.attention_chunk_size:
-            local_mask = self.create_chunked_attention_mask(
+            chunk_causal_mask = self.create_chunked_attention_mask(
                 inputs_embeds.shape[1], chunk_size
             )
 
@@ -426,7 +427,7 @@ class Llama4TextModel(nn.Module):
 
             layer_outputs = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask,
+                attention_mask=mask,
                 chunk_causal_mask=chunk_causal_mask,
                 cache=cache,
             )
@@ -481,6 +482,19 @@ class LanguageModel(nn.Module):
         logits = self.lm_head(hidden_states)
 
         return LanguageModelOutput(logits=logits)
+
+    def make_cache(self):
+        caches = []
+        for i in range(self.args.num_hidden_layers):
+            if int((i + 1) % 4 != 0):
+                caches.append(KVCache())
+            else:
+                caches.append(RotatingKVCache())
+        return caches
+
+    @property
+    def layers(self):
+        return self.model.layers
 
 
 def scatter(input_tensor, dim, index, src):
