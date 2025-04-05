@@ -99,23 +99,23 @@ def pixel_shuffle(input_tensor, shuffle_ratio):
     batch_size, num_patches, channels = input_tensor.shape
     patch_size = int(math.sqrt(num_patches))
 
-    input_tensor = input_tensor.view(batch_size, patch_size, patch_size, -1)
-    batch_size, height, width, channels = input_tensor.size()
+    input_tensor = input_tensor.reshape(batch_size, patch_size, patch_size, -1)
+    batch_size, height, width, channels = input_tensor.shape
 
-    reshaped_tensor = input_tensor.view(
+    reshaped_tensor = input_tensor.reshape(
         batch_size, height, int(width * shuffle_ratio), int(channels / shuffle_ratio)
     )
-    reshaped_tensor = reshaped_tensor.permute(0, 2, 1, 3).contiguous()
+    reshaped_tensor = reshaped_tensor.transpose(0, 2, 1, 3).contiguous()
 
-    reshaped_tensor = reshaped_tensor.view(
+    reshaped_tensor = reshaped_tensor.reshape(
         batch_size,
         int(height * shuffle_ratio),
         int(width * shuffle_ratio),
         int(channels / (shuffle_ratio**2)),
     )
-    reshaped_tensor = reshaped_tensor.permute(0, 2, 1, 3).contiguous()
+    reshaped_tensor = reshaped_tensor.transpose(0, 2, 1, 3).contiguous()
 
-    output_tensor = reshaped_tensor.view(batch_size, -1, reshaped_tensor.shape[-1])
+    output_tensor = reshaped_tensor.reshape(batch_size, -1, reshaped_tensor.shape[-1])
     return output_tensor
 
 
@@ -138,7 +138,7 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
 def reshape_for_broadcast(freqs_ci: mx.array, query: mx.array):
     ndim = query.ndim
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(query.shape)]
-    return freqs_ci.view(*shape)
+    return freqs_ci.reshape(*shape)
 
 
 def view_as_complex(x):
@@ -591,7 +591,7 @@ class VisionModel(nn.Module):
 
         hidden_state = self.layernorm_pre(hidden_state)
 
-        hidden_state = hidden_state.view(batch_size_times_num_tiles, -1, hidden_dim)
+        hidden_state = hidden_state.reshape(batch_size_times_num_tiles, -1, hidden_dim)
         freqs_ci = self.rotary_embedding(pixel_values)
 
         output = self.model(
