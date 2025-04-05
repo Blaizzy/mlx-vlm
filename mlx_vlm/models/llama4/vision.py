@@ -611,8 +611,6 @@ class VisionModel(nn.Module):
         # now, we use Llama4VisionPixelShuffle + mlp to project embeddings
         hidden_state = self.vision_adapter(hidden_state)
 
-        hidden_states = output.hidden_states if output_hidden_states else None
-
         return hidden_state
 
     def sanitize(self, weights):
