@@ -9,7 +9,7 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
 
-from ..base import LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask, visualize_attention_mask
 
 
 @dataclass
@@ -173,10 +173,8 @@ class Llama4TextAttention(nn.Module):
             keys = self.rope(keys, offset=offset)
 
         if self.use_qk_norm:
-            queries = mx.fast.rms_norm(
-                queries, weight=None, eps=self.config.rms_norm_eps
-            )
-            keys = mx.fast.rms_norm(keys, weight=None, eps=self.config.rms_norm_eps)
+            queries = mx.fast.rms_norm(queries, weight=None, eps=1e-6)
+            keys = mx.fast.rms_norm(keys, weight=None, eps=1e-6)
 
         # Use temperature tuning from https://arxiv.org/abs/2501.19399) to NoROPE layers
         if self.attn_temperature_tuning and not self.use_rope:
@@ -193,6 +191,11 @@ class Llama4TextAttention(nn.Module):
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
+
+        if self.use_rope and mask is not None:
+            key_len = keys.shape[-2]
+            if mask.shape[-1] != key_len:
+                mask = mask[..., -key_len:]
 
         attn_output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, mask=mask, scale=self.scale
@@ -230,7 +233,11 @@ class Llama4TextDecoderLayer(nn.Module):
         chunk_causal_mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
-        if self.use_chunked_attention and chunk_causal_mask is not None:
+        if (
+            self.use_chunked_attention
+            and chunk_causal_mask is not None
+            and mask is not None
+        ):
             mask = chunk_causal_mask
 
         r = self.self_attn(self.input_layernorm(x), mask, cache)
@@ -277,6 +284,7 @@ class Llama4TextModel(nn.Module):
 
         If the chunk size is 3.
         This can just be appplied over the already created attention mask
+
         """
         block_pos = mx.abs(
             (mx.expand_dims(mx.arange(seq_len), 0) // attention_chunk_size)
@@ -285,7 +293,9 @@ class Llama4TextModel(nn.Module):
         token_pos = mx.expand_dims(mx.arange(seq_len), 0) - mx.expand_dims(
             mx.arange(seq_len), 1
         )
-        mask = (block_pos == 0) & (token_pos <= 0)
+        # (token_pos < 0) offset by one
+        # This creates a mask where the first column is empty
+        mask = (block_pos == 0) & (token_pos >= 0) & (token_pos < 0)
         return mask
 
     def __call__(
@@ -304,7 +314,6 @@ class Llama4TextModel(nn.Module):
 
         if mask is None:
             mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
 
