@@ -181,6 +181,7 @@ class Llama4VisionAttention(nn.Module):
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_key_value_groups = 1
         self.attention_dropout = config.attention_dropout
+        self.scale = 1 / math.sqrt(self.head_dim)
 
         self.q_proj = nn.Linear(
             self.embed_dim, self.num_heads * self.head_dim, bias=True
@@ -199,7 +200,7 @@ class Llama4VisionAttention(nn.Module):
         self,
         hidden_states: mx.array,
         freqs_ci: mx.array,
-        attention_mask: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
         cache: Optional[mx.array] = None,
     ):
         B, L, D = hidden_states.shape
@@ -217,7 +218,7 @@ class Llama4VisionAttention(nn.Module):
         value_states = value_states.transpose(0, 2, 1, 3)
 
         attn_output = mx.fast.scaled_dot_product_attention(
-            query_states, key_states, value_states, scale=1
+            query_states, key_states, value_states, scale=self.scale
         )
 
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, L, -1)
@@ -276,7 +277,7 @@ class Llama4VisionEncoderLayer(nn.Module):
         self,
         hidden_state: mx.array,
         freqs_ci: mx.array,
-        attention_mask: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
     ):
         # Self Attention
         residual = hidden_state
@@ -286,7 +287,7 @@ class Llama4VisionEncoderLayer(nn.Module):
         hidden_state = self.self_attn(
             hidden_state,
             freqs_ci=freqs_ci,
-            attention_mask=attention_mask,
+            mask=mask,
         )
         hidden_state = residual + hidden_state
 
@@ -321,13 +322,13 @@ class Llama4VisionEncoder(nn.Module):
         self,
         hidden_states: mx.array,
         freqs_ci: mx.array,  # TODO move this to an attribute instead of keeping it around
-        attention_mask: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
     ):
 
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(
                 hidden_state=hidden_states,
-                attention_mask=attention_mask,
+                mask=mask,
                 freqs_ci=freqs_ci,
             )
 
@@ -421,9 +422,7 @@ class Llama4UnfoldConvolution(nn.Module):
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
         hidden_states = self.unfold(hidden_states)
-        hidden_states = hidden_states.swapaxes(
-            1, 2
-        )  # MLX equivalent of permute(0, 2, 1)
+        hidden_states = hidden_states.transpose(0, 2, 1)
         hidden_states = self.linear(hidden_states)
         return hidden_states
 
@@ -446,7 +445,6 @@ class Llama4VisionRotaryEmbedding:
             )
         )
 
-        # ((frequencies_y + 1)[..., None] * rope_freq[None, None, :]).repeat_interleave(2, dim=-1)
         # Expand dimensions for frequencies_x and frequencies_y
         freqs_x_expanded = (frequencies_x + 1)[..., None] * rope_freq[None, None, :]
         freqs_y_expanded = (frequencies_y + 1)[..., None] * rope_freq[None, None, :]
@@ -471,7 +469,8 @@ class Llama4VisionRotaryEmbedding:
         # Replaced masked_fill with where
         mask = img_idx.reshape(-1, 1, 1) < 0
         freqs = mx.where(mask, mx.zeros_like(freqs), freqs)
-        freq_cis = view_as_complex(mx.stack([mx.cos(freqs), mx.sin(freqs)], axis=-1))
+        freq_cis = mx.stack([mx.cos(freqs), mx.sin(freqs)], axis=-1)
+        freq_cis = view_as_complex(freq_cis)
         self.freqs_ci = freq_cis  # idx**2, idx**2, idx * 2
 
     def __call__(self, hidden_states):
@@ -493,8 +492,10 @@ class VisionModel(nn.Module):
         self.scale = config.hidden_size**-0.5
 
         self.patch_embedding = Llama4UnfoldConvolution(config)
-        self.class_embedding = mx.ones((self.hidden_size,))
-        self.positional_embedding_vlm = mx.ones((self.num_patches, self.hidden_size))
+        self.class_embedding = self.scale * mx.random.normal((self.hidden_size,))
+        self.positional_embedding_vlm = self.scale * mx.random.normal(
+            (self.num_patches, self.hidden_size)
+        )
         self.rotary_embedding = Llama4VisionRotaryEmbedding(config)
 
         # layer norms
@@ -531,10 +532,9 @@ class VisionModel(nn.Module):
             num_patches,
             hidden_dim,
         )
-        class_embedding = mx.repeat(
-            mx.expand_dims(self.class_embedding, axis=(0, 1)),
-            repeats=hidden_state.shape[0],
-            axis=0,
+
+        class_embedding = mx.broadcast_to(
+            self.class_embedding, (hidden_state.shape[0], 1, hidden_state.shape[-1])
         )
 
         hidden_state = mx.concatenate([hidden_state, class_embedding], axis=1)
@@ -547,6 +547,7 @@ class VisionModel(nn.Module):
             num_patches,
             hidden_dim,
         )
+
         positional_embedding = self.positional_embedding_vlm.astype(hidden_state.dtype)
         hidden_state = hidden_state + positional_embedding
 
@@ -557,7 +558,7 @@ class VisionModel(nn.Module):
 
         hidden_state = self.model(
             hidden_state,
-            attention_mask=None,
+            mask=None,
             freqs_ci=freqs_ci,
         )
 
