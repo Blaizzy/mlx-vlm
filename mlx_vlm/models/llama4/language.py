@@ -202,53 +202,53 @@ class Llama4TextAttention(nn.Module):
             self.config.rope_scaling,
             self.config.max_position_embeddings,
         )
-        if self.config.use_qk_norm and self.use_rope:
-            self.qk_norm = Llama4TextL2Norm()
+        self.use_qk_norm = self.config.use_qk_norm and self.use_rope
 
     def __call__(
         self,
-        hidden_states: mx.array,
-        attention_mask: Optional[mx.array],
+        x: mx.array,
+        mask: Optional[mx.array],
         cache: Optional[Any] = None,
     ):
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+        B, L, D = x.shape
+        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        queries = self.q_proj(hidden_states).reshape(hidden_shape)
-        keys = self.k_proj(hidden_states).reshape(hidden_shape)
-        values = self.v_proj(hidden_states).reshape(hidden_shape).transpose(1, 2)
+        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+
+        if cache is not None:
+            offset = cache.offset
+        else:
+            offset = 0
 
         if self.use_rope:  # the 16E model skips rope for long context on certain layers
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
+            queries = self.rope(queries, offset=offset)
+            keys = self.rope(keys, offset=offset)
 
-        if hasattr(self, "qk_norm"):  # the 128E model does not use qk_norm
-            queries = self.qk_norm(queries)
-            keys = self.qk_norm(keys)
+        if self.use_qk_norm:
+            queries = mx.fast.rms_norm(queries, weight=None, eps=self.qk_norm.eps)
+            keys = mx.fast.rms_norm(keys, weight=None, eps=self.qk_norm.eps)
 
         # Use temperature tuning from https://arxiv.org/abs/2501.19399) to NoROPE layers
         if self.attn_temperature_tuning and not self.use_rope:
             attn_scales = (
-                mx.log(mx.floor((float(cache.offset) + 1.0) / self.floor_scale) + 1.0)
+                mx.log(mx.floor((float(offset) + 1.0) / self.floor_scale) + 1.0)
                 * self.attn_scale
                 + 1.0
             )
-            attn_scales = attn_scales.reshape((*input_shape, 1, 1))
-            queries = (queries * attn_scales).to(queries.dtype)
-
-        queries = queries.transpose(1, 2)
-        keys = keys.transpose(1, 2)
+            attn_scales = attn_scales[:, None]
+            queries = (queries * attn_scales).astype(queries.dtype)
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
         attn_output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, mask=attention_mask, scale=self.scale
+            queries, keys, values, mask=mask, scale=self.scale
         )
 
-        attn_output = attn_output.reshape(*input_shape, -1)
-        attn_output = self.o_proj(attn_output)
-        return attn_output
+        attn_output = attn_output.reshape(B, L, -1)
+        return self.o_proj(attn_output)
 
 
 class Llama4TextDecoderLayer(nn.Module):
