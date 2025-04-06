@@ -63,100 +63,52 @@ class TextConfig:
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
-        if self.moe_layers is None:
-            self.moe_layers = [
-                i
-                for i in range(self.num_hidden_layers)
-                if i % self.interleave_moe_layer_step == 0
-            ]
 
-
-class Llama4TextMLP(nn.Module):
-    def __init__(self, config, intermediate_size=None):
+class Attention(nn.Module):
+    def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
 
-        if intermediate_size is None:
-            intermediate_size = config.intermediate_size
-
-        self.config = config
-        self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
-        self.activation_fn = nn.SiLU()
-
-    def __call__(self, x):
-        down_proj = self.activation_fn(self.gate_proj(x)) * self.up_proj(x)
-        return self.down_proj(down_proj)
-
-
-class Llama4TextMoe(nn.Module):
-    def __init__(self, config: TextConfig):
-        super().__init__()
-        self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_local_experts
-        self.experts = SwitchGLU(
-            config.hidden_size, config.intermediate_size, self.num_experts
-        )
-        self.router = nn.Linear(
-            config.hidden_size, config.num_local_experts, bias=False
-        )
-        self.shared_expert = Llama4TextMLP(config)
-
-    def __call__(self, x) -> mx.array:
-        logits = self.router(x)
-        k = self.top_k
-        indices = mx.argpartition(-logits, kth=k - 1, axis=-1)[..., :k]
-        scores = mx.take_along_axis(logits, indices, axis=-1)
-        scores = mx.sigmoid(scores.astype(mx.float32)).astype(x.dtype)
-
-        out = self.experts(x * scores, indices).squeeze(2)
-        return out + self.shared_expert(x)
-
-
-class Llama4TextAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
-    def __init__(self, config: TextConfig, layer_idx):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        self.head_dim = head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
-        self.attention_bias = attention_bias = getattr(config, "attention_bias", False)
         dim = config.hidden_size
         self.n_heads = n_heads = config.num_attention_heads
         self.n_kv_heads = n_kv_heads = config.num_key_value_heads
-
-        self.scale = head_dim**-0.5
 
         self.use_rope = int((layer_idx + 1) % 4 != 0)  # rope unused for dense layers
         self.attn_temperature_tuning = config.attn_temperature_tuning
         self.floor_scale = config.floor_scale
         self.attn_scale = config.attn_scale
 
+        self.head_dim = head_dim = config.head_dim or config.hidden_size // n_heads
+
+        self.scale = head_dim**-0.5
+        if hasattr(config, "attention_bias"):
+            attention_bias = config.attention_bias
+        else:
+            attention_bias = False
+
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=attention_bias)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=attention_bias)
 
+        self.use_qk_norm = config.use_qk_norm and self.use_rope
+
         if self.use_rope:
             self.rope = initialize_rope(
-                self.head_dim,
-                self.config.rope_theta,
-                self.config.rope_traditional,
-                self.config.rope_scaling,
-                self.config.max_position_embeddings,
+                head_dim,
+                config.rope_theta,
+                traditional=True,
+                scaling_config=config.rope_scaling,
+                max_position_embeddings=config.max_position_embeddings,
             )
-        self.use_qk_norm = self.config.use_qk_norm and self.use_rope
 
     def __call__(
         self,
         x: mx.array,
-        mask: Optional[mx.array],
+        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-    ):
+    ) -> mx.array:
         B, L, D = x.shape
+
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
@@ -168,7 +120,7 @@ class Llama4TextAttention(nn.Module):
         else:
             offset = 0
 
-        if self.use_rope:  # the 16E model skips rope for long context on certain layers
+        if self.use_rope:
             queries = self.rope(queries, offset=offset)
             keys = self.rope(keys, offset=offset)
 
@@ -176,7 +128,6 @@ class Llama4TextAttention(nn.Module):
             queries = mx.fast.rms_norm(queries, weight=None, eps=1e-6)
             keys = mx.fast.rms_norm(keys, weight=None, eps=1e-6)
 
-        # Use temperature tuning from https://arxiv.org/abs/2501.19399) to NoROPE layers
         if self.attn_temperature_tuning and not self.use_rope:
             attn_scales = (
                 mx.log(
@@ -192,221 +143,148 @@ class Llama4TextAttention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
-        if self.use_rope and mask is not None:
-            key_len = keys.shape[-2]
-            if mask.shape[-1] != key_len:
-                mask = mask[..., -key_len:]
-
-        attn_output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, mask=mask, scale=self.scale
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=self.scale, mask=mask
         )
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(output)
 
-        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(attn_output)
 
-
-class Llama4TextDecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx):
+class MLP(nn.Module):
+    def __init__(self, config: TextConfig, intermediate_size: int = None):
         super().__init__()
+
+        dim = config.hidden_size
+        hidden_dim = intermediate_size or config.intermediate_size
+
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+
+    def __call__(self, x) -> mx.array:
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class MoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_local_experts
+        self.experts = SwitchGLU(
+            config.hidden_size, config.intermediate_size, self.num_experts
+        )
+        self.router = nn.Linear(
+            config.hidden_size, config.num_local_experts, bias=False
+        )
+        self.shared_expert = MLP(config)
+
+    def __call__(self, x) -> mx.array:
+        logits = self.router(x)
+        k = self.top_k
+        indices = mx.argpartition(-logits, kth=k - 1, axis=-1)[..., :k]
+        scores = mx.take_along_axis(logits, indices, axis=-1)
+        scores = mx.sigmoid(scores.astype(mx.float32)).astype(x.dtype)
+
+        out = self.experts(x * scores, indices).squeeze(2)
+        return out + self.shared_expert(x)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, config: TextConfig, layer_idx: int):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
-        self.self_attn = Llama4TextAttention(config, layer_idx)
-        self.use_chunked_attention = int((layer_idx + 1) % 4 != 0)  # <=> use rope
-        self.is_moe_layer = layer_idx in config.moe_layers
-        if self.is_moe_layer:  # the 128E model interleaves dense / sparse
-            self.feed_forward = Llama4TextMoe(config)
+        self.self_attn = Attention(config, layer_idx)
+        self.use_chunked_attention = int((layer_idx + 1) % 4 != 0)
+        self.is_moe_layer = (layer_idx % config.interleave_moe_layer_step) == (
+            config.interleave_moe_layer_step - 1
+        )
+        if self.is_moe_layer:
+            self.feed_forward = MoE(config)
         else:
-            self.feed_forward = Llama4TextMLP(
-                config, intermediate_size=config.intermediate_size_mlp
-            )
+            self.feed_forward = MLP(config, config.intermediate_size_mlp)
 
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-
-        self.layer_idx = layer_idx
+        self.config = config
 
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
-        chunk_causal_mask: Optional[mx.array] = None,
+        chunked_mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-    ):
-        if (
-            self.use_chunked_attention
-            and chunk_causal_mask is not None
-            and mask is not None
-        ):
-            mask = chunk_causal_mask
-
+    ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
         r = self.feed_forward(self.post_attention_layernorm(h))
         out = h + r
-
         return out
 
 
-class Llama4TextModel(nn.Module):
+class LlamaModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
-        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.num_hidden_layers = config.num_hidden_layers
         assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
-            Llama4TextDecoderLayer(config, layer_idx)
-            for layer_idx in range(config.num_hidden_layers)
+            TransformerBlock(config, i) for i in range(config.num_hidden_layers)
         ]
-
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.embed_tokens = value
-
-    def create_chunked_attention_mask(
-        self, seq_len: int, attention_chunk_size: int
-    ) -> mx.array:
-        """
-        Generate the following:
-
-        'What'      :  0 ■ ⬚ ⬚ ⬚ ⬚ ⬚    |
-        '▁is'       :  1 ■ ■ ⬚ ⬚ ⬚ ⬚     |
-        '▁ch'       :  2 ■ ■ ■ ⬚ ⬚ ⬚     |
-        'unked'     :  3 ⬚ ⬚ ⬚ ■ ⬚ ⬚    |
-        '▁attention':  4 ⬚ ⬚ ⬚ ■ ■ ⬚    |
-        '?'         :  5 ⬚ ⬚ ⬚ ■ ■ ■     |
-
-        If the chunk size is 3.
-        This can just be appplied over the already created attention mask
-
-        """
-        block_pos = mx.abs(
-            (mx.expand_dims(mx.arange(seq_len), 0) // attention_chunk_size)
-            - (mx.expand_dims(mx.arange(seq_len), 1) // attention_chunk_size)
-        )
-        token_pos = mx.expand_dims(mx.arange(seq_len), 0) - mx.expand_dims(
-            mx.arange(seq_len), 1
-        )
-        # (token_pos < 0) offset by one
-        # This creates a mask where the first column is empty
-        mask = (block_pos == 0) & (token_pos >= 0) & (token_pos < 0)
-        return mask
 
     def __call__(
         self,
         input_ids: mx.array = None,
         input_embeds: mx.array = None,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-        output_hidden_states: Optional[bool] = None,
+        mask: mx.array = None,
+        cache=None,
     ):
-
-        if input_embeds is None:
+        if input_ids is not None:
             h = self.embed_tokens(input_ids)
         else:
             h = input_embeds
 
         if mask is None:
             mask = create_attention_mask(h, cache)
+
         if cache is None:
             cache = [None] * len(self.layers)
 
-        chunk_causal_mask = None
-        if chunk_size := self.config.attention_chunk_size:
-            chunk_causal_mask = self.create_chunked_attention_mask(
-                h.shape[1], chunk_size
-            ).astype(h.dtype)
+        chunked_mask = None
 
         for layer, c in zip(self.layers, cache):
-
-            h = layer(
-                h,
-                mask=mask,
-                chunk_causal_mask=chunk_causal_mask,
-                cache=c,
-            )
+            h = layer(h, mask, chunked_mask, cache=c)
 
         return self.norm(h)
 
 
 class LanguageModel(nn.Module):
-
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
-        self.model = Llama4TextModel(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
-
-    def set_decoder(self, decoder):
-        self.model = decoder
-
-    def get_decoder(self):
-        return self.model
+        self.model_type = config.model_type
+        self.model = LlamaModel(self.config)
+        self.lm_head = nn.Linear(
+            self.config.hidden_size, self.config.vocab_size, bias=False
+        )
 
     def __call__(
         self,
         input_ids: mx.array = None,
         input_embeds: mx.array = None,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
+        mask: mx.array = None,
+        cache=None,
     ):
-        outputs = self.model(
-            input_ids=input_ids,
-            input_embeds=input_embeds,
-            mask=mask,
-            cache=cache,
-        )
-
-        logits = self.lm_head(outputs)
-
-        return LanguageModelOutput(logits=logits)
-
-    def make_cache(self):
-        caches = []
-        for i in range(self.config.num_hidden_layers):
-            if (i + 1) % 4 != 0:
-                caches.append(KVCache())
-            else:
-                caches.append(
-                    RotatingKVCache(
-                        max_size=self.config.attention_chunk_size,
-                    )
-                )
-        return caches
-
-    @property
-    def n_kv_heads(self):
-        return self.config.num_key_value_heads
-
-    @property
-    def head_dim(self):
-        return self.config.hidden_size // self.config.num_attention_heads
-
-    @property
-    def layers(self):
-        return self.model.layers
+        out = self.model(input_ids, input_embeds, mask, cache)
+        out = self.lm_head(out)
+        return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
-
         # Rename expert weights for SwitchGLU
         for l in range(self.config.num_hidden_layers):
             prefix = f"language_model.model.layers.{l}.feed_forward.experts"
@@ -421,3 +299,19 @@ class LanguageModel(nn.Module):
                 down_proj = weights.pop(f"{prefix}.down_proj")
                 weights[f"{prefix}.down_proj.weight"] = mx.swapaxes(down_proj, 1, 2)
         return weights
+
+    @property
+    def layers(self):
+        return self.model.layers
+
+    @property
+    def n_kv_heads(self):
+        return self.config.num_key_value_heads
+
+    @property
+    def head_dim(self):
+        return (
+            self.config.head_dim
+            if self.config.head_dim
+            else self.config.hidden_size // self.config.num_attention_heads
+        )
