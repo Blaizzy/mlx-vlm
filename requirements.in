@@ -1,0 +1,11 @@
+mlx>=0.22.0
+mlx-lm>=0.21.5
+datasets
+tqdm
+numpy
+transformers
+scipy
+gradio
+Pillow
+requests
+opencv-python
