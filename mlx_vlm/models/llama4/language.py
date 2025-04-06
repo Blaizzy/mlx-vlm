@@ -230,6 +230,9 @@ class Llama4TextDecoderLayer(nn.Module):
         chunk_causal_mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
+        if self.use_chunked_attention and chunk_causal_mask is not None:
+            mask = chunk_causal_mask
+
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
         r = self.feed_forward(self.post_attention_layernorm(h))
@@ -298,7 +301,7 @@ class Llama4TextModel(nn.Module):
             raise ValueError("You must specify input_ids")
 
         if input_embeds is None:
-            h = self.embed_tokens(input_ids.astype(self.embed_tokens.weight.dtype))
+            h = self.embed_tokens(input_ids)
         else:
             h = input_embeds
 
@@ -312,7 +315,7 @@ class Llama4TextModel(nn.Module):
         if chunk_size := self.config.attention_chunk_size:
             chunk_causal_mask = self.create_chunked_attention_mask(
                 h.shape[1], chunk_size
-            )
+            ).astype(h.dtype)
 
         for layer, c in zip(self.layers, cache):
 
@@ -371,14 +374,18 @@ class LanguageModel(nn.Module):
 
         return LanguageModelOutput(logits=logits)
 
-    # def make_cache(self):
-    #     caches = []
-    #     for i in range(self.config.num_hidden_layers):
-    #         if int((i + 1) % 4 != 0):
-    #             caches.append(KVCache())
-    #         else:
-    #             caches.append(RotatingKVCache())
-    #     return caches
+    def make_cache(self):
+        caches = []
+        for i in range(self.config.num_hidden_layers):
+            if (i + 1) % 4 != 0:
+                caches.append(KVCache())
+            else:
+                caches.append(
+                    RotatingKVCache(
+                        max_size=self.config.attention_chunk_size,
+                    )
+                )
+        return caches
 
     @property
     def n_kv_heads(self):
