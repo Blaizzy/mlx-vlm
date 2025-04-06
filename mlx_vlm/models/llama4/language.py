@@ -143,6 +143,11 @@ class Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
+        if self.use_rope and isinstance(mask, mx.array):
+            key_len = keys.shape[-2]
+            if mask.shape[-1] != key_len:
+                mask = mask[..., -key_len:]
+
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
         )
@@ -210,13 +215,15 @@ class TransformerBlock(nn.Module):
         )
         self.config = config
 
+        self.use_chunked_attention = int((layer_idx + 1) % 4 != 0)  # <=> use rope
+
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
-        chunked_mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
+
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
         r = self.feed_forward(self.post_attention_layernorm(h))
@@ -237,6 +244,34 @@ class LlamaModel(nn.Module):
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def create_chunked_attention_mask(
+        self, seq_len: int, attention_chunk_size: int, offset: int = 0
+    ) -> mx.array:
+        """
+        Generate the following:
+
+        'What'      :  0 ■ ⬚ ⬚ ⬚ ⬚ ⬚    |
+        '▁is'       :  1 ■ ■ ⬚ ⬚ ⬚ ⬚     |
+        '▁ch'       :  2 ■ ■ ■ ⬚ ⬚ ⬚     |
+        'unked'     :  3 ⬚ ⬚ ⬚ ■ ⬚ ⬚    |
+        '▁attention':  4 ⬚ ⬚ ⬚ ■ ■ ⬚    |
+        '?'         :  5 ⬚ ⬚ ⬚ ■ ■ ■     |
+
+        If the chunk size is 3.
+        This can just be appplied over the already created attention mask
+
+        """
+        start = 0
+        end = offset + seq_len
+        linds = mx.arange(start, end)
+        rinds = mx.arange(start + offset, end)[:, None]
+        block_pos = mx.abs(
+            (linds // attention_chunk_size) - (rinds // attention_chunk_size)
+        )
+        token_pos = linds <= rinds
+        mask = (block_pos == 0) & (token_pos)
+        return mask
+
     def __call__(
         self,
         input_ids: mx.array = None,
@@ -255,10 +290,23 @@ class LlamaModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        chunked_mask = None
+        if cache is not None:
+            offset = cache[0].offset
+        else:
+            offset = 0
 
-        for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, chunked_mask, cache=c)
+        # Create a mask for the chunked attention
+        chunk_mask = self.create_chunked_attention_mask(
+            h.shape[1], self.config.attention_chunk_size, offset
+        )
+
+        for idx, (layer, c) in enumerate(zip(self.layers, cache)):
+            use_chunked_attention = int((idx + 1) % 4 != 0)
+            if use_chunked_attention:
+                local_mask = chunk_mask
+            else:
+                local_mask = mask
+            h = layer(h, local_mask, cache=c)
 
         return self.norm(h)
 
@@ -315,3 +363,14 @@ class LanguageModel(nn.Module):
             if self.config.head_dim
             else self.config.hidden_size // self.config.num_attention_heads
         )
+
+    def make_cache(self):
+        caches = []
+        for i in range(self.config.num_hidden_layers):
+            if (i + 1) % 4 != 0:
+                caches.append(KVCache())
+            else:
+                caches.append(
+                    RotatingKVCache(max_size=self.config.attention_chunk_size, keep=0)
+                )
+        return caches
