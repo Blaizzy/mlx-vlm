@@ -245,7 +245,7 @@ class LlamaModel(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def create_chunked_attention_mask(
-        self, seq_len: int, attention_chunk_size: int, offset: int = 0
+        self, seq_len: int, attention_chunk_size: int, start: int = 0, offset: int = 0
     ) -> mx.array:
         """
         Generate the following:
@@ -259,12 +259,11 @@ class LlamaModel(nn.Module):
 
         If the chunk size is 3.
         This can just be appplied over the already created attention mask
-
         """
-        start = 0
+
         end = offset + seq_len
         linds = mx.arange(start, end)
-        rinds = mx.arange(start + offset, end)[:, None]
+        rinds = mx.arange(offset, end)[:, None]
         block_pos = mx.abs(
             (linds // attention_chunk_size) - (rinds // attention_chunk_size)
         )
@@ -284,6 +283,11 @@ class LlamaModel(nn.Module):
         else:
             h = input_embeds
 
+        if cache is not None:
+            for idx, c in enumerate(cache):
+                if (idx + 1) % 4 != 0:
+                    c.update()
+
         if mask is None:
             mask = create_attention_mask(h, cache)
 
@@ -291,17 +295,19 @@ class LlamaModel(nn.Module):
             cache = [None] * len(self.layers)
 
         if cache is not None:
+            start = cache[0].start_position
             offset = cache[0].offset
         else:
+            start = 0
             offset = 0
 
         # Create a mask for the chunked attention
         chunk_mask = self.create_chunked_attention_mask(
-            h.shape[1], self.config.attention_chunk_size, offset
+            h.shape[1], self.config.attention_chunk_size, start, offset
         )
 
         for idx, (layer, c) in enumerate(zip(self.layers, cache)):
-            use_chunked_attention = int((idx + 1) % 4 != 0)
+            use_chunked_attention = (idx + 1) % 4 != 0
             if use_chunked_attention:
                 local_mask = chunk_mask
             else:
@@ -309,6 +315,50 @@ class LlamaModel(nn.Module):
             h = layer(h, local_mask, cache=c)
 
         return self.norm(h)
+
+
+class ChunkedKVCache(KVCache):
+    def __init__(self, chunk_size):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.start_position = 0
+
+    def update(self):
+        # Maintain the cache below the chunk size
+        if self.keys is not None and self.keys.shape[2] >= self.chunk_size:
+            self.keys = self.keys[..., self.chunk_size :, :]
+            self.values = self.values[..., self.chunk_size :, :]
+            self.start_position += self.chunk_size
+
+    def update_and_fetch(self, keys, values):
+        prev = self.offset - self.start_position
+        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
+            B, n_kv_heads, _, k_head_dim = keys.shape
+            v_head_dim = values.shape[3]
+            n_steps = (self.step + keys.shape[2] - 1) // self.step
+            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
+            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
+            new_k = mx.zeros(k_shape, keys.dtype)
+            new_v = mx.zeros(v_shape, values.dtype)
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = self.keys[..., :prev, :]
+                    self.values = self.values[..., :prev, :]
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                self.values = mx.concatenate([self.values, new_v], axis=2)
+            else:
+                self.keys, self.values = new_k, new_v
+
+        self.offset += keys.shape[2]
+        end = self.offset - self.start_position
+        self.keys[..., prev:end, :] = keys
+        self.values[..., prev:end, :] = values
+        return self.keys[..., :end, :], self.values[..., :end, :]
+
+    def trim(self, n):
+        n = min(self.offset - self.start_position, n)
+        self.offset -= n
+        return n
 
 
 class LanguageModel(nn.Module):
@@ -328,7 +378,12 @@ class LanguageModel(nn.Module):
         mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(input_ids, input_embeds, mask, cache)
+        out = self.model(
+            input_ids=input_ids,
+            input_embeds=input_embeds,
+            mask=mask,
+            cache=cache,
+        )
         out = self.lm_head(out)
         return LanguageModelOutput(logits=out)
 
@@ -368,9 +423,7 @@ class LanguageModel(nn.Module):
         caches = []
         for i in range(self.config.num_hidden_layers):
             if (i + 1) % 4 != 0:
-                caches.append(KVCache())
+                caches.append(ChunkedKVCache(self.config.attention_chunk_size))
             else:
-                caches.append(
-                    RotatingKVCache(max_size=self.config.attention_chunk_size, keep=0)
-                )
+                caches.append(KVCache())  # no chunking for dense layers
         return caches
