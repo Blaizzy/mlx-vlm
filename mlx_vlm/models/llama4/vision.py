@@ -421,8 +421,8 @@ class Llama4UnfoldConvolution(nn.Module):
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
         hidden_states = self.unfold(hidden_states)
-        hidden_states = mx.transpose(
-            hidden_states, [0, 2, 1]
+        hidden_states = hidden_states.swapaxes(
+            1, 2
         )  # MLX equivalent of permute(0, 2, 1)
         hidden_states = self.linear(hidden_states)
         return hidden_states
@@ -447,10 +447,26 @@ class Llama4VisionRotaryEmbedding:
         )
 
         # ((frequencies_y + 1)[..., None] * rope_freq[None, None, :]).repeat_interleave(2, dim=-1)
+        # Expand dimensions for frequencies_x and frequencies_y
         freqs_x_expanded = (frequencies_x + 1)[..., None] * rope_freq[None, None, :]
-        freqs_x = mx.tile(freqs_x_expanded, (1, 1, 2))
         freqs_y_expanded = (frequencies_y + 1)[..., None] * rope_freq[None, None, :]
-        freqs_y = mx.tile(freqs_y_expanded, (1, 1, 2))
+
+        def repeat_interleave(tensor, repeats, dim=-1):
+            # Get the shape
+            shape = list(tensor.shape)
+
+            # Reshape to add an extra dimension for repeating
+            tensor = mx.reshape(tensor, shape[:-1] + [shape[-1], 1])
+
+            # Repeat along the new dimension
+            tensor = mx.repeat(tensor, repeats, axis=-1)
+
+            # Reshape to flatten the last two dimensions
+            return mx.reshape(tensor, shape[:-1] + [shape[-1] * repeats])
+
+        # Apply interleaving
+        freqs_x = repeat_interleave(freqs_x_expanded, 2)
+        freqs_y = repeat_interleave(freqs_y_expanded, 2)
         freqs = mx.concatenate([freqs_x, freqs_y], axis=-1).astype(mx.float32)[..., ::2]
         # Replaced masked_fill with where
         mask = img_idx.reshape(-1, 1, 1) < 0

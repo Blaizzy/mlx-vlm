@@ -297,9 +297,6 @@ class Llama4TextModel(nn.Module):
         output_hidden_states: Optional[bool] = None,
     ):
 
-        if input_ids is None:
-            raise ValueError("You must specify input_ids")
-
         if input_embeds is None:
             h = self.embed_tokens(input_ids)
         else:
