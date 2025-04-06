@@ -41,8 +41,8 @@ class ModelConfig:
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.config = config
         self.vision_model = VisionModel(config.vision_config)
-
         self.multi_modal_projector = Llama4MultiModalProjector(config)
         self.language_model = LanguageModel(config.text_config)
         self.vocab_size = config.text_config.vocab_size
@@ -99,7 +99,7 @@ class Model(nn.Module):
             ),
         )
 
-        vision_flat = image_features.reshape(-1, image_features.size(-1))
+        vision_flat = image_features.reshape(-1, image_features.shape[-1])
         projected_vision_flat = self.multi_modal_projector(vision_flat)
 
         # Insert special image tokens in the input_ids
@@ -113,16 +113,8 @@ class Model(nn.Module):
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = np.where(input_ids == image_token_index)[1].tolist()
-        num_images, _, vision_hidden_size = image_features.shape
 
-        reshaped_image_hidden_states = image_features.reshape(-1, vision_hidden_size)
-
-        # cast to the dtype of the input_embeds to support quantized models
-        reshaped_image_hidden_states = reshaped_image_hidden_states.astype(
-            inputs_embeds.dtype
-        )
-
-        inputs_embeds[:, image_positions, :] = reshaped_image_hidden_states
+        inputs_embeds[:, image_positions, :] = image_features
 
         return inputs_embeds
 
@@ -137,7 +129,7 @@ class Model(nn.Module):
         input_embeddings = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
 
         logits = self.language_model(
-            inputs=input_ids, cache=cache, inputs_embeds=input_embeddings
+            input_ids=input_ids, cache=cache, input_embeds=input_embeddings
         )
 
         return logits
