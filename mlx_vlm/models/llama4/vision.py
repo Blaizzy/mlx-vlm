@@ -422,7 +422,7 @@ class Llama4UnfoldConvolution(nn.Module):
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
         hidden_states = self.unfold(hidden_states)
-        hidden_states = hidden_states.transpose(0, 2, 1)
+        hidden_states = hidden_states.swapaxes(1, 2)
         hidden_states = self.linear(hidden_states)
         return hidden_states
 
