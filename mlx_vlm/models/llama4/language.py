@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.rope_utils import initialize_rope
+from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import LanguageModelOutput, create_attention_mask
 
@@ -70,43 +71,6 @@ class TextConfig:
             ]
 
 
-def bmm(a: mx.array, b: mx.array) -> mx.array:
-    """
-    Performs a batch matrix-matrix product using einsum.
-
-    Args:
-        a: Tensor of shape (b, n, m)
-        b: Tensor of shape (b, m, p)
-
-    Returns:
-        Tensor of shape (b, n, p)
-    """
-    return mx.einsum("bij,bjk->bik", a, b)
-
-
-class Llama4TextExperts(nn.Module):
-    def __init__(self, config: TextConfig):
-        super().__init__()
-        self.num_experts = config.num_local_experts
-        self.intermediate_size = config.intermediate_size
-        self.hidden_size = config.hidden_size
-        self.expert_dim = self.intermediate_size
-        self.gate_up_proj = mx.ones(
-            (self.num_experts, self.hidden_size, 2 * self.expert_dim)
-        )
-        self.down_proj = mx.ones((self.num_experts, self.expert_dim, self.hidden_size))
-        self.act_fn = nn.SiLU()
-
-    def __call__(self, hidden_states: mx.array) -> mx.array:
-
-        hidden_states = hidden_states.reshape(self.num_experts, -1, self.hidden_size)
-        gate_up = bmm(hidden_states, self.gate_up_proj)
-        gate, up = mx.split(gate_up, 2, axis=-1)
-        next_states = bmm((up * self.act_fn(gate)), self.down_proj)
-        next_states = next_states.reshape(-1, self.hidden_size)
-        return next_states
-
-
 class Llama4TextMLP(nn.Module):
     def __init__(self, config, intermediate_size=None):
         super().__init__()
@@ -165,52 +129,27 @@ class Llama4TextRMSNorm(nn.Module):
 
 
 class Llama4TextMoe(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: TextConfig):
         super().__init__()
         self.top_k = config.num_experts_per_tok
-        self.hidden_dim = config.hidden_size
         self.num_experts = config.num_local_experts
-        self.experts = Llama4TextExperts(config)
+        self.experts = SwitchGLU(
+            config.hidden_size, config.intermediate_size, self.num_experts
+        )
         self.router = nn.Linear(
             config.hidden_size, config.num_local_experts, bias=False
         )
         self.shared_expert = Llama4TextMLP(config)
 
-    def __call__(self, hidden_states):
-        batch, seq_len, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = self.router(hidden_states).transpose(0, 2, 1)
-        tokens_per_expert = batch * seq_len
+    def __call__(self, x) -> mx.array:
+        logits = self.router(x)
+        k = self.top_k
+        indices = mx.argpartition(-logits, kth=k - 1, axis=-1)[..., :k]
+        scores = mx.take_along_axis(logits, indices, axis=-1)
+        scores = mx.sigmoid(scores.astype(mx.float32)).astype(x.dtype)
 
-        router_top_value, router_indices = mx.argpartition(
-            router_logits.transpose(0, 2, 1), self.top_k, axis=1
-        )
-        router_scores = scatter(
-            mx.full(router_logits.transpose(0, 2, 1), float("-inf")),
-            1,
-            router_indices,
-            router_top_value,
-        ).transpose(0, 2, 1)
-        # We do this to make sure we have -inf for non topK tokens before going through the !
-        # Here we are just creating a tensor to index each and every single one of the hidden states. Let s maybe register a buffer for this!
-        router_indices = (
-            mx.arange(tokens_per_expert)
-            .reshape(1, -1)
-            .expand(router_scores.shape[0], -1)
-        )
-        router_scores = mx.sigmoid(router_scores.float()).to(hidden_states.dtype)
-
-        router_indices = router_indices.reshape(-1, 1).expand(-1, hidden_dim)
-        routed_in = mx.take_along_axis(hidden_states, router_indices, axis=0)
-        # we gather inputs corresponding to each expert based on the router indices
-        routed_in = routed_in * router_scores.reshape(-1, 1)
-        routed_out = self.experts(routed_in)
-        out = self.shared_expert(hidden_states)
-        # now that we finished expert computation -> we scatter add because we gathered previously
-        # we have to do this because we used all experts on all tokens. This is faster than the for loop, tho you are compute bound
-        # this scales a lot better if you do EP!
-        out = scatter_add(out, 0, router_indices, routed_out.reshape(-1, hidden_dim))
-        return out, router_scores
+        out = self.experts(x * scores, indices).squeeze(2)
+        return out + self.shared_expert(x)
 
 
 class Llama4TextAttention(nn.Module):
@@ -420,7 +359,7 @@ class Llama4TextModel(nn.Module):
     def __call__(
         self,
         input_ids: mx.array = None,
-        attention_mask: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         output_hidden_states: Optional[bool] = None,
     ):
@@ -433,10 +372,12 @@ class Llama4TextModel(nn.Module):
         )
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            mask = create_attention_mask(inputs_embeds, cache)
+
         if cache is None:
             cache = [None] * len(self.layers)
 
+        chunk_causal_mask = None
         if chunk_size := self.config.attention_chunk_size:
             chunk_causal_mask = self.create_chunked_attention_mask(
                 inputs_embeds.shape[1], chunk_size
@@ -453,7 +394,7 @@ class Llama4TextModel(nn.Module):
                 cache=cache,
             )
 
-            hidden_states = layer_outputs[0]
+            hidden_states = layer_outputs
 
         hidden_states = self.norm(hidden_states)
 
@@ -464,6 +405,7 @@ class LanguageModel(nn.Module):
 
     def __init__(self, config: TextConfig):
         super().__init__()
+        self.config = config
         self.model = Llama4TextModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -506,7 +448,7 @@ class LanguageModel(nn.Module):
 
     def make_cache(self):
         caches = []
-        for i in range(self.args.num_hidden_layers):
+        for i in range(self.config.num_hidden_layers):
             if int((i + 1) % 4 != 0):
                 caches.append(KVCache())
             else:
@@ -517,70 +459,19 @@ class LanguageModel(nn.Module):
     def layers(self):
         return self.model.layers
 
+    def sanitize(self, weights):
 
-def scatter(input_tensor, dim, index, src):
-    """
-    Writes values from src into input_tensor at the indices specified in index (functional version).
-
-    Args:
-        input_tensor: The tensor to be updated
-        dim: The dimension along which to index
-        index: The indices into input_tensor where values from src will be written
-        src: The tensor containing values to write into input_tensor
-
-    Returns:
-        Updated tensor
-    """
-    result = input_tensor
-
-    # Handle different dimensions
-    if dim == 0:
-        # For each index, update the corresponding row
-        for i in range(index.shape[0]):
-            for j in range(index.shape[1] if index.ndim > 1 else 1):
-                idx = index[i, j] if index.ndim > 1 else index[i]
-                src_val = src[i, j] if src.ndim > 1 else src[i]
-                result = result.at[idx].set(src_val)
-    elif dim == 1:
-        # For each index, update the corresponding column
-        for i in range(index.shape[0]):
-            for j in range(index.shape[1] if index.ndim > 1 else 1):
-                idx = index[i, j] if index.ndim > 1 else index[i]
-                src_val = src[i, j] if src.ndim > 1 else src[i]
-                result = result.at[i, idx].set(src_val)
-
-    return result
-
-
-def scatter_add(input_tensor, dim, index, src):
-    """
-    Adds values from src to input_tensor at the indices specified in index (functional version).
-
-    Args:
-        input_tensor: The tensor to be updated
-        dim: The dimension along which to index
-        index: The indices into input_tensor where values from src will be added
-        src: The tensor containing values to add to input_tensor
-
-    Returns:
-        Updated tensor
-    """
-    result = input_tensor
-
-    # Handle different dimensions
-    if dim == 0:
-        # For each index, add to the corresponding row
-        for i in range(index.shape[0]):
-            for j in range(index.shape[1] if index.ndim > 1 else 1):
-                idx = index[i, j] if index.ndim > 1 else index[i]
-                src_val = src[i, j] if src.ndim > 1 else src[i]
-                result = result.at[idx].add(src_val)
-    elif dim == 1:
-        # For each index, add to the corresponding column
-        for i in range(index.shape[0]):
-            for j in range(index.shape[1] if index.ndim > 1 else 1):
-                idx = index[i, j] if index.ndim > 1 else index[i]
-                src_val = src[i, j] if src.ndim > 1 else src[i]
-                result = result.at[i, idx].add(src_val)
-
-    return result
+        # Rename expert weights for SwitchGLU
+        for l in range(self.config.num_hidden_layers):
+            prefix = f"language_model.model.layers.{l}.feed_forward.experts"
+            if f"{prefix}.gate_up_proj" in weights:
+                v = weights.pop(f"{prefix}.gate_up_proj")
+                gate_k = f"{prefix}.gate_proj.weight"
+                up_k = f"{prefix}.up_proj.weight"
+                gate_proj, up_proj = mx.split(v, 2, axis=-1)
+                weights[gate_k] = mx.swapaxes(gate_proj, 1, 2)
+                weights[up_k] = mx.swapaxes(up_proj, 1, 2)
+            if f"{prefix}.down_proj" in weights:
+                down_proj = weights.pop(f"{prefix}.down_proj")
+                weights[f"{prefix}.down_proj.weight"] = mx.swapaxes(down_proj, 1, 2)
+        return weights
