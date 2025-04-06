@@ -180,7 +180,7 @@ class LanguageModelOutput:
 
 
 # Add this code to visualize the chunked attention mask
-def visualize_mask(mask):
+def visualize_attention_mask(mask):
     """Visualize attention mask with symbols for better readability."""
     if mask is None:
         print("No mask")
