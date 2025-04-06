@@ -177,3 +177,27 @@ class LanguageModelOutput:
     logits: mx.array
     cross_attention_states: Optional[List[mx.array]] = None
     encoder_outputs: Optional[List[mx.array]] = None
+
+
+# Add this code to visualize the chunked attention mask
+def visualize_mask(mask):
+    """Visualize attention mask with symbols for better readability."""
+    if mask is None:
+        print("No mask")
+        return
+
+    seq_len = mask.shape[0]
+
+    print("        ", end="")
+    for i in range(seq_len):
+        print(f"{i:2d} ", end="")
+    print()
+
+    for i in range(seq_len):
+        print(f"Token {i:2d}: ", end="")
+        for j in range(seq_len):
+            if mask[i, j]:
+                print(" ■ ", end="")
+            else:
+                print(" ⬚ ", end="")
+        print()
