@@ -59,27 +59,6 @@ def check_array_shape(arr):
         return False
 
 
-class Llama4VisionMLP2(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.fc1 = nn.Linear(
-            self.intermediate_size, config.projector_input_dim, bias=False
-        )
-        self.fc2 = nn.Linear(
-            config.projector_output_dim, config.projector_output_dim, bias=False
-        )
-        self.activation_fn = nn.GELU()  # ACT2FN[config.hidden_act]
-        self.dropout = config.projector_dropout
-
-    def __call__(self, hidden_states):
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
-        hidden_states = nn.Dropout(self.dropout)(hidden_states)
-        return self.activation_fn(self.fc2(hidden_states))
-
-
 class Llama4MultiModalProjector(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -105,7 +84,7 @@ def pixel_shuffle(input_tensor, shuffle_ratio):
     reshaped_tensor = input_tensor.reshape(
         batch_size, height, int(width * shuffle_ratio), int(channels / shuffle_ratio)
     )
-    reshaped_tensor = reshaped_tensor.transpose(0, 2, 1, 3).contiguous()
+    reshaped_tensor = reshaped_tensor.transpose(0, 2, 1, 3)
 
     reshaped_tensor = reshaped_tensor.reshape(
         batch_size,
@@ -113,7 +92,7 @@ def pixel_shuffle(input_tensor, shuffle_ratio):
         int(width * shuffle_ratio),
         int(channels / (shuffle_ratio**2)),
     )
-    reshaped_tensor = reshaped_tensor.transpose(0, 2, 1, 3).contiguous()
+    reshaped_tensor = reshaped_tensor.transpose(0, 2, 1, 3)
 
     output_tensor = reshaped_tensor.reshape(batch_size, -1, reshaped_tensor.shape[-1])
     return output_tensor
@@ -127,7 +106,7 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
             config.projector_input_dim // (self.pixel_shuffle_ratio**2)
         )
         self.output_dim = config.projector_output_dim
-        self.mlp = Llama4VisionMLP2(config)
+        self.mlp = Llama4VisionMLP(config, is_projector=True)
 
     def __call__(self, encoded_patches: mx.array) -> mx.array:
         encoded_patches = pixel_shuffle(encoded_patches, self.pixel_shuffle_ratio)
@@ -184,6 +163,7 @@ def vision_apply_rotary_emb(
     key: mx.array,
     freqs_ci: mx.array,
 ) -> Tuple[mx.array, mx.array]:
+
     query_ = view_as_complex(query.astype(mx.float32).reshape(*query.shape[:-1], -1, 2))
     key_ = view_as_complex(key.astype(mx.float32).reshape(*key.shape[:-1], -1, 2))
     freqs_ci = reshape_for_broadcast(freqs_ci=freqs_ci, query=query_)
@@ -222,41 +202,61 @@ class Llama4VisionAttention(nn.Module):
         attention_mask: Optional[mx.array] = None,
         cache: Optional[mx.array] = None,
     ):
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+        B, L, D = hidden_states.shape
 
-        query_states = self.q_proj(hidden_states).reshape(hidden_shape)
-        key_states = self.k_proj(hidden_states).reshape(hidden_shape)
-        value_states = self.v_proj(hidden_states).reshape(hidden_shape)
+        query_states = self.q_proj(hidden_states).reshape(B, L, self.num_heads, -1)
+        key_states = self.k_proj(hidden_states).reshape(B, L, self.num_heads, -1)
+        value_states = self.v_proj(hidden_states).reshape(B, L, self.num_heads, -1)
 
         query_states, key_states = vision_apply_rotary_emb(
             query_states, key_states, freqs_ci=freqs_ci
         )
 
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
+        query_states = query_states.transpose(0, 2, 1, 3)
+        key_states = key_states.transpose(0, 2, 1, 3)
+        value_states = value_states.transpose(0, 2, 1, 3)
 
         attn_output = mx.fast.scaled_dot_product_attention(
             query_states, key_states, value_states, scale=1
         )
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         attn_output = self.o_proj(attn_output)
         return attn_output
 
 
 class Llama4VisionMLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, bias=True, is_projector=False):
         super().__init__()
         self.config = config
         self.activation_fn = nn.GELU()  # ACT2FN[config.hidden_act]
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=True)
-        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=True)
+
+        if is_projector:
+            self.hidden_size = config.hidden_size
+            self.intermediate_size = config.intermediate_size
+            self.fc1 = nn.Linear(
+                self.intermediate_size, config.projector_input_dim, bias=False
+            )
+            self.fc2 = nn.Linear(
+                config.projector_output_dim, config.projector_output_dim, bias=False
+            )
+        else:
+            self.fc1 = nn.Linear(
+                config.hidden_size, config.intermediate_size, bias=bias
+            )
+            self.fc2 = nn.Linear(
+                config.intermediate_size, config.hidden_size, bias=bias
+            )
+
+        self.is_projector = is_projector
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
         hidden_states = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
+
+        if self.is_projector:
+            return self.activation_fn(self.fc2(hidden_states))
+
         hidden_states = self.fc2(hidden_states)
         return hidden_states
 
@@ -272,19 +272,18 @@ class Llama4VisionEncoderLayer(nn.Module):
         self.input_layernorm = nn.LayerNorm(config.hidden_size)
         self.post_attention_layernorm = nn.LayerNorm(config.hidden_size)
 
-    def forward(
+    def __call__(
         self,
         hidden_state: mx.array,
         freqs_ci: mx.array,
         attention_mask: Optional[mx.array] = None,
-        output_attentions: bool = None,
     ):
         # Self Attention
         residual = hidden_state
 
         hidden_state = self.input_layernorm(hidden_state)
 
-        hidden_state, attn_weights = self.self_attn(
+        hidden_state = self.self_attn(
             hidden_state,
             freqs_ci=freqs_ci,
             attention_mask=attention_mask,
@@ -297,12 +296,7 @@ class Llama4VisionEncoderLayer(nn.Module):
         hidden_state = self.mlp(hidden_state)
         hidden_state = residual + hidden_state
 
-        outputs = (hidden_state,)
-
-        if output_attentions:
-            outputs += (attn_weights,)
-
-        return outputs
+        return hidden_state
 
 
 class Llama4VisionEncoder(nn.Module):
@@ -328,49 +322,16 @@ class Llama4VisionEncoder(nn.Module):
         hidden_states: mx.array,
         freqs_ci: mx.array,  # TODO move this to an attribute instead of keeping it around
         attention_mask: Optional[mx.array] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
     ):
 
-        output_attentions = (
-            output_attentions
-            if output_attentions is not None
-            else self.config.output_attentions
-        )
-        output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else self.config.output_hidden_states
-        )
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
-
-        encoder_states = () if output_hidden_states else None
-        all_attentions = () if output_attentions else None
-
         for encoder_layer in self.layers:
-
-            encoder_states = encoder_states + (hidden_states,)
-
-            layer_outputs = encoder_layer(
+            hidden_states = encoder_layer(
                 hidden_state=hidden_states,
                 attention_mask=attention_mask,
-                output_attentions=output_attentions,
                 freqs_ci=freqs_ci,
             )
 
-            #    if output_attentions:
-            #         all_attentions = all_attentions + (layer_outputs[1],)
-
-            hidden_states = layer_outputs[0]
-
-        return (
-            hidden_states,
-            encoder_states,
-            # all_attentions
-        )
+        return hidden_states
 
 
 class Llama4UnfoldConvolution(nn.Module):
@@ -541,20 +502,6 @@ class VisionModel(nn.Module):
         output_hidden_states: Optional[bool] = None,
     ):
 
-        output_attentions = (
-            output_attentions
-            if output_attentions is not None
-            else self.config.output_attentions
-        )
-        output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else self.config.output_hidden_states
-        )
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
-
         # num_concurrent_media and num_chunks are both currently 1
         batch_size_times_num_tiles, num_channels, height, width = pixel_values.shape
         num_concurrent_media = 1
@@ -568,9 +515,12 @@ class VisionModel(nn.Module):
             num_patches,
             hidden_dim,
         )
-        class_embedding = self.class_embedding.expand(
-            hidden_state.shape[0], 1, hidden_state.shape[-1]
+        class_embedding = mx.repeat(
+            mx.expand_dims(self.class_embedding, axis=(0, 1)),
+            repeats=hidden_state.shape[0],
+            axis=0,
         )
+
         hidden_state = mx.concatenate([hidden_state, class_embedding], axis=1)
         num_patches += 1
 
@@ -581,9 +531,7 @@ class VisionModel(nn.Module):
             num_patches,
             hidden_dim,
         )
-        positional_embedding = self.positional_embedding_vlm.to(
-            dtype=hidden_state.dtype, device=hidden_state.device
-        )
+        positional_embedding = self.positional_embedding_vlm.astype(hidden_state.dtype)
         hidden_state = hidden_state + positional_embedding
 
         hidden_state = self.layernorm_pre(hidden_state)
@@ -591,15 +539,11 @@ class VisionModel(nn.Module):
         hidden_state = hidden_state.reshape(batch_size_times_num_tiles, -1, hidden_dim)
         freqs_ci = self.rotary_embedding(pixel_values)
 
-        output = self.model(
+        hidden_state = self.model(
             hidden_state,
             attention_mask=None,
-            output_hidden_states=output_hidden_states,
-            output_attentions=output_attentions,
             freqs_ci=freqs_ci,
         )
-
-        hidden_state = output.last_hidden_state
 
         hidden_state = self.layernorm_post(hidden_state)
 
