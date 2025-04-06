@@ -89,45 +89,6 @@ class Llama4TextMLP(nn.Module):
         return self.down_proj(down_proj)
 
 
-class Llama4TextL2Norm(nn.Module):
-    def __init__(self, dim: int = None, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-
-    def _norm(self, x):
-        residual = mx.array(x**2)
-        residual = mx.mean(residual, axis=-1, keepdims=True)
-        return x * mx.rsqrt(residual + self.eps)
-
-    def __call__(self, x):
-        return self._norm(x.float()).astype(x.dtype)
-
-    def extra_repr(self):
-        return f"eps={self.eps}"
-
-
-class Llama4TextRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-5):
-        """
-        Llama4RMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
-        self.eps = eps
-        self.weight = mx.ones(hidden_size)
-
-    def _norm(self, x):
-        residual = mx.array(x**2)
-        residual = mx.mean(residual, axis=-1, keepdims=True)
-        return x * mx.rsqrt(residual + self.eps)
-
-    def __call__(self, x):
-        output = self._norm(x.float()).astype(x.dtype)
-        return output * self.weight
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.eps}"
-
-
 class Llama4TextMoe(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -159,49 +120,34 @@ class Llama4TextAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(
+        self.head_dim = head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
-        self.num_attention_heads = config.num_attention_heads
-        self.num_key_value_groups = (
-            config.num_attention_heads // config.num_key_value_heads
-        )
-        self.num_key_value_heads = config.num_key_value_heads
-        self.scale = self.head_dim**-0.5
-        self.attn_scale = config.attn_scale
-        self.floor_scale = config.floor_scale
-        self.attn_temperature_tuning = config.attn_temperature_tuning
-        self.attention_dropout = config.attention_dropout
-        self.is_causal = True
-        self.use_rope = int((layer_idx + 1) % 4 != 0)  # rope unused for dense layers
-        self.q_proj = nn.Linear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim,
-            config.hidden_size,
-            bias=config.attention_bias,
-        )
+        self.attention_bias = attention_bias = getattr(config, "attention_bias", False)
+        dim = config.hidden_size
+        self.n_heads = n_heads = config.num_attention_heads
+        self.n_kv_heads = n_kv_heads = config.num_key_value_heads
 
-        self.rope = initialize_rope(
-            self.head_dim,
-            self.config.rope_theta,
-            self.config.rope_traditional,
-            self.config.rope_scaling,
-            self.config.max_position_embeddings,
-        )
+        self.scale = head_dim**-0.5
+
+        self.use_rope = int((layer_idx + 1) % 4 != 0)  # rope unused for dense layers
+        self.attn_temperature_tuning = config.attn_temperature_tuning
+        self.floor_scale = config.floor_scale
+        self.attn_scale = config.attn_scale
+
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=attention_bias)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=attention_bias)
+
+        if self.use_rope:
+            self.rope = initialize_rope(
+                self.head_dim,
+                self.config.rope_theta,
+                self.config.rope_traditional,
+                self.config.rope_scaling,
+                self.config.max_position_embeddings,
+            )
         self.use_qk_norm = self.config.use_qk_norm and self.use_rope
 
     def __call__(
@@ -227,13 +173,18 @@ class Llama4TextAttention(nn.Module):
             keys = self.rope(keys, offset=offset)
 
         if self.use_qk_norm:
-            queries = mx.fast.rms_norm(queries, weight=None, eps=self.qk_norm.eps)
-            keys = mx.fast.rms_norm(keys, weight=None, eps=self.qk_norm.eps)
+            queries = mx.fast.rms_norm(
+                queries, weight=None, eps=self.config.rms_norm_eps
+            )
+            keys = mx.fast.rms_norm(keys, weight=None, eps=self.config.rms_norm_eps)
 
         # Use temperature tuning from https://arxiv.org/abs/2501.19399) to NoROPE layers
         if self.attn_temperature_tuning and not self.use_rope:
             attn_scales = (
-                mx.log(mx.floor((float(offset) + 1.0) / self.floor_scale) + 1.0)
+                mx.log(
+                    mx.floor(mx.arange(offset + 1, offset + L + 1) / self.floor_scale)
+                    + 1.0
+                )
                 * self.attn_scale
                 + 1.0
             )
@@ -247,7 +198,7 @@ class Llama4TextAttention(nn.Module):
             queries, keys, values, mask=mask, scale=self.scale
         )
 
-        attn_output = attn_output.reshape(B, L, -1)
+        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(attn_output)
 
 
@@ -265,10 +216,8 @@ class Llama4TextDecoderLayer(nn.Module):
                 config, intermediate_size=config.intermediate_size_mlp
             )
 
-        self.input_layernorm = Llama4TextRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm = Llama4TextRMSNorm(
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -276,53 +225,33 @@ class Llama4TextDecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: mx.array,
-        attention_mask: Optional[mx.array] = None,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
         chunk_causal_mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
-        residual = hidden_states
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x + r
+        r = self.feed_forward(self.post_attention_layernorm(h))
+        out = h + r
 
-        hidden_states = self.input_layernorm(hidden_states)
-
-        # use local attention mask for ROPE layers
-        if self.use_chunked_attention and chunk_causal_mask is not None:
-            attention_mask = chunk_causal_mask
-
-        # Self Attention
-        attention_states = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            cache=cache,
-        )
-        hidden_states = residual + attention_states
-
-        # Fully Connected
-        residual = hidden_states
-
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.feed_forward(hidden_states)
-        if self.is_moe_layer:
-            hidden_states, _ = hidden_states
-
-        hidden_states = residual + hidden_states.reshape(residual.shape)
-
-        return hidden_states
+        return out
 
 
 class Llama4TextModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
+        self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
+        assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
             Llama4TextDecoderLayer(config, layer_idx)
             for layer_idx in range(config.num_hidden_layers)
         ]
 
-        self.norm = Llama4TextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -359,6 +288,7 @@ class Llama4TextModel(nn.Module):
     def __call__(
         self,
         input_ids: mx.array = None,
+        input_embeds: mx.array = None,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         output_hidden_states: Optional[bool] = None,
@@ -367,12 +297,13 @@ class Llama4TextModel(nn.Module):
         if input_ids is None:
             raise ValueError("You must specify input_ids")
 
-        inputs_embeds = self.embed_tokens(
-            input_ids.astype(self.embed_tokens.weight.dtype)
-        )
+        if input_embeds is None:
+            h = self.embed_tokens(input_ids.astype(self.embed_tokens.weight.dtype))
+        else:
+            h = input_embeds
 
         if mask is None:
-            mask = create_attention_mask(inputs_embeds, cache)
+            mask = create_attention_mask(h, cache)
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -380,25 +311,19 @@ class Llama4TextModel(nn.Module):
         chunk_causal_mask = None
         if chunk_size := self.config.attention_chunk_size:
             chunk_causal_mask = self.create_chunked_attention_mask(
-                inputs_embeds.shape[1], chunk_size
+                h.shape[1], chunk_size
             )
 
-        hidden_states = inputs_embeds
+        for layer, c in zip(self.layers, cache):
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=mask,
+            h = layer(
+                h,
+                mask=mask,
                 chunk_causal_mask=chunk_causal_mask,
-                cache=cache,
+                cache=c,
             )
 
-            hidden_states = layer_outputs
-
-        hidden_states = self.norm(hidden_states)
-
-        return hidden_states
+        return self.norm(h)
 
 
 class LanguageModel(nn.Module):
@@ -431,29 +356,37 @@ class LanguageModel(nn.Module):
     def __call__(
         self,
         input_ids: mx.array = None,
+        input_embeds: mx.array = None,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
         outputs = self.model(
             input_ids=input_ids,
-            attention_mask=mask,
+            input_embeds=input_embeds,
+            mask=mask,
             cache=cache,
         )
 
-        hidden_states = outputs[0]
-
-        logits = self.lm_head(hidden_states)
+        logits = self.lm_head(outputs)
 
         return LanguageModelOutput(logits=logits)
 
-    def make_cache(self):
-        caches = []
-        for i in range(self.config.num_hidden_layers):
-            if int((i + 1) % 4 != 0):
-                caches.append(KVCache())
-            else:
-                caches.append(RotatingKVCache())
-        return caches
+    # def make_cache(self):
+    #     caches = []
+    #     for i in range(self.config.num_hidden_layers):
+    #         if int((i + 1) % 4 != 0):
+    #             caches.append(KVCache())
+    #         else:
+    #             caches.append(RotatingKVCache())
+    #     return caches
+
+    @property
+    def n_kv_heads(self):
+        return self.config.num_key_value_heads
+
+    @property
+    def head_dim(self):
+        return self.config.hidden_size // self.config.num_attention_heads
 
     @property
     def layers(self):
