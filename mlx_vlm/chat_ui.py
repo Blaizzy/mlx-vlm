@@ -31,7 +31,8 @@ def chat(message, history, temperature, max_tokens):
     if config["model_type"] != "paligemma":
         chat_history = []
         for item in history:
-            chat_history.append({"role": "user", "content": item[0]})
+            if isinstance(item[0], str):
+                chat_history.append({"role": "user", "content": item[0]})
             if item[1] is not None:
                 chat_history.append({"role": "assistant", "content": item[1]})
 

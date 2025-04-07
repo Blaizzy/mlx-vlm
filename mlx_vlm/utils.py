@@ -677,7 +677,7 @@ def convert(
     )
 
     weights = dict(tree_flatten(model.parameters()))
-    dtype = mx.float16 if quantize else getattr(mx, dtype)
+    dtype = getattr(mx, dtype)
     weights = {k: v.astype(dtype) for k, v in weights.items()}
 
     if quantize and dequantize:
@@ -701,9 +701,11 @@ def convert(
     del model
     save_weights(mlx_path, weights, donate_weights=True)
 
-    py_files = glob.glob(str(model_path / "*.py"))
-    for file in py_files:
-        shutil.copy(file, mlx_path)
+    # Copy Python and JSON files from the model path to the MLX path
+    for pattern in ["*.py", "*.json"]:
+        files = glob.glob(str(model_path / pattern))
+        for file in files:
+            shutil.copy(file, mlx_path)
 
     processor.save_pretrained(mlx_path)
 
@@ -758,6 +760,40 @@ def process_image(img, resize_shape, image_processor):
     return img
 
 
+def process_inputs(processor, images, prompts, return_tensors="mlx"):
+    if hasattr(processor, "process"):
+        inputs = processor.process(
+            text=prompts,
+            images=images,
+            padding=True,
+            return_tensors=return_tensors,
+        )
+    else:
+        inputs = processor(
+            text=prompts, images=images, padding=True, return_tensors=return_tensors
+        )
+    return inputs
+
+
+def process_inputs_with_fallback(processor, images, prompts, return_tensors="mlx"):
+    try:
+        inputs = process_inputs(
+            processor, images, prompts, return_tensors=return_tensors
+        )
+    except Exception as e:
+        try:
+            print(
+                f"\033[33mWarning\033[0m: Failed to process inputs with error: {e}",
+                "Trying to process inputs with return_tensors='pt'",
+            )
+            inputs = process_inputs(processor, images, prompts, return_tensors="pt")
+        except Exception as e:
+            raise ValueError(
+                f"Failed to process inputs with error: {e}. Please install PyTorch and try again."
+            )
+    return inputs
+
+
 def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=None):
 
     if not isinstance(images, list):
@@ -806,14 +842,7 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
         if hasattr(processor, "tokenizer"):
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-        if hasattr(processor, "process"):
-            inputs = processor.process(
-                text=prompts, images=images, padding=True, return_tensors="mlx"
-            )
-        else:
-            inputs = processor(
-                text=prompts, images=images, padding=True, return_tensors="mlx"
-            )
+        inputs = process_inputs_with_fallback(processor, images, prompts)
 
         if "images" in inputs:
             inputs["pixel_values"] = inputs["images"]
@@ -928,7 +957,6 @@ def generate_step(
             outputs = model.language_model(
                 y[None],
                 cache=cache,
-                mask=mask,
                 **kwargs,
             )
 
@@ -1005,7 +1033,10 @@ def stream_generate(
         Generator[Tuple[mx.array, mx.array]]: A generator producing text.
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    prompt_tokens = mx.array(tokenizer.encode(prompt))
+    add_special_tokens = not hasattr(processor, "chat_template")
+    prompt_tokens = mx.array(
+        tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+    )
 
     resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)

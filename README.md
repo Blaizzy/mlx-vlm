@@ -29,7 +29,7 @@ pip install mlx-vlm
 Generate output from a model using the CLI:
 
 ```sh
-python -m mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --temp 0.0 --image http://images.cocodataset.org/val2017/000000039769.jpg
+python -m mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --temperature 0.0 --image http://images.cocodataset.org/val2017/000000039769.jpg
 ```
 
 ### Chat UI with Gradio
@@ -57,6 +57,7 @@ config = load_config(model_path)
 
 # Prepare input
 image = ["http://images.cocodataset.org/val2017/000000039769.jpg"]
+# image = [Image.open("...")] can also be used with PIL.Image.Image objects
 prompt = "Describe this image."
 
 # Apply chat template
