@@ -315,7 +315,6 @@ class Llama4VisionEncoder(nn.Module):
         self.layers = [
             Llama4VisionEncoderLayer(config) for _ in range(config.num_hidden_layers)
         ]
-        self.gradient_checkpointing = False
         self.config = config
 
     def __call__(
