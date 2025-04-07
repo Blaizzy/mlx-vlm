@@ -106,7 +106,7 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
             config.projector_input_dim // (self.pixel_shuffle_ratio**2)
         )
         self.output_dim = config.projector_output_dim
-        self.mlp = Llama4VisionMLP(config, is_projector=True)
+        self.mlp = Llama4VisionMLP(config, bias=False, is_projector=True)
 
     def __call__(self, encoded_patches: mx.array) -> mx.array:
         encoded_patches = pixel_shuffle(encoded_patches, self.pixel_shuffle_ratio)
@@ -231,23 +231,27 @@ class Llama4VisionMLP(nn.Module):
         super().__init__()
         self.config = config
         self.activation_fn = nn.GELU()  # ACT2FN[config.hidden_act]
+        self.is_projector = is_projector
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
 
-        if is_projector:
-            self.hidden_size = config.hidden_size
-            self.intermediate_size = config.intermediate_size
-            self.fc1 = nn.Linear(
-                self.intermediate_size, config.projector_input_dim, bias=False
-            )
-            self.fc2 = nn.Linear(
-                config.projector_output_dim, config.projector_output_dim, bias=False
-            )
-        else:
-            self.fc1 = nn.Linear(
-                config.hidden_size, config.intermediate_size, bias=bias
-            )
-            self.fc2 = nn.Linear(
-                config.intermediate_size, config.hidden_size, bias=bias
-            )
+        # Determine dimensions for first linear layer based on whether this is a projector
+        fc1_input_dim = self.intermediate_size if is_projector else self.hidden_size
+        fc1_output_dim = (
+            config.projector_input_dim if is_projector else self.intermediate_size
+        )
+
+        self.fc1 = nn.Linear(fc1_input_dim, fc1_output_dim, bias=bias)
+
+        # Determine dimensions for second linear layer
+        fc2_input_dim = (
+            config.projector_output_dim if is_projector else self.intermediate_size
+        )
+        fc2_output_dim = (
+            config.projector_output_dim if is_projector else self.hidden_size
+        )
+
+        self.fc2 = nn.Linear(fc2_input_dim, fc2_output_dim, bias=bias)
 
         self.is_projector = is_projector
 
@@ -296,7 +300,6 @@ class Llama4VisionEncoderLayer(nn.Module):
         hidden_state = self.post_attention_layernorm(hidden_state)
         hidden_state = self.mlp(hidden_state)
         hidden_state = residual + hidden_state
-
         return hidden_state
 
 
@@ -532,7 +535,7 @@ class VisionModel(nn.Module):
             hidden_dim,
         )
 
-        class_embedding = mx.broadcast_to(
+        class_embedding = self.scale * mx.broadcast_to(
             self.class_embedding, (hidden_state.shape[0], 1, hidden_state.shape[-1])
         )
 
@@ -547,7 +550,9 @@ class VisionModel(nn.Module):
             hidden_dim,
         )
 
-        positional_embedding = self.positional_embedding_vlm.astype(hidden_state.dtype)
+        positional_embedding = self.scale * self.positional_embedding_vlm.astype(
+            hidden_state.dtype
+        )
         hidden_state = hidden_state + positional_embedding
 
         hidden_state = self.layernorm_pre(hidden_state)
