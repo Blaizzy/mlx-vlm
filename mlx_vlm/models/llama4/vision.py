@@ -535,7 +535,7 @@ class VisionModel(nn.Module):
             hidden_dim,
         )
 
-        class_embedding = self.scale * mx.broadcast_to(
+        class_embedding = mx.broadcast_to(
             self.class_embedding, (hidden_state.shape[0], 1, hidden_state.shape[-1])
         )
 
@@ -550,9 +550,7 @@ class VisionModel(nn.Module):
             hidden_dim,
         )
 
-        positional_embedding = self.scale * self.positional_embedding_vlm.astype(
-            hidden_state.dtype
-        )
+        positional_embedding = self.positional_embedding_vlm.astype(hidden_state.dtype)
         hidden_state = hidden_state + positional_embedding
 
         hidden_state = self.layernorm_pre(hidden_state)
