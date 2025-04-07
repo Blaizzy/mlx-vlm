@@ -113,11 +113,7 @@ class Model(nn.Module):
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = np.where(input_ids == image_token_index)[1].tolist()
-
-        image_features = image_features.reshape(-1, image_features.shape[-1])
-
-        inputs_embeds[:, image_positions, :] = image_features
-
+        inputs_embeds[:, image_positions] = image_features
         return inputs_embeds
 
     def __call__(
