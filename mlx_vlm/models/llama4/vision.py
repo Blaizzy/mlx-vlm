@@ -6,7 +6,6 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-import torch
 
 
 @dataclass
@@ -262,7 +261,7 @@ class Llama4VisionMLP(nn.Module):
     def __init__(self, config, bias=True, is_projector=False):
         super().__init__()
         self.config = config
-        self.activation_fn = nn.GELU()  # ACT2FN[config.hidden_act]
+        self.activation_fn = nn.GELU(approx="precise")  # ACT2FN[config.hidden_act]
         self.is_projector = is_projector
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -358,7 +357,6 @@ class Llama4VisionEncoder(nn.Module):
         freqs_ci: mx.array,  # TODO move this to an attribute instead of keeping it around
         mask: Optional[mx.array] = None,
     ):
-        CLIP_VALUE = 30.0  # Define the clipping value
 
         for i, encoder_layer in enumerate(self.layers):
             hidden_states = encoder_layer(
@@ -366,13 +364,6 @@ class Llama4VisionEncoder(nn.Module):
                 mask=mask,
                 freqs_ci=freqs_ci,
             )
-
-            # Clip the output of the *last* encoder layer
-            # if i == self.config.num_hidden_layers - 1:
-            #      print(f"Clipping output of layer {i} to [{-CLIP_VALUE}, {CLIP_VALUE}]")
-            #      hidden_states = mx.clip(hidden_states, a_min=-CLIP_VALUE, a_max=CLIP_VALUE)
-
-            # Log stats *after* potential clipping
             check_and_log_stats(f"encoder_layer_{i}", hidden_states)
 
         return hidden_states
@@ -464,12 +455,8 @@ class Llama4UnfoldConvolution(nn.Module):
         return result
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
-
-        # hidden_states = self.unfold(hidden_states)
-        torch_unfold = torch.nn.Unfold(kernel_size=self.kernel_size, stride=self.stride)
-        hidden_states = torch.from_dlpack(hidden_states.astype(mx.float32))
-        hidden_states = torch_unfold(hidden_states)
-        hidden_states = mx.array(hidden_states.permute(0, 2, 1)).astype(mx.bfloat16)
+        hidden_states = self.unfold(hidden_states)
+        hidden_states = hidden_states.swapaxes(1, 2)
         hidden_states = self.linear(hidden_states)
         return hidden_states
 
@@ -539,8 +526,7 @@ class VisionModel(nn.Module):
         self.scale = config.hidden_size**-0.5
 
         self.patch_embedding = Llama4UnfoldConvolution(config)
-        self.class_embedding = mx.ones((self.hidden_size,))
-        self.positional_embedding_vlm = mx.ones((self.num_patches, self.hidden_size))
+
         self.rotary_embedding = Llama4VisionRotaryEmbedding(config)
 
         # layer norms
@@ -580,7 +566,10 @@ class VisionModel(nn.Module):
             num_patches,
             hidden_dim,
         )
+        self.class_embedding = self.scale * mx.random.normal((self.hidden_size,))
         class_embedding = mx.tile(self.class_embedding, (hidden_state.shape[0], 1, 1))
+
+        print(f"Class embedding: {class_embedding}")
         hidden_state = mx.concatenate([hidden_state, class_embedding], axis=1)
         num_patches += 1
         check_and_log_stats("after_cls_concat", hidden_state)
@@ -591,6 +580,9 @@ class VisionModel(nn.Module):
             num_chunks,
             num_patches,
             hidden_dim,
+        )
+        self.positional_embedding_vlm = self.scale * mx.random.normal(
+            (self.num_patches, self.hidden_size)
         )
         positional_embedding = self.positional_embedding_vlm.astype(hidden_state.dtype)
         hidden_state = hidden_state + positional_embedding
@@ -624,7 +616,11 @@ class VisionModel(nn.Module):
     def sanitize(self, weights):
         sanitized_weights = {}
         for k, v in weights.items():
-            if "position_ids" in k:
+            if (
+                "position_ids" in k
+                or "class_embedding" in k
+                or "positional_embedding_vlm" in k
+            ):
                 # Remove unused position_ids
                 continue
             else:
