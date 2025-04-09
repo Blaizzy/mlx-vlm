@@ -181,7 +181,7 @@ class Llama4VisionAttention(nn.Module):
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_key_value_groups = 1
         self.attention_dropout = config.attention_dropout
-        self.scale = 1 / math.sqrt(self.head_dim)
+        self.scale = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(
             self.embed_dim, self.num_heads * self.head_dim, bias=True
@@ -230,7 +230,7 @@ class Llama4VisionMLP(nn.Module):
     def __init__(self, config, bias=True, is_projector=False):
         super().__init__()
         self.config = config
-        self.activation_fn = nn.GELU()  # ACT2FN[config.hidden_act]
+        self.activation_fn = nn.GELU(approx="precise")  # ACT2FN[config.hidden_act]
         self.is_projector = is_projector
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -526,6 +526,7 @@ class VisionModel(nn.Module):
         num_concurrent_media = 1
         num_chunks = 1
         hidden_state = self.patch_embedding(pixel_values)
+
         _, num_patches, hidden_dim = hidden_state.shape
 
         # Add cls token
@@ -535,9 +536,7 @@ class VisionModel(nn.Module):
             hidden_dim,
         )
 
-        class_embedding = mx.broadcast_to(
-            self.class_embedding, (hidden_state.shape[0], 1, hidden_state.shape[-1])
-        )
+        class_embedding = mx.tile(self.class_embedding, (hidden_state.shape[0], 1, 1))
 
         hidden_state = mx.concatenate([hidden_state, class_embedding], axis=1)
         num_patches += 1
@@ -579,15 +578,6 @@ class VisionModel(nn.Module):
             if "position_ids" in k:
                 # Remove unused position_ids
                 continue
-            elif "patch_embedding.weight" in k:
-                # PyTorch conv2d weight tensors have shape:
-                #   [out_channels, in_channels, kH, KW]
-                # MLX conv2d expects the weight be of shape:
-                #   [out_channels, kH, KW, in_channels]
-                if check_array_shape(v):
-                    sanitized_weights[k] = v
-                else:
-                    sanitized_weights[k] = v.transpose(0, 2, 3, 1)
             else:
                 sanitized_weights[k] = v
 
