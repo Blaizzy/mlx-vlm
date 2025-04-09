@@ -558,6 +558,11 @@ class VisionModel(nn.Module):
         self.num_patches = (self.image_size // self.patch_size) ** 2 + 1
         self.scale = config.hidden_size**-0.5
 
+        self.class_embedding = self.scale * mx.random.normal((self.hidden_size,))
+        self.positional_embedding_vlm = self.scale * mx.random.normal(
+            (self.num_patches, self.hidden_size)
+        )
+
         self.patch_embedding = Llama4UnfoldConvolution(config)
 
         self.rotary_embedding = Llama4VisionRotaryEmbedding(config)
@@ -599,7 +604,7 @@ class VisionModel(nn.Module):
             num_patches,
             hidden_dim,
         )
-        self.class_embedding = self.scale * mx.random.normal((self.hidden_size,))
+
         class_embedding = mx.tile(self.class_embedding, (hidden_state.shape[0], 1, 1))
 
         print(f"Class embedding: {class_embedding}")
@@ -649,11 +654,7 @@ class VisionModel(nn.Module):
     def sanitize(self, weights):
         sanitized_weights = {}
         for k, v in weights.items():
-            if (
-                "position_ids" in k
-                or "class_embedding" in k
-                or "positional_embedding_vlm" in k
-            ):
+            if "position_ids" in k:
                 # Remove unused position_ids
                 continue
             else:
