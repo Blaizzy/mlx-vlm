@@ -59,6 +59,37 @@ def check_array_shape(arr):
         return False
 
 
+activations = {}
+
+
+def check_and_log_stats(name, tensor, capture_activations=True):
+    """Helper function to check for anomalies and log stats."""
+    if not capture_activations:
+        return
+
+    print(f"--- Activation Stats: {name} ---")
+    # Check for NaNs/Infs
+    has_nan = mx.isnan(tensor).any()
+    has_inf = mx.isinf(tensor).any()
+    if has_nan:
+        print(f"WARNING: Found NaN in {name}")
+    if has_inf:
+        print(f"WARNING: Found Inf in {name}")
+
+    # Calculate and print stats (ensure computation happens)
+    min_val = mx.min(tensor).item()
+    max_val = mx.max(tensor).item()
+    mean_val = mx.mean(tensor).item()
+    std_val = mx.std(tensor).item()
+    print(f"  Shape: {tensor.shape}")
+    print(f"  Min: {min_val:.4f}, Max: {max_val:.4f}")
+    print(f"  Mean: {mean_val:.4f}, Std: {std_val:.4f}")
+    print("-" * (len(name) + 24))
+
+    # Store the tensor itself
+    activations[name] = tensor
+
+
 class Llama4MultiModalProjector(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -327,12 +358,13 @@ class Llama4VisionEncoder(nn.Module):
         mask: Optional[mx.array] = None,
     ):
 
-        for encoder_layer in self.layers:
+        for i, encoder_layer in enumerate(self.layers):
             hidden_states = encoder_layer(
                 hidden_state=hidden_states,
                 mask=mask,
                 freqs_ci=freqs_ci,
             )
+            check_and_log_stats(f"encoder_layer_{i}", hidden_states)
 
         return hidden_states
 
@@ -519,13 +551,16 @@ class VisionModel(nn.Module):
         pixel_values: mx.array,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        capture_activations: Optional[bool] = True,
     ):
 
-        # num_concurrent_media and num_chunks are both currently 1
         batch_size_times_num_tiles, num_channels, height, width = pixel_values.shape
         num_concurrent_media = 1
         num_chunks = 1
+
         hidden_state = self.patch_embedding(pixel_values)
+        check_and_log_stats("patch_embedding", hidden_state)
+
         _, num_patches, hidden_dim = hidden_state.shape
 
         # Add cls token
@@ -534,13 +569,12 @@ class VisionModel(nn.Module):
             num_patches,
             hidden_dim,
         )
-
         class_embedding = mx.broadcast_to(
             self.class_embedding, (hidden_state.shape[0], 1, hidden_state.shape[-1])
         )
-
         hidden_state = mx.concatenate([hidden_state, class_embedding], axis=1)
         num_patches += 1
+        check_and_log_stats("after_cls_concat", hidden_state)
 
         # Position embeddings
         hidden_state = hidden_state.reshape(
@@ -549,11 +583,12 @@ class VisionModel(nn.Module):
             num_patches,
             hidden_dim,
         )
-
         positional_embedding = self.positional_embedding_vlm.astype(hidden_state.dtype)
         hidden_state = hidden_state + positional_embedding
+        check_and_log_stats("after_pos_embedding", hidden_state)
 
         hidden_state = self.layernorm_pre(hidden_state)
+        check_and_log_stats("after_layernorm_pre", hidden_state)
 
         hidden_state = hidden_state.reshape(batch_size_times_num_tiles, -1, hidden_dim)
         freqs_ci = self.rotary_embedding(pixel_values)
@@ -563,15 +598,19 @@ class VisionModel(nn.Module):
             mask=None,
             freqs_ci=freqs_ci,
         )
+        check_and_log_stats("encoder_output", hidden_state)
 
         hidden_state = self.layernorm_post(hidden_state)
+        check_and_log_stats("after_layernorm_post", hidden_state)
 
         hidden_state = hidden_state[:, :-1, :]
 
         # now, we use Llama4VisionPixelShuffle + mlp to project embeddings
-        hidden_state = self.vision_adapter(hidden_state)
+        final_hidden_state = self.vision_adapter(hidden_state)
+        check_and_log_stats("final_adapter_output", final_hidden_state)
 
-        return hidden_state
+        # Return only the final state
+        return final_hidden_state
 
     def sanitize(self, weights):
         sanitized_weights = {}
