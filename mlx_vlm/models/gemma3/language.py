@@ -152,10 +152,35 @@ class TransformerBlock(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
+
+        # clip the input to avoid overflow in float16
+        # In some cases we upcast the input to float32 then clip it back to float16
+        # This issue happens because post layernorm weights are huge
+        # TODO: add example to show this issue
+
+        if x.dtype == mx.float16:
+            x = mx.clip(x, -65504, 65504)
+
         r = self.self_attn(self.input_layernorm(x), mask, cache)
-        h = x + self.post_attention_layernorm(r)
+        h = self.post_attention_layernorm(r)
+
+        if h.dtype == mx.float16:
+            h = mx.clip(
+                x.astype(mx.float32) + h.astype(mx.float32), -65504, 65504
+            ).astype(mx.float16)
+        else:
+            h = x + h
+
         r = self.mlp(self.pre_feedforward_layernorm(h))
-        out = h + self.post_feedforward_layernorm(r)
+        out = self.post_feedforward_layernorm(r)
+
+        if out.dtype == mx.float16:
+            out = mx.clip(
+                h.astype(mx.float32) + out.astype(mx.float32), -65504, 65504
+            ).astype(mx.float16)
+        else:
+            out = h + out
+
         return out
 
 
