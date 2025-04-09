@@ -526,7 +526,6 @@ class VisionModel(nn.Module):
         num_concurrent_media = 1
         num_chunks = 1
         hidden_state = self.patch_embedding(pixel_values)
-
         _, num_patches, hidden_dim = hidden_state.shape
 
         # Add cls token
@@ -536,7 +535,9 @@ class VisionModel(nn.Module):
             hidden_dim,
         )
 
-        class_embedding = mx.tile(self.class_embedding, (hidden_state.shape[0], 1, 1))
+        class_embedding = mx.broadcast_to(
+            self.class_embedding, (hidden_state.shape[0], 1, hidden_state.shape[-1])
+        )
 
         hidden_state = mx.concatenate([hidden_state, class_embedding], axis=1)
         num_patches += 1
