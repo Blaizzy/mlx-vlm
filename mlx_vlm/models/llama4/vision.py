@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+import torch
 
 
 @dataclass
@@ -240,15 +241,8 @@ class Llama4VisionAttention(nn.Module):
         key_states = self.k_proj(hidden_states).reshape(B, L, self.num_heads, -1)
         value_states = self.v_proj(hidden_states).reshape(B, L, self.num_heads, -1)
 
-        # query_states, key_states = vision_apply_rotary_emb(
-        #     query_states, key_states, freqs_ci=freqs_ci
-        # )
-
-        query_states = mx.fast.rope(
-            query_states, 2, traditional=False, base=10000.0, scale=1.0, offset=1
-        )
-        key_states = mx.fast.rope(
-            key_states, 2, traditional=False, base=10000.0, scale=1.0, offset=1
+        query_states, key_states = vision_apply_rotary_emb(
+            query_states, key_states, freqs_ci=freqs_ci
         )
 
         query_states = query_states.transpose(0, 2, 1, 3)
@@ -470,8 +464,12 @@ class Llama4UnfoldConvolution(nn.Module):
         return result
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
-        hidden_states = self.unfold(hidden_states)
-        hidden_states = hidden_states.swapaxes(1, 2)
+
+        # hidden_states = self.unfold(hidden_states)
+        torch_unfold = torch.nn.Unfold(kernel_size=self.kernel_size, stride=self.stride)
+        hidden_states = torch.from_dlpack(hidden_states.astype(mx.float32))
+        hidden_states = torch_unfold(hidden_states)
+        hidden_states = mx.array(hidden_states.permute(0, 2, 1)).astype(mx.bfloat16)
         hidden_states = self.linear(hidden_states)
         return hidden_states
 
