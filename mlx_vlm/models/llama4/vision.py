@@ -240,8 +240,15 @@ class Llama4VisionAttention(nn.Module):
         key_states = self.k_proj(hidden_states).reshape(B, L, self.num_heads, -1)
         value_states = self.v_proj(hidden_states).reshape(B, L, self.num_heads, -1)
 
-        query_states, key_states = vision_apply_rotary_emb(
-            query_states, key_states, freqs_ci=freqs_ci
+        # query_states, key_states = vision_apply_rotary_emb(
+        #     query_states, key_states, freqs_ci=freqs_ci
+        # )
+
+        query_states = mx.fast.rope(
+            query_states, 2, traditional=False, base=10000.0, scale=1.0, offset=1
+        )
+        key_states = mx.fast.rope(
+            key_states, 2, traditional=False, base=10000.0, scale=1.0, offset=1
         )
 
         query_states = query_states.transpose(0, 2, 1, 3)
@@ -261,7 +268,7 @@ class Llama4VisionMLP(nn.Module):
     def __init__(self, config, bias=True, is_projector=False):
         super().__init__()
         self.config = config
-        self.activation_fn = nn.GELU(approx="precise")  # ACT2FN[config.hidden_act]
+        self.activation_fn = nn.GELU()  # ACT2FN[config.hidden_act]
         self.is_projector = is_projector
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -357,6 +364,7 @@ class Llama4VisionEncoder(nn.Module):
         freqs_ci: mx.array,  # TODO move this to an attribute instead of keeping it around
         mask: Optional[mx.array] = None,
     ):
+        CLIP_VALUE = 30.0  # Define the clipping value
 
         for i, encoder_layer in enumerate(self.layers):
             hidden_states = encoder_layer(
@@ -364,6 +372,13 @@ class Llama4VisionEncoder(nn.Module):
                 mask=mask,
                 freqs_ci=freqs_ci,
             )
+
+            # Clip the output of the *last* encoder layer
+            # if i == self.config.num_hidden_layers - 1:
+            #      print(f"Clipping output of layer {i} to [{-CLIP_VALUE}, {CLIP_VALUE}]")
+            #      hidden_states = mx.clip(hidden_states, a_min=-CLIP_VALUE, a_max=CLIP_VALUE)
+
+            # Log stats *after* potential clipping
             check_and_log_stats(f"encoder_layer_{i}", hidden_states)
 
         return hidden_states
@@ -526,10 +541,8 @@ class VisionModel(nn.Module):
         self.scale = config.hidden_size**-0.5
 
         self.patch_embedding = Llama4UnfoldConvolution(config)
-        self.class_embedding = self.scale * mx.random.normal((self.hidden_size,))
-        self.positional_embedding_vlm = self.scale * mx.random.normal(
-            (self.num_patches, self.hidden_size)
-        )
+        self.class_embedding = mx.ones((self.hidden_size,))
+        self.positional_embedding_vlm = mx.ones((self.num_patches, self.hidden_size))
         self.rotary_embedding = Llama4VisionRotaryEmbedding(config)
 
         # layer norms
@@ -569,9 +582,7 @@ class VisionModel(nn.Module):
             num_patches,
             hidden_dim,
         )
-        class_embedding = mx.broadcast_to(
-            self.class_embedding, (hidden_state.shape[0], 1, hidden_state.shape[-1])
-        )
+        class_embedding = mx.tile(self.class_embedding, (hidden_state.shape[0], 1, 1))
         hidden_state = mx.concatenate([hidden_state, class_embedding], axis=1)
         num_patches += 1
         check_and_log_stats("after_cls_concat", hidden_state)
