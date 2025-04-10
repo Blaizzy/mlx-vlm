@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union, Callable
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -26,7 +26,7 @@ from transformers import (
 )
 
 from .models.base import BaseImageProcessor, KVCache, SimpleKVCache
-from .sample_utils import top_p_sampling
+from .sample_utils import top_p_sampling, make_sampler
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
 
@@ -872,6 +872,8 @@ def generate_step(
     mask,
     *,
     max_tokens: int = 256,
+    sampler: Optional[Callable[mx.array, mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     temperature: float = 0.0,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
