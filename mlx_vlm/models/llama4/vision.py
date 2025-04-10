@@ -261,7 +261,7 @@ class Llama4VisionMLP(nn.Module):
     def __init__(self, config, bias=True, is_projector=False):
         super().__init__()
         self.config = config
-        self.activation_fn = nn.GELU(approx="precise")  # ACT2FN[config.hidden_act]
+        self.activation_fn = nn.GELU(approx="fast")  # ACT2FN[config.hidden_act]
         self.is_projector = is_projector
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -292,9 +292,8 @@ class Llama4VisionMLP(nn.Module):
 
         if self.is_projector:
             return self.activation_fn(self.fc2(hidden_states))
-
-        hidden_states = self.fc2(hidden_states)
-        return hidden_states
+        else:
+            return self.fc2(hidden_states)
 
 
 class Llama4VisionEncoderLayer(nn.Module):
@@ -305,8 +304,8 @@ class Llama4VisionEncoderLayer(nn.Module):
         self.self_attn = Llama4VisionAttention(config)
         self.mlp = Llama4VisionMLP(config)
 
-        self.input_layernorm = nn.LayerNorm(config.hidden_size)
-        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size)
+        self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=1e-05)
+        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=1e-05)
 
     def __call__(
         self,
@@ -367,6 +366,9 @@ class Llama4VisionEncoder(nn.Module):
             check_and_log_stats(f"encoder_layer_{i}", hidden_states)
 
         return hidden_states
+
+
+import torch
 
 
 class Llama4UnfoldConvolution(nn.Module):
@@ -455,8 +457,11 @@ class Llama4UnfoldConvolution(nn.Module):
         return result
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
-        hidden_states = self.unfold(hidden_states)
-        hidden_states = hidden_states.swapaxes(1, 2)
+        torch_unfold = torch.nn.Unfold(kernel_size=self.kernel_size, stride=self.stride)
+        hidden_states = torch.from_dlpack(hidden_states.astype(mx.float32))
+        hidden_states = torch_unfold(hidden_states)
+        hidden_states = mx.array(hidden_states.permute(0, 2, 1)).astype(mx.bfloat16)
+
         hidden_states = self.linear(hidden_states)
         return hidden_states
 
@@ -535,8 +540,8 @@ class VisionModel(nn.Module):
         self.rotary_embedding = Llama4VisionRotaryEmbedding(config)
 
         # layer norms
-        self.layernorm_pre = nn.LayerNorm(self.hidden_size)
-        self.layernorm_post = nn.LayerNorm(self.hidden_size)
+        self.layernorm_pre = nn.LayerNorm(self.hidden_size, eps=1e-05)
+        self.layernorm_post = nn.LayerNorm(self.hidden_size, eps=1e-05)
 
         # encoders
         self.model = Llama4VisionEncoder(config)
@@ -572,7 +577,9 @@ class VisionModel(nn.Module):
             hidden_dim,
         )
 
-        class_embedding = mx.tile(self.class_embedding, (hidden_state.shape[0], 1, 1))
+        class_embedding = mx.broadcast_to(
+            self.class_embedding, (hidden_state.shape[0], 1, hidden_state.shape[-1])
+        )
 
         print(f"Class embedding: {class_embedding}")
         hidden_state = mx.concatenate([hidden_state, class_embedding], axis=1)
@@ -586,10 +593,9 @@ class VisionModel(nn.Module):
             num_patches,
             hidden_dim,
         )
-        self.positional_embedding_vlm = self.scale * mx.random.normal(
-            (self.num_patches, self.hidden_size)
-        )
-        positional_embedding = self.positional_embedding_vlm.astype(hidden_state.dtype)
+
+        positional_embedding = self.positional_embedding_vlm
+        print(f"Positional embedding: {positional_embedding}")
         hidden_state = hidden_state + positional_embedding
         check_and_log_stats("after_pos_embedding", hidden_state)
 
@@ -614,6 +620,10 @@ class VisionModel(nn.Module):
         # now, we use Llama4VisionPixelShuffle + mlp to project embeddings
         final_hidden_state = self.vision_adapter(hidden_state)
         check_and_log_stats("final_adapter_output", final_hidden_state)
+
+        print("Vision Encoder Sum: ", mx.sum(final_hidden_state))
+
+        # mx.save("mlx_llama_4_vl.npy", final_hidden_state)
 
         # Return only the final state
         return final_hidden_state
