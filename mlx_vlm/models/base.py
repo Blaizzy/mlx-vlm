@@ -201,3 +201,26 @@ def visualize_attention_mask(mask):
             else:
                 print(" ⬚ ", end="")
         print()
+
+
+def check_activation_stats(name, tensor):
+    """Helper function to check for anomalies and log stats."""
+
+    print(f"--- Activation Stats: {name} ---")
+    # Check for NaNs/Infs
+    has_nan = mx.isnan(tensor).any()
+    has_inf = mx.isinf(tensor).any()
+    if has_nan:
+        print(f"WARNING: Found NaN in {name}")
+    if has_inf:
+        print(f"WARNING: Found Inf in {name}")
+
+    # Calculate and print stats (ensure computation happens)
+    min_val = mx.min(tensor).item()
+    max_val = mx.max(tensor).item()
+    mean_val = mx.mean(tensor).item()
+    std_val = mx.std(tensor).item()
+    print(f"  Shape: {tensor.shape}")
+    print(f"  Min: {min_val:.4f}, Max: {max_val:.4f}")
+    print(f"  Mean: {mean_val:.4f}, Std: {std_val:.4f}")
+    print("-" * (len(name) + 24))
