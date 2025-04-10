@@ -59,6 +59,8 @@ class TestModels(unittest.TestCase):
         **kwargs,
     ):
         self.assertEqual(vision_tower.model_type, model_type)
+        if model_type == "llama4_vision_model":
+            vision_hidden_size = kwargs.pop("projector_output_dim", vision_hidden_size)
 
         batch_size = 1
         if model_type == "qwen2_5_vl":
@@ -87,9 +89,20 @@ class TestModels(unittest.TestCase):
             hidden_states = vision_tower(input_tensor, **kwargs)
 
         # Check vision hidden feature layer's shape matches the expected hidden size
-        self.assertEqual(
-            hidden_states[vision_feature_layer].shape[-1], vision_hidden_size
-        )
+        if channel_first:
+            if model_type == "llama4_vision_model":
+
+                self.assertEqual(
+                    hidden_states[vision_feature_layer].shape[1], vision_hidden_size
+                )
+            else:
+                self.assertEqual(
+                    hidden_states[vision_feature_layer].shape[1], vision_hidden_size
+                )
+        else:
+            self.assertEqual(
+                hidden_states[vision_feature_layer].shape[-1], vision_hidden_size
+            )
 
     def test_llava_bunny(self):
         from mlx_vlm.models import llava_bunny
@@ -1118,11 +1131,13 @@ class TestModels(unittest.TestCase):
         )
 
         self.vision_test_runner(
-            model.vision_tower,
+            model.vision_model,
             config.vision_config.model_type,
             config.vision_config.hidden_size,
             config.vision_config.num_channels,
             (config.vision_config.image_size, config.vision_config.image_size),
+            channel_first=True,
+            projector_output_dim=config.vision_config.projector_output_dim,
         )
 
     def test_gemma3(self):
