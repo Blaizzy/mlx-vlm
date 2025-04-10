@@ -1064,6 +1064,67 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
         )
 
+    def test_llama4(self):
+        from mlx_vlm.models import llama4
+
+        text_config = llama4.TextConfig(
+            model_type="llama4_text",
+            hidden_size=5120,
+            num_hidden_layers=3,
+            intermediate_size=8192,
+            intermediate_size_mlp=16384,
+            num_attention_heads=40,
+            num_key_value_heads=8,
+            rms_norm_eps=1e-05,
+            vocab_size=32000,
+            attention_chunk_size=8192,
+            attention_dropout=0.0,
+            head_dim=128,
+            hidden_act="silu",
+            attention_bias=False,
+        )
+        vision_config = llama4.VisionConfig(
+            model_type="llama4_vision_model",
+            image_size=336,
+            patch_size=14,
+            num_channels=3,
+            num_hidden_layers=3,
+            hidden_size=1408,
+            intermediate_size=5632,
+            num_attention_heads=16,
+            norm_eps=1e-05,
+            initializer_range=0.02,
+            pixel_shuffle_ratio=0.5,
+            projector_input_dim=4096,
+            projector_output_dim=4096,
+            projector_dropout=0.0,
+            vision_output_dim=4096,
+            rope_theta=10000,
+            vision_feature_layer=-1,
+            vision_feature_select_strategy="default",
+        )
+        config = llama4.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="llama4",
+        )
+        model = llama4.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
     def test_gemma3(self):
         from mlx_vlm.models import gemma3
 
