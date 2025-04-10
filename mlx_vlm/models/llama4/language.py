@@ -1,15 +1,14 @@
 import inspect
-import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
 
-from ..base import LanguageModelOutput, create_attention_mask, visualize_attention_mask
-from ..cache import KVCache
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import ChunkedKVCache, KVCache
 
 
 @dataclass
@@ -283,15 +282,13 @@ class LlamaModel(nn.Module):
         else:
             h = input_embeds
 
-        if cache is not None:
-            for idx, c in enumerate(cache):
-                if (idx + 1) % 4 != 0:
-                    c.update()
-
         if mask is None:
             mask = create_attention_mask(h, cache)
 
         if cache is not None:
+            for idx, c in enumerate(cache):
+                if (idx + 1) % 4 != 0:
+                    c.maybe_trim_front()
             start = cache[0].start_position
             offset = cache[0].offset
         else:
