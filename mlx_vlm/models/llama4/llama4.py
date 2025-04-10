@@ -109,33 +109,14 @@ class Model(nn.Module):
         return final_inputs_embeds
 
     def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
-        import torch
-
         image_token_index = self.config.image_token_index
-        image_features = torch.from_dlpack(image_features.astype(mx.float16))
-        inputs_embeds = torch.from_dlpack(inputs_embeds.astype(mx.float16))
-        input_ids = torch.from_dlpack(input_ids.astype(mx.int32))
 
-        original_inputs_embeds_shape = inputs_embeds.shape
+        # Positions of <image> tokens in input_ids, assuming batch size is 1
+        image_positions = np.where(input_ids == image_token_index)[1].tolist()
 
-        special_image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
-        final_mask = special_image_mask.to(inputs_embeds.device)
-        inputs_embeds = inputs_embeds.view(-1, inputs_embeds.size(-1))
+        inputs_embeds[:, image_positions, :] = image_features
 
-        final_mask_1d = final_mask[..., 0].reshape(-1)
-        num_tokens_to_fill = final_mask_1d.sum()
-
-        if num_tokens_to_fill != image_features.size(0):
-            raise ValueError(
-                f"Mismatch: final_mask wants {num_tokens_to_fill} embeddings, "
-                f"but multi_modal_projector returned {image_features.size(0)}"
-            )
-
-        expanded_mask = final_mask_1d.unsqueeze(-1).expand(-1, inputs_embeds.size(-1))
-        inputs_embeds = inputs_embeds.masked_scatter(expanded_mask, image_features)
-        inputs_embeds = inputs_embeds.view(original_inputs_embeds_shape)
-
-        return mx.array(inputs_embeds)
+        return inputs_embeds
 
     def __call__(
         self,
