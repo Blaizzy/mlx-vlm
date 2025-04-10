@@ -292,8 +292,8 @@ class Llama4VisionMLP(nn.Module):
 
         if self.is_projector:
             return self.activation_fn(self.fc2(hidden_states))
-        else:
-            return self.fc2(hidden_states)
+
+        return self.fc2(hidden_states)
 
 
 class Llama4VisionEncoderLayer(nn.Module):
@@ -304,8 +304,8 @@ class Llama4VisionEncoderLayer(nn.Module):
         self.self_attn = Llama4VisionAttention(config)
         self.mlp = Llama4VisionMLP(config)
 
-        self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=1e-05)
-        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=1e-05)
+        self.input_layernorm = nn.LayerNorm(config.hidden_size)
+        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size)
 
     def __call__(
         self,
@@ -366,9 +366,6 @@ class Llama4VisionEncoder(nn.Module):
             check_and_log_stats(f"encoder_layer_{i}", hidden_states)
 
         return hidden_states
-
-
-import torch
 
 
 class Llama4UnfoldConvolution(nn.Module):
@@ -457,11 +454,8 @@ class Llama4UnfoldConvolution(nn.Module):
         return result
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
-        torch_unfold = torch.nn.Unfold(kernel_size=self.kernel_size, stride=self.stride)
-        hidden_states = torch.from_dlpack(hidden_states.astype(mx.float32))
-        hidden_states = torch_unfold(hidden_states)
-        hidden_states = mx.array(hidden_states.permute(0, 2, 1)).astype(mx.bfloat16)
-
+        hidden_states = self.unfold(hidden_states)
+        hidden_states = hidden_states.swapaxes(1, 2)
         hidden_states = self.linear(hidden_states)
         return hidden_states
 
@@ -540,8 +534,8 @@ class VisionModel(nn.Module):
         self.rotary_embedding = Llama4VisionRotaryEmbedding(config)
 
         # layer norms
-        self.layernorm_pre = nn.LayerNorm(self.hidden_size, eps=1e-05)
-        self.layernorm_post = nn.LayerNorm(self.hidden_size, eps=1e-05)
+        self.layernorm_pre = nn.LayerNorm(self.hidden_size)
+        self.layernorm_post = nn.LayerNorm(self.hidden_size)
 
         # encoders
         self.model = Llama4VisionEncoder(config)
