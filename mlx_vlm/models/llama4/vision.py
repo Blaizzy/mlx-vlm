@@ -5,19 +5,15 @@ from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 
 @dataclass
 class VisionConfig:
     model_type: str
-    attention_dropout: float
-    hidden_act: str
     hidden_size: int
     image_size: int
     initializer_range: float
     intermediate_size: int
-    multi_modal_projector_bias: bool
     norm_eps: float
     num_attention_heads: int
     num_channels: int
@@ -180,7 +176,6 @@ class Llama4VisionAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_key_value_groups = 1
-        self.attention_dropout = config.attention_dropout
         self.scale = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(

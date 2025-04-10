@@ -26,7 +26,8 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-from .models.base import BaseImageProcessor, KVCache, SimpleKVCache
+from .models.base import BaseImageProcessor
+from .models.cache import KVCache, SimpleKVCache
 from .sample_utils import top_p_sampling
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
