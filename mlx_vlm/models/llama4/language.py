@@ -291,9 +291,6 @@ class LlamaModel(nn.Module):
         if mask is None:
             mask = create_attention_mask(h, cache)
 
-        if cache is None:
-            cache = [None] * len(self.layers)
-
         if cache is not None:
             start = cache[0].start_position
             offset = cache[0].offset
@@ -305,6 +302,9 @@ class LlamaModel(nn.Module):
         chunk_mask = self.create_chunked_attention_mask(
             h.shape[1], self.config.attention_chunk_size, start, offset
         )
+
+        if cache is None:
+            cache = [None] * len(self.layers)
 
         for idx, (layer, c) in enumerate(zip(self.layers, cache)):
             use_chunked_attention = (idx + 1) % 4 != 0
