@@ -1,4 +1,3 @@
-# server.py
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -55,7 +54,6 @@ def get_cached_model(model_path: str, adapter_path: Optional[str]):
     """
     global model_cache
 
-    # Construct a unique key for the cache
     cache_key = (model_path, adapter_path)
 
     # Return from cache if already loaded and matches the requested paths
@@ -71,7 +69,6 @@ def get_cached_model(model_path: str, adapter_path: Optional[str]):
     # Load the model resources
     model, processor, config = load_model_resources(model_path, adapter_path)
 
-    # Update the cache
     model_cache = {
         "cache_key": cache_key,
         "model_path": model_path,
@@ -87,14 +84,14 @@ def get_cached_model(model_path: str, adapter_path: Optional[str]):
 def unload_model_sync():
     global model_cache
     if not model_cache:
-        return False # Indicate nothing was unloaded
+        return False 
 
     print(f"Unloading model: {model_cache.get('model_path')}, Adapter: {model_cache.get('adapter_path')}")
     # Clear references
     model_cache = {}
     # Force garbage collection
     gc.collect()
-    mx.clear_cache() # Clear mlx cache as well
+    mx.clear_cache() 
     print("Model unloaded and cache cleared.")
     return True
 
@@ -130,7 +127,7 @@ class ChatRequest(GenerationRequest):
 class GenerationResponse(BaseModel):
     text: str
     model: str
-    usage: Dict[str, Any] # Placeholder for verbose usage stats, can be expanded as needed
+    usage: Dict[str, Any] # Placeholder for verbose usage stats (TODO)
 
 class StreamChunk(BaseModel):
     chunk: str
@@ -162,7 +159,6 @@ async def generate_endpoint(request: GenerationRequest):
             )
 
         # Prepare the prompt using the chat template logic
-        # Adapt apply_chat_template for single prompt + optional system message
         chat_messages = []
         if request.system:
             system_prompt = codecs.decode(request.system, "unicode_escape")
@@ -170,7 +166,6 @@ async def generate_endpoint(request: GenerationRequest):
         prompt = codecs.decode(request.prompt, "unicode_escape")
         chat_messages.append({"role": "user", "content": prompt})
 
-        # For now, assume it works or adapt it as needed.
         formatted_prompt = apply_chat_template(
             processor, config, chat_messages, num_images=len(request.image)
         )
@@ -207,15 +202,13 @@ async def generate_endpoint(request: GenerationRequest):
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
-                    # Try to send an error message over the stream if possible
                     error_data = json.dumps({"error": str(e)})
                     yield f"data: {error_data}\n\n"
+                
                 finally:
-                    # Clean up resources after generation completes or fails
                     mx.clear_cache()
                     gc.collect()
                     print("Stream finished, cleared cache.")
-
 
             return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
@@ -250,7 +243,6 @@ async def generate_endpoint(request: GenerationRequest):
             except Exception as e:
                  print(f"Error during generation: {e}")
                  traceback.print_exc()
-                 # Clean up resources even on error
                  mx.clear_cache()
                  gc.collect()
                  raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
@@ -263,7 +255,6 @@ async def generate_endpoint(request: GenerationRequest):
         # Catch unexpected errors
         print(f"Unexpected error in /generate endpoint: {e}")
         traceback.print_exc()
-        # Clean up resources on unexpected error
         mx.clear_cache()
         gc.collect()
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
@@ -295,7 +286,6 @@ async def generate_endpoint(request: GenerationRequest):
                 else tuple(request.resize_shape)
             )
 
-        # Prepare the prompt using the chat template logic
         chat_messages = request.prompt
 
         # For now, assume it works or adapt it as needed.
@@ -336,11 +326,10 @@ async def generate_endpoint(request: GenerationRequest):
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
-                    # Try to send an error message over the stream if possible
                     error_data = json.dumps({"error": str(e)})
                     yield f"data: {error_data}\n\n"
+
                 finally:
-                    # Clean up resources after generation completes or fails
                     mx.clear_cache()
                     gc.collect()
                     print("Stream finished, cleared cache.")
@@ -378,7 +367,6 @@ async def generate_endpoint(request: GenerationRequest):
             except Exception as e:
                  print(f"Error during generation: {e}")
                  traceback.print_exc()
-                 # Clean up resources even on error
                  mx.clear_cache()
                  gc.collect()
                  raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
@@ -391,7 +379,6 @@ async def generate_endpoint(request: GenerationRequest):
         # Catch unexpected errors
         print(f"Unexpected error in /generate endpoint: {e}")
         traceback.print_exc()
-        # Clean up resources on unexpected error
         mx.clear_cache()
         gc.collect()
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
@@ -465,7 +452,6 @@ async def generate_endpoint(request: VLMRequest):
         except Exception as e:
                 print(f"Error during generation: {e}")
                 traceback.print_exc()
-                # Clean up resources even on error
                 mx.clear_cache()
                 gc.collect()
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
@@ -477,7 +463,6 @@ async def generate_endpoint(request: VLMRequest):
         # Catch unexpected errors
         print(f"Unexpected error in /generate endpoint: {e}")
         traceback.print_exc()
-        # Clean up resources on unexpected error
         mx.clear_cache()
         gc.collect()
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
