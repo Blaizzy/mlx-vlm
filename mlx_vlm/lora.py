@@ -128,6 +128,11 @@ if __name__ == "__main__":
         help="Enable full weight training instead of LoRA. When this flag is set, all LoRA settings (lora-alpha, lora-rank, lora-dropout) will be ignored."
     )
     parser.add_argument(
+        "--training-type",
+        action="store_true",
+        help="Enable full weight training instead of LoRA. When this flag is set, all LoRA settings (lora-alpha, lora-rank, lora-dropout) will be ignored."
+    )
+    parser.add_argument(
         "--dataset", type=str, required=True, help="Path to the dataset"
     )
     parser.add_argument(
@@ -165,6 +170,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--print-every", type=int, default=10, help="Print loss every n steps"
+    )
+    parser.add_argument(
+        "--wandb_project", type=int, default=0.1, help="LoRA alpha parameter"
     )
     parser.add_argument(
         "--lora-alpha", type=int, default=0.1, help="LoRA alpha parameter"
