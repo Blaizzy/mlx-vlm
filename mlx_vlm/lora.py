@@ -2,12 +2,12 @@ import argparse
 import logging
 
 import mlx.optimizers as optim
-from tqdm import tqdm
 
 from .trainers import TrainingArgs, TrainingCallback, save_adapter, save_full_model, train
 from .trainers.dataset import load_and_prepare_dataset
 from .trainers.utils import get_peft_model, print_trainable_parameters
 from .utils import load, load_image_processor
+from .trainers.callback import WandBCallback
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -65,27 +65,40 @@ def main(args):
             
         def on_train_loss_report(self, train_info):
             self.progress_bar.update(train_info["iteration"] - self.progress_bar.n)
-            self.progress_bar.set_postfix({
-                "Loss": f"{train_info['train_loss']:.4f}",
-                "LR": f"{train_info['learning_rate']:.2e}",
-                "Tokens/sec": f"{train_info['tokens_per_second']:.0f}"
-            })
-            
-            # Log additional information
-            custom_print({
-                "Step": train_info["iteration"],
-                "Loss": f"{train_info['train_loss']:.4f}",
-                "Learning Rate": f"{train_info['learning_rate']:.2e}",
-                "Tokens/sec": f"{train_info['tokens_per_second']:.0f}"
-            })
+
+            # Use dynamic keys from train_info for logging and progress bar
+            postfix = {}
+            log_info = {"Step": train_info["iteration"]}
+            for key, value in train_info.items():
+                if key == "iteration":
+                    continue
+                try:
+                    if isinstance(value, float):
+                        log_info[key] = f"{value:.4f}" if abs(value) >= 1e-3 else f"{value:.2e}"
+                        postfix[key] = log_info[key]
+                    elif isinstance(value, int):
+                        log_info[key] = str(value)
+                        postfix[key] = log_info[key]
+                except Exception:
+                    continue
+
+            self.progress_bar.set_postfix(postfix)
+            custom_print(log_info)
             
         def on_val_loss_report(self, val_info):
-            # Log validation results
-            custom_print({
-                "Step": val_info["iteration"],
-                "Val Loss": f"{val_info['val_loss']:.4f}",
-                "Val Time": f"{val_info['val_time']:.2f}s"
-            })
+            log_info = {"Step": val_info.get("iteration", "N/A")}
+            for key, value in val_info.items():
+                if key == "iteration":
+                    continue
+                try:
+                    if isinstance(value, float):
+                        log_info[key] = f"{value:.4f}" if abs(value) >= 1e-3 else f"{value:.2e}"
+                    elif isinstance(value, int):
+                        log_info[key] = str(value)
+                except Exception:
+                    continue
+
+            custom_print(log_info)
     
     model.train()
     

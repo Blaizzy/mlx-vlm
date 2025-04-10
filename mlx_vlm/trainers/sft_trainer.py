@@ -262,7 +262,7 @@ def train(
     dataset,
     args: TrainingArgs = TrainingArgs(),
     loss=default_loss,
-    training_callback=None,
+    training_callback: TrainingCallback = None,
     clip_gradients=None,
     train_on_completions=False,
     assistant_id=77091
