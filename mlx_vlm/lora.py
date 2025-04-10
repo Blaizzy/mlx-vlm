@@ -172,7 +172,10 @@ if __name__ == "__main__":
         "--print-every", type=int, default=10, help="Print loss every n steps"
     )
     parser.add_argument(
-        "--wandb_project", type=int, default=0.1, help="LoRA alpha parameter"
+        "--wandb-project",
+        type=str,
+        default=None,
+        help="WandB project name to report training metrics. Disabled if None.",
     )
     parser.add_argument(
         "--lora-alpha", type=int, default=0.1, help="LoRA alpha parameter"

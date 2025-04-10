@@ -9,6 +9,7 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_map
 
 from .utils import grad_checkpoint
+from .callback import TrainingCallback
 
 @dataclass
 class TrainingArgs:
