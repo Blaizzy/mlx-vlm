@@ -103,9 +103,10 @@ if __name__ == "__main__":
         help="Enable full weight training instead of LoRA. When this flag is set, all LoRA settings (lora-alpha, lora-rank, lora-dropout) will be ignored."
     )
     parser.add_argument(
-        "--training-type",
-        action="store_true",
-        help="Enable full weight training instead of LoRA. When this flag is set, all LoRA settings (lora-alpha, lora-rank, lora-dropout) will be ignored."
+        "--train-mode",
+        type=str,
+        choices=["sft", "grpo"],
+        help="Training mode: SFT, DPO, ORPO or GRPO",
     )
     parser.add_argument(
         "--dataset", type=str, required=True, help="Path to the dataset"

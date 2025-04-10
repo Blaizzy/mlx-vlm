@@ -124,66 +124,109 @@ class SFTDataset:
             return self.__getitem__((idx + 1) % len(self))
 
 
-# class DPOORPODataset:
-#     def __init__(
-#         self,
-#         hf_dataset,
-#         config,
-#         processor,
-#         image_processor=None,
-#         take=None,
-#         split=None,
-#         image_resize_shape=None,
-#         images_key: str = "image",
-#         messages_key: str = "messages",
-#         chosen_key: str = "chosen",
-#         rejected_key: str = "rejected"
-#     ):
-#         self.dataset = hf_dataset[split] if split is not None else hf_dataset
-#         if take is not None:
-#             self.dataset = self.dataset.take(take)
+class GRPODataset:
+    """
+    Dataset wrapper for GRPO training data with VLM support.
+    Each example must have 'prompt', 'answer', and 'image' fields.
+    Returns model-ready inputs, including pixel values and tokenized sequences.
+    """
+    def __init__(
+        self,
+        hf_dataset,
+        config,
+        processor,
+        image_processor=None,
+        take=None,
+        split=None,
+        image_resize_shape=None,
+        images_key: str = "image",
+        prompt_key: str = "prompt",
+        answer_key: str = "answer",
+        system_key: str = "system",
+        type_key: str = "type",
+        use_chat_template: bool = False,
+        use_prompt: bool = False
+    ):
+        self.dataset = hf_dataset[split] if split is not None else hf_dataset
+        if take is not None:
+            self.dataset = self.dataset.take(take)
 
-#         self.processor = processor
-#         self.config = config
-#         self.image_processor = image_processor
-#         self.image_resize_shape = image_resize_shape
-#         self.images_key = images_key
-#         self.messages_key = messages_key
-#         self.chosen_key = chosen_key
-#         self.rejected_key = rejected_key
-    
-#     def __len__(self):
-#         return len(self.dataset)
+        self.processor = processor
+        self.config = config
+        self.image_processor = image_processor
+        self.image_resize_shape = image_resize_shape
+        self.images_key = images_key
+        self.prompt_key = prompt_key
+        self.answer_key = answer_key
+        self.system_key = system_key
+        self.type_key = type_key
+        self.use_chat_template = use_chat_template
+        self.use_prompt = use_prompt
 
+    def __len__(self):
+        return len(self.dataset)
 
-# class GRPODataset:
-#     def __init__(
-#         self,
-#         hf_dataset,
-#         config,
-#         processor,
-#         image_processor=None,
-#         take=None,
-#         split=None,
-#         image_resize_shape=None,
-#         images_key: str = "image",
-#         prompt_key: str = "prompt",
-#         answer_key: str = "answer"
-#     ):
-#         self.dataset = hf_dataset[split] if split is not None else hf_dataset
-#         if take is not None:
-#             self.dataset = self.dataset.take(take)
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
 
-#         self.processor = processor
-#         self.config = config
-#         self.image_processor = image_processor
-#         self.image_resize_shape = image_resize_shape
-#         self.images_key = images_key
-#         self.prompt_key = prompt_key
-#         self.answer_key = answer_key
-    
-#     def __len__(self):
-#         return len(self.dataset)
+        image = item[self.images_key]
+        prompt_str = str(item[self.prompt_key])
+        answer_str = str(item[self.answer_key])
+        type_info = item.get(self.type_key, None)
+
+        if self.use_chat_template:
+            default_system_str = (
+                "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
+                "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
+                "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, "
+                "i.e., <think> reasoning process here </think><answer> answer here </answer>."
+            )
+            system_str = item.get(self.system_key, default_system_str)
+            full_prompt = [
+                {'role': 'system', 'content': system_str},
+                {'role': 'user', 'content': prompt_str}
+            ]
+            prompt_tokens = self.processor.apply_chat_template(
+                full_prompt,
+                add_generation_prompt=True
+            )
+            answer_tokens = self.processor.tokenizer.encode(answer_str)
+        else:
+            if self.use_prompt:
+                full_prompt_str = (
+                    "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
+                    "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
+                    "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, "
+                    f"i.e., <think> reasoning process here </think><answer> answer here </answer>. User: {prompt_str} Assistant: "
+                )
+                prompt_tokens = self.processor.tokenizer.encode(full_prompt_str)
+            else:
+                prompt_tokens = self.processor.tokenizer.encode(prompt_str)
+            answer_tokens = self.processor.tokenizer.encode(answer_str)
+
+        from ..utils import prepare_inputs
+        inputs = prepare_inputs(
+            self.processor,
+            image,
+            [prompt_tokens + answer_tokens],
+            self.config["image_token_index"],
+            self.image_resize_shape,
+        )
+
+        input_ids = inputs["input_ids"]
+        pixel_values = inputs["pixel_values"]
+        attention_mask = inputs["attention_mask"]
+        other_inputs = {k: v for k, v in inputs.items() if k not in ["input_ids", "pixel_values", "attention_mask"]}
+
+        return {
+            "input_ids": input_ids,
+            "pixel_values": pixel_values,
+            "attention_mask": attention_mask,
+            "prompt_str": prompt_str,
+            "answer_str": answer_str,
+            "type": type_info,
+            **other_inputs
+        }
 
 
 def prepare_dataset(
@@ -284,7 +327,6 @@ def load_and_prepare_dataset(
     image_resize_shape: Optional[Any] = None,
     path: Optional[str] = None,
     split: Optional[str] = None,
-    type: str = "sft"
 ):
     logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
     loaded_dataset = load_dataset(args.dataset, name=args.dataset_config, split=args.split)
@@ -297,9 +339,19 @@ def load_and_prepare_dataset(
         args=args
     )
 
-    if type == "sft": # will be args.train_type later for dpo and so on
+    if args.train_type == "sft":
         return SFTDataset(
             prepared_dataset,
+            config,
+            processor,
+            image_processor=image_processor,
+            image_resize_shape=args.image_resize_shape,
+            messages_key=messages_key,
+            images_key=image_field
+        )
+    elif args.train_type == "grpo":
+        return GRPODataset(
+            prepare_dataset,
             config,
             processor,
             image_processor=image_processor,
