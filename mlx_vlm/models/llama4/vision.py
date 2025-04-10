@@ -59,37 +59,6 @@ def check_array_shape(arr):
         return False
 
 
-activations = {}
-
-
-def check_and_log_stats(name, tensor, capture_activations=True):
-    """Helper function to check for anomalies and log stats."""
-    if not capture_activations:
-        return
-
-    print(f"--- Activation Stats: {name} ---")
-    # Check for NaNs/Infs
-    has_nan = mx.isnan(tensor).any()
-    has_inf = mx.isinf(tensor).any()
-    if has_nan:
-        print(f"WARNING: Found NaN in {name}")
-    if has_inf:
-        print(f"WARNING: Found Inf in {name}")
-
-    # Calculate and print stats (ensure computation happens)
-    min_val = mx.min(tensor).item()
-    max_val = mx.max(tensor).item()
-    mean_val = mx.mean(tensor).item()
-    std_val = mx.std(tensor).item()
-    print(f"  Shape: {tensor.shape}")
-    print(f"  Min: {min_val:.4f}, Max: {max_val:.4f}")
-    print(f"  Mean: {mean_val:.4f}, Std: {std_val:.4f}")
-    print("-" * (len(name) + 24))
-
-    # Store the tensor itself
-    activations[name] = tensor
-
-
 class Llama4MultiModalProjector(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -363,7 +332,6 @@ class Llama4VisionEncoder(nn.Module):
                 mask=mask,
                 freqs_ci=freqs_ci,
             )
-            check_and_log_stats(f"encoder_layer_{i}", hidden_states)
 
         return hidden_states
 
@@ -560,7 +528,6 @@ class VisionModel(nn.Module):
         num_chunks = 1
 
         hidden_state = self.patch_embedding(pixel_values)
-        check_and_log_stats("patch_embedding", hidden_state)
 
         _, num_patches, hidden_dim = hidden_state.shape
 
@@ -574,11 +541,8 @@ class VisionModel(nn.Module):
         class_embedding = mx.broadcast_to(
             self.class_embedding, (hidden_state.shape[0], 1, hidden_state.shape[-1])
         )
-
-        print(f"Class embedding: {class_embedding}")
         hidden_state = mx.concatenate([hidden_state, class_embedding], axis=1)
         num_patches += 1
-        check_and_log_stats("after_cls_concat", hidden_state)
 
         # Position embeddings
         hidden_state = hidden_state.reshape(
@@ -589,12 +553,9 @@ class VisionModel(nn.Module):
         )
 
         positional_embedding = self.positional_embedding_vlm
-        print(f"Positional embedding: {positional_embedding}")
         hidden_state = hidden_state + positional_embedding
-        check_and_log_stats("after_pos_embedding", hidden_state)
 
         hidden_state = self.layernorm_pre(hidden_state)
-        check_and_log_stats("after_layernorm_pre", hidden_state)
 
         hidden_state = hidden_state.reshape(batch_size_times_num_tiles, -1, hidden_dim)
         freqs_ci = self.rotary_embedding(pixel_values)
@@ -604,20 +565,13 @@ class VisionModel(nn.Module):
             mask=None,
             freqs_ci=freqs_ci,
         )
-        check_and_log_stats("encoder_output", hidden_state)
 
         hidden_state = self.layernorm_post(hidden_state)
-        check_and_log_stats("after_layernorm_post", hidden_state)
 
         hidden_state = hidden_state[:, :-1, :]
 
         # now, we use Llama4VisionPixelShuffle + mlp to project embeddings
         final_hidden_state = self.vision_adapter(hidden_state)
-        check_and_log_stats("final_adapter_output", final_hidden_state)
-
-        print("Vision Encoder Sum: ", mx.sum(final_hidden_state))
-
-        # mx.save("mlx_llama_4_vl.npy", final_hidden_state)
 
         # Return only the final state
         return final_hidden_state
