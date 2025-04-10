@@ -278,7 +278,7 @@ class LlamaModel(nn.Module):
         mask: mx.array = None,
         cache=None,
     ):
-        if input_ids is not None:
+        if input_embeds is None:
             h = self.embed_tokens(input_ids)
         else:
             h = input_embeds
