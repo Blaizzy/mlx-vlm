@@ -7,15 +7,10 @@ from .trainers import TrainingArgs, TrainingCallback, save_adapter, save_full_mo
 from .trainers.dataset import load_and_prepare_dataset
 from .trainers.utils import get_peft_model, print_trainable_parameters
 from .utils import load, load_image_processor
-from .trainers.callback import WandBCallback
+from .trainers.callback import WandBCallback, CustomTrainingCallback, TrainingCallback
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-def custom_print(*args, **kwargs):
-    tqdm.write(" ".join(map(str, args)), **kwargs)
-
 
 def main(args):
     logger.info(f"\033[32mLoading model from {args.model_path}\033[0m")
@@ -58,52 +53,19 @@ def main(args):
         adapter_file=args.output_path
     )
     
-    # Create a custom TrainingCallback for tqdm progress bar
-    class CustomTrainingCallback(TrainingCallback):
-        def __init__(self, total_iters):
-            self.progress_bar = tqdm(total=total_iters, position=0, leave=True)
-            
-        def on_train_loss_report(self, train_info):
-            self.progress_bar.update(train_info["iteration"] - self.progress_bar.n)
-
-            # Use dynamic keys from train_info for logging and progress bar
-            postfix = {}
-            log_info = {"Step": train_info["iteration"]}
-            for key, value in train_info.items():
-                if key == "iteration":
-                    continue
-                try:
-                    if isinstance(value, float):
-                        log_info[key] = f"{value:.4f}" if abs(value) >= 1e-3 else f"{value:.2e}"
-                        postfix[key] = log_info[key]
-                    elif isinstance(value, int):
-                        log_info[key] = str(value)
-                        postfix[key] = log_info[key]
-                except Exception:
-                    continue
-
-            self.progress_bar.set_postfix(postfix)
-            custom_print(log_info)
-            
-        def on_val_loss_report(self, val_info):
-            log_info = {"Step": val_info.get("iteration", "N/A")}
-            for key, value in val_info.items():
-                if key == "iteration":
-                    continue
-                try:
-                    if isinstance(value, float):
-                        log_info[key] = f"{value:.4f}" if abs(value) >= 1e-3 else f"{value:.2e}"
-                    elif isinstance(value, int):
-                        log_info[key] = str(value)
-                except Exception:
-                    continue
-
-            custom_print(log_info)
-    
     model.train()
     
     logger.info(f"\033[32mTraining model\033[0m")
-    callback = CustomTrainingCallback(training_args.iters)
+    if args.wandb_project:
+        logger.info(f"\033[32mUsing WandB for logging\033[0m")
+        callback = WandBCallback(
+            project_name=args.wandb_project,
+            log_dir=training_args.adapter_file,
+            config=training_args.__dict__,
+            wrapped_callback=CustomTrainingCallback(training_args.iters)
+        )
+    else:
+        callback = CustomTrainingCallback(training_args.iters)
     
     # Use the functional train approach instead of manual loop
     train(
