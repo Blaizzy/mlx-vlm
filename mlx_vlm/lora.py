@@ -3,11 +3,11 @@ import logging
 
 import mlx.optimizers as optim
 
-from .trainers import TrainingArgs, TrainingCallback, save_adapter, save_full_model, train
+from .trainers import TrainingArgs, save_adapter, save_full_model, train
 from .trainers.dataset import load_and_prepare_dataset
 from .trainers.utils import get_peft_model, print_trainable_parameters
 from .utils import load, load_image_processor
-from .trainers.callback import WandBCallback, CustomTrainingCallback, TrainingCallback
+from .trainers.callback import WandBCallback, CustomTrainingCallback
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
