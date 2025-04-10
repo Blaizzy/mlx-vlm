@@ -21,3 +21,7 @@ var/
 *.egg
 .DS_Store
 *.log
+
+# virtual environment
+.myenv
+.venv
