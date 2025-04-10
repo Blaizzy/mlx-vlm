@@ -9,7 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
-from ..base import KVCache
+from ..cache import KVCache
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
