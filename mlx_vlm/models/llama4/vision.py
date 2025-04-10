@@ -461,84 +461,51 @@ class Llama4UnfoldConvolution(nn.Module):
         return hidden_states
 
 
-# class Llama4VisionRotaryEmbedding:
-#     def __init__(self, config):
-#         super().__init__()
-#         idx = config.image_size // config.patch_size
-#         img_idx = mx.arange(idx**2, dtype=mx.int32).reshape(idx**2, 1)
-#         img_idx = mx.concatenate([img_idx, img_idx[:1]], axis=0)
-#         img_idx[-1, -1] = -2  # ID_CLS_TOKEN
-#         frequencies_x = img_idx % idx  # get the coordinates of the 2d matrix along x
-#         frequencies_y = img_idx // idx  # get the coordinates of the 2d matrix along y
-#         freq_dim = config.hidden_size // config.num_attention_heads // 2
-#         rope_freq = 1.0 / (
-#             config.rope_theta
-#             ** (
-#                 mx.arange(0, freq_dim, 2, dtype=mx.float32)[: (freq_dim // 2)]
-#                 / freq_dim
-#             )
-#         )
-
-#         # Expand dimensions for frequencies_x and frequencies_y
-#         freqs_x_expanded = (frequencies_x + 1)[..., None] * rope_freq[None, None, :]
-#         freqs_y_expanded = (frequencies_y + 1)[..., None] * rope_freq[None, None, :]
-
-#         def repeat_interleave(tensor, repeats, dim=-1):
-#             # Get the shape
-#             shape = list(tensor.shape)
-
-#             # Reshape to add an extra dimension for repeating
-#             tensor = mx.reshape(tensor, shape[:-1] + [shape[-1], 1])
-
-#             # Repeat along the new dimension
-#             tensor = mx.repeat(tensor, repeats, axis=-1)
-
-#             # Reshape to flatten the last two dimensions
-#             return mx.reshape(tensor, shape[:-1] + [shape[-1] * repeats])
-
-#         # Apply interleaving
-#         freqs_x = repeat_interleave(freqs_x_expanded, 2)
-#         freqs_y = repeat_interleave(freqs_y_expanded, 2)
-#         freqs = mx.concatenate([freqs_x, freqs_y], axis=-1).astype(mx.float32)[..., ::2]
-#         # Replaced masked_fill with where
-#         mask = img_idx.reshape(-1, 1, 1) < 0
-#         freqs = mx.where(mask, mx.zeros_like(freqs), freqs)
-#         freq_cis = mx.stack([mx.cos(freqs), mx.sin(freqs)], axis=-1)
-#         freq_cis = view_as_complex(freq_cis)
-#         self.freqs_ci = freq_cis  # idx**2, idx**2, idx * 2
-
-#     def __call__(self, hidden_states):
-#         return self.freqs_ci
-
-import torch
-
-
 class Llama4VisionRotaryEmbedding:
     def __init__(self, config):
         super().__init__()
         idx = config.image_size // config.patch_size
-        img_idx = torch.arange(idx**2, dtype=torch.int32).reshape(idx**2, 1)
-        img_idx = torch.cat([img_idx, img_idx[:1]], dim=0)
+        img_idx = mx.arange(idx**2, dtype=mx.int32).reshape(idx**2, 1)
+        img_idx = mx.concatenate([img_idx, img_idx[:1]], axis=0)
         img_idx[-1, -1] = -2  # ID_CLS_TOKEN
         frequencies_x = img_idx % idx  # get the coordinates of the 2d matrix along x
         frequencies_y = img_idx // idx  # get the coordinates of the 2d matrix along y
         freq_dim = config.hidden_size // config.num_attention_heads // 2
         rope_freq = 1.0 / (
             config.rope_theta
-            ** (torch.arange(0, freq_dim, 2)[: (freq_dim // 2)].float() / freq_dim)
+            ** (
+                mx.arange(0, freq_dim, 2, dtype=mx.float32)[: (freq_dim // 2)]
+                / freq_dim
+            )
         )
-        freqs_x = (
-            (frequencies_x + 1)[..., None] * rope_freq[None, None, :]
-        ).repeat_interleave(2, dim=-1)
-        freqs_y = (
-            (frequencies_y + 1)[..., None] * rope_freq[None, None, :]
-        ).repeat_interleave(2, dim=-1)
-        freqs = torch.cat([freqs_x, freqs_y], dim=-1).float().contiguous()[..., ::2]
-        freqs = freqs.masked_fill(img_idx.reshape(-1, 1, 1) < 0, 0)
-        freq_cis = torch.view_as_complex(
-            torch.stack([torch.cos(freqs), torch.sin(freqs)], dim=-1)
-        )
-        self.freqs_ci = mx.array(freq_cis)  # idx**2, idx**2, idx * 2
+
+        # Expand dimensions for frequencies_x and frequencies_y
+        freqs_x_expanded = (frequencies_x + 1)[..., None] * rope_freq[None, None, :]
+        freqs_y_expanded = (frequencies_y + 1)[..., None] * rope_freq[None, None, :]
+
+        def repeat_interleave(tensor, repeats, dim=-1):
+            # Get the shape
+            shape = list(tensor.shape)
+
+            # Reshape to add an extra dimension for repeating
+            tensor = mx.reshape(tensor, shape[:-1] + [shape[-1], 1])
+
+            # Repeat along the new dimension
+            tensor = mx.repeat(tensor, repeats, axis=-1)
+
+            # Reshape to flatten the last two dimensions
+            return mx.reshape(tensor, shape[:-1] + [shape[-1] * repeats])
+
+        # Apply interleaving
+        freqs_x = repeat_interleave(freqs_x_expanded, 2)
+        freqs_y = repeat_interleave(freqs_y_expanded, 2)
+        freqs = mx.concatenate([freqs_x, freqs_y], axis=-1).astype(mx.float32)[..., ::2]
+        # Replaced masked_fill with where
+        mask = img_idx.reshape(-1, 1, 1) < 0
+        freqs = mx.where(mask, mx.zeros_like(freqs), freqs)
+        freq_cis = mx.stack([mx.cos(freqs), mx.sin(freqs)], axis=-1)
+        freq_cis = view_as_complex(freq_cis)
+        self.freqs_ci = freq_cis  # idx**2, idx**2, idx * 2
 
     def __call__(self, hidden_states):
         return self.freqs_ci
