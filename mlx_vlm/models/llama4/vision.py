@@ -474,15 +474,15 @@ class Llama4VisionRotaryEmbedding:
 
 
 class VisionModel(nn.Module):
-    base_model_prefix = "vision_model"
-    config_class = VisionConfig
-
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.image_size = config.image_size
         self.patch_size = config.patch_size
         self.hidden_size = config.hidden_size
         self.num_channels = config.num_channels
+        self.model_type = config.model_type
+        if self.model_type not in ["llama4", "llama4_vision_model"]:
+            raise ValueError(f"Model type {self.model_type} not supported")
 
         self.num_patches = (self.image_size // self.patch_size) ** 2 + 1
         self.scale = config.hidden_size**-0.5
