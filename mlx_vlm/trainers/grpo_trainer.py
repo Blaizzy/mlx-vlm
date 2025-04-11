@@ -1,5 +1,3 @@
-# Copyright © 2024 Apple Inc.
-
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -102,10 +100,10 @@ def generate_grpo(
             current_batch_size = min(batch_size, total_samples - i)
             batch_prompts = prompt_tokens[i: i + current_batch_size]
 
-            if image and processor:
+            if images and processor:
                 inputs = prepare_inputs(
                     processor,
-                    image=image if isinstance(image, str) else image[i],
+                    image=images if isinstance(images, str) else images[i],
                     prompts=batch_prompts,
                     image_token_index=image_token_index,
                     resize_shape=resize_shape,
