@@ -143,6 +143,7 @@ class GRPODataset:
         prompt_key: str = "prompt",
         answer_key: str = "answer",
         system_key: str = "system",
+        system_prompt: str = None,
         type_key: str = "type",
         use_chat_template: bool = False,
         use_prompt: bool = False
@@ -162,6 +163,7 @@ class GRPODataset:
         self.type_key = type_key
         self.use_chat_template = use_chat_template
         self.use_prompt = use_prompt
+        self.system_prompt = system_prompt
 
     def __len__(self):
         return len(self.dataset)
@@ -181,7 +183,7 @@ class GRPODataset:
                 "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, "
                 "i.e., <think> reasoning process here </think><answer> answer here </answer>."
             )
-            system_str = item.get(self.system_key, default_system_str)
+            system_str = self.system_prompt or item.get(self.system_key, default_system_str)
             full_prompt = [
                 {'role': 'system', 'content': system_str},
                 {'role': 'user', 'content': prompt_str}
