@@ -497,6 +497,7 @@ def train_grpo(
     model: nn.Module,
     ref_model: Optional[nn.Module],
     tokenizer,
+    processor,
     optimizer,
     train_dataset,
     val_dataset,
@@ -533,11 +534,14 @@ def train_grpo(
             model=model,
             tokenizer=tokenizer,
             prompt_tokens=prompt_tokens,
+            image=images,
+            processor=processor,
+            image_token_index=args.image_token_index,
+            resize_shape=args.image_resize_shape,
             max_tokens=args.max_completion_length,
             group_size=args.group_size,
             temperature=args.temperature,
             batch_size=args.batch_size,
-            image=images
         )
 
         (loss, toks, metrics), grad = loss_value_and_grad(
