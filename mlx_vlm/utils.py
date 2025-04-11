@@ -35,7 +35,6 @@ MODEL_REMAPPING = {"llava-qwen2": "llava_bunny", "bunny-llama": "llava_bunny"}
 
 MAX_FILE_SIZE_GB = 5
 
-
 @dataclass
 class GenerationResult:
     text: str
