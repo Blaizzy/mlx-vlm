@@ -1013,6 +1013,10 @@ def stream_generate(
         Generator[Tuple[mx.array, mx.array]]: A generator producing text.
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    eos_token = kwargs.pop("eos_token", tokenizer.eos_token_id)
+    if isinstance(eos_token, str):
+        eos_token = tokenizer.encode(eos_token)[0]
+
     prompt_tokens = mx.array(tokenizer.encode(prompt))
 
     resize_shape = kwargs.pop("resize_shape", None)
@@ -1051,7 +1055,7 @@ def stream_generate(
             prompt_tps = input_ids.size / prompt_time
             tic = time.perf_counter()
 
-        if token == tokenizer.eos_token_id:
+        if token == eos_token:
             break
 
         detokenizer.add_token(token)

@@ -76,6 +76,7 @@ def parse_arguments():
     )
     parser.add_argument("--chat", action="store_true", help="Chat in multi-turn style.")
     parser.add_argument("--verbose", action="store_false", help="Detailed output.")
+    parser.add_argument("--eos-token", type=str, default=None, help="EOS token.")
 
     return parser.parse_args()
 
@@ -101,6 +102,8 @@ def main():
     prompt = apply_chat_template(processor, config, prompt, num_images=len(args.image))
 
     kwargs = {}
+    if args.eos_token is not None:
+        kwargs["eos_token"] = args.eos_token
 
     if args.resize_shape is not None:
         if len(args.resize_shape) not in [1, 2]:
