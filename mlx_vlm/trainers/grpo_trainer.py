@@ -72,8 +72,56 @@ def get_per_token_logps(model: nn.Module, inputs, lengths):
     mx.eval(logits)
     return per_token_logps
 
-def flatten_once(x):
-    return [item for sublist in x for item in sublist] if isinstance(x[0], list) else x
+
+def generate_step_grpo(
+    input_ids: mx.array,
+    model: nn.Module,
+    pixel_values,
+    mask,
+    *,
+    max_tokens: int = 256,
+    temperature: float = 0.0,
+    grid_thw=None,
+) -> Generator[Tuple[int, mx.array], None, None]:
+    """
+    A GRPO-specific generation step that does not rely on external generate_step().
+    Yields token ID and logprobs for each token.
+    """
+    def sample(logits: mx.array) -> Tuple[mx.array, mx.array]:
+        logprobs = logits - mx.logsumexp(logits)
+        if temperature == 0.0:
+            token = mx.argmax(logits, axis=-1)
+        else:
+            token = mx.random.categorical(logits * (1 / temperature))
+        return token, logprobs
+
+    outputs = model(input_ids, pixel_values, mask=mask, grid_thw=grid_thw)
+    if not hasattr(outputs, "logits") or outputs.logits is None:
+        print("[ERROR] Initial model forward returned invalid logits")
+        return
+
+    logits = outputs.logits[:, -1, :]
+    y, logprobs = sample(logits)
+    yield y.item(), logprobs
+
+    decoder_input_ids = y[None]
+    n = 1
+    while n < max_tokens:
+        decoder_out = model.language_model(
+            decoder_input_ids,
+            encoder_outputs=getattr(outputs, "encoder_outputs", None),
+        )
+        if not hasattr(decoder_out, "logits") or decoder_out.logits is None:
+            print(f"[ERROR] Decoder step {n} returned invalid logits")
+            return
+
+        logits = decoder_out.logits[:, -1, :]
+        y, logprobs = sample(logits)
+        yield y.item(), logprobs
+        decoder_input_ids = y[None]
+        n += 1
+
+
 
 def generate_grpo(
     model: nn.Module,
@@ -84,12 +132,9 @@ def generate_grpo(
     group_size: int = 2,
     temperature: float = 0.8,
     batch_size: int = 1,
-    end_token: str = "</answer>",
-    image_token_index: int = None,
-    resize_shape=None,
+    end_token: str = "</answer>"
 ):
     try:
-        from ..utils import generate_step, prepare_inputs
         end_sequence = mx.array(processor.tokenizer.encode(end_token))
         total_samples = len(prompt_tokens)
         all_completions = []
@@ -100,68 +145,62 @@ def generate_grpo(
             current_batch_size = min(batch_size, total_samples - i)
             batch_prompts = prompt_tokens[i: i + current_batch_size]
 
-        if images and processor and images[i] is not None:
-            ids = prompt_tokens[i]
-            inputs = prepare_inputs(
-                processor,
-                images[i],
-                processor.tokenizer.decode(ids.tolist() if isinstance(ids, mx.array) else ids),
-                image_token_index=image_token_index,
-                resize_shape=resize_shape,
-            )
+            if images and images[i] is not None:
+                pixel_values = images[i]
+                prompt_tensor = prompt_tokens[i]
+                prompt_tensor = mx.array(prompt_tensor) if not isinstance(prompt_tensor, mx.array) else prompt_tensor
+                if len(prompt_tensor.shape) == 1:
+                    prompt_tensor = prompt_tensor[None, :]
+                mask = mx.ones_like(prompt_tensor)
+            else:
+                batch_prompts = [
+                    p.tolist() if isinstance(p, mx.array) else p
+                    for p in batch_prompts
+                ]
+                batch_prompts = [list(map(int, p)) for p in batch_prompts]
+                max_prompt_len = max(len(p) for p in batch_prompts)
+                padded = [
+                    p + [processor.tokenizer.pad_token_id] * (max_prompt_len - len(p))
+                    for p in batch_prompts
+                ]
+                prompt_tensor = mx.stop_gradient(mx.array(padded))
+                pixel_values = mask = None
+                if len(prompt_tensor.shape) == 1:
+                    prompt_tensor = prompt_tensor[None, :]
+                print(f"[DEBUG] Checking prompt tensor shape: {prompt_tensor.shape}")
+                if prompt_tensor.shape[1] == 0:
+                    return [], [], []
 
-            pixel_values = inputs["pixel_values"]
-            mask = inputs["attention_mask"]
-            input_ids = inputs["input_ids"]
-
-            batch_prompts = [input_ids.tolist()]
-            max_prompt_len = max(len(p) for p in batch_prompts)
-            padded = [
-                p + [processor.tokenizer.pad_token_id] * (max_prompt_len - len(p))
-                for p in batch_prompts
-            ]
-            prompt_tensor = mx.stop_gradient(mx.array(padded))
-        else:
-            batch_prompts = [
-                p.tolist() if isinstance(p, mx.array) else p
-                for p in batch_prompts
-            ]
-            batch_prompts = [list(map(int, p)) for p in batch_prompts]
-            max_prompt_len = max(len(p) for p in batch_prompts)
-            padded = [
-                p + [processor.tokenizer.pad_token_id] * (max_prompt_len - len(p))
-                for p in batch_prompts
-            ]
-            prompt_tensor = mx.stop_gradient(mx.array(padded))
-            pixel_values = mask = None
-
-            if len(prompt_tensor.shape) == 1:
-                prompt_tensor = prompt_tensor[None, :]
-            if prompt_tensor.shape[1] == 0:
-                return [], [], []
-
+            # ✅ Always defined
             expanded_prompts = mx.repeat(prompt_tensor, group_size, axis=0)
             batch_results = []
 
             for prompt_idx in range(expanded_prompts.shape[0]):
                 current_tokens = []
-
-                for token, _ in generate_step(
-                    expanded_prompts[prompt_idx],
-                    model,
-                    pixel_values,
-                    mask,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    grid_thw=(1, 14, 14)
-                ):
-                    current_tokens.append(token)
-                    if token == processor.tokenizer.eos_token_id:
-                        break
-                    if len(current_tokens) >= len(end_sequence) and mx.array_equal(
-                        mx.array(current_tokens[-len(end_sequence):]), end_sequence
+                print(f"[DEBUG] Generating for prompt index {prompt_idx}")
+                print(f"[DEBUG] Prompt tensor shape: {expanded_prompts[prompt_idx].shape}")
+                print(f"[DEBUG] Prompt tensor dtype: {expanded_prompts[prompt_idx].dtype}")
+                print(f"[DEBUG] Prompt tensor: {expanded_prompts[prompt_idx]}")
+                try:
+                    for token, _ in generate_step_grpo(
+                        expanded_prompts[prompt_idx],
+                        model,
+                        pixel_values,
+                        mask,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        grid_thw=(1, 14, 14)
                     ):
-                        break
+                        print(f"[DEBUG] Generated token: {token}")
+                        current_tokens.append(token)
+                        if token == processor.tokenizer.eos_token_id:
+                            break
+                        if len(current_tokens) >= len(end_sequence) and mx.array_equal(
+                            mx.array(current_tokens[-len(end_sequence):]), end_sequence
+                        ):
+                            break
+                except Exception as e:
+                    print(f"[ERROR] generate_step failed: {e}")
 
                 if current_tokens:
                     batch_results.append(mx.array(current_tokens))
@@ -528,7 +567,7 @@ def train_grpo(
             processor=processor,
             prompt_tokens=prompt_tokens,
             images=images,
-            image_token_index=getattr(model.config, "image_token_index", None),
+            # image_token_index=getattr(model.config, "image_token_index", None),
             max_tokens=args.max_completion_length,
             group_size=args.group_size,
             temperature=args.temperature,
@@ -539,8 +578,8 @@ def train_grpo(
             model,
             processor=processor,
             batch=(prompt_tokens, targets, prompt_lens, target_lens, type_info),
-            completions=all_completions,
-            completion_texts=all_completion_texts,
+            all_completions=all_completions,
+            all_completion_texts=all_completion_texts,
             batch_indices=batch_indices,
             reward_funcs=reward_funcs,
             beta=args.beta,
