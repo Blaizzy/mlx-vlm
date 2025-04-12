@@ -341,7 +341,7 @@ def load_and_prepare_dataset(
         args=args
     )
 
-    if args.train_type == "sft":
+    if args.train_mode == "sft":
         return SFTDataset(
             prepared_dataset,
             config,
@@ -351,7 +351,7 @@ def load_and_prepare_dataset(
             messages_key=messages_key,
             images_key=image_field
         )
-    elif args.train_type == "grpo":
+    elif args.train_mode == "grpo":
         return GRPODataset(
             prepare_dataset,
             config,

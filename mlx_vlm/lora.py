@@ -105,8 +105,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--train-mode",
         type=str,
+        default="sft",
         choices=["sft", "grpo"],
-        help="Training mode: SFT, DPO, ORPO or GRPO",
+        help="Training mode: SFT, DPO, ORPO or GRPO, default is SFT",
     )
     parser.add_argument(
         "--dataset", type=str, required=True, help="Path to the dataset"

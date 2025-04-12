@@ -359,12 +359,8 @@ def grpo_loss(
     if beta != 0.0:
         per_token_loss = per_token_loss + beta * kl_div
 
-    per_token_loss = per_token_loss * length_mask
-
     # Average over tokens
-    loss = (
-        per_token_loss * length_mask
-    ).sum() / length_mask.sum()
+    loss = (per_token_loss).sum() / length_mask.sum()
 
     # Calculate mean KL divergence for metrics
     mean_kl = ((kl_div * length_mask).sum(axis=1) / length_mask.sum(axis=1)).mean()
