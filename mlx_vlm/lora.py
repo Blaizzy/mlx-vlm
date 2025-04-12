@@ -89,7 +89,7 @@ def main(args):
     elif args.train_mode == "grpo":
         train_grpo(
             model=model,
-            ref_model=ref_model,
+            ref_model=ref_model.freeze(),
             tokenizer=processor,
             dataset=dataset,
             optimizer=optimizer,

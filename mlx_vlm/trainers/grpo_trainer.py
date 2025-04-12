@@ -246,16 +246,9 @@ def generate_grpo(
             batch_prompts = prompt_tokens[i: i + current_batch_size]
 
             if images and tokenizer:
-                inputs = prepare_inputs(
-                    tokenizer,
-                    images if isinstance(images, str) else images[i],
-                    prompts=batch_prompts,
-                    image_token_index=image_token_index,
-                    resize_shape=resize_shape,
-                )
-                prompt_tensor = mx.stop_gradient(inputs["input_ids"])
-                pixel_values = inputs["pixel_values"]
-                mask = inputs["attention_mask"]
+                pixel_values = images[i] if isinstance(images, list) else images
+                prompt_tensor = mx.stop_gradient(mx.array(batch_prompts))
+                mask = mx.ones_like(prompt_tensor)
             else:
                 max_prompt_len = max(len(p) for p in batch_prompts)
                 padded = [
