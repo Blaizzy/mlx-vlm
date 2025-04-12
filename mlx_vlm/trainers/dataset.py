@@ -239,7 +239,7 @@ def prepare_dataset(
     config,
     processor,
     args,
-    promtp_field: str = "question",
+    prompt_field: str = "question",
     completion_field: str = "output",
     new_image_field: str = "images",
     messages_field: str = "messages"
@@ -256,7 +256,7 @@ def prepare_dataset(
     if needs_message_transform:
         def transform_to_messages(example):
             messages = [
-                {"role": "user", "content": example[promtp_field]},
+                {"role": "user", "content": example[prompt_field]},
                 {"role": "assistant", "content": example[completion_field]}
             ]
             example["messages"] = messages
@@ -340,6 +340,10 @@ def load_and_prepare_dataset(
         logger.info(f"\033[32mStarting to train with SFT\033[0m")
         logger.info(f"\033[32mPreparing and maping dataset\033[0m")
         prepared_dataset, messages_key, image_field = prepare_dataset(
+            prompt_field = "question",
+            completion_field = "output",
+            new_image_field = "image",
+            messages_field = "messages",
             dataset=loaded_dataset,
             config=config,
             processor=processor,
@@ -358,7 +362,7 @@ def load_and_prepare_dataset(
         logger.info(f"\033[32mStarting to train with GRPO\033[0m")
         logger.info(f"\033[32mPreparing and maping dataset\033[0m")
         prepared_dataset, messages_key, image_field = prepare_dataset(
-            promtp_field = "problem",
+            prompt_field = "problem",
             completion_field = "answer",
             new_image_field = "images",
             messages_field = "messages",

@@ -45,9 +45,9 @@ class TrainingArgs:
     )
 
 
-def default_loss(model, inputs, targets, lengths, pixel_values=None, attention_mask=None):
+def default_loss(model, inputs, targets, lengths, pixel_values=None, mask=None):
     # Call the model and get the output object
-    outputs = model(inputs, pixel_values=pixel_values, attention_mask=attention_mask)
+    outputs = model(inputs, pixel_values=pixel_values, mask=mask)
     
     # Extract logits from the output object and remove the last token
     logits = outputs.logits[:, :-1].astype(mx.float32)
@@ -63,7 +63,7 @@ def default_loss(model, inputs, targets, lengths, pixel_values=None, attention_m
 
 
 def loss_with_completions(
-    model, inputs, targets, lengths, pixel_values=None, attention_mask=None, 
+    model, inputs, targets, lengths, pixel_values=None, mask=None, 
     assistant_id=77091, train_on_completions=False
 ):
     batch_size, seq_length = inputs.shape
@@ -89,7 +89,7 @@ def loss_with_completions(
         weight_mask = None
 
     # Call the model and get the output object
-    outputs = model(inputs, pixel_values=pixel_values, attention_mask=attention_mask)
+    outputs = model(inputs, pixel_values=pixel_values, mask=mask)
     
     # Extract logits from the output object and remove the last token
     logits = outputs.logits[:, :-1].astype(mx.float32)
@@ -168,18 +168,18 @@ def iterate_batches(
             
             # Create properly sized batch arrays
             batch_input_ids = np.zeros((local_batch_size, max_length_padded), dtype=np.int32)
-            batch_attention_mask = np.zeros((local_batch_size, max_length_padded), dtype=np.int32)
+            batch_mask = np.zeros((local_batch_size, max_length_padded), dtype=np.int32)
             
             # Fill the batch arrays
             for i, sample in enumerate(processed_samples):
                 seq_length = min(len(sample["input_ids"]), max_seq_length)
                 batch_input_ids[i, :seq_length] = sample["input_ids"][:seq_length]
-                batch_attention_mask[i, :seq_length] = 1
+                batch_mask[i, :seq_length] = 1
             
             # Build the final batch dictionary
             batch_dict = {
                 "input_ids": mx.array(batch_input_ids),
-                "attention_mask": mx.array(batch_attention_mask),
+                "mask": mx.array(batch_mask),
                 "lengths": mx.array([min(len(sample["input_ids"]), max_length_padded) for sample in processed_samples])
             }
             
@@ -235,7 +235,7 @@ def train_sft(
 
     def step(batch):
         # Derive lengths from attention mask
-        lengths = batch["attention_mask"].sum(axis=1)
+        lengths = batch["mask"].sum(axis=1)
         
         # Get targets (shifted input_ids)
         targets = batch["input_ids"][:, 1:]

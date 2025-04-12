@@ -72,153 +72,8 @@ def get_per_token_logps(model: nn.Module, inputs, lengths):
     mx.eval(logits)
     return per_token_logps
 
-
-def generate_step(
-    input_ids: mx.array,
-    model: nn.Module,
-    pixel_values,
-    mask,
-    *,
-    max_tokens: int = 256,
-    temperature: float = 0.0,
-    repetition_penalty: Optional[float] = None,
-    repetition_context_size: Optional[int] = 20,
-    top_p: float = 1.0,
-    logit_bias: Optional[Dict[int, float]] = None,
-    **kwargs,
-) -> Generator[Tuple[mx.array, mx.array], None, None]:
-    """
-    A generator producing token ids based on the given prompt from the model.
-
-    Args:
-        prompt (mx.array): The input prompt.
-        model (nn.Module): The model to use for generation.
-        temperature (float): The temperature for sampling, if 0 the argmax is used.
-          Default: ``0``.
-        repetition_penalty (float, optional): The penalty factor for repeating
-          tokens.
-        repetition_context_size (int, optional): The number of tokens to
-          consider for repetition penalty. Default: ``20``.
-        top_p (float, optional): Nulceus sampling, higher means model considers
-          more less likely words.
-        logit_bias (dictionary, optional): Additive logit bias.
-
-    Yields:
-        Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
-          one token and a vector of log probabilities.
-    """
-
-    def sample(logits: mx.array) -> Tuple[mx.array, float]:
-        if logit_bias:
-            indices = mx.array(list(logit_bias.keys()))
-            values = mx.array(list(logit_bias.values()))
-            logits[:, indices] += values
-        logprobs = logits - mx.logsumexp(logits)
-
-        if temperature == 0:
-            token = mx.argmax(logits, axis=-1)
-        else:
-            if top_p > 0 and top_p < 1.0:
-                token = top_p_sampling(logits, top_p, temperature)
-            else:
-                token = mx.random.categorical(logits * (1 / temperature))
-
-        return token, logprobs
-
-    if repetition_penalty and (
-        repetition_penalty < 0 or not isinstance(repetition_penalty, float)
-    ):
-        raise ValueError(
-            f"repetition_penalty must be a non-negative float, got {repetition_penalty}"
-        )
-
-    y = input_ids
-    if hasattr(model.language_model, "make_cache"):
-        cache = model.language_model.make_cache()
-    else:
-        kv_heads = (
-            [model.language_model.n_kv_heads] * len(model.language_model.layers)
-            if isinstance(model.language_model.n_kv_heads, int)
-            else model.language_model.n_kv_heads
-        )
-        if model.config.model_type == "florence2":
-            cache = [
-                (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
-            ]
-        else:
-            cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
-
-    repetition_context = input_ids.reshape(-1).tolist()
-
-    if repetition_context_size:
-        repetition_context = repetition_context[-repetition_context_size:]
-
-    def _step(y, **kwargs):
-        nonlocal repetition_context
-        if "decoder_input_ids" in kwargs:
-            outputs = model.language_model(
-                cache=cache,
-                **kwargs,
-            )
-        else:
-
-            outputs = model.language_model(
-                y[None],
-                cache=cache,
-                **kwargs,
-            )
-
-        logits = outputs.logits[:, -1, :]
-
-        if repetition_penalty:
-            logits = apply_repetition_penalty(
-                logits, repetition_context, repetition_penalty
-            )
-            y, logprobs = sample(logits)
-            repetition_context.append(y.item())
-        else:
-            y, logprobs = sample(logits)
-
-        if repetition_context_size:
-            if len(repetition_context) > repetition_context_size:
-                repetition_context = repetition_context[-repetition_context_size:]
-        return y, logprobs.squeeze(0)
-
-    outputs = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
-
-    logits = outputs.logits[:, -1, :]
-    y, logprobs = sample(logits)
-    mx.async_eval(y)
-
-    if outputs.cross_attention_states is not None:
-        kwargs = {
-            k: v
-            for k, v in zip(
-                ["cross_attention_states"], [outputs.cross_attention_states]
-            )
-        }
-    elif outputs.encoder_outputs is not None:
-        kwargs = {
-            "decoder_input_ids": y[None],
-            "encoder_outputs": outputs.encoder_outputs,
-        }
-    else:
-        kwargs = {}
-
-    n = 0
-    while True:
-        if n != max_tokens:
-            next_y, next_logprobs = _step(y, **kwargs)
-            mx.async_eval(next_y)
-            if "decoder_input_ids" in kwargs:
-                kwargs["decoder_input_ids"] = next_y[None]
-            yield y.item(), logprobs
-            y, logprobs = next_y, next_logprobs
-        if n == max_tokens:
-            break
-
-        n += 1
-
+def flatten_once(x):
+    return [item for sublist in x for item in sublist] if isinstance(x[0], list) else x
 
 def generate_grpo(
     model: nn.Module,
@@ -234,7 +89,7 @@ def generate_grpo(
     resize_shape=None,
 ):
     try:
-        from ..utils import prepare_inputs, top_p_sampling, apply_repetition_penalty
+        from ..utils import generate_step
         end_sequence = mx.array(processor.tokenizer.encode(end_token))
         total_samples = len(prompt_tokens)
         all_completions = []
@@ -247,6 +102,11 @@ def generate_grpo(
 
             if images and processor:
                 pixel_values = images[i] if isinstance(images, list) else images
+                batch_prompts = [
+                    flatten_once(p.tolist()) if isinstance(p, mx.array) else flatten_once(p)
+                    for p in batch_prompts
+                ]
+                batch_prompts = [list(map(int, p)) for p in batch_prompts]
                 max_prompt_len = max(len(p) for p in batch_prompts)
                 padded = [
                     p + [processor.tokenizer.pad_token_id] * (max_prompt_len - len(p))
@@ -255,6 +115,11 @@ def generate_grpo(
                 prompt_tensor = mx.stop_gradient(mx.array(padded))
                 mask = mx.ones_like(prompt_tensor)
             else:
+                batch_prompts = [
+                    p.tolist() if isinstance(p, mx.array) else p
+                    for p in batch_prompts
+                ]
+                batch_prompts = [list(map(int, p)) for p in batch_prompts]
                 max_prompt_len = max(len(p) for p in batch_prompts)
                 padded = [
                     p + [processor.tokenizer.pad_token_id] * (max_prompt_len - len(p))

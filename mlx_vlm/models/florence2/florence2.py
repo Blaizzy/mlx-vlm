@@ -298,6 +298,7 @@ class Model(nn.Module):
         decoder_input_ids=None,
         decoder_attention_mask=None,
         labels=None,
+        mask: Optional[mx.array] = None,
         **kwargs,
     ):
         """Forward pass."""
