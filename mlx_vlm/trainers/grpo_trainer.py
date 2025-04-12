@@ -8,6 +8,7 @@ import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten, tree_map
 
+
 from .grpo_reward_functions import (
     RewardFunctions,
     r1_accuracy_reward_func,
@@ -81,46 +82,125 @@ def generate_step_grpo(
     *,
     max_tokens: int = 256,
     temperature: float = 0.0,
-    grid_thw=None,
-) -> Generator[Tuple[int, mx.array], None, None]:
-    """
-    A GRPO-specific generation step that does not rely on external generate_step().
-    Yields token ID and logprobs for each token.
-    """
-    def sample(logits: mx.array) -> Tuple[mx.array, mx.array]:
+    repetition_penalty: Optional[float] = None,
+    repetition_context_size: Optional[int] = 20,
+    top_p: float = 1.0,
+    logit_bias: Optional[Dict[int, float]] = None,
+    **kwargs,
+) -> Generator[Tuple[mx.array, mx.array], None, None]:
+    from ..models.base import KVCache, SimpleKVCache
+    from ..utils import top_p_sampling, apply_repetition_penalty
+
+    def sample(logits: mx.array) -> Tuple[mx.array, float]:
+        if logit_bias:
+            indices = mx.array(list(logit_bias.keys()))
+            values = mx.array(list(logit_bias.values()))
+            logits[:, indices] += values
         logprobs = logits - mx.logsumexp(logits)
-        if temperature == 0.0:
+
+        if temperature == 0:
             token = mx.argmax(logits, axis=-1)
         else:
-            token = mx.random.categorical(logits * (1 / temperature))
+            if top_p > 0 and top_p < 1.0:
+                token = top_p_sampling(logits, top_p, temperature)
+            else:
+                token = mx.random.categorical(logits * (1 / temperature))
+
         return token, logprobs
 
-    outputs = model(input_ids, pixel_values, mask=mask, grid_thw=grid_thw)
-    if not hasattr(outputs, "logits") or outputs.logits is None:
-        print("[ERROR] Initial model forward returned invalid logits")
-        return
+    if repetition_penalty and (
+        repetition_penalty < 0 or not isinstance(repetition_penalty, float)
+    ):
+        raise ValueError(
+            f"repetition_penalty must be a non-negative float, got {repetition_penalty}"
+        )
+
+    y = input_ids
+    if hasattr(model.language_model, "make_cache"):
+        cache = model.language_model.make_cache()
+    else:
+        kv_heads = (
+            [model.language_model.n_kv_heads] * len(model.language_model.layers)
+            if isinstance(model.language_model.n_kv_heads, int)
+            else model.language_model.n_kv_heads
+        )
+        if model.config.model_type == "florence2":
+            cache = [
+                (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
+            ]
+        else:
+            cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
+
+    repetition_context = input_ids.reshape(-1).tolist()
+
+    if repetition_context_size:
+        repetition_context = repetition_context[-repetition_context_size:]
+
+    def _step(y, **kwargs):
+        nonlocal repetition_context
+        if "decoder_input_ids" in kwargs:
+            outputs = model.language_model(
+                cache=cache,
+                **kwargs,
+            )
+        else:
+            outputs = model.language_model(
+                y[None],
+                cache=cache,
+                **kwargs,
+            )
+
+        logits = outputs.logits[:, -1, :]
+
+        if repetition_penalty:
+            logits = apply_repetition_penalty(
+                logits, repetition_context, repetition_penalty
+            )
+            y, logprobs = sample(logits)
+            repetition_context.append(y.item())
+        else:
+            y, logprobs = sample(logits)
+
+        if repetition_context_size:
+            if len(repetition_context) > repetition_context_size:
+                repetition_context = repetition_context[-repetition_context_size:]
+        return y.item(), logprobs.squeeze(0)
+
+    outputs = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
 
     logits = outputs.logits[:, -1, :]
     y, logprobs = sample(logits)
-    yield y.item(), logprobs
+    mx.async_eval(y)
 
-    decoder_input_ids = y[None]
-    n = 1
-    while n < max_tokens:
-        decoder_out = model.language_model(
-            decoder_input_ids,
-            encoder_outputs=getattr(outputs, "encoder_outputs", None),
-        )
-        if not hasattr(decoder_out, "logits") or decoder_out.logits is None:
-            print(f"[ERROR] Decoder step {n} returned invalid logits")
-            return
+    if outputs.cross_attention_states is not None:
+        kwargs = {
+            k: v
+            for k, v in zip(
+                ["cross_attention_states"], [outputs.cross_attention_states]
+            )
+        }
+    elif outputs.encoder_outputs is not None:
+        kwargs = {
+            "decoder_input_ids": y[None],
+            "encoder_outputs": outputs.encoder_outputs,
+        }
+    else:
+        kwargs = {}
 
-        logits = decoder_out.logits[:, -1, :]
-        y, logprobs = sample(logits)
-        yield y.item(), logprobs
-        decoder_input_ids = y[None]
+    n = 0
+    while True:
+        if n != max_tokens:
+            next_y, next_logprobs = _step(y, **kwargs)
+            mx.async_eval(next_y)
+            if "decoder_input_ids" in kwargs:
+                kwargs["decoder_input_ids"] = next_y[None]
+            print(f"[GEN] Token: {y.item()}, Logprob: {logprobs}")
+            yield y.item(), logprobs
+            y, logprobs = next_y, next_logprobs
+        if n == max_tokens:
+            break
+
         n += 1
-
 
 
 def generate_grpo(
@@ -145,7 +225,10 @@ def generate_grpo(
             current_batch_size = min(batch_size, total_samples - i)
             batch_prompts = prompt_tokens[i: i + current_batch_size]
 
-            if images and images[i] is not None:
+            # Fix the condition to properly check if images exists and has valid data
+            has_image = images is not None and i < len(images) and images[i] is not None
+            
+            if has_image:
                 pixel_values = images[i]
                 prompt_tensor = prompt_tokens[i]
                 prompt_tensor = mx.array(prompt_tensor) if not isinstance(prompt_tensor, mx.array) else prompt_tensor
@@ -164,11 +247,13 @@ def generate_grpo(
                     for p in batch_prompts
                 ]
                 prompt_tensor = mx.stop_gradient(mx.array(padded))
-                pixel_values = mask = None
+                pixel_values = None
+                mask = None
                 if len(prompt_tensor.shape) == 1:
                     prompt_tensor = prompt_tensor[None, :]
                 print(f"[DEBUG] Checking prompt tensor shape: {prompt_tensor.shape}")
                 if prompt_tensor.shape[1] == 0:
+                    print("[ERROR] Empty prompt! Skipping batch.")
                     return [], [], []
 
             # ✅ Always defined
@@ -177,10 +262,6 @@ def generate_grpo(
 
             for prompt_idx in range(expanded_prompts.shape[0]):
                 current_tokens = []
-                print(f"[DEBUG] Generating for prompt index {prompt_idx}")
-                print(f"[DEBUG] Prompt tensor shape: {expanded_prompts[prompt_idx].shape}")
-                print(f"[DEBUG] Prompt tensor dtype: {expanded_prompts[prompt_idx].dtype}")
-                print(f"[DEBUG] Prompt tensor: {expanded_prompts[prompt_idx]}")
                 try:
                     for token, _ in generate_step_grpo(
                         expanded_prompts[prompt_idx],
@@ -191,7 +272,10 @@ def generate_grpo(
                         temperature=temperature,
                         grid_thw=(1, 14, 14)
                     ):
-                        print(f"[DEBUG] Generated token: {token}")
+                        print(token)
+                        if token is None or (hasattr(token, "item") and mx.isnan(token).item()):
+                            print("[WARNING] Got invalid token, breaking")
+                            break
                         current_tokens.append(token)
                         if token == processor.tokenizer.eos_token_id:
                             break
@@ -200,8 +284,7 @@ def generate_grpo(
                         ):
                             break
                 except Exception as e:
-                    print(f"[ERROR] generate_step failed: {e}")
-
+                    print(e)
                 if current_tokens:
                     batch_results.append(mx.array(current_tokens))
 
@@ -573,6 +656,20 @@ def train_grpo(
             temperature=args.temperature,
             batch_size=args.batch_size,
         )
+        if not all_completions:
+            print("[WARNING] Retrying generation due to empty completions")
+            all_completions, all_completion_texts, batch_indices = generate_grpo(
+                model=model,
+                processor=processor,
+                prompt_tokens=prompt_tokens,
+                images=images,
+                max_tokens=args.max_completion_length,
+                group_size=args.group_size,
+                temperature=args.temperature,
+                batch_size=args.batch_size,
+            )
+            if not all_completions:
+                raise ValueError("Still no completions after retry. Check model and inputs.")
 
         (loss, toks, metrics), grad = loss_value_and_grad(
             model,
