@@ -1145,6 +1145,17 @@ def stream_generate(
             peak_memory=mx.get_peak_memory() / 1e9,
         )
 
+    detokenizer.finalize()
+    yield GenerationResult(
+        text=detokenizer.last_segment,
+        token=token,
+        logprobs=logprobs,
+        prompt_tokens=input_ids.size,
+        generation_tokens=n + 1,
+        prompt_tps=prompt_tps,
+        generation_tps=(n + 1) / (time.perf_counter() - tic),
+        peak_memory=mx.get_peak_memory() / 1e9,
+    )
 
 def generate(
     model: nn.Module,
