@@ -106,7 +106,7 @@ def loss_with_completions(
 
 def iterate_batches(
     dataset,
-    tokenizer,
+    processor,
     batch_size,
     max_seq_length,
     train=False,
@@ -202,7 +202,7 @@ def iterate_batches(
 
 def train_sft(
     model,
-    tokenizer,
+    processor,
     optimizer,
     dataset,
     args: TrainingArgs = TrainingArgs(),
@@ -216,7 +216,7 @@ def train_sft(
 
     dataset_iterator = iterate_batches(
         dataset,
-        tokenizer,
+        processor,
         args.batch_size,
         args.max_seq_length,
         train=True

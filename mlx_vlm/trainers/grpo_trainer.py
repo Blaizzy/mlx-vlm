@@ -222,7 +222,7 @@ def generate_step(
 
 def generate_grpo(
     model: nn.Module,
-    tokenizer,
+    processor,
     prompt_tokens=None,
     images: Union[str, List[str]] = None,
     max_tokens: int = 512,
@@ -235,7 +235,7 @@ def generate_grpo(
 ):
     try:
         from ..utils import prepare_inputs, top_p_sampling, apply_repetition_penalty
-        end_sequence = mx.array(tokenizer.tokenizer.encode(end_token))
+        end_sequence = mx.array(processor.tokenizer.encode(end_token))
         total_samples = len(prompt_tokens)
         all_completions = []
         all_completion_texts = []
@@ -245,14 +245,19 @@ def generate_grpo(
             current_batch_size = min(batch_size, total_samples - i)
             batch_prompts = prompt_tokens[i: i + current_batch_size]
 
-            if images and tokenizer:
+            if images and processor:
                 pixel_values = images[i] if isinstance(images, list) else images
-                prompt_tensor = mx.stop_gradient(mx.array(batch_prompts))
+                max_prompt_len = max(len(p) for p in batch_prompts)
+                padded = [
+                    p + [processor.tokenizer.pad_token_id] * (max_prompt_len - len(p))
+                    for p in batch_prompts
+                ]
+                prompt_tensor = mx.stop_gradient(mx.array(padded))
                 mask = mx.ones_like(prompt_tensor)
             else:
                 max_prompt_len = max(len(p) for p in batch_prompts)
                 padded = [
-                    p + [tokenizer.pad_token_id] * (max_prompt_len - len(p))
+                    p + [processor.tokenizer.pad_token_id] * (max_prompt_len - len(p))
                     for p in batch_prompts
                 ]
                 prompt_tensor = mx.stop_gradient(mx.array(padded))
@@ -278,7 +283,7 @@ def generate_grpo(
                     temperature=temperature,
                 ):
                     current_tokens.append(token)
-                    if token == tokenizer.eos_token_id:
+                    if token == processor.tokenizer.eos_token_id:
                         break
                     if len(current_tokens) >= len(end_sequence) and mx.array_equal(
                         mx.array(current_tokens[-len(end_sequence):]), end_sequence
@@ -292,7 +297,7 @@ def generate_grpo(
                 prompt_idx = i + (j // group_size)
                 if prompt_idx < total_samples:
                     batch_indices.append(prompt_idx)
-                    completion_text = tokenizer.decode(completion_ids.tolist())
+                    completion_text = processor.tokenizer.decode(completion_ids.tolist())
                     all_completions.append(mx.stop_gradient(completion_ids))
                     all_completion_texts.append(completion_text)
 
@@ -305,7 +310,7 @@ def generate_grpo(
 def grpo_loss(
     model,
     ref_model,
-    tokenizer,
+    processor,
     batch,
     all_completions=None,
     all_completion_texts=None,
@@ -542,7 +547,7 @@ def grpo_loss(
         print(f"\n📋 Raw Prompt:\n{prompt_text[last_prompt_idx]}")
         print("\n" + "=" * 10 + "\n")
         if last_prompt_idx < len(prompt_tokens):
-            actual_prompt = tokenizer.decode(prompt_tokens[last_prompt_idx])
+            actual_prompt = processor.tokenizer.decode(prompt_tokens[last_prompt_idx])
             print(f"\n🔄 Model Input:\n{actual_prompt}")
             print("\n" + "=" * 10 + "\n")
     print(f"\n📝 Generation:\n{all_completion_texts[-1]}")
@@ -616,7 +621,7 @@ def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
 def train_grpo(
     model: nn.Module,
     ref_model: Optional[nn.Module],
-    tokenizer,
+    processor,
     optimizer,
     dataset,
     reward_funcs: Optional[List[RewardFunctions]] = [
@@ -650,7 +655,7 @@ def train_grpo(
 
         all_completions, all_completion_texts, batch_indices = generate_grpo(
             model=model,
-            tokenizer=tokenizer,
+            processor=processor,
             prompt_tokens=prompt_tokens,
             images=images,
             image_token_index=getattr(model.config, "image_token_index", None),
@@ -662,7 +667,7 @@ def train_grpo(
 
         (loss, toks, metrics), grad = loss_value_and_grad(
             model,
-            tokenizer=tokenizer,
+            processor=processor,
             batch=(prompt_tokens, targets, prompt_lens, target_lens, type_info),
             completions=all_completions,
             completion_texts=all_completion_texts,

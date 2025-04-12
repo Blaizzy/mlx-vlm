@@ -77,7 +77,7 @@ def main(args):
     if args.train_mode == "sft":
         train_sft(
             model=model,
-            tokenizer=processor,
+            processor=processor,
             optimizer=optimizer,
             dataset=dataset,
             args=training_args,
@@ -90,7 +90,7 @@ def main(args):
         train_grpo(
             model=model,
             ref_model=ref_model.freeze(),
-            tokenizer=processor,
+            processor=processor,
             dataset=dataset,
             optimizer=optimizer,
         )
