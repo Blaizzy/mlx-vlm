@@ -1157,6 +1157,7 @@ def stream_generate(
         peak_memory=mx.get_peak_memory() / 1e9,
     )
 
+
 def generate(
     model: nn.Module,
     processor: PreTrainedTokenizer,
