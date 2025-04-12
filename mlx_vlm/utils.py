@@ -1087,7 +1087,7 @@ def stream_generate(
             generation_tokens=n + 1,
             prompt_tps=prompt_tps,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
-            peak_memory=mx.metal.get_peak_memory() / 1e9,
+            peak_memory=mx.get_peak_memory() / 1e9,
         )
 
     detokenizer.finalize()
@@ -1099,7 +1099,7 @@ def stream_generate(
         generation_tokens=n + 1,
         prompt_tps=prompt_tps,
         generation_tps=(n + 1) / (time.perf_counter() - tic),
-        peak_memory=mx.metal.get_peak_memory() / 1e9,
+        peak_memory=mx.get_peak_memory() / 1e9,
     )
 
 
