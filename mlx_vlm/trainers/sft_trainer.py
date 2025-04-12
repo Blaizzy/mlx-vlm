@@ -212,8 +212,6 @@ def train_sft(
     train_on_completions=False,
     assistant_id=77091
 ):
-    print(f"Starting training..., iters: {args.iters}")
-
     dataset_iterator = iterate_batches(
         dataset,
         processor,
@@ -295,7 +293,6 @@ def train_sft(
         
         # Process multi-modal data (if needed)
         if "pixel_values" in batch and batch["pixel_values"] is not None:
-            # Pass pixel_values to the model if needed
             pass
         
         # Training step
@@ -316,18 +313,7 @@ def train_sft(
             it_sec = args.steps_per_report / train_time
             tokens_sec = float(n_tokens) / train_time
             trained_tokens += n_tokens
-            peak_mem = mx.metal.get_peak_memory() / 1e9
-            if rank == 0:
-                print(
-                    f"Iter {it}: Train loss {train_loss:.3f}, "
-                    f"Learning Rate {learning_rate:.3e}, "
-                    f"It/sec {it_sec:.3f}, "
-                    f"Tokens/sec {tokens_sec:.3f}, "
-                    f"Trained Tokens {trained_tokens}, "
-                    f"Peak mem {peak_mem:.3f} GB",
-                    flush=True,
-                )
-
+            peak_mem = mx.get_peak_memory() / 1e9
             if training_callback is not None:
                 train_info = {
                     "iteration": it,

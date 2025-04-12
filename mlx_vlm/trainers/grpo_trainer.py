@@ -501,9 +501,6 @@ def train_grpo(
     iterate_batches: callable = iterate_grpo_batches,
     training_callback: TrainingCallback = None,
 ):
-    print(
-        f"Starting GRPO training with {len(reward_funcs)} reward functions..., iters: {args.iters}"
-    )
     world = mx.distributed.init()
     world_size = world.size()
     rank = world.rank()

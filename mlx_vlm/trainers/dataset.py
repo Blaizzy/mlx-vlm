@@ -337,7 +337,6 @@ def load_and_prepare_dataset(
     loaded_dataset = load_dataset(args.dataset, name=args.dataset_config, split=args.split)
 
     if args.train_mode == "sft":
-        logger.info(f"\033[32mStarting to train with SFT\033[0m")
         logger.info(f"\033[32mPreparing and maping dataset\033[0m")
         prepared_dataset, messages_key, image_field = prepare_dataset(
             prompt_field = "question",
@@ -359,7 +358,6 @@ def load_and_prepare_dataset(
             images_key=image_field
         )
     elif args.train_mode == "grpo":
-        logger.info(f"\033[32mStarting to train with GRPO\033[0m")
         logger.info(f"\033[32mPreparing and maping dataset\033[0m")
         prepared_dataset, messages_key, image_field = prepare_dataset(
             prompt_field = "problem",

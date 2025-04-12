@@ -62,7 +62,7 @@ def main(args):
     
     model.train()
     
-    logger.info(f"\033[32mTraining model\033[0m")
+    logger.info(f"\033[32mTraining model with {args.train_mode}\033[0m")
     if args.wandb_project:
         logger.info(f"\033[32mUsing WandB for logging\033[0m")
         callback = WandBCallback(
