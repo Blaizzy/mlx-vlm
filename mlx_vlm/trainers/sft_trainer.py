@@ -200,62 +200,7 @@ def iterate_batches(
             break
 
 
-def evaluate(
-    model,
-    dataset_iterator,
-    tokenizer,
-    batch_size,
-    num_batches,
-    max_seq_length=2048,
-    loss=default_loss,
-    clip_gradients=None,
-    train_on_completions=False,
-    assistant_id=77091,
-):
-    all_losses = mx.array(0.0)
-    ntokens = mx.array(0)
-
-    for i, batch in enumerate(dataset_iterator):
-        if num_batches != -1 and i >= num_batches:
-            break
-            
-        # Derive lengths from attention mask
-        lengths = batch["attention_mask"].sum(axis=1)
-        
-        # Get targets (shifted input_ids)
-        targets = batch["input_ids"][:, 1:]
-        
-        if train_on_completions:
-            losses, toks = loss_with_completions(
-                model,
-                batch["input_ids"],
-                targets,
-                lengths,
-                pixel_values=batch.get("pixel_values"),
-                attention_mask=batch["attention_mask"],
-                assistant_id=assistant_id,
-                train_on_completions=True
-            )
-        else:
-            losses, toks = loss(
-                model,
-                batch["input_ids"],
-                targets,
-                lengths,
-                pixel_values=batch.get("pixel_values"),
-                attention_mask=batch["attention_mask"]
-            )
-            
-        all_losses += losses * toks
-        ntokens += toks
-        mx.eval(all_losses, ntokens)
-
-    all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
-    ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
-
-    return (all_losses / ntokens).item()
-
-def train(
+def train_sft(
     model,
     tokenizer,
     optimizer,

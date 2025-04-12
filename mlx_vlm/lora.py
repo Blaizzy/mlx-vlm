@@ -3,7 +3,7 @@ import logging
 
 import mlx.optimizers as optim
 
-from .trainers import TrainingArgs, save_adapter, save_full_model, train
+from .trainers import TrainingArgs, save_adapter, save_full_model, train_sft, train_grpo
 from .trainers.dataset import load_and_prepare_dataset
 from .trainers.utils import get_peft_model, print_trainable_parameters
 from .utils import load, load_image_processor
@@ -37,6 +37,13 @@ def main(args):
             alpha=args.lora_alpha,
             dropout=args.lora_dropout
         )
+    
+    if args.train_mode == "grpo":
+        logger.info(f"\033[32mSetting Reference Model\033[0m")
+        ref_model, _ = load(
+            args.model_path, processor_config={"trust_remote_code": True}
+        )
+
 
     print_trainable_parameters(model)
 
@@ -67,18 +74,26 @@ def main(args):
     else:
         callback = CustomTrainingCallback(training_args.iters)
     
-    # Use the functional train approach instead of manual loop
-    train(
-        model=model,
-        tokenizer=processor,
-        optimizer=optimizer,
-        dataset=dataset,
-        args=training_args,
-        training_callback=callback,
-        train_on_completions=getattr(args, 'train_on_completions', False),
-        assistant_id=getattr(args, 'assistant_id', 77091),
-        clip_gradients=getattr(args, 'clip_gradients', None)
-    )
+    if args.train_mode == "sft":
+        train_sft(
+            model=model,
+            tokenizer=processor,
+            optimizer=optimizer,
+            dataset=dataset,
+            args=training_args,
+            training_callback=callback,
+            train_on_completions=getattr(args, 'train_on_completions', False),
+            assistant_id=getattr(args, 'assistant_id', 77091),
+            clip_gradients=getattr(args, 'clip_gradients', None)
+        )
+    elif args.train_mode == "grpo":
+        train_grpo(
+            model=model,
+            ref_model=ref_model,
+            tokenizer=processor,
+            dataset=dataset,
+            optimizer=optimizer,
+        )
     
     # Save model weights
     if args.full_weight_training:
@@ -138,9 +153,6 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--batch-size", type=int, default=1, help="Batch size for training"
-    )
-    parser.add_argument(
-        "--epochs", type=int, default=1, help="Number of epochs to train"
     )
     parser.add_argument(
         "--steps", type=int, default=1000, help="Number of steps per epoch"

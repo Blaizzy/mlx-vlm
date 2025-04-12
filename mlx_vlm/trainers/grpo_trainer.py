@@ -1,15 +1,13 @@
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten
 
-from ..models import cache
-from ..utils import generate_step
 from .grpo_reward_functions import (
     RewardFunctions,
     r1_accuracy_reward_func,
@@ -19,9 +17,9 @@ from .grpo_reward_functions import (
     r1_soft_format_reward_func,
     r1_strict_format_reward_func,
 )
+
 from .sft_trainer import TrainingArgs, average_gradients, grad_checkpoint
 from .callback import TrainingCallback
-from ..utils import prepare_inputs
 
 
 @dataclass
@@ -75,10 +73,156 @@ def get_per_token_logps(model: nn.Module, inputs, lengths):
     return per_token_logps
 
 
+def generate_step(
+    input_ids: mx.array,
+    model: nn.Module,
+    pixel_values,
+    mask,
+    *,
+    max_tokens: int = 256,
+    temperature: float = 0.0,
+    repetition_penalty: Optional[float] = None,
+    repetition_context_size: Optional[int] = 20,
+    top_p: float = 1.0,
+    logit_bias: Optional[Dict[int, float]] = None,
+    **kwargs,
+) -> Generator[Tuple[mx.array, mx.array], None, None]:
+    """
+    A generator producing token ids based on the given prompt from the model.
+
+    Args:
+        prompt (mx.array): The input prompt.
+        model (nn.Module): The model to use for generation.
+        temperature (float): The temperature for sampling, if 0 the argmax is used.
+          Default: ``0``.
+        repetition_penalty (float, optional): The penalty factor for repeating
+          tokens.
+        repetition_context_size (int, optional): The number of tokens to
+          consider for repetition penalty. Default: ``20``.
+        top_p (float, optional): Nulceus sampling, higher means model considers
+          more less likely words.
+        logit_bias (dictionary, optional): Additive logit bias.
+
+    Yields:
+        Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
+          one token and a vector of log probabilities.
+    """
+
+    def sample(logits: mx.array) -> Tuple[mx.array, float]:
+        if logit_bias:
+            indices = mx.array(list(logit_bias.keys()))
+            values = mx.array(list(logit_bias.values()))
+            logits[:, indices] += values
+        logprobs = logits - mx.logsumexp(logits)
+
+        if temperature == 0:
+            token = mx.argmax(logits, axis=-1)
+        else:
+            if top_p > 0 and top_p < 1.0:
+                token = top_p_sampling(logits, top_p, temperature)
+            else:
+                token = mx.random.categorical(logits * (1 / temperature))
+
+        return token, logprobs
+
+    if repetition_penalty and (
+        repetition_penalty < 0 or not isinstance(repetition_penalty, float)
+    ):
+        raise ValueError(
+            f"repetition_penalty must be a non-negative float, got {repetition_penalty}"
+        )
+
+    y = input_ids
+    if hasattr(model.language_model, "make_cache"):
+        cache = model.language_model.make_cache()
+    else:
+        kv_heads = (
+            [model.language_model.n_kv_heads] * len(model.language_model.layers)
+            if isinstance(model.language_model.n_kv_heads, int)
+            else model.language_model.n_kv_heads
+        )
+        if model.config.model_type == "florence2":
+            cache = [
+                (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
+            ]
+        else:
+            cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
+
+    repetition_context = input_ids.reshape(-1).tolist()
+
+    if repetition_context_size:
+        repetition_context = repetition_context[-repetition_context_size:]
+
+    def _step(y, **kwargs):
+        nonlocal repetition_context
+        if "decoder_input_ids" in kwargs:
+            outputs = model.language_model(
+                cache=cache,
+                **kwargs,
+            )
+        else:
+
+            outputs = model.language_model(
+                y[None],
+                cache=cache,
+                **kwargs,
+            )
+
+        logits = outputs.logits[:, -1, :]
+
+        if repetition_penalty:
+            logits = apply_repetition_penalty(
+                logits, repetition_context, repetition_penalty
+            )
+            y, logprobs = sample(logits)
+            repetition_context.append(y.item())
+        else:
+            y, logprobs = sample(logits)
+
+        if repetition_context_size:
+            if len(repetition_context) > repetition_context_size:
+                repetition_context = repetition_context[-repetition_context_size:]
+        return y, logprobs.squeeze(0)
+
+    outputs = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
+
+    logits = outputs.logits[:, -1, :]
+    y, logprobs = sample(logits)
+    mx.async_eval(y)
+
+    if outputs.cross_attention_states is not None:
+        kwargs = {
+            k: v
+            for k, v in zip(
+                ["cross_attention_states"], [outputs.cross_attention_states]
+            )
+        }
+    elif outputs.encoder_outputs is not None:
+        kwargs = {
+            "decoder_input_ids": y[None],
+            "encoder_outputs": outputs.encoder_outputs,
+        }
+    else:
+        kwargs = {}
+
+    n = 0
+    while True:
+        if n != max_tokens:
+            next_y, next_logprobs = _step(y, **kwargs)
+            mx.async_eval(next_y)
+            if "decoder_input_ids" in kwargs:
+                kwargs["decoder_input_ids"] = next_y[None]
+            yield y.item(), logprobs
+            y, logprobs = next_y, next_logprobs
+        if n == max_tokens:
+            break
+
+        n += 1
+
+
 def generate_grpo(
     model: nn.Module,
     tokenizer,
-    processor=None,
     prompt_tokens=None,
     images: Union[str, List[str]] = None,
     max_tokens: int = 512,
@@ -90,7 +234,8 @@ def generate_grpo(
     resize_shape=None,
 ):
     try:
-        end_sequence = mx.array(tokenizer.encode(end_token))
+        from ..utils import prepare_inputs, top_p_sampling, apply_repetition_penalty
+        end_sequence = mx.array(tokenizer.tokenizer.encode(end_token))
         total_samples = len(prompt_tokens)
         all_completions = []
         all_completion_texts = []
@@ -100,10 +245,10 @@ def generate_grpo(
             current_batch_size = min(batch_size, total_samples - i)
             batch_prompts = prompt_tokens[i: i + current_batch_size]
 
-            if images and processor:
+            if images and tokenizer:
                 inputs = prepare_inputs(
-                    processor,
-                    image=images if isinstance(images, str) else images[i],
+                    tokenizer,
+                    images if isinstance(images, str) else images[i],
                     prompts=batch_prompts,
                     image_token_index=image_token_index,
                     resize_shape=resize_shape,
@@ -130,7 +275,6 @@ def generate_grpo(
 
             for prompt_idx in range(expanded_prompts.shape[0]):
                 current_tokens = []
-                prompt_cache = cache.make_prompt_cache(model)
 
                 for token, _ in generate_step(
                     expanded_prompts[prompt_idx],
@@ -175,13 +319,8 @@ def grpo_loss(
     batch_indices=None,
     reward_funcs: Optional[List[RewardFunctions]] = None,
     beta: float = 0.1,
-    group_size: int = 4,
     epsilon: float = 1e-4,
-    max_tokens: int = 64,
-    temperature: float = 0.8,
     reward_weights: Optional[List[float]] = None,
-    batch_size: int = 1,
-    is_validation: bool = False,
 ):
     prompt_tokens, _, prompt_text, answer_text, type_info = batch
 
@@ -404,26 +543,25 @@ def grpo_loss(
         **reward_metrics,
     }
 
-    if is_validation and all_completion_texts:
-        print("\n=== Validation Sample Details ===")
-        last_prompt_idx = batch_indices[-1] if batch_indices else 0
-        if last_prompt_idx < len(prompt_text):
-            print(f"\n📋 Raw Prompt:\n{prompt_text[last_prompt_idx]}")
-            print("\n" + "=" * 10 + "\n")
-            if last_prompt_idx < len(prompt_tokens):
-                actual_prompt = tokenizer.decode(prompt_tokens[last_prompt_idx])
-                print(f"\n🔄 Model Input:\n{actual_prompt}")
-                print("\n" + "=" * 10 + "\n")
-        print(f"\n📝 Generation:\n{all_completion_texts[-1]}")
+    print("\n=== Validation Sample Details ===")
+    last_prompt_idx = batch_indices[-1] if batch_indices else 0
+    if last_prompt_idx < len(prompt_text):
+        print(f"\n📋 Raw Prompt:\n{prompt_text[last_prompt_idx]}")
         print("\n" + "=" * 10 + "\n")
-        if last_prompt_idx < len(answer_text):
-            print(f"\n✅ Answer:\n{answer_text[last_prompt_idx]}")
+        if last_prompt_idx < len(prompt_tokens):
+            actual_prompt = tokenizer.decode(prompt_tokens[last_prompt_idx])
+            print(f"\n🔄 Model Input:\n{actual_prompt}")
             print("\n" + "=" * 10 + "\n")
-        if "r1_extract_xml_answer" in globals():
-            print(
-                f"\n🔍 Extracted Answer:\n{r1_extract_xml_answer(all_completion_texts[-1])}"
-            )
-        print("\n" + "=" * 35 + "\n")
+    print(f"\n📝 Generation:\n{all_completion_texts[-1]}")
+    print("\n" + "=" * 10 + "\n")
+    if last_prompt_idx < len(answer_text):
+        print(f"\n✅ Answer:\n{answer_text[last_prompt_idx]}")
+        print("\n" + "=" * 10 + "\n")
+    if "r1_extract_xml_answer" in globals():
+        print(
+            f"\n🔍 Extracted Answer:\n{r1_extract_xml_answer(all_completion_texts[-1])}"
+        )
+    print("\n" + "=" * 35 + "\n")
 
     mx.clear_cache()
 
@@ -431,16 +569,11 @@ def grpo_loss(
 
 
 def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
-    has_types = isinstance(dataset[0], tuple) and len(dataset[0]) >= 5
-    has_images = isinstance(dataset[0], tuple) and len(dataset[0]) == 6
-
-    if not dataset or not isinstance(dataset[0], tuple) or (not has_types and len(dataset[0]) != 4):
-        raise ValueError(
-        "Dataset must be list of (prompt_tokens, answer_tokens, prompt_str, answer_str[, type, image]) tuples"
-        )
+    if not dataset or not isinstance(dataset[0], dict):
+        raise ValueError("Dataset must be a list of dictionaries")
 
     def length_key(i):
-        return len(dataset[i][0]) + len(dataset[i][1])
+        return len(dataset[i]["input_ids"])
 
     idx = sorted(range(len(dataset)), key=length_key)
 
@@ -466,14 +599,14 @@ def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
         )
 
         for batch_idx in indices:
-            current_batch = [dataset[j] for j in batch_idx]
+            current_batch = [dataset[int(j)] for j in batch_idx]
 
-            prompts_tokens = [item[0] for item in current_batch]
-            answers_tokens = [item[1] for item in current_batch]
-            prompts_text = [item[2] for item in current_batch]
-            answers_text = [item[3] for item in current_batch]
-            types = [item[4] for item in current_batch] if has_types else None
-            images = [item[5] for item in current_batch] if has_images else None
+            prompts_tokens = [item["input_ids"] for item in current_batch]
+            answers_tokens = [item["answer_ids"] for item in current_batch]
+            prompts_text = [item["prompt_str"] for item in current_batch]
+            answers_text = [item["answer_str"] for item in current_batch]
+            types = [item.get("type", None) for item in current_batch]
+            images = [item.get("pixel_values", None) for item in current_batch]
 
             if any(len(p) > max_seq_length for p in prompts_tokens):
                 print(
@@ -491,10 +624,8 @@ def train_grpo(
     model: nn.Module,
     ref_model: Optional[nn.Module],
     tokenizer,
-    processor,
     optimizer,
-    train_dataset,
-    val_dataset,
+    dataset,
     reward_funcs: Optional[List[RewardFunctions]] = [
         r1_accuracy_reward_func,
         r1_int_reward_func,
@@ -529,9 +660,7 @@ def train_grpo(
             tokenizer=tokenizer,
             prompt_tokens=prompt_tokens,
             images=images,
-            processor=processor,
-            image_token_index=args.image_token_index,
-            resize_shape=args.image_resize_shape,
+            image_token_index=getattr(model.config, "image_token_index", None),
             max_tokens=args.max_completion_length,
             group_size=args.group_size,
             temperature=args.temperature,
@@ -547,7 +676,6 @@ def train_grpo(
             batch_indices=batch_indices,
             reward_funcs=reward_funcs,
             beta=args.beta,
-            group_size=args.group_size,
             epsilon=args.epsilon,
             ref_model=ref_model,
         )
@@ -581,66 +709,12 @@ def train_grpo(
     for it, batch in zip(
         range(1, args.iters + 1),
         iterate_batches(
-            dataset=train_dataset,
+            dataset=dataset,
             batch_size=args.batch_size,
             max_seq_length=args.max_seq_length,
             train=True,
         ),
     ):
-        if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
-            stop = time.perf_counter()
-            val_loss, val_ntokens, val_metrics = evaluate_grpo(
-                model=model,
-                dataset=val_dataset,
-                loss_fn=loss_fn,
-                ref_model=ref_model,
-                reward_funcs=reward_funcs,
-                tokenizer=tokenizer,
-                group_size=args.group_size,
-                batch_size=args.batch_size,
-                num_batches=args.val_batches,
-                max_seq_length=args.max_seq_length,
-                max_tokens=args.max_completion_length,
-                beta=args.beta,
-                epsilon=args.epsilon,
-                temperature=args.temperature,
-                iterate_batches=iterate_batches,
-            )
-            val_time = time.perf_counter() - stop
-            if rank == 0:
-                val_metrics_str = (
-                    f"Val loss {val_loss:.3f}, "
-                    f"Val total_rewards_mean {val_metrics['total_rewards_mean']:.3f}, "
-                    f"Val total_rewards_std {val_metrics['total_rewards_std']:.3f}, "
-                    f"Val grouped_rewards_mean {val_metrics['grouped_rewards_mean']:.3f}, "
-                    f"Val grouped_rewards_std {val_metrics['grouped_rewards_std']:.3f}, "
-                    f"Val Average Generated Tokens {val_metrics['average_generated_tokens']}, "
-                    f"Val kl {val_metrics['kl']:.3f}"
-                )
-
-                for i, reward_func in enumerate(reward_funcs):
-                    val_metrics_str += (
-                        f", Val {reward_func.__name__}_mean {val_metrics[f'{reward_func.__name__}_mean']:.3f}, "
-                        f"Val {reward_func.__name__}_std {val_metrics[f'{reward_func.__name__}_std']:.3f}"
-                    )
-
-                print(
-                    f"Iter {it}: {val_metrics_str}, " f"Val took {val_time:.3f}s",
-                    flush=True,
-                )
-
-            if training_callback is not None:
-                training_callback.on_val_loss_report(
-                    {
-                        "iteration": it,
-                        "val_loss": val_loss,
-                        **{f"val_{k}": v for k, v in val_metrics.items()},
-                        "val_time": val_time,
-                    }
-                )
-
-            start = time.perf_counter()
-
         loss, toks, metrics = step(batch)
         losses += loss
         n_tokens += toks

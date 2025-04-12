@@ -139,8 +139,8 @@ class GRPODataset:
         take=None,
         split=None,
         image_resize_shape=None,
-        images_key: str = "image",
-        prompt_key: str = "prompt",
+        images_key: str = "images",
+        prompt_key: str = "problem",
         answer_key: str = "answer",
         system_key: str = "system",
         system_prompt: str = None,
@@ -207,10 +207,12 @@ class GRPODataset:
             answer_tokens = self.processor.tokenizer.encode(answer_str)
 
         from ..utils import prepare_inputs
+        prompt_text = self.processor.tokenizer.decode(prompt_tokens)
+        answer_text = self.processor.tokenizer.decode(answer_tokens)
         inputs = prepare_inputs(
             self.processor,
             image,
-            [prompt_tokens + answer_tokens],
+            [prompt_text + answer_text],
             self.config["image_token_index"],
             self.image_resize_shape,
         )
@@ -222,6 +224,7 @@ class GRPODataset:
 
         return {
             "input_ids": input_ids,
+            "answer_ids": answer_tokens,
             "pixel_values": pixel_values,
             "attention_mask": attention_mask,
             "prompt_str": prompt_str,
@@ -238,7 +241,7 @@ def prepare_dataset(
     args,
     promtp_field: str = "question",
     completion_field: str = "output",
-    new_image_field: str = "image",
+    new_image_field: str = "images",
     messages_field: str = "messages"
 ):
     needs_message_transform = False
@@ -333,15 +336,15 @@ def load_and_prepare_dataset(
     logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
     loaded_dataset = load_dataset(args.dataset, name=args.dataset_config, split=args.split)
 
-    logger.info(f"\033[32mPreparing and maping dataset\033[0m")
-    prepared_dataset, messages_key, image_field = prepare_dataset(
-        dataset=loaded_dataset,
-        config=config,
-        processor=processor,
-        args=args
-    )
-
     if args.train_mode == "sft":
+        logger.info(f"\033[32mStarting to train with SFT\033[0m")
+        logger.info(f"\033[32mPreparing and maping dataset\033[0m")
+        prepared_dataset, messages_key, image_field = prepare_dataset(
+            dataset=loaded_dataset,
+            config=config,
+            processor=processor,
+            args=args
+        )
         return SFTDataset(
             prepared_dataset,
             config,
@@ -352,13 +355,25 @@ def load_and_prepare_dataset(
             images_key=image_field
         )
     elif args.train_mode == "grpo":
+        logger.info(f"\033[32mStarting to train with GRPO\033[0m")
+        logger.info(f"\033[32mPreparing and maping dataset\033[0m")
+        prepared_dataset, messages_key, image_field = prepare_dataset(
+            promtp_field = "problem",
+            completion_field = "answer",
+            new_image_field = "images",
+            messages_field = "messages",
+            dataset=loaded_dataset,
+            config=config,
+            processor=processor,
+            args=args
+        )
         return GRPODataset(
-            prepare_dataset,
+            prepared_dataset,
             config,
             processor,
             image_processor=image_processor,
             image_resize_shape=args.image_resize_shape,
-            messages_key=messages_key,
+            # messages_key=messages_key,
             images_key=image_field
         )
     else:
