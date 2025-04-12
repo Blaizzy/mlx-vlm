@@ -290,12 +290,7 @@ class LanguageModel(nn.Module):
                 i % self.config.sliding_window_pattern
                 == self.config.sliding_window_pattern - 1
             ):
-                caches.append(
-                    KVCache(
-                        head_dim=self.config.head_dim,
-                        n_kv_heads=self.config.num_key_value_heads,
-                    )
-                )
+                caches.append(KVCache())
             else:
                 caches.append(
                     RotatingKVCache(
