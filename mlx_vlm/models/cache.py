@@ -2,7 +2,7 @@ import mlx.core as mx
 from mlx_lm.models.cache import KVCache, RotatingKVCache, _BaseCache
 
 
-class SimpleKVCache(_BaseCache):
+class SimpleKVCache:
     """A simple key-value cache for transformer attention layers.
 
     Stores and concatenates key/value tensors along sequence dimension.

@@ -978,7 +978,7 @@ def generate_step(
                 (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
             ]
         else:
-            cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
+            cache = [KVCache() for n in kv_heads]
 
     repetition_context = input_ids.reshape(-1).tolist()
 
