@@ -150,7 +150,7 @@ class Encoder(nn.Module):
             if output_hidden_states:
                 encoder_states = encoder_states + (x,)
 
-            h = x[0]
+            h = x
 
         return (h, encoder_states)
 
@@ -243,7 +243,6 @@ class VisionModel(nn.Module):
             )
 
         x = self.embeddings(x, mask=patch_attention_mask)
-
         encoder_outputs = self.encoder(x=x, output_hidden_states=output_hidden_states)
 
         pooler_output = self.post_layernorm(encoder_outputs[0])

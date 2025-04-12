@@ -6,7 +6,8 @@ from typing import Any, Dict, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache, RotatingKVCache
 from ..switch_layers import SwitchGLU
 
 
@@ -523,10 +524,11 @@ class DeepseekV2Model(nn.Module):
         else:
             h = inputs_embeds
 
-        mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        if mask is None:
+            mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -545,11 +547,11 @@ class LanguageModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
+        inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
-        inputs_embeds=None,
         cache: Optional[Any] = None,
     ):
-        out = self.model(inputs, mask, inputs_embeds, cache)
+        out = self.model(inputs, mask=mask, inputs_embeds=inputs_embeds, cache=cache)
         out = self.lm_head(out)
         return LanguageModelOutput(logits=out)
 

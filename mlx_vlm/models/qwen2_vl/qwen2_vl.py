@@ -21,6 +21,7 @@ class ModelConfig:
     model_type: str
     ignore_index: int = -100
     image_token_index: int = 151655
+    video_token_index: int = 151656
     vision_feature_select_strategy: str = "default"
     vision_feature_layer: int = -2
     vocab_size: int = 32000
@@ -53,7 +54,7 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        image_grid_thw: Optional[mx.array] = None,
+        grid_thw: Optional[mx.array] = None,
     ):
 
         if pixel_values is None:
@@ -67,7 +68,7 @@ class Model(nn.Module):
 
         # Get the ouptut hidden states from the vision model
         hidden_states = self.vision_tower(
-            pixel_values, image_grid_thw, output_hidden_states=False
+            pixel_values, grid_thw, output_hidden_states=False
         )
 
         if hidden_states.ndim == 2:
@@ -83,10 +84,15 @@ class Model(nn.Module):
         self, image_features, inputs_embeds, input_ids
     ):
         image_token_index = self.config.image_token_index
+        video_token_index = self.config.video_token_index
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = input_ids == image_token_index
+        if mx.sum(image_positions) == 0:
+            image_positions = input_ids == video_token_index
+
         image_indices = np.where(image_positions)[1].tolist()
+
         inputs_embeds[:, image_indices, :] = image_features
 
         return inputs_embeds
@@ -99,13 +105,12 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        image_grid_thw = kwargs.pop("image_grid_thw", None)
-        if image_grid_thw is not None:
-            image_grid_thw = mx.array(image_grid_thw)
 
-        input_embddings = self.get_input_embeddings(
-            input_ids, pixel_values, image_grid_thw
-        )
+        image_grid_thw = kwargs.pop("image_grid_thw", None)
+        video_grid_thw = kwargs.pop("video_grid_thw", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+
+        input_embddings = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
 
         logits = self.language_model(None, cache=cache, inputs_embeds=input_embddings)
         return logits

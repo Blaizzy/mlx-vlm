@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import glob
 import importlib
@@ -16,7 +17,7 @@ import mlx.nn as nn
 import numpy as np
 import requests
 from huggingface_hub import snapshot_download
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.utils import tree_flatten, tree_reduce, tree_unflatten
 from PIL import Image, ImageOps
 from transformers import (
     AutoConfig,
@@ -25,7 +26,8 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-from .models.base import BaseImageProcessor, KVCache, SimpleKVCache
+from .models.base import BaseImageProcessor
+from .models.cache import KVCache, SimpleKVCache
 from .sample_utils import top_p_sampling
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
@@ -34,6 +36,44 @@ from .trainer import apply_lora_layers
 MODEL_REMAPPING = {"llava-qwen2": "llava_bunny", "bunny-llama": "llava_bunny"}
 
 MAX_FILE_SIZE_GB = 5
+
+
+# A stream on the default device just for generation
+generation_stream = mx.new_stream(mx.default_device())
+
+
+@contextlib.contextmanager
+def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
+    """
+    A context manager to temporarily change the wired limit.
+
+    Note, the wired limit should not be changed during an async eval.  If an
+    async eval could be running pass in the streams to synchronize with prior
+    to exiting the context manager.
+    """
+    model_bytes = tree_reduce(
+        lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
+    )
+    max_rec_size = mx.metal.device_info()["max_recommended_working_set_size"]
+    if model_bytes > 0.9 * max_rec_size:
+        model_mb = model_bytes // 2**20
+        max_rec_mb = max_rec_size // 2**20
+        print(
+            f"[WARNING] Generating with a model that requires {model_mb} MB "
+            f"which is close to the maximum recommended size of {max_rec_mb} "
+            "MB. This can be slow. See the documentation for possible work-arounds: "
+            "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
+        )
+    old_limit = mx.set_wired_limit(max_rec_size)
+    try:
+        yield None
+    finally:
+        if streams is not None:
+            for s in streams:
+                mx.synchronize(s)
+        else:
+            mx.synchronize()
+        mx.set_wired_limit(old_limit)
 
 
 @dataclass
@@ -411,7 +451,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         ```
 
         ```bash
-        python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temp 0.0 --prompt "Describe this image." --image <path_to_image>
+        python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temperature 0.0 --prompt "Describe this image." --image <path_to_image>
         ```
         """
     )
@@ -677,7 +717,7 @@ def convert(
     )
 
     weights = dict(tree_flatten(model.parameters()))
-    dtype = mx.float16 if quantize else getattr(mx, dtype)
+    dtype = getattr(mx, dtype)
     weights = {k: v.astype(dtype) for k, v in weights.items()}
 
     if quantize and dequantize:
@@ -701,9 +741,11 @@ def convert(
     del model
     save_weights(mlx_path, weights, donate_weights=True)
 
-    py_files = glob.glob(str(model_path / "*.py"))
-    for file in py_files:
-        shutil.copy(file, mlx_path)
+    # Copy Python and JSON files from the model path to the MLX path
+    for pattern in ["*.py", "*.json"]:
+        files = glob.glob(str(model_path / pattern))
+        for file in files:
+            shutil.copy(file, mlx_path)
 
     processor.save_pretrained(mlx_path)
 
@@ -758,6 +800,40 @@ def process_image(img, resize_shape, image_processor):
     return img
 
 
+def process_inputs(processor, images, prompts, return_tensors="mlx"):
+    if hasattr(processor, "process"):
+        inputs = processor.process(
+            text=prompts,
+            images=images,
+            padding=True,
+            return_tensors=return_tensors,
+        )
+    else:
+        inputs = processor(
+            text=prompts, images=images, padding=True, return_tensors=return_tensors
+        )
+    return inputs
+
+
+def process_inputs_with_fallback(processor, images, prompts, return_tensors="mlx"):
+    try:
+        inputs = process_inputs(
+            processor, images, prompts, return_tensors=return_tensors
+        )
+    except Exception as e:
+        try:
+            print(
+                f"\033[33mWarning\033[0m: Failed to process inputs with error: {e}",
+                "Trying to process inputs with return_tensors='pt'",
+            )
+            inputs = process_inputs(processor, images, prompts, return_tensors="pt")
+        except Exception as e:
+            raise ValueError(
+                f"Failed to process inputs with error: {e}. Please install PyTorch and try again."
+            )
+    return inputs
+
+
 def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=None):
 
     if not isinstance(images, list):
@@ -803,15 +879,10 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
         ).astype(mx.int32)
 
     else:
-        processor.tokenizer.pad_token = processor.tokenizer.eos_token
-        if hasattr(processor, "process"):
-            inputs = processor.process(
-                text=prompts, images=images, padding=True, return_tensors="mlx"
-            )
-        else:
-            inputs = processor(
-                text=prompts, images=images, padding=True, return_tensors="mlx"
-            )
+        if hasattr(processor, "tokenizer"):
+            processor.tokenizer.pad_token = processor.tokenizer.eos_token
+
+        inputs = process_inputs_with_fallback(processor, images, prompts)
 
         if "images" in inputs:
             inputs["pixel_values"] = inputs["images"]
@@ -841,7 +912,7 @@ def generate_step(
     mask,
     *,
     max_tokens: int = 256,
-    temp: float = 0.0,
+    temperature: float = 0.0,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
@@ -854,7 +925,7 @@ def generate_step(
     Args:
         prompt (mx.array): The input prompt.
         model (nn.Module): The model to use for generation.
-        temp (float): The temperature for sampling, if 0 the argmax is used.
+        temperature (float): The temperature for sampling, if 0 the argmax is used.
           Default: ``0``.
         repetition_penalty (float, optional): The penalty factor for repeating
           tokens.
@@ -876,13 +947,13 @@ def generate_step(
             logits[:, indices] += values
         logprobs = logits - mx.logsumexp(logits)
 
-        if temp == 0:
+        if temperature == 0:
             token = mx.argmax(logits, axis=-1)
         else:
             if top_p > 0 and top_p < 1.0:
-                token = top_p_sampling(logits, top_p, temp)
+                token = top_p_sampling(logits, top_p, temperature)
             else:
-                token = mx.random.categorical(logits * (1 / temp))
+                token = mx.random.categorical(logits * (1 / temperature))
 
         return token, logprobs
 
@@ -907,7 +978,7 @@ def generate_step(
                 (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
             ]
         else:
-            cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
+            cache = [KVCache() for n in kv_heads]
 
     repetition_context = input_ids.reshape(-1).tolist()
 
@@ -915,36 +986,36 @@ def generate_step(
         repetition_context = repetition_context[-repetition_context_size:]
 
     def _step(y, **kwargs):
-        nonlocal repetition_context
-        if "decoder_input_ids" in kwargs:
-            outputs = model.language_model(
-                cache=cache,
-                **kwargs,
-            )
-        else:
+        with mx.stream(generation_stream):
+            nonlocal repetition_context
+            if "decoder_input_ids" in kwargs:
+                outputs = model.language_model(
+                    cache=cache,
+                    **kwargs,
+                )
+            else:
 
-            outputs = model.language_model(
-                y[None],
-                cache=cache,
-                mask=mask,
-                **kwargs,
-            )
+                outputs = model.language_model(
+                    y[None],
+                    cache=cache,
+                    **kwargs,
+                )
 
-        logits = outputs.logits[:, -1, :]
+            logits = outputs.logits[:, -1, :]
 
-        if repetition_penalty:
-            logits = apply_repetition_penalty(
-                logits, repetition_context, repetition_penalty
-            )
-            y, logprobs = sample(logits)
-            repetition_context.append(y.item())
-        else:
-            y, logprobs = sample(logits)
+            if repetition_penalty:
+                logits = apply_repetition_penalty(
+                    logits, repetition_context, repetition_penalty
+                )
+                y, logprobs = sample(logits)
+                repetition_context.append(y.item())
+            else:
+                y, logprobs = sample(logits)
 
-        if repetition_context_size:
-            if len(repetition_context) > repetition_context_size:
-                repetition_context = repetition_context[-repetition_context_size:]
-        return y, logprobs.squeeze(0)
+            if repetition_context_size:
+                if len(repetition_context) > repetition_context_size:
+                    repetition_context = repetition_context[-repetition_context_size:]
+            return y, logprobs.squeeze(0)
 
     outputs = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
 
@@ -1003,45 +1074,66 @@ def stream_generate(
         Generator[Tuple[mx.array, mx.array]]: A generator producing text.
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    prompt_tokens = mx.array(tokenizer.encode(prompt))
+    add_special_tokens = not hasattr(processor, "chat_template")
+    prompt_tokens = mx.array(
+        tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+    )
 
     resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)
 
-    if not image:
-        input_ids = prompt_tokens[None, :]
-        pixel_values = mask = None
+    if kwargs.get("pixel_values") is None:
+        if not image:
+            input_ids = prompt_tokens[None, :]
+            pixel_values = mask = None
+        else:
+            inputs = prepare_inputs(
+                processor, image, prompt, image_token_index, resize_shape
+            )
+            input_ids = inputs["input_ids"]
+            pixel_values = inputs["pixel_values"]
+            mask = inputs["attention_mask"]
+            data_kwargs = {
+                k: v
+                for k, v in inputs.items()
+                if k not in ["input_ids", "pixel_values", "attention_mask"]
+            }
+            kwargs.update(data_kwargs)
     else:
-        inputs = prepare_inputs(
-            processor, image, prompt, image_token_index, resize_shape
-        )
-        input_ids = inputs["input_ids"]
-        pixel_values = inputs["pixel_values"]
-        mask = inputs["attention_mask"]
-        data_kwargs = {
-            k: v
-            for k, v in inputs.items()
-            if k not in ["input_ids", "pixel_values", "attention_mask"]
-        }
-        kwargs.update(data_kwargs)
+        input_ids = kwargs.pop("input_ids")
+        pixel_values = kwargs.pop("pixel_values")
+        mask = kwargs.pop("mask")
 
-    detokenizer = processor.detokenizer
-    detokenizer.reset()
-    tic = time.perf_counter()
-    for n, (token, logprobs) in enumerate(
-        generate_step(input_ids, model, pixel_values, mask, **kwargs)
-    ):
-        if n == 0:
-            prompt_time = time.perf_counter() - tic
-            prompt_tps = input_ids.size / prompt_time
-            tic = time.perf_counter()
+    with wired_limit(model, [generation_stream]):
+        detokenizer = processor.detokenizer
+        detokenizer.reset()
+        tic = time.perf_counter()
+        for n, (token, logprobs) in enumerate(
+            generate_step(input_ids, model, pixel_values, mask, **kwargs)
+        ):
+            if n == 0:
+                prompt_time = time.perf_counter() - tic
+                prompt_tps = input_ids.size / prompt_time
+                tic = time.perf_counter()
 
-        if token == tokenizer.eos_token_id:
-            break
+            if token == tokenizer.eos_token_id:
+                break
 
-        detokenizer.add_token(token)
+            detokenizer.add_token(token)
 
-        # Yield the last segment if streaming
+            # Yield the last segment if streaming
+            yield GenerationResult(
+                text=detokenizer.last_segment,
+                token=token,
+                logprobs=logprobs,
+                prompt_tokens=input_ids.size,
+                generation_tokens=n + 1,
+                prompt_tps=prompt_tps,
+                generation_tps=(n + 1) / (time.perf_counter() - tic),
+                peak_memory=mx.get_peak_memory() / 1e9,
+            )
+
+        detokenizer.finalize()
         yield GenerationResult(
             text=detokenizer.last_segment,
             token=token,
@@ -1050,7 +1142,7 @@ def stream_generate(
             generation_tokens=n + 1,
             prompt_tps=prompt_tps,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
-            peak_memory=mx.metal.get_peak_memory() / 1e9,
+            peak_memory=mx.get_peak_memory() / 1e9,
         )
 
     detokenizer.finalize()
@@ -1062,7 +1154,7 @@ def stream_generate(
         generation_tokens=n + 1,
         prompt_tps=prompt_tps,
         generation_tps=(n + 1) / (time.perf_counter() - tic),
-        peak_memory=mx.metal.get_peak_memory() / 1e9,
+        peak_memory=mx.get_peak_memory() / 1e9,
     )
 
 
@@ -1081,7 +1173,7 @@ def generate(
        model (nn.Module): The language model.
        tokenizer (PreTrainedTokenizer): The tokenizer.
        prompt (str): The string prompt.
-       temp (float): The temperature for sampling (default 0).
+       temperature (float): The temperature for sampling (default 0).
        max_tokens (int): The maximum number of tokens (default 100).
        verbose (bool): If ``True``, print tokens and timing information
            (default ``False``).
@@ -1093,11 +1185,20 @@ def generate(
 
     if verbose:
         print("=" * 10)
-        print("Image:", image, "\n")
+        if image is not None:
+            input_path = image
+        elif kwargs.get("video") is not None:
+            input_path = kwargs.get("video")
+        else:
+            input_path = None
+
+        print(f"Files: {input_path}", "\n")
+
         print("Prompt:", prompt)
 
     text = ""
     last_response = None
+
     for response in stream_generate(model, processor, prompt, image, **kwargs):
         if verbose:
             print(response.text, end="", flush=True)

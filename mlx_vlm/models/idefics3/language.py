@@ -6,20 +6,21 @@ from typing import Dict, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache
 
 
 @dataclass
 class TextConfig:
     model_type: str
     hidden_size: int
-    num_hidden_layers: int
     intermediate_size: int
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
     num_key_value_heads: int
     rope_theta: float = 1000000.0
+    num_hidden_layers: int = 32
     rope_traditional: bool = False
     tie_word_embeddings: bool = False
 
@@ -145,9 +146,9 @@ class LanguageModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
-        inputs_embeds=None,
+        inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
+        cache=None,
     ):
         # for passing merged input embeddings
         if inputs_embeds is None:
@@ -155,10 +156,11 @@ class LanguageModel(nn.Module):
         else:
             h = inputs_embeds.astype(self.norm.weight.dtype)
 
-        mask = create_attention_mask(h)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        if mask is None:
+            mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)

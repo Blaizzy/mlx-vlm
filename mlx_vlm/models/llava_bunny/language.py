@@ -5,7 +5,8 @@ from typing import Dict, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache
 
 
 @dataclass
@@ -165,9 +166,9 @@ class Qwen2Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
+        cache=None,
     ):
         # for passing merged input embeddings
         if inputs_embeds is None:
@@ -175,10 +176,11 @@ class Qwen2Model(nn.Module):
         else:
             h = inputs_embeds
 
-        mask = create_attention_mask(h)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        if mask is None:
+            mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -196,11 +198,11 @@ class LanguageModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
+        cache=None,
     ):
-        out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds, mask=mask)
+        out = self.model(inputs, mask=mask, cache=cache, inputs_embeds=inputs_embeds)
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):

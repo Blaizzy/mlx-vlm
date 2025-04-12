@@ -5,7 +5,8 @@ from typing import Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache
 
 
 @dataclass
@@ -331,7 +332,8 @@ class MllamaTextModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = create_attention_mask(hidden_states)
+        if mask is None:
+            mask = create_attention_mask(hidden_states, cache)
 
         for idx, (decoder_layer, c) in enumerate(zip(self.layers, cache)):
             if idx in self.config.cross_attention_layers:

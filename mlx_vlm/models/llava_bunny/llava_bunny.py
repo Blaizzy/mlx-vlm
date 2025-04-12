@@ -161,6 +161,8 @@ class Model(nn.Module):
 
     def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
         image_token_index = self.config.image_token_index
+        num_images, num_image_patches, embed_dim = image_features.shape
+
         batch_size, seq_length, embed_dim = inputs_embeds.shape
         num_images, num_image_patches, _ = image_features.shape
 
@@ -194,7 +196,10 @@ class Model(nn.Module):
     ):
         input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
         logits = self.language_model(
-            inputs=input_ids, cache=cache, inputs_embeds=input_embeddings, mask=mask
+            inputs=input_ids,
+            cache=cache,
+            inputs_embeds=input_embeddings,
+            mask=None,  # TODO: add mask
         )
         return logits
 

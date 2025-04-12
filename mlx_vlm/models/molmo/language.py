@@ -5,7 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache
 
 
 @dataclass
@@ -184,7 +185,7 @@ class Molmo(nn.Module):
             cache = [None] * self.config.n_layers
 
         if mask is None:
-            mask = create_attention_mask(h)
+            mask = create_attention_mask(h, cache)
 
         for block, c in zip(self.blocks, cache):
             h = block(h, mask, c)
