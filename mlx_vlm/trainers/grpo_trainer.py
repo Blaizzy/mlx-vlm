@@ -6,7 +6,7 @@ from typing import Dict, Generator, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 
 from .grpo_reward_functions import (
     RewardFunctions,
@@ -89,7 +89,7 @@ def generate_grpo(
     resize_shape=None,
 ):
     try:
-        from ..utils import generate_step
+        from ..utils import generate_step, prepare_inputs
         end_sequence = mx.array(processor.tokenizer.encode(end_token))
         total_samples = len(prompt_tokens)
         all_completions = []
@@ -100,38 +100,45 @@ def generate_grpo(
             current_batch_size = min(batch_size, total_samples - i)
             batch_prompts = prompt_tokens[i: i + current_batch_size]
 
-            if images and processor:
-                pixel_values = images[i] if isinstance(images, list) else images
-                batch_prompts = [
-                    flatten_once(p.tolist()) if isinstance(p, mx.array) else flatten_once(p)
-                    for p in batch_prompts
-                ]
-                batch_prompts = [list(map(int, p)) for p in batch_prompts]
-                max_prompt_len = max(len(p) for p in batch_prompts)
-                padded = [
-                    p + [processor.tokenizer.pad_token_id] * (max_prompt_len - len(p))
-                    for p in batch_prompts
-                ]
-                prompt_tensor = mx.stop_gradient(mx.array(padded))
-                mask = mx.ones_like(prompt_tensor)
-            else:
-                batch_prompts = [
-                    p.tolist() if isinstance(p, mx.array) else p
-                    for p in batch_prompts
-                ]
-                batch_prompts = [list(map(int, p)) for p in batch_prompts]
-                max_prompt_len = max(len(p) for p in batch_prompts)
-                padded = [
-                    p + [processor.tokenizer.pad_token_id] * (max_prompt_len - len(p))
-                    for p in batch_prompts
-                ]
-                prompt_tensor = mx.stop_gradient(mx.array(padded))
-                pixel_values = mask = None
+        if images and processor and images[i] is not None:
+            ids = prompt_tokens[i]
+            inputs = prepare_inputs(
+                processor,
+                images[i],
+                processor.tokenizer.decode(ids.tolist() if isinstance(ids, mx.array) else ids),
+                image_token_index=image_token_index,
+                resize_shape=resize_shape,
+            )
+
+            pixel_values = inputs["pixel_values"]
+            mask = inputs["attention_mask"]
+            input_ids = inputs["input_ids"]
+
+            batch_prompts = [input_ids.tolist()]
+            max_prompt_len = max(len(p) for p in batch_prompts)
+            padded = [
+                p + [processor.tokenizer.pad_token_id] * (max_prompt_len - len(p))
+                for p in batch_prompts
+            ]
+            prompt_tensor = mx.stop_gradient(mx.array(padded))
+        else:
+            batch_prompts = [
+                p.tolist() if isinstance(p, mx.array) else p
+                for p in batch_prompts
+            ]
+            batch_prompts = [list(map(int, p)) for p in batch_prompts]
+            max_prompt_len = max(len(p) for p in batch_prompts)
+            padded = [
+                p + [processor.tokenizer.pad_token_id] * (max_prompt_len - len(p))
+                for p in batch_prompts
+            ]
+            prompt_tensor = mx.stop_gradient(mx.array(padded))
+            pixel_values = mask = None
 
             if len(prompt_tensor.shape) == 1:
                 prompt_tensor = prompt_tensor[None, :]
             if prompt_tensor.shape[1] == 0:
-                continue
+                return [], [], []
 
             expanded_prompts = mx.repeat(prompt_tensor, group_size, axis=0)
             batch_results = []
@@ -146,6 +153,7 @@ def generate_grpo(
                     mask,
                     max_tokens=max_tokens,
                     temperature=temperature,
+                    grid_thw=(1, 14, 14)
                 ):
                     current_tokens.append(token)
                     if token == processor.tokenizer.eos_token_id:
@@ -498,8 +506,8 @@ def train_grpo(
     ],
     args: GRPOTrainingArgs = GRPOTrainingArgs(),
     loss_fn: callable = grpo_loss,
-    iterate_batches: callable = iterate_grpo_batches,
     training_callback: TrainingCallback = None,
+    clip_gradients=None
 ):
     world = mx.distributed.init()
     world_size = world.size()
@@ -540,6 +548,11 @@ def train_grpo(
             ref_model=ref_model,
         )
 
+        if clip_gradients is not None:
+            grad = tree_map(
+                lambda g: mx.clip(g, -clip_gradients, clip_gradients), grad
+            )
+
         grad = average_gradients(grad)
         optimizer.update(model, grad)
 
@@ -568,7 +581,7 @@ def train_grpo(
     start = time.perf_counter()
     for it, batch in zip(
         range(1, args.iters + 1),
-        iterate_batches(
+        iterate_grpo_batches(
             dataset=dataset,
             batch_size=args.batch_size,
             max_seq_length=args.max_seq_length,

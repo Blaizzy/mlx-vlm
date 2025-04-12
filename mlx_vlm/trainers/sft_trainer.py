@@ -206,7 +206,7 @@ def train_sft(
     optimizer,
     dataset,
     args: TrainingArgs = TrainingArgs(),
-    loss=default_loss,
+    loss: callable = default_loss,
     training_callback: TrainingCallback = None,
     clip_gradients=None,
     train_on_completions=False,

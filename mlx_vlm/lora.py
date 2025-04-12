@@ -3,7 +3,7 @@ import logging
 
 import mlx.optimizers as optim
 
-from .trainers import TrainingArgs, save_adapter, save_full_model, train_sft, train_grpo
+from .trainers import TrainingArgs, GRPOTrainingArgs, save_adapter, save_full_model, train_sft, train_grpo
 from .trainers.dataset import load_and_prepare_dataset
 from .trainers.utils import get_peft_model, print_trainable_parameters
 from .utils import load, load_image_processor
@@ -52,13 +52,26 @@ def main(args):
 
     logger.info(f"\033[32mSetting up training arguments\033[0m")
     
-    # Convert existing args to TrainingArgs
-    training_args = TrainingArgs(
-        batch_size=args.batch_size,
-        iters=args.steps,
-        steps_per_report=args.print_every,
-        adapter_file=args.output_path
-    )
+    if args.train_mode == "sft":
+        training_args = TrainingArgs(
+            batch_size=args.batch_size,
+            iters=args.steps,
+            steps_per_report=args.print_every,
+            adapter_file=args.output_path
+        )
+    else:
+        training_args = GRPOTrainingArgs(
+            batch_size=args.batch_size,
+            iters=args.steps,
+            steps_per_report=args.print_every,
+            adapter_file=args.output_path,
+            max_completion_length=args.max_completion_length,
+            group_size=args.group_size,
+            beta=args.beta,
+            epsilon=args.epsilon,
+            temperature=args.temperature,
+            reward_weights=eval(args.reward_weights) if args.reward_weights else None
+        )
     
     model.train()
     
@@ -92,7 +105,10 @@ def main(args):
             ref_model=ref_model.freeze(),
             processor=processor,
             dataset=dataset,
+            args=training_args,
             optimizer=optimizer,
+            training_callback=callback,
+            clip_gradients=getattr(args, 'clip_gradients', None)
         )
     
     # Save model weights
