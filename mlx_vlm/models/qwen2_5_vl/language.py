@@ -93,7 +93,7 @@ class Attention(nn.Module):
 
         offset = cache.offset if cache else 0
 
-        if mask is not None:
+        if mask is not None and isinstance(mask, mx.array):
             mask = mask[..., : keys.shape[-2]]
 
         queries = self.rotary_emb(queries, offset=offset)
