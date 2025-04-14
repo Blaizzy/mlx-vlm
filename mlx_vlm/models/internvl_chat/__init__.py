@@ -6,3 +6,4 @@ from .internvl_chat import (
     VisionConfig,
     VisionModel,
 )
+from .processor import InternVLChatProcessor, InternVLImageProcessor
