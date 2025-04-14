@@ -1,8 +1,10 @@
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
+from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.cache import RotatingKVCache
 from PIL import Image
 from transformers.image_processing_utils import BaseImageProcessor as ImageProcessor
@@ -62,31 +64,6 @@ class BaseImageProcessor(ImageProcessor):
         pass
 
 
-def create_additive_causal_mask(N: int, offset: int = 0):
-    rinds = mx.arange(offset + N)
-    linds = mx.arange(offset, offset + N) if offset else rinds
-    mask = linds[:, None] < rinds[None]
-    return mask * -1e9
-
-
-def create_attention_mask(h: mx.array, cache: Optional[Any] = None):
-    T = h.shape[1]
-    if T > 1:
-        if cache is not None and cache[0] is not None:
-            c = cache[0]
-            if isinstance(c, RotatingKVCache):
-                offset = min(c.max_size - 1, c.offset)
-            else:
-                offset = c.offset
-        else:
-            offset = 0
-        mask = create_additive_causal_mask(T, offset)
-        mask = mask.astype(h.dtype)
-    else:
-        mask = None
-    return mask
-
-
 # Add this code to visualize the chunked attention mask
 def visualize_attention_mask(mask):
     """Visualize attention mask with symbols for better readability."""
@@ -132,3 +109,28 @@ def check_activation_stats(name, tensor):
     print(f"  Min: {min_val:.4f}, Max: {max_val:.4f}")
     print(f"  Mean: {mean_val:.4f}, Std: {std_val:.4f}")
     print("-" * (len(name) + 24))
+
+
+def pixel_shuffle(input_tensor, shuffle_ratio):
+    # input_tensor: [batch_size, num_patches, channels]
+    batch_size, num_patches, channels = input_tensor.shape
+    patch_size = int(math.sqrt(num_patches))
+
+    input_tensor = input_tensor.reshape(batch_size, patch_size, patch_size, -1)
+    batch_size, height, width, channels = input_tensor.shape
+
+    reshaped_tensor = input_tensor.reshape(
+        batch_size, height, int(width * shuffle_ratio), int(channels / shuffle_ratio)
+    )
+    reshaped_tensor = reshaped_tensor.transpose(0, 2, 1, 3)
+
+    reshaped_tensor = reshaped_tensor.reshape(
+        batch_size,
+        int(height * shuffle_ratio),
+        int(width * shuffle_ratio),
+        int(channels / (shuffle_ratio**2)),
+    )
+    reshaped_tensor = reshaped_tensor.transpose(0, 2, 1, 3)
+
+    output_tensor = reshaped_tensor.reshape(batch_size, -1, reshaped_tensor.shape[-1])
+    return output_tensor
