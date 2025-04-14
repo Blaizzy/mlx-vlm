@@ -354,6 +354,9 @@ class InternVLChatProcessor(ProcessorMixin):
         """
         return self.tokenizer.decode(*args, **kwargs)
 
+    def save_pretrained(self, save_directory, **kwargs):
+        pass
+
     @staticmethod
     def from_pretrained(pretrained_model_name_or_path, **kwargs):
         tokenizer = AutoTokenizer.from_pretrained(
