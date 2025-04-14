@@ -56,7 +56,6 @@ class ModelConfig:
     text_config: TextConfig
     vision_config: VisionConfig
     model_type: str
-    template: str
     ignore_index: int = -100
     image_token_index: int = 151667
     video_token_index: int = 151656
