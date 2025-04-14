@@ -1075,7 +1075,11 @@ def stream_generate(
         Generator[Tuple[mx.array, mx.array]]: A generator producing text.
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    add_special_tokens = not hasattr(processor, "chat_template")
+    add_special_tokens = (
+        not hasattr(processor, "chat_template")
+        if model.config.model_type == "gemma3"
+        else True
+    )
     prompt_tokens = mx.array(
         tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
     )
