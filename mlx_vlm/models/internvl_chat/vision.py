@@ -6,6 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import interpolate
+
 
 @dataclass
 class VisionConfig:
@@ -210,47 +212,6 @@ class VisionEmbeddings(nn.Module):
             (1, self.num_positions, self.embed_dim)
         )
 
-    def interpolate(self, pos_embed, size, mode="cubic", align_corners=False):
-        """
-        MLX implementation of PyTorch's F.interpolate with bicubic mode
-
-        Args:
-            pos_embed: MLX array with shape [B, C, H_src, W_src] or [C, H_src, W_src]
-            size: Tuple (H_dst, W_dst) - target size
-            align_corners: Boolean - whether to align corners
-
-        Returns:
-            Interpolated array with shape [B, C, H_dst, W_dst] or [C, H_dst, W_dst]
-        """
-        # Handle different input shapes
-        input_dim = pos_embed.ndim
-        original_shape = pos_embed.shape
-
-        if input_dim == 3:
-            # [C, H, W] -> [1, C, H, W]
-            pos_embed = pos_embed.reshape(1, *original_shape)
-
-        # Get source dimensions
-        h_src, w_src = pos_embed.shape[-2:]
-        h_dst, w_dst = size
-
-        # Calculate scale factors
-        scale_h = h_dst / h_src
-        scale_w = w_dst / w_src
-
-        # Create upsampler
-        upsampler = nn.Upsample(
-            scale_factor=(scale_h, scale_w), mode=mode, align_corners=align_corners
-        )
-
-        # Apply upsampling
-        result = upsampler(pos_embed)
-
-        # Return in the original dimension format
-        if input_dim == 3:
-            return result.reshape(original_shape[0], *size)
-        return result
-
     def _get_pos_embed(self, pos_embed, H, W):
         target_dtype = pos_embed.dtype
         pos_embed = pos_embed.reshape(
@@ -259,7 +220,7 @@ class VisionEmbeddings(nn.Module):
             self.image_size // self.patch_size,
             -1,
         ).transpose(0, 3, 1, 2)
-        pos_embed = self.interpolate(pos_embed, (H, W))
+        pos_embed = interpolate(pos_embed, (H, W))
         pos_embed = (
             pos_embed.reshape(1, -1, H * W).transpose(0, 2, 1).astype(target_dtype)
         )
