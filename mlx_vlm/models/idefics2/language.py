@@ -1,12 +1,12 @@
 import inspect
-import re
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache
 
 
 @dataclass

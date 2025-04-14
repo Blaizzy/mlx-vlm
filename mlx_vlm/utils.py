@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import glob
 import importlib
@@ -16,7 +17,7 @@ import mlx.nn as nn
 import numpy as np
 import requests
 from huggingface_hub import snapshot_download
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.utils import tree_flatten, tree_reduce, tree_unflatten
 from PIL import Image, ImageOps
 from transformers import (
     AutoConfig,
@@ -25,7 +26,8 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-from .models.base import BaseImageProcessor, KVCache, SimpleKVCache
+from .models.base import BaseImageProcessor
+from .models.cache import KVCache, SimpleKVCache
 from .sample_utils import top_p_sampling
 from .tokenizer_utils import load_tokenizer
 from .trainers import apply_lora_layers
@@ -937,7 +939,7 @@ def generate_step(
                 (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
             ]
         else:
-            cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
+            cache = [KVCache() for n in kv_heads]
 
     repetition_context = input_ids.reshape(-1).tolist()
 
@@ -945,35 +947,36 @@ def generate_step(
         repetition_context = repetition_context[-repetition_context_size:]
 
     def _step(y, **kwargs):
-        nonlocal repetition_context
-        if "decoder_input_ids" in kwargs:
-            outputs = model.language_model(
-                cache=cache,
-                **kwargs,
-            )
-        else:
+        with mx.stream(generation_stream):
+            nonlocal repetition_context
+            if "decoder_input_ids" in kwargs:
+                outputs = model.language_model(
+                    cache=cache,
+                    **kwargs,
+                )
+            else:
 
-            outputs = model.language_model(
-                y[None],
-                cache=cache,
-                **kwargs,
-            )
+                outputs = model.language_model(
+                    y[None],
+                    cache=cache,
+                    **kwargs,
+                )
 
-        logits = outputs.logits[:, -1, :]
+            logits = outputs.logits[:, -1, :]
 
-        if repetition_penalty:
-            logits = apply_repetition_penalty(
-                logits, repetition_context, repetition_penalty
-            )
-            y, logprobs = sample(logits)
-            repetition_context.append(y.item())
-        else:
-            y, logprobs = sample(logits)
+            if repetition_penalty:
+                logits = apply_repetition_penalty(
+                    logits, repetition_context, repetition_penalty
+                )
+                y, logprobs = sample(logits)
+                repetition_context.append(y.item())
+            else:
+                y, logprobs = sample(logits)
 
-        if repetition_context_size:
-            if len(repetition_context) > repetition_context_size:
-                repetition_context = repetition_context[-repetition_context_size:]
-        return y, logprobs.squeeze(0)
+            if repetition_context_size:
+                if len(repetition_context) > repetition_context_size:
+                    repetition_context = repetition_context[-repetition_context_size:]
+            return y, logprobs.squeeze(0)
 
     outputs = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
 
@@ -1062,23 +1065,36 @@ def stream_generate(
         pixel_values = kwargs.pop("pixel_values")
         mask = kwargs.pop("mask")
 
-    detokenizer = processor.detokenizer
-    detokenizer.reset()
-    tic = time.perf_counter()
-    for n, (token, logprobs) in enumerate(
-        generate_step(input_ids, model, pixel_values, mask, **kwargs)
-    ):
-        if n == 0:
-            prompt_time = time.perf_counter() - tic
-            prompt_tps = input_ids.size / prompt_time
-            tic = time.perf_counter()
+    with wired_limit(model, [generation_stream]):
+        detokenizer = processor.detokenizer
+        detokenizer.reset()
+        tic = time.perf_counter()
+        for n, (token, logprobs) in enumerate(
+            generate_step(input_ids, model, pixel_values, mask, **kwargs)
+        ):
+            if n == 0:
+                prompt_time = time.perf_counter() - tic
+                prompt_tps = input_ids.size / prompt_time
+                tic = time.perf_counter()
 
-        if token == tokenizer.eos_token_id:
-            break
+            if token == tokenizer.eos_token_id:
+                break
 
-        detokenizer.add_token(token)
+            detokenizer.add_token(token)
 
-        # Yield the last segment if streaming
+            # Yield the last segment if streaming
+            yield GenerationResult(
+                text=detokenizer.last_segment,
+                token=token,
+                logprobs=logprobs,
+                prompt_tokens=input_ids.size,
+                generation_tokens=n + 1,
+                prompt_tps=prompt_tps,
+                generation_tps=(n + 1) / (time.perf_counter() - tic),
+                peak_memory=mx.get_peak_memory() / 1e9,
+            )
+
+        detokenizer.finalize()
         yield GenerationResult(
             text=detokenizer.last_segment,
             token=token,
