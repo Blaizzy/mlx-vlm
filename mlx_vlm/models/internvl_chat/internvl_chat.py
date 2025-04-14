@@ -17,35 +17,26 @@ from .vision import VisionConfig, VisionModel
 
 @dataclass
 class TextConfig:
-    model_type: str = "qwen2"
-    vocab_size: int = 151674
-    max_position_embeddings: int = 32768
-    hidden_size: int = 896
-    intermediate_size: int = 4864
-    num_hidden_layers: int = 24
-    num_attention_heads: int = 14
-    use_sliding_window: bool = False
-    sliding_window: Optional[int] = None
-    max_window_layers: int = 70
-    num_key_value_heads: int = 2
-    hidden_act: str = "silu"
-    initializer_range: float = 0.02
-    rms_norm_eps: float = 1e-06
-    use_cache: bool = False
-    rope_theta: float = 1000000.0
-    rope_scaling: dict = None
+    model_type: str
+    vocab_size: int
+    max_position_embeddings: int
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    use_sliding_window: bool
+    max_window_layers: int
+    num_key_value_heads: int
+    hidden_act: str
+    rms_norm_eps: float
+    rope_theta: float
+    rope_scaling: dict
     rope_traditional: bool = False
     attention_dropout: float = 0.0
     tie_word_embeddings: bool = False
+    sliding_window: Optional[int] = None
 
     def __post_init__(self):
-        if self.rope_scaling is None:
-            self.rope_scaling = {
-                "factor": 2.0,
-                "rope_type": "dynamic",
-                "type": "dynamic",
-            }
-
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
@@ -65,8 +56,9 @@ class ModelConfig:
     text_config: TextConfig
     vision_config: VisionConfig
     model_type: str
+    template: str
     ignore_index: int = -100
-    image_token_index: int = 151655
+    image_token_index: int = 151667
     video_token_index: int = 151656
     vision_feature_select_strategy: str = "default"
     vision_feature_layer: int = -1
@@ -75,12 +67,6 @@ class ModelConfig:
 
     @classmethod
     def from_dict(cls, params):
-        # Copy text config parameters from root level
-        excluded_keys = {"vision_config"}
-        params["text_config"] = dict(
-            filter(lambda x: x[0] not in excluded_keys, params.items())
-        )
-
         return cls(
             **{
                 k: v
@@ -115,7 +101,6 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        grid_thw: Optional[mx.array] = None,
     ):
 
         if pixel_values is None:
@@ -124,11 +109,17 @@ class Model(nn.Module):
         dtype = self.vision_model.embeddings.patch_embedding.weight.dtype
         pixel_values = pixel_values.astype(dtype)
 
+        # TODO: Remove this after transformers implementation is merged
+        if pixel_values.ndim == 5:
+            pixel_values = pixel_values[0]
+
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
-        hidden_states, _, _ = self.vision_model(pixel_values, output_hidden_states=True)
+        hidden_states, _, _ = self.vision_model(
+            pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
+        )
 
         # Extract vision embeddings, removing the class token (first token)
         hidden_states = hidden_states[:, 1:, :]
@@ -151,6 +142,7 @@ class Model(nn.Module):
     def _merge_input_ids_with_image_features(
         self, image_features, inputs_embeds, input_ids
     ):
+        B, N, C = inputs_embeds.shape
         image_token_index = self.config.image_token_index
         video_token_index = self.config.video_token_index
 
@@ -161,9 +153,11 @@ class Model(nn.Module):
 
         image_indices = np.where(image_positions)[1].tolist()
 
+        image_features = image_features.reshape(-1, image_features.shape[-1])
+
         inputs_embeds[:, image_indices, :] = image_features
 
-        return inputs_embeds
+        return inputs_embeds.reshape(B, N, C)
 
     def __call__(
         self,
@@ -173,13 +167,7 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-
-        image_grid_thw = kwargs.pop("image_grid_thw", None)
-        video_grid_thw = kwargs.pop("video_grid_thw", None)
-        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
-
-        input_embddings = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
-
+        input_embddings = self.get_input_embeddings(input_ids, pixel_values)
         logits = self.language_model(None, cache=cache, inputs_embeds=input_embddings)
         return logits
 

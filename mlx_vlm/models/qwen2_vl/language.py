@@ -12,13 +12,13 @@ from ..cache import KVCache
 
 @dataclass
 class TextConfig:
-    model_type: str = "qwen2"
-    hidden_size: int = 5120
-    num_hidden_layers: int = 24
-    intermediate_size: int = 27648
-    num_attention_heads: int = 40
-    rms_norm_eps: float = 1e-05
-    vocab_size: int = 152064
+    model_type: str
+    hidden_size: int
+    num_hidden_layers: int
+    intermediate_size: int
+    num_attention_heads: int
+    rms_norm_eps: float
+    vocab_size: int
     num_key_value_heads: Optional[int] = 8
     max_position_embeddings: Optional[int] = 40960
     rope_theta: float = 1000000.0
@@ -96,7 +96,7 @@ class Attention(nn.Module):
 
         offset = cache.offset if cache else 0
 
-        if mask is not None:
+        if mask is not None and isinstance(mask, mx.array):
             mask = mask[..., : keys.shape[-2]]
 
         queries = self.rotary_emb(queries, offset=offset)
