@@ -6,6 +6,8 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import pixel_shuffle
+
 
 @dataclass
 class VisionConfig:
@@ -67,31 +69,6 @@ class Llama4MultiModalProjector(nn.Module):
     def __call__(self, image_features):
         hidden_states = self.linear_1(image_features)
         return hidden_states
-
-
-def pixel_shuffle(input_tensor, shuffle_ratio):
-    # input_tensor: [batch_size, num_patches, channels]
-    batch_size, num_patches, channels = input_tensor.shape
-    patch_size = int(math.sqrt(num_patches))
-
-    input_tensor = input_tensor.reshape(batch_size, patch_size, patch_size, -1)
-    batch_size, height, width, channels = input_tensor.shape
-
-    reshaped_tensor = input_tensor.reshape(
-        batch_size, height, int(width * shuffle_ratio), int(channels / shuffle_ratio)
-    )
-    reshaped_tensor = reshaped_tensor.transpose(0, 2, 1, 3)
-
-    reshaped_tensor = reshaped_tensor.reshape(
-        batch_size,
-        int(height * shuffle_ratio),
-        int(width * shuffle_ratio),
-        int(channels / (shuffle_ratio**2)),
-    )
-    reshaped_tensor = reshaped_tensor.transpose(0, 2, 1, 3)
-
-    output_tensor = reshaped_tensor.reshape(batch_size, -1, reshaped_tensor.shape[-1])
-    return output_tensor
 
 
 class Llama4VisionPixelShuffleMLP(nn.Module):
