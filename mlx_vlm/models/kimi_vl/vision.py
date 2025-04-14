@@ -118,7 +118,7 @@ class Learnable2DInterpPosEmb(nn.Module):
             else:
                 pos_embs.append(
                     interpolate(
-                        pos_embed=self.weight.transpose(2, 0, 1).unsqueeze(0),
+                        pos_embed=mx.expand_dims(self.weight.transpose(2, 0, 1), 0),
                         size=shape,
                         mode=self.interpolation_mode,
                     )

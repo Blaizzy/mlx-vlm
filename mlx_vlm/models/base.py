@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.cache import RotatingKVCache
 from PIL import Image

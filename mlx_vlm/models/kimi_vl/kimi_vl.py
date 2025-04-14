@@ -154,8 +154,8 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        image_grid_thw = kwargs.pop("image_grid_thw", None)
-        video_grid_thw = kwargs.pop("video_grid_thw", None)
+        image_grid_thw = kwargs.pop("image_grid_hws", None)
+        video_grid_thw = kwargs.pop("video_grid_hws", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
         input_embeddings = self.get_input_embeddings(
             input_ids, pixel_values, grid_thw=grid_thw
