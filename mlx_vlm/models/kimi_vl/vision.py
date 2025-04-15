@@ -1,6 +1,6 @@
 import inspect
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -100,9 +100,171 @@ class VisionRotaryEmbedding(nn.Module):
         return freqs
 
 
+def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
+    """
+    Bicubic interpolation using a Metal kernel.
+
+    Args:
+        x: MLX tensor of shape [B, C, H, W]
+        size: Tuple of (out_h, out_w) or None
+        scale_factor: Float or tuple of (scale_h, scale_w) or None
+        align_corners: Whether to align corners
+
+    Returns:
+        Interpolated MLX tensor
+    """
+    # Get input dimensions
+    batch_size, channels, in_h, in_w = x.shape
+
+    # Calculate output dimensions and scales
+    if size is not None:
+        out_h, out_w = size
+        scale_h, scale_w = out_h / in_h, out_w / in_w
+    elif scale_factor is not None:
+        if isinstance(scale_factor, (int, float)):
+            scale_h = scale_w = scale_factor
+        else:
+            scale_h, scale_w = scale_factor
+        out_h, out_w = int(in_h * scale_h), int(in_w * scale_w)
+    else:
+        raise ValueError("Either size or scale_factor must be specified")
+
+    # Create scale and align_corners parameters tensor
+    params = mx.array(
+        [scale_h, scale_w, 1.0 if align_corners else 0.0], dtype=mx.float32
+    )
+
+    # Create dimensions tensor
+    dims = mx.array([batch_size, channels, in_h, in_w, out_h, out_w], dtype=mx.int32)
+
+    # Reshape input tensor to 1D for kernel processing
+    x_flat = x.reshape(-1)
+
+    # Convert to float32 for processing if needed
+    input_dtype = x.dtype
+    if input_dtype != mx.float32:
+        x_flat = x_flat.astype(mx.float32)
+
+    # Metal kernel source code
+    source = """
+        // Get thread position
+        uint x_out = thread_position_in_grid.x;
+        uint y_out = thread_position_in_grid.y;
+        uint bc_idx = thread_position_in_grid.z;
+
+        // Extract dimensions from dims
+        int batch_size = dims[0];
+        int channels = dims[1];
+        int in_h = dims[2];
+        int in_w = dims[3];
+        int out_h = dims[4];
+        int out_w = dims[5];
+
+        // Extract scales and flags
+        float scale_h = params[0];
+        float scale_w = params[1];
+        bool align_corners = params[2] > 0.5;
+
+        // Check bounds
+        if (x_out >= (uint)out_w || y_out >= (uint)out_h || bc_idx >= (uint)(batch_size * channels))
+            return;
+
+        // Calculate batch and channel indices
+        int c = bc_idx % channels;
+        int b = bc_idx / channels;
+
+        // Calculate input coordinates based on output position
+        float x_in, y_in;
+
+        if (align_corners && out_w > 1 && out_h > 1) {
+            x_in = float(x_out) * (in_w - 1) / (out_w - 1);
+            y_in = float(y_out) * (in_h - 1) / (out_h - 1);
+        } else {
+            x_in = (float(x_out) + 0.5f) / scale_w - 0.5f;
+            y_in = (float(y_out) + 0.5f) / scale_h - 0.5f;
+        }
+
+        // Get integer and fractional parts
+        int x0 = int(floor(x_in));
+        int y0 = int(floor(y_in));
+        float x_frac = x_in - x0;
+        float y_frac = y_in - y0;
+
+        // Cubic kernel function
+        auto cubic_kernel = [](float x) -> float {
+            float absx = fabs(x);
+            float absx2 = absx * absx;
+            float absx3 = absx2 * absx;
+
+            // PyTorch uses a=-0.75
+            const float a = -0.75f;
+
+            if (absx <= 1.0f) {
+                return (a+2.0f)*absx3 - (a+3.0f)*absx2 + 1.0f;
+            } else if (absx < 2.0f) {
+                return a*absx3 - 5.0f*a*absx2 + 8.0f*a*absx - 4.0f*a;
+            }
+            return 0.0f;
+        };
+
+        // Perform bicubic interpolation
+        float result = 0.0f;
+
+        for (int i = -1; i <= 2; i++) {
+            int y_pos = y0 + i;
+            // Clamp y coordinate to valid range
+            y_pos = max(0, min(y_pos, in_h - 1));
+            float wy = cubic_kernel(y_frac - i);
+
+            for (int j = -1; j <= 2; j++) {
+                int x_pos = x0 + j;
+                // Clamp x coordinate to valid range
+                x_pos = max(0, min(x_pos, in_w - 1));
+                float wx = cubic_kernel(x_frac - j);
+
+                // Calculate input tensor offset
+                int input_offset = ((b * channels + c) * in_h + y_pos) * in_w + x_pos;
+
+                // Add weighted contribution
+                result += input[input_offset] * wy * wx;
+            }
+        }
+
+        // Calculate output tensor offset
+        int output_offset = ((b * channels + c) * out_h + y_out) * out_w + x_out;
+
+        // Assign the result to output with correct type
+        output[output_offset] = (float)result;
+    """
+
+    # Create the kernel
+    kernel = mx.fast.metal_kernel(
+        name="bicubic_interpolation",
+        input_names=["input", "dims", "params"],
+        output_names=["output"],
+        source=source,
+    )
+
+    # Run the kernel
+    outputs = kernel(
+        inputs=[x_flat, dims, params],
+        grid=(out_w, out_h, batch_size * channels),
+        threadgroup=(128, 128, 1),
+        output_shapes=[(batch_size * channels * out_h * out_w,)],
+        output_dtypes=[mx.float32],  # Always use float32 for kernel output
+    )
+
+    # Reshape output back to 4D tensor and convert back to original dtype
+    result = outputs[0].reshape(batch_size, channels, out_h, out_w)
+    if input_dtype != mx.float32:
+        result = result.astype(input_dtype)
+
+    return result
+
+
 class Learnable2DInterpPosEmb(nn.Module):
     def __init__(
-        self, height: int, width: int, dim: int, interpolation_mode: str = "cubic"
+        self, height: int, width: int, dim: int, interpolation_mode: str = "bicubic"
     ) -> None:
         super().__init__()
         self.height = height
@@ -114,19 +276,21 @@ class Learnable2DInterpPosEmb(nn.Module):
         pos_embs = []
         for shape in grid_hws.tolist():
             if shape == self.weight.shape[:-1]:
-                pos_embs.append(self.weight.flatten(end_dim=1))
+                pos_embs.append(self.weight.flatten(end_axis=1))
             else:
-                pos_embs.append(
-                    interpolate(
-                        pos_embed=mx.expand_dims(self.weight.transpose(2, 0, 1), 0),
+                result = (
+                    bicubic_interpolate(
+                        mx.expand_dims(self.weight.transpose(2, 0, 1), axis=0),
                         size=shape,
-                        mode=self.interpolation_mode,
                     )
                     .squeeze(0)
                     .transpose(1, 2, 0)
                     .flatten(end_axis=1)
                 )
-        out = x + mx.concatenate(pos_embs, axis=1)
+
+                pos_embs.append(result)
+
+        out = x + mx.concatenate(pos_embs).astype(x.dtype)
         return out
 
 
@@ -161,22 +325,62 @@ class PatchEmbed(nn.Module):
         return hidden_states
 
 
-class PatchMerger(nn.Module):
-    def __init__(self, dim: int, context_dim: int, spatial_merge_size: int = 2) -> None:
-        super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size**2)
-        self.ln_q = nn.LayerNorm(context_dim, eps=1e-6)
-        self.mlp = [
-            nn.Linear(self.hidden_size, self.hidden_size),
-            nn.GELU(),
-            nn.Linear(self.hidden_size, dim),
-        ]
+def reshape_for_broadcast(freqs_ci: mx.array, query: mx.array):
+    ndim = query.ndim
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(query.shape)]
+    return freqs_ci.reshape(*shape)
 
-    def __call__(self, x: mx.array) -> mx.array:
-        x = self.ln_q(x).reshape(-1, self.hidden_size)
-        for layer in self.mlp:
-            x = layer(x)
-        return x
+
+def view_as_complex(x):
+    """
+    Convert a tensor with shape (..., 2) to a complex tensor with shape (...).
+
+    Args:
+        x: A real tensor with last dimension of size 2.
+
+    Returns:
+        A complex tensor with size one less than the input.
+    """
+    # Ensure the last dimension is size 2
+    assert x.shape[-1] == 2, f"Last dimension must be 2, got {x.shape[-1]}"
+
+    # Get real and imaginary parts
+    real, imag = x[..., 0], x[..., 1]
+
+    # Create complex tensor
+    return real + 1j * imag
+
+
+def view_as_real(x):
+    """
+    Convert a complex tensor with shape (...) to a real tensor with shape (..., 2).
+
+    Args:
+        x: A complex tensor.
+
+    Returns:
+        A real tensor with an extra dimension of size 2.
+    """
+    # Get real and imaginary parts
+    real = mx.real(x)
+    imag = mx.imag(x)
+
+    # Combine into a tensor with last dimension 2
+    return mx.stack([real, imag], axis=-1)
+
+
+def vision_apply_rotary_emb(
+    query: mx.array,
+    key: mx.array,
+    freqs_ci: mx.array,
+) -> Tuple[mx.array, mx.array]:
+
+    query_ = view_as_complex(query.astype(mx.float32).reshape(*query.shape[:-1], -1, 2))
+    key_ = view_as_complex(key.astype(mx.float32).reshape(*key.shape[:-1], -1, 2))
+    freqs_ci = reshape_for_broadcast(freqs_ci=freqs_ci, query=query_)
+    query_out = view_as_real(query_ * freqs_ci).flatten(3)
+    key_out = view_as_real(key_ * freqs_ci).flatten(3)
+    return query_out.astype(query.dtype), key_out.astype(key.dtype)
 
 
 class Attention(nn.Module):
@@ -199,14 +403,14 @@ class Attention(nn.Module):
         )
         q, k, v = mx.split(qkv, 3)
 
-        q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
-        k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
-        attention_mask = mx.ones((1, seq_length, seq_length), dtype=x.dtype)
+        q, k = vision_apply_rotary_emb(q, k, rotary_pos_emb)
+
+        attention_mask = mx.zeros((1, seq_length, seq_length), dtype=x.dtype)
 
         for i in range(1, len(cu_seqlens)):
             start = int(cu_seqlens[i - 1])
             end = int(cu_seqlens[i])
-            attention_mask[start:end, start:end] = 0
+            attention_mask[start:end, start:end] = 1
 
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
@@ -252,6 +456,137 @@ class Qwen2VLVisionBlock(nn.Module):
         return hidden_states
 
 
+class Rope2DPosEmb(nn.Module):
+    """2D rotary position embedding with multi-resolution support.
+
+    This class is intended to be used in the following way:
+    1. Before training, create an instance of Rope2DPosEmb. This instance will hold the precomputed cis.
+    2. Before each forward pass, call `get_freqs_cis_by_*` to get the `freqs_cis` tensor for this iteration.
+    3. During the forward pass, pass the `freqs_cis` tensor to each attention layer, and call `apply` just before each attention operation.
+        The rope is shared across all attention layers and all heads.
+
+    Refs:
+    - RoFormer: https://arxiv.org/abs/2104.09864
+    - VisionLLaMA: https://arxiv.org/abs/2403.00522
+    - https://github.com/Meituan-AutoML/VisionLLaMA/blob/main/dit/models.py
+
+    Args:
+        dim (int): usually the multi-head attention dimension, should be divisible by 4 (TODO: relax this constraint if needed)
+        max_height (int): the maximum height of the 2D grid
+        max_width (int): the maximum width of the 2D grid
+        theta_base (float): the base of the theta
+    """
+
+    def __init__(self, dim: int, max_height: int, max_width: int, theta_base=10000):
+        super().__init__()
+        self.dim = dim
+        assert self.dim % 4 == 0, "dim must be divisible by 4"
+        self.max_height = max_height
+        self.max_width = max_width
+        self.theta_base = theta_base
+
+        self.freqs_cis = None
+
+    def extra_repr(self):
+        return f"dim={self.dim}, max_height={self.max_height}, max_width={self.max_width}, theta_base={self.theta_base}"
+
+    def _precompute_freqs_cis(self, device) -> mx.array:
+        """Calculate the cis(freqs) for each position in the 2D grid.
+
+        Return: complex array of shape (max_height, max_width, dim//2) and value:
+            height axis: ret[h, w, 2*i] = cis(h * theta_base**(-4*i/dim))
+            weight axis: ret[h, w, 2*i+1] = cis(w * theta_base**(-4*i/dim))   with (i in [0, dim//4))
+            note: `cis` is a mathematical notation defined by cis x = cos x + i sin x,
+        """
+        N = self.max_height * self.max_width
+        flat_pos = mx.arange(0, N, dtype=mx.float32)
+        x_pos = flat_pos % self.max_width
+        y_pos = flat_pos // self.max_width
+        dim_range = mx.arange(0, self.dim, 4)[: (self.dim // 4)].astype(
+            mx.float32
+        )  # C/4
+        freqs = 1.0 / (self.theta_base ** (dim_range / self.dim))
+        x_freqs = mx.outer(x_pos, freqs)  # N, C/4
+        y_freqs = mx.outer(y_pos, freqs)  # N, C/4
+
+        # Create complex numbers using cos and sin
+        x_cos = mx.cos(x_freqs)
+        x_sin = mx.sin(x_freqs)
+        y_cos = mx.cos(y_freqs)
+        y_sin = mx.sin(y_freqs)
+
+        # Create complex numbers
+        x_cis = x_cos + 1j * x_sin  # N, C/4
+        y_cis = y_cos + 1j * y_sin  # N, C/4
+
+        # N, C/4, 2
+        freqs_cis = mx.stack([x_cis, y_cis], axis=-1)
+
+        # max_height, max_width, C/2
+        freqs_cis = freqs_cis.reshape(self.max_height, self.max_width, -1)
+        return freqs_cis
+
+    def get_freqs_cis(self, grid_hws: mx.array) -> mx.array:
+        """
+        Args:
+            grid_hws (mx.array): grid height and width
+
+        Returns:
+            freqs_cis: array of shape (sum(t * height * width), dim//2)
+        """
+        if self.freqs_cis is None:
+            self.freqs_cis = self._precompute_freqs_cis(None)
+
+        shapes = grid_hws.tolist()
+        assert all(
+            1 <= h <= self.max_height and 1 <= w <= self.max_width for h, w in shapes
+        ), (
+            shapes,
+            self.max_height,
+            self.max_width,
+        )
+
+        freqs_cis_list = []
+        for h, w in shapes:
+            # Get the slice of precomputed frequencies for this shape
+            shape_freqs = self.freqs_cis[:h, :w]
+            # Reshape to flatten the spatial dimensions
+            shape_freqs = shape_freqs.reshape(-1, self.dim // 2)
+            freqs_cis_list.append(shape_freqs)
+
+        freqs_cis = mx.concatenate(freqs_cis_list, axis=0)
+        return freqs_cis
+
+
+def patch_merger(
+    x: mx.array,
+    grid_hws: mx.array,
+    merge_kernel_size: list[int, int] = (2, 2),
+) -> List[mx.array]:
+    d_model = x.shape[-1]
+
+    outputs = []
+    pre_sum = 0
+    for x_shape in grid_hws.tolist():
+        height, width = x_shape[0], x_shape[1]
+        # Get the current sequence
+        seq = x[pre_sum : pre_sum + height * width]
+        # Reshape along self.merge_kernel_size and concat to the last dimension
+        kernel_height, kernel_width = merge_kernel_size
+        new_height, new_width = height // kernel_height, width // kernel_width
+        reshaped_seq = seq.reshape(
+            new_height, kernel_height, new_width, kernel_width, d_model
+        )
+        reshaped_seq = mx.transpose(reshaped_seq, (0, 2, 1, 3, 4))
+        padded_seq = reshaped_seq.reshape(
+            new_height * new_width, kernel_height * kernel_width, -1
+        )
+        outputs.append(padded_seq)
+        pre_sum += height * width
+
+    return outputs
+
+
 class VisionModel(nn.Module):
 
     def __init__(self, config: VisionConfig) -> None:
@@ -261,6 +596,7 @@ class VisionModel(nn.Module):
         if self.model_type not in ["qwen2_vl", "moonvit"]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
         self.spatial_merge_size = config.spatial_merge_size
+        self.merge_kernel_size = config.merge_kernel_size
 
         self.patch_embed = PatchEmbed(
             patch_size=config.patch_size,
@@ -274,44 +610,7 @@ class VisionModel(nn.Module):
 
         self.blocks = [Qwen2VLVisionBlock(config) for _ in range(config.depth)]
         self.final_layernorm = nn.LayerNorm(config.hidden_size, eps=1e-6)
-
-    def rot_pos_emb(self, grid_thw):
-        pos_ids = []
-
-        for t, h, w in grid_thw:
-            h, w = int(h), int(w)  # Ensure h and w are integers
-            hpos_ids = mx.expand_dims(mx.arange(h), 1)
-            hpos_ids = mx.repeat(hpos_ids, w, axis=1)
-            hpos_ids = hpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            hpos_ids = mx.transpose(hpos_ids, (0, 2, 1, 3))
-            hpos_ids = hpos_ids.flatten()
-
-            wpos_ids = mx.expand_dims(mx.arange(w), 0)
-            wpos_ids = mx.repeat(wpos_ids, h, axis=0)
-            wpos_ids = wpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            wpos_ids = mx.transpose(wpos_ids, (0, 2, 1, 3))
-            wpos_ids = wpos_ids.flatten()
-
-            stacked_pos_ids = mx.stack([hpos_ids, wpos_ids], axis=-1)
-            pos_ids.append(mx.repeat(stacked_pos_ids, t, axis=0))
-
-        pos_ids = mx.concatenate(pos_ids, axis=0)
-        max_grid_size = mx.max(grid_thw[:, 1:])
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
-
-        rotary_pos_emb_full = rotary_pos_emb_full[pos_ids]
-
-        return rotary_pos_emb_full.reshape(pos_ids.shape[0], -1)
+        self.rope_pos_emb = Rope2DPosEmb(head_dim, 512, 512)
 
     def __call__(
         self,
@@ -321,21 +620,19 @@ class VisionModel(nn.Module):
     ) -> mx.array:
 
         hidden_states = self.patch_embed(hidden_states, grid_thw)
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        rotary_pos_emb = self.rope_pos_emb.get_freqs_cis(grid_thw)
 
         # Assuming grid_thw has shape (batch_size, 3)
         batch_size = grid_thw.shape[0]
 
         # Calculate cu_seqlens for each item in the batch
-        cu_seqlens = []
-        for i in range(batch_size):
-            seq_len = grid_thw[i, 1] * grid_thw[i, 2]
-            cu_seqlens.append(mx.repeat(seq_len, grid_thw[i, 0]))
-
-        # Concatenate the cu_seqlens for all items in the batch
-        cu_seqlens = mx.concatenate(cu_seqlens)
-
-        cu_seqlens = mx.cumsum(cu_seqlens.astype(mx.int32), axis=0)
+        lengths = mx.concatenate(
+            (
+                mx.zeros((1,), dtype=grid_thw.dtype),
+                grid_thw[:, 0] * grid_thw[:, 1],
+            )
+        )
+        cu_seqlens = mx.cumsum(lengths.astype(mx.int32), axis=0)
         cu_seqlens = mx.pad(cu_seqlens, (1, 0), mode="constant", constant_values=0)
 
         encoder_states = (hidden_states,) if output_hidden_states else None
@@ -347,7 +644,13 @@ class VisionModel(nn.Module):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
 
-        return self.final_layernorm(hidden_states)
+        hidden_states = self.final_layernorm(hidden_states)
+
+        hidden_states = patch_merger(
+            hidden_states, grid_thw, merge_kernel_size=self.merge_kernel_size
+        )
+
+        return hidden_states
 
     def sanitize(self, weights):
         sanitized_weights = {}
