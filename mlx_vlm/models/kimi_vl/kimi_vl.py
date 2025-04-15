@@ -24,12 +24,12 @@ class ModelConfig:
     ignore_index: int = -100
     vocab_size: int = 128259
     scale_factor: int = 2
-    image_token_id: int = 49153
+    media_placeholder_token_id: int = 163606
     image_token_index: Optional[int] = None
 
     def __post_init__(self):
         if self.image_token_index is None:
-            self.image_token_index = self.image_token_id
+            self.image_token_index = self.media_placeholder_token_id
 
     @classmethod
     def from_dict(cls, params):
@@ -40,31 +40,6 @@ class ModelConfig:
                 if k in inspect.signature(cls).parameters
             }
         )
-
-
-class MoonVitVLProjector(nn.Module):
-
-    def __init__(
-        self,
-        in_channels: int,
-        merge_kernel_size: list[int, int],
-        ln_eps: float = 1e-5,
-        out_dim: int = 4096,
-    ):
-        super().__init__()
-        self.hidden_size = in_channels * merge_kernel_size[0] * merge_kernel_size[1]
-
-        self.pre_norm = nn.LayerNorm(in_channels, eps=ln_eps)
-        self.linear_1 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
-        self.act = nn.GELU()
-        self.linear_2 = nn.Linear(self.hidden_size, out_dim, bias=True)
-
-    def forward(self, x: mx.array) -> mx.array:
-        h = self.pre_norm(x).reshape(-1, self.hidden_size)
-        h = self.linear_1(h)
-        h = self.act(h)
-        h = self.linear_2(h)
-        return h
 
 
 class KimiVLMultiModalProjector(nn.Module):
@@ -115,14 +90,13 @@ class Model(nn.Module):
 
         inputs_embeds = self.language_model.embed_tokens(input_ids)
 
-        pooler_output, embeddings, hidden_state = self.vision_tower(
+        hidden_state = self.vision_tower(
             pixel_values.transpose(0, 2, 3, 1),
             output_hidden_states=True,
             grid_thw=grid_thw,
         )
 
-        image_features = pooler_output.astype(pixel_values.dtype)
-        image_features = self.multi_modal_projector(image_features)
+        image_features = self.multi_modal_projector(hidden_state)
 
         final_inputs_embeds = self._prepare_inputs_for_multimodal(
             image_features, inputs_embeds, input_ids
@@ -135,7 +109,7 @@ class Model(nn.Module):
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = np.where(input_ids == image_token_index)[1].tolist()
 
-        num_images, _, vision_hidden_size = image_features.shape
+        num_images, vision_hidden_size = image_features.shape
 
         reshaped_image_hidden_states = image_features.reshape(-1, vision_hidden_size)
 
