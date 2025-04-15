@@ -180,7 +180,7 @@ class Model(nn.Module):
             inputs=input_ids,
             cache=cache,
             inputs_embeds=input_embeddings,
-            # mask=final_attention_mask_4d, # TODO: Fix mask
+            mask=final_attention_mask_4d, # TODO: Fix mask
         )
         return logits
 

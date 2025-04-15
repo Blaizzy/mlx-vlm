@@ -1,11 +1,9 @@
 import math
-from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Callable, Optional, OrderedDict, Tuple, Union
+from typing import Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 
 @dataclass
@@ -15,6 +13,7 @@ class AudioConfig:
     conf_attention_chunk_size: int = 12
     conf_attention_context_left: int = 13
     conf_attention_context_right: int = 0
+    conf_attention_invalid_logits_value: float = -1e9
     conf_attention_logit_cap: float = 50.0
     conf_num_attention_heads: int = 8
     conf_num_hidden_layers: int = 12
@@ -23,216 +22,167 @@ class AudioConfig:
     conf_reduction_factor: int = 4
     conf_residual_weight: float = 0.5
     sscp_conv_channel_size: tuple[int, int] = (128, 32)
+    sscp_conv_group_norm_eps: float = 1e-3
     sscp_conv_kernel_size: tuple[tuple[int, int], tuple[int, int]] = ((3, 3), (3, 3))
     sscp_conv_stride_size: tuple[tuple[int, int], tuple[int, int]] = ((2, 2), (2, 2))
 
 
-# (x: mx.array, mask: mx.BoolArray (no BoolArray in mlx))
-type SLSequence = Tuple[mx.array, mx.array]
-
-
-class SequenceLayer(nn.Module):
-    layers: Callable[[SLSequence], SLSequence]
-
-    def __call__(self, x: SLSequence) -> SLSequence:
-        return self.layers(x)
-
-
-class SequenceLayerConv2d(SequenceLayer):
+class Gemma3p5RMSNorm(nn.Module):
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
-        kernel: tuple[int, int],
-        stride: tuple[int, int],
+        dim: int,
         *args,
-        padding: tuple[int, int] = (0, 0),
-        use_bias: bool = False,
+        eps: float = 1e-6,
+        scale_shift: float = 1.0,
+        with_scale: bool = True,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel = kernel
-        self.stride = stride
-
-        self.padding = padding
-        self.use_bias = use_bias
-
-        self.conv = nn.Conv2d(
-            in_channels=self.in_channels,
-            out_channels=self.out_channels,
-            kernel_size=self.kernel,
-            stride=self.stride,
-            padding=self.padding,
-            bias=self.use_bias,
-        )
-
-    def __call__(self, x: SLSequence) -> SLSequence:
-        y, mask = x
-        y = self.conv(y)
-        return y, mask
-
-
-class SequenceLayerEinsum(SequenceLayer):
-
-    def __init__(self, shape: Sequence[int], equation: str, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.shape = shape
-        self.equation = equation
-        self.weight = mx.empty(self.shape)
-
-    def forward(self, x: SLSequence) -> SLSequence:
-        y, mask = x
-        y = mx.einsum(self.equation, y, self.weight)
-        return y, mask
-
-
-class SequenceLayerDense(SequenceLayerEinsum):
-    def __init__(self, shape: tuple[int, int], *args, **kwargs):
-        super().__init__(*args, shape=shape, equation="...a,ab->...b", **kwargs)
-
-
-class SequenceLayerDenseShaped(SequenceLayer):
-    def __init__(
-        self,
-        *args,
-        input_shape: Sequence[int] = (),
-        output_shape: Sequence[int] = (),
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        self.input_shape = tuple(input_shape)
-        self.input_dims = "".join(
-            chr(ord("a") + i) for i in range(len(self.input_shape))
-        )
-        self.input_weight_shape = self.input_shape or (1,)
-        self.input_weight_dims = self.input_dims or "I"
-        self.output_shape = tuple(output_shape)
-        self.output_dims = "".join(
-            chr(ord("a") + i + len(self.input_shape))
-            for i in range(len(self.output_shape))
-        )
-        self.output_weight_shape = self.output_shape or (1,)
-        self.output_weight_dims = self.output_dims or "O"
-        self.equation = f"BT{self.input_dims},{self.input_weight_dims}{self.output_weight_dims}->BT{self.output_dims}"
-
-        weight_shape = self.input_weight_shape + self.output_weight_shape
-        self.weight = mx.empty(weight_shape)
-
-    def __call__(self, x: SLSequence) -> SLSequence:
-        y, mask = x
-        y = mx.einsum(self.equation, y, self.weight)
-        return y, mask
-
-
-class SequenceLayerDepthwiseConv1D(SequenceLayer):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        num_groups: int,
-        *args,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        self.conv = nn.Conv1d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            stride=1,
-            padding=0,  # Manual causal padding
-            groups=num_groups,  # Depthwise
-            bias=False,
-        )
-
-    def forward(self, x: SLSequence) -> SLSequence:
-        y, mask = x
-        y = self.conv(y)
-        return y, mask
-
-
-class SequenceLayerExpandDims(SequenceLayer):
-    def __init__(self, dims: Union[int, Sequence[int]], *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.dims = (dims,) if isinstance(dims, int) else dims
-
-    def _normalize_dims(
-        self,
-        x_ndims: int,
-    ) -> Sequence[int]:
-        dims = [d + x_ndims if d < 0 else d for d in self.dims]
-        dims = sorted(dims)
-        for d in dims:
-            if d < 0 or d > x_ndims:
-                raise ValueError(f"Received invalid dim for expansion: {d}")
-        return dims
-
-    def __call__(self, x: SLSequence) -> SLSequence:
-        y, mask = x
-        y_dims = self._normalize_dims(y.ndim)
-        for d in y_dims:
-            y = mx.expand_dims(y, axis=d)
-        return y, mask
-
-
-class SequenceLayerGatedLinearUnit(SequenceLayer):
-    def __call__(self, x: SLSequence) -> SLSequence:
-        x, mask = x
-        feature, gate = mx.split(x, 2, dim=-1)
-        gate = mx.sigmoid(gate)
-        x = feature * gate
-        return x, mask
-
-
-class SequenceLayerGroupNorm(SequenceLayer):
-    def __init__(
-        self, num_groups: int, num_channels: int, *args, eps: float = 1e-3, **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-
-        self.num_groups = num_groups
-        self.num_channels = num_channels
+        super().__init__()
         self.eps = eps
+        self.scale_shift = scale_shift
+        self.with_scale = with_scale
 
-        self.norm = nn.GroupNorm(
-            num_groups=self.num_groups, num_channels=self.num_channels, eps=self.eps
+        if self.with_scale:
+            self.weight = mx.ones(dim)
+        else:
+            self.weight = mx.array(1.0)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.eps}"
+
+    def __call__(self, x: mx.array):
+        x, original_dtype = self._guard_against_excess_precision(x)
+
+        scale = self.weight
+        if self.scale_shift != 0.0:
+            scale += self.scale_shift
+
+        mean_squared = x.pow(2).mean(-1, keepdim=True)
+        root_mean_squared = x * mx.rsqrt(mean_squared + self.eps)
+        # Llama does x.to(float16) * w whilst Gemma2 is (x * w).to(float16)
+        # See https://github.com/huggingface/transformers/pull/29402
+        scaled = root_mean_squared * scale.float()
+        return scaled.type(original_dtype)
+
+    def _guard_against_excess_precision(self, x: mx.array) -> tuple[mx.array, mx.dtype]:
+        # TODO(ryanmullins): Implement Torch equivalent to jax.lax.reduce_precision
+        return x.float(), x.dtype
+
+
+class Gemma3p5AudioRelativePositionEmbedding(nn.Module):
+
+    def __init__(self, config: AudioConfig, *args, **kwargs):
+        super().__init__()
+        self.config = config
+
+        self.num_heads = self.config.conf_num_attention_heads
+        self.hidden_size = self.config.hidden_size
+        self.units_per_head = self.hidden_size // self.num_heads
+        self.max_backward = self.config.conf_attention_context_left
+        self.max_forward = self.config.conf_attention_context_right
+
+        self.pos_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.units_per_head, bias=False
         )
 
-    def __call__(self, x: SLSequence) -> SLSequence:
-        y, mask = x
-        y = self.norm(y)
-        return y, mask
+    def _get_timing_signal_1d_pos(
+        self, position: mx.array, channels: int, dtype: mx.dtype
+    ) -> mx.array:
+        assert position.ndim == 2
+        position = mx.expand_dims(position.float(), axis=-1)
+
+        min_timescale = 1.0
+        max_timescale = 1.0e4
+        num_timescales = channels // 2
+        log_timescale_increment = math.log(
+            float(max_timescale) / float(min_timescale)
+        ) / max(num_timescales - 1, 1)
+        inv_timescales = min_timescale * mx.exp(
+            mx.arange(num_timescales) * -log_timescale_increment
+        )
+        inv_timescales = mx.expand_dims(
+            mx.expand_dims(inv_timescales.float(), axis=0), axis=0
+        ).to(device=position.device)
+
+        scaled_time = position * inv_timescales
+
+        timing_signal = mx.concatenate(
+            [mx.sin(scaled_time), mx.cos(scaled_time)], dim=-1
+        )
+        timing_signal_padding = (0, np.mod(channels, 2), 0, 0, 0, 0)
+        timing_signal = mx.pad(timing_signal, timing_signal_padding)
+
+        return timing_signal.type(dtype)
+
+    def __call__(self, queries: mx.array, keys: mx.array) -> mx.array:
+        b, u, w = queries.shape[:3]
+        _, _, c = keys.shape[:3]
+        n = self.num_heads
+        h = self.units_per_head
+        l = self.max_backward
+        r = self.max_forward
+        lr = l + r
+        assert c == w + lr
+
+        pos = mx.expand_dims(mx.arange(l, -r - 1, -1), axis=0)
+        assert pos.shape == (1, lr + 1)
+
+        sin_emb = self._get_timing_signal_1d_pos(
+            pos, self.hidden_size, dtype=queries.dtype
+        )
+
+        # Note: In JAX code, sl.Dense modifies sin_emb with a jax.numpy.einsum("...d,dnh->...nh") but this has been
+        # converted to nn.Linear to align with the Transformers style guide.
+        batch_dims = sin_emb.shape[:-1]
+        sin_emb_projected: mx.array = self.pos_proj(sin_emb)
+        sin_emb = sin_emb_projected.reshape(*batch_dims, n, h)
+        sin_emb = sin_emb.squeeze(0)
+
+        # Note: In JAX code, sl.TransformerXLRelativePositionEmbedding computes term_ac with
+        # torch.einsum("BuwNH,BucNH->BNuwc", ...), this converts that operation to a matmul to comply with the
+        # Transformers style guide.
+        queries_p = queries.permute(0, 3, 1, 2, 4)
+        keys_p_t = keys.permute(0, 3, 1, 4, 2)
+        term_ac = mx.matmul(queries_p, keys_p_t)
+
+        # Note: In JAX code, sl.TransformerXLRelativePositionEmbedding computes term_bd with
+        # torch.einsum("BuwNH,FNH->BNuwF", ...), this converts that operation to a matmul to comply with the
+        # Transformers style guide.
+        queries_p_bd = queries.permute(0, 3, 1, 2, 4)
+        sin_emb_p_t = sin_emb.permute(1, 2, 0)
+        term_bd = mx.matmul(queries_p_bd, sin_emb_p_t)
+        # Perform relative shift in order to get [B, N, U, W, C]
+        # Pads the input to [B, N, U, W, C + 1]
+        term_bd_pad = (0, c - lr, 0, 0, 0, 0, 0, 0, 0, 0)
+        term_bd = mx.pad(term_bd, term_bd_pad)
+        term_bd = term_bd.reshape((b, n, u, w * (c + 1)))
+        term_bd = term_bd[:, :, :, : w * c]
+        # Reshapes to [B, N, U, W, C]. Note the output last dim is 1-smaller
+        # than the input, which "pushses" one element off to the next row for each
+        # row. The accumulated effect is row_i is right-shifted i steps (i>=0).
+        term_bd = term_bd.reshape((b, n, u, w, c))
+
+        return term_ac + term_bd
 
 
-class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
-    def __init__(
-        self,
-        num_heads: int,
-        hidden_size: int,
-        block_size: int,
-        max_past_horizon: int,
-        relative_position_embedding: nn.Module,
-        *args,
-        max_future_horizon: int = 0,
-        attention_invalid_logits_value: float = -1.0e9,
-        attention_logits_soft_cap: float = 50.0,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        self.num_heads = num_heads
-        self.hidden_size = hidden_size
-        self.units_per_head = hidden_size // self.num_heads
-        self.block_size = block_size
-        self.max_past_horizon = max_past_horizon
-        self.max_future_horizon = max_future_horizon
-        self.attention_invalid_logits_value = attention_invalid_logits_value
-        self.attention_logits_soft_cap = attention_logits_soft_cap
+class AudioAttention(nn.Module):
+    def __init__(self, config: AudioConfig, *args, **kwargs):
+        super().__init__()
+        self.config = config
 
-        if self.block_size < 1:
-            raise ValueError(f"Expected {self.block_size=} >= 1.")
+        self.num_heads = self.config.conf_num_attention_heads
+        self.hidden_size = self.config.hidden_size
+        self.units_per_head = self.hidden_size // self.num_heads
+        self.chunk_size = self.config.conf_attention_chunk_size
+        self.max_past_horizon = self.config.conf_attention_context_left
+        self.max_future_horizon = self.config.conf_attention_context_right
+        self.attention_invalid_logits_value = (
+            self.config.conf_attention_invalid_logits_value
+        )
+        self.attention_logits_soft_cap = self.config.conf_attention_logit_cap
+
+        if self.chunk_size < 1:
+            raise ValueError(f"Expected {self.chunk_size=} >= 1.")
         if self.max_past_horizon < 1:
             raise ValueError(f"Expected {self.max_past_horizon=} >= 1.")
         if self.max_future_horizon < 0:
@@ -240,20 +190,25 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         if self.max_future_horizon == 0 and self.max_past_horizon == 0:
             raise ValueError("max_horizon and max_future_horizon cannot both be 0.")
         if self.attention_logits_soft_cap < 0.0:
-            raise ValueError(f"{self.attention_logits_soft_cap=} should be None or non-negative.")
+            raise ValueError(
+                f"{self.attention_logits_soft_cap=} should be None or non-negative."
+            )
 
-        self.relative_position_embedding = relative_position_embedding
-
-        self.per_dim_scale = mx.empty((self.units_per_head,))
-
-        self.qkv_proj = SequenceLayerEinsum(
-            shape=(self.hidden_size, 3, self.num_heads, self.units_per_head),
-            equation="...a,abcd->...bcd",
+        self.relative_position_embedding = Gemma3p5AudioRelativePositionEmbedding(
+            config
+        )
+        self.per_dim_scale = mx.zeros((self.units_per_head,))
+        self.qkv_linear = nn.Linear(
+            self.hidden_size, 3 * self.num_heads * self.units_per_head, bias=False
         )
 
     def _pad_dim1(
-        self, x: mx.array, dim10_val: int, dim11_val: int, padding_val: Union[bool, float] = 0.0
-    ) -> mx.array: 
+        self,
+        x: mx.array,
+        dim10_val: int,
+        dim11_val: int,
+        padding_val: Union[bool, float] = 0.0,
+    ) -> mx.array:
         padding_tuple = [0] * x.ndim * 2
         dim_idx_from_end = x.ndim - 2
         start_idx_for_dim = 2 * dim_idx_from_end
@@ -263,7 +218,9 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         x = mx.pad(x, padding_tuple, mode="constant", constant_value=padding_val)
         return x
 
-    def _convert_to_block(self, x: mx.array, padding_val: Union[bool, float] = 0.0) -> mx.array:
+    def _convert_to_block(
+        self, x: mx.array, padding_val: Union[bool, float] = 0.0
+    ) -> mx.array:
         shape = x.shape
         b, t = shape[:2]
         num_blocks = (t + self.block_size - 1) // self.block_size
@@ -275,8 +232,15 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         x = x.permute(permute_dims).contiguous()
         return x
 
-    def _extract_block_context(self, x: mx.array, padding_val: Union[bool, float] = 0.0) -> mx.array:
-        x = self._pad_dim1(x, self.max_past_horizon, self.max_future_horizon + self.block_size + 1, padding_val)
+    def _extract_block_context(
+        self, x: mx.array, padding_val: Union[bool, float] = 0.0
+    ) -> mx.array:
+        x = self._pad_dim1(
+            x,
+            self.max_past_horizon,
+            self.max_future_horizon + self.block_size + 1,
+            padding_val,
+        )
 
         outer_dims = x.shape[:1]
         inner_dims = x.shape[2:]
@@ -289,7 +253,9 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         num_frames = (output_size + frame_step - 1) // frame_step
 
         if not num_frames:
-            return mx.zeros(outer_dims + (0, frame_len) + inner_dims, dtype=x.dtype, device=x.device)
+            return mx.zeros(
+                outer_dims + (0, frame_len) + inner_dims, dtype=x.dtype, device=x.device
+            )
 
         subframe_factor = math.gcd(frame_len, frame_step)
         padding_left = 0
@@ -315,22 +281,19 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         x = x.permute(*permute_dims).contiguous()
         return x
 
-    def forward(self, x: SLSequence) -> SLSequence:
-        y, mask = x
+    def __call__(self, x: mx.array, mask: mx.array) -> mx.array:
+        batch_dims = x.shape[:-1]
+        qkv_projected: mx.Tensor = self.qkv_linear(x)
+        qkv = qkv_projected.reshape(*batch_dims, 3, self.num_heads, self.units_per_head)
 
-        qkv: mx.Tensor = self.qkv_proj(y)
-        
-        q = None
-        k = None
-        v = None
-        # TODO: mx.select doesn't exist
-
-        #q = torch.select(qkv, dim=2, index=0).float()
-        #k = torch.select(qkv, dim=2, index=1).float()
-        #v = torch.select(qkv, dim=2, index=2).float()
+        q = mx.take_along_axis(qkv, indices=mx.array([0]), axis=2).astype(mx.float32)
+        k = mx.take_along_axis(qkv, indices=mx.array([1]), axis=2).astype(mx.float32)
+        v = mx.take_along_axis(qkv, indices=mx.array([2]), axis=2).astype(mx.float32)
 
         q_scale = 1 / math.sqrt(self.units_per_head)
-        r_softplus_0 = 1.442695041  # Ported from JAX Sequence Layers; 1.0 / jax.nn.softplus(0.0)
+        r_softplus_0 = (
+            1.442695041  # Ported from JAX Sequence Layers; 1.0 / jax.nn.softplus(0.0)
+        )
         q_scale = mx.array(q_scale * r_softplus_0, dtype=mx.float32)
         q = q * q_scale * nn.softplus(self.per_dim_scale)
 
@@ -342,8 +305,11 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         num_query_blocks = q_blocks.shape[1]
         v_blocks = self._extract_block_context(v)
 
-        valid_mask_blocks: mx.array = self._extract_block_context(mask, padding_val=False)
-        valid_mask_blocks = valid_mask_blocks.unsqueeze(1).unsqueeze(-2)
+        valid_mask_blocks: mx.array = self._extract_block_context(
+            mask, padding_val=False
+        )
+        valid_mask_blocks = mx.expand_dims(valid_mask_blocks, axis=1)
+        valid_mask_blocks = mx.expand_dims(valid_mask_blocks, axis=-2)
         lower_causal_mask = mx.tril(
             mx.ones((context_size, self.block_size), dtype=mx.bool_),
             diagonal=0,
@@ -352,8 +318,12 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
             mx.ones((self.block_size, context_size), dtype=mx.bool_),
             diagonal=self.max_past_horizon + self.max_future_horizon,
         )
-        local_causal_valid_mask = mx.ones((self.block_size, context_size), dtype=mx.bool_)
-        local_causal_valid_mask = local_causal_valid_mask * lower_causal_mask * upper_causal_mask
+        local_causal_valid_mask = mx.ones(
+            (self.block_size, context_size), dtype=mx.bool_
+        )
+        local_causal_valid_mask = (
+            local_causal_valid_mask * lower_causal_mask * upper_causal_mask
+        )
         valid_mask_blocks = mx.logical_and(valid_mask_blocks, local_causal_valid_mask)
 
         # Embed queries and keys
@@ -365,175 +335,37 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         logits = mx.tanh(logits)
         logits = logits * softcap
 
-        logits = mx.where(valid_mask_blocks, logits, self.attention_invalid_logits_value)
+        logits = mx.where(
+            valid_mask_blocks, logits, self.attention_invalid_logits_value
+        )
         probabilities = mx.softmax(logits, dim=-1, dtype=mx.float32)
-        context_vectors = mx.einsum("BNuwc,BucNH->BuwNH", probabilities, v_blocks)
+        # Note: In JAX code, sl.LocalDotProductSelfAttention computes context_vectors with
+        # torch.einsum("BNuwc,BucNH->BuwNH", ...), this implementation converts from einsums to matmul operations to
+        # comply with the Transformers style guide.
+        b_dim, n_dim, u_dim, w_dim, c_dim = probabilities.shape
+        h_dim = v_blocks.shape[-1]
+        prob_bun = probabilities.transpose(0, 2, 1, 3, 4).reshape(-1, w_dim, c_dim)
+        v_bun = v_blocks.transpose(0, 1, 3, 2, 4).reshape(-1, c_dim, h_dim)
+        result_bmm = mx.matmul(prob_bun, v_bun)
+        context_vectors = result_bmm.reshape(b_dim, u_dim, n_dim, w_dim, h_dim).transpose(
+            0, 1, 3, 2, 4
+        )
         context_vectors = context_vectors.reshape(
-            (batch_size, num_query_blocks * self.block_size, self.num_heads, self.units_per_head)
+            (
+                batch_size,
+                num_query_blocks * self.chunk_size,
+                self.num_heads,
+                self.units_per_head,
+            )
         )
         context_vectors = context_vectors[:, :q_time]
 
         return context_vectors, mask
 
 
-class SequenceLayerMaskInvalid(SequenceLayer):
-    def __call__(self, x: SLSequence) -> SLSequence:
-        y, mask = x
-        if mask.dtype != mx.bool_:
-             mask = mask.astype(mx.bool_)
-        expanded_mask = mask.expand_dims(-1)
-        fill_value = mx.array(0.0, dtype=y.dtype)
-        y_masked = mx.where(expanded_mask, fill_value, y)
-        return y_masked, mask
-
-class SequenceLayerRelu(SequenceLayer):
-    def __call__(self, x: SLSequence) -> SLSequence:
-        x, mask = x
-        x = nn.relu(x)
-        return x, mask
-
-class SequenceLayerResidual(SequenceLayer):
-    def __init__(
-        self,
-        layers: nn.Sequential,
-        *args,
-        shortcut_layers: Optional[nn.Sequential] = None,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        self.layers = layers
-        self.shortcut_layers = shortcut_layers
-
-    def residual_function(self, x: SLSequence, shortcut_x: SLSequence) -> SLSequence:
-        y = x[0] + shortcut_x[0]
-        mask = x[1] | shortcut_x[1]
-        return y, mask
-
-    def __call__(self, x: SLSequence) -> SLSequence:
-        y: SLSequence = self.layers(x)
-        if self.shortcut_layers is not None:
-            shortcut_y: SLSequence = self.shortcut_layers(x)
-            y = self.residual_function(y, shortcut_y)
-        return y
-
-
-class SequenceLayerRMSNorm(SequenceLayer):
-    def __init__(
-        self, shape: Sequence[int], *args, dim: int = -1, eps: float = 1e-6, **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-
-        self.shape = shape
-        self.dim = dim
-        self.eps = eps
-        self.scale = mx.ones(self.shape)
-
-    def forward(self, x: SLSequence) -> SLSequence:
-        y, mask = x
-        y_dtype = y.dtype
-        y = y.float()
-        mean_squared = y.pow(2).mean(dim=self.dim, keepdim=True)
-        root_mean_squared = y * mx.rsqrt(mean_squared + self.eps)
-        scaled = root_mean_squared * self.scale.float()
-        return scaled.type(y_dtype), mask
-
-
-class SequenceLayerScale(SequenceLayer):
-    def __init__(self, factor: float, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.factor = factor
-
-    def forward(self, x: SLSequence) -> SLSequence:
-        x, mask = x
-        x = x * self.factor
-        return x, mask
-
-
-class SequenceLayerSwish(SequenceLayer):
-    def forward(self, x: SLSequence) -> SLSequence:
-        x, mask = x
-        x = mx.silu(x)
-        return x, mask
-
-
-class SequenceLayerTransformerXLRelativePositionEmbedding(nn.Module):
-    def __init__(
-        self,
-        num_heads: int,
-        hidden_size: int,
-        max_backward: int,
-        max_forward: int,
-        position_bias_dim: int,
-        *args,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        self.num_heads = num_heads
-        self.hidden_size = hidden_size
-        self.units_per_head = self.hidden_size // self.num_heads
-        self.max_backward = max_backward
-        self.max_forward = max_forward
-        self.position_bias_dim = position_bias_dim
-
-        self.pos_proj = SequenceLayerEinsum(
-            shape=(self.hidden_size, self.num_heads, self.units_per_head),
-            equation="...d,dnh->...nh",
-        )
-
-    def _get_timing_signal_1d_pos(self, position: mx.array, channels: int, dtype: mx.dtype) -> mx.array:
-        assert position.ndim == 2
-        position = position.float().unsqueeze(-1)
-
-        min_timescale = 1.0
-        max_timescale = 1.0e4
-        num_timescales = channels // 2
-        log_timescale_increment = math.log(float(max_timescale) / float(min_timescale)) / max(num_timescales - 1, 1)
-        inv_timescales = min_timescale * mx.exp(mx.arange(num_timescales) * -log_timescale_increment)
-        inv_timescales = inv_timescales.float().unsqueeze(0).unsqueeze(0).to(device=position.device)
-
-        scaled_time = position * inv_timescales
-
-        timing_signal = mx.concatenate([mx.sin(scaled_time), mx.cos(scaled_time)], dim=-1)
-        timing_signal_padding = (0, np.mod(channels, 2), 0, 0, 0, 0)
-        timing_signal = mx.pad(timing_signal, timing_signal_padding)
-
-        return timing_signal.type(dtype)
-
-    def forward(self, queries: mx.array, keys: mx.array) -> mx.array:
-        b, u, w = queries.shape[:3]
-        _, _, c = keys.shape[:3]
-        n = self.num_heads
-        l = self.max_backward
-        r = self.max_forward
-        lr = l + r
-        assert c == w + lr
-
-        pos = mx.arange(l, -r - 1, -1).unsqueeze(0)
-        assert pos.shape == (1, lr + 1)
-
-        sin_emb = self._get_timing_signal_1d_pos(pos, self.position_bias_dim, dtype=queries.dtype)
-        sin_emb: mx.array = self.pos_proj((sin_emb, None))[0]
-        sin_emb = sin_emb.squeeze(0)
-
-        term_ac = mx.einsum("BuwNH,BucNH->BNuwc", queries, keys)
-        term_bd = mx.einsum("BuwNH,FNH->BNuwF", queries, sin_emb)
-
-        # Perform relative shift in order to get [B, N, U, W, C]
-        # Pads the input to [B, N, U, W, C + 1]
-        term_bd_pad = (0, c - lr, 0, 0, 0, 0, 0, 0, 0, 0)
-        term_bd = nn.functional.pad(term_bd, term_bd_pad)
-        term_bd = term_bd.reshape((b, n, u, w * (c + 1)))
-        term_bd = term_bd[:, :, :, : w * c]
-        # Reshapes to [B, N, U, W, C]. Note the output last dim is 1-smaller
-        # than the input, which "pushses" one element off to the next row for each
-        # row. The accumulated effect is row_i is right-shifted i steps (i>=0).
-        term_bd = term_bd.reshape((b, n, u, w, c))
-        return term_ac + term_bd
-
-
-class Gemma3p5AudioSSCPConvBlock(SequenceLayer):
+class Gemma3p5AudioSSCPConvBlock(nn.Module):
     def __init__(self, config: AudioConfig, idx: int, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.config = config
 
         self.out_channels = self.config.sscp_conv_channel_size[idx]
@@ -543,233 +375,188 @@ class Gemma3p5AudioSSCPConvBlock(SequenceLayer):
         # input_channels is equal to either the out_channels from the prior
         # Conv2d or 1 if this is the first Conv2d.
         if idx > 0:
-            self.input_channels = self.config.sscp_conv_channel_size[idx - 1]
+            self.in_channels = self.config.sscp_conv_channel_size[idx - 1]
         else:
-            self.input_channels = 1
+            self.in_channels = 1
 
-        self.layers = nn.Sequential(
-            OrderedDict(
-                [
-                    (
-                        "conv2d",
-                        SequenceLayerConv2d(
-                            in_channels=self.input_channels,
-                            out_channels=self.out_channels,
-                            kernel=self.kernel_size,
-                            stride=self.stride,
-                        ),
-                    ),
-                    (
-                        "norm",
-                        SequenceLayerGroupNorm(
-                            num_groups=1, num_channels=self.out_channels
-                        ),
-                    ),
-                    ("relu", SequenceLayerRelu()),
-                ]
-            )
+        self.conv = nn.Conv2d(
+            in_channels=self.in_channels,
+            out_channels=self.out_channels,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=(0, 0),
+            bias=False,
+        )
+        self.norm = nn.GroupNorm(
+            num_groups=1,
+            dims=self.out_channels,
+            eps=self.config.sscp_conv_group_norm_eps,
+            pytorch_compatible=True,
         )
 
+    def __call__(self, x: mx.array) -> mx.array:
+        x = self.conv(x)
+        x = self.norm(x)
+        return mx.relu(x)
 
-class Gemma3p5AudioSubSampleConvProjection(SequenceLayer):
+
+class Gemma3p5AudioSubSampleConvProjection(nn.Module):
+
     def __init__(self, config: AudioConfig, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.config = config
 
-        self.layers = nn.Sequential(
-            OrderedDict(
-                [
-                    ("expand", SequenceLayerExpandDims(dims=-1)),
-                    ("conv_0", Gemma3p5AudioSSCPConvBlock(config, 0)),
-                    ("conv_1", Gemma3p5AudioSSCPConvBlock(config, 1)),
-                    (
-                        "input_proj",
-                        SequenceLayerDenseShaped(
-                            input_shape=(
-                                self.config.sscp_conv_channel_size[1],
-                                self.config.sscp_conv_channel_size[1],
-                            ),
-                            output_shape=(self.config.hidden_size,),
-                        ),
-                    ),
-                ]
-            )
+        self.input_proj_in_shape = (
+            self.config.sscp_conv_channel_size[1],
+            self.config.sscp_conv_channel_size[1],
+        )
+        self.input_proj_in_features = np.prod(self.input_proj_in_shape)
+
+        self.conv_0 = Gemma3p5AudioSSCPConvBlock(config, 0)
+        self.conv_1 = Gemma3p5AudioSSCPConvBlock(config, 1)
+        self.input_proj_linear = nn.Linear(
+            self.input_proj_in_features, self.config.hidden_size, bias=False
         )
 
+    def __call__(self, x: mx.array) -> mx.array:
+        x = mx.expand_dims(x, axis=-1)
+        x = self.conv_0(x)
+        x = self.conv_1(x)
+        batch_dims = x.shape[: -len(self.input_proj_in_shape)]
+        x_flat = x.reshape(-1, self.input_proj_in_features)
+        x_proj: mx.array = self.input_proj_linear(x_flat)
+        return x_proj.reshape(*batch_dims, self.config.hidden_size)
 
-class Gemma3p5AudioConformerAttention(SequenceLayer):
+
+class Gemma3p5AudioConformerAttention(nn.Module):
     def __init__(self, config: AudioConfig, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.config = config
 
-        self.layers = SequenceLayerResidual(
-            layers=nn.Sequential(
-                OrderedDict(
-                    [
-                        (
-                            "pre_attn_norm",
-                            SequenceLayerRMSNorm(shape=(self.config.hidden_size,)),
-                        ),
-                        
-                ("attn", SequenceLayerLocalDotProductSelfAttention(
-                    num_heads=self.config.conf_num_attention_heads,
-                    hidden_size=self.config.hidden_size,
-                    block_size=self.config.conf_attention_chunk_size,
-                    attention_logits_soft_cap=self.config.conf_attention_logit_cap,
-                    max_past_horizon=self.config.conf_attention_context_left,
-                    max_future_horizon=self.config.conf_attention_context_right,
-                    relative_position_embedding=SequenceLayerTransformerXLRelativePositionEmbedding(
-                        num_heads=self.config.conf_num_attention_heads,
-                        hidden_size=self.config.hidden_size,
-                        max_backward=self.config.conf_attention_context_left,
-                        max_forward=self.config.conf_attention_context_right,
-                        position_bias_dim=self.config.hidden_size,
-                    ),
-                )),
+        unit_per_head = self.config.hidden_size // self.config.conf_num_attention_heads
+        self.post_in_shape = (self.config.conf_num_attention_heads, unit_per_head)
+        self.post_in_features = np.prod(self.post_in_shape)
 
-                        (
-                            "post_attn_dense",
-                            SequenceLayerDenseShaped(
-                                input_shape=(
-                                    self.config.conf_num_attention_heads,
-                                    self.config.hidden_size
-                                    // self.config.conf_num_attention_heads,
-                                ),
-                                output_shape=(self.config.hidden_size,),
-                            ),
-                        ),
-                        (
-                            "post_attn_norm",
-                            SequenceLayerRMSNorm(shape=(self.config.hidden_size,)),
-                        ),
-                    ]
-                )
-            )
+        self.pre_attn_norm = Gemma3p5RMSNorm(self.config.hidden_size)
+        self.attn = AudioAttention(config)
+        self.post = nn.Linear(
+            self.post_in_features, self.config.hidden_size, bias=False
         )
-
-
-class Gemma3p5AudioConformerFeedForward(SequenceLayer):
-    def __init__(self, config: AudioConfig, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.config = config
-
-        self.layers = SequenceLayerResidual(
-            layers=nn.Sequential(
-                OrderedDict(
-                    [
-                        (
-                            "pre_layer_norm",
-                            SequenceLayerRMSNorm(shape=(self.config.hidden_size,)),
-                        ),
-                        (
-                            "ffw_layer_1",
-                            SequenceLayerDense(
-                                shape=(
-                                    self.config.hidden_size,
-                                    self.config.hidden_size * 4,
-                                )
-                            ),
-                        ),
-                        (
-                            "ffw_layer_2",
-                            SequenceLayerDense(
-                                shape=(
-                                    self.config.hidden_size * 4,
-                                    self.config.hidden_size,
-                                )
-                            ),
-                        ),
-                        (
-                            "post_layer_norm",
-                            SequenceLayerRMSNorm(shape=(self.config.hidden_size,)),
-                        ),
-                        (
-                            "post_layer_scale",
-                            SequenceLayerScale(factor=config.conf_residual_weight),
-                        ),
-                    ]
-                )
-            )
-        )
-
-
-class Gemma3p5AudioConformerLightConv1d(SequenceLayer):
-    def __init__(self, config: AudioConfig, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.config = config
-
-        self.layers = SequenceLayerResidual(
-            layers=nn.Sequential(OrderedDict([
-                ("pre_layer_norm", SequenceLayerRMSNorm(shape=(self.config.hidden_size, ))),
-                ("linear_start", SequenceLayerDense(shape=(self.config.hidden_size, self.config.hidden_size * 2))),
-                ("glu", SequenceLayerGatedLinearUnit()),
-                ("depthwise_conv1d", SequenceLayerDepthwiseConv1D(
-                    in_channels=self.config.hidden_size,
-                    out_channels=self.config.hidden_size,
-                    kernel_size=self.config.conf_conv_kernel_size,
-                    num_groups=self.config.hidden_size,
-                )),
-                ("conv_norm", SequenceLayerRMSNorm(shape=(self.config.hidden_size, ))),
-                ("conv_activation", SequenceLayerSwish()),
-                ("linear_end", SequenceLayerDense(shape=(self.config.hidden_size, self.config.hidden_size))),
-            ]))
-        )
-
-
-
-
-class Gemma3p5AudioConformerBlock(SequenceLayer):
-    def __init__(self, config: AudioConfig, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.config = config
-
-        self.layers = nn.Sequential(
-            OrderedDict(
-                [
-                    ("ffw_layer_start", Gemma3p5AudioConformerFeedForward(self.config)),
-                    ("attention", Gemma3p5AudioConformerAttention(self.config)),
-                    ("lconv1d", Gemma3p5AudioConformerLightConv1d(self.config)),
-                    ("ffw_layer_end", Gemma3p5AudioConformerFeedForward(self.config)),
-                    ("norm", SequenceLayerRMSNorm(shape=(self.config.hidden_size,))),
-                ]
-            )
-        )
-
-
-class Gemma3p5AudioUniformReducer(nn.Module):
-    def __init__(self, config: AudioConfig, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.config = config
-        self.reduction_factor = config.conf_reduction_factor
+        self.post_norm = Gemma3p5RMSNorm(self.config.hidden_size)
 
     def __call__(self, x: mx.array, mask: mx.array) -> mx.array:
-        if self.reduction_factor > 1:
-            x = x[:, :: self.reduction_factor]
-            mask = mask[:, :: self.reduction_factor]
-        return x, mask
+        x = self.pre_attn_norm(x)
+        x = self.attn(x, mask)
+
+        batch_dims = x.shape[: -len(self.post_in_shape)]
+        x_flat = x.reshape(-1, self.post_in_features)
+        output_flat: mx.array = self.post(x_flat)
+        x = output_flat.reshape(*batch_dims, self.config.hidden_size)
+
+        return self.post_norm(x)
+
+
+class Gemma3p5AudioConformerFeedForward(nn.Module):
+    def __init__(self, config: AudioConfig, *args, **kwargs):
+        super().__init__()
+        self.config = config
+
+        self.pre_layer_norm = Gemma3p5RMSNorm(self.config.hidden_size)
+        self.ffw_layer_1 = nn.Linear(
+            self.config.hidden_size, self.config.hidden_size * 4, bias=False
+        )
+        self.ffw_layer_2 = nn.Linear(
+            self.config.hidden_size * 4, self.config.hidden_size, bias=False
+        )
+        self.post_layer_norm = Gemma3p5RMSNorm(self.config.hidden_size)
+        self.post_layer_scale = mx.array(self.config.conf_residual_weight)
+
+    def __call__(self, x: mx.array) -> Tuple[mx.array, mx.array]:
+        x = self.pre_layer_norm(x)
+        x = self.ffw_layer_1(x)
+        x = self.ffw_layer_2(x)
+        x = self.pre_layer_norm(x)
+        x *= self.post_layer_scale
+        return x
+
+
+class Gemma3p5AudioConformerLightConv1d(nn.Module):
+    def __init__(self, config: AudioConfig, *args, **kwargs):
+        super().__init__()
+        self.config = config
+
+        self.pre_layer_norm = Gemma3p5RMSNorm(self.config.hidden_size)
+        self.linear_start = nn.Linear(
+            self.config.hidden_size, self.config.hidden_size * 2, bias=False
+        )
+        self.depthwise_conv1d = nn.Conv1d(
+            in_channels=self.config.hidden_size,
+            out_channels=self.config.hidden_size,
+            kernel_size=self.config.conf_conv_kernel_size,
+            stride=1,
+            padding=0,  # Manual causal padding
+            groups=self.config.hidden_size,  # Depthwise
+            bias=False,
+        )
+        self.conv_norm = Gemma3p5RMSNorm(self.config.hidden_size)
+        self.linear_end = nn.Linear(
+            self.config.hidden_size, self.config.hidden_size, bias=False
+        )
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x = self.pre_layer_norm(x)
+        x = self.linear_start(x)
+        x = nn.glu(x, axis=-1)
+        x = self.depthwise_conv1d(x)
+        x = self.conv_norm(x)
+        x = nn.silu(x)
+        return self.linear_end(x)
+
+
+class Gemma3p5AudioConformerBlock(nn.Module):
+
+    def __init__(self, config: AudioConfig, *args, **kwargs):
+        super().__init__()
+        self.config = config
+
+        self.ffw_layer_start = Gemma3p5AudioConformerFeedForward(self.config)
+        self.attention = Gemma3p5AudioConformerAttention(self.config)
+        self.lconv1d = Gemma3p5AudioConformerLightConv1d(self.config)
+        self.ffw_layer_end = Gemma3p5AudioConformerFeedForward(self.config)
+        self.norm = Gemma3p5RMSNorm(self.config.hidden_size)
+
+    def __call__(self, x: mx.array, mask: mx.array) -> mx.array:
+        x = self.ffw_layer_start(x)
+        x = self.attention(x, mask)
+        x = self.lconv1d(x)
+        x = self.ffw_layer_end(x)
+        x = self.norm(x)
+        return x
 
 
 class AudioModel(nn.Module):
     def __init__(self, config: AudioConfig, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.config = config
 
         self.subsample_conv_projection = Gemma3p5AudioSubSampleConvProjection(config)
-        self.conformer_blocks = [
+        self.conformer = [
             Gemma3p5AudioConformerBlock(config)
             for _ in range(config.conf_num_hidden_layers)
         ]
-        self.uniform_reducer = Gemma3p5AudioUniformReducer(config)
 
-        self.layers = nn.Sequential(OrderedDict([
-            ("subsample_conv_projection", Gemma3p5AudioSubSampleConvProjection(config)),
-            ("conformer", nn.Sequential(OrderedDict([
-                (f"block_{i}", Gemma3p5AudioConformerBlock(config))
-                for i in range(config.conf_num_hidden_layers)
-            ]))),
-            ("reducer", Gemma3p5AudioUniformReducer(config)),
-            ("mask_invalid", SequenceLayerMaskInvalid()),
-        ]))
 
-    def __call__(self, x: mx.array) -> mx.array:
-        raise NotImplementedError()
+    def __call__(self, x: mx.array, mask: mx.array) -> Tuple[mx.array, mx.array]:
+        x = self.subsample_conv_projection(x)
+        for block in self.conformer:
+            x = block(x, mask)
+
+        if self.config.conf_reduction_factor > 1:
+            x = x[:, :: self.config.conf_reduction_factor]
+            mask = mask[:, :: self.config.conf_reduction_factor]
+
+        expanded_mask = mask.expand_dims(-1)
+        fill_value = mx.array(0.0, dtype=x.dtype)
+        x = mx.where(expanded_mask, fill_value, x)
+
+        return x, mask

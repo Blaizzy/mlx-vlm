@@ -1,7 +1,7 @@
 import inspect
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
