@@ -1,11 +1,10 @@
 import inspect
+import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-
-from ..base import interpolate
 
 
 @dataclass
@@ -255,10 +254,11 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
     )
 
     # Run the kernel
+    threadgroup = get_optimal_threadgroup(out_w, out_h)
     outputs = kernel(
         inputs=[x_flat, dims, params],
         grid=(out_w, out_h, batch_size * channels),
-        threadgroup=(128, 128, 1),
+        threadgroup=threadgroup,
         output_shapes=[(batch_size * channels * out_h * out_w,)],
         output_dtypes=[mx.float32],  # Always use float32 for kernel output
     )
@@ -269,6 +269,54 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
         result = result.astype(input_dtype)
 
     return result
+
+
+def get_optimal_threadgroup(out_w, out_h):
+    # Get device information
+    import platform
+    import subprocess
+
+    # Default conservative values
+    default_threadgroup = (32, 32, 1)
+
+    try:
+        # On macOS, get GPU model information
+        if platform.system() == "Darwin":
+            result = subprocess.run(
+                ["system_profiler", "SPDisplaysDataType"],
+                capture_output=True,
+                text=True,
+            )
+            gpu_info = result.stdout.lower()
+
+            # M1/M2/M3 series detection
+            if "m3 max" in gpu_info or "m3 ultra" in gpu_info:
+                return (128, 128, 1)  # High-end Apple Silicon
+            elif "m2" in gpu_info or "m3" in gpu_info:
+                return (64, 64, 1)  # Mid-tier Apple Silicon
+            elif "m1" in gpu_info:
+                return (32, 32, 1)  # First-gen Apple Silicon
+
+            # Check for AMD GPUs in Mac Pro, etc.
+            if "amd" in gpu_info and "radeon" in gpu_info:
+                if "6900" in gpu_info or "6800" in gpu_info:
+                    return (128, 128, 1)
+                else:
+                    return (64, 64, 1)
+
+        # Adapt to workload size - don't create threadgroups larger than the work
+        max_width = min(128, out_w)
+        max_height = min(128, out_h)
+
+        # Ensure dimensions are powers of 2 for better performance
+        width = 2 ** (max_width.bit_length() - 1)
+        height = 2 ** (max_height.bit_length() - 1)
+
+        return (width, height, 1)
+
+    except Exception:
+        # Return safe defaults if detection fails
+        return default_threadgroup
 
 
 class Learnable2DInterpPosEmb(nn.Module):
@@ -329,33 +377,25 @@ class PatchEmbed(nn.Module):
         )
 
     def __call__(self, hidden_states: mx.array, grid_thw: mx.array) -> mx.array:
-        hidden_states = self.proj(hidden_states).reshape(hidden_states.shape[0], -1)
+        hidden_states = self.proj(hidden_states).swapaxes(1, 3)
+        hidden_states = hidden_states.reshape(hidden_states.shape[0], -1)
         hidden_states = self.pos_emb(hidden_states, grid_thw)
         return hidden_states
 
 
-def reshape_for_broadcast(freqs_ci: mx.array, query: mx.array):
-    ndim = query.ndim
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(query.shape)]
-    return freqs_ci.reshape(*shape)
+def _apply_rope_input_validation(x, freqs_cis):
+    assert x.ndim == freqs_cis.ndim + 1, (x.shape, freqs_cis.shape)
+    assert x.shape[:-2] == freqs_cis.shape[:-1], (x.shape, freqs_cis.shape)
+    assert x.shape[-1] == 2 * freqs_cis.shape[-1], (x.shape, freqs_cis.shape)
+    assert freqs_cis.dtype == mx.complex64, freqs_cis.dtype
 
 
 def view_as_complex(x):
     """
     Convert a tensor with shape (..., 2) to a complex tensor with shape (...).
-
-    Args:
-        x: A real tensor with last dimension of size 2.
-
-    Returns:
-        A complex tensor with size one less than the input.
     """
-    # Ensure the last dimension is size 2
-    assert x.shape[-1] == 2, f"Last dimension must be 2, got {x.shape[-1]}"
-
     # Get real and imaginary parts
     real, imag = x[..., 0], x[..., 1]
-
     # Create complex tensor
     return real + 1j * imag
 
@@ -363,33 +403,35 @@ def view_as_complex(x):
 def view_as_real(x):
     """
     Convert a complex tensor with shape (...) to a real tensor with shape (..., 2).
-
-    Args:
-        x: A complex tensor.
-
-    Returns:
-        A real tensor with an extra dimension of size 2.
     """
     # Get real and imaginary parts
     real = mx.real(x)
     imag = mx.imag(x)
-
     # Combine into a tensor with last dimension 2
     return mx.stack([real, imag], axis=-1)
 
 
-def vision_apply_rotary_emb(
-    query: mx.array,
-    key: mx.array,
-    freqs_ci: mx.array,
-) -> Tuple[mx.array, mx.array]:
+def apply_rope(
+    q: mx.array, k: mx.array, freqs_cis: mx.array
+) -> tuple[mx.array, mx.array]:
+    """
+    Args: (The leading dimensions of all inputs should be the same)
+        q: query, array of shape (..., num_heads, head_dim)
+        k: key, array of shape (..., num_heads, head_dim)
+        freqs_cis: array of shape (..., head_dim/2), dtype=mx.complex64. It contains the precomputed cis(freqs) for each position in the 2D grid.
+    Returns:
+        xq_out, xk_out: arrays of shape (..., num_heads, head_dim)
+    """
+    _apply_rope_input_validation(q, freqs_cis)
+    _apply_rope_input_validation(k, freqs_cis)
 
-    query_ = view_as_complex(query.astype(mx.float32).reshape(*query.shape[:-1], -1, 2))
-    key_ = view_as_complex(key.astype(mx.float32).reshape(*key.shape[:-1], -1, 2))
-    freqs_ci = reshape_for_broadcast(freqs_ci=freqs_ci, query=query_)
-    query_out = view_as_real(query_ * freqs_ci).flatten(3)
-    key_out = view_as_real(key_ * freqs_ci).flatten(3)
-    return query_out.astype(query.dtype), key_out.astype(key.dtype)
+    freqs_cis = mx.expand_dims(freqs_cis, axis=-2)  # ..., 1, head_dim/2
+    # ..., num_heads, head_dim/2
+    q_ = view_as_complex(q.astype(mx.float32).reshape(*q.shape[:-1], -1, 2))
+    k_ = view_as_complex(k.astype(mx.float32).reshape(*k.shape[:-1], -1, 2))
+    q_out = view_as_real(q_ * freqs_cis).flatten(-2)  # ..., num_heads, head_dim
+    k_out = view_as_real(k_ * freqs_cis).flatten(-2)  # ..., num_heads, head_dim
+    return q_out.astype(q.dtype), k_out.astype(k.dtype)
 
 
 class Attention(nn.Module):
@@ -405,38 +447,48 @@ class Attention(nn.Module):
         self, x: mx.array, cu_seqlens: mx.array, rotary_pos_emb: mx.array = None
     ) -> mx.array:
         seq_length = x.shape[0]
-        qkv = (
-            self.wqkv(x)
-            .reshape(seq_length, 3, self.num_heads, -1)
-            .transpose(1, 0, 2, 3)
-        )
-        q, k, v = mx.split(qkv, 3)
+        qkv = self.wqkv(x)
 
-        q, k = vision_apply_rotary_emb(q, k, rotary_pos_emb)
+        qkv_shape = qkv.shape[:-1] + (
+            3,
+            self.num_heads,
+            self.head_dim,
+        )
+        # xqkv: (batch_size, seqlen, 3, nheads, headdim)
+        qkv = qkv.reshape(*qkv_shape)
+
+        q, k, v = mx.split(qkv, 3, axis=1)
+        q = q.squeeze(1)
+        k = k.squeeze(1)
+        v = v.squeeze(1)
+
+        q, k = apply_rope(q, k, rotary_pos_emb)
 
         attention_mask = mx.zeros((1, seq_length, seq_length), dtype=x.dtype)
 
         for i in range(1, len(cu_seqlens)):
             start = int(cu_seqlens[i - 1])
             end = int(cu_seqlens[i])
-            attention_mask[start:end, start:end] = 1
+            attention_mask[..., start:end, start:end] = 1
 
-        q = q.transpose(0, 2, 1, 3)
-        k = k.transpose(0, 2, 1, 3)
-        v = v.transpose(0, 2, 1, 3)
+        q = q.transpose(1, 0, 2)
+        k = k.transpose(1, 0, 2)
+        v = v.transpose(1, 0, 2)
 
-        output = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.scale, mask=attention_mask
-        )
-        output = output.transpose(0, 2, 1, 3)
-        output = output.reshape(seq_length, -1)
-        return self.wo(output)
+        attn_weight = q @ k.swapaxes(-2, -1) / math.sqrt(q.shape[-1])
+        attn_weight += attention_mask
+        attn_weight = mx.softmax(attn_weight, axis=-1).astype(q.dtype)
+
+        attn_output = attn_weight @ v
+        attn_output = attn_output.transpose(1, 0, 2)
+        attn_output = attn_output.reshape(seq_length, -1)
+        return self.wo(attn_output)
 
 
 class MLP(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
-        self.activation_fn = nn.GELU(approx="fast")
+        self.activation_fn = nn.GELU()
         self.fc0 = nn.Linear(dim, hidden_dim)
         self.fc1 = nn.Linear(hidden_dim, dim)
 
@@ -642,7 +694,6 @@ class VisionModel(nn.Module):
             )
         )
         cu_seqlens = mx.cumsum(lengths.astype(mx.int32), axis=0)
-        cu_seqlens = mx.pad(cu_seqlens, (1, 0), mode="constant", constant_values=0)
 
         encoder_states = (hidden_states,) if output_hidden_states else None
 
