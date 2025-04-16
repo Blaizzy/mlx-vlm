@@ -272,50 +272,46 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
 
 
 def get_optimal_threadgroup(out_w, out_h):
-    # Get device information
-    import platform
-    import subprocess
+    # Calculate optimal threadgroup dimensions based on output dimensions
 
-    # Default conservative values
+    # Maximum threadgroup size for most Metal GPUs
+    # This could be made more dynamic with Metal API queries if needed
+    MAX_THREADS_PER_GROUP = 1024
+    MAX_THREADS_PER_DIM = 1024
+
+    # Start with a reasonable default size for 2D workloads
     default_threadgroup = (32, 32, 1)
 
     try:
-        # On macOS, get GPU model information
-        if platform.system() == "Darwin":
-            result = subprocess.run(
-                ["system_profiler", "SPDisplaysDataType"],
-                capture_output=True,
-                text=True,
-            )
-            gpu_info = result.stdout.lower()
+        # Don't create threadgroups larger than the work dimensions
+        max_width = min(MAX_THREADS_PER_DIM, out_w)
+        max_height = min(MAX_THREADS_PER_DIM, out_h)
 
-            # M1/M2/M3 series detection
-            if "m3 max" in gpu_info or "m3 ultra" in gpu_info:
-                return (128, 128, 1)  # High-end Apple Silicon
-            elif "m2" in gpu_info or "m3" in gpu_info:
-                return (64, 64, 1)  # Mid-tier Apple Silicon
-            elif "m1" in gpu_info:
-                return (32, 32, 1)  # First-gen Apple Silicon
-
-            # Check for AMD GPUs in Mac Pro, etc.
-            if "amd" in gpu_info and "radeon" in gpu_info:
-                if "6900" in gpu_info or "6800" in gpu_info:
-                    return (128, 128, 1)
-                else:
-                    return (64, 64, 1)
-
-        # Adapt to workload size - don't create threadgroups larger than the work
-        max_width = min(128, out_w)
-        max_height = min(128, out_h)
-
-        # Ensure dimensions are powers of 2 for better performance
+        # Find largest power of 2 that fits within our dimensions
         width = 2 ** (max_width.bit_length() - 1)
+        if width > max_width:
+            width = width // 2
+
         height = 2 ** (max_height.bit_length() - 1)
+        if height > max_height:
+            height = height // 2
+
+        # Ensure we don't exceed maximum threads per threadgroup
+        while width * height > MAX_THREADS_PER_GROUP:
+            # Reduce the larger dimension first
+            if width >= height:
+                width = width // 2
+            else:
+                height = height // 2
+
+        # Ensure minimum size for efficiency
+        width = max(8, width)
+        height = max(8, height)
 
         return (width, height, 1)
 
     except Exception:
-        # Return safe defaults if detection fails
+        # Return safe defaults if calculation fails
         return default_threadgroup
 
 
