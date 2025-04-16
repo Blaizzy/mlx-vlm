@@ -17,7 +17,7 @@ class VisionConfig:
     patch_size: int = 14
     vocab_size: int = 32000
     mlp_ratio: float = 4.0
-    in_channels: int = 3
+    num_channels: int = 3
     layer_norm_eps: float = 1e-6
     intermediate_size: int = 4304
     init_pos_emb_height: int = 64
@@ -350,18 +350,18 @@ class PatchEmbed(nn.Module):
     def __init__(
         self,
         patch_size: int = 14,
-        in_channels: int = 3,
+        num_channels: int = 3,
         embed_dim: int = 1152,
         init_pos_emb_height: int = 64,
     ) -> None:
         super().__init__()
         self.patch_size = patch_size
-        self.in_channels = in_channels
+        self.num_channels = num_channels
         self.embed_dim = embed_dim
         self.init_pos_emb_height = init_pos_emb_height
 
         self.proj = nn.Conv2d(
-            in_channels,
+            num_channels,
             embed_dim,
             kernel_size=patch_size,
             stride=patch_size,
@@ -657,7 +657,7 @@ class VisionModel(nn.Module):
 
         self.patch_embed = PatchEmbed(
             patch_size=config.patch_size,
-            in_channels=config.in_channels,
+            num_channels=config.num_channels,
             embed_dim=config.embed_dim,
             init_pos_emb_height=config.init_pos_emb_height,
         )
