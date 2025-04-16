@@ -1,5 +1,4 @@
 import inspect
-import math
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -462,6 +461,7 @@ class Attention(nn.Module):
 
         attention_mask = mx.zeros((1, seq_length, seq_length), dtype=x.dtype)
 
+        # Create attention mask for each sequence in the batch
         for i in range(1, len(cu_seqlens)):
             start = int(cu_seqlens[i - 1])
             end = int(cu_seqlens[i])
@@ -471,7 +471,7 @@ class Attention(nn.Module):
         k = k.transpose(1, 0, 2)
         v = v.transpose(1, 0, 2)
 
-        attn_weight = q @ k.swapaxes(-2, -1) / math.sqrt(q.shape[-1])
+        attn_weight = q @ k.swapaxes(2, 1) / mx.sqrt(q.shape[-1])
         attn_weight += attention_mask
         attn_weight = mx.softmax(attn_weight, axis=-1).astype(q.dtype)
 
