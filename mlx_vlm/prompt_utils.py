@@ -107,6 +107,7 @@ def get_message_json(
         "aya_vision": "message_list_with_image",
         "mistral3": "message_list_with_image_first",
         "internvl_chat": "message_list_with_image_type",
+        "kimi_vl": "message_list_with_image",
         "gemma3": "message_with_start_image_token",
         "llama4": "message_list_with_image",
         "smolvlm": "message_list_with_image_first",
