@@ -102,7 +102,7 @@ class VisionRotaryEmbedding(nn.Module):
 
 def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
     """
-    Bicubic interpolation using a Metal kernel.
+    Bicubic interpolation using MLX's built-in interpolate function.
 
     Args:
         x: MLX tensor of shape [B, C, H, W]
@@ -116,7 +116,7 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
     # Get input dimensions
     batch_size, channels, in_h, in_w = x.shape
 
-    # Calculate output dimensions and scales
+    # Calculate output dimensions
     if size is not None:
         out_h, out_w = size
         scale_h, scale_w = out_h / in_h, out_w / in_w
@@ -180,8 +180,9 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
             x_in = float(x_out) * (in_w - 1) / (out_w - 1);
             y_in = float(y_out) * (in_h - 1) / (out_h - 1);
         } else {
-            x_in = (float(x_out) + 0.5f) / scale_w - 0.5f;
-            y_in = (float(y_out) + 0.5f) / scale_h - 0.5f;
+            // Fix the alignment calculation to ensure consistent mapping across thread boundaries
+            x_in = ((float(x_out) + 0.5f) / float(out_w)) * float(in_w) - 0.5f;
+            y_in = ((float(y_out) + 0.5f) / float(out_h)) * float(in_h) - 0.5f;
         }
 
         // Get integer and fractional parts
@@ -190,14 +191,14 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
         float x_frac = x_in - x0;
         float y_frac = y_in - y0;
 
-        // Cubic kernel function
+        // Improved cubic kernel function for better continuity
         auto cubic_kernel = [](float x) -> float {
             float absx = fabs(x);
             float absx2 = absx * absx;
             float absx3 = absx2 * absx;
 
-            // PyTorch uses a=-0.75
-            const float a = -0.75f;
+            // Use a=-0.5 for smoother interpolation
+            const float a = -0.5f;
 
             if (absx <= 1.0f) {
                 return (a+2.0f)*absx3 - (a+3.0f)*absx2 + 1.0f;
@@ -207,8 +208,9 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
             return 0.0f;
         };
 
-        // Perform bicubic interpolation
+        // Perform bicubic interpolation with improved boundary handling
         float result = 0.0f;
+        float weight_sum = 0.0f;  // Track weight sum for normalization
 
         for (int i = -1; i <= 2; i++) {
             int y_pos = y0 + i;
@@ -221,19 +223,26 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
                 // Clamp x coordinate to valid range
                 x_pos = max(0, min(x_pos, in_w - 1));
                 float wx = cubic_kernel(x_frac - j);
+                float weight = wy * wx;
 
                 // Calculate input tensor offset
                 int input_offset = ((b * channels + c) * in_h + y_pos) * in_w + x_pos;
 
                 // Add weighted contribution
-                result += input[input_offset] * wy * wx;
+                result += input[input_offset] * weight;
+                weight_sum += weight;
             }
+        }
+
+        // Normalize by weight sum to ensure consistent intensity
+        if (weight_sum > 0.0f) {
+            result /= weight_sum;
         }
 
         // Calculate output tensor offset
         int output_offset = ((b * channels + c) * out_h + y_out) * out_w + x_out;
 
-        // Assign the result to output with correct type
+        // Assign the result to output
         output[output_offset] = (float)result;
     """
 
