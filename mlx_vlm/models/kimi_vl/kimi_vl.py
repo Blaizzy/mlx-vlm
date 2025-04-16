@@ -109,15 +109,7 @@ class Model(nn.Module):
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = np.where(input_ids == image_token_index)[1].tolist()
 
-        num_images, vision_hidden_size = image_features.shape
-
-        reshaped_image_hidden_states = image_features.reshape(-1, vision_hidden_size)
-
-        # cast to the dtype of the input_embeds to support quantized models
-        reshaped_image_hidden_states = reshaped_image_hidden_states.astype(
-            inputs_embeds.dtype
-        )
-        inputs_embeds[:, image_positions, :] = reshaped_image_hidden_states
+        inputs_embeds[:, image_positions, :] = image_features
 
         return inputs_embeds
 
