@@ -379,9 +379,7 @@ def load_processor(
     model_path, add_detokenizer=True, **kwargs
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
 
-    processor = AutoProcessor.from_pretrained(
-        "moonshotai/Kimi-VL-A3B-Thinking", **kwargs
-    )
+    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
         if "tokenizer" in processor.__dict__.keys():
