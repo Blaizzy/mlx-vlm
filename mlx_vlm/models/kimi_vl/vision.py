@@ -471,7 +471,7 @@ class Attention(nn.Module):
         k = k.transpose(1, 0, 2)
         v = v.transpose(1, 0, 2)
 
-        attn_weight = q @ k.swapaxes(2, 1) / mx.sqrt(q.shape[-1])
+        attn_weight = q @ k.swapaxes(-2, -1) / mx.sqrt(q.shape[-1])
         attn_weight += attention_mask
         attn_weight = mx.softmax(attn_weight, axis=-1).astype(q.dtype)
 
