@@ -59,8 +59,10 @@ class TestModels(unittest.TestCase):
         **kwargs,
     ):
         self.assertEqual(vision_tower.model_type, model_type)
+        if model_type == "llama4_vision_model":
+            vision_hidden_size = kwargs.pop("projector_output_dim", vision_hidden_size)
 
-        batch_size = 1
+        batch_size = kwargs.pop("batch_size", 1)
         if model_type == "qwen2_5_vl":
             input_tensor = mx.random.uniform(shape=(image_size[0], image_size[1]))
         else:
@@ -87,9 +89,20 @@ class TestModels(unittest.TestCase):
             hidden_states = vision_tower(input_tensor, **kwargs)
 
         # Check vision hidden feature layer's shape matches the expected hidden size
-        self.assertEqual(
-            hidden_states[vision_feature_layer].shape[-1], vision_hidden_size
-        )
+        if channel_first:
+            if model_type == "llama4_vision_model":
+
+                self.assertEqual(
+                    hidden_states[vision_feature_layer].shape[1], vision_hidden_size
+                )
+            else:
+                self.assertEqual(
+                    hidden_states[vision_feature_layer].shape[1], vision_hidden_size
+                )
+        else:
+            self.assertEqual(
+                hidden_states[vision_feature_layer].shape[-1], vision_hidden_size
+            )
 
     def test_llava_bunny(self):
         from mlx_vlm.models import llava_bunny
@@ -391,6 +404,63 @@ class TestModels(unittest.TestCase):
         )
 
         model = idefics3.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_model,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
+    def test_internvl_chat(self):
+        from mlx_vlm.models import internvl_chat
+
+        test_config = internvl_chat.TextConfig(
+            model_type="qwen2",
+            hidden_size=3584,
+            num_hidden_layers=5,
+            intermediate_size=18944,
+            num_attention_heads=28,
+            rms_norm_eps=1e-6,
+            max_window_layers=16,
+            use_sliding_window=False,
+            vocab_size=151674,
+            num_key_value_heads=4,
+            rope_theta=1000000.0,
+            rope_scaling={"factor": 2.0, "rope_type": "dynamic", "type": "dynamic"},
+            hidden_act="silu",
+            max_position_embeddings=32768,
+        )
+
+        vision_config = internvl_chat.VisionConfig(
+            model_type="intern_vit_6b",
+            num_hidden_layers=5,
+            hidden_size=1152,
+            intermediate_size=4304,
+            num_attention_heads=16,
+            image_size=384,
+            patch_size=14,
+            num_channels=3,
+            layer_norm_eps=1e-6,
+        )
+
+        config = internvl_chat.ModelConfig(
+            text_config=test_config,
+            vision_config=vision_config,
+            model_type="internvl_chat",
+            ignore_index=-100,
+            image_token_index=151667,
+        )
+
+        model = internvl_chat.Model(config)
 
         self.language_test_runner(
             model.language_model,
@@ -1062,6 +1132,100 @@ class TestModels(unittest.TestCase):
             config.vision_config.hidden_size,
             config.vision_config.num_channels,
             (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
+    def test_llama4(self):
+        from mlx_vlm.models import llama4
+
+        text_config = llama4.TextConfig(
+            model_type="llama4_text",
+            hidden_size=5120,
+            num_hidden_layers=3,
+            intermediate_size=8192,
+            intermediate_size_mlp=16384,
+            num_attention_heads=40,
+            num_key_value_heads=8,
+            rms_norm_eps=1e-05,
+            vocab_size=32000,
+            attention_chunk_size=8192,
+            attention_dropout=0.0,
+            head_dim=128,
+            hidden_act="silu",
+            attention_bias=False,
+        )
+        vision_config = llama4.VisionConfig(
+            model_type="llama4_vision_model",
+            image_size=336,
+            patch_size=14,
+            num_channels=3,
+            num_hidden_layers=3,
+            hidden_size=1408,
+            intermediate_size=5632,
+            num_attention_heads=16,
+            norm_eps=1e-05,
+            initializer_range=0.02,
+            pixel_shuffle_ratio=0.5,
+            projector_input_dim=4096,
+            projector_output_dim=4096,
+            projector_dropout=0.0,
+            vision_output_dim=4096,
+            rope_theta=10000,
+            vision_feature_layer=-1,
+            vision_feature_select_strategy="default",
+        )
+        config = llama4.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="llama4",
+        )
+        model = llama4.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_model,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+            channel_first=True,
+            projector_output_dim=config.vision_config.projector_output_dim,
+        )
+
+    def test_kimi_vl(self):
+        from mlx_vlm.models import kimi_vl
+
+        text_config = kimi_vl.TextConfig()
+        vision_config = kimi_vl.VisionConfig()
+        config = kimi_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="kimi_vl",
+        )
+        model = kimi_vl.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.patch_size, config.vision_config.patch_size),
+            grid_thw=mx.array(
+                [[20, 28], [22, 28]], dtype=mx.int64
+            ),  # image temporals shape (num_images, 3)
+            batch_size=1176,
         )
 
     def test_gemma3(self):

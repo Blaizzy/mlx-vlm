@@ -5,7 +5,8 @@ from typing import Any, Dict, List, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, LanguageModelOutput, RotatingKVCache, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache, RotatingKVCache
 
 
 @dataclass
@@ -106,8 +107,9 @@ class Attention(nn.Module):
             keys = self.rope(keys)
 
         # Sliding window
-        if mask is not None and mask.shape[-1] != keys.shape[-2]:
-            mask = mask[..., -keys.shape[-2] :]
+        if mask is not None and isinstance(mask, mx.array):
+            if mask.shape[-1] != keys.shape[-2]:
+                mask = mask[..., -keys.shape[-2] :]
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
@@ -289,12 +291,7 @@ class LanguageModel(nn.Module):
                 i % self.config.sliding_window_pattern
                 == self.config.sliding_window_pattern - 1
             ):
-                caches.append(
-                    KVCache(
-                        head_dim=self.config.head_dim,
-                        n_kv_heads=self.config.num_key_value_heads,
-                    )
-                )
+                caches.append(KVCache())
             else:
                 caches.append(
                     RotatingKVCache(

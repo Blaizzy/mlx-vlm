@@ -6,7 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import KVCache, LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache
 
 
 @dataclass
@@ -92,7 +93,7 @@ class Attention(nn.Module):
 
         offset = cache.offset if cache else 0
 
-        if mask is not None:
+        if mask is not None and isinstance(mask, mx.array):
             mask = mask[..., : keys.shape[-2]]
 
         queries = self.rotary_emb(queries, offset=offset)
