@@ -5,6 +5,7 @@ from functools import partial
 from math import sqrt
 from typing import Dict, Optional, Union
 
+import cv2
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
