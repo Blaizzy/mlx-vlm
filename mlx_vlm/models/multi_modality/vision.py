@@ -388,7 +388,7 @@ class HybridVisionModel(nn.Module):
 #     return resized_image
 
 
-# TOOD: Match the output of scipy.ndimage.zoom
+# TODO: Match the output of scipy.ndimage.zoom
 def resize_image(image, size, antialias=True):
     """
     Resize an image with OpenCV.
