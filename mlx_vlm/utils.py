@@ -310,13 +310,16 @@ def load(
     model_path = get_model_path(path_or_hf_repo)
 
     model = load_model(model_path, lazy, **kwargs)
+    config = load_config(model_path, **kwargs)
     if adapter_path is not None:
         # TODO: Support more modules than just language_model
         model = apply_lora_layers(model, adapter_path)
         model.eval()
 
     image_processor = load_image_processor(model_path, **kwargs)
-    processor = load_processor(model_path, True, **kwargs)
+    processor = load_processor(
+        model_path, True, eos_token_ids=config.get("eos_token_id", None), **kwargs
+    )
 
     if image_processor is not None:
         processor.image_processor = image_processor
@@ -376,7 +379,7 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 
 
 def load_processor(
-    model_path, add_detokenizer=True, **kwargs
+    model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
 
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
@@ -384,8 +387,18 @@ def load_processor(
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
         if "tokenizer" in processor.__dict__.keys():
             processor.detokenizer = detokenizer_class(processor.tokenizer)
+            eos_token_ids = (
+                eos_token_ids
+                if eos_token_ids is not None
+                else processor.tokenizer.eos_token_ids
+            )
+            processor.tokenizer.stopping_criteria = StoppingCriteria(eos_token_ids)
         else:
             processor.detokenizer = detokenizer_class(processor)
+            eos_token_ids = (
+                eos_token_ids if eos_token_ids is not None else processor.eos_token_ids
+            )
+            processor.stopping_criteria = StoppingCriteria(eos_token_ids)
     return processor
 
 
@@ -394,7 +407,12 @@ def fetch_from_hub(
 ) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
     model = load_model(model_path, lazy, **kwargs)
     config = load_config(model_path, **kwargs)
-    processor = load_processor(model_path, add_detokenizer=False, **kwargs)
+    processor = load_processor(
+        model_path,
+        add_detokenizer=False,
+        eos_token_ids=config.get("eos_token_id", None),
+        **kwargs,
+    )
     return model, config, processor
 
 
@@ -1055,6 +1073,17 @@ def generate_step(
         n += 1
 
 
+class StoppingCriteria:
+    def __init__(self, eos_token_ids: List[int]):
+        if isinstance(eos_token_ids, int):
+            self.eos_token_ids = [eos_token_ids]
+        else:
+            self.eos_token_ids = eos_token_ids
+
+    def __call__(self, input_ids: mx.array) -> bool:
+        return input_ids in self.eos_token_ids
+
+
 def stream_generate(
     model: nn.Module,
     processor: PreTrainedTokenizer,
@@ -1076,6 +1105,7 @@ def stream_generate(
         Generator[Tuple[mx.array, mx.array]]: A generator producing text.
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
     add_special_tokens = (
         not hasattr(processor, "chat_template")
         if model.config.model_type == "gemma3"
@@ -1122,7 +1152,8 @@ def stream_generate(
                 prompt_tps = input_ids.size / prompt_time
                 tic = time.perf_counter()
 
-            if token == tokenizer.eos_token_id:
+            # Stop generation if the token is in the eos_token_ids
+            if tokenizer.stopping_criteria(token):
                 break
 
             detokenizer.add_token(token)
