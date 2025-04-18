@@ -392,13 +392,15 @@ def load_processor(
                 if eos_token_ids is not None
                 else processor.tokenizer.eos_token_ids
             )
-            processor.tokenizer.stopping_criteria = StoppingCriteria(eos_token_ids)
+            processor.tokenizer.stopping_criteria = StoppingCriteria(
+                eos_token_ids, processor.tokenizer
+            )
         else:
             processor.detokenizer = detokenizer_class(processor)
             eos_token_ids = (
                 eos_token_ids if eos_token_ids is not None else processor.eos_token_ids
             )
-            processor.stopping_criteria = StoppingCriteria(eos_token_ids)
+            processor.stopping_criteria = StoppingCriteria(eos_token_ids, processor)
     return processor
 
 
@@ -1074,11 +1076,35 @@ def generate_step(
 
 
 class StoppingCriteria:
-    def __init__(self, eos_token_ids: List[int]):
+    def __init__(self, eos_token_ids: List[int], tokenizer=None):
         if isinstance(eos_token_ids, int):
             self.eos_token_ids = [eos_token_ids]
         else:
             self.eos_token_ids = eos_token_ids
+        self.tokenizer = tokenizer
+
+    def add_eos_token_ids(self, new_eos_token_ids: Union[int, List[int]] = None):
+        """
+        Add new token IDs to the list of EOS token IDs.
+
+        Args:
+            new_eos_token_ids: Integer, string, or list of integers/strings representing token IDs to add.
+                               If strings are provided, they will be converted to integers if possible.
+        """
+        if new_eos_token_ids is None:
+            pass
+
+        if self.tokenizer is None:
+            raise ValueError("Processor is not provided")
+
+        if new_eos_token_ids is not None:
+            if isinstance(new_eos_token_ids, str):
+                new_eos_token_ids = [new_eos_token_ids]
+            new_eos_token_ids = [
+                self.tokenizer.encode(" " + token, add_special_tokens=False)[0]
+                for token in new_eos_token_ids
+            ]
+            self.eos_token_ids.extend(new_eos_token_ids)
 
     def __call__(self, input_ids: mx.array) -> bool:
         return input_ids in self.eos_token_ids
@@ -1235,6 +1261,13 @@ def generate(
 
     text = ""
     last_response = None
+
+    # Add custom EOS tokens to the stopping criteria
+    eos_tokens = kwargs.get("eos_tokens", None)
+    if hasattr(processor, "tokenizer"):
+        processor.tokenizer.stopping_criteria.add_eos_token_ids(eos_tokens)
+    else:
+        processor.stopping_criteria.add_eos_token_ids(eos_tokens)
 
     for response in stream_generate(model, processor, prompt, image, **kwargs):
         if verbose:
