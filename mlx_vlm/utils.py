@@ -310,16 +310,17 @@ def load(
     model_path = get_model_path(path_or_hf_repo)
 
     model = load_model(model_path, lazy, **kwargs)
-    config = load_config(model_path, **kwargs)
     if adapter_path is not None:
         # TODO: Support more modules than just language_model
         model = apply_lora_layers(model, adapter_path)
         model.eval()
 
     image_processor = load_image_processor(model_path, **kwargs)
-    processor = load_processor(
-        model_path, True, eos_token_ids=config.get("eos_token_id", None), **kwargs
-    )
+
+    # Get the eos_token_id from the model config
+    eos_token_id = getattr(model.config, "eos_token_id", None)
+
+    processor = load_processor(model_path, True, eos_token_ids=eos_token_id, **kwargs)
 
     if image_processor is not None:
         processor.image_processor = image_processor
