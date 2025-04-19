@@ -5,10 +5,10 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import LanguageModelOutput, create_attention_mask
 from ..cache import KVCache, RotatingKVCache
-from ..switch_layers import SwitchGLU
 
 
 @dataclass
