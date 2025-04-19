@@ -1258,6 +1258,8 @@ def generate(
     eos_tokens = kwargs.get("eos_tokens", None)
     stopping_criteria = kwargs.get("stopping_criteria", None)
 
+    # TODO: Reset if both eos_tokens and stopping_criteria are None
+
     # Get the tokenizer
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
