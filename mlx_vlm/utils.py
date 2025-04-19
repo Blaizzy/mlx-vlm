@@ -1113,10 +1113,10 @@ def stream_generate(
 
     eos_token_ids = {processor.tokenizer.eos_token_id}
     # config is more accurate as it can hold multiple eos tokens
-    eos_config = config.get("eos_token_id", None)
-    if eos_config is not None:
-        eos_config = eos_config if isinstance(eos_config, list) else [eos_config]
-        eos_token_ids.update(eos_config)
+    cfg_ids = config.get("eos_token_id", None)
+    if cfg_ids is not None:
+        cfg_ids = cfg_ids if isinstance(cfg_ids, list) else [cfg_ids]
+        eos_token_ids.update(cfg_ids if isinstance(cfg_ids, list) else [cfg_ids])
 
     with wired_limit(model, [generation_stream]):
         detokenizer = processor.detokenizer
