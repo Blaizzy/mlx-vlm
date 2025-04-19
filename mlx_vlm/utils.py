@@ -1101,7 +1101,7 @@ class StoppingCriteria:
             if isinstance(new_eos_token_ids, str):
                 new_eos_token_ids = [new_eos_token_ids]
             new_eos_token_ids = [
-                self.tokenizer.encode(" " + token, add_special_tokens=False)[0]
+                self.tokenizer.encode(" " + token, add_special_tokens=False)[-1]
                 for token in new_eos_token_ids
             ]
             self.eos_token_ids.extend(new_eos_token_ids)
