@@ -1267,11 +1267,13 @@ def generate(
 
     # Use custom stopping criteria
     if stopping_criteria is not None:
-        if isinstance(stopping_criteria, StoppingCriteria):
+        if isinstance(stopping_criteria, StoppingCriteria) or callable(
+            stopping_criteria
+        ):
             tokenizer.stopping_criteria = stopping_criteria
         else:
             raise ValueError(
-                "stopping_criteria must be an instance of StoppingCriteria"
+                "stopping_criteria must be an instance of StoppingCriteria or a callable"
             )
 
     for response in stream_generate(model, processor, prompt, image, **kwargs):
