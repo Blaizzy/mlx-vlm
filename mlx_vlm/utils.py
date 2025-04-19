@@ -385,22 +385,27 @@ def load_processor(
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
-        if "tokenizer" in processor.__dict__.keys():
-            processor.detokenizer = detokenizer_class(processor.tokenizer)
-            eos_token_ids = (
-                eos_token_ids
-                if eos_token_ids is not None
-                else processor.tokenizer.eos_token_ids
-            )
-            processor.tokenizer.stopping_criteria = StoppingCriteria(
-                eos_token_ids, processor.tokenizer
-            )
+
+        # Get the tokenizer object
+        tokenizer_obj = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+
+        # Instantiate the detokenizer
+        processor.detokenizer = detokenizer_class(tokenizer_obj)
+
+        # Determine the EOS token IDs, prioritizing the function argument
+        final_eos_token_ids = (
+            eos_token_ids if eos_token_ids is not None else tokenizer_obj.eos_token_ids
+        )
+
+        # Create and assign the StoppingCriteria
+        criteria = StoppingCriteria(final_eos_token_ids, tokenizer_obj)
+        if hasattr(processor, "tokenizer"):
+            processor.tokenizer.stopping_criteria = criteria
         else:
-            processor.detokenizer = detokenizer_class(processor)
-            eos_token_ids = (
-                eos_token_ids if eos_token_ids is not None else processor.eos_token_ids
-            )
-            processor.stopping_criteria = StoppingCriteria(eos_token_ids, processor)
+            processor.stopping_criteria = criteria
+
     return processor
 
 
