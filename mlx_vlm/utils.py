@@ -1255,12 +1255,24 @@ def generate(
     text = ""
     last_response = None
 
-    # Add custom EOS tokens to the stopping criteria
     eos_tokens = kwargs.get("eos_tokens", None)
-    if hasattr(processor, "tokenizer"):
-        processor.tokenizer.stopping_criteria.add_eos_token_ids(eos_tokens)
-    else:
-        processor.stopping_criteria.add_eos_token_ids(eos_tokens)
+    stopping_criteria = kwargs.get("stopping_criteria", None)
+
+    # Get the tokenizer
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+    # Add custom EOS tokens to the stopping criteria
+    if eos_tokens is not None:
+        tokenizer.stopping_criteria.add_eos_token_ids(eos_tokens)
+
+    # Use custom stopping criteria
+    if stopping_criteria is not None:
+        if isinstance(stopping_criteria, StoppingCriteria):
+            tokenizer.stopping_criteria = stopping_criteria
+        else:
+            raise ValueError(
+                "stopping_criteria must be an instance of StoppingCriteria"
+            )
 
     for response in stream_generate(model, processor, prompt, image, **kwargs):
         if verbose:
