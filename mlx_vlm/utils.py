@@ -1111,6 +1111,12 @@ class StoppingCriteria:
             ]
             self.eos_token_ids.extend(new_eos_token_ids)
 
+    def reset(self, eos_token_ids: List[int]):
+        if eos_token_ids is None:
+            raise ValueError("Failed to reset stopping criteria: eos_token_ids is None")
+        if self.eos_token_ids != eos_token_ids:
+            self.eos_token_ids = eos_token_ids
+
     def __call__(self, input_ids: mx.array) -> bool:
         return input_ids in self.eos_token_ids
 
@@ -1258,8 +1264,6 @@ def generate(
     eos_tokens = kwargs.get("eos_tokens", None)
     stopping_criteria = kwargs.get("stopping_criteria", None)
 
-    # TODO: Reset if both eos_tokens and stopping_criteria are None
-
     # Get the tokenizer
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
@@ -1268,7 +1272,7 @@ def generate(
         tokenizer.stopping_criteria.add_eos_token_ids(eos_tokens)
 
     # Use custom stopping criteria
-    if stopping_criteria is not None:
+    elif stopping_criteria is not None:
         if isinstance(stopping_criteria, StoppingCriteria) or callable(
             stopping_criteria
         ):
@@ -1277,6 +1281,8 @@ def generate(
             raise ValueError(
                 "stopping_criteria must be an instance of StoppingCriteria or a callable"
             )
+    else:
+        tokenizer.stopping_criteria.reset(model.config.eos_token_id)
 
     for response in stream_generate(model, processor, prompt, image, **kwargs):
         if verbose:
