@@ -1060,6 +1060,7 @@ def stream_generate(
     processor: PreTrainedTokenizer,
     prompt: str,
     image: Union[str, List[str]] = None,
+    config: Dict = None,
     **kwargs,
 ) -> Union[str, Generator[str, None, None]]:
     """
@@ -1110,6 +1111,13 @@ def stream_generate(
         pixel_values = kwargs.pop("pixel_values")
         mask = kwargs.pop("mask")
 
+    eos_token_ids = {processor.tokenizer.eos_token_id}
+    # config is more accurate as it can hold multiple eos tokens
+    eos_config = config.get("eos_token_id", None)
+    if eos_config is not None:
+        eos_config = eos_config if isinstance(eos_config, list) else [eos_config]
+        eos_token_ids.update(eos_config)
+
     with wired_limit(model, [generation_stream]):
         detokenizer = processor.detokenizer
         detokenizer.reset()
@@ -1122,7 +1130,7 @@ def stream_generate(
                 prompt_tps = input_ids.size / prompt_time
                 tic = time.perf_counter()
 
-            if token == tokenizer.eos_token_id:
+            if token in eos_token_ids:
                 break
 
             detokenizer.add_token(token)
@@ -1168,6 +1176,7 @@ def generate(
     model: nn.Module,
     processor: PreTrainedTokenizer,
     prompt: str,
+    config: Dict = None,
     image: Union[str, List[str]] = None,
     verbose: bool = False,
     **kwargs,
@@ -1179,6 +1188,7 @@ def generate(
        model (nn.Module): The language model.
        tokenizer (PreTrainedTokenizer): The tokenizer.
        prompt (str): The string prompt.
+       config (Dict): The model config.
        temperature (float): The temperature for sampling (default 0).
        max_tokens (int): The maximum number of tokens (default 100).
        verbose (bool): If ``True``, print tokens and timing information
@@ -1205,7 +1215,7 @@ def generate(
     text = ""
     last_response = None
 
-    for response in stream_generate(model, processor, prompt, image, **kwargs):
+    for response in stream_generate(model, processor, prompt, image, config=config, **kwargs):
         if verbose:
             print(response.text, end="", flush=True)
         text += response.text

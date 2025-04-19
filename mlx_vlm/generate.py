@@ -142,6 +142,7 @@ def main():
             model,
             processor,
             prompt,
+            config=config,
             image=args.image,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
