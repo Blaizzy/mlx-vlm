@@ -1083,10 +1083,12 @@ def generate_step(
 
 class StoppingCriteria:
     def __init__(self, eos_token_ids: List[int], tokenizer=None):
+
         if isinstance(eos_token_ids, int):
             self.eos_token_ids = [eos_token_ids]
         else:
             self.eos_token_ids = eos_token_ids
+
         self.tokenizer = tokenizer
 
     def add_eos_token_ids(self, new_eos_token_ids: Union[int, List[int]] = None):
@@ -1112,9 +1114,14 @@ class StoppingCriteria:
             ]
             self.eos_token_ids.extend(new_eos_token_ids)
 
-    def reset(self, eos_token_ids: List[int]):
-        if eos_token_ids is None:
-            raise ValueError("Failed to reset stopping criteria: eos_token_ids is None")
+    def reset(self, eos_token_ids: List[int] = None):
+        eos_token_ids = (
+            eos_token_ids if eos_token_ids is not None else self.tokenizer.eos_token_ids
+        )
+
+        if isinstance(eos_token_ids, int):
+            eos_token_ids = [eos_token_ids]
+
         if self.eos_token_ids != eos_token_ids:
             self.eos_token_ids = eos_token_ids
 
