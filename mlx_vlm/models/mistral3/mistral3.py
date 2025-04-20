@@ -26,6 +26,7 @@ class ModelConfig:
     vocab_size: int = 32000
     spatial_merge_size: int = 2
     multimodal_projector_bias: bool = False
+    eos_token_id: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, params):
