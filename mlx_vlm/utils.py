@@ -28,7 +28,7 @@ from transformers import (
 
 
 from .models.base import BaseImageProcessor, KVCache, SimpleKVCache
-from .sample_utils import top_p_sampling, make_sampler
+from .sample_utils import top_p_sampling, apply_top_k, apply_top_p, apply_min_p
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
 
@@ -940,6 +940,8 @@ def generate_step(
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
+    min_p: float = 0.0,
+    top_k: int = -1,
     logit_bias: Optional[Dict[int, float]] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -957,6 +959,10 @@ def generate_step(
           consider for repetition penalty. Default: ``20``.
         top_p (float, optional): Nulceus sampling, higher means model considers
           more less likely words.
+        min_p (float, optional): The minimum value (scaled by the top token's
+          probability) that a token probability must have to be considered.
+        top_k (int, optional): The top k tokens ranked by probability to constrain
+          the sampling to.
         logit_bias (dictionary, optional): Additive logit bias.
 
     Yields:
@@ -974,10 +980,18 @@ def generate_step(
         if temperature == 0:
             token = mx.argmax(logits, axis=-1)
         else:
+            sampling_methods = []
+            if top_k > 0:
+                sampling_methods.append(apply_top_k(logits, top_k))
             if top_p > 0 and top_p < 1.0:
-                token = top_p_sampling(logits, top_p, temperature)
-            else:
-                token = mx.random.categorical(logits * (1 / temperature))
+                sampling_methods.append(apply_top_p(logits, top_p))
+            if min_p != 0.0:
+                sampling_methods.append(apply_min_p(logits, min_p, min_tokens_to_keep=1))
+                
+            for method in sampling_methods:
+                logits = method(logits)
+                
+            token = mx.random.categorical(logits * (1 / temperature))
 
         return token, logprobs
 
