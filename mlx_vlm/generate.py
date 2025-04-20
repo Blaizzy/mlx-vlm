@@ -76,7 +76,13 @@ def parse_arguments():
     )
     parser.add_argument("--chat", action="store_true", help="Chat in multi-turn style.")
     parser.add_argument("--verbose", action="store_false", help="Detailed output.")
-
+    parser.add_argument(
+        "--eos-tokens",
+        type=str,
+        nargs="+",
+        default=None,
+        help="EOS tokens to add to the tokenizer.",
+    )
     return parser.parse_args()
 
 
@@ -110,6 +116,11 @@ def main():
             if len(args.resize_shape) == 1
             else tuple(args.resize_shape)
         )
+
+    if args.eos_tokens is not None:
+        kwargs["eos_tokens"] = [
+            codecs.decode(token, "unicode_escape") for token in args.eos_tokens
+        ]
 
     if args.chat:
         chat = []
