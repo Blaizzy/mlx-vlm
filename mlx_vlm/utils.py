@@ -27,7 +27,8 @@ from transformers import (
 )
 
 
-from .models.base import BaseImageProcessor, KVCache, SimpleKVCache
+from .models.base import BaseImageProcessor
+from .models.cache import KVCache, SimpleKVCache
 from .sample_utils import top_p_sampling, apply_top_k, apply_top_p, apply_min_p
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
