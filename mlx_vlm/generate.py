@@ -83,6 +83,12 @@ def parse_arguments():
         default=None,
         help="EOS tokens to add to the tokenizer.",
     )
+    parser.add_argument(
+        "--skip-special-tokens",
+        action="store_true",
+        help="Skip special tokens in the detokenizer.",
+    )
+
     return parser.parse_args()
 
 
@@ -121,6 +127,9 @@ def main():
         kwargs["eos_tokens"] = [
             codecs.decode(token, "unicode_escape") for token in args.eos_tokens
         ]
+
+    if args.skip_special_tokens:
+        kwargs["skip_special_tokens"] = args.skip_special_tokens
 
     if args.chat:
         chat = []
