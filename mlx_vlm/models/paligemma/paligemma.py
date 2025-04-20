@@ -3,7 +3,7 @@ import inspect
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -23,6 +23,7 @@ class ModelConfig:
     image_token_index: int = 257152
     hidden_size: int = 2048
     pad_token_id: int = 0
+    eos_token_id: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, params):
