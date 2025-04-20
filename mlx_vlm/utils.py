@@ -27,8 +27,7 @@ from transformers import (
 )
 
 
-from .models.base import BaseImageProcessor
-from .models.cache import KVCache, SimpleKVCache
+from .models.base import BaseImageProcessor, KVCache, SimpleKVCache
 from .sample_utils import top_p_sampling, apply_top_k, apply_top_p, apply_min_p
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
@@ -935,6 +934,8 @@ def generate_step(
     mask,
     *,
     max_tokens: int = 256,
+    sampler: Optional[Callable[mx.array, mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     temperature: float = 0.0,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
