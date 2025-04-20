@@ -1,5 +1,6 @@
 import inspect
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
@@ -130,6 +131,23 @@ class MLP(nn.Module):
         return self.down_proj(nn.gelu_approx(self.gate_proj(x)) * self.up_proj(x))
 
 
+@partial(mx.compile, shapeless=True)
+def clip_residual(x, y=None):
+    bound = mx.finfo(mx.float16).max
+    if y is None:
+        if x.dtype == mx.float16:
+            return mx.clip(x.astype(mx.float32), -bound, bound).astype(mx.float16)
+        else:
+            return x
+
+    if x.dtype != mx.float16:
+        return x + y
+
+    return mx.clip(x.astype(mx.float32) + y.astype(mx.float32), -bound, bound).astype(
+        mx.float16
+    )
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
@@ -162,31 +180,21 @@ class TransformerBlock(nn.Module):
         # convert back to float16 to maintain numerical stability.
 
         # Clip input to avoid overflow in float16
-        x = mx.clip(x, -65504, 65504) if x.dtype == mx.float16 else x
+        x = clip_residual(x)
 
         # Self-attention block
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = self.post_attention_layernorm(r)
 
         # Add residual connection with overflow protection for float16
-        if h.dtype == mx.float16:
-            h = mx.clip(
-                x.astype(mx.float32) + h.astype(mx.float32), -65504, 65504
-            ).astype(mx.float16)
-        else:
-            h = x + h
+        h = clip_residual(x + h)
 
         # MLP block
         r = self.mlp(self.pre_feedforward_layernorm(h))
         out = self.post_feedforward_layernorm(r)
 
         # Add residual connection with overflow protection for float16
-        if out.dtype == mx.float16:
-            out = mx.clip(
-                h.astype(mx.float32) + out.astype(mx.float32), -65504, 65504
-            ).astype(mx.float16)
-        else:
-            out = h + out
+        out = clip_residual(h + out)
 
         return out
 
