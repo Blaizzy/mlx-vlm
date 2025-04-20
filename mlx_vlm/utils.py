@@ -1151,6 +1151,14 @@ def stream_generate(
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
+    # Skip special tokens
+    skip_special_tokens = kwargs.pop("skip_special_tokens", False)
+    skip_special_token_ids = (
+        set(tokenizer.all_special_ids)
+        if skip_special_tokens and hasattr(tokenizer, "all_special_ids")
+        else []
+    )
+
     add_special_tokens = (
         not hasattr(processor, "chat_template")
         if model.config.model_type == "gemma3"
@@ -1201,7 +1209,7 @@ def stream_generate(
             if tokenizer.stopping_criteria(token):
                 break
 
-            detokenizer.add_token(token)
+            detokenizer.add_token(token, skip_special_token_ids=skip_special_token_ids)
 
             # Yield the last segment if streaming
             yield GenerationResult(
