@@ -128,10 +128,29 @@ def generate_grpo(
                 pixel_values = mx.repeat(img, group_size, axis=0)
             else:
                 pixel_values = None
-            if pixel_values is None:
-                print("[DEBUG] pixel_values is None")
+            # Handle pixel_values and compute grid_thw if possible
+            if pixel_values is None or not hasattr(pixel_values, 'ndim') or pixel_values.ndim < 4:
+                print(f"[DEBUG] pixel_values is None or too few dims ({None if pixel_values is None else pixel_values.shape}); skipping grid_thw")
+                grid_thw = None
             else:
-                print(f"[DEBUG] pixel_values shape: {pixel_values.shape}")
+                print(f"[DEBUG] pixel_values shape: {pixel_values.shape}; computing grid_thw")
+                # Determine patch size
+                if hasattr(model, 'vision_tower') and hasattr(model.vision_tower, 'patch_embed') and hasattr(model.vision_tower.patch_embed, 'patch_size'):
+                    patch_size = model.vision_tower.patch_embed.patch_size
+                    # Normalize to two-element tuple
+                    if isinstance(patch_size, int):
+                        patch_size = (patch_size, patch_size)
+                    elif hasattr(patch_size, '__len__') and len(patch_size) == 1:
+                        patch_size = (patch_size[0], patch_size[0])
+                    elif hasattr(patch_size, '__len__') and len(patch_size) > 2:
+                        patch_size = tuple(patch_size[:2])
+                else:
+                    patch_size = (pixel_values.shape[2], pixel_values.shape[3])
+                # Compute grid dimensions
+                grid_h = pixel_values.shape[2] // patch_size[0]
+                grid_w = pixel_values.shape[3] // patch_size[1]
+                # Static time dimension=1 for single-image inputs
+                grid_thw = [(t, h, w) for t in range(1) for h in range(grid_h) for w in range(grid_w)]
  
             # Expand for group_size
             expanded_prompts = mx.repeat(prompt_tensor, group_size, axis=0)
@@ -141,6 +160,7 @@ def generate_grpo(
             batch_results = []
             for g_idx in range(group_size):
                 from ..utils import generate_step
+                kwargs = {'grid_thw': grid_thw}
 
                 current_tokens = []
                 # Stream tokens and logprobs from generate_step
