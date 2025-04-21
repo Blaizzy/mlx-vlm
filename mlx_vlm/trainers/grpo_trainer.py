@@ -88,7 +88,12 @@ def generate_step_grpo(
     logit_bias: Optional[Dict[int, float]] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
-    from ..models.base import KVCache, SimpleKVCache
+    from ..models.base import SimpleKVCache
+
+    try:
+        from ..models.base import KVCache
+    except ImportError:
+        KVCache = SimpleKVCache
     from ..utils import top_p_sampling, apply_repetition_penalty
 
     def sample(logits: mx.array) -> Tuple[mx.array, float]:
@@ -166,7 +171,10 @@ def generate_step_grpo(
                 repetition_context = repetition_context[-repetition_context_size:]
         return y.item(), logprobs.squeeze(0)
 
-    outputs = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
+    if pixel_values is not None and mask is not None:
+        outputs = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
+    else:
+        outputs = model(input_ids, cache=cache, **kwargs)
 
     logits = outputs.logits[:, -1, :]
     y, logprobs = sample(logits)
