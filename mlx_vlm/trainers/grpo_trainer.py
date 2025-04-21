@@ -88,10 +88,10 @@ def generate_grpo(
     group_size: int = 2,
     temperature: float = 0.8,
     batch_size: int = 1,
-    end_token: str = "</answer>"
+    end_token: str = "</answer>",
+    **kwargs
 ):
     try:
-        print(prompt_tokens)
         # Ensure masks list matches prompts if provided
         if prompt_masks is not None and len(prompt_masks) != len(prompt_tokens):
             raise ValueError("prompt_masks length must match prompt_tokens length")
@@ -105,28 +105,16 @@ def generate_grpo(
         # Sequential generation, one sample at a time
         for prompt_idx in range(total_samples):
             print(f"[DEBUG] Prompt {prompt_idx+1}/{total_samples}")
-            # Flatten and prepare prompt tokens
-            p = prompt_tokens[prompt_idx]
-            if isinstance(p, (mx.array, np.ndarray)):
-                p_list = p.tolist()
-            else:
-                p_list = p
-            if not isinstance(p_list, list):
-                p_list = list(p_list)
-            while p_list and isinstance(p_list[0], (list, tuple)):
-                p_list = [tok for sub in p_list for tok in sub]
-            int_tokens = [int(x) for x in p_list]
  
-            # Create tensors
-            prompt_tensor = mx.array([int_tokens])
+            # Convert the current prompt (list of token IDs) to an MXNet NDArray and reshape to [1, seq_len]
+            prompt_array = mx.array(prompt_tokens[prompt_idx])
+            prompt_tensor = prompt_array.reshape((1, -1))
             print(f"[DEBUG] prompt_tensor shape: {prompt_tensor.shape}")
             # Ensure mask tensor has shape (group_size, seq_len)
             if prompt_masks is not None:
                 m = prompt_masks[prompt_idx]
-                # Convert mask list to MXNet NDArray
-                mask_arr = mx.array(m)
                 # Reshape to [1, seq_len] then repeat to [group_size, seq_len]
-                mask_tensor = mask_arr.reshape((1, -1))
+                mask_tensor = m.reshape((1, -1))
                 mask_tensor = mx.repeat(mask_tensor, group_size, axis=0)
             else:
                 mask_tensor = None
@@ -151,42 +139,40 @@ def generate_grpo(
  
             # Generate group_size completions
             batch_results = []
-            for g_idx in range(expanded_prompts.shape[0]):
+            for g_idx in range(group_size):
+                from ..utils import generate_step
+
                 current_tokens = []
-                try:
-                    from ..utils import generate_step
-                    print(f"[DEBUG] Calling generate_step for prompt_idx={prompt_idx}, group index={g_idx}")
-                    token_count = 0
-                    print(f"[DEBUG] generate_step inputs: prompt_shape={expanded_prompts[g_idx].shape}, pixel_values_shape={pixel_values.shape if pixel_values is not None else None}, mask_shape={mask_tensor.shape if mask_tensor is not None else None}")
-                    for y, logprobs in generate_step(
-                        expanded_prompts[g_idx],
-                        model,
-                        pixel_values,
-                        mask_tensor,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        grid_thw=(1, 14, 14)
-                    ):
-                        token_count += 1
-                        print(f"[DEBUG] generate_step yielded y={y}, logprobs={logprobs}")
-                        if y is None or (hasattr(y, "item") and mx.isnan(y).item()):
+                # Stream tokens and logprobs from generate_step
+                for y, logprobs in generate_step(
+                    input_ids=expanded_prompts[g_idx].reshape((1, -1)),
+                    model=model,
+                    pixel_values=pixel_values,
+                    mask=mask_tensor,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    **kwargs
+                ):
+                    # Stop if invalid
+                    if y is None or (hasattr(y, "item") and mx.isnan(y).item()):
+                        break
+                    # Convert token to Python int
+                    token_id = int(y.asnumpy()) if hasattr(y, 'asnumpy') else int(y)
+                    current_tokens.append(token_id)
+                    # Stop on EOS token
+                    if token_id == processor.tokenizer.eos_token_id:
+                        break
+                    # Stop if end_sequence is generated
+                    if len(current_tokens) >= len(end_sequence):
+                        # compare last tokens to end_sequence
+                        tail = current_tokens[-len(end_sequence):]
+                        seq_ids = end_sequence.asnumpy().tolist()
+                        if tail == seq_ids:
                             break
-                        current_tokens.append(y)
-                        if y == processor.tokenizer.eos_token_id:
-                            break
-                        if len(current_tokens) >= len(end_sequence) and mx.array_equal(
-                            mx.array(current_tokens[-len(end_sequence):]), end_sequence
-                        ):
-                            break
-                    if token_count == 0:
-                        print("[DEBUG] generate_step yielded no tokens")
-                    else:
-                        print(f"[DEBUG] generate_step yielded {token_count} tokens")
-                    print(f"[DEBUG] Collected {len(current_tokens)} tokens for this group")
-                except Exception:
-                    pass
+                    
+                print(f"[DEBUG] Prompt {prompt_idx}, Group {g_idx}: Collected {len(current_tokens)} tokens: {current_tokens}")
                 if current_tokens:
-                    batch_results.append(mx.array(current_tokens))
+                    batch_results.append(mx.array(current_tokens, dtype=mx.int32))
  
             # Collect completions
             for completion_ids in batch_results:
