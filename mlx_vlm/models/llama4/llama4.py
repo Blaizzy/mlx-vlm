@@ -22,6 +22,7 @@ class ModelConfig:
     ignore_index: int = -100
     image_token_id: int = 200092
     image_token_index: Optional[int] = None
+    eos_token_id: Optional[List[int]] = None
 
     def __post_init__(self):
         if self.image_token_index is None:
