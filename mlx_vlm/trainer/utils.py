@@ -156,6 +156,8 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
         config = json.load(f)
         if "rank" not in config:
             raise ValueError("The adapter does not have lora params in the config")
+        if "resume_adapter_file" not in config:
+            config["resume_adapter_file"] = ""
 
     # TODO: add lora params to the config and load them here
     list_of_modules = find_all_linear_names(model.language_model.model)
