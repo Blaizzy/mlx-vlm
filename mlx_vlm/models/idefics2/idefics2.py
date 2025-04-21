@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -46,6 +46,7 @@ class ModelConfig:
     image_token_id: int = 32001
     vocab_size: int = 151936
     image_token_index: Optional[int] = None
+    eos_token_id: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, params):

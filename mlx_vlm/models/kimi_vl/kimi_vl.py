@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -26,6 +26,7 @@ class ModelConfig:
     scale_factor: int = 2
     media_placeholder_token_id: int = 163606
     image_token_index: Optional[int] = None
+    eos_token_id: Optional[List[int]] = None
 
     def __post_init__(self):
         if self.image_token_index is None:
