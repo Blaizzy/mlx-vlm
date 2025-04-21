@@ -13,6 +13,7 @@ from typing import (
     TypedDict, 
     Required
 )
+import uuid
 import uvicorn
 import gc
 import mlx.core as mx
@@ -20,7 +21,7 @@ import json
 import asyncio
 import traceback 
 import codecs
-import datetime
+from datetime import datetime
 from .utils import generate, stream_generate
 from .prompt_utils import apply_chat_template
 from .generate import (
@@ -109,14 +110,11 @@ def unload_model_sync():
     print("Model unloaded and cache cleared.")
     return True
 
-# API Models
+# OpenAI API Models
 
 class ResponseInputTextParam(TypedDict, total=False):
     text: Required[str]
-    """The text input to the model."""
-
-    type: Required[Literal["input_text"]]
-    """The type of the input item. Always `input_text`."""
+    type: Required[Literal["input_text"]]# The type of the input item. Always `input_text`.
 
 
 class ResponseInputImageParam(TypedDict, total=False):
@@ -125,20 +123,11 @@ class ResponseInputImageParam(TypedDict, total=False):
 
     One of `high`, `low`, or `auto`. Defaults to `auto`.
     """
-
-    type: Required[Literal["input_image"]]
-    """The type of the input item. Always `input_image`."""
-
+    type: Required[Literal["input_image"]]# The type of the input item. Always `input_image`.
     image_url: Required[str]
-    """The URL of the image to be sent to the model.
-
-    A fully qualified URL or base64 encoded image in a data URL.
-    """
-
     file_id: Optional[str]
     """The ID of the file to be sent to the model.
      NOTE : wouldn't this help the model if we passed the file_id as well to the vlm models
-    
     """
 
 ResponseInputContentParam: TypeAlias = Union[ResponseInputTextParam, ResponseInputImageParam]
@@ -147,10 +136,7 @@ ResponseInputMessageContentListParam: TypeAlias = List[ResponseInputContentParam
 
 class ResponseOutputText(TypedDict, total=False):
     text: Required[str]
-    """The text input to the model."""
-
-    type: Required[Literal["output_text"]]
-    """The type of the output item. Always `output_text`."""
+    type: Required[Literal["output_text"]]#The type of the output item. Always `output_text`
 
 ResponseOutputMessageContentList: TypeAlias = List[ResponseOutputText]
 
@@ -172,30 +158,6 @@ class OpenAIRequest(BaseModel):
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     resize_shape: Optional[Tuple[int, int]] = Field(None, description="Resize shape for the image (height, width). Provide two integers.")
     adapter_path: Optional[str] = Field(None, description="The path to the adapter weights.")
-
-class VLMRequest(BaseModel):
-    model: str = Field(DEFAULT_MODEL_PATH, description="The path to the local model directory or Hugging Face repo.")
-    adapter_path: Optional[str] = Field(None, description="The path to the adapter weights.")
-    image: List[str] = Field(default_factory=list, description="List of URLs or local paths of images to process.")
-    prompt: str = Field(DEFAULT_PROMPT, description="Message to be processed by the model.")
-    system: Optional[str] = Field(None, description="Optional system message for the model (used in chat structure).")
-    max_tokens: int = Field(DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate.")
-    temperature: float = Field(DEFAULT_TEMPERATURE, description="Temperature for sampling.")
-    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
-    seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
-    resize_shape: Optional[Tuple[int, int]] = Field(None, description="Resize shape for the image (height, width). Provide two integers.")
-
-class GenerationRequest(VLMRequest):
-    """
-    Inherits from VLMRequest and adds additional fields for the generation request.
-    """
-    stream: bool = Field(False, description="Whether to stream the response chunk by chunk.")
-
-class ChatRequest(GenerationRequest):
-    """
-    Inherits from GenerationRequest and adds fields specific to chat interactions.
-    """
-    prompt: List[ChatMessage] = Field(default_factory=list, description="List of chat messages for the conversation.")   
 
 class OpenAIUsage(BaseModel):
     """Token usage details including input tokens, output tokens, breakdown, and total tokens used."""
@@ -227,17 +189,84 @@ class OpenAIResponse(BaseModel):
     usage: OpenAIUsage = Field(..., description="Token usage details") # we need the model to return stats
     user: Optional[str] = Field(None, description="A unique identifier representing your end-user")
 
-class GenerationResponse(BaseModel):
+class BaseStreamEvent(BaseModel):
+    type: str
+
+class ContentPartOutputText(BaseModel):
+    type: Literal["output_text"]
     text: str
-    model: str
-    usage: Dict[str, Any] # Placeholder for verbose usage stats : we need the model to return stats
+    annotations: List[str] = []
 
-class StreamChunk(BaseModel):
-    chunk: str
-    model: str # placeholder (TBC).
+class MessageItem(BaseModel):
+    id: str
+    type: Literal["message"]
+    status: Literal["in_progress", "completed"]
+    role: str
+    content: List[ContentPartOutputText] = []
 
-# API endpoints
+class ResponseCreatedEvent(BaseStreamEvent):
+    type: Literal["response.created"]
+    response: OpenAIResponse
 
+class ResponseInProgressEvent(BaseStreamEvent):
+    type: Literal["response.in_progress"]
+    response: OpenAIResponse
+
+class ResponseOutputItemAddedEvent(BaseStreamEvent):
+    type: Literal["response.output_item.added"]
+    output_index: int
+    item: MessageItem
+
+class ResponseContentPartAddedEvent(BaseStreamEvent):
+    type: Literal["response.content_part.added"]
+    item_id: str
+    output_index: int
+    content_index: int
+    part: ContentPartOutputText
+
+class ResponseOutputTextDeltaEvent(BaseStreamEvent):
+    type: Literal["response.output_text.delta"]
+    item_id: str
+    output_index: int
+    content_index: int
+    delta: str
+
+class ResponseOutputTextDoneEvent(BaseStreamEvent):
+    type: Literal["response.output_text.done"]
+    item_id: str
+    output_index: int
+    content_index: int
+    text: str
+
+class ResponseContentPartDoneEvent(BaseStreamEvent):
+    type: Literal["response.content_part.done"]
+    item_id: str
+    output_index: int
+    content_index: int
+    part: ContentPartOutputText
+
+class ResponseOutputItemDoneEvent(BaseStreamEvent):
+    type: Literal["response.output_item.done"]
+    output_index: int
+    item: MessageItem
+
+class ResponseCompletedEvent(BaseStreamEvent):
+    type: Literal["response.completed"]
+    response: OpenAIResponse
+
+StreamEvent = Union[
+    ResponseCreatedEvent,
+    ResponseInProgressEvent,
+    ResponseOutputItemAddedEvent,
+    ResponseContentPartAddedEvent,
+    ResponseOutputTextDeltaEvent,
+    ResponseOutputTextDoneEvent,
+    ResponseContentPartDoneEvent,
+    ResponseOutputItemDoneEvent,
+    ResponseCompletedEvent
+]
+
+# OpenAI endpoint    
 @app.post("/responses") 
 async def openai_endpoint(request : Request):
     """
@@ -252,8 +281,9 @@ async def openai_endpoint(request : Request):
     API_URL = "http://0.0.0.0:8000"
     API_KEY = 'any'
 
-    def run_openai(prompt, img_url,system, model="mlx-community/Qwen2.5-VL-3B-Instruct-8bit"): 
-        ''' Calls the OpenAI API'''
+    def run_openai(prompt, img_url,system, stream=False, max_output_tokens=512, model="mlx-community/Qwen2.5-VL-3B-Instruct-8bit"): 
+        ''' Calls the OpenAI API 
+        '''
         
         client = OpenAI(base_url=f"{API_URL}", api_key=API_KEY)
         
@@ -272,9 +302,18 @@ async def openai_endpoint(request : Request):
                         ],
                     }
                 ], 
+                max_output_tokens=max_output_tokens,
+                stream=stream
             )
+            if stream:
+                for event in response:
+                    print(event)
+            
+            else:
+                output_text=response.output[0].content[0].text #Not sur why response.output_text _repr_ is ''
+                print(f"output_text: {output_text}")
 
-            return response.output_text
+            return 
             
         except Exception as e:
             # building a response object to match the one returned when request is successful so that it can be processed in the same way
@@ -312,49 +351,96 @@ async def openai_endpoint(request : Request):
             elif isinstance(openai_request.input, list):
                 # If input is a list, treat it as a series of chat messages
                 for message in openai_request.input:
-                    if isinstance(message, dict) and "role" in message and "content" in message:
-                        if isinstance(message["content"], str):
-                            chat_messages.append({"role": message["role"], "content": message["content"]})
-                            if message["role"] == "system":
-                                instructions = message["content"]
-                        elif isinstance(message["content"], list):
+                    if isinstance(message, ChatMessage):
+                        if isinstance(message.content, str):
+                            chat_messages.append({"role": message.role, "content": message.content})
+                            if message.role == "system":
+                                instructions = message.content
+                        elif isinstance(message.content, list):
                             # Handle list of content items
-                            for item in message["content"]:
-                                if isinstance(item, dict) and "type" in item :
-                                    if item["type"] == "input_text" and "text" in item:
-                                        chat_messages.append({"role": message["role"], "content": item["text"]})
-                                        if message["role"] == "system":
+                            for item in message.content:
+                                if isinstance(item, dict):
+                                    if item["type"] == "input_text" :
+                                        chat_messages.append({"role": message.role, "content": item["text"]})
+                                        if message.role == "system":
                                             instructions = item["text"]
                                     # examples for multiple images (https://platform.openai.com/docs/guides/images?api-mode=responses)
                                     elif item["type"] == "input_image":
                                         images.append(item["image_url"])
                                     else:
+                                        print(f"invalid input item type: {item["type"]}")
                                         raise HTTPException(status_code=400, detail="Invalid input item type.")
                                 else:
+                                    print(f"Invalid message content item format: {item}")
                                     raise HTTPException(status_code=400, detail="Missing type in input item.")
                         else:
+                            print("Invalid message content format.")
                             raise HTTPException(status_code=400, detail="Invalid input format.")
                     else:
+                        print("not a ChatMessage")
                         raise HTTPException(status_code=400, detail="Invalid input format.")
             else:
+                print("neither string not list")
                 raise HTTPException(status_code=400, detail="Invalid input format.")
         
         else:
-                raise HTTPException(status_code=400, detail="Missing input.")
+            print('no input')
+            raise HTTPException(status_code=400, detail="Missing input.")
 
-        # For now, assume it works or adapt it as needed.
         formatted_prompt = apply_chat_template(
             processor, config, chat_messages, num_images=len(images)
         )
 
         generated_at = datetime.now().timestamp()
+        response_id = f"resp_{uuid.uuid4().hex}"
+        message_id = f"msg_{uuid.uuid4().hex}"
 
         if openai_request.stream:
             # Streaming response
             async def stream_generator():
                 token_iterator = None
                 try:
-                    # Use stream_generate from utils
+                    # Create base response object (to match the openai pipeline)
+                    base_response = OpenAIResponse(
+                        id=response_id,
+                        object="response",
+                        created_at=int(generated_at),
+                        status="in_progress",
+                        instructions=instructions,
+                        max_output_tokens=openai_request.max_output_tokens,
+                        model=openai_request.model,
+                        output=[],
+                        output_text="",
+                        temperature=openai_request.temperature,
+                        top_p=openai_request.top_p,
+                        usage={
+                            "input_tokens": 0,  # get prompt tokens
+                            "output_tokens": 0,  
+                            "total_tokens": 0  
+                        }
+                    )
+                    
+                    # Send response.created event  (to match the openai pipeline)
+                    yield f"event: response.created\ndata: {ResponseCreatedEvent(type='response.created', response=base_response).model_dump_json()}\n\n"
+                    
+                    # Send response.in_progress event  (to match the openai pipeline)
+                    yield f"event: response.in_progress\ndata: {ResponseInProgressEvent(type='response.in_progress', response=base_response).model_dump_json()}\n\n"
+                    
+                    # Send response.output_item.added event  (to match the openai pipeline)
+                    message_item = MessageItem(
+                        id=message_id,
+                        type="message",
+                        status="in_progress",
+                        role="assistant",
+                        content=[]
+                    )
+                    yield f"event: response.output_item.added\ndata: {ResponseOutputItemAddedEvent(type='response.output_item.added', output_index=0, item=message_item).model_dump_json()}\n\n"
+                    
+                    # Send response.content_part.added event
+                    content_part = ContentPartOutputText(type="output_text", text="", annotations=[])
+                    yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=0, content_index=0, part=content_part).model_dump_json()}\n\n"
+                    
+                    # Stream text deltas
                     token_iterator = stream_generate(
                         model=model,
                         processor=processor,
@@ -366,19 +452,51 @@ async def openai_endpoint(request : Request):
                         **kwargs
                     )
                     
+                    full_text = ""
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, 'text'):
-                           print("Warning: Received unexpected chunk format:", chunk)
-                           continue 
+                            continue
+                            
+                        delta = chunk.text
+                        full_text += delta
 
-                        # TODO
-                        # Yield chunks in Server-Sent Events (SSE) format
-                        chunk_data = StreamChunk(chunk=chunk.text, model=openai_request.model)
-                        yield f"data: {chunk_data.model_dump_json()}\n\n"
-                        await asyncio.sleep(0.01) # Small sleep to prevent blocking event loop entirely
-
-                    # Signal stream end (optional, depends on client handling)
-                    # yield f"data: {json.dumps({'end': True})}\n\n"
+                        usage_stats = {
+                            "input_tokens": chunk.prompt_tokens,
+                            "output_tokens": chunk.generation_tokens
+                        }
+                        
+                        # Send response.output_text.delta event
+                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                        await asyncio.sleep(0.01)
+                    
+                    # Send response.output_text.done event (to match the openai pipeline)
+                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=full_text).model_dump_json()}\n\n"
+                    
+                    # Send response.content_part.done event (to match the openai pipeline)
+                    final_content_part = ContentPartOutputText(type="output_text", text=full_text, annotations=[])
+                    yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=0, content_index=0, part=final_content_part).model_dump_json()}\n\n"
+                    
+                    # Send response.output_item.done event (to match the openai pipeline)
+                    final_message_item = MessageItem(
+                        id=message_id,
+                        type="message",
+                        status="completed",
+                        role="assistant",
+                        content=[final_content_part]
+                    )
+                    yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_item).model_dump_json()}\n\n"
+                    
+                    # Send response.completed event (to match the openai pipeline)
+                    completed_response = base_response.model_copy(update={
+                        "status": "completed",
+                        "output": [final_message_item],
+                        "usage": {
+                            "input_tokens": usage_stats["input_tokens"],
+                            "output_tokens": usage_stats["output_tokens"],
+                            "total_tokens": usage_stats["input_tokens"] + usage_stats["output_tokens"]
+                        }
+                    })
+                    yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
 
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
@@ -405,7 +523,7 @@ async def openai_endpoint(request : Request):
                     temperature=openai_request.temperature,
                     max_tokens=openai_request.max_output_tokens,
                     top_p=openai_request.top_p,
-                    verbose=False, # Keep API output clean
+                    verbose=False, # stats are passed in the response
                     **kwargs
                 )
                 # Clean up resources
@@ -413,9 +531,8 @@ async def openai_endpoint(request : Request):
                 gc.collect()
                 print("Generation finished, cleared cache.")
 
-                # Create response
                 result = OpenAIResponse(
-                    id= f"generation-{generated_at}",
+                    id= response_id,
                     object= "response",
                     created_at= int(generated_at),
                     status= "completed",
@@ -428,18 +545,18 @@ async def openai_endpoint(request : Request):
                         "content": [
                             {
                             "type": "output_text",
-                            "text": output,
+                            "text": output[0],
                             }
                         ]
                         }
                     ],
-                    output_text= output,
+                    output_text= output[0],
                     temperature= openai_request.temperature,
                     top_p= openai_request.top_p,
-                    usage= { # TODO
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "total_tokens": 0
+                    usage= { 
+                        "input_tokens": output[1]["input_tokens"],
+                        "output_tokens": output[1]["output_tokens"],
+                        "total_tokens": output[1]["total_tokens"]
                     }
                 )
                 return result
@@ -451,18 +568,61 @@ async def openai_endpoint(request : Request):
                  gc.collect()
                  raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
-
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions (like model loading failure)
         raise http_exc
     except Exception as e:
         # Catch unexpected errors
-        print(f"Unexpected error in /generate endpoint: {e}")
+        print(f"Unexpected error in /responses endpoint: {e}")
         traceback.print_exc()
         mx.clear_cache()
         gc.collect()
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
+# MLX_VLM Models
+class VLMRequest(BaseModel):
+    model: str = Field(DEFAULT_MODEL_PATH, description="The path to the local model directory or Hugging Face repo.")
+    adapter_path: Optional[str] = Field(None, description="The path to the adapter weights.")
+    image: List[str] = Field(default_factory=list, description="List of URLs or local paths of images to process.")
+    prompt: str = Field(DEFAULT_PROMPT, description="Message to be processed by the model.")
+    system: Optional[str] = Field(None, description="Optional system message for the model (used in chat structure).")
+    max_tokens: int = Field(DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate.")
+    temperature: float = Field(DEFAULT_TEMPERATURE, description="Temperature for sampling.")
+    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
+    resize_shape: Optional[Tuple[int, int]] = Field(None, description="Resize shape for the image (height, width). Provide two integers.")
+
+class GenerationRequest(VLMRequest):
+    """
+    Inherits from VLMRequest and adds additional fields for the generation request.
+    """
+    stream: bool = Field(False, description="Whether to stream the response chunk by chunk.")
+
+class ChatRequest(GenerationRequest):
+    """
+    Inherits from GenerationRequest and adds fields specific to chat interactions.
+    """
+    prompt: List[ChatMessage] = Field(default_factory=list, description="List of chat messages for the conversation.")   
+
+class UsageStats(OpenAIUsage):
+    """
+    Inherits from OpenAIUsage and adds additional fields for usage statistics.
+    """
+    prompt_tps: float = Field(..., description="Tokens per second for the prompt.")
+    generation_tps: float = Field(..., description="Tokens per second for the generation.")
+    peak_memory: float = Field(..., description="Peak memory usage during the generation.")
+
+class GenerationResponse(BaseModel):
+    text: str
+    model: str
+    usage: Optional[UsageStats]
+
+class StreamChunk(BaseModel):
+    chunk: str
+    model: str 
+    usage: Optional[UsageStats]
+
+# MLX_VLM API endpoints
 
 @app.post("/generate", response_model=None) # Response model handled dynamically based on stream flag
 async def generate_endpoint(request: GenerationRequest):
@@ -522,7 +682,19 @@ async def generate_endpoint(request: GenerationRequest):
                            continue 
 
                         # Yield chunks in Server-Sent Events (SSE) format
-                        chunk_data = StreamChunk(chunk=chunk.text, model=request.model)
+                        usage_stats = {
+                            "input_tokens": chunk.prompt_tokens,
+                            "output_tokens": chunk.generation_tokens,
+                            "total_tokens": chunk.prompt_tokens + chunk.generation_tokens,
+                            "prompt_tps": chunk.prompt_tps,
+                            "generation_tps": chunk.generation_tps,
+                            "peak_memory": chunk.peak_memory,
+                        }
+                        chunk_data = StreamChunk(
+                            chunk=chunk.text, 
+                            model=request.model,
+                            usage=usage_stats
+                        )
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
                         await asyncio.sleep(0.01) # Small sleep to prevent blocking event loop entirely
 
@@ -554,7 +726,7 @@ async def generate_endpoint(request: GenerationRequest):
                     temperature=request.temperature,
                     max_tokens=request.max_tokens,
                     top_p=request.top_p,
-                    verbose=False, # Keep API output clean
+                    verbose=False, # stats are passed in the response
                     **kwargs
                 )
                 # Clean up resources
@@ -562,11 +734,10 @@ async def generate_endpoint(request: GenerationRequest):
                 gc.collect()
                 print("Generation finished, cleared cache.")
 
-                # Create response
                 result = GenerationResponse(
-                    text=output,
+                    text=output[0],
                     model=request.model,
-                    usage={} # TODO
+                    usage=output[1] 
                 )
                 return result
 
@@ -576,7 +747,6 @@ async def generate_endpoint(request: GenerationRequest):
                  mx.clear_cache()
                  gc.collect()
                  raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
-
 
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions (like model loading failure)
@@ -618,7 +788,6 @@ async def generate_endpoint(request: GenerationRequest):
 
         chat_messages = request.prompt
 
-        # For now, assume it works or adapt it as needed.
         formatted_prompt = apply_chat_template(
             processor, config, chat_messages, num_images=len(request.image)
         )
@@ -686,7 +855,6 @@ async def generate_endpoint(request: GenerationRequest):
                 gc.collect()
                 print("Generation finished, cleared cache.")
 
-                # Create response
                 result = GenerationResponse(
                     text=output,
                     model=request.model,
