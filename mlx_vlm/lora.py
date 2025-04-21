@@ -70,12 +70,18 @@ def main(args):
 
     logger.info(f"\033[32mSetting up LoRA\033[0m")
     list_of_modules = find_all_linear_names(model.language_model)
+
+    resume_adapter_file = args.resume_adapter_file
+    if resume_adapter_file:
+        logger.info(f"\033[32mResuming from adapter file {resume_adapter_file}\033[0m")
+
     model = get_peft_model(
         model,
         list_of_modules,
         rank=args.lora_rank,
         alpha=args.lora_alpha,
         dropout=args.lora_dropout,
+        resume_adapter_file=args.resume_adapter_file,
     )
 
     logger.info(f"\033[32mSetting up optimizer\033[0m")
@@ -171,6 +177,12 @@ if __name__ == "__main__":
         type=str,
         default="adapters",
         help="Path to save the trained adapter",
+    )
+    parser.add_argument(
+        "--resume-adapter-file",
+        type=str,
+        default="",
+        help="Load path to resume training from the given fine-tuned weights.",
     )
 
     args = parser.parse_args()

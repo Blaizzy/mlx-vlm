@@ -33,7 +33,14 @@ def set_module_by_name(model, name, new_module):
 
 
 def get_peft_model(
-    model, linear_layers, rank=10, alpha=0.1, dropout=0.1, freeze=True, verbose=True
+    model,
+    linear_layers,
+    rank=10,
+    alpha=0.1,
+    dropout=0.1,
+    freeze=True,
+    verbose=True,
+    resume_adapter_file="",
 ):
     if freeze:
         freeze_model(model)
@@ -43,6 +50,9 @@ def get_peft_model(
             if name.split(".")[-1] in linear_layers:
                 lora_layer = LoRaLayer(module, rank, alpha, dropout)
                 set_module_by_name(model.language_model, name, lora_layer)
+
+    if resume_adapter_file:
+        model.load_weights(resume_adapter_file, strict=False)
 
     model.config.lora = {}
     model.config.lora["rank"] = rank

@@ -40,6 +40,23 @@ class TestTrainerUtils(unittest.TestCase):
 
         self.assertTrue(mock_freeze.called)
         self.assertTrue(mock_print.called)
+        model.load_weights.assert_not_called()
+        self.assertTrue(hasattr(model.config, "lora"))
+
+    @patch("mlx_vlm.trainer.utils.freeze_model")
+    @patch("mlx_vlm.trainer.utils.print_trainable_parameters")
+    def test_get_peft_model_with_resume_adapter_file(self, mock_print, mock_freeze):
+        model = MagicMock()
+        model.language_model.named_modules.return_value = [
+            ("layer1", nn.Linear(256, 512)),
+            ("layer2", nn.QuantizedLinear(256, 512, 8)),
+        ]
+
+        result = get_peft_model(model, ["layer1", "layer2"], 10, 0.1, 0.1, False, False, "resume_adapter_file")
+
+        self.assertFalse(mock_freeze.called)
+        self.assertFalse(mock_print.called)
+        model.load_weights.assert_called()
         self.assertTrue(hasattr(model.config, "lora"))
 
     def test_find_all_linear_names(self):
