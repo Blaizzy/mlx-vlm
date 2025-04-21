@@ -1,7 +1,18 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any, Union, Tuple
+from typing import (
+    List, 
+    Optional, 
+    Dict, 
+    Any, 
+    Union, 
+    Tuple, 
+    Literal, 
+    TypeAlias, 
+    TypedDict, 
+    Required
+)
 import uvicorn
 import gc
 import mlx.core as mx
@@ -9,6 +20,7 @@ import json
 import asyncio
 import traceback 
 import codecs
+import datetime
 from .utils import generate, stream_generate
 from .prompt_utils import apply_chat_template
 from .generate import (
@@ -26,6 +38,8 @@ app = FastAPI(title="MLX_VLM Inference API",
               version="0.1.0")
 
 MAX_IMAGES = 10 # Maximum number of images to process at once
+
+# Loading/unloading utilities
 
 model_cache = {}
 
@@ -95,9 +109,69 @@ def unload_model_sync():
     print("Model unloaded and cache cleared.")
     return True
 
+# API Models
+
+class ResponseInputTextParam(TypedDict, total=False):
+    text: Required[str]
+    """The text input to the model."""
+
+    type: Required[Literal["input_text"]]
+    """The type of the input item. Always `input_text`."""
+
+
+class ResponseInputImageParam(TypedDict, total=False):
+    detail: Literal["high", "low", "auto"] = Field("auto", description="The detail level of the image to be sent to the model.")
+    """The detail level of the image to be sent to the model.
+
+    One of `high`, `low`, or `auto`. Defaults to `auto`.
+    """
+
+    type: Required[Literal["input_image"]]
+    """The type of the input item. Always `input_image`."""
+
+    image_url: Required[str]
+    """The URL of the image to be sent to the model.
+
+    A fully qualified URL or base64 encoded image in a data URL.
+    """
+
+    file_id: Optional[str]
+    """The ID of the file to be sent to the model.
+     NOTE : wouldn't this help the model if we passed the file_id as well to the vlm models
+    
+    """
+
+ResponseInputContentParam: TypeAlias = Union[ResponseInputTextParam, ResponseInputImageParam]
+
+ResponseInputMessageContentListParam: TypeAlias = List[ResponseInputContentParam]
+
+class ResponseOutputText(TypedDict, total=False):
+    text: Required[str]
+    """The text input to the model."""
+
+    type: Required[Literal["output_text"]]
+    """The type of the output item. Always `output_text`."""
+
+ResponseOutputMessageContentList: TypeAlias = List[ResponseOutputText]
+
 class ChatMessage(BaseModel):
-    role: str = Field(..., description="Role of the message sender (e.g., 'system', 'user', 'assistant').")
-    content: str = Field(..., description="Content of the message.")
+    role: Literal["user", "assistant", "system", "developer"] = Field(..., description="Role of the message sender (e.g., 'system', 'user', 'assistant').")
+    content: Union[str, ResponseInputMessageContentListParam,ResponseOutputMessageContentList] = Field(..., description="Content of the message.")
+
+class OpenAIRequest(BaseModel):
+    """
+    OpenAI-compatible request structure.
+    Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
+    """
+    input: Union[str, List[ChatMessage]] = Field(..., description="Input text or list of chat messages.")
+    model: str = Field(..., description="The model to use for generation.")
+    max_output_tokens: int = Field(DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate.")
+    temperature: float = Field(DEFAULT_TEMPERATURE, description="Temperature for sampling.")
+    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    stream: bool = Field(False, description="Whether to stream the response chunk by chunk.")
+    seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
+    resize_shape: Optional[Tuple[int, int]] = Field(None, description="Resize shape for the image (height, width). Provide two integers.")
+    adapter_path: Optional[str] = Field(None, description="The path to the adapter weights.")
 
 class VLMRequest(BaseModel):
     model: str = Field(DEFAULT_MODEL_PATH, description="The path to the local model directory or Hugging Face repo.")
@@ -121,17 +195,273 @@ class ChatRequest(GenerationRequest):
     """
     Inherits from GenerationRequest and adds fields specific to chat interactions.
     """
-    prompt: List[ChatMessage] = Field(default_factory=list, description="List of chat messages for the conversation.")    
+    prompt: List[ChatMessage] = Field(default_factory=list, description="List of chat messages for the conversation.")   
 
+class OpenAIUsage(BaseModel):
+    """Token usage details including input tokens, output tokens, breakdown, and total tokens used."""
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int 
+
+class OpenAIErrorObject(BaseModel):
+    """Error object returned when the model fails to generate a Response."""
+    code: Optional[str] = None
+    message: Optional[str] = None
+    param: Optional[str] = None
+    type: Optional[str] = None
+
+class OpenAIResponse(BaseModel):
+    id: str = Field(..., description="Unique identifier for this Response")
+    object: Literal["response"] = Field(..., description="The object type of this resource - always set to response")
+    created_at: int = Field(..., description="Unix timestamp (in seconds) of when this Response was created")
+    status: Literal["completed", "failed", "in_progress", "incomplete"] = Field(..., description="The status of the response generation")
+    error: Optional[OpenAIErrorObject] = Field(None, description="An error object returned when the model fails to generate a Response")
+    instructions: Optional[str] = Field(None, description="Inserts a system (or developer) message as the first item in the model's context")
+    max_output_tokens: Optional[int] = Field(None, description="An upper bound for the number of tokens that can be generated for a response")
+    model: str = Field(..., description="Model ID used to generate the response")
+    output: List[Union[ChatMessage, Any]] = Field(..., description="An array of content items generated by the model")
+    output_text: Optional[str] = Field(None, description="SDK-only convenience property containing aggregated text output")
+    temperature: Optional[float] = Field(None, ge=0, le=2, description="Sampling temperature between 0 and 2")
+    top_p: Optional[float] = Field(None, ge=0, le=1, description="Nucleus sampling probability mass")
+    truncation: Union[Literal["auto", "disabled"], str] = Field("disabled", description="The truncation strategy to use")
+    usage: OpenAIUsage = Field(..., description="Token usage details") # we need the model to return stats
+    user: Optional[str] = Field(None, description="A unique identifier representing your end-user")
 
 class GenerationResponse(BaseModel):
     text: str
     model: str
-    usage: Dict[str, Any] # Placeholder for verbose usage stats (TODO)
+    usage: Dict[str, Any] # Placeholder for verbose usage stats : we need the model to return stats
 
 class StreamChunk(BaseModel):
     chunk: str
     model: str # placeholder (TBC).
+
+# API endpoints
+
+@app.post("/responses") 
+async def openai_endpoint(request : Request):
+    """
+    OpenAI-compatible endpoint for generating text based on a prompt and optional images.
+
+    using client.responses.create method.
+
+    example:
+
+    from openai import OpenAI
+
+    API_URL = "http://0.0.0.0:8000"
+    API_KEY = 'any'
+
+    def run_openai(prompt, img_url,system, model="mlx-community/Qwen2.5-VL-3B-Instruct-8bit"): 
+        ''' Calls the OpenAI API'''
+        
+        client = OpenAI(base_url=f"{API_URL}", api_key=API_KEY)
+        
+        try : 
+            response = client.responses.create(
+                model=model,
+                input=[
+                    {"role":"system",
+                    "content": f"{system}"
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": prompt},
+                            {"type": "input_image", "image_url": f"{img_url}"},
+                        ],
+                    }
+                ], 
+            )
+
+            return response.output_text
+            
+        except Exception as e:
+            # building a response object to match the one returned when request is successful so that it can be processed in the same way
+            return {"model - error":str(e),"content":{}, "model":model}
+
+    """
+
+    body = await request.json()
+    openai_request = OpenAIRequest(**body)
+
+    print(openai_request)
+
+    try:
+        # Get model, processor, config - loading if necessary
+        model, processor, config = get_cached_model(openai_request.model, openai_request.adapter_path)
+
+        kwargs = {}
+
+        if openai_request.resize_shape is not None:
+            if len(openai_request.resize_shape) not in [1, 2]:
+                raise HTTPException(status_code=400, detail="resize_shape must contain exactly two integers (height, width)")
+            kwargs["resize_shape"] = (
+                (openai_request.resize_shape[0],) * 2
+                if len(openai_request.resize_shape) == 1
+                else tuple(openai_request.resize_shape)
+            )
+
+        chat_messages = []
+        images= []
+        instructions = None
+        if openai_request.input:
+            if isinstance(openai_request.input, str):
+                # If input is a string, treat it as a single text message
+                chat_messages.append({"role": "user", "content": openai_request.input})
+            elif isinstance(openai_request.input, list):
+                # If input is a list, treat it as a series of chat messages
+                for message in openai_request.input:
+                    if isinstance(message, dict) and "role" in message and "content" in message:
+                        if isinstance(message["content"], str):
+                            chat_messages.append({"role": message["role"], "content": message["content"]})
+                            if message["role"] == "system":
+                                instructions = message["content"]
+                        elif isinstance(message["content"], list):
+                            # Handle list of content items
+                            for item in message["content"]:
+                                if isinstance(item, dict) and "type" in item :
+                                    if item["type"] == "input_text" and "text" in item:
+                                        chat_messages.append({"role": message["role"], "content": item["text"]})
+                                        if message["role"] == "system":
+                                            instructions = item["text"]
+                                    # examples for multiple images (https://platform.openai.com/docs/guides/images?api-mode=responses)
+                                    elif item["type"] == "input_image":
+                                        images.append(item["image_url"])
+                                    else:
+                                        raise HTTPException(status_code=400, detail="Invalid input item type.")
+                                else:
+                                    raise HTTPException(status_code=400, detail="Missing type in input item.")
+                        else:
+                            raise HTTPException(status_code=400, detail="Invalid input format.")
+                    else:
+                        raise HTTPException(status_code=400, detail="Invalid input format.")
+            else:
+                raise HTTPException(status_code=400, detail="Invalid input format.")
+        
+        else:
+                raise HTTPException(status_code=400, detail="Missing input.")
+
+        # For now, assume it works or adapt it as needed.
+        formatted_prompt = apply_chat_template(
+            processor, config, chat_messages, num_images=len(images)
+        )
+
+        generated_at = datetime.now().timestamp()
+
+        if openai_request.stream:
+            # Streaming response
+            async def stream_generator():
+                token_iterator = None
+                try:
+                    # Use stream_generate from utils
+                    token_iterator = stream_generate(
+                        model=model,
+                        processor=processor,
+                        prompt=formatted_prompt,
+                        image=images,
+                        temperature=openai_request.temperature,
+                        max_tokens=openai_request.max_output_tokens,
+                        top_p=openai_request.top_p,
+                        **kwargs
+                    )
+                    
+                    for chunk in token_iterator:
+                        if chunk is None or not hasattr(chunk, 'text'):
+                           print("Warning: Received unexpected chunk format:", chunk)
+                           continue 
+
+                        # TODO
+                        # Yield chunks in Server-Sent Events (SSE) format
+                        chunk_data = StreamChunk(chunk=chunk.text, model=openai_request.model)
+                        yield f"data: {chunk_data.model_dump_json()}\n\n"
+                        await asyncio.sleep(0.01) # Small sleep to prevent blocking event loop entirely
+
+                    # Signal stream end (optional, depends on client handling)
+                    # yield f"data: {json.dumps({'end': True})}\n\n"
+
+                except Exception as e:
+                    print(f"Error during stream generation: {e}")
+                    traceback.print_exc()
+                    error_data = json.dumps({"error": str(e)})
+                    yield f"data: {error_data}\n\n"
+
+                finally:
+                    mx.clear_cache()
+                    gc.collect()
+                    print("Stream finished, cleared cache.")
+
+            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+        else:
+            # Non-streaming response
+            try:
+                # Use generate from utils
+                output = generate(
+                    model=model,
+                    processor=processor,
+                    prompt=formatted_prompt,
+                    image=images,
+                    temperature=openai_request.temperature,
+                    max_tokens=openai_request.max_output_tokens,
+                    top_p=openai_request.top_p,
+                    verbose=False, # Keep API output clean
+                    **kwargs
+                )
+                # Clean up resources
+                mx.clear_cache()
+                gc.collect()
+                print("Generation finished, cleared cache.")
+
+                # Create response
+                result = OpenAIResponse(
+                    id= f"generation-{generated_at}",
+                    object= "response",
+                    created_at= int(generated_at),
+                    status= "completed",
+                    instructions= instructions,
+                    max_output_tokens= openai_request.max_output_tokens,
+                    model= openai_request.model,
+                    output= [
+                        {
+                        "role": "assistant",
+                        "content": [
+                            {
+                            "type": "output_text",
+                            "text": output,
+                            }
+                        ]
+                        }
+                    ],
+                    output_text= output,
+                    temperature= openai_request.temperature,
+                    top_p= openai_request.top_p,
+                    usage= { # TODO
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0
+                    }
+                )
+                return result
+
+            except Exception as e:
+                 print(f"Error during generation: {e}")
+                 traceback.print_exc()
+                 mx.clear_cache()
+                 gc.collect()
+                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+
+
+    except HTTPException as http_exc:
+        # Re-raise HTTP exceptions (like model loading failure)
+        raise http_exc
+    except Exception as e:
+        # Catch unexpected errors
+        print(f"Unexpected error in /generate endpoint: {e}")
+        traceback.print_exc()
+        mx.clear_cache()
+        gc.collect()
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
 
 @app.post("/generate", response_model=None) # Response model handled dynamically based on stream flag
@@ -264,7 +594,7 @@ async def generate_endpoint(request: GenerationRequest):
     """
     Generate text based on a prompt and optional images.
     Prompt must be a list of chat messages, including system, user, and assistant messages.
-    System message will be ignored of not already in the prompt.
+    System message will be ignored if not already in the prompt.
     Can operate in streaming or non-streaming mode.
 
     NOTE: ideally, generate.py should be refactored to allow reusing the same code here
