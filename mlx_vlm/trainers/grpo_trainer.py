@@ -78,6 +78,7 @@ def get_per_token_logps(model: nn.Module, inputs, lengths):
     mx.eval(logits)
     return per_token_logps
 
+
 def generate_grpo(
     model: nn.Module,
     processor,
@@ -89,7 +90,7 @@ def generate_grpo(
     temperature: float = 0.8,
     batch_size: int = 1,
     end_token: str = "</answer>",
-    **kwargs
+    other_inputs: Optional[List[Dict]] = None
 ):
     try:
         # Ensure masks list matches prompts if provided
@@ -128,39 +129,19 @@ def generate_grpo(
                 pixel_values = mx.repeat(img, group_size, axis=0)
             else:
                 pixel_values = None
-            # Handle pixel_values and compute grid_thw if possible
-            if pixel_values is None or not hasattr(pixel_values, 'ndim') or pixel_values.ndim < 4:
-                print(f"[DEBUG] pixel_values is None or too few dims ({None if pixel_values is None else pixel_values.shape}); skipping grid_thw")
-                grid_thw = None
-            else:
-                print(f"[DEBUG] pixel_values shape: {pixel_values.shape}; computing grid_thw")
-                # Determine patch size
-                if hasattr(model, 'vision_tower') and hasattr(model.vision_tower, 'patch_embed') and hasattr(model.vision_tower.patch_embed, 'patch_size'):
-                    patch_size = model.vision_tower.patch_embed.patch_size
-                    # Normalize to two-element tuple
-                    if isinstance(patch_size, int):
-                        patch_size = (patch_size, patch_size)
-                    elif hasattr(patch_size, '__len__') and len(patch_size) == 1:
-                        patch_size = (patch_size[0], patch_size[0])
-                    elif hasattr(patch_size, '__len__') and len(patch_size) > 2:
-                        patch_size = tuple(patch_size[:2])
-                else:
-                    patch_size = (pixel_values.shape[2], pixel_values.shape[3])
-                # Compute grid dimensions
-                grid_h = pixel_values.shape[2] // patch_size[0]
-                grid_w = pixel_values.shape[3] // patch_size[1]
-                # Static time dimension=1 for single-image inputs
-                grid_thw = [(t, h, w) for t in range(1) for h in range(grid_h) for w in range(grid_w)]
  
             # Expand for group_size
             expanded_prompts = mx.repeat(prompt_tensor, group_size, axis=0)
             print(f"[DEBUG] expanded_prompts shape: {expanded_prompts.shape}")
+            if other_inputs is not None:
+                kwargs = other_inputs[prompt_idx]
+            else:
+                kwargs = {}
  
             # Generate group_size completions
             batch_results = []
             for g_idx in range(group_size):
                 from ..utils import generate_step
-                kwargs = {'grid_thw': grid_thw}
 
                 current_tokens = []
                 # Stream tokens and logprobs from generate_step
@@ -507,13 +488,23 @@ def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
             images = [item.get("pixel_values", None) for item in current_batch]
             prompt_masks = [item.get("attention_mask") for item in current_batch]
 
+            other_inputs = []
+            for item in current_batch:
+                oi = {}
+                if "image_grid_thw" in item:
+                    oi["image_grid_thw"] = item["image_grid_thw"]
+                if "video_grid_thw" in item:
+                    oi["video_grid_thw"] = item["video_grid_thw"]
+                # Add more keys here if needed later
+                other_inputs.append(oi)
+
             if any(len(p) > max_seq_length for p in prompts_tokens):
                 print(
                     f"[WARNING] Some prompts are longer than {max_seq_length} tokens. "
                     "Long prompts will be truncated."
                 )
 
-            yield prompts_tokens, answers_tokens, prompts_text, answers_text, types, images, prompt_masks
+            yield prompts_tokens, answers_tokens, prompts_text, answers_text, types, images, prompt_masks, other_inputs
 
         if not train:
             break
@@ -549,15 +540,16 @@ def train_grpo(
     state = [model.state, optimizer.state]
 
     def step(batch):
-        prompt_tokens, targets, prompt_lens, target_lens, type_info, images, prompt_masks = batch
+        prompt_tokens, targets, prompt_lens, target_lens, type_info, images, prompt_masks, other_inputs = batch
 
-        all_completions, all_completion_texts, batch_indices = generate_grpo(
+        all_completions, all_completion_texts, batch_indices, other_inputs = generate_grpo(
             model=model,
             processor=processor,
             prompt_tokens=prompt_tokens,
             prompt_masks=prompt_masks,
             images=images,
             # image_token_index=getattr(model.config, "image_token_index", None),
+            other_inputs=other_inputs,
             max_tokens=args.max_completion_length,
             group_size=args.group_size,
             temperature=args.temperature,
