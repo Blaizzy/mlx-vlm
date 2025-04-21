@@ -67,7 +67,7 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         raise HTTPException(status_code=500, detail=f"Failed to load model: {e}")
 
 
-def get_cached_model(model_path: str, adapter_path: Optional[str]):
+def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
     """
     Factory function to get or load the appropriate model resources from cache or by loading.
     """
@@ -410,27 +410,11 @@ async def openai_endpoint(request: Request):
     body = await request.json()
     openai_request = OpenAIRequest(**body)
 
-    print(openai_request)
-
     try:
         # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(
-            openai_request.model, openai_request.adapter_path
-        )
+        model, processor, config = get_cached_model(openai_request.model)
 
         kwargs = {}
-
-        if openai_request.resize_shape is not None:
-            if len(openai_request.resize_shape) not in [1, 2]:
-                raise HTTPException(
-                    status_code=400,
-                    detail="resize_shape must contain exactly two integers (height, width)",
-                )
-            kwargs["resize_shape"] = (
-                (openai_request.resize_shape[0],) * 2
-                if len(openai_request.resize_shape) == 1
-                else tuple(openai_request.resize_shape)
-            )
 
         chat_messages = []
         images = []
