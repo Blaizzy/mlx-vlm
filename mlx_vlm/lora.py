@@ -81,7 +81,7 @@ def main(args):
         rank=args.lora_rank,
         alpha=args.lora_alpha,
         dropout=args.lora_dropout,
-        resume_adapter_file=args.resume_adapter_file,
+        resume_adapter_file=resume_adapter_file,
     )
 
     logger.info(f"\033[32mSetting up optimizer\033[0m")
