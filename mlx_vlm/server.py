@@ -193,14 +193,6 @@ class OpenAIRequest(BaseModel):
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
-    seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
-    resize_shape: Optional[Tuple[int, int]] = Field(
-        None,
-        description="Resize shape for the image (height, width). Provide two integers.",
-    )
-    adapter_path: Optional[str] = Field(
-        None, description="The path to the adapter weights."
-    )
 
 
 class OpenAIUsage(BaseModel):
@@ -397,15 +389,17 @@ async def openai_endpoint(request: Request):
                 max_output_tokens=max_output_tokens,
                 stream=stream
             )
-            if stream:
-                for event in response:
-                    print(event)
-
+            if not stream:
+                print(response.output[0].content[0].text)
+                print(response.usage)
             else:
-                output_text=response.output[0].content[0].text #Not sur why response.output_text _repr_ is ''
-                print(f"output_text: {output_text}")
-
-            return
+                for event in response:
+                    # Process different event types if needed
+                    if hasattr(event, 'delta') and event.delta:
+                        print(event.delta, end="", flush=True)
+                    elif event.type == 'response.completed':
+                        print("\n--- Usage ---")
+                        print(event.response.usage)
 
         except Exception as e:
             # building a response object to match the one returned when request is successful so that it can be processed in the same way
