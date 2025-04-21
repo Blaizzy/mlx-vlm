@@ -93,7 +93,7 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
                     "*.json",
                     "*.safetensors",
                     "*.py",
-                    "tokenizer.model",
+                    "*.model",
                     "*.tiktoken",
                     "*.txt",
                 ],
@@ -277,7 +277,11 @@ def load(
         model.eval()
 
     image_processor = load_image_processor(model_path, **kwargs)
-    processor = load_processor(model_path, True, **kwargs)
+
+    # Get the eos_token_id from the model config
+    eos_token_id = getattr(model.config, "eos_token_id", None)
+
+    processor = load_processor(model_path, True, eos_token_ids=eos_token_id, **kwargs)
 
     if image_processor is not None:
         processor.image_processor = image_processor
@@ -337,16 +341,33 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 
 
 def load_processor(
-    model_path, add_detokenizer=True, **kwargs
+    model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
 
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
-        if "tokenizer" in processor.__dict__.keys():
-            processor.detokenizer = detokenizer_class(processor.tokenizer)
+
+        # Get the tokenizer object
+        tokenizer_obj = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+
+        # Instantiate the detokenizer
+        processor.detokenizer = detokenizer_class(tokenizer_obj)
+
+        # Determine the EOS token IDs, prioritizing the function argument
+        final_eos_token_ids = (
+            eos_token_ids if eos_token_ids is not None else tokenizer_obj.eos_token_ids
+        )
+
+        # Create and assign the StoppingCriteria
+        criteria = StoppingCriteria(final_eos_token_ids, tokenizer_obj)
+        if hasattr(processor, "tokenizer"):
+            processor.tokenizer.stopping_criteria = criteria
         else:
-            processor.detokenizer = detokenizer_class(processor)
+            processor.stopping_criteria = criteria
+
     return processor
 
 
@@ -355,7 +376,12 @@ def fetch_from_hub(
 ) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
     model = load_model(model_path, lazy, **kwargs)
     config = load_config(model_path, **kwargs)
-    processor = load_processor(model_path, add_detokenizer=False, **kwargs)
+    processor = load_processor(
+        model_path,
+        add_detokenizer=False,
+        eos_token_ids=config.get("eos_token_id", None),
+        **kwargs,
+    )
     return model, config, processor
 
 
@@ -398,7 +424,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
 
     from . import __version__
 
-    card = ModelCard.load(hf_path)
+    card = ModelCard.load("OpenGVLab/InternVL3-1B")
     card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"]
     card.text = dedent(
         f"""
@@ -616,6 +642,7 @@ def save_config(
     """
     # Clean unused keys
     config.pop("_name_or_path", None)
+    config.pop("torch_dtype", None)
 
     # sort the config for better readability
     config = dict(sorted(config.items()))
@@ -854,6 +881,7 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
         else:
             pixel_values = mx.array(inputs["pixel_values"])
 
+        model_inputs["input_ids"] = mx.array(inputs["input_ids"])
         model_inputs["pixel_values"] = pixel_values
         model_inputs["attention_mask"] = (
             mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
@@ -1014,6 +1042,54 @@ def generate_step(
         n += 1
 
 
+class StoppingCriteria:
+    def __init__(self, eos_token_ids: List[int], tokenizer=None):
+
+        if isinstance(eos_token_ids, int):
+            self.eos_token_ids = [eos_token_ids]
+        else:
+            self.eos_token_ids = eos_token_ids
+
+        self.tokenizer = tokenizer
+
+    def add_eos_token_ids(self, new_eos_token_ids: Union[int, List[int]] = None):
+        """
+        Add new token IDs to the list of EOS token IDs.
+
+        Args:
+            new_eos_token_ids: Integer, string, or list of integers/strings representing token IDs to add.
+                               If strings are provided, they will be converted to integers if possible.
+        """
+        if new_eos_token_ids is None:
+            pass
+
+        if self.tokenizer is None:
+            raise ValueError("Processor is not provided")
+
+        if new_eos_token_ids is not None:
+            if isinstance(new_eos_token_ids, str):
+                new_eos_token_ids = [new_eos_token_ids]
+            new_eos_token_ids = [
+                self.tokenizer.encode(" " + token, add_special_tokens=False)[-1]
+                for token in new_eos_token_ids
+            ]
+            self.eos_token_ids.extend(new_eos_token_ids)
+
+    def reset(self, eos_token_ids: List[int] = None):
+        eos_token_ids = (
+            eos_token_ids if eos_token_ids is not None else self.tokenizer.eos_token_ids
+        )
+
+        if isinstance(eos_token_ids, int):
+            eos_token_ids = [eos_token_ids]
+
+        if self.eos_token_ids != eos_token_ids:
+            self.eos_token_ids = eos_token_ids
+
+    def __call__(self, input_ids: mx.array) -> bool:
+        return input_ids in self.eos_token_ids
+
+
 def stream_generate(
     model: nn.Module,
     processor: PreTrainedTokenizer,
@@ -1035,7 +1111,20 @@ def stream_generate(
         Generator[Tuple[mx.array, mx.array]]: A generator producing text.
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    add_special_tokens = not hasattr(processor, "chat_template")
+
+    # Skip special tokens
+    skip_special_tokens = kwargs.pop("skip_special_tokens", False)
+    skip_special_token_ids = (
+        set(tokenizer.all_special_ids)
+        if skip_special_tokens and hasattr(tokenizer, "all_special_ids")
+        else []
+    )
+
+    add_special_tokens = (
+        not hasattr(processor, "chat_template")
+        if model.config.model_type == "gemma3"
+        else True
+    )
     prompt_tokens = mx.array(
         tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
     )
@@ -1077,10 +1166,11 @@ def stream_generate(
                 prompt_tps = input_ids.size / prompt_time
                 tic = time.perf_counter()
 
-            if token == tokenizer.eos_token_id:
+            # Stop generation if the token is in the eos_token_ids
+            if tokenizer.stopping_criteria(token):
                 break
 
-            detokenizer.add_token(token)
+            detokenizer.add_token(token, skip_special_token_ids=skip_special_token_ids)
 
             # Yield the last segment if streaming
             yield GenerationResult(
@@ -1105,18 +1195,6 @@ def stream_generate(
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
         )
-
-    detokenizer.finalize()
-    yield GenerationResult(
-        text=detokenizer.last_segment,
-        token=token,
-        logprobs=logprobs,
-        prompt_tokens=input_ids.size,
-        generation_tokens=n + 1,
-        prompt_tps=prompt_tps,
-        generation_tps=(n + 1) / (time.perf_counter() - tic),
-        peak_memory=mx.get_peak_memory() / 1e9,
-    )
 
 
 def generate(
@@ -1159,6 +1237,29 @@ def generate(
 
     text = ""
     last_response = None
+
+    eos_tokens = kwargs.get("eos_tokens", None)
+    stopping_criteria = kwargs.get("stopping_criteria", None)
+
+    # Get the tokenizer
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+    # Add custom EOS tokens to the stopping criteria
+    if eos_tokens is not None:
+        tokenizer.stopping_criteria.add_eos_token_ids(eos_tokens)
+
+    # Use custom stopping criteria
+    elif stopping_criteria is not None:
+        if isinstance(stopping_criteria, StoppingCriteria) or callable(
+            stopping_criteria
+        ):
+            tokenizer.stopping_criteria = stopping_criteria
+        else:
+            raise ValueError(
+                "stopping_criteria must be an instance of StoppingCriteria or a callable"
+            )
+    else:
+        tokenizer.stopping_criteria.reset(model.config.eos_token_id)
 
     for response in stream_generate(model, processor, prompt, image, **kwargs):
         if verbose:

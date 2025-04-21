@@ -37,6 +37,7 @@ class ModelConfig:
     image_pos_embed: Optional[dict] = field(
         default_factory=lambda: {"type": "learned_abs_2d", "max_pos_embeddings": 50}
     )
+    eos_token_id: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, params):

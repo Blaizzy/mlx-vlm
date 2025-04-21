@@ -1,4 +1,5 @@
 import argparse
+import importlib.util
 import json
 import platform
 import subprocess
@@ -8,6 +9,22 @@ import time
 import traceback
 
 import mlx.core as mx
+
+
+# Function to check if a package is installed
+def is_package_installed(package_name):
+    return importlib.util.find_spec(package_name) is not None
+
+
+# Check required packages
+required_packages = ["psutil", "rich", "tqdm"]
+missing_packages = [pkg for pkg in required_packages if not is_package_installed(pkg)]
+
+if missing_packages:
+    print(f"Missing required packages: {', '.join(missing_packages)}")
+    print("Please install them using: pip install " + " ".join(missing_packages))
+    sys.exit(1)
+
 import psutil
 from rich.console import Console
 from rich.panel import Panel

@@ -48,6 +48,7 @@ class ModelConfig:
     pad_id: int = 100001
     num_image_tokens: int = 576
     vocab_size: int = 32000
+    eos_token_id: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, params):
