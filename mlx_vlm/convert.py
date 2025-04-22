@@ -2,7 +2,7 @@
 
 import argparse
 
-from .utils import convert
+from .utils import MODEL_CONVERSION_DTYPES, convert
 
 
 def configure_parser() -> argparse.ArgumentParser:
