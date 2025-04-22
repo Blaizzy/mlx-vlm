@@ -31,10 +31,10 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dtype",
-        help="Type to save the parameters, ignored if -q is given.",
+        help="Type to save the parameter. Defaults to config.json's `torch_dtype` or bfloat16",
         type=str,
-        choices=["float16", "bfloat16", "float32"],
-        default="float16",
+        choices=MODEL_CONVERSION_DTYPES,
+        default=None,
     )
     parser.add_argument(
         "--upload-repo",
