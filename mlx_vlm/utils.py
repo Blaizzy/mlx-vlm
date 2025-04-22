@@ -229,6 +229,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             **quantization,
             class_predicate=class_predicate,
         )
+
     model.load_weights(list(weights.items()))
     if not lazy:
         mx.eval(model.parameters())
@@ -467,7 +468,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
 
     from . import __version__
 
-    card = ModelCard.load("OpenGVLab/InternVL3-1B")
+    card = ModelCard.load(hf_path)
     card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"]
     card.text = dedent(
         f"""
@@ -1219,8 +1220,9 @@ def stream_generate(
                 prompt_tps = input_ids.size / prompt_time
                 tic = time.perf_counter()
 
-        if token == tokenizer.eos_token_id:
-            break
+            # Stop generation if the token is in the eos_token_ids
+            if tokenizer.stopping_criteria(token):
+                break
 
             detokenizer.add_token(token, skip_special_token_ids=skip_special_token_ids)
 
