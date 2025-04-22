@@ -31,7 +31,7 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dtype",
-        help="Type to save the parameter. Defaults to config.json's `torch_dtype` or bfloat16",
+        help="Type to save the parameter. Defaults to config.json's `torch_dtype` or the current model weights dtype",
         type=str,
         choices=MODEL_CONVERSION_DTYPES,
         default=None,
