@@ -37,6 +37,8 @@ MODEL_REMAPPING = {"llava-qwen2": "llava_bunny", "bunny-llama": "llava_bunny"}
 
 MAX_FILE_SIZE_GB = 5
 
+MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
+
 
 # A stream on the default device just for generation
 generation_stream = mx.new_stream(mx.default_device())
@@ -730,7 +732,7 @@ def convert(
     quantize: bool = False,
     q_group_size: int = 64,
     q_bits: int = 4,
-    dtype: str = "float16",
+    dtype: Optional[str] = None,
     upload_repo: str = None,
     revision: Optional[str] = None,
     dequantize: bool = False,
@@ -743,9 +745,13 @@ def convert(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
 
+    if dtype is None:
+        dtype = config.get("torch_dtype", None)
     weights = dict(tree_flatten(model.parameters()))
-    dtype = getattr(mx, dtype)
-    weights = {k: v.astype(dtype) for k, v in weights.items()}
+    if dtype in MODEL_CONVERSION_DTYPES:
+        print("[INFO] Using dtype:", dtype)
+        dtype = getattr(mx, dtype)
+        weights = {k: v.astype(dtype) for k, v in weights.items()}
 
     if quantize and dequantize:
         raise ValueError("Choose either quantize or dequantize, not both.")
