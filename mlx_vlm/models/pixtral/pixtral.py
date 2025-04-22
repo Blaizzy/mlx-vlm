@@ -3,7 +3,7 @@ import inspect
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -24,6 +24,7 @@ class ModelConfig:
     vision_feature_select_strategy: str = "full"
     vision_feature_layer: int = -1
     vocab_size: int = 32000
+    eos_token_id: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, params):
@@ -68,6 +69,7 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        **kwargs,
     ):
         if pixel_values is None:
             return self.language_model.model.embed_tokens(input_ids)
@@ -135,7 +137,7 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        input_embddings = self.get_input_embeddings(input_ids, pixel_values)
+        input_embddings = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
         logits = self.language_model(
             input_ids, cache=cache, inputs_embeds=input_embddings
         )

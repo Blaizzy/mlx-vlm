@@ -1,14 +1,23 @@
-import inspect
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
+import mlx.nn as nn
+from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.cache import RotatingKVCache
 from PIL import Image
 from transformers.image_processing_utils import BaseImageProcessor as ImageProcessor
 from transformers.image_processing_utils import get_size_dict
 from transformers.image_utils import ChannelDimension, PILImageResampling
+
+
+@dataclass
+class LanguageModelOutput:
+    logits: mx.array
+    cross_attention_states: Optional[List[mx.array]] = None
+    encoder_outputs: Optional[List[mx.array]] = None
 
 
 def expand2square(pil_img, background_color):
@@ -69,125 +78,115 @@ class BaseImageProcessor(ImageProcessor):
         pass
 
 
-class KVCache:
+# Add this code to visualize the chunked attention mask
+def visualize_attention_mask(mask):
+    """Visualize attention mask with symbols for better readability."""
+    if mask is None:
+        print("No mask")
+        return
 
-    def __init__(self, head_dim, n_kv_heads, step=256):
-        self.n_kv_heads = n_kv_heads
-        if isinstance(head_dim, int):
-            self.k_head_dim = self.v_head_dim = head_dim
-        elif isinstance(head_dim, tuple) and len(head_dim) == 2:
-            self.k_head_dim, self.v_head_dim = head_dim
-        else:
-            raise ValueError("head_dim must be an int or a tuple of two ints")
-        self.keys = None
-        self.values = None
-        self.offset = 0
-        self.step = step
+    seq_len = mask.shape[0]
 
-    def update_and_fetch(self, keys, values):
-        self.update(keys, values)
-        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+    print("        ", end="")
+    for i in range(seq_len):
+        print(f"{i:2d} ", end="")
+    print()
 
-    def fetch(self):
-        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
-
-    def update(self, keys, values):
-        prev = self.offset
-        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
-            n_steps = (self.step + keys.shape[2] - 1) // self.step
-            k_shape = (1, self.n_kv_heads, n_steps * self.step, self.k_head_dim)
-            v_shape = (1, self.n_kv_heads, n_steps * self.step, self.v_head_dim)
-            new_k = mx.zeros(k_shape, keys.dtype)
-            new_v = mx.zeros(v_shape, values.dtype)
-            if self.keys is not None:
-                if prev % self.step != 0:
-                    self.keys = self.keys[..., :prev, :]
-                    self.values = self.values[..., :prev, :]
-                self.keys = mx.concatenate([self.keys, new_k], axis=2)
-                self.values = mx.concatenate([self.values, new_v], axis=2)
+    for i in range(seq_len):
+        print(f"Token {i:2d}: ", end="")
+        for j in range(seq_len):
+            if mask[i, j]:
+                print(" ■ ", end="")
             else:
-                self.keys, self.values = new_k, new_v
-
-        self.offset += keys.shape[2]
-        self.keys[..., prev : self.offset, :] = keys
-        self.values[..., prev : self.offset, :] = values
+                print(" ⬚ ", end="")
+        print()
 
 
-class SimpleKVCache:
-    """A simple key-value cache for transformer attention layers.
+def check_activation_stats(name, tensor):
+    """Helper function to check for anomalies and log stats."""
 
-    Stores and concatenates key/value tensors along sequence dimension.
+    print(f"--- Activation Stats: {name} ---")
+    # Check for NaNs/Infs
+    has_nan = mx.isnan(tensor).any()
+    has_inf = mx.isinf(tensor).any()
+    if has_nan:
+        print(f"WARNING: Found NaN in {name}")
+    if has_inf:
+        print(f"WARNING: Found Inf in {name}")
+
+    # Calculate and print stats (ensure computation happens)
+    min_val = mx.min(tensor).item()
+    max_val = mx.max(tensor).item()
+    mean_val = mx.mean(tensor).item()
+    std_val = mx.std(tensor).item()
+    print(f"  Shape: {tensor.shape}")
+    print(f"  Min: {min_val:.4f}, Max: {max_val:.4f}")
+    print(f"  Mean: {mean_val:.4f}, Std: {std_val:.4f}")
+    print("-" * (len(name) + 24))
+
+
+def pixel_shuffle(input_tensor, shuffle_ratio):
+    # input_tensor: [batch_size, num_patches, channels]
+    batch_size, num_patches, channels = input_tensor.shape
+    patch_size = int(math.sqrt(num_patches))
+
+    input_tensor = input_tensor.reshape(batch_size, patch_size, patch_size, -1)
+    batch_size, height, width, channels = input_tensor.shape
+
+    reshaped_tensor = input_tensor.reshape(
+        batch_size, height, int(width * shuffle_ratio), int(channels / shuffle_ratio)
+    )
+    reshaped_tensor = reshaped_tensor.transpose(0, 2, 1, 3)
+
+    reshaped_tensor = reshaped_tensor.reshape(
+        batch_size,
+        int(height * shuffle_ratio),
+        int(width * shuffle_ratio),
+        int(channels / (shuffle_ratio**2)),
+    )
+    reshaped_tensor = reshaped_tensor.transpose(0, 2, 1, 3)
+
+    output_tensor = reshaped_tensor.reshape(batch_size, -1, reshaped_tensor.shape[-1])
+    return output_tensor
+
+
+def interpolate(pos_embed, size, mode="cubic", align_corners=False):
     """
+    MLX implementation of PyTorch's F.interpolate with bicubic mode
 
-    def __init__(self):
-        self.keys = None
-        self.values = None
-        self.cache_length = 0
+    Args:
+        pos_embed: MLX array with shape [B, C, H_src, W_src] or [C, H_src, W_src]
+        size: Tuple (H_dst, W_dst) - target size
+        align_corners: Boolean - whether to align corners
 
-    def update_and_fetch(self, keys, values):
-        """Update cache with new key/value tensors and return full cache.
+    Returns:
+        Interpolated array with shape [B, C, H_dst, W_dst] or [C, H_dst, W_dst]
+    """
+    # Handle different input shapes
+    input_dim = pos_embed.ndim
+    original_shape = pos_embed.shape
 
-        Args:
-            keys: New key tensor to add [batch, heads, seq_len, head_dim]
-            values: New value tensor to add [batch, heads, seq_len, head_dim]
+    if input_dim == 3:
+        # [C, H, W] -> [1, C, H, W]
+        pos_embed = pos_embed.reshape(1, *original_shape)
 
-        Returns:
-            Tuple of (cached_keys, cached_values) containing full cache history
-        """
-        if self.cache_length == 0:
-            # First update - just store tensors
-            self.keys = keys
-            self.values = values
-        else:
-            # Concatenate with existing cache along sequence dimension
-            self.keys = mx.concatenate([self.keys, keys], axis=2)
-            self.values = mx.concatenate([self.values, values], axis=2)
+    # Get source dimensions
+    h_src, w_src = pos_embed.shape[-2:]
+    h_dst, w_dst = size
 
-        self.cache_length += keys.shape[2]
-        return self.keys, self.values
+    # Calculate scale factors
+    scale_h = h_dst / h_src
+    scale_w = w_dst / w_src
 
-    def fetch(self):
-        return self.keys, self.values
+    # Create upsampler
+    upsampler = nn.Upsample(
+        scale_factor=(scale_h, scale_w), mode=mode, align_corners=align_corners
+    )
 
-    def update(self, keys, values):
-        """Update cache with new key/value tensors without returning.
+    # Apply upsampling
+    result = upsampler(pos_embed)
 
-        Args:
-            keys: New key tensor to store
-            values: New value tensor to store
-        """
-        self.keys = keys
-        self.values = values
-        self.cache_length += keys.shape[2]
-
-
-def create_additive_causal_mask(N: int, offset: int = 0):
-    rinds = mx.arange(offset + N)
-    linds = mx.arange(offset, offset + N) if offset else rinds
-    mask = linds[:, None] < rinds[None]
-    return mask * -1e9
-
-
-def create_attention_mask(h: mx.array, cache: Optional[Any] = None):
-    T = h.shape[1]
-    if T > 1:
-        if cache is not None and cache[0] is not None:
-            c = cache[0]
-            if isinstance(c, RotatingKVCache):
-                offset = min(c.max_size - 1, c.offset)
-            else:
-                offset = c.offset
-        else:
-            offset = 0
-        mask = create_additive_causal_mask(T, offset)
-        mask = mask.astype(h.dtype)
-    else:
-        mask = None
-    return mask
-
-
-@dataclass
-class LanguageModelOutput:
-    logits: mx.array
-    cross_attention_states: Optional[List[mx.array]] = None
-    encoder_outputs: Optional[List[mx.array]] = None
+    # Return in the original dimension format
+    if input_dim == 3:
+        return result.reshape(original_shape[0], *size)
+    return result

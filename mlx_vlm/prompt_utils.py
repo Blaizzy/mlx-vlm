@@ -50,13 +50,17 @@ def get_message_json(
             message["content"] = message["content"][0]["content"]
         return message
 
-    def handle_image_token(token_format):
+    def handle_image_token(token_format, image_first=True):
         content = prompt
         if role != "system" and role == "user" and not skip_image_token:
+
             prefix = (
                 token_format * num_images if model_name != "phi3_v" else token_format
             )
-            content = f"{prefix}{content}"
+            if image_first:
+                content = f"{prefix}{content}"
+            else:
+                content = f"{content}{prefix}"
         return {"role": role, "content": content}
 
     def handle_video_with_text():
@@ -80,12 +84,18 @@ def get_message_json(
         ),
         "message_list_with_image_type": handle_list_with_image_type,
         "message_with_image_token": lambda: handle_image_token("<image>"),
+        "message_with_image_token_pipe": lambda: handle_image_token("<|image|>"),
+        "message_with_start_image_token": lambda: handle_image_token(
+            "<start_of_image>", image_first=False
+        ),
         "message_with_image_token_new_line": lambda: handle_image_token("<image>\n"),
         "message_with_numbered_image_tokens": lambda: handle_image_token(
             " ".join([f"<|image_{i+1}|>" for i in range(num_images)])
         ),
         "prompt_only": lambda: prompt,
         "prompt_with_image_token": lambda: "<image>" * num_images + prompt,
+        "prompt_with_start_image_token": lambda: prompt
+        + "<start_of_image>" * num_images,
         "message_video_with_text": handle_video_with_text,
     }
 
@@ -96,6 +106,11 @@ def get_message_json(
         "idefics3": "message_list_with_image_first",
         "phi4mm": "message_with_numbered_image_tokens",
         "aya_vision": "message_list_with_image_first",
+        "mistral3": "message_list_with_image_first",
+        "internvl_chat": "message_list_with_image_type",
+        "kimi_vl": "message_list_with_image",
+        "gemma3": "message_with_start_image_token",
+        "llama4": "message_list_with_image",
         "smolvlm": "message_list_with_image_first",
         "llava": "message_list_with_image",
         "llava_next": "message_list_with_image",

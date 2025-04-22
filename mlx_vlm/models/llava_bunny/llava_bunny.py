@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from functools import partial, reduce
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -39,6 +39,7 @@ class ModelConfig:
     ignore_index: int = -100
     image_token_index: int = -200
     vocab_size: int = 151936
+    eos_token_id: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, params):
@@ -186,8 +187,6 @@ class Model(nn.Module):
         # (batch_size, num_image_patches + sequence_len, embed_dim)
         return mx.concatenate(final_embeddings, axis=0)
 
-        # Create a final embedding of shape
-
     def __call__(
         self,
         input_ids: mx.array,
@@ -198,7 +197,10 @@ class Model(nn.Module):
     ):
         input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
         logits = self.language_model(
-            inputs=input_ids, cache=cache, inputs_embeds=input_embeddings, mask=mask
+            inputs=input_ids,
+            cache=cache,
+            inputs_embeds=input_embeddings,
+            mask=None,  # TODO: add mask
         )
         return logits
 

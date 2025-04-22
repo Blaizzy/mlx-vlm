@@ -15,7 +15,7 @@ DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = []
 DEFAULT_PROMPT = "What are these?"
 DEFAULT_MAX_TOKENS = 256
-DEFAULT_TEMP = 0.5
+DEFAULT_TEMPERATURE = 0.5
 DEFAULT_TOP_P = 1.0
 DEFAULT_SEED = 0
 
@@ -71,12 +71,23 @@ def parse_arguments():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=DEFAULT_TEMP,
+        default=DEFAULT_TEMPERATURE,
         help="Temperature for sampling.",
     )
     parser.add_argument("--chat", action="store_true", help="Chat in multi-turn style.")
     parser.add_argument("--verbose", action="store_false", help="Detailed output.")
-    parser.add_argument("--eos-token", type=str, default=None, help="EOS token.")
+    parser.add_argument(
+        "--eos-tokens",
+        type=str,
+        nargs="+",
+        default=None,
+        help="EOS tokens to add to the tokenizer.",
+    )
+    parser.add_argument(
+        "--skip-special-tokens",
+        action="store_true",
+        help="Skip special tokens in the detokenizer.",
+    )
 
     return parser.parse_args()
 
@@ -113,6 +124,14 @@ def main():
             if len(args.resize_shape) == 1
             else tuple(args.resize_shape)
         )
+
+    if args.eos_tokens is not None:
+        kwargs["eos_tokens"] = [
+            codecs.decode(token, "unicode_escape") for token in args.eos_tokens
+        ]
+
+    if args.skip_special_tokens:
+        kwargs["skip_special_tokens"] = args.skip_special_tokens
 
     if args.chat:
         chat = []

@@ -6,7 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import KVCache, LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache
 
 
 @dataclass
@@ -18,12 +19,15 @@ class TextConfig:
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
-    num_key_value_heads: Optional[int] = None
-    max_position_embeddings: Optional[int] = 32768
-    rope_theta: float = 1000000
+    num_key_value_heads: Optional[int] = 8
+    max_position_embeddings: Optional[int] = 40960
+    rope_theta: float = 1000000.0
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    tie_word_embeddings: bool = True
+    tie_word_embeddings: bool = False
+    sliding_window: int = 32768
+    use_sliding_window: bool = False
+    use_cache: bool = True
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -92,7 +96,7 @@ class Attention(nn.Module):
 
         offset = cache.offset if cache else 0
 
-        if mask is not None:
+        if mask is not None and isinstance(mask, mx.array):
             mask = mask[..., : keys.shape[-2]]
 
         queries = self.rotary_emb(queries, offset=offset)
@@ -161,18 +165,20 @@ class Qwen2Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
         inputs_embeds: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
+        cache=None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
         else:
             h = inputs_embeds
 
-        mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        if mask is None:
+            mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -187,18 +193,15 @@ class LanguageModel(nn.Module):
         self.model_type = args.model_type
         self.model = Qwen2Model(args)
 
-        if args.model_type != "qwen2_vl":
-            raise ValueError(f"Unsupported model type: {args.model_type}")
-
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
+        cache=None,
     ):
         out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
         if self.args.tie_word_embeddings:
