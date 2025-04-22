@@ -43,6 +43,7 @@ class ModelConfig(BaseModelConfig):
     speech_lora: Optional[Dict[str, Any]] = None
     resid_pdrop: float = 0.0
     sliding_window: int = 262144
+    eos_token_id: Optional[int] = None
 
     def __post_init__(self):
         if self.num_key_value_heads is None:

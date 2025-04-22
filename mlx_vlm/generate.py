@@ -113,8 +113,6 @@ def main():
     prompt = apply_chat_template(processor, config, prompt, num_images=len(args.image))
 
     kwargs = {}
-    if args.eos_token is not None:
-        kwargs["eos_token"] = args.eos_token
 
     if args.resize_shape is not None:
         if len(args.resize_shape) not in [1, 2]:
