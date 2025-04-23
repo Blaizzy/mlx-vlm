@@ -69,7 +69,6 @@ class LoRaLayer(nn.Module):
             B = getattr(self.lora_B, self.lora_name).weight
 
             # Dimensions for x @ A to work:
-
             if x.shape[-1] == A.shape[1]:
                 A_transposed = A.T
                 B_transposed = B.T

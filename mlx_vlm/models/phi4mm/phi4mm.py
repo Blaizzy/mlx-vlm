@@ -1,6 +1,7 @@
 import json
 import re
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
@@ -196,6 +197,21 @@ class TransformerBlock(nn.Module):
         return out
 
 
+@partial(mx.compile)
+def pad_embeddings(embeddings, padding_idx):
+    # Create mask where padding_idx is 0 and everything else is 1
+    mask = mx.where(
+        embeddings == padding_idx,
+        mx.zeros(embeddings.shape, dtype=mx.float32),
+        mx.ones(embeddings.shape, dtype=mx.float32),
+    )
+
+    # Apply mask to zero out padding embeddings
+    masked_embeddings = embeddings * mask
+
+    return masked_embeddings
+
+
 class Phi4Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -279,10 +295,11 @@ class Phi4Model(nn.Module):
         input_mode = InputMode(input_mode)
 
         if input_mode in [InputMode.VISION_SPEECH, InputMode.VISION]:
-            self.set_lora_adapter("vision")
+            self.unset_lora_adapter()
+            # self.set_lora_adapter("vision") # TODO: Fix lora adapter
             audio_projection_mode = "vision"
         elif input_mode == InputMode.SPEECH:
-            # self.set_lora_adapter("speech")
+            # self.set_lora_adapter("speech") # TODO: Fix lora adapter
             audio_projection_mode = "speech"
         elif input_mode == InputMode.LANGUAGE:
             self.unset_lora_adapter()
@@ -307,7 +324,7 @@ class Phi4Model(nn.Module):
             )
         elif input_embeds is None and pixel_values is None:
             h = self.embed_tokens(input_ids)
-            h = self.pad_embeddings(h, self.config.pad_token_id)
+            h = pad_embeddings(h, self.config.pad_token_id)
         else:
             h = input_embeds
 
@@ -328,19 +345,6 @@ class Phi4Model(nn.Module):
             out = self.lm_head(out)
 
         return LanguageModelOutput(logits=out)
-
-    def pad_embeddings(self, embeddings, padding_idx):
-        # Create mask where padding_idx is 0 and everything else is 1
-        mask = mx.where(
-            embeddings == padding_idx,
-            mx.zeros(embeddings.shape, dtype=mx.float32),
-            mx.ones(embeddings.shape, dtype=mx.float32),
-        )
-
-        # Apply mask to zero out padding embeddings
-        masked_embeddings = embeddings * mask
-
-        return masked_embeddings
 
     @property
     def head_dim(self):
@@ -440,9 +444,9 @@ class Model(nn.Module):
 
         for k, v in weights.items():
             if "lora_A.vision.weight" in k:
-                weights[k] = v.swapaxes(1, 0)
+                weights[k] = mx.ones_like(v).swapaxes(1, 0)
             elif "lora_B.vision.weight" in k:
-                weights[k] = v.swapaxes(1, 0)
+                weights[k] = mx.ones_like(v).swapaxes(1, 0)
             elif "lora_A.speech.weight" in k:
                 weights[k] = v.swapaxes(1, 0)
             elif "lora_B.speech.weight" in k:
