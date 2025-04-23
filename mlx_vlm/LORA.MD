@@ -47,15 +47,15 @@ Support for other formats and column names will be added soon.
 
 The script accepts the following command-line arguments:
 
-- `--model_path`: Path to the pre-trained model (default: "mlx-community/Qwen2-VL-2B-Instruct-bf16")
+- `--model-path`: Path to the pre-trained model (default: "mlx-community/Qwen2-VL-2B-Instruct-bf16")
 - `--dataset`: Path to your dataset (required)
-- `--learning_rate`: Learning rate for the optimizer (default: 1e-4)
-- `--batch_size`: Batch size for training (default: 1)
+- `--learning-rate`: Learning rate for the optimizer (default: 1e-4)
+- `--batch-size`: Batch size for training (default: 1)
 - `--epochs`: Number of epochs to train (default: 1)
 - `--steps`: Number of steps per epoch (default: 0)
-- `--print_every`: Print loss every n steps (default: 10)
-- `--saved_adapter_path`: Load path to resume training from a previously saved adapter (default: None)
-- `--output_path`: Path to save the trained adapter (default: "adapters.safetensors")
+- `--print-every`: Print loss every n steps (default: 10)
+- `--resume-adapter-path`: Load path to resume training from a previously saved adapter (default: None)
+- `--output-path`: Path to save the trained adapter (default: "adapters.safetensors")
 
 ## Example
 
