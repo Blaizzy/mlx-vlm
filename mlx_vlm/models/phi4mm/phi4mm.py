@@ -222,6 +222,26 @@ class Phi4Model(nn.Module):
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # LoRA related settings
+        assert getattr(config, "speech_lora", None) is not None
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear) or isinstance(module, nn.QuantizedLinear):
+                if re.match(config.speech_lora["layer"], name):
+                    # print(f"Applying Speech LoRA to {name}")
+                    lora_layer = LoRaLayer(
+                        module,
+                        config.speech_lora["r"],
+                        config.speech_lora["lora_alpha"],
+                        config.speech_lora["dp"],
+                        "speech",
+                    )
+
+                    set_module_by_name(self, name, lora_layer)
+
+        self.config.speech_lora["r"] = config.speech_lora["r"]
+        self.config.speech_lora["lora_alpha"] = config.speech_lora["lora_alpha"]
+        self.config.speech_lora["layer"] = config.speech_lora["layer"]
+        self.config.speech_lora["dp"] = config.speech_lora["dp"]
+
         assert getattr(config, "vision_lora", None) is not None
         for name, module in self.named_modules():
 
@@ -235,32 +255,13 @@ class Phi4Model(nn.Module):
                         config.vision_lora["dp"],
                         "vision",
                     )
+                    name = name.replace(".base_layer", "")
                     set_module_by_name(self, name, lora_layer)
 
         self.config.vision_lora["r"] = config.vision_lora["r"]
         self.config.vision_lora["lora_alpha"] = config.vision_lora["lora_alpha"]
         self.config.vision_lora["layer"] = config.vision_lora["layer"]
         self.config.vision_lora["dp"] = config.vision_lora["dp"]
-
-        assert getattr(config, "speech_lora", None) is not None
-        for name, module in self.named_modules():
-            if isinstance(module, nn.Linear) or isinstance(module, nn.QuantizedLinear):
-                if re.match(config.speech_lora["layer"], name):
-                    # print(f"Applying Speech LoRA to {name}")
-                    lora_layer = LoRaLayer(
-                        module,
-                        config.speech_lora["r"],
-                        config.speech_lora["lora_alpha"],
-                        config.speech_lora["dp"],
-                        "speech",
-                    )
-                    name = name.replace(".base_layer", "")
-                    set_module_by_name(self, name, lora_layer)
-
-        self.config.speech_lora["r"] = config.speech_lora["r"]
-        self.config.speech_lora["lora_alpha"] = config.speech_lora["lora_alpha"]
-        self.config.speech_lora["layer"] = config.speech_lora["layer"]
-        self.config.speech_lora["dp"] = config.speech_lora["dp"]
 
     def __call__(
         self,
@@ -365,7 +366,26 @@ class Phi4Model(nn.Module):
         with open(adapter_config, "r") as f:
             adapter_config = json.load(f)
 
-        self.load_weights(str(adapter_path), strict=False)
+        weights = mx.load(str(adapter_path))
+
+        # Sanitize weights to match the expected format
+        sanitized_weights = {}
+        for k, v in weights.items():
+            if "base_model.model.model.layers" in k and "lora_A.weight" in k:
+                new_k = k.replace("base_model.model.model.layers", "layers")
+                new_k = new_k.replace("lora_A.weight", f"lora_A.{adapter_name}.weight")
+                sanitized_weights[new_k] = v
+            elif "base_model.model.model.layers" in k and "lora_B.weight" in k:
+                new_k = k.replace("base_model.model.model.layers", "layers")
+                new_k = new_k.replace("lora_B.weight", f"lora_B.{adapter_name}.weight")
+                sanitized_weights[new_k] = v
+            else:
+                sanitized_weights[k] = v
+
+        weights = sanitized_weights
+
+        self.load_weights(list(weights.items()), strict=False)
+        print(f"Loaded adapter weights for {adapter_name}")
         self.eval()
         for module in self.layers:
             for name, module in module.named_modules():

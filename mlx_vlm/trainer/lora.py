@@ -5,6 +5,19 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
+class LoraAdapter(nn.Module):
+    def __init__(self, input_dims, rank, std_dev=None):
+        super().__init__()
+        if std_dev is None:
+            self.weight = mx.ones((input_dims, rank))
+        else:
+            self.weight = mx.random.uniform(
+                low=-std_dev,
+                high=std_dev,
+                shape=(input_dims, rank),
+            )
+
+
 class LoRaLayer(nn.Module):
     def __init__(
         self,
@@ -27,19 +40,14 @@ class LoRaLayer(nn.Module):
 
         std_dev = 1 / math.sqrt(rank)
 
-        # Create A and B as submodules with the specified name prefix
+        # Create A and B as proper nested modules
         if name is not None:
-            setattr(
-                self,
-                f"lora_A.{name}.weight",
-                mx.random.uniform(
-                    low=-std_dev,
-                    high=std_dev,
-                    shape=(input_dims, rank),
-                ),
-            )
-            setattr(self, f"lora_B.{name}.weight", mx.ones((rank, output_dims)))
-            self.lora_name = name  # Store name for __call__
+            self.lora_name = name
+            self.lora_A = nn.Module()
+            self.lora_B = nn.Module()
+            setattr(self.lora_A, name, LoraAdapter(input_dims, rank))
+            setattr(self.lora_B, name, LoraAdapter(rank, output_dims))
+
         else:
             self.A = mx.random.uniform(
                 low=-std_dev,
@@ -57,11 +65,22 @@ class LoRaLayer(nn.Module):
             return y
 
         if hasattr(self, "lora_name"):
-            A = getattr(self, f"lora_A.{self.lora_name}.weight")
-            B = getattr(self, f"lora_B.{self.lora_name}.weight")
-            lora_update = (self.dropout(x) @ A) @ B
+            A = getattr(self.lora_A, self.lora_name).weight
+            B = getattr(self.lora_B, self.lora_name).weight
+
+            # Dimensions for x @ A to work:
+
+            if x.shape[-1] == A.shape[1]:
+                A_transposed = A.T
+                B_transposed = B.T
+            else:
+                A_transposed = A
+                B_transposed = B
+
+            lora_update = (self.dropout(x) @ A_transposed) @ B_transposed
         else:
             lora_update = (self.dropout(x) @ self.A) @ self.B
+
         return y + (self.alpha * lora_update).astype(x.dtype)
 
 
