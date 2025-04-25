@@ -92,16 +92,18 @@ def generate_grpo(
     end_token: str = "</answer>",
     other_inputs: Optional[List[Dict]] = None
 ):
+    from ..utils import StoppingCriteria
+    if prompt_masks is not None and len(prompt_masks) != len(prompt_tokens):
+        raise ValueError("prompt_masks length must match prompt_tokens length")
+
+    end_sequence = mx.array(processor.tokenizer.encode(end_token))
+    stopping_criteria = StoppingCriteria(end_sequence.tolist(), tokenizer=processor.tokenizer)
+    total_samples = len(prompt_tokens)
+    all_completions = []
+    all_completion_texts = []
+    batch_indices = []
+
     try:
-        if prompt_masks is not None and len(prompt_masks) != len(prompt_tokens):
-            raise ValueError("prompt_masks length must match prompt_tokens length")
-
-        end_sequence = mx.array(processor.tokenizer.encode(end_token))
-        total_samples = len(prompt_tokens)
-        all_completions = []
-        all_completion_texts = []
-        batch_indices = []
-
         for prompt_idx in range(total_samples):
             prompt_array = mx.array(prompt_tokens[prompt_idx])
             prompt_tensor = prompt_array.reshape((1, -1))
@@ -129,8 +131,6 @@ def generate_grpo(
             else:
                 pixel_values = None
 
-            expanded_prompts = mx.repeat(prompt_tensor, group_size, axis=0)
-
             if other_inputs is not None:
                 kwargs = other_inputs[prompt_idx]
             else:
@@ -142,7 +142,7 @@ def generate_grpo(
 
                 current_tokens = []
                 for result in generate_step(
-                    input_ids=expanded_prompts[g_idx].reshape((1, -1)),
+                    input_ids=prompt_tensor,
                     model=model,
                     pixel_values=pixel_values,
                     mask=mask_tensor,
@@ -150,15 +150,12 @@ def generate_grpo(
                     temperature=temperature,
                     **kwargs
                 ):
-                    token_id = result.token
+                    token_id = result[0]
                     if token_id is None:
                         break
                     current_tokens.append(token_id)
-                    if token_id == processor.tokenizer.eos_token_id:
+                    if stopping_criteria(token_id):
                         break
-                    if len(current_tokens) >= len(end_sequence):
-                        if current_tokens[-len(end_sequence):] == end_sequence.asnumpy().tolist():
-                            break
 
                 if current_tokens:
                     batch_results.append(mx.array(current_tokens, dtype=mx.int32))
@@ -529,7 +526,7 @@ def train_grpo(
     def step(batch):
         prompt_tokens, targets, prompt_lens, target_lens, type_info, images, prompt_masks, other_inputs = batch
 
-        all_completions, all_completion_texts, batch_indices, other_inputs = generate_grpo(
+        all_completions, all_completion_texts, batch_indices = generate_grpo(
             model=model,
             processor=processor,
             prompt_tokens=prompt_tokens,

@@ -186,7 +186,11 @@ class GRPODataset:
             {'role': 'user', 'content': prompt_str}
         ]
         # Apply chat template to get prompt text, then tokenize
-        prompt_text = get_prompt(self.config["model_type"], self.processor, conversation)
+        prompt_text = apply_chat_template(
+            processor=self.processor,
+            config=self.config,
+            prompt=conversation
+        )
         answer_tokens = self.processor.tokenizer.encode(answer_str)
 
         from ..utils import prepare_inputs
