@@ -93,59 +93,55 @@ def generate_grpo(
     other_inputs: Optional[List[Dict]] = None
 ):
     try:
-        # Ensure masks list matches prompts if provided
         if prompt_masks is not None and len(prompt_masks) != len(prompt_tokens):
             raise ValueError("prompt_masks length must match prompt_tokens length")
+
         end_sequence = mx.array(processor.tokenizer.encode(end_token))
-        print(f"[DEBUG] Starting generate_grpo: total_samples={len(prompt_tokens)}, group_size={group_size}, max_tokens={max_tokens}")
         total_samples = len(prompt_tokens)
         all_completions = []
         all_completion_texts = []
         batch_indices = []
 
-        # Sequential generation, one sample at a time
         for prompt_idx in range(total_samples):
-            print(f"[DEBUG] Prompt {prompt_idx+1}/{total_samples}")
- 
-            # Convert the current prompt (list of token IDs) to an MXNet NDArray and reshape to [1, seq_len]
             prompt_array = mx.array(prompt_tokens[prompt_idx])
             prompt_tensor = prompt_array.reshape((1, -1))
-            print(f"[DEBUG] prompt_tensor shape: {prompt_tensor.shape}")
-            # Ensure mask tensor has shape (group_size, seq_len)
+
             if prompt_masks is not None:
                 m = prompt_masks[prompt_idx]
-                # Reshape to [1, seq_len] then repeat to [group_size, seq_len]
-                mask_tensor = m.reshape((1, -1))
+                mask_tensor = mx.array(m).reshape((1, -1))
                 mask_tensor = mx.repeat(mask_tensor, group_size, axis=0)
             else:
                 mask_tensor = None
- 
-            # Prepare pixel values for this sample
-            if images is not None:
-                img = images[prompt_idx]
-                img = mx.array(img) if isinstance(img, (list, np.ndarray)) else img
-                if img.ndim == 3:
-                    img = img[None, ...]
-                pixel_values = mx.repeat(img, group_size, axis=0)
+
+            if images:
+                pixel = images[prompt_idx]
+                if (
+                    pixel is None
+                    or not isinstance(pixel, mx.array)
+                    or pixel.size == 0
+                    or (hasattr(pixel, 'shape') and 0 in pixel.shape)
+                ):
+                    pixel_values = None
+                else:
+                    if pixel.ndim == 3:
+                        pixel = pixel[None, ...]
+                    pixel_values = pixel
             else:
                 pixel_values = None
- 
-            # Expand for group_size
+
             expanded_prompts = mx.repeat(prompt_tensor, group_size, axis=0)
-            print(f"[DEBUG] expanded_prompts shape: {expanded_prompts.shape}")
+
             if other_inputs is not None:
                 kwargs = other_inputs[prompt_idx]
             else:
                 kwargs = {}
- 
-            # Generate group_size completions
+
             batch_results = []
             for g_idx in range(group_size):
                 from ..utils import generate_step
 
                 current_tokens = []
-                # Stream tokens and logprobs from generate_step
-                for y, logprobs in generate_step(
+                for result in generate_step(
                     input_ids=expanded_prompts[g_idx].reshape((1, -1)),
                     model=model,
                     pixel_values=pixel_values,
@@ -154,28 +150,19 @@ def generate_grpo(
                     temperature=temperature,
                     **kwargs
                 ):
-                    # Stop if invalid
-                    if y is None or (hasattr(y, "item") and mx.isnan(y).item()):
+                    token_id = result.token
+                    if token_id is None:
                         break
-                    # Convert token to Python int
-                    token_id = int(y.asnumpy()) if hasattr(y, 'asnumpy') else int(y)
                     current_tokens.append(token_id)
-                    # Stop on EOS token
                     if token_id == processor.tokenizer.eos_token_id:
                         break
-                    # Stop if end_sequence is generated
                     if len(current_tokens) >= len(end_sequence):
-                        # compare last tokens to end_sequence
-                        tail = current_tokens[-len(end_sequence):]
-                        seq_ids = end_sequence.asnumpy().tolist()
-                        if tail == seq_ids:
+                        if current_tokens[-len(end_sequence):] == end_sequence.asnumpy().tolist():
                             break
-                    
-                print(f"[DEBUG] Prompt {prompt_idx}, Group {g_idx}: Collected {len(current_tokens)} tokens: {current_tokens}")
+
                 if current_tokens:
                     batch_results.append(mx.array(current_tokens, dtype=mx.int32))
- 
-            # Collect completions
+
             for completion_ids in batch_results:
                 batch_indices.append(prompt_idx)
                 completion_text = processor.tokenizer.decode(completion_ids.tolist())

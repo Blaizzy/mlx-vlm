@@ -145,7 +145,6 @@ class GRPODataset:
         system_key: str = "system",
         system_prompt: str = None,
         type_key: str = "type",
-        use_chat_template: bool = False,
         use_prompt: bool = False
     ):
         self.dataset = hf_dataset[split] if split is not None else hf_dataset
@@ -161,7 +160,6 @@ class GRPODataset:
         self.answer_key = answer_key
         self.system_key = system_key
         self.type_key = type_key
-        self.use_chat_template = use_chat_template
         self.use_prompt = use_prompt
         self.system_prompt = system_prompt
 
@@ -176,45 +174,28 @@ class GRPODataset:
         answer_str = str(item[self.answer_key])
         type_info = item.get(self.type_key, None)
 
-        if self.use_chat_template:
-            default_system_str = (
-                "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
-                "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
-                "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, "
-                "i.e., <think> reasoning process here </think><answer> answer here </answer>."
-            )
-            system_str = self.system_prompt or item.get(self.system_key, default_system_str)
-            full_prompt = [
-                {'role': 'system', 'content': system_str},
-                {'role': 'user', 'content': prompt_str}
-            ]
-            prompt_tokens = self.processor.apply_chat_template(
-                full_prompt,
-                add_generation_prompt=True
-            )
-            answer_tokens = self.processor.tokenizer.encode(answer_str)
-        else:
-            if self.use_prompt:
-                full_prompt_str = (
-                    "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
-                    "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
-                    "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, "
-                    f"i.e., <think> reasoning process here </think><answer> answer here </answer>. User: {prompt_str} Assistant: "
-                )
-                prompt_tokens = self.processor.tokenizer.encode(full_prompt_str)
-            else:
-                prompt_tokens = self.processor.tokenizer.encode(prompt_str)
-            answer_tokens = self.processor.tokenizer.encode(answer_str)
+        default_system_str = (
+            "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
+            "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
+            "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, "
+            "i.e., <think> reasoning process here </think><answer> answer here </answer>."
+        )
+        system_str = self.system_prompt or item.get(self.system_key, default_system_str)
+        conversation = [
+            {'role': 'system', 'content': system_str},
+            {'role': 'user', 'content': prompt_str}
+        ]
+        # Apply chat template to get prompt text, then tokenize
+        prompt_text = get_prompt(self.config["model_type"], self.processor, conversation)
+        answer_tokens = self.processor.tokenizer.encode(answer_str)
 
         from ..utils import prepare_inputs
-        prompt_text = self.processor.tokenizer.decode(prompt_tokens)
-        answer_text = self.processor.tokenizer.decode(answer_tokens)
         inputs = prepare_inputs(
             self.processor,
             image,
-            [prompt_text + answer_text],
-            self.config["image_token_index"],
-            self.image_resize_shape,
+            prompt_text,
+            image_token_index=self.config["image_token_index"],
+            resize_shape=self.image_resize_shape
         )
 
         input_ids = inputs["input_ids"]
@@ -361,8 +342,8 @@ def load_and_prepare_dataset(
         logger.info(f"\033[32mPreparing and maping dataset\033[0m")
         prepared_dataset, messages_key, image_field = prepare_dataset(
             prompt_field = "problem",
-            completion_field = "answer",
-            new_image_field = "images",
+            completion_field = "solution",
+            new_image_field = "image",
             messages_field = "messages",
             dataset=loaded_dataset,
             config=config,
@@ -376,7 +357,8 @@ def load_and_prepare_dataset(
             image_processor=image_processor,
             image_resize_shape=args.image_resize_shape,
             # messages_key=messages_key,
-            images_key=image_field
+            images_key=image_field,
+            answer_key="solution"
         )
     else:
         raise ValueError("training type musst be 'sft',")
