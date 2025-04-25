@@ -61,8 +61,8 @@ class GRPOTrainingArgs(TrainingArgs):
     )
 
 
-def get_per_token_logps(model: nn.Module, inputs, lengths):
-    logits = model(inputs).astype(mx.float16)
+def get_per_token_logps(model: nn.Module, inputs, lengths, pixel_values=None, mask=None, **kwargs):
+    logits = model(inputs, pixel_values=pixel_values, mask=mask, **kwargs)
     logits = logits[:, :-1, :]
     targets = inputs[:, 1:]
     per_token_logps = []
@@ -77,7 +77,6 @@ def get_per_token_logps(model: nn.Module, inputs, lengths):
         per_token_logps.append(token_log_probs)
     mx.eval(logits)
     return per_token_logps
-
 
 def generate_grpo(
     model: nn.Module,
@@ -185,7 +184,7 @@ def grpo_loss(
     epsilon: float = 1e-4,
     reward_weights: Optional[List[float]] = None,
 ):
-    prompt_tokens, _, prompt_text, answer_text, type_info = batch
+    prompt_tokens, _, prompt_text, answer_text, type_info, images, other_inputs = batch
 
     if not all_completions:
         raise ValueError(
@@ -241,13 +240,35 @@ def grpo_loss(
     attention_mask = mx.stack(attention_masks)
     lengths = attention_mask.sum(axis=1)
 
-    token_log_probs = get_per_token_logps(model, inputs, lengths)
+    if images and any(img is not None for img in images):
+        pixel_values = []
+        for img in images:
+            if (
+                img is None
+                or not isinstance(img, mx.array)
+                or img.size == 0
+                or (hasattr(img, 'shape') and 0 in img.shape)
+            ):
+                pixel_values.append(mx.zeros((1, 0, model.hidden_size)))  # or something safe
+            elif img.ndim == 3:
+                pixel_values.append(img[None, ...])
+            else:
+                pixel_values.append(img)
+        pixel_values = mx.concatenate(pixel_values, axis=0)
+    else:
+        pixel_values = None
+        
+    if other_inputs is not None:
+        kwargs = other_inputs[0]
+    else:
+        kwargs = {}
+    token_log_probs = get_per_token_logps(model, prompt_tokens, lengths, pixel_values=pixel_values, mask=attention_mask, **kwargs)
     mx.eval(token_log_probs)
 
     if ref_model is None:
         ref_token_log_probs = token_log_probs
     else:
-        ref_token_log_probs = get_per_token_logps(ref_model, inputs, lengths)
+        ref_token_log_probs = get_per_token_logps(ref_model, prompt_tokens, lengths, pixel_values=pixel_values, mask=attention_mask, **kwargs)
         mx.eval(ref_token_log_probs)
 
     max_len = max(x.shape[0] for x in token_log_probs)
@@ -532,25 +553,24 @@ def train_grpo(
             prompt_tokens=prompt_tokens,
             prompt_masks=prompt_masks,
             images=images,
-            # image_token_index=getattr(model.config, "image_token_index", None),
             other_inputs=other_inputs,
             max_tokens=args.max_completion_length,
             group_size=args.group_size,
             temperature=args.temperature,
-            batch_size=args.batch_size,
+            batch_size=args.batch_size
         )
         if not all_completions:
             print("[WARNING] Retrying generation due to empty completions")
             all_completions, all_completion_texts, batch_indices = generate_grpo(
                 model=model,
                 processor=processor,
-            prompt_tokens=prompt_tokens,
-            prompt_masks=prompt_masks,
+                prompt_tokens=prompt_tokens,
+                prompt_masks=prompt_masks,
                 images=images,
                 max_tokens=args.max_completion_length,
                 group_size=args.group_size,
                 temperature=args.temperature,
-                batch_size=args.batch_size,
+                batch_size=args.batch_size
             )
             if not all_completions:
                 raise ValueError("Still no completions after retry. Check model and inputs.")
@@ -558,14 +578,14 @@ def train_grpo(
         (loss, toks, metrics), grad = loss_value_and_grad(
             model,
             processor=processor,
-            batch=(prompt_tokens, targets, prompt_lens, target_lens, type_info),
+            batch=(prompt_tokens, targets, prompt_lens, target_lens, type_info, images, other_inputs),
             all_completions=all_completions,
             all_completion_texts=all_completion_texts,
             batch_indices=batch_indices,
             reward_funcs=reward_funcs,
             beta=args.beta,
             epsilon=args.epsilon,
-            ref_model=ref_model,
+            ref_model=ref_model
         )
 
         if clip_gradients is not None:
