@@ -61,8 +61,9 @@ class GRPOTrainingArgs(TrainingArgs):
     )
 
 
-def get_per_token_logps(model: nn.Module, inputs, lengths, pixel_values=None, mask=None, **kwargs):
-    logits = model(inputs, pixel_values=pixel_values, mask=mask, **kwargs)
+def get_per_token_logps(model: nn.Module, inputs, lengths, **kwargs):
+    output = model(inputs, mask=None, pixel_values=None, **kwargs)
+    logits = output.logits
     logits = logits[:, :-1, :]
     targets = inputs[:, 1:]
     per_token_logps = []
@@ -239,36 +240,18 @@ def grpo_loss(
     inputs = mx.stack(padded_completions)
     attention_mask = mx.stack(attention_masks)
     lengths = attention_mask.sum(axis=1)
-
-    if images and any(img is not None for img in images):
-        pixel_values = []
-        for img in images:
-            if (
-                img is None
-                or not isinstance(img, mx.array)
-                or img.size == 0
-                or (hasattr(img, 'shape') and 0 in img.shape)
-            ):
-                pixel_values.append(mx.zeros((1, 0, model.hidden_size)))  # or something safe
-            elif img.ndim == 3:
-                pixel_values.append(img[None, ...])
-            else:
-                pixel_values.append(img)
-        pixel_values = mx.concatenate(pixel_values, axis=0)
-    else:
-        pixel_values = None
         
     if other_inputs is not None:
         kwargs = other_inputs[0]
     else:
         kwargs = {}
-    token_log_probs = get_per_token_logps(model, prompt_tokens, lengths, pixel_values=pixel_values, mask=attention_mask, **kwargs)
+    token_log_probs = get_per_token_logps(model, inputs, lengths, **kwargs)
     mx.eval(token_log_probs)
 
     if ref_model is None:
         ref_token_log_probs = token_log_probs
     else:
-        ref_token_log_probs = get_per_token_logps(ref_model, prompt_tokens, lengths, pixel_values=pixel_values, mask=attention_mask, **kwargs)
+        ref_token_log_probs = get_per_token_logps(ref_model, inputs, lengths, **kwargs)
         mx.eval(ref_token_log_probs)
 
     max_len = max(x.shape[0] for x in token_log_probs)
@@ -426,26 +409,6 @@ def grpo_loss(
         "average_generated_tokens": len(all_completion_texts[-1]) // len(batch_indices),
         **reward_metrics,
     }
-
-    print("\n=== Validation Sample Details ===")
-    last_prompt_idx = batch_indices[-1] if batch_indices else 0
-    if last_prompt_idx < len(prompt_text):
-        print(f"\n📋 Raw Prompt:\n{prompt_text[last_prompt_idx]}")
-        print("\n" + "=" * 10 + "\n")
-        if last_prompt_idx < len(prompt_tokens):
-            actual_prompt = processor.tokenizer.decode(prompt_tokens[last_prompt_idx])
-            print(f"\n🔄 Model Input:\n{actual_prompt}")
-            print("\n" + "=" * 10 + "\n")
-    print(f"\n📝 Generation:\n{all_completion_texts[-1]}")
-    print("\n" + "=" * 10 + "\n")
-    if last_prompt_idx < len(answer_text):
-        print(f"\n✅ Answer:\n{answer_text[last_prompt_idx]}")
-        print("\n" + "=" * 10 + "\n")
-    if "r1_extract_xml_answer" in globals():
-        print(
-            f"\n🔍 Extracted Answer:\n{r1_extract_xml_answer(all_completion_texts[-1])}"
-        )
-    print("\n" + "=" * 35 + "\n")
 
     mx.clear_cache()
 
