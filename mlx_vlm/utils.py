@@ -1327,4 +1327,13 @@ def generate(
         )
         print(f"Peak memory: {last_response.peak_memory:.3f} GB")
 
-    return text
+    usage_stats = {
+        "input_tokens": last_response.prompt_tokens,
+        "output_tokens": last_response.generation_tokens,
+        "total_tokens": last_response.prompt_tokens + last_response.generation_tokens,
+        "prompt_tps": last_response.prompt_tps,
+        "generation_tps": last_response.generation_tps,
+        "peak_memory": last_response.peak_memory,
+    }
+
+    return text, usage_stats
