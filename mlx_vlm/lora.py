@@ -68,14 +68,14 @@ def main(args):
         image_resize_shape=args.image_resize_shape,
     )
 
-    resume_adapter_path = args.resume_adapter_path
-    if resume_adapter_path:
-        logger.info(f"\033[32mResuming from adapter path {resume_adapter_path}\033[0m")
+    adapter_path = args.adapter_path
+    if adapter_path:
+        logger.info(f"\033[32mResuming from adapter path {adapter_path}\033[0m")
         logger.info(
             f"\033[32mLora rank, alpha, and dropout will be loaded from adapter_config.json file\033[0m"
         )
 
-        model = apply_lora_layers(model, resume_adapter_path)
+        model = apply_lora_layers(model, adapter_path)
 
     else:
         logger.info(f"\033[32mSetting up LoRA\033[0m")
@@ -184,7 +184,7 @@ if __name__ == "__main__":
         help="Path to save the trained adapter",
     )
     parser.add_argument(
-        "--resume-adapter-path",
+        "--adapter-path",
         type=str,
         default=None,
         help="Load path to resume training from a previously saved adapter",
