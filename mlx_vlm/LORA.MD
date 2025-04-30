@@ -62,16 +62,16 @@ The script accepts the following command-line arguments:
 Here's an example of how to run the script with custom parameters:
 
 ```
-python lora.py --dataset /path/to/your/dataset --model_path /path/to/your/model --epochs 2 --batch_size 4 --learning_rate 5e-5
+python lora.py --dataset /path/to/your/dataset --model-path /path/to/your/model --epochs 2 --batch-size 4 --learning-rate 5e-5
 ```
 
 ## Output
 
-The script will print the training loss at regular intervals (defined by `--print_every`). After training, it will save the LoRA adapter to the specified output path.
+The script will print the training loss at regular intervals (defined by `--print-every`). After training, it will save the LoRA adapter to the specified output path.
 
 ## Note
 
-If you want to use QLoRA, you need to pass a pre-quantized model to the script using the `--model_path` argument (i.e. `mlx-community/Qwen2-VL-2B-Instruct-4bit`).
+If you want to use QLoRA, you need to pass a pre-quantized model to the script using the `--model-path` argument (i.e. `mlx-community/Qwen2-VL-2B-Instruct-4bit`).
 Make sure you have the necessary permissions to read the dataset and write the output file. Also, ensure that your system has sufficient computational resources to handle the specified batch size and model.
 
 ## Contributing
