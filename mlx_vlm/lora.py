@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from .prompt_utils import apply_chat_template
 from .trainer import Dataset, Trainer, save_adapter
-from .trainer.utils import find_all_linear_names, get_peft_model, apply_lora_layers
+from .trainer.utils import apply_lora_layers, find_all_linear_names, get_peft_model
 from .utils import load, load_image_processor
 
 logging.basicConfig(level=logging.INFO)
