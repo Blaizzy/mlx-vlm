@@ -226,7 +226,6 @@ class Gemma3Model(nn.Module):
             h = inputs_embeds
 
         h *= mx.array(self.config.hidden_size**0.5, mx.bfloat16).astype(h.dtype)
-        # raise ValueError(f"{h[0][28][:10].tolist()=}, std={mx.std(h[0][28])}, {h.dtype=}")
 
         if cache is None:
             cache = [None] * len(self.layers)
