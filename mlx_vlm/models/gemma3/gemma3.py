@@ -8,116 +8,10 @@ from typing import List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-import torch
 from huggingface_hub import snapshot_download
 
 from .language import LanguageModel, RMSNorm, TextConfig
 from .vision import VisionConfig, VisionModel
-
-
-def mlx_masked_scatter(target: mx.array, mask: mx.array, source: mx.array) -> mx.array:
-    """
-    Implements masked_scatter functionality with MLX.
-
-    Args:
-        target: The tensor to be updated
-        mask: Boolean mask indicating which elements to update (same shape as target)
-        source: Tensor containing values to copy into target (flattened and used sequentially)
-
-    Returns:
-        Updated target tensor
-
-    Raises:
-        ValueError: If the mask shape does not match the target shape
-        ValueError: If the source tensor has fewer elements than required by the mask
-    """
-    if mask.shape != target.shape:
-        raise ValueError(
-            f"Mask shape {mask.shape} must match target shape {target.shape}"
-        )
-
-    # Flatten tensors
-    target_shape = target.shape
-    ndim = len(target_shape)
-    mask_flat = mx.flatten(mask)
-    source_flat = mx.flatten(source)
-    source_len = source_flat.shape[0]
-
-    result = mx.array(target)
-
-    src_idx = 0
-    for flat_idx in range(mask_flat.shape[0]):
-        if mask_flat[flat_idx].item():
-            # Convert flat index to multi-dimensional indices
-            indices = []
-            temp_idx = flat_idx
-            for dim in reversed(target_shape[1:]):
-                indices.insert(0, temp_idx % dim)
-                temp_idx //= dim
-            indices.insert(0, temp_idx)
-
-            # Get the next source value
-            if src_idx >= source_len:
-                raise ValueError(
-                    "Source tensor has fewer elements than required by the mask"
-                )
-            src_val = source_flat[src_idx]
-            src_idx += 1
-
-            # Convert list of indices to array for slice_update
-            start_indices = mx.array(indices)
-
-            # Define the axes (0, 1, 2, ..., ndim-1)
-            axes = tuple(range(ndim))
-
-            # Create a properly shaped update array
-            update_shape = tuple(1 for _ in range(ndim))
-            update = mx.reshape(src_val, update_shape)
-
-            # Update the result
-            result = mx.slice_update(result, update, start_indices, axes)
-
-    return result
-
-
-def _mlx_masked_scatter_tests():
-    """
-    Temporarily bundle in tests for mlx_masked_scatter
-    """
-    # 2d
-    target = mx.array([[0, 0, 0, 0, 0], [0, 0, 0, 0, 0]])
-    mask = mx.array([[0, 0, 0, 1, 1], [1, 1, 0, 1, 1]])
-    source = mx.array([[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]])
-    assert mx.allclose(
-        mlx_masked_scatter(target, mask, source),
-        mx.array([[0, 0, 0, 0, 1], [2, 3, 0, 4, 5]]),
-    )
-
-    # 3d
-    # fmt: off
-    target = mx.zeros((1, 5, 3))
-    mask = mx.array([[[0, 0, 0],[1, 1, 1],[0, 0, 0],[1, 1, 1],[0, 0, 0],]])
-    source = mx.array([
-        [[1, 2, 3],[4, 5, 6],[7, 8, 9],[10, 11, 12],],
-        [[13, 14, 15],[16, 17, 18],[19, 20, 21],[22, 23, 24],],
-    ])
-    assert mx.allclose(
-        mlx_masked_scatter(target, mask, source),
-        mx.array([[[0, 0, 0], [1, 2, 3], [0, 0, 0], [4, 5, 6], [0, 0, 0]]]),
-    )
-    # fmt: on
-
-
-def torch_masked_scatter(
-    target: mx.array, mask: mx.array, source: mx.array
-) -> mx.array:
-    mask_torch = torch.from_dlpack(np.array(mask))
-    target_torch = torch.from_dlpack(np.array(target))
-    source_torch = torch.from_dlpack(np.array(source))
-
-    target_torch = target_torch.masked_scatter(mask_torch, source_torch)
-    target = mx.array(target_torch.float().numpy()).astype(target.dtype)
-    return target
 
 
 @dataclass
@@ -251,10 +145,8 @@ class Model(nn.Module):
             pad_mask_expanded, mx.zeros_like(final_embedding), final_embedding
         )
 
-        # final_embedding = mlx_masked_scatter(
-        #     final_embedding, image_mask_expanded, scaled_image_features
-        # )
-        final_embedding = torch_masked_scatter(
+        # insert image token embeddings
+        final_embedding = self._masked_scatter(
             final_embedding, image_mask_expanded, scaled_image_features
         )
 
@@ -265,6 +157,29 @@ class Model(nn.Module):
         final_attention_mask_4d = mx.expand_dims(final_attention_mask_4d, 1)
         final_embedding = mx.array(final_embedding)
         return final_embedding, final_attention_mask_4d
+
+    @staticmethod
+    def _masked_scatter(
+        final_embedding: mx.array,
+        image_mask_expanded: mx.array,
+        scaled_image_features: mx.array,
+    ):
+        # Reshape the tensors to 1D
+        final_embedding_shape = final_embedding.shape
+        scaled_image_features_flattened = mx.flatten(scaled_image_features)
+        final_embedding_flattened = mx.flatten(final_embedding)
+        image_mask_expanded_flattened = mx.flatten(image_mask_expanded)
+
+        # Scatter the scaled image features into the special image token positions
+        image_positions = mx.array(
+            np.where(image_mask_expanded_flattened)[0], mx.uint32
+        )
+        final_embedding_flattened[image_positions] = scaled_image_features_flattened
+
+        # Reshape back to the original shape
+        final_embedding = mx.reshape(final_embedding_flattened, final_embedding_shape)
+
+        return final_embedding
 
     def __call__(
         self,
