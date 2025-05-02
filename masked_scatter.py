@@ -1,19 +1,22 @@
 import mlx.core as mx
 
 
-def mlx_masked_scatter(target, mask, source):
+def mlx_masked_scatter(target: mx.array, mask: mx.array, source: mx.array) -> mx.array:
     """
-    Implements PyTorch's masked_scatter functionality using MLX operations.
+    Implements masked_scatter functionality with MLX.
 
     Args:
-        target: The tensor to be updated (any dimensionality)
+        target: The tensor to be updated
         mask: Boolean mask indicating which elements to update (same shape as target)
         source: Tensor containing values to copy into target (flattened and used sequentially)
 
     Returns:
         Updated target tensor
+
+    Raises:
+        ValueError: If the mask shape does not match the target shape
+        ValueError: If the source tensor has fewer elements than required by the mask
     """
-    # Make sure mask has same shape as target
     if mask.shape != target.shape:
         raise ValueError(
             f"Mask shape {mask.shape} must match target shape {target.shape}"
@@ -22,23 +25,15 @@ def mlx_masked_scatter(target, mask, source):
     # Flatten tensors
     target_shape = target.shape
     ndim = len(target_shape)
-
-    # Flatten the mask to find True positions
-    mask_flat = mx.reshape(mask, (-1,))
-
-    # Flatten the source tensor for sequential access
-    source_flat = mx.reshape(source, (-1,))
+    mask_flat = mx.flatten(mask)
+    source_flat = mx.flatten(source)
     source_len = source_flat.shape[0]
 
-    # Create a copy of the target
     result = mx.array(target)
 
-    # Counter for source elements
     src_idx = 0
-
-    # For each position in the flattened mask
     for flat_idx in range(mask_flat.shape[0]):
-        if mask_flat[flat_idx].item():  # If mask is True at this position
+        if mask_flat[flat_idx].item():
             # Convert flat index to multi-dimensional indices
             indices = []
             temp_idx = flat_idx
@@ -47,8 +42,12 @@ def mlx_masked_scatter(target, mask, source):
                 temp_idx //= dim
             indices.insert(0, temp_idx)
 
-            # Get the next source value (cycling if needed)
-            src_val = source_flat[src_idx % source_len]
+            # Get the next source value
+            if src_idx >= source_len:
+                raise ValueError(
+                    "Source tensor has fewer elements than required by the mask"
+                )
+            src_val = source_flat[src_idx]
             src_idx += 1
 
             # Convert list of indices to array for slice_update
@@ -71,8 +70,10 @@ def mlx_masked_scatter(target, mask, source):
 target = mx.array([[0, 0, 0, 0, 0], [0, 0, 0, 0, 0]])
 mask = mx.array([[0, 0, 0, 1, 1], [1, 1, 0, 1, 1]])
 source = mx.array([[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]])
-
-print(mlx_masked_scatter(target, mask, source).tolist())
+assert mx.allclose(
+    mlx_masked_scatter(target, mask, source),
+    mx.array([[0, 0, 0, 0, 1], [2, 3, 0, 4, 5]]),
+)
 
 # 3d
 # fmt: off
@@ -82,5 +83,8 @@ source = mx.array([
     [[1, 2, 3],[4, 5, 6],[7, 8, 9],[10, 11, 12],],
     [[13, 14, 15],[16, 17, 18],[19, 20, 21],[22, 23, 24],],
 ])
+assert mx.allclose(
+    mlx_masked_scatter(target, mask, source),
+    mx.array([[[0, 0, 0], [1, 2, 3], [0, 0, 0], [4, 5, 6], [0, 0, 0]]]),
+)
 # fmt: on
-print(mlx_masked_scatter(target, mask, source).tolist())
