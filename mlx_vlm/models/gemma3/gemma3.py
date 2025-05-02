@@ -122,10 +122,6 @@ class Model(nn.Module):
 
         batch_size, sequence_length = input_ids.shape
         scaled_image_features = image_features / (self.config.hidden_size**0.5)
-        print(f"{scaled_image_features.shape=}")
-        scaled_image_features = mx.flatten(
-            scaled_image_features, start_axis=0, end_axis=1
-        )
         final_embedding = mx.zeros((batch_size, sequence_length, embed_dim))
 
         pad_token_id = self.config.pad_token_id
