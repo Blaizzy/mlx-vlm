@@ -67,8 +67,20 @@ def mlx_masked_scatter(target, mask, source):
     return result
 
 
+# 2d
 target = mx.array([[0, 0, 0, 0, 0], [0, 0, 0, 0, 0]])
 mask = mx.array([[0, 0, 0, 1, 1], [1, 1, 0, 1, 1]])
 source = mx.array([[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]])
 
+print(mlx_masked_scatter(target, mask, source).tolist())
+
+# 3d
+# fmt: off
+target = mx.zeros((1, 5, 3))
+mask = mx.array([[[0, 0, 0],[1, 1, 1],[0, 0, 0],[1, 1, 1],[0, 0, 0],]])
+source = mx.array([
+    [[1, 2, 3],[4, 5, 6],[7, 8, 9],[10, 11, 12],],
+    [[13, 14, 15],[16, 17, 18],[19, 20, 21],[22, 23, 24],],
+])
+# fmt: on
 print(mlx_masked_scatter(target, mask, source).tolist())
