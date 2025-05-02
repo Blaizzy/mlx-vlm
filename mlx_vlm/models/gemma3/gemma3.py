@@ -122,6 +122,7 @@ class Model(nn.Module):
 
         batch_size, sequence_length = input_ids.shape
         scaled_image_features = image_features / (self.config.hidden_size**0.5)
+        print(f"{scaled_image_features.shape=}")
         scaled_image_features = mx.flatten(
             scaled_image_features, start_axis=0, end_axis=1
         )
@@ -150,11 +151,9 @@ class Model(nn.Module):
         )
 
         image_mask_expanded_torch = torch.from_dlpack(
-            np.array(image_mask_expanded.squeeze(), copy=True)
+            np.array(image_mask_expanded, copy=True)
         )
-        final_embedding_torch = torch.from_dlpack(
-            np.array(final_embedding.squeeze(), copy=True)
-        )
+        final_embedding_torch = torch.from_dlpack(np.array(final_embedding, copy=True))
         image_features_torch = torch.from_dlpack(
             np.array(scaled_image_features, copy=True)
         )
@@ -164,7 +163,7 @@ class Model(nn.Module):
         )
         final_embedding = mx.array(final_embedding_torch.float().numpy()).astype(
             final_embedding.dtype
-        )[None, :]
+        )
 
         attention_mask_expanded_1 = mx.expand_dims(attention_mask, 1)
         attention_mask_expanded_2 = mx.expand_dims(attention_mask, 2)
