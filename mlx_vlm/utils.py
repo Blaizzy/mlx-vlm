@@ -927,6 +927,13 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
             pixel_values = mx.array(inputs["pixel_values"])
 
         model_inputs["input_ids"] = mx.array(inputs["input_ids"])
+        model_inputs["input_ids"] = mx.concatenate(
+            [
+                model_inputs["input_ids"][
+                    :, 1:
+                ],  # First batch with first token removed
+            ]
+        )
         model_inputs["pixel_values"] = pixel_values
         model_inputs["attention_mask"] = (
             mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None

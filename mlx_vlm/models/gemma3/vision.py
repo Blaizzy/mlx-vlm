@@ -150,7 +150,7 @@ class Encoder(nn.Module):
             if output_hidden_states:
                 encoder_states = encoder_states + (x,)
 
-            h = x[0]
+            h = x
 
         return (h, encoder_states)
 
@@ -195,13 +195,17 @@ class SigLipVisionModel(nn.Module):
         x: mx.array,
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
+        print(f"Input shape: {x.shape}")
         x = self.embeddings(x)
+        print(f"Embeddings shape: {x.shape}")
 
         encoder_outputs = self.encoder(
             x=x, output_hidden_states=output_hidden_states, mask=None
         )
+        print(f"Encoder outputs: {encoder_outputs[0].shape}")
 
         pooler_output = self.post_layernorm(encoder_outputs[0])
+        print(f"Pooler output shape: {pooler_output.shape}")
 
         return pooler_output, x, encoder_outputs[-1]
 

@@ -62,6 +62,7 @@ class Gemma3MultiModalProjector(nn.Module):
         reshaped_vision_outputs = reshaped_vision_outputs.reshape(
             b, l, self.patches_per_image, self.patches_per_image
         )
+        print(f"{reshaped_vision_outputs.shape=} {b=}")
 
         # Transpose to place h, w in indices 1, 2
         reshaped_vision_outputs = reshaped_vision_outputs.transpose(0, 2, 3, 1)
@@ -98,12 +99,14 @@ class Model(nn.Module):
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
+        print(f"{pixel_values.shape=}, {pixel_values.transpose(0, 2, 3, 1).shape=}")
         hidden_state, _, _ = self.vision_tower(
             pixel_values.transpose(0, 2, 3, 1).astype(inputs_embeds.dtype),
             output_hidden_states=True,
         )
+        print(f"{hidden_state.shape=}")
 
-        image_features = hidden_state[None, :].astype(pixel_values.dtype)
+        image_features = hidden_state.astype(pixel_values.dtype)
         image_features = self.multi_modal_projector(image_features)
 
         final_inputs_embeds, final_attention_mask_4d = (
@@ -120,6 +123,9 @@ class Model(nn.Module):
 
         batch_size, sequence_length = input_ids.shape
         scaled_image_features = image_features / (self.config.hidden_size**0.5)
+        scaled_image_features = mx.flatten(
+            scaled_image_features, start_axis=0, end_axis=1
+        )
         final_embedding = mx.zeros((batch_size, sequence_length, embed_dim))
 
         pad_token_id = self.config.pad_token_id
@@ -141,20 +147,93 @@ class Model(nn.Module):
         final_embedding = mx.where(
             pad_mask_expanded, mx.zeros_like(final_embedding), final_embedding
         )
-        pad_size = final_embedding.shape[1] - scaled_image_features.shape[1]
-        scaled_image_features = mx.pad(
-            scaled_image_features, ((0, 0), (0, pad_size), (0, 0))
-        )
+        # pad_size = final_embedding.shape[1] - scaled_image_features.shape[1]
+        # scaled_image_features = mx.pad(
+        #     scaled_image_features, ((0, 0), (0, pad_size), (0, 0))
+        # )
         # insert image embeddings - the image mask is always less or equal to the sentence in length
-        image_mask_expanded = mx.expand_dims(image_mask, -1)
-        image_mask_expanded = mx.repeat(image_mask_expanded, embed_dim, axis=-1)
-        final_embedding = mx.where(
-            image_mask_expanded, scaled_image_features, final_embedding
+        # image_mask_expanded = mx.expand_dims(image_mask, -1)
+        # image_mask_expanded = mx.repeat(image_mask_expanded, embed_dim, axis=-1)
+        # final_embedding = mx.where(
+        #     image_mask_expanded, scaled_image_features, final_embedding
+        # )
+        import numpy as np
+        import torch
+
+        img_mask_torch = torch.from_dlpack(np.array(image_mask.squeeze(), copy=True))
+        final_embedding_torch = torch.from_dlpack(
+            np.array(final_embedding.squeeze(), copy=True)
+        )
+        image_features_torch = torch.from_dlpack(
+            np.array(scaled_image_features, copy=True)
+        )
+        print(
+            f"{final_embedding_torch.shape=}, {image_features_torch.shape=}, {img_mask_torch.shape=}"
         )
 
-        final_embedding = mx.where(
-            pad_mask_expanded, mx.zeros_like(final_embedding), final_embedding
+        # Expand mask to match the dimensions of final_embedding_torch
+        img_mask_expanded = img_mask_torch.unsqueeze(-1).expand_as(
+            final_embedding_torch
         )
+
+        final_embedding_torch = final_embedding_torch.masked_scatter(
+            img_mask_expanded, image_features_torch
+        )
+        final_embedding = mx.array(final_embedding_torch.float().numpy()).astype(
+            final_embedding.dtype
+        )[None, :]
+
+        # # Implement masked_scatter-like behavior for image embeddings
+        # # We need to take features sequentially from scaled_image_features
+        # # and place them at positions where image_mask is True
+        # for b in range(batch_size):
+        #     # Find positions of image tokens in this batch
+        #     # Since mx.argwhere is not available, we'll manually find the indices
+        #     img_indices = []
+        #     for i in range(sequence_length):
+        #         if image_mask[b, i]:
+        #             img_indices.append(i)
+
+        #     if len(img_indices) > 0:
+        #         # Number of image tokens to process (limited by what's available)
+        #         n_tokens = min(len(img_indices), scaled_image_features.shape[1])
+
+        #         # For each image position, create a temporary mask and apply the feature
+        #         for i in range(n_tokens):
+        #             # Position in the sequence
+        #             pos = img_indices[i]
+
+        #             # Feature to insert (from the i-th position in image features)
+        #             feature = scaled_image_features[b, i]
+
+        #             # Create a mask for just this position in this batch
+        #             # Since .at[].set() is not available, we'll create the mask differently
+        #             batch_mask = mx.zeros((batch_size,), dtype=mx.bool_)
+        #             batch_mask = mx.array([j == b for j in range(batch_size)])
+
+        #             pos_mask = mx.zeros((sequence_length,), dtype=mx.bool_)
+        #             pos_mask = mx.array([j == pos for j in range(sequence_length)])
+
+        #             # Expand dimensions to match the embedding shape
+        #             batch_mask_expanded = mx.expand_dims(batch_mask, -1)
+        #             batch_mask_expanded = mx.expand_dims(batch_mask_expanded, -1)
+        #             batch_mask_expanded = mx.repeat(batch_mask_expanded, sequence_length, axis=1)
+        #             batch_mask_expanded = mx.repeat(batch_mask_expanded, embed_dim, axis=2)
+
+        #             pos_mask_expanded = mx.expand_dims(pos_mask, -1)
+        #             pos_mask_expanded = mx.expand_dims(pos_mask_expanded, 0)
+        #             pos_mask_expanded = mx.repeat(pos_mask_expanded, batch_size, axis=0)
+        #             pos_mask_expanded = mx.repeat(pos_mask_expanded, embed_dim, axis=2)
+
+        #             # Combine masks to target just this position in this batch
+        #             position_mask = mx.logical_and(batch_mask_expanded, pos_mask_expanded)
+
+        #             # Apply the feature to just this position
+        #             final_embedding = mx.where(position_mask, feature, final_embedding)
+
+        # final_embedding = mx.where(
+        #     pad_mask_expanded, mx.zeros_like(final_embedding), final_embedding
+        # )
 
         attention_mask_expanded_1 = mx.expand_dims(attention_mask, 1)
         attention_mask_expanded_2 = mx.expand_dims(attention_mask, 2)
@@ -175,7 +254,7 @@ class Model(nn.Module):
         input_embeddings, final_attention_mask_4d = self.get_input_embeddings(
             input_ids, pixel_values, mask
         )
-
+        print(f"{input_embeddings.shape=}")
         logits = self.language_model(
             inputs=input_ids,
             cache=cache,
