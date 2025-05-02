@@ -111,9 +111,9 @@ def _mlx_masked_scatter_tests():
 def torch_masked_scatter(
     target: mx.array, mask: mx.array, source: mx.array
 ) -> mx.array:
-    mask_torch = torch.from_dlpack(np.array(mask, copy=True))
-    target_torch = torch.from_dlpack(np.array(target, copy=True))
-    source_torch = torch.from_dlpack(np.array(source, copy=True))
+    mask_torch = torch.from_dlpack(np.array(mask))
+    target_torch = torch.from_dlpack(np.array(target))
+    source_torch = torch.from_dlpack(np.array(source))
 
     target_torch = target_torch.masked_scatter(mask_torch, source_torch)
     target = mx.array(target_torch.float().numpy()).astype(target.dtype)
