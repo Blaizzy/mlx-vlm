@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import glob
 import importlib
@@ -16,7 +17,7 @@ import mlx.nn as nn
 import numpy as np
 import requests
 from huggingface_hub import snapshot_download
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.utils import tree_flatten, tree_reduce, tree_unflatten
 from PIL import Image, ImageOps
 from transformers import (
     AutoConfig,
@@ -25,7 +26,8 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-from .models.base import BaseImageProcessor, KVCache, SimpleKVCache
+from .models.base import BaseImageProcessor
+from .models.cache import KVCache, SimpleKVCache
 from .sample_utils import top_p_sampling
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
@@ -34,6 +36,46 @@ from .trainer import apply_lora_layers
 MODEL_REMAPPING = {"llava-qwen2": "llava_bunny", "bunny-llama": "llava_bunny"}
 
 MAX_FILE_SIZE_GB = 5
+
+MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
+
+
+# A stream on the default device just for generation
+generation_stream = mx.new_stream(mx.default_device())
+
+
+@contextlib.contextmanager
+def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
+    """
+    A context manager to temporarily change the wired limit.
+
+    Note, the wired limit should not be changed during an async eval.  If an
+    async eval could be running pass in the streams to synchronize with prior
+    to exiting the context manager.
+    """
+    model_bytes = tree_reduce(
+        lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
+    )
+    max_rec_size = mx.metal.device_info()["max_recommended_working_set_size"]
+    if model_bytes > 0.9 * max_rec_size:
+        model_mb = model_bytes // 2**20
+        max_rec_mb = max_rec_size // 2**20
+        print(
+            f"[WARNING] Generating with a model that requires {model_mb} MB "
+            f"which is close to the maximum recommended size of {max_rec_mb} "
+            "MB. This can be slow. See the documentation for possible work-arounds: "
+            "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
+        )
+    old_limit = mx.set_wired_limit(max_rec_size)
+    try:
+        yield None
+    finally:
+        if streams is not None:
+            for s in streams:
+                mx.synchronize(s)
+        else:
+            mx.synchronize()
+        mx.set_wired_limit(old_limit)
 
 
 @dataclass
@@ -92,7 +134,7 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
                     "*.json",
                     "*.safetensors",
                     "*.py",
-                    "tokenizer.model",
+                    "*.model",
                     "*.tiktoken",
                     "*.txt",
                 ],
@@ -276,7 +318,11 @@ def load(
         model.eval()
 
     image_processor = load_image_processor(model_path, **kwargs)
-    processor = load_processor(model_path, True, **kwargs)
+
+    # Get the eos_token_id from the model config
+    eos_token_id = getattr(model.config, "eos_token_id", None)
+
+    processor = load_processor(model_path, True, eos_token_ids=eos_token_id, **kwargs)
 
     if image_processor is not None:
         processor.image_processor = image_processor
@@ -336,16 +382,33 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 
 
 def load_processor(
-    model_path, add_detokenizer=True, **kwargs
+    model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
 
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
-        if "tokenizer" in processor.__dict__.keys():
-            processor.detokenizer = detokenizer_class(processor.tokenizer)
+
+        # Get the tokenizer object
+        tokenizer_obj = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+
+        # Instantiate the detokenizer
+        processor.detokenizer = detokenizer_class(tokenizer_obj)
+
+        # Determine the EOS token IDs, prioritizing the function argument
+        final_eos_token_ids = (
+            eos_token_ids if eos_token_ids is not None else tokenizer_obj.eos_token_ids
+        )
+
+        # Create and assign the StoppingCriteria
+        criteria = StoppingCriteria(final_eos_token_ids, tokenizer_obj)
+        if hasattr(processor, "tokenizer"):
+            processor.tokenizer.stopping_criteria = criteria
         else:
-            processor.detokenizer = detokenizer_class(processor)
+            processor.stopping_criteria = criteria
+
     return processor
 
 
@@ -354,7 +417,12 @@ def fetch_from_hub(
 ) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
     model = load_model(model_path, lazy, **kwargs)
     config = load_config(model_path, **kwargs)
-    processor = load_processor(model_path, add_detokenizer=False, **kwargs)
+    processor = load_processor(
+        model_path,
+        add_detokenizer=False,
+        eos_token_ids=config.get("eos_token_id", None),
+        **kwargs,
+    )
     return model, config, processor
 
 
@@ -397,7 +465,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
 
     from . import __version__
 
-    card = ModelCard.load(hf_path)
+    card = ModelCard.load("OpenGVLab/InternVL3-1B")
     card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"]
     card.text = dedent(
         f"""
@@ -615,6 +683,7 @@ def save_config(
     """
     # Clean unused keys
     config.pop("_name_or_path", None)
+    config.pop("torch_dtype", None)
 
     # sort the config for better readability
     config = dict(sorted(config.items()))
@@ -663,7 +732,7 @@ def convert(
     quantize: bool = False,
     q_group_size: int = 64,
     q_bits: int = 4,
-    dtype: str = "float16",
+    dtype: Optional[str] = None,
     upload_repo: str = None,
     revision: Optional[str] = None,
     dequantize: bool = False,
@@ -676,9 +745,13 @@ def convert(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
 
+    if dtype is None:
+        dtype = config.get("torch_dtype", None)
     weights = dict(tree_flatten(model.parameters()))
-    dtype = getattr(mx, dtype)
-    weights = {k: v.astype(dtype) for k, v in weights.items()}
+    if dtype in MODEL_CONVERSION_DTYPES:
+        print("[INFO] Using dtype:", dtype)
+        dtype = getattr(mx, dtype)
+        weights = {k: v.astype(dtype) for k, v in weights.items()}
 
     if quantize and dequantize:
         raise ValueError("Choose either quantize or dequantize, not both.")
@@ -853,6 +926,7 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
         else:
             pixel_values = mx.array(inputs["pixel_values"])
 
+        model_inputs["input_ids"] = mx.array(inputs["input_ids"])
         model_inputs["pixel_values"] = pixel_values
         model_inputs["attention_mask"] = (
             mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
@@ -938,7 +1012,7 @@ def generate_step(
                 (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
             ]
         else:
-            cache = [KVCache(model.language_model.head_dim, n) for n in kv_heads]
+            cache = [KVCache() for n in kv_heads]
 
     repetition_context = input_ids.reshape(-1).tolist()
 
@@ -946,35 +1020,36 @@ def generate_step(
         repetition_context = repetition_context[-repetition_context_size:]
 
     def _step(y, **kwargs):
-        nonlocal repetition_context
-        if "decoder_input_ids" in kwargs:
-            outputs = model.language_model(
-                cache=cache,
-                **kwargs,
-            )
-        else:
+        with mx.stream(generation_stream):
+            nonlocal repetition_context
+            if "decoder_input_ids" in kwargs:
+                outputs = model.language_model(
+                    cache=cache,
+                    **kwargs,
+                )
+            else:
 
-            outputs = model.language_model(
-                y[None],
-                cache=cache,
-                **kwargs,
-            )
+                outputs = model.language_model(
+                    y[None],
+                    cache=cache,
+                    **kwargs,
+                )
 
-        logits = outputs.logits[:, -1, :]
+            logits = outputs.logits[:, -1, :]
 
-        if repetition_penalty:
-            logits = apply_repetition_penalty(
-                logits, repetition_context, repetition_penalty
-            )
-            y, logprobs = sample(logits)
-            repetition_context.append(y.item())
-        else:
-            y, logprobs = sample(logits)
+            if repetition_penalty:
+                logits = apply_repetition_penalty(
+                    logits, repetition_context, repetition_penalty
+                )
+                y, logprobs = sample(logits)
+                repetition_context.append(y.item())
+            else:
+                y, logprobs = sample(logits)
 
-        if repetition_context_size:
-            if len(repetition_context) > repetition_context_size:
-                repetition_context = repetition_context[-repetition_context_size:]
-        return y, logprobs.squeeze(0)
+            if repetition_context_size:
+                if len(repetition_context) > repetition_context_size:
+                    repetition_context = repetition_context[-repetition_context_size:]
+            return y, logprobs.squeeze(0)
 
     outputs = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
 
@@ -1012,6 +1087,54 @@ def generate_step(
         n += 1
 
 
+class StoppingCriteria:
+    def __init__(self, eos_token_ids: List[int], tokenizer=None):
+
+        if isinstance(eos_token_ids, int):
+            self.eos_token_ids = [eos_token_ids]
+        else:
+            self.eos_token_ids = eos_token_ids
+
+        self.tokenizer = tokenizer
+
+    def add_eos_token_ids(self, new_eos_token_ids: Union[int, List[int]] = None):
+        """
+        Add new token IDs to the list of EOS token IDs.
+
+        Args:
+            new_eos_token_ids: Integer, string, or list of integers/strings representing token IDs to add.
+                               If strings are provided, they will be converted to integers if possible.
+        """
+        if new_eos_token_ids is None:
+            pass
+
+        if self.tokenizer is None:
+            raise ValueError("Processor is not provided")
+
+        if new_eos_token_ids is not None:
+            if isinstance(new_eos_token_ids, str):
+                new_eos_token_ids = [new_eos_token_ids]
+            new_eos_token_ids = [
+                self.tokenizer.encode(" " + token, add_special_tokens=False)[-1]
+                for token in new_eos_token_ids
+            ]
+            self.eos_token_ids.extend(new_eos_token_ids)
+
+    def reset(self, eos_token_ids: List[int] = None):
+        eos_token_ids = (
+            eos_token_ids if eos_token_ids is not None else self.tokenizer.eos_token_ids
+        )
+
+        if isinstance(eos_token_ids, int):
+            eos_token_ids = [eos_token_ids]
+
+        if self.eos_token_ids != eos_token_ids:
+            self.eos_token_ids = eos_token_ids
+
+    def __call__(self, input_ids: mx.array) -> bool:
+        return input_ids in self.eos_token_ids
+
+
 def stream_generate(
     model: nn.Module,
     processor: PreTrainedTokenizer,
@@ -1033,7 +1156,20 @@ def stream_generate(
         Generator[Tuple[mx.array, mx.array]]: A generator producing text.
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    add_special_tokens = not hasattr(processor, "chat_template")
+
+    # Skip special tokens
+    skip_special_tokens = kwargs.pop("skip_special_tokens", False)
+    skip_special_token_ids = (
+        set(tokenizer.all_special_ids)
+        if skip_special_tokens and hasattr(tokenizer, "all_special_ids")
+        else []
+    )
+
+    add_special_tokens = (
+        not hasattr(processor, "chat_template")
+        if model.config.model_type == "gemma3"
+        else True
+    )
     prompt_tokens = mx.array(
         tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
     )
@@ -1063,23 +1199,37 @@ def stream_generate(
         pixel_values = kwargs.pop("pixel_values")
         mask = kwargs.pop("mask")
 
-    detokenizer = processor.detokenizer
-    detokenizer.reset()
-    tic = time.perf_counter()
-    for n, (token, logprobs) in enumerate(
-        generate_step(input_ids, model, pixel_values, mask, **kwargs)
-    ):
-        if n == 0:
-            prompt_time = time.perf_counter() - tic
-            prompt_tps = input_ids.size / prompt_time
-            tic = time.perf_counter()
+    with wired_limit(model, [generation_stream]):
+        detokenizer = processor.detokenizer
+        detokenizer.reset()
+        tic = time.perf_counter()
+        for n, (token, logprobs) in enumerate(
+            generate_step(input_ids, model, pixel_values, mask, **kwargs)
+        ):
+            if n == 0:
+                prompt_time = time.perf_counter() - tic
+                prompt_tps = input_ids.size / prompt_time
+                tic = time.perf_counter()
 
-        if token == tokenizer.eos_token_id:
-            break
+            # Stop generation if the token is in the eos_token_ids
+            if tokenizer.stopping_criteria(token):
+                break
 
-        detokenizer.add_token(token)
+            detokenizer.add_token(token, skip_special_token_ids=skip_special_token_ids)
 
-        # Yield the last segment if streaming
+            # Yield the last segment if streaming
+            yield GenerationResult(
+                text=detokenizer.last_segment,
+                token=token,
+                logprobs=logprobs,
+                prompt_tokens=input_ids.size,
+                generation_tokens=n + 1,
+                prompt_tps=prompt_tps,
+                generation_tps=(n + 1) / (time.perf_counter() - tic),
+                peak_memory=mx.get_peak_memory() / 1e9,
+            )
+
+        detokenizer.finalize()
         yield GenerationResult(
             text=detokenizer.last_segment,
             token=token,
@@ -1088,20 +1238,8 @@ def stream_generate(
             generation_tokens=n + 1,
             prompt_tps=prompt_tps,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
-            peak_memory=mx.metal.get_peak_memory() / 1e9,
+            peak_memory=mx.get_peak_memory() / 1e9,
         )
-
-    detokenizer.finalize()
-    yield GenerationResult(
-        text=detokenizer.last_segment,
-        token=token,
-        logprobs=logprobs,
-        prompt_tokens=input_ids.size,
-        generation_tokens=n + 1,
-        prompt_tps=prompt_tps,
-        generation_tps=(n + 1) / (time.perf_counter() - tic),
-        peak_memory=mx.metal.get_peak_memory() / 1e9,
-    )
 
 
 def generate(
@@ -1145,6 +1283,29 @@ def generate(
     text = ""
     last_response = None
 
+    eos_tokens = kwargs.get("eos_tokens", None)
+    stopping_criteria = kwargs.get("stopping_criteria", None)
+
+    # Get the tokenizer
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+    # Add custom EOS tokens to the stopping criteria
+    if eos_tokens is not None:
+        tokenizer.stopping_criteria.add_eos_token_ids(eos_tokens)
+
+    # Use custom stopping criteria
+    elif stopping_criteria is not None:
+        if isinstance(stopping_criteria, StoppingCriteria) or callable(
+            stopping_criteria
+        ):
+            tokenizer.stopping_criteria = stopping_criteria
+        else:
+            raise ValueError(
+                "stopping_criteria must be an instance of StoppingCriteria or a callable"
+            )
+    else:
+        tokenizer.stopping_criteria.reset(model.config.eos_token_id)
+
     for response in stream_generate(model, processor, prompt, image, **kwargs):
         if verbose:
             print(response.text, end="", flush=True)
@@ -1166,4 +1327,13 @@ def generate(
         )
         print(f"Peak memory: {last_response.peak_memory:.3f} GB")
 
-    return text
+    usage_stats = {
+        "input_tokens": last_response.prompt_tokens,
+        "output_tokens": last_response.generation_tokens,
+        "total_tokens": last_response.prompt_tokens + last_response.generation_tokens,
+        "prompt_tps": last_response.prompt_tps,
+        "generation_tps": last_response.generation_tps,
+        "peak_memory": last_response.peak_memory,
+    }
+
+    return text, usage_stats

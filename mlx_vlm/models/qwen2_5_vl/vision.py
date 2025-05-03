@@ -281,7 +281,7 @@ class VisionModel(nn.Module):
             wpos_ids = wpos_ids.flatten()
 
             stacked_pos_ids = mx.stack([hpos_ids, wpos_ids], axis=-1)
-            pos_ids.append(mx.repeat(stacked_pos_ids, t, axis=0))
+            pos_ids.append(mx.tile(stacked_pos_ids, (t, 1)))
 
         pos_ids = mx.concatenate(pos_ids, axis=0)
         max_grid_size = mx.max(grid_thw[:, 1:])

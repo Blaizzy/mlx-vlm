@@ -1,12 +1,30 @@
 import argparse
+import importlib.util
 import json
 import platform
 import subprocess
 import sys
 import textwrap
 import time
+import traceback
 
 import mlx.core as mx
+
+
+# Function to check if a package is installed
+def is_package_installed(package_name):
+    return importlib.util.find_spec(package_name) is not None
+
+
+# Check required packages
+required_packages = ["psutil", "rich", "tqdm"]
+missing_packages = [pkg for pkg in required_packages if not is_package_installed(pkg)]
+
+if missing_packages:
+    print(f"Missing required packages: {', '.join(missing_packages)}")
+    print("Please install them using: pip install " + " ".join(missing_packages))
+    sys.exit(1)
+
 import psutil
 from rich.console import Console
 from rich.panel import Panel
@@ -85,6 +103,7 @@ def test_model_loading(model_path):
         return model, processor, config, False
     except Exception as e:
         console.print(f"[bold red]✗[/] Failed to load model: {str(e)}")
+        # traceback.print_exc() #Uncomment this to see the full traceback
         return None, None, None, True
 
 
@@ -95,11 +114,17 @@ def test_generation(
         test_type = "vision-language" if vision_language else "language-only"
         console.print(f"[bold yellow]Testing {test_type} generation...")
 
-        prompt = (
-            test_inputs["prompt"]
-            if vision_language
-            else test_inputs["language_only_prompt"]
-        )
+        if (
+            config.get("model_type", "") == "florence2"
+            and test_type == "vision-language"
+        ):
+            prompt = "<OD>"
+        else:
+            prompt = (
+                test_inputs["prompt"]
+                if vision_language
+                else test_inputs["language_only_prompt"]
+            )
         num_images = len(test_inputs["image"]) if vision_language else 0
 
         formatted_prompt = apply_chat_template(
@@ -132,6 +157,7 @@ def test_generation(
         return False
     except Exception as e:
         console.print(f"[bold red]✗[/] {test_type} generation failed: {str(e)}")
+        traceback.print_exc()
         return True
 
 
@@ -174,8 +200,8 @@ def main():
             print("\n")
 
             # Clear cache and reset peak memory for next test
-            mx.metal.clear_cache()
-            mx.metal.reset_peak_memory()
+            mx.clear_cache()
+            mx.reset_peak_memory()
 
             # Test language-only generation
             error |= test_generation(
@@ -185,8 +211,8 @@ def main():
 
         console.print("[bold blue]Cleaning up...")
         del model, processor
-        mx.metal.clear_cache()
-        mx.metal.reset_peak_memory()
+        mx.clear_cache()
+        mx.reset_peak_memory()
         console.print("[bold green]✓[/] Cleanup complete\n")
         results.append(
             f"[bold {'green' if not error else 'red'}]{'✓' if not error else '✗'}[/] {model_path}"

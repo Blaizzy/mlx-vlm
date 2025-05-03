@@ -5,7 +5,8 @@ from typing import List, Optional, Tuple, Type, Union
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from scipy.ndimage import zoom
+from PIL import Image
+from PIL.Image import Resampling
 
 
 @dataclass
@@ -39,33 +40,62 @@ class MLPBlock(nn.Module):
 
 def resize_image(image_np, new_size=(96, 96), order=1):
     """
-    Resize an image with multiple channels using bilinear interpolation.
+    Resize an image with multiple channels using PIL.
+
     Args:
-    image_np (numpy.ndarray): The input image array of shape (channels, height, width).
+    image_np (numpy.ndarray): The input image array of shape (batch, channels, height, width).
     new_size (tuple): The target size as (height, width).
-    order (int): The order of the spline interpolation, 1 is bilinear.
+    order (int): The order of interpolation (used to determine resampling method).
 
     Returns:
-    numpy.ndarray: The resized image array.
+    numpy.ndarray: The resized image array in the same format as input.
     """
+    # Remove batch dimension
     image_np = np.array(image_np[0])
 
-    # Calculate zoom factors for the spatial dimensions only
-    height_factor = new_size[0] / image_np.shape[1]
-    width_factor = new_size[1] / image_np.shape[2]
-    zoom_factors = (height_factor, width_factor)  # Apply zoom to height and width only
+    # Get dimensions
+    channels, height, width = image_np.shape
 
-    # Resize each channel separately and collect them in a list
-    resized_channels = []
-    for channel in range(image_np.shape[0]):
-        # Apply zoom to the current channel and append to the list
-        resized_channel = zoom(image_np[channel], zoom_factors, order=order)
-        resized_channels.append(resized_channel)
+    # Choose interpolation method based on order parameter
+    resample_method = Resampling.BILINEAR  # Default to bilinear
+    if order == 0:
+        resample_method = Resampling.NEAREST
+    elif order == 2 or order == 3:
+        resample_method = Resampling.BICUBIC
 
-    # Stack the resized channels back into a single array
-    resized_image_np = np.stack(resized_channels, axis=0)
+    # Handle different channel configurations
+    if channels == 1:
+        # For single-channel images (grayscale)
+        # Reshape to 2D array (height, width)
+        image_2d = image_np.reshape(height, width)
 
-    return mx.array(resized_image_np)[None, :]
+        # Create PIL image - ensure proper mode and data type conversion
+        pil_image = Image.fromarray(image_2d.astype(np.float32))
+
+        # Resize using PIL (note: PIL takes width, height order)
+        resized_pil = pil_image.resize(
+            (new_size[1], new_size[0]), resample=resample_method
+        )
+
+        # Convert back to numpy array, reshape to add channel dimension
+        resized_np = np.array(resized_pil).reshape((1, new_size[0], new_size[1]))
+    else:
+        # For multi-channel images, process each channel individually
+        resized_channels = []
+
+        for c in range(channels):
+            channel_data = image_np[c]
+            pil_channel = Image.fromarray(channel_data.astype(np.float32))
+            resized_channel = pil_channel.resize(
+                (new_size[1], new_size[0]), resample=resample_method
+            )
+            resized_channels.append(np.array(resized_channel))
+
+        # Stack channels back together
+        resized_np = np.stack(resized_channels, axis=0)
+
+    # Add batch dimension back and convert to mx.array
+    return mx.array(resized_np)[None, :]
 
 
 class SAMEncoder(nn.Module):

@@ -4,9 +4,9 @@ from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache, RotatingKVCache
 
 
 @dataclass
@@ -92,7 +92,7 @@ class Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
-        if self.use_sliding_window and mask is not None:
+        if self.use_sliding_window and mask is not None and isinstance(mask, mx.array):
             key_len = keys.shape[-2]
             if mask.shape[-1] != key_len:
                 mask = mask[..., -key_len:]

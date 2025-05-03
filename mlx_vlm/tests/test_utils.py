@@ -2,6 +2,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_vlm.utils import (
+    StoppingCriteria,
     get_class_predicate,
     prepare_inputs,
     quantize_model,
@@ -189,3 +190,27 @@ def test_prepare_inputs():
     )
     assert "input_ids" in inputs
     assert mx.array_equal(inputs["input_ids"], mx.array([1, 2, 3]))
+
+
+def test_stopping_criteria():
+    class MockProcessor:
+        def __init__(self):
+            self.tokenizer = type(
+                "DummyTokenizer", (), {"pad_token": None, "eos_token": "[EOS]"}
+            )()
+
+        def encode(self, text, add_special_tokens=False):
+            # Mock encode method that returns a token ID (32008) for "[EOS]"
+            if "[EOS]" in text:
+                return [32008]
+            return [1]  # Default token ID
+
+    processor = MockProcessor()
+    stopping_criteria = StoppingCriteria([2, 32000, 32007], processor)
+    assert stopping_criteria.eos_token_ids == [2, 32000, 32007]
+
+    stopping_criteria.add_eos_token_ids("[EOS]")
+    assert stopping_criteria.eos_token_ids == [2, 32000, 32007, 32008]
+
+    stopping_criteria.add_eos_token_ids("</answer>")
+    assert stopping_criteria.eos_token_ids == [2, 32000, 32007, 32008, 1]

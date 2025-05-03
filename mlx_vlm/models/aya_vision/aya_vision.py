@@ -3,7 +3,7 @@ import inspect
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -26,6 +26,7 @@ class ModelConfig:
     adapter_layer_norm_eps: float = 1e-06
     vision_feature_layer: int = -1
     vision_feature_select_strategy: str = "full"
+    eos_token_id: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, params):

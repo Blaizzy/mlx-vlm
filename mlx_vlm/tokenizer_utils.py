@@ -1,6 +1,7 @@
 import json
 from functools import partial
 from json import JSONDecodeError
+from typing import List
 
 from transformers import AutoTokenizer
 
@@ -48,7 +49,7 @@ class StreamingDetokenizer:
     def reset(self):
         raise NotImplementedError()
 
-    def add_token(self, token):
+    def add_token(self, token, skip_special_token_ids: List[int] = []):
         raise NotImplementedError()
 
     def finalize(self):
@@ -85,7 +86,9 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
         self._current_tokens = []
         self._current_text = ""
 
-    def add_token(self, token):
+    def add_token(self, token, skip_special_token_ids: List[int] = []):
+        if token in skip_special_token_ids:
+            return
         self._current_tokens.append(token)
 
     def finalize(self):
@@ -138,7 +141,9 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
         self.text = ""
         self.tokens = []
 
-    def add_token(self, token):
+    def add_token(self, token, skip_special_token_ids: List[int] = []):
+        if token in skip_special_token_ids:
+            return
         v = self.tokenmap[token]
         if v[0] == "\u2581":
             if self.text or not self.trim_space:
@@ -186,7 +191,9 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         self.text = ""
         self.tokens = []
 
-    def add_token(self, token):
+    def add_token(self, token, skip_special_token_ids: List[int] = []):
+        if token in skip_special_token_ids:
+            return
         v = self.tokenmap[token]
         # if the token starts with space
         if self._byte_decoder[v[0]] == 32:

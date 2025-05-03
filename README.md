@@ -70,6 +70,29 @@ output = generate(model, processor, formatted_prompt, image, verbose=False)
 print(output)
 ```
 
+### Server (FastAPI)
+To start the server
+```sh
+python -m mlx_vlm.server
+```
+
+Models can be loaded or unloaded dynamically and they are cached (one at a time) when the server is running.
+
+Usage example:
+```sh
+curl -X POST "http://localhost:8000/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen2.5-VL-32B-Instruct-8bit",
+    "image": ["/path/to/repo/examples/images/renewables_california.png"],
+    "prompt": "This is today'\''s chart fo energy demand in California. Can you provide an analysis of the chart and comment on the implications for renewable energy in California?",
+    "system": "You are a helpful assistant.",
+    "stream": true,
+    "max_tokens": 1000
+  }'
+```
+
+
 ## Multi-Image Chat Support
 
 MLX-VLM supports analyzing multiple images simultaneously with select models. This feature enables more complex visual reasoning tasks and comprehensive analysis across multiple images in a single conversation.

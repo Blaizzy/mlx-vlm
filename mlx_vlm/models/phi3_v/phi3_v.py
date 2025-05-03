@@ -2,13 +2,14 @@ import inspect
 import math
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import KVCache, LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache
 from .language import LanguageModel, TextConfig
 from .su_rope import Phi3SuScaledRotaryEmbedding
 from .vision import VisionConfig, VisionModel
@@ -37,6 +38,7 @@ class ModelConfig:
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     max_position_embeddings: int = 131072
     original_max_position_embeddings: int = 4096
+    eos_token_id: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, params):

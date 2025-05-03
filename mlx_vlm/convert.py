@@ -2,7 +2,7 @@
 
 import argparse
 
-from .utils import convert
+from .utils import MODEL_CONVERSION_DTYPES, convert
 
 
 def configure_parser() -> argparse.ArgumentParser:
@@ -31,10 +31,10 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dtype",
-        help="Type to save the parameters, ignored if -q is given.",
+        help="Type to save the parameter. Defaults to config.json's `torch_dtype` or the current model weights dtype",
         type=str,
-        choices=["float16", "bfloat16", "float32"],
-        default="float16",
+        choices=MODEL_CONVERSION_DTYPES,
+        default=None,
     )
     parser.add_argument(
         "--upload-repo",

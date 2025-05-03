@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from functools import partial, reduce
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -39,6 +39,7 @@ class ModelConfig:
     ignore_index: int = -100
     image_token_index: int = -200
     vocab_size: int = 151936
+    eos_token_id: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, params):

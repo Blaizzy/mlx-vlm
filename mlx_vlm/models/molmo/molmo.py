@@ -3,7 +3,7 @@ import inspect
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -24,6 +24,7 @@ class ModelConfig:
     image_pooling_w: int = 2
     image_pooling_2d: str = "attention"
     image_projector: str = "mlp"
+    eos_token_id: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, params):
