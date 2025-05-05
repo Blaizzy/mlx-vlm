@@ -231,7 +231,9 @@ class Model(nn.Module):
         position_ids = kwargs.pop("position_ids", None)
         
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
-
+        # reset rope_deltas when processing a new image/video
+        if pixel_values is not None:
+            self.rope_deltas = None
         input_embddings = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
         if position_ids is None and (mask is None or mask.ndim == 2):
             # Calculate RoPE index once per generation in the pre-fill stage only
