@@ -1027,6 +1027,12 @@ def generate_step(
                     cache=cache,
                     **kwargs,
                 )
+            elif model.config.model_type == "qwen2_vl":
+                outputs = model(
+                    y[None],
+                    cache=cache,
+                    **kwargs,
+                )
             else:
                 outputs = model.language_model(
                     y[None],
