@@ -69,14 +69,14 @@ class Attention(nn.Module):
         self.scale = head_dim**-0.5
         self.qkv_bias = config.qkv_bias
 
-        self.qkv = nn.Linear(dims, 3 * self.dims, bias=config.qkv_bias)
+        self.qkv = nn.Linear(dims, 3 * dims, bias=config.qkv_bias)
         self.proj = nn.Linear(dims, dims)
 
         self.qk_normalization = config.qk_normalization
 
         if self.qk_normalization:
-            self.q_norm = nn.RMSNorm(self.embed_dim, eps=config.layer_norm_eps)
-            self.k_norm = nn.RMSNorm(self.embed_dim, eps=config.layer_norm_eps)
+            self.q_norm = nn.RMSNorm(dims, eps=config.layer_norm_eps)
+            self.k_norm = nn.RMSNorm(dims, eps=config.layer_norm_eps)
 
     def __call__(self, x, mask=None):
         B, L, C = x.shape
