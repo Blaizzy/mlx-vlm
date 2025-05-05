@@ -911,7 +911,7 @@ async def generate_endpoint(request: GenerationRequest):
 
 
 @app.post(
-    "/chat", response_model=None
+    "/chat/completions", response_model=None
 )  # Response model handled dynamically based on stream flag
 async def generate_endpoint(request: GenerationRequest):
     """
@@ -1083,6 +1083,13 @@ async def unload_model_endpoint():
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="server")
+
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args()
+
     uvicorn.run(
-        "mlx_vlm.server:app", host="0.0.0.0", port=8000, workers=1, reload=True
+        "mlx_vlm.server:app", host="0.0.0.0", port=args.port, workers=1, reload=True
     )  # reload=True for development to automatically restart on code changes.
