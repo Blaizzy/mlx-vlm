@@ -49,6 +49,80 @@ class TextConfig:
         )
 
 
+class Qwen25RotaryEmbedding:
+    def __init__(self, dim, max_position_embeddings=2048, base=10000):
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+
+        inv_freq = 1.0 / (
+            self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
+        )
+        self.inv_freq = inv_freq
+
+        self._set_cos_sin_cache(seq_len=max_position_embeddings)
+
+    def _set_cos_sin_cache(self, seq_len):
+        self.max_seq_len_cached = seq_len
+        t = mx.arange(self.max_seq_len_cached).astype(mx.float32)
+
+        freqs = mx.outer(t, self.inv_freq)
+        emb = mx.concatenate((freqs, freqs), axis=-1)
+        self.cos_cached = mx.cos(emb)
+        self.sin_cached = mx.sin(emb)
+
+    def __call__(self, x, seq_len=None):
+
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len)
+
+        return (
+            self.cos_cached[:seq_len].astype(x.dtype),
+            self.sin_cached[:seq_len].astype(x.dtype),
+        )
+
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return mx.concatenate([-x2, x1], axis=-1)
+
+
+def apply_multimodal_rotary_pos_emb(q, k, cos, sin, position_ids, mrope_section):
+    """
+    Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors.
+    Args:
+        q (mx.array): The query tensor.
+        k (mx.array): The key tensor.
+        cos (mx.array): The cosine part of the rotary embedding.
+        sin (mx.array): The sine part of the rotary embedding.
+        mrope_section (List[int]): Multimodal rope section for channel dimension of temporal, height and width.
+        unsqueeze_dim (int, optional): Dimension to unsqueeze. Defaults to 1.
+    Returns:
+        tuple(mx.array): The rotated query and key tensors.
+    """
+
+    mrope_section = np.cumsum(mrope_section * 2)[:-1].tolist()
+    cos = cos[position_ids]
+    sin = sin[position_ids]
+
+    cos = mx.concatenate(
+        [m[i % 3] for i, m in enumerate(mx.split(cos, mrope_section, axis=-1))], axis=-1
+    )[
+        :, None, :, :
+    ]  # unsqueeze dim 1
+    sin = mx.concatenate(
+        [m[i % 3] for i, m in enumerate(mx.split(sin, mrope_section, axis=-1))], axis=-1
+    )[:, None, :, :]
+
+    # Apply rotary embedding
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+
+    return q_embed, k_embed
+
+
 class Attention(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -66,10 +140,12 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.rotary_emb = nn.RoPE(
+        self.rope_scaling = args.rope_scaling
+
+        self.rotary_emb = Qwen25RotaryEmbedding(
             head_dim,
+            max_position_embeddings=args.max_position_embeddings,
             base=args.rope_theta,
-            traditional=args.rope_traditional,
         )
 
     def __call__(
@@ -77,6 +153,7 @@ class Attention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -91,13 +168,23 @@ class Attention(nn.Module):
             0, 2, 1, 3
         )
 
-        offset = cache.offset if cache else 0
-
+        kv_seq_len = keys.shape[-2]
+        
+        if position_ids is None:
+            kv_seq_len += cache.offset + 1
+            position_ids = mx.arange(cache.offset, cache.offset + L)
+            position_ids = mx.expand_dims(position_ids, axis=0)
+            position_ids = mx.tile(position_ids, (3, 1, 1))
+        else:
+            kv_seq_len += cache.offset + 1
+        
+        cos, sin = self.rotary_emb(values, kv_seq_len)
+        
         if mask is not None and isinstance(mask, mx.array):
             mask = mask[..., : keys.shape[-2]]
-
-        queries = self.rotary_emb(queries, offset=offset)
-        keys = self.rotary_emb(keys, offset=offset)
+        queries, keys = apply_multimodal_rotary_pos_emb(
+            queries, keys, cos, sin, position_ids, self.rope_scaling["mrope_section"]
+        )
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
@@ -138,8 +225,9 @@ class Qwen2VLDecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         out = h + r
@@ -178,7 +266,7 @@ class Qwen2Model(nn.Module):
             mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c)
+            h = layer(h, mask, c, position_ids)
 
         return self.norm(h)
 
@@ -202,8 +290,9 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        position_ids: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, mask=mask, cache=cache, inputs_embeds=inputs_embeds)
+        out = self.model(inputs, mask=mask, cache=cache, inputs_embeds=inputs_embeds, position_ids=position_ids)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
