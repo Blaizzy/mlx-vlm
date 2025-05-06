@@ -91,12 +91,12 @@ class Attention(nn.Module):
         if self.qk_normalization:
             B_, H_, N_, D_ = queries.shape
             queries = (
-                self.q_norm(queries.transpose(1, 2).flatten(-2, -1))
+                self.q_norm(queries.transpose(0, 2, 1, 3).flatten(-2, -1))
                 .reshape(B_, N_, H_, D_)
                 .transpose(0, 2, 1, 3)
             )
             keys = (
-                self.k_norm(keys.transpose(1, 2).flatten(-2, -1))
+                self.k_norm(keys.transpose(0, 2, 1, 3).flatten(-2, -1))
                 .reshape(B_, N_, H_, D_)
                 .transpose(0, 2, 1, 3)
             )
