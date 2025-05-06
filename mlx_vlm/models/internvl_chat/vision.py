@@ -69,14 +69,14 @@ class Attention(nn.Module):
         self.scale = head_dim**-0.5
         self.qkv_bias = config.qkv_bias
 
-        self.qkv = nn.Linear(dims, 3 * self.dims, bias=config.qkv_bias)
+        self.qkv = nn.Linear(dims, 3 * dims, bias=config.qkv_bias)
         self.proj = nn.Linear(dims, dims)
 
         self.qk_normalization = config.qk_normalization
 
         if self.qk_normalization:
-            self.q_norm = nn.RMSNorm(self.embed_dim, eps=config.layer_norm_eps)
-            self.k_norm = nn.RMSNorm(self.embed_dim, eps=config.layer_norm_eps)
+            self.q_norm = nn.RMSNorm(dims, eps=config.layer_norm_eps)
+            self.k_norm = nn.RMSNorm(dims, eps=config.layer_norm_eps)
 
     def __call__(self, x, mask=None):
         B, L, C = x.shape
@@ -91,12 +91,12 @@ class Attention(nn.Module):
         if self.qk_normalization:
             B_, H_, N_, D_ = queries.shape
             queries = (
-                self.q_norm(queries.transpose(1, 2).flatten(-2, -1))
+                self.q_norm(queries.transpose(0, 2, 1, 3).flatten(-2, -1))
                 .reshape(B_, N_, H_, D_)
                 .transpose(0, 2, 1, 3)
             )
             keys = (
-                self.k_norm(keys.transpose(1, 2).flatten(-2, -1))
+                self.k_norm(keys.transpose(0, 2, 1, 3).flatten(-2, -1))
                 .reshape(B_, N_, H_, D_)
                 .transpose(0, 2, 1, 3)
             )

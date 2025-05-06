@@ -465,7 +465,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
 
     from . import __version__
 
-    card = ModelCard.load("OpenGVLab/InternVL3-1B")
+    card = ModelCard.load(hf_path)
     card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"]
     card.text = dedent(
         f"""
@@ -495,37 +495,6 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         repo_type="model",
     )
     print(f"Upload successful, go to https://huggingface.co/{upload_repo} for details.")
-
-
-def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
-    """
-    Ensures the model is available locally. If the path does not exist locally,
-    it is downloaded from the Hugging Face Hub.
-
-    Args:
-        path_or_hf_repo (str): The local path or Hugging Face repository ID of the model.
-        revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
-
-    Returns:
-        Path: The path to the model.
-    """
-    model_path = Path(path_or_hf_repo)
-    if not model_path.exists():
-        model_path = Path(
-            snapshot_download(
-                repo_id=path_or_hf_repo,
-                revision=revision,
-                allow_patterns=[
-                    "*.json",
-                    "*.safetensors",
-                    "*.py",
-                    "tokenizer.model",
-                    "*.tiktoken",
-                    "*.txt",
-                ],
-            )
-        )
-    return model_path
 
 
 def apply_repetition_penalty(logits: mx.array, generated_tokens: Any, penalty: float):
@@ -1327,4 +1296,13 @@ def generate(
         )
         print(f"Peak memory: {last_response.peak_memory:.3f} GB")
 
-    return text
+    usage_stats = {
+        "input_tokens": last_response.prompt_tokens,
+        "output_tokens": last_response.generation_tokens,
+        "total_tokens": last_response.prompt_tokens + last_response.generation_tokens,
+        "prompt_tps": last_response.prompt_tps,
+        "generation_tps": last_response.generation_tps,
+        "peak_memory": last_response.peak_memory,
+    }
+
+    return text, usage_stats

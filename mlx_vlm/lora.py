@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from .prompt_utils import apply_chat_template
 from .trainer import Dataset, Trainer, save_adapter
-from .trainer.utils import find_all_linear_names, get_peft_model
+from .trainer.utils import apply_lora_layers, find_all_linear_names, get_peft_model
 from .utils import load, load_image_processor
 
 logging.basicConfig(level=logging.INFO)
@@ -68,15 +68,26 @@ def main(args):
         image_resize_shape=args.image_resize_shape,
     )
 
-    logger.info(f"\033[32mSetting up LoRA\033[0m")
-    list_of_modules = find_all_linear_names(model.language_model)
-    model = get_peft_model(
-        model,
-        list_of_modules,
-        rank=args.lora_rank,
-        alpha=args.lora_alpha,
-        dropout=args.lora_dropout,
-    )
+    adapter_path = args.adapter_path
+    if adapter_path:
+        logger.info(f"\033[32mResuming from adapter path {adapter_path}\033[0m")
+        logger.info(
+            f"\033[32mLora rank, alpha, and dropout will be loaded from adapter_config.json file\033[0m"
+        )
+
+        model = apply_lora_layers(model, adapter_path)
+
+    else:
+        logger.info(f"\033[32mSetting up LoRA\033[0m")
+
+        list_of_modules = find_all_linear_names(model.language_model)
+        model = get_peft_model(
+            model,
+            list_of_modules,
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+        )
 
     logger.info(f"\033[32mSetting up optimizer\033[0m")
     optimizer = optim.Adam(learning_rate=args.learning_rate)
@@ -171,6 +182,12 @@ if __name__ == "__main__":
         type=str,
         default="adapters",
         help="Path to save the trained adapter",
+    )
+    parser.add_argument(
+        "--adapter-path",
+        type=str,
+        default=None,
+        help="Load path to resume training from a previously saved adapter",
     )
 
     args = parser.parse_args()
