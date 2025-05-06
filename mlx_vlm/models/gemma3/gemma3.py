@@ -7,6 +7,7 @@ from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from huggingface_hub import snapshot_download
 
 from .language import LanguageModel, RMSNorm, TextConfig
@@ -103,7 +104,7 @@ class Model(nn.Module):
             output_hidden_states=True,
         )
 
-        image_features = hidden_state[None, :].astype(pixel_values.dtype)
+        image_features = hidden_state.astype(pixel_values.dtype)
         image_features = self.multi_modal_projector(image_features)
 
         final_inputs_embeds, final_attention_mask_4d = (
@@ -135,25 +136,18 @@ class Model(nn.Module):
         text_mask_expanded = mx.repeat(text_mask_expanded, embed_dim, axis=-1)
         pad_mask_expanded = mx.expand_dims(pad_mask, -1)
         pad_mask_expanded = mx.repeat(pad_mask_expanded, embed_dim, axis=-1)
+        image_mask_expanded = mx.expand_dims(image_mask, -1)
+        image_mask_expanded = mx.repeat(image_mask_expanded, embed_dim, axis=-1)
 
         # insert padding and text token embeddings
         final_embedding = mx.where(text_mask_expanded, inputs_embeds, final_embedding)
         final_embedding = mx.where(
             pad_mask_expanded, mx.zeros_like(final_embedding), final_embedding
         )
-        pad_size = final_embedding.shape[1] - scaled_image_features.shape[1]
-        scaled_image_features = mx.pad(
-            scaled_image_features, ((0, 0), (0, pad_size), (0, 0))
-        )
-        # insert image embeddings - the image mask is always less or equal to the sentence in length
-        image_mask_expanded = mx.expand_dims(image_mask, -1)
-        image_mask_expanded = mx.repeat(image_mask_expanded, embed_dim, axis=-1)
-        final_embedding = mx.where(
-            image_mask_expanded, scaled_image_features, final_embedding
-        )
 
-        final_embedding = mx.where(
-            pad_mask_expanded, mx.zeros_like(final_embedding), final_embedding
+        # insert image token embeddings
+        final_embedding = self._masked_scatter(
+            final_embedding, image_mask_expanded, scaled_image_features
         )
 
         attention_mask_expanded_1 = mx.expand_dims(attention_mask, 1)
@@ -163,6 +157,29 @@ class Model(nn.Module):
         final_attention_mask_4d = mx.expand_dims(final_attention_mask_4d, 1)
         final_embedding = mx.array(final_embedding)
         return final_embedding, final_attention_mask_4d
+
+    @staticmethod
+    def _masked_scatter(
+        final_embedding: mx.array,
+        image_mask_expanded: mx.array,
+        scaled_image_features: mx.array,
+    ):
+        # Reshape the tensors to 1D
+        final_embedding_shape = final_embedding.shape
+        scaled_image_features_flattened = mx.flatten(scaled_image_features)
+        final_embedding_flattened = mx.flatten(final_embedding)
+        image_mask_expanded_flattened = mx.flatten(image_mask_expanded)
+
+        # Scatter the scaled image features into the special image token positions
+        image_positions = mx.array(
+            np.where(image_mask_expanded_flattened)[0], mx.uint32
+        )
+        final_embedding_flattened[image_positions] = scaled_image_features_flattened
+
+        # Reshape back to the original shape
+        final_embedding = mx.reshape(final_embedding_flattened, final_embedding_shape)
+
+        return final_embedding
 
     def __call__(
         self,
