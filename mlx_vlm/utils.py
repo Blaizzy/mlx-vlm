@@ -497,37 +497,6 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
     print(f"Upload successful, go to https://huggingface.co/{upload_repo} for details.")
 
 
-def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
-    """
-    Ensures the model is available locally. If the path does not exist locally,
-    it is downloaded from the Hugging Face Hub.
-
-    Args:
-        path_or_hf_repo (str): The local path or Hugging Face repository ID of the model.
-        revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
-
-    Returns:
-        Path: The path to the model.
-    """
-    model_path = Path(path_or_hf_repo)
-    if not model_path.exists():
-        model_path = Path(
-            snapshot_download(
-                repo_id=path_or_hf_repo,
-                revision=revision,
-                allow_patterns=[
-                    "*.json",
-                    "*.safetensors",
-                    "*.py",
-                    "tokenizer.model",
-                    "*.tiktoken",
-                    "*.txt",
-                ],
-            )
-        )
-    return model_path
-
-
 def apply_repetition_penalty(logits: mx.array, generated_tokens: Any, penalty: float):
     """
     Apply repetition penalty to specific logits based on the given context.
