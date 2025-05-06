@@ -253,6 +253,7 @@ class Qwen2Model(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        position_ids: Optional[mx.array] = None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
