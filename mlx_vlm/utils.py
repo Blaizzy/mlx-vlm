@@ -1027,7 +1027,7 @@ def generate_step(
                     cache=cache,
                     **kwargs,
                 )
-            elif model.config.model_type == "qwen2_vl":
+            elif model.config.model_type == "qwen2_vl" or model.config.model_type == "qwen2_5_vl":
                 outputs = model(
                     y[None],
                     cache=cache,
