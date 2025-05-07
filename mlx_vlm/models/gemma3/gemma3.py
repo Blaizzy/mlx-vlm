@@ -108,27 +108,38 @@ class Model(nn.Module):
         image_features = self.multi_modal_projector(image_features)
 
         final_inputs_embeds, final_attention_mask_4d = (
-            self._prepare_inputs_for_multimodal(
-                image_features, inputs_embeds, input_ids, mask
+            self.prepare_inputs_for_multimodal(
+                self.config.hidden_size,
+                self.config.pad_token_id,
+                self.config.image_token_index,
+                image_features,
+                inputs_embeds,
+                input_ids,
+                mask,
             )
         )
         return final_inputs_embeds, final_attention_mask_4d
 
-    def _prepare_inputs_for_multimodal(
-        self, image_features, inputs_embeds, input_ids, attention_mask
+    @staticmethod
+    def prepare_inputs_for_multimodal(
+        hidden_size,
+        pad_token_id,
+        image_token_index,
+        image_features,
+        inputs_embeds,
+        input_ids,
+        attention_mask,
     ):
         _, _, embed_dim = image_features.shape
 
         batch_size, sequence_length = input_ids.shape
-        scaled_image_features = image_features / (self.config.hidden_size**0.5)
+        scaled_image_features = image_features / (hidden_size**0.5)
         final_embedding = mx.zeros((batch_size, sequence_length, embed_dim))
 
-        pad_token_id = self.config.pad_token_id
+        pad_token_id = pad_token_id
         pad_token_id = pad_token_id if pad_token_id is not None else 0
-        text_mask = (input_ids != self.config.image_token_index) & (
-            input_ids != pad_token_id
-        )
-        image_mask = input_ids == self.config.image_token_index
+        text_mask = (input_ids != image_token_index) & (input_ids != pad_token_id)
+        image_mask = input_ids == image_token_index
         pad_mask = input_ids == pad_token_id
 
         # expand masks to match embedding dimension
