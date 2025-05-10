@@ -997,7 +997,6 @@ def generate_step(
                     **kwargs,
                 )
             else:
-
                 outputs = model.language_model(
                     y[None],
                     cache=cache,
