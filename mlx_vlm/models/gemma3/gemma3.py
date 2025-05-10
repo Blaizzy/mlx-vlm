@@ -78,6 +78,27 @@ class Gemma3MultiModalProjector(nn.Module):
         return projected_vision_outputs.astype(x.dtype)
 
 
+def masked_scatter(
+    final_embedding: mx.array,
+    image_mask_expanded: mx.array,
+    scaled_image_features: mx.array,
+):
+    # Reshape the tensors to 1D
+    final_embedding_shape = final_embedding.shape
+    scaled_image_features_flattened = mx.flatten(scaled_image_features)
+    final_embedding_flattened = mx.flatten(final_embedding)
+    image_mask_expanded_flattened = mx.flatten(image_mask_expanded)
+
+    # Scatter the scaled image features into the special image token positions
+    image_positions = mx.array(np.where(image_mask_expanded_flattened)[0], mx.uint32)
+    final_embedding_flattened[image_positions] = scaled_image_features_flattened
+
+    # Reshape back to the original shape
+    final_embedding = mx.reshape(final_embedding_flattened, final_embedding_shape)
+
+    return final_embedding
+
+
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -157,7 +178,7 @@ class Model(nn.Module):
         )
 
         # insert image token embeddings
-        final_embedding = self._masked_scatter(
+        final_embedding = masked_scatter(
             final_embedding, image_mask_expanded, scaled_image_features
         )
 
@@ -168,29 +189,6 @@ class Model(nn.Module):
         final_attention_mask_4d = mx.expand_dims(final_attention_mask_4d, 1)
         final_embedding = mx.array(final_embedding)
         return final_embedding, final_attention_mask_4d
-
-    @staticmethod
-    def _masked_scatter(
-        final_embedding: mx.array,
-        image_mask_expanded: mx.array,
-        scaled_image_features: mx.array,
-    ):
-        # Reshape the tensors to 1D
-        final_embedding_shape = final_embedding.shape
-        scaled_image_features_flattened = mx.flatten(scaled_image_features)
-        final_embedding_flattened = mx.flatten(final_embedding)
-        image_mask_expanded_flattened = mx.flatten(image_mask_expanded)
-
-        # Scatter the scaled image features into the special image token positions
-        image_positions = mx.array(
-            np.where(image_mask_expanded_flattened)[0], mx.uint32
-        )
-        final_embedding_flattened[image_positions] = scaled_image_features_flattened
-
-        # Reshape back to the original shape
-        final_embedding = mx.reshape(final_embedding_flattened, final_embedding_shape)
-
-        return final_embedding
 
     def __call__(
         self,
