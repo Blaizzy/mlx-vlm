@@ -10,8 +10,10 @@ import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
 from .audio import AudioConfig, AudioModel
-from .language import LanguageModel, RMSNorm, TextConfig
+from .language import LanguageModel, Gemma3p5RMSNorm, TextConfig
 from .vision import VisionConfig, VisionModel
+
+
 
 
 @dataclass
@@ -43,7 +45,7 @@ class Gemma3MultiModalProjector(nn.Module):
             (config.vision_config.hidden_size, config.text_config.hidden_size)
         )
 
-        self.mm_soft_emb_norm = RMSNorm(
+        self.mm_soft_emb_norm = Gemma3p5RMSNorm(
             config.vision_config.hidden_size, eps=config.vision_config.layer_norm_eps
         )
         self.patches_per_image = int(
@@ -83,9 +85,10 @@ class Model(nn.Module):
         self.model_type = config.model_type
         self.config = config
 
-        self.vision_tower = VisionModel(config.vision_config)
+        # self.vision_tower = VisionModel(config.vision_config)
+
         self.language_model = LanguageModel(config.text_config)
-        self.multi_modal_projector = Gemma3MultiModalProjector(config)
+        # self.multi_modal_projector = Gemma3MultiModalProjector(config)
 
     def get_input_embeddings(
         self,
@@ -96,22 +99,22 @@ class Model(nn.Module):
         if pixel_values is None:
             return self.language_model.model.embed_tokens(input_ids), None
 
-        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+        # inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        hidden_state, _, _ = self.vision_tower(
-            pixel_values.transpose(0, 2, 3, 1).astype(inputs_embeds.dtype),
-            output_hidden_states=True,
-        )
+        # hidden_state, _, _ = self.vision_tower(
+        #     pixel_values.transpose(0, 2, 3, 1).astype(inputs_embeds.dtype),
+        #     output_hidden_states=True,
+        # )
 
-        image_features = hidden_state[None, :].astype(pixel_values.dtype)
-        image_features = self.multi_modal_projector(image_features)
+        # image_features = hidden_state[None, :].astype(pixel_values.dtype)
+        # image_features = self.multi_modal_projector(image_features)
 
-        final_inputs_embeds, final_attention_mask_4d = (
-            self._prepare_inputs_for_multimodal(
-                image_features, inputs_embeds, input_ids, mask
-            )
-        )
-        return final_inputs_embeds, final_attention_mask_4d
+        # final_inputs_embeds, final_attention_mask_4d = (
+        #     self._prepare_inputs_for_multimodal(
+        #         image_features, inputs_embeds, input_ids, mask
+        #     )
+        # )
+        # return final_inputs_embeds, final_attention_mask_4d
 
     def _prepare_inputs_for_multimodal(
         self, image_features, inputs_embeds, input_ids, attention_mask
@@ -180,9 +183,19 @@ class Model(nn.Module):
             inputs=input_ids,
             cache=cache,
             inputs_embeds=input_embeddings,
-            mask=final_attention_mask_4d, # TODO: Fix mask
+            # mask=final_attention_mask_4d, # TODO: Fix mask
         )
         return logits
+
+    def sanitize(self, weights):
+        sanitized_weights = {}
+        for k, v in weights.items():
+            if "language_model" not in k:
+                k = "language_model." + k
+
+            sanitized_weights[k] = v
+
+        return sanitized_weights
 
     @staticmethod
     def from_pretrained(path_or_hf_repo: str):
