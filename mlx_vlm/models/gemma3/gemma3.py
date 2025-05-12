@@ -125,8 +125,7 @@ class Model(nn.Module):
             output_hidden_states=True,
         )
 
-        image_features = hidden_state.astype(pixel_values.dtype)
-        image_features = self.multi_modal_projector(image_features)
+        image_features = self.multi_modal_projector(hidden_state)
 
         final_inputs_embeds, final_attention_mask_4d = (
             self.prepare_inputs_for_multimodal(
@@ -188,7 +187,7 @@ class Model(nn.Module):
         final_attention_mask_4d = final_attention_mask_4d
         final_attention_mask_4d = mx.expand_dims(final_attention_mask_4d, 1)
         final_embedding = mx.array(final_embedding)
-        return final_embedding, final_attention_mask_4d
+        return final_embedding.astype(inputs_embeds.dtype), final_attention_mask_4d
 
     def __call__(
         self,
