@@ -208,7 +208,7 @@ class FastGELUActivation(nn.Module):
             0.5
             * input
             * (1.0 + mx.tanh(np.sqrt(2 / np.pi) * (input + 0.044715 * (input**3))))
-        )
+        ).astype(input.dtype)
 
 
 class MLP(nn.Module):

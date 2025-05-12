@@ -152,11 +152,12 @@ class EncoderLayer(nn.Module):
         )
 
     def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
-        x = x + self.drop_path1(self.attn(self.norm1(x).astype(x.dtype)) * self.ls1)
+        dtype = x.dtype
+        x = x + self.drop_path1(self.attn(self.norm1(x).astype(dtype)) * self.ls1)
 
-        x = x + self.drop_path2(self.mlp(self.norm2(x).astype(x.dtype)) * self.ls2)
+        x = x + self.drop_path2(self.mlp(self.norm2(x).astype(dtype)) * self.ls2)
 
-        return x
+        return x.astype(dtype)
 
 
 class Encoder(nn.Module):
@@ -246,7 +247,7 @@ class VisionEmbeddings(nn.Module):
         )
         embeddings = embeddings + position_embedding.astype(target_dtype)
 
-        return mx.array(embeddings)
+        return embeddings
 
 
 class VisionModel(nn.Module):
@@ -265,11 +266,9 @@ class VisionModel(nn.Module):
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
         x = self.embeddings(x)
-        x = x.astype(self.embeddings.patch_embedding.weight.dtype)
-        encoder_outputs = self.encoder(
+        last_hidden_state, encoder_outputs = self.encoder(
             x=x, output_hidden_states=output_hidden_states, mask=None
         )
-        last_hidden_state = encoder_outputs[0]
         pooler_output = last_hidden_state[:, 0, :]
         return last_hidden_state, pooler_output, encoder_outputs[1:]
 
