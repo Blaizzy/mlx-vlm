@@ -64,7 +64,7 @@ class Gemma3p5RMSNorm(nn.Module):
         scaled = root_mean_squared * scale.float()
         return scaled.type(original_dtype)
 
-    def _guard_against_excess_precision(self, x: mx.array) -> tuple[mx.array, mx.dtype]:
+    def _guard_against_excess_precision(self, x: mx.array) -> tuple[mx.array, mx.Dtype]:
         # TODO(ryanmullins): Implement Torch equivalent to jax.lax.reduce_precision
         return x.float(), x.dtype
 
@@ -86,7 +86,7 @@ class Gemma3p5AudioRelativePositionEmbedding(nn.Module):
         )
 
     def _get_timing_signal_1d_pos(
-        self, position: mx.array, channels: int, dtype: mx.dtype
+        self, position: mx.array, channels: int, dtype: mx.Dtype
     ) -> mx.array:
         assert position.ndim == 2
         position = mx.expand_dims(position.float(), axis=-1)

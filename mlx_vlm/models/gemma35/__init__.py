@@ -8,3 +8,5 @@ from .gemma35 import (
     VisionConfig,
     VisionModel,
 )
+from .processor import Gemma35Processor
+

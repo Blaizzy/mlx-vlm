@@ -109,6 +109,7 @@ def get_message_json(
         "internvl_chat": "message_list_with_image_type",
         "kimi_vl": "message_list_with_image",
         "gemma3": "message_with_start_image_token",
+        "gemma3p5_text": "message_with_start_image_token",
         "llama4": "message_list_with_image",
         "smolvlm": "message_list_with_image_first",
         "llava": "message_list_with_image",

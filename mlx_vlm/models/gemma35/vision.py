@@ -9,12 +9,12 @@ import numpy as np
 
 @dataclass
 class VisionConfig:
-    model_type: str
-    num_hidden_layers: int
-    hidden_size: int
-    intermediate_size: int
-    num_attention_heads: int
-    patch_size: int
+    model_type: str = "siglip_vision_model"
+    num_hidden_layers: int = 12
+    hidden_size: int = 2048
+    intermediate_size: int = 8192
+    num_attention_heads: int = 16
+    patch_size: int = 16
     image_size: int = 224
     num_channels: int = 3
     layer_norm_eps: float = 1e-6
