@@ -5,33 +5,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-
-@dataclass
-class VisionConfig:
-    model_type: str = "qwen2_vl"
-    depth: int = 32
-    embed_dim: int = 1280
-    hidden_size: int = 1536
-    num_heads: int = 16
-    image_size: int = 384
-    patch_size: int = 14
-    vocab_size: int = 32000
-    mlp_ratio: float = 4.0
-    in_channels: int = 3
-    layer_norm_eps: float = 1e-6
-    spatial_patch_size: int = 14
-    spatial_merge_size: int = 2
-    temporal_patch_size: int = 2
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import VisionConfig
 
 
 def check_array_shape(arr):
