@@ -11,44 +11,8 @@ import numpy as np
 from huggingface_hub import snapshot_download
 
 from ..base import pixel_shuffle
-from ..qwen2_vl.language import LanguageModel
+from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class TextConfig:
-    model_type: str
-    vocab_size: int
-    max_position_embeddings: int
-    hidden_size: int
-    intermediate_size: int
-    num_hidden_layers: int
-    num_attention_heads: int
-    use_sliding_window: bool
-    max_window_layers: int
-    num_key_value_heads: int
-    hidden_act: str
-    rms_norm_eps: float
-    rope_theta: float
-    rope_scaling: dict
-    rope_traditional: bool = False
-    attention_dropout: float = 0.0
-    tie_word_embeddings: bool = False
-    sliding_window: Optional[int] = None
-
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 @dataclass
