@@ -22,6 +22,7 @@ class ModelConfig:
     ignore_index: int = -100
     image_token_index: int = 151655
     video_token_index: int = 151656
+    vision_start_token_id: int = 151652
     vision_feature_select_strategy: str = "default"
     vision_feature_layer: int = -2
     vocab_size: int = 32000
@@ -49,7 +50,7 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
-        self.language_model = LanguageModel(config.text_config)
+        self.language_model = LanguageModel(config.text_config, config)
 
     def get_input_embeddings(
         self,
@@ -97,12 +98,13 @@ class Model(nn.Module):
         inputs_embeds[:, image_indices, :] = image_features
 
         return inputs_embeds
-
+    
+    
     def __call__(
         self,
         input_ids: mx.array,
-        pixel_values: mx.array,
-        mask: mx.array,
+        pixel_values: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
         cache=None,
         **kwargs,
     ):
@@ -110,10 +112,14 @@ class Model(nn.Module):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
-
         input_embddings = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
-
-        logits = self.language_model(None, cache=cache, inputs_embeds=input_embddings)
+        kwargs = {
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "video_grid_thw": video_grid_thw,
+            **kwargs,
+        }
+        logits = self.language_model(input_ids, input_embddings, mask=mask, cache=cache, **kwargs)
         return logits
 
     @staticmethod
