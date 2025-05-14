@@ -115,6 +115,8 @@ class Model(nn.Module):
         input_embddings = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
         kwargs = {
             "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "video_grid_thw": video_grid_thw,
             **kwargs,
         }
         logits = self.language_model(input_ids, input_embddings, mask=mask, cache=cache, **kwargs)
