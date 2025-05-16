@@ -60,7 +60,6 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
         image_grid_thw: Optional[mx.array] = None,
     ):
-
         if pixel_values is None:
             return self.language_model.model.embed_tokens(input_ids)
 
@@ -79,16 +78,21 @@ class Model(nn.Module):
             hidden_states = hidden_states[None, :, :]
 
         # Insert special image tokens in the input_ids
-        final_inputs_embeds = self._merge_input_ids_with_image_features(
-            hidden_states, inputs_embeds, input_ids
+        final_inputs_embeds = self.merge_input_ids_with_image_features(
+            self.config.image_token_id,
+            self.config.video_token_id,
+            hidden_states,
+            inputs_embeds,
+            input_ids,
         )
         return final_inputs_embeds
 
-    def _merge_input_ids_with_image_features(
-        self, image_features, inputs_embeds, input_ids
+    @staticmethod
+    def merge_input_ids_with_image_features(
+        image_token_id, video_token_id, image_features, inputs_embeds, input_ids
     ):
-        image_token_id = self.config.image_token_id
-        video_token_id = self.config.video_token_id
+        image_token_id = image_token_id
+        video_token_id = video_token_id
         # Positions of <image> tokens in input_ids, assuming batch size is 1
         image_positions = input_ids == image_token_id
         if mx.sum(image_positions) == 0:

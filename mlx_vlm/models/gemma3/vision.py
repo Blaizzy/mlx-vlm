@@ -150,7 +150,7 @@ class Encoder(nn.Module):
             if output_hidden_states:
                 encoder_states = encoder_states + (x,)
 
-            h = x[0]
+            h = x
 
         return (h, encoder_states)
 

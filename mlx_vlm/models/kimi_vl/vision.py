@@ -542,12 +542,12 @@ class Rope2DPosEmb(nn.Module):
         self.max_width = max_width
         self.theta_base = theta_base
 
-        self.freqs_cis = None
+        self._freqs_cis = None
 
     def extra_repr(self):
         return f"dim={self.dim}, max_height={self.max_height}, max_width={self.max_width}, theta_base={self.theta_base}"
 
-    def _precompute_freqs_cis(self, device) -> mx.array:
+    def _precompute_freqs_cis(self) -> mx.array:
         """Calculate the cis(freqs) for each position in the 2D grid.
 
         Return: complex array of shape (max_height, max_width, dim//2) and value:
@@ -591,8 +591,8 @@ class Rope2DPosEmb(nn.Module):
         Returns:
             freqs_cis: array of shape (sum(t * height * width), dim//2)
         """
-        if self.freqs_cis is None:
-            self.freqs_cis = self._precompute_freqs_cis(None)
+        if self._freqs_cis is None:
+            self._freqs_cis = self._precompute_freqs_cis()
 
         shapes = grid_hws.tolist()
         assert all(
@@ -606,7 +606,7 @@ class Rope2DPosEmb(nn.Module):
         freqs_cis_list = []
         for h, w in shapes:
             # Get the slice of precomputed frequencies for this shape
-            shape_freqs = self.freqs_cis[:h, :w]
+            shape_freqs = self._freqs_cis[:h, :w]
             # Reshape to flatten the spatial dimensions
             shape_freqs = shape_freqs.reshape(-1, self.dim // 2)
             freqs_cis_list.append(shape_freqs)

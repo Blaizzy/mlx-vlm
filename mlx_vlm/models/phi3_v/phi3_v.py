@@ -217,7 +217,9 @@ class Model(nn.Module):
         **kwargs,
     ):
         out = self.model(inputs, pixel_values, image_sizes, mask=mask, cache=cache)
-        logits = self.lm_head(out).astype(self.lm_head.weight.dtype)
+        logits = self.lm_head(out)
+        if self.lm_head.weight.dtype in [mx.float16, mx.bfloat16, mx.float32]:
+            logits = logits.astype(self.lm_head.weight.dtype)
         return LanguageModelOutput(logits=logits)
 
     @property

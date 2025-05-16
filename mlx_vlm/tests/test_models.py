@@ -58,51 +58,58 @@ class TestModels(unittest.TestCase):
         channel_first=False,
         **kwargs,
     ):
-        self.assertEqual(vision_tower.model_type, model_type)
-        if model_type == "llama4_vision_model":
-            vision_hidden_size = kwargs.pop("projector_output_dim", vision_hidden_size)
-
-        batch_size = kwargs.pop("batch_size", 1)
-        if model_type == "qwen2_5_vl":
-            input_tensor = mx.random.uniform(shape=(image_size[0], image_size[1]))
-        else:
-            shape = (
-                (batch_size, num_channels, image_size[0], image_size[1])
-                if channel_first
-                else (batch_size, image_size[0], image_size[1], num_channels)
+        for t in [mx.float32, mx.float16]:
+            vision_tower.update(
+                tree_map(lambda p: p.astype(t), vision_tower.parameters())
             )
-            input_tensor = mx.random.uniform(shape=shape)
+            self.assertEqual(vision_tower.model_type, model_type)
 
-        if "image_masks" in inspect.signature(vision_tower.__call__).parameters:
-            input_tensor = input_tensor.transpose(0, 3, 1, 2)
-            image_masks = mx.ones((batch_size, num_channels, image_size[0]))
-            kwargs["image_masks"] = image_masks
-
-        if (
-            "output_hidden_states"
-            in inspect.signature(vision_tower.__call__).parameters
-        ):
-            hidden_states = vision_tower(
-                input_tensor, output_hidden_states=True, **kwargs
-            )
-        else:
-            hidden_states = vision_tower(input_tensor, **kwargs)
-
-        # Check vision hidden feature layer's shape matches the expected hidden size
-        if channel_first:
             if model_type == "llama4_vision_model":
+                vision_hidden_size = kwargs.pop(
+                    "projector_output_dim", vision_hidden_size
+                )
 
-                self.assertEqual(
-                    hidden_states[vision_feature_layer].shape[1], vision_hidden_size
+            batch_size = kwargs.pop("batch_size", 1)
+            if model_type == "qwen2_5_vl":
+                input_tensor = mx.random.uniform(shape=(image_size[0], image_size[1]))
+            else:
+                shape = (
+                    (batch_size, num_channels, image_size[0], image_size[1])
+                    if channel_first
+                    else (batch_size, image_size[0], image_size[1], num_channels)
+                )
+                input_tensor = mx.random.uniform(shape=shape)
+
+            if "image_masks" in inspect.signature(vision_tower.__call__).parameters:
+                input_tensor = input_tensor.transpose(0, 3, 1, 2)
+                image_masks = mx.ones((batch_size, num_channels, image_size[0]))
+                kwargs["image_masks"] = image_masks
+
+            input_tensor = input_tensor.astype(t)
+
+            if (
+                "output_hidden_states"
+                in inspect.signature(vision_tower.__call__).parameters
+            ):
+                hidden_states = vision_tower(
+                    input_tensor, output_hidden_states=True, **kwargs
                 )
             else:
-                self.assertEqual(
-                    hidden_states[vision_feature_layer].shape[1], vision_hidden_size
-                )
-        else:
-            self.assertEqual(
-                hidden_states[vision_feature_layer].shape[-1], vision_hidden_size
-            )
+                hidden_states = vision_tower(input_tensor, **kwargs)
+
+            hidden_states = hidden_states[vision_feature_layer]
+
+            # Check vision hidden feature layer's shape matches the expected hidden size
+            if channel_first:
+                if model_type == "llama4_vision_model":
+
+                    self.assertEqual(hidden_states.shape[1], vision_hidden_size)
+                else:
+                    self.assertEqual(hidden_states.shape[1], vision_hidden_size)
+            else:
+                self.assertEqual(hidden_states.shape[-1], vision_hidden_size)
+
+            self.assertEqual(hidden_states.dtype, t)
 
     def test_llava_bunny(self):
         from mlx_vlm.models import llava_bunny
@@ -1226,6 +1233,7 @@ class TestModels(unittest.TestCase):
                 [[20, 28], [22, 28]], dtype=mx.int64
             ),  # image temporals shape (num_images, 3)
             batch_size=1176,
+            vision_feature_layer=-1,
         )
 
     def test_gemma3(self):
