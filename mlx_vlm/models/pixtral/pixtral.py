@@ -99,15 +99,15 @@ class Model(nn.Module):
         image_features = self.multi_modal_projector(selected_image_feature)
 
         # Insert special image tokens in the input_ids
-        final_inputs_embeds = self._merge_input_ids_with_image_features(
-            image_features, inputs_embeds, input_ids
+        final_inputs_embeds = self.merge_input_ids_with_image_features(
+            self.config.image_token_index, image_features, inputs_embeds, input_ids
         )
         return final_inputs_embeds
 
-    def _merge_input_ids_with_image_features(
-        self, image_features, inputs_embeds, input_ids
+    @staticmethod
+    def merge_input_ids_with_image_features(
+        image_token_index, image_features, inputs_embeds, input_ids
     ):
-        image_token_index = self.config.image_token_index
         num_images, num_image_patches, embed_dim = image_features.shape
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
