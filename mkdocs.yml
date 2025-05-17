@@ -82,7 +82,6 @@ extra_css:
 
 nav:
     - Home: index.md
-    - Installation: installation.md
     - CLI Reference: cli_reference.md
     - Examples: examples.md
     - Contributing: contributing.md
