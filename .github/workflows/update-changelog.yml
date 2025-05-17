@@ -19,7 +19,7 @@ jobs:
         pip install requests python-dotenv
     - name: Update Changelog
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.DOCS_TOKEN }}
       run: python update_changelog.py
     - name: Commit changes
       run: |
