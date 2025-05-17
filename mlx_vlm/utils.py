@@ -1074,7 +1074,7 @@ class StoppingCriteria:
                                If strings are provided, they will be converted to integers if possible.
         """
         if new_eos_token_ids is None:
-            pass
+            return
 
         if self.tokenizer is None:
             raise ValueError("Processor is not provided")
