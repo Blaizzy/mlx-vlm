@@ -214,3 +214,24 @@ def test_stopping_criteria():
 
     stopping_criteria.add_eos_token_ids("</answer>")
     assert stopping_criteria.eos_token_ids == [2, 32000, 32007, 32008, 1]
+
+
+def test_stopping_criteria_reset():
+    class MockProcessor:
+        def __init__(self):
+            self.tokenizer = type(
+                "DummyTokenizer", (), {"pad_token": None, "eos_token": "[EOS]"}
+            )()
+
+        def encode(self, text, add_special_tokens=False):
+            if "[EOS]" in text:
+                return [32008]
+            return [1]
+
+    processor = MockProcessor()
+    stopping_criteria = StoppingCriteria([2], processor)
+    stopping_criteria.add_eos_token_ids("[EOS]")
+
+    stopping_criteria.reset([5, 7])
+    assert stopping_criteria.eos_token_ids == [5, 7]
+    assert stopping_criteria(7) is True
