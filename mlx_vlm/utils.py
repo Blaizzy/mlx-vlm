@@ -153,6 +153,8 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         lazy (bool): If False eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
+        revision (str, optional): A revision id which can be a branch name,
+            a tag, or a commit hash. Default: ``None``.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -288,6 +290,7 @@ def load(
     path_or_hf_repo: str,
     adapter_path: Optional[str] = None,
     lazy: bool = False,
+    revision: Optional[str] = None,
     **kwargs,
 ) -> Tuple[nn.Module, Union[PreTrainedTokenizer, PreTrainedTokenizerFast]]:
     """
@@ -302,6 +305,8 @@ def load(
         lazy (bool): If False eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
+        revision (str, optional): A revision id which can be a branch name,
+            a tag, or a commit hash. Default: ``None``.
     Returns:
         Tuple[nn.Module, TokenizerWrapper]: A tuple containing the loaded model and tokenizer.
 
@@ -309,7 +314,7 @@ def load(
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
-    model_path = get_model_path(path_or_hf_repo)
+    model_path = get_model_path(path_or_hf_repo, revision=revision)
 
     model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
