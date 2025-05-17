@@ -85,7 +85,7 @@ curl -X POST "http://localhost:8000/generate" \
   -d '{
     "model": "mlx-community/Qwen2.5-VL-32B-Instruct-8bit",
     "image": ["/path/to/repo/examples/images/renewables_california.png"],
-    "prompt": "This is today'\''s chart fo energy demand in California. Can you provide an analysis of the chart and comment on the implications for renewable energy in California?",
+    "prompt": "This is today'\''s chart for energy demand in California. Can you provide an analysis of the chart and comment on the implications for renewable energy in California?",
     "system": "You are a helpful assistant.",
     "stream": true,
     "max_tokens": 1000
