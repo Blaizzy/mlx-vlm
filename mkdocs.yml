@@ -83,16 +83,11 @@ extra_css:
 nav:
     - Home: index.md
     - Installation: installation.md
-    - Usage: usage.md
     - CLI Reference: cli_reference.md
-    - Examples:
-        - Multi-Modal Chatbot: examples/chatbot.md
-        - Function Calling: examples/function_calling.md
-    - Managing Models: models.md
-    - API Reference: endpoints.md
+    - Examples: examples.md
     - Contributing: contributing.md
     - Community Projects: community_projects.md
-    - Report Issues: https://github.com/Blaizzy/mlx-vlm/issues
+    - Report Issues: report_issues.md
     - Changelog: changelog.md
 
 docs_dir: docs
