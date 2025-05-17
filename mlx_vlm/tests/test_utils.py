@@ -1,7 +1,8 @@
-import mlx.core as mx
-import mlx.nn as nn
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import mlx.core as mx
+import mlx.nn as nn
 
 from mlx_vlm.utils import (
     StoppingCriteria,
