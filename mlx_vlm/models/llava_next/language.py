@@ -22,6 +22,7 @@ class TextConfig:
     rope_theta: float = 1000000
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    max_position_embeddings: int = 4096
 
     @classmethod
     def from_dict(cls, params):

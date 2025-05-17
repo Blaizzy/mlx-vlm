@@ -21,6 +21,7 @@ class TextConfig:
     num_key_value_heads: int
     rope_theta: float = 1000000.0
     rope_traditional: bool = False
+    max_position_embeddings: int = 4096
     tie_word_embeddings: bool = False
 
     @classmethod
