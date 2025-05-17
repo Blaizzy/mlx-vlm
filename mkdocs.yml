@@ -1,0 +1,12 @@
+site_name: MLX-VLM
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Usage: usage.md
+  - CLI Reference: cli_reference.md
+  - Examples: examples.md
+  - Contributing: contributing.md
+  - Community Projects: community_projects.md
+  - Report Issues: report_issues.md
+  - Changelog: changelog.md
+docs_dir: docs
