@@ -29,6 +29,7 @@ class TextConfig:
     rope_scaling: Optional[Dict[str, Union[float, List[float]]]] = None
     mm_tokens_per_image: int = 256
     sliding_window_pattern: int = 6
+    max_position_embeddings: int = 4096
 
     @classmethod
     def from_dict(cls, params):

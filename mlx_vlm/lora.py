@@ -3,9 +3,14 @@ import logging
 
 import mlx.optimizers as optim
 
+## my
 from .trainers import TrainingArgs, GRPOTrainingArgs, save_adapter, save_full_model, train_sft, train_grpo
 from .trainers.dataset import load_and_prepare_dataset
-from .trainers.utils import get_peft_model, print_trainable_parameters
+from .trainers.utils import get_peft_model, print_trainable_parameters, apply_lora_layers, find_all_linear_name
+## prince
+from .prompt_utils import apply_chat_template
+from .trainer import Dataset, Trainer, save_adapter
+## done
 from .utils import load, load_image_processor
 from .trainers.callback import WandBCallback, CustomTrainingCallback
 
@@ -27,6 +32,15 @@ def main(args):
         image_processor=image_processor,
     )
 
+    adapter_path = args.adapter_path
+    if adapter_path:
+        logger.info(f"\033[32mResuming from adapter path {adapter_path}\033[0m")
+        logger.info(
+            f"\033[32mLora rank, alpha, and dropout will be loaded from adapter_config.json file\033[0m"
+        )
+
+        model = apply_lora_layers(model, adapter_path)
+        
     if args.full_weight_training:
         logger.info(f"\033[32mUsing full weight training (all parameters will be trained)\033[0m")
     else:
@@ -192,6 +206,12 @@ if __name__ == "__main__":
         type=str,
         default="adapters",
         help="Path to save the trained adapter",
+    )
+    parser.add_argument(
+        "--adapter-path",
+        type=str,
+        default=None,
+        help="Load path to resume training from a previously saved adapter",
     )
 
     # GRPO args
