@@ -194,11 +194,12 @@ class GRPODataset:
         answer_tokens = self.processor.tokenizer.encode(answer_str)
 
         from ..utils import prepare_inputs
+
         inputs = prepare_inputs(
             self.processor,
             image,
             prompt_text,
-            image_token_index=self.config["image_token_index"],
+            image_token_index=self.config.get("vision_token_id", "image_token_index"),
             resize_shape=self.image_resize_shape
         )
 

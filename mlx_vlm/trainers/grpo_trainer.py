@@ -268,6 +268,8 @@ def grpo_loss(
     token_log_probs = mx.stack(padded_log_probs)
     ref_token_log_probs = mx.stack(padded_ref_log_probs)
 
+    # Move the abouve outside if here and in step()
+
     all_func_rewards = []
     for reward_func in reward_funcs:
         raw_rewards = reward_func(
@@ -310,6 +312,8 @@ def grpo_loss(
     rewards_no_nan = mx.where(valid_reward_mask, rewards, mx.zeros_like(rewards))
     rewards = (rewards_no_nan * mx.expand_dims(reward_weights, 0)).sum(axis=1)
 
+    # Here too
+
     num_unique_prompts = len(unique_prompt_indices)
 
     rewards_by_prompt = [[] for _ in range(num_unique_prompts)]
@@ -335,6 +339,8 @@ def grpo_loss(
         else:
             idx = batch_indices.index(unique_prompt_indices[i])
             advantages[idx] = 0.0
+
+    # Here too
 
     # Compute KL divergence using Schulman's approximator
     kl_div = (
