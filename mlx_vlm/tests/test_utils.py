@@ -72,13 +72,13 @@ class MockProcessor:
         # Simulate MLX tensor output
         if return_tensors == "mlx":
             inputs = {k: mx.array(v) for k, v in data.items()}
-            inputs["pixel_values"] = mx.zeros((4, 5, 6)) if images else None
+            inputs["pixel_values"] = mx.zeros((4, 5, 6)) if images else []
             return inputs
         # Simulate PyTorch tensor output
         elif return_tensors == "pt":
             try:
                 inputs = {k: MockTorch.tensor(v) for k, v in data.items()}
-                inputs["pixel_values"] = MockTorch.tensor([4, 5, 6]) if images else None
+                inputs["pixel_values"] = MockTorch.tensor([4, 5, 6]) if images else []
                 return inputs
             except ImportError:
                 raise ImportError("PyTorch is not installed")
