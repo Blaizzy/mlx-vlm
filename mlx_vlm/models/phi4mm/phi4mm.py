@@ -146,10 +146,10 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        # if mask is not None:
-        #     key_len = keys.shape[-2]
-        #     if mask.shape[-1] != key_len:
-        #         mask = mask[..., -key_len:]
+        if mask is not None and isinstance(mask, mx.array):
+            key_len = keys.shape[-2]
+            if mask.shape[-1] != key_len:
+                mask = mask[..., -key_len:]
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
@@ -296,7 +296,7 @@ class Phi4Model(nn.Module):
 
         if input_mode in [InputMode.VISION_SPEECH, InputMode.VISION]:
             self.unset_lora_adapter()
-            # self.set_lora_adapter("vision") # TODO: Fix lora adapter
+            self.set_lora_adapter("vision")  # TODO: Fix lora adapter
             audio_projection_mode = "vision"
         elif input_mode == InputMode.SPEECH:
             # self.set_lora_adapter("speech") # TODO: Fix lora adapter
@@ -378,11 +378,11 @@ class Phi4Model(nn.Module):
             if "base_model.model.model.layers" in k and "lora_A.weight" in k:
                 new_k = k.replace("base_model.model.model.layers", "layers")
                 new_k = new_k.replace("lora_A.weight", f"lora_A.{adapter_name}.weight")
-                sanitized_weights[new_k] = v
+                sanitized_weights[new_k] = v.transpose(1, 0)
             elif "base_model.model.model.layers" in k and "lora_B.weight" in k:
                 new_k = k.replace("base_model.model.model.layers", "layers")
                 new_k = new_k.replace("lora_B.weight", f"lora_B.{adapter_name}.weight")
-                sanitized_weights[new_k] = v
+                sanitized_weights[new_k] = v.transpose(1, 0)
             else:
                 sanitized_weights[k] = v
 
@@ -444,13 +444,13 @@ class Model(nn.Module):
 
         for k, v in weights.items():
             if "lora_A.vision.weight" in k:
-                weights[k] = mx.ones_like(v).swapaxes(1, 0)
+                weights[k] = v.transpose(1, 0)
             elif "lora_B.vision.weight" in k:
-                weights[k] = mx.ones_like(v).swapaxes(1, 0)
+                weights[k] = v.transpose(1, 0)
             elif "lora_A.speech.weight" in k:
-                weights[k] = v.swapaxes(1, 0)
+                weights[k] = v.transpose(1, 0)
             elif "lora_B.speech.weight" in k:
-                weights[k] = v.swapaxes(1, 0)
+                weights[k] = v.transpose(1, 0)
             else:
                 weights[k] = v
 
