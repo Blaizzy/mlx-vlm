@@ -304,6 +304,7 @@ class Phi4Model(nn.Module):
             self.set_lora_adapter("vision")
             audio_projection_mode = "vision"
         elif input_mode == InputMode.SPEECH:
+            self.unset_lora_adapter()
             self.set_lora_adapter("speech")
             audio_projection_mode = "speech"
         elif input_mode == InputMode.LANGUAGE:
