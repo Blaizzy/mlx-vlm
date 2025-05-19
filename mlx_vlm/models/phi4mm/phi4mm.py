@@ -1,6 +1,7 @@
 import json
 import re
 from dataclasses import dataclass
+from enum import Enum
 from functools import partial
 from typing import Any, Dict, List, Optional, Union
 
@@ -12,8 +13,14 @@ from ...trainer.utils import LoRaLayer, apply_lora_layers, set_module_by_name
 from ...utils import get_model_path
 from ..base import BaseModelConfig, LanguageModelOutput, create_attention_mask
 from .multimodal import Phi4MMImageAudioEmbedding
-from .processing_phi4mm import InputMode, Phi4MMProcessor
 from .su_rope import SuScaledRotaryEmbedding
+
+
+class InputMode(Enum):
+    LANGUAGE = 0
+    VISION = 1
+    SPEECH = 2
+    VISION_SPEECH = 3
 
 
 @dataclass
