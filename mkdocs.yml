@@ -1,0 +1,93 @@
+site_name: MLX-VLM
+site_description: MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) on your Mac using MLX.
+site_author: Prince Canuma
+repo_name: Blaizzy/mlx-vlm
+site_url: https://Blaizzy.github.io/mlx-vlm
+repo_url: https://github.com/Blaizzy/mlx-vlm
+
+copyright: "Copyright \u00a9 2024 - 2024 Prince Canuma"
+
+theme:
+    palette:
+        - scheme: default
+          primary: black
+          toggle:
+              icon: material/toggle-switch-off-outline
+              name: Switch to dark mode
+        - scheme: slate
+          primary: black
+          accent: indigo
+          toggle:
+              icon: material/toggle-switch
+              name: Switch to light mode
+    name: material
+    icon:
+        repo: fontawesome/brands/github
+    features:
+        - navigation.instant
+        - navigation.tracking
+        - navigation.top
+        - navigation.footer
+        - search.highlight
+        - search.share
+        - content.code.copy
+    custom_dir: "docs/overrides"
+    font:
+        text: Google Sans
+        code: Regular
+
+plugins:
+    - search
+    - mkdocstrings
+    - mkdocs-jupyter:
+          include_source: True
+          ignore_h1_titles: True
+          execute: True
+          allow_errors: false
+          ignore: ["conf.py"]
+          execute_ignore: ["*ignore.ipynb"]
+
+markdown_extensions:
+    - admonition
+    - abbr
+    - attr_list
+    - def_list
+    - footnotes
+    - meta
+    - md_in_html
+    - pymdownx.superfences
+    - pymdownx.highlight:
+          linenums: true
+    - toc:
+          permalink: true
+
+extra:
+    social:
+        - icon: fontawesome/brands/github
+          link: https://github.com/Blaizzy
+        - icon: fontawesome/brands/twitter
+          link: https://twitter.com/Prince_Canuma
+    version:
+        provider: mike
+    consent:
+        title: Cookie consent
+        description: >-
+          We use cookies to recognize your repeated visits and preferences, as well
+          as to measure the effectiveness of our documentation and whether users
+          find what they're searching for. With your consent, you're helping us to
+          make our documentation better.
+
+extra_css:
+    - stylesheets/extra.css
+
+nav:
+    - Home: index.md
+    - Installation: installation.md
+    - CLI Reference: cli_reference.md
+    - Examples: examples.md
+    - Contributing: contributing.md
+    - Community Projects: community_projects.md
+    - Report Issues: report_issues.md
+    - Changelog: changelog.md
+
+docs_dir: docs

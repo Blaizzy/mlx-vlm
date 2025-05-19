@@ -69,14 +69,14 @@ class Attention(nn.Module):
         self.scale = head_dim**-0.5
         self.qkv_bias = config.qkv_bias
 
-        self.qkv = nn.Linear(dims, 3 * self.dims, bias=config.qkv_bias)
+        self.qkv = nn.Linear(dims, 3 * dims, bias=config.qkv_bias)
         self.proj = nn.Linear(dims, dims)
 
         self.qk_normalization = config.qk_normalization
 
         if self.qk_normalization:
-            self.q_norm = nn.RMSNorm(self.embed_dim, eps=config.layer_norm_eps)
-            self.k_norm = nn.RMSNorm(self.embed_dim, eps=config.layer_norm_eps)
+            self.q_norm = nn.RMSNorm(dims, eps=config.layer_norm_eps)
+            self.k_norm = nn.RMSNorm(dims, eps=config.layer_norm_eps)
 
     def __call__(self, x, mask=None):
         B, L, C = x.shape
@@ -91,12 +91,12 @@ class Attention(nn.Module):
         if self.qk_normalization:
             B_, H_, N_, D_ = queries.shape
             queries = (
-                self.q_norm(queries.transpose(1, 2).flatten(-2, -1))
+                self.q_norm(queries.transpose(0, 2, 1, 3).flatten(-2, -1))
                 .reshape(B_, N_, H_, D_)
                 .transpose(0, 2, 1, 3)
             )
             keys = (
-                self.k_norm(keys.transpose(1, 2).flatten(-2, -1))
+                self.k_norm(keys.transpose(0, 2, 1, 3).flatten(-2, -1))
                 .reshape(B_, N_, H_, D_)
                 .transpose(0, 2, 1, 3)
             )
@@ -152,11 +152,12 @@ class EncoderLayer(nn.Module):
         )
 
     def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
-        x = x + self.drop_path1(self.attn(self.norm1(x).astype(x.dtype)) * self.ls1)
+        dtype = x.dtype
+        x = x + self.drop_path1(self.attn(self.norm1(x).astype(dtype)) * self.ls1)
 
-        x = x + self.drop_path2(self.mlp(self.norm2(x).astype(x.dtype)) * self.ls2)
+        x = x + self.drop_path2(self.mlp(self.norm2(x).astype(dtype)) * self.ls2)
 
-        return x
+        return x.astype(dtype)
 
 
 class Encoder(nn.Module):
@@ -246,7 +247,7 @@ class VisionEmbeddings(nn.Module):
         )
         embeddings = embeddings + position_embedding.astype(target_dtype)
 
-        return mx.array(embeddings)
+        return embeddings
 
 
 class VisionModel(nn.Module):
@@ -265,11 +266,9 @@ class VisionModel(nn.Module):
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
         x = self.embeddings(x)
-        x = x.astype(self.embeddings.patch_embedding.weight.dtype)
-        encoder_outputs = self.encoder(
+        last_hidden_state, encoder_outputs = self.encoder(
             x=x, output_hidden_states=output_hidden_states, mask=None
         )
-        last_hidden_state = encoder_outputs[0]
         pooler_output = last_hidden_state[:, 0, :]
         return last_hidden_state, pooler_output, encoder_outputs[1:]
 

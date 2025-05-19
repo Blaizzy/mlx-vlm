@@ -1,9 +1,13 @@
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
 import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_vlm.utils import (
     StoppingCriteria,
     get_class_predicate,
+    load,
     prepare_inputs,
     quantize_model,
     sanitize_weights,
@@ -214,3 +218,47 @@ def test_stopping_criteria():
 
     stopping_criteria.add_eos_token_ids("</answer>")
     assert stopping_criteria.eos_token_ids == [2, 32000, 32007, 32008, 1]
+
+
+def test_stopping_criteria_reset():
+    class MockProcessor:
+        def __init__(self):
+            self.tokenizer = type(
+                "DummyTokenizer", (), {"pad_token": None, "eos_token": "[EOS]"}
+            )()
+
+        def encode(self, text, add_special_tokens=False):
+            if "[EOS]" in text:
+                return [32008]
+            return [1]
+
+    processor = MockProcessor()
+    stopping_criteria = StoppingCriteria([2], processor)
+    stopping_criteria.add_eos_token_ids("[EOS]")
+
+    stopping_criteria.reset([5, 7])
+    assert stopping_criteria.eos_token_ids == [5, 7]
+    assert stopping_criteria(7) is True
+
+
+def test_load_passes_revision():
+    model_mock = MagicMock()
+    model_mock.config = MagicMock(eos_token_id=None)
+    processor_mock = MagicMock()
+
+    with patch("mlx_vlm.utils.get_model_path") as mock_get_model_path, patch(
+        "mlx_vlm.utils.load_model",
+        return_value=model_mock,
+    ) as mock_load_model, patch(
+        "mlx_vlm.utils.load_processor",
+        return_value=processor_mock,
+    ) as mock_load_processor, patch(
+        "mlx_vlm.utils.load_image_processor", return_value=None
+    ):
+        mock_get_model_path.return_value = Path("/tmp/model")
+
+        model, processor = load("repo", revision="abc")
+
+        assert model is model_mock
+        assert processor is processor_mock
+        mock_get_model_path.assert_called_with("repo", revision="abc")

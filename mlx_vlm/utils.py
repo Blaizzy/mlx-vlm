@@ -153,6 +153,8 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         lazy (bool): If False eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
+        revision (str, optional): A revision id which can be a branch name,
+            a tag, or a commit hash. Default: ``None``.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -291,6 +293,7 @@ def load(
     path_or_hf_repo: str,
     adapter_path: Optional[str] = None,
     lazy: bool = False,
+    revision: Optional[str] = None,
     **kwargs,
 ) -> Tuple[nn.Module, Union[PreTrainedTokenizer, PreTrainedTokenizerFast]]:
     """
@@ -305,6 +308,8 @@ def load(
         lazy (bool): If False eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
+        revision (str, optional): A revision id which can be a branch name,
+            a tag, or a commit hash. Default: ``None``.
     Returns:
         Tuple[nn.Module, TokenizerWrapper]: A tuple containing the loaded model and tokenizer.
 
@@ -312,7 +317,7 @@ def load(
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
-    model_path = get_model_path(path_or_hf_repo)
+    model_path = get_model_path(path_or_hf_repo, revision=revision)
 
     model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
@@ -498,37 +503,6 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         repo_type="model",
     )
     print(f"Upload successful, go to https://huggingface.co/{upload_repo} for details.")
-
-
-def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
-    """
-    Ensures the model is available locally. If the path does not exist locally,
-    it is downloaded from the Hugging Face Hub.
-
-    Args:
-        path_or_hf_repo (str): The local path or Hugging Face repository ID of the model.
-        revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
-
-    Returns:
-        Path: The path to the model.
-    """
-    model_path = Path(path_or_hf_repo)
-    if not model_path.exists():
-        model_path = Path(
-            snapshot_download(
-                repo_id=path_or_hf_repo,
-                revision=revision,
-                allow_patterns=[
-                    "*.json",
-                    "*.safetensors",
-                    "*.py",
-                    "tokenizer.model",
-                    "*.tiktoken",
-                    "*.txt",
-                ],
-            )
-        )
-    return model_path
 
 
 def apply_repetition_penalty(logits: mx.array, generated_tokens: Any, penalty: float):
@@ -1037,7 +1011,6 @@ def generate_step(
                     **kwargs,
                 )
             else:
-
                 outputs = model.language_model(
                     y[None],
                     cache=cache,
@@ -1115,7 +1088,7 @@ class StoppingCriteria:
                                If strings are provided, they will be converted to integers if possible.
         """
         if new_eos_token_ids is None:
-            pass
+            return
 
         if self.tokenizer is None:
             raise ValueError("Processor is not provided")
@@ -1336,4 +1309,13 @@ def generate(
         )
         print(f"Peak memory: {last_response.peak_memory:.3f} GB")
 
-    return text
+    usage_stats = {
+        "input_tokens": last_response.prompt_tokens,
+        "output_tokens": last_response.generation_tokens,
+        "total_tokens": last_response.prompt_tokens + last_response.generation_tokens,
+        "prompt_tps": last_response.prompt_tps,
+        "generation_tps": last_response.generation_tps,
+        "peak_memory": last_response.peak_memory,
+    }
+
+    return text, usage_stats

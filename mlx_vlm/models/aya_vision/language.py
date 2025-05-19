@@ -26,6 +26,7 @@ class TextConfig:
     layer_norm_bias: bool = False
     sliding_window: int = 4096
     sliding_window_pattern: int = 4
+    max_position_embeddings: int = 4096
 
     @classmethod
     def from_dict(cls, params):
