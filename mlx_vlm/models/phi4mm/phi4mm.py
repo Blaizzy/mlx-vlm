@@ -15,8 +15,6 @@ from .multimodal import Phi4MMImageAudioEmbedding
 from .processing_phi4mm import InputMode, Phi4MMProcessor
 from .su_rope import SuScaledRotaryEmbedding
 
-AutoProcessor.register("phi4mm", Phi4MMProcessor)
-
 
 @dataclass
 class ModelConfig(BaseModelConfig):
