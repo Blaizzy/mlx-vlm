@@ -234,6 +234,9 @@ class Qwen2Model(nn.Module):
         return self.norm(h)
 
 
+
+    
+
 class LanguageModel(nn.Module):
     def __init__(self, args: TextConfig, config: ModelConfig):
         super().__init__()
