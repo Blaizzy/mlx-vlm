@@ -1,14 +1,89 @@
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
 import mlx.core as mx
 import mlx.nn as nn
+import pytest
 
 from mlx_vlm.utils import (
     StoppingCriteria,
     get_class_predicate,
+    load,
     prepare_inputs,
+    process_inputs_with_fallback,
     quantize_model,
     sanitize_weights,
     update_module_configs,
 )
+
+
+class MockTensor:
+    def __init__(self, data):
+        self.data = data
+
+    def numpy(self):
+        return self.data
+
+    def detach(self):
+        return self
+
+
+class MockTorch:
+    @staticmethod
+    def tensor(data):
+        return MockTensor(data)
+
+
+class MockProcessor:
+    def __init__(self):
+        self.tokenizer = type(
+            "DummyTokenizer", (), {"pad_token": None, "eos_token": "[EOS]"}
+        )()
+
+    def __call__(self, text=None, images=None, padding=None, return_tensors="mlx"):
+        # Count image tokens in text
+        image_token_count = text.count("<image>") if text else 0
+
+        # Handle None images case
+        if images is None:
+            if image_token_count > 0:
+                raise ValueError(
+                    f"Number of image tokens in prompt_token_ids ({image_token_count}) "
+                    f"does not match number of images (0)"
+                )
+        else:
+            # Convert single image to list
+            if not isinstance(images, list):
+                images = [images]
+
+            images = [img for img in images if img is not None]
+
+            if image_token_count != len(images):
+                raise ValueError(
+                    f"Number of image tokens in prompt_token_ids ({image_token_count}) "
+                    f"does not match number of images ({len(images)})"
+                )
+
+        data = {
+            "input_ids": [1, 2, 3],
+            "attention_mask": [7, 8, 9],
+        }
+
+        # Simulate MLX tensor output
+        if return_tensors == "mlx":
+            inputs = {k: mx.array(v) for k, v in data.items()}
+            inputs["pixel_values"] = mx.zeros((4, 5, 6)) if images else []
+            return inputs
+        # Simulate PyTorch tensor output
+        elif return_tensors == "pt":
+            try:
+                inputs = {k: MockTorch.tensor(v) for k, v in data.items()}
+                inputs["pixel_values"] = MockTorch.tensor([4, 5, 6]) if images else []
+                return inputs
+            except ImportError:
+                raise ImportError("PyTorch is not installed")
+        else:
+            raise ValueError(f"Unsupported return_tensors: {return_tensors}")
 
 
 def test_sanitize_weights():
@@ -153,19 +228,6 @@ def test_prepare_inputs():
     """Test prepare_inputs function."""
 
     # Mock processor
-    class MockProcessor:
-        def __init__(self):
-            self.tokenizer = type(
-                "DummyTokenizer", (), {"pad_token": None, "eos_token": "[EOS]"}
-            )()
-
-        def __call__(self, text=None, images=None, padding=None, return_tensors=None):
-            return {
-                "input_ids": mx.array([1, 2, 3]),
-                "pixel_values": mx.array([4, 5, 6]),
-                "attention_mask": mx.array([7, 8, 9]),
-            }
-
     processor = MockProcessor()
 
     # Test text-only input
@@ -175,10 +237,10 @@ def test_prepare_inputs():
     assert "input_ids" in inputs
     assert mx.array_equal(inputs["input_ids"], mx.array([1, 2, 3]))
 
-    # Test image-only input
+    # Test image-only input with image token
     image = mx.zeros((3, 224, 224))
     inputs = prepare_inputs(
-        processor, prompts=None, images=image, image_token_index=None
+        processor, prompts="<image>", images=image, image_token_index=None
     )
     assert "input_ids" in inputs
     assert mx.array_equal(inputs["input_ids"], mx.array([1, 2, 3]))
@@ -186,10 +248,72 @@ def test_prepare_inputs():
     # Test both text and image
     image = mx.zeros((3, 224, 224))
     inputs = prepare_inputs(
-        processor, prompts="test", images=image, image_token_index=None
+        processor, prompts="test <image>", images=image, image_token_index=None
     )
     assert "input_ids" in inputs
     assert mx.array_equal(inputs["input_ids"], mx.array([1, 2, 3]))
+    assert mx.array_equal(inputs["pixel_values"], mx.zeros((4, 5, 6)))
+    assert mx.array_equal(inputs["attention_mask"], mx.array([7, 8, 9]))
+
+    # Test image present without image token
+    image = mx.zeros((3, 224, 224))
+    with pytest.raises(
+        ValueError,
+        match="Number of image tokens in prompt_token_ids.*does not match number of images",
+    ):
+        prepare_inputs(
+            processor,
+            images=image,
+            prompts="test without image token",
+            image_token_index=None,
+        )
+
+    # Test image token without image present
+    with pytest.raises(
+        ValueError,
+        match="Number of image tokens in prompt_token_ids.*does not match number of images",
+    ):
+        prepare_inputs(
+            processor,
+            images=None,
+            prompts="test with <image> token",
+            image_token_index=None,
+        )
+
+
+def test_process_inputs_with_fallback():
+
+    processor = MockProcessor()
+
+    # Test MLX tensor output
+    inputs = process_inputs_with_fallback(
+        processor, images=None, prompts="test", return_tensors="mlx"
+    )
+    assert isinstance(inputs["input_ids"], mx.array)
+    assert isinstance(inputs["attention_mask"], mx.array)
+
+    try:
+        # Test PyTorch tensor output with fallback
+        inputs = process_inputs_with_fallback(
+            processor, images=None, prompts="test", return_tensors="pt"
+        )
+        # Check if the tensors have PyTorch-like attributes without importing torch
+        assert hasattr(inputs["input_ids"], "numpy") and hasattr(
+            inputs["input_ids"], "detach"
+        )
+        assert hasattr(inputs["attention_mask"], "numpy") and hasattr(
+            inputs["attention_mask"], "detach"
+        )
+    except ImportError:
+        # Test PyTorch not installed scenario
+        with patch("builtins.__import__", side_effect=ImportError):
+            with pytest.raises(
+                ValueError,
+                match="Failed to process inputs with error.*PyTorch is not installed.*Please install PyTorch",
+            ):
+                process_inputs_with_fallback(
+                    processor, images=None, prompts="test", return_tensors="pt"
+                )
 
 
 def test_stopping_criteria():
@@ -214,3 +338,47 @@ def test_stopping_criteria():
 
     stopping_criteria.add_eos_token_ids("</answer>")
     assert stopping_criteria.eos_token_ids == [2, 32000, 32007, 32008, 1]
+
+
+def test_stopping_criteria_reset():
+    class MockProcessor:
+        def __init__(self):
+            self.tokenizer = type(
+                "DummyTokenizer", (), {"pad_token": None, "eos_token": "[EOS]"}
+            )()
+
+        def encode(self, text, add_special_tokens=False):
+            if "[EOS]" in text:
+                return [32008]
+            return [1]
+
+    processor = MockProcessor()
+    stopping_criteria = StoppingCriteria([2], processor)
+    stopping_criteria.add_eos_token_ids("[EOS]")
+
+    stopping_criteria.reset([5, 7])
+    assert stopping_criteria.eos_token_ids == [5, 7]
+    assert stopping_criteria(7) is True
+
+
+def test_load_passes_revision():
+    model_mock = MagicMock()
+    model_mock.config = MagicMock(eos_token_id=None)
+    processor_mock = MagicMock()
+
+    with patch("mlx_vlm.utils.get_model_path") as mock_get_model_path, patch(
+        "mlx_vlm.utils.load_model",
+        return_value=model_mock,
+    ) as mock_load_model, patch(
+        "mlx_vlm.utils.load_processor",
+        return_value=processor_mock,
+    ) as mock_load_processor, patch(
+        "mlx_vlm.utils.load_image_processor", return_value=None
+    ):
+        mock_get_model_path.return_value = Path("/tmp/model")
+
+        model, processor = load("repo", revision="abc")
+
+        assert model is model_mock
+        assert processor is processor_mock
+        mock_get_model_path.assert_called_with("repo", revision="abc")

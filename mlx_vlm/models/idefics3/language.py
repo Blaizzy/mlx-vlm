@@ -22,6 +22,7 @@ class TextConfig:
     rope_theta: float = 1000000.0
     num_hidden_layers: int = 32
     rope_traditional: bool = False
+    max_position_embeddings: int = 4096
     tie_word_embeddings: bool = False
 
     @classmethod
