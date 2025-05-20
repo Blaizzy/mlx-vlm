@@ -8,7 +8,7 @@ import numpy as np
 
 from ..base import LanguageModelOutput, create_attention_mask
 from ..cache import KVCache
-from .vision import VisionConfig
+from .config import VisionConfig
 
 @dataclass
 class ModelConfig:
@@ -27,46 +27,7 @@ class ModelConfig:
             }
         )
 
-@dataclass
-class TextConfig:
-    model_type: str
-    hidden_size: int
-    num_hidden_layers: int
-    intermediate_size: int
-    num_attention_heads: int
-    rms_norm_eps: float
-    vocab_size: int
-    num_key_value_heads: Optional[int] = None
-    max_position_embeddings: Optional[int] = 128000
-    rope_theta: float = 1000000.0
-    rope_traditional: bool = False
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    tie_word_embeddings: bool = True
-
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
-
-        if self.rope_scaling:
-            required_keys = {"mrope_section", "type"}
-            if not all(key in self.rope_scaling for key in required_keys):
-                raise ValueError(f"rope_scaling must contain keys {required_keys}")
-
-            if not self.rope_scaling["type"] in ["mrope", "default"]:
-                raise ValueError(f"rope_scaling type must be 'mrope' or 'default'")
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
-
-class Qwen25RotaryEmbedding:
+class Qwen2RotaryEmbedding:
     def __init__(self, dim, max_position_embeddings=2048, base=10000):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
@@ -159,7 +120,7 @@ class Attention(nn.Module):
 
         self.rope_scaling = args.rope_scaling
 
-        self.rotary_emb = Qwen25RotaryEmbedding(
+        self.rotary_emb = Qwen2RotaryEmbedding(
             head_dim,
             max_position_embeddings=args.max_position_embeddings,
             base=args.rope_theta,
