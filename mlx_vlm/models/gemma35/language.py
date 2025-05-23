@@ -107,6 +107,56 @@ class Gemma3p5LaurelBlock(nn.Module):
         normed_laurel_x = self.post_laurel_norm(laurel_x)
         return x + normed_laurel_x
 
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return mx.concatenate((-x2, x1), axis=-1)
+
+def apply_rotary_pos_emb(
+    x: mx.array,
+    cos: mx.array,
+    sin: mx.array,
+    position_ids: Optional[mx.array] = None,
+    unsqueeze_dim: int = 1,
+):
+
+    cos = mx.expand_dims(cos, unsqueeze_dim)
+    sin = mx.expand_dims(sin, unsqueeze_dim)
+    return (x * cos) + (rotate_half(x) * sin)
+
+class Gemma3p5RotaryEmbedding(nn.Module):
+    def __init__(self, config: TextConfig, device=None):
+        super().__init__()
+
+        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+        else:
+            self.rope_type = "default"
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+
+        # TODO: This is a hack to get the RoPE parameters just for testing.
+        # Will be removed...
+        from transformers.modeling_rope_utils import _compute_default_rope_parameters
+        self.rope_init_fn = _compute_default_rope_parameters
+
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        self._inv_freq = mx.array(inv_freq, dtype=mx.float32)
+        self._original_inv_freq = mx.array(inv_freq, dtype=mx.float32)
+
+
+    def __call__(self, x, position_ids):
+        inv_freq_expanded = self._inv_freq[None, :, None].astype(mx.float32)
+        position_ids_expanded = position_ids[:, None, :].astype(mx.float32)
+
+        freqs = (inv_freq_expanded.astype(mx.float32) @ position_ids_expanded.astype(mx.float32)).transpose(0, 2, 1)
+        emb = mx.concatenate((freqs, freqs), axis=-1)
+        cos = mx.cos(emb) * self.attention_scaling
+        sin = mx.sin(emb) * self.attention_scaling
+
+        return cos.astype(x.dtype), sin.astype(x.dtype)
 
 class Gemma3p5Attention(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
@@ -148,26 +198,23 @@ class Gemma3p5Attention(nn.Module):
             # The last layer before sharing starts is always the last that computes global attention layer
             self.kv_shared_layer_index = first_kv_shared_layer_idx - 1
 
-        self.rope = nn.RoPE(
-            head_dim,
-            traditional=config.rope_traditional,
-            base=config.rope_theta if self.is_sliding else config.rope_local_base_freq,
-        )
-
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         caches: Optional[List[Any]] = None,
+        position_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
         input_shape = x.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
+        cos, sin = position_embeddings
+
         queries = self.q_proj(x)
         queries = queries.reshape(hidden_shape)
         queries = self.qkv_norm(queries)
-        queries = self.rope(queries) if cache is None else self.rope(queries, offset=cache.offset)
+        queries = apply_rotary_pos_emb(queries, cos, sin, unsqueeze_dim=2)
         queries = queries.transpose(0, 2, 1, 3)
 
         if self.is_kv_shared_layer and self.kv_shared_layer_index is not None and caches is not None and cache is not None and cache.offset > 0:
@@ -178,7 +225,7 @@ class Gemma3p5Attention(nn.Module):
         else:
             keys = self.k_proj(x).reshape(hidden_shape)
             keys = self.qkv_norm(keys)
-            keys = self.rope(keys) if cache is None else self.rope(keys, offset=cache.offset)
+            keys = apply_rotary_pos_emb(keys, cos, sin, unsqueeze_dim=2)
             keys = keys.transpose(0, 2, 1, 3)
 
             values = self.v_proj(x).reshape(hidden_shape)
@@ -395,6 +442,8 @@ class Gemma3p5DecoderLayer(nn.Module):
         per_layer_input: Optional[mx.array] = None,
         caches: Optional[List[Any]] = None,
         cache_position: Optional[mx.array] = None,
+        position_embeddings_global: Optional[mx.array] = None,
+        position_embeddings_local: Optional[mx.array] = None,
     ):
         if isinstance(x, list):
             x = mx.stack(x, axis=0)
@@ -421,7 +470,7 @@ class Gemma3p5DecoderLayer(nn.Module):
                 min(effective_seq_len, mask.shape[-1])
             )
             mask_indexes += offset
-            mask = mask[:, :, :, mask_indexes]
+            mask = mask[:, :, :, mask_indexes.astype(mx.int32)]
 
         predictions = self.altup.predict(x)
         active_prediction = predictions[self.config.altup_active_idx]
@@ -430,12 +479,18 @@ class Gemma3p5DecoderLayer(nn.Module):
         active_prediction_normed = self.input_layernorm(active_prediction)
         laurel_output = self.laurel(active_prediction_normed)
 
+        # apply global RoPE to non-sliding layer only
+        if self.is_sliding:
+            position_embeddings = position_embeddings_local
+        else:
+            position_embeddings = position_embeddings_global
 
         attn = self.self_attn(
             active_prediction_normed,
             mask,
             cache,
             caches,
+            position_embeddings,
         )
 
         attn = self.post_attention_layernorm(attn)
@@ -531,6 +586,9 @@ class Gemma3Model(nn.Module):
         self._per_layer_projection_scale = mx.array(self.hidden_size**-0.5)
         self._per_layer_input_scale = mx.rsqrt(mx.array(2.0))
 
+        self.rope_embedding = Gemma3p5RotaryEmbedding(config)
+        self.rope_embedding_local = Gemma3p5RotaryEmbedding(config)
+
     def _update_causal_mask(
         self,
         attention_mask: mx.array,
@@ -542,7 +600,7 @@ class Gemma3Model(nn.Module):
 
         dtype = input_tensor.dtype
         sequence_length = input_tensor.shape[1]
-        if isinstance(past_key_values[0], (RotatingKVCache, KVCache)):
+        if isinstance(past_key_values[0], (_BaseCache)):
             target_length = self.config.sliding_window
         else:
             target_length = attention_mask.shape[-1] if attention_mask is not None else input_tensor.shape[1]
@@ -655,6 +713,12 @@ class Gemma3Model(nn.Module):
 
         h0 = h
 
+        # Initialize RoPE embeddings
+        position_ids = cache_position[None, :]
+        position_embeddings_global = self.rope_embedding(h0, position_ids)
+        position_embeddings_local = self.rope_embedding_local(h0, position_ids)
+
+
         # Expand hidden_states to support per-layer inputs
         target_magnitude = mx.mean(h0**2, axis=-1, keepdims=True) ** 0.5
         epsilon_tensor = mx.array(1e-10, dtype=h0.dtype)
@@ -672,7 +736,16 @@ class Gemma3Model(nn.Module):
         for i, (layer, c) in enumerate(zip(self.layers[:self.config.num_hidden_layers], cache)):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
-            h = layer(h, causal_mask, c, per_layer_input, cache, cache_position)
+            h = layer(
+                h,
+                causal_mask,
+                c,
+                per_layer_input,
+                cache,
+                cache_position,
+                position_embeddings_global,
+                position_embeddings_local
+            )
 
         # Per-layer inputs to single output
         target_magnitude = mx.mean(h[0] ** 2, axis=-1, keepdims=True) ** 0.5
@@ -763,21 +836,25 @@ class LanguageModel(nn.Module):
         caches = []
 
         for i in range(self.config.num_hidden_layers):
-
+            # Normal KVcache and RotatingKVCache work,
+            # but results are better with StaticKVCache and SlidingWindowCache.
             if (
                 i % self.config.sliding_window_pattern
                 == self.config.sliding_window_pattern - 1
             ):
                 caches.append(
-                    KVCache()
+                    StaticKVCache(
+                        max_size=min(self.config.sliding_window, self.config.max_position_embeddings),
+
+                    )
                 )
             else:
                 caches.append(
-                    RotatingKVCache(
+                    SlidingWindowCache(
                         max_size=min(self.config.sliding_window, self.config.max_position_embeddings),
-                        keep=self.config.sliding_window_pattern
                     )
                 )
+
 
         return caches
 
