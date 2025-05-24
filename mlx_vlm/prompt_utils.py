@@ -104,7 +104,8 @@ def get_message_json(
         # Models using message_list_with_image format
         "idefics2": "message_list_with_image",
         "idefics3": "message_list_with_image_first",
-        "aya_vision": "message_list_with_image",
+        "phi4mm": "message_with_numbered_image_tokens",
+        "aya_vision": "message_list_with_image_first",
         "mistral3": "message_list_with_image_first",
         "internvl_chat": "message_list_with_image_type",
         "kimi_vl": "message_list_with_image",
