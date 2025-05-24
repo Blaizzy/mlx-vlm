@@ -6,7 +6,8 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, LanguageModelOutput, SimpleKVCache, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache, SimpleKVCache
 
 
 @dataclass
@@ -70,7 +71,6 @@ class Florence2Attention(nn.Module):
         self,
         hidden_states,
         key_value_states=None,
-        # cache: Optional[Tuple[mx.array, mx.array]] = None,
         cache: Optional[KVCache] = None,
         attention_mask=None,
         layer_head_mask=None,

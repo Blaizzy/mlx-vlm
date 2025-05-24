@@ -6,7 +6,8 @@ from typing import Dict, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache
 
 
 @dataclass
@@ -21,6 +22,7 @@ class TextConfig:
     rope_theta: float = 1000000.0
     num_hidden_layers: int = 32
     rope_traditional: bool = False
+    max_position_embeddings: int = 4096
     tie_word_embeddings: bool = False
 
     @classmethod
@@ -145,9 +147,9 @@ class LanguageModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
-        inputs_embeds=None,
+        inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
+        cache=None,
     ):
         # for passing merged input embeddings
         if inputs_embeds is None:
@@ -155,10 +157,11 @@ class LanguageModel(nn.Module):
         else:
             h = inputs_embeds.astype(self.norm.weight.dtype)
 
-        mask = create_attention_mask(h)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        if mask is None:
+            mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)

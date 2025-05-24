@@ -59,6 +59,7 @@ class ModelConfig:
     vocab_size: int = 32000
     tile_tag: str = "2D"
     global_view_pos: str = "head"
+    eos_token_id: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, params):

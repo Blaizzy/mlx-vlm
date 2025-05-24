@@ -1,12 +1,12 @@
 import inspect
-import re
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache
 
 
 @dataclass
@@ -21,6 +21,7 @@ class TextConfig:
     num_key_value_heads: int
     rope_theta: float = 1000000.0
     rope_traditional: bool = False
+    max_position_embeddings: int = 4096
     tie_word_embeddings: bool = False
 
     @classmethod
@@ -145,9 +146,9 @@ class LanguageModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
-        inputs_embeds=None,
+        inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
+        cache=None,
     ):
         # for passing merged input embeddings
         if inputs_embeds is None:
@@ -155,10 +156,11 @@ class LanguageModel(nn.Module):
         else:
             h = inputs_embeds
 
-        mask = create_attention_mask(h)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        if mask is None:
+            mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)

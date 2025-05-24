@@ -5,10 +5,10 @@ from functools import partial
 from math import sqrt
 from typing import Dict, Optional, Union
 
+import cv2
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from scipy.ndimage import zoom
 
 from .sam import SAMEncoder
 
@@ -208,7 +208,7 @@ class FastGELUActivation(nn.Module):
             0.5
             * input
             * (1.0 + mx.tanh(np.sqrt(2 / np.pi) * (input + 0.044715 * (input**3))))
-        )
+        ).astype(input.dtype)
 
 
 class MLP(nn.Module):
@@ -349,43 +349,100 @@ class HybridVisionModel(nn.Module):
             return self.vision_tower(x)[0]
 
 
+# def resize_image(image, size, antialias=True):
+#     """
+#     Resize an image using scipy.ndimage.zoom with an option for bicubic interpolation.
+
+#     Args:
+#         image (numpy.ndarray): The input image array.
+#         size (tuple): The target size as (width, height).
+#         antialias (bool): True to use bicubic interpolation, False to use nearest neighbor.
+
+#     Returns:
+#         numpy.ndarray: The resized image array.
+#     """
+#     # Ensure the image is an array and remove singleton dimensions
+#     image = np.array(image[0])
+
+#     # Calculate zoom factors for the spatial dimensions
+#     # Note: size is expected as (width, height) but image.shape gives (height, width)
+#     current_height, current_width = image.shape[:2]
+#     width_factor = size[0] / current_width
+#     height_factor = size[1] / current_height
+#     zoom_factors = (height_factor, width_factor)  # Apply zoom to height and width
+
+#     # Choose the interpolation order: 3 for bicubic, 0 for nearest
+#     order = 3 if antialias else 0
+
+#     # Apply zoom to the image. Handle both grayscale and color images.
+#     if image.ndim == 2:  # Grayscale image
+#         resized_image = zoom(image, zoom_factors, order=order)
+#     elif image.ndim == 3:  # Color image
+#         # Apply zoom separately for each channel
+#         resized_channels = [
+#             zoom(image[:, :, i], zoom_factors, order=order)
+#             for i in range(image.shape[2])
+#         ]
+#         resized_image = np.stack(resized_channels, axis=2)
+
+#     return resized_image
+
+
+# TODO: Match the output of scipy.ndimage.zoom
 def resize_image(image, size, antialias=True):
     """
-    Resize an image using scipy.ndimage.zoom with an option for bicubic interpolation.
+    Resize an image with OpenCV.
 
     Args:
-        image (numpy.ndarray): The input image array.
-        size (tuple): The target size as (width, height).
-        antialias (bool): True to use bicubic interpolation, False to use nearest neighbor.
+        image (numpy.ndarray): The input image array.  Supports H × W or H × W × C.
+                               If you pass in a batch (N × H × W × C) just slice the
+                               element you want, e.g. image[0].
+        size  (tuple): Target size as (width, height) — exactly the same order that
+                       cv2.resize expects.
+        antialias (bool):
+            * True  → high‑quality interpolation (bicubic for upscaling, area for downscaling)
+            * False → nearest‑neighbor (fast, blocky)
 
     Returns:
         numpy.ndarray: The resized image array.
     """
-    # Ensure the image is an array and remove singleton dimensions
-    image = np.array(image[0])
+    img = np.ascontiguousarray(np.asarray(image))
+    if img.ndim == 4 and img.shape[0] == 1:  # squeeze stray batch dim
+        img = img[0]
+    h0, w0 = img.shape[:2]
 
-    # Calculate zoom factors for the spatial dimensions
-    # Note: size is expected as (width, height) but image.shape gives (height, width)
-    current_height, current_width = image.shape[:2]
-    width_factor = size[0] / current_width
-    height_factor = size[1] / current_height
-    zoom_factors = (height_factor, width_factor)  # Apply zoom to height and width
+    # --- work out dsize vs fx/fy ---------------------------------------------
+    dsize = None
+    fx = fy = 0.0
+    if isinstance(size, (int, float)):  # uniform scale
+        fx = fy = float(size)
+    elif isinstance(size, (tuple, list)) and len(size) == 2:
+        a, b = size
+        # Heuristic: treat "small" floats as scale factors
+        if all(isinstance(x, (int, float)) and x < 10 for x in (a, b)):
+            fx, fy = float(a), float(b)  # scale factors
+        else:
+            dsize = (int(a), int(b))  # absolute pixels
+    else:
+        raise ValueError("target must be scalar or a 2‑tuple")
 
-    # Choose the interpolation order: 3 for bicubic, 0 for nearest
-    order = 3 if antialias else 0
+    # Guard against zeros after int‑casting
+    if dsize:
+        if dsize[0] <= 0 or dsize[1] <= 0:
+            raise ValueError(f"dsize became {dsize}")
+    else:
+        if fx <= 0 or fy <= 0:
+            raise ValueError(f"fx,fy became {(fx, fy)}")
 
-    # Apply zoom to the image. Handle both grayscale and color images.
-    if image.ndim == 2:  # Grayscale image
-        resized_image = zoom(image, zoom_factors, order=order)
-    elif image.ndim == 3:  # Color image
-        # Apply zoom separately for each channel
-        resized_channels = [
-            zoom(image[:, :, i], zoom_factors, order=order)
-            for i in range(image.shape[2])
-        ]
-        resized_image = np.stack(resized_channels, axis=2)
+    # --- choose interpolation -------------------------------------------------
+    if antialias:
+        # Use Lanczos interpolation for potentially better detail preservation
+        interp = cv2.INTER_LANCZOS4
+    else:
+        interp = cv2.INTER_NEAREST
 
-    return resized_image
+    # --- call OpenCV ----------------------------------------------------------
+    return mx.array(cv2.resize(img, dsize=dsize, fx=fx, fy=fy, interpolation=interp))
 
 
 class VisionModel(nn.Module):

@@ -240,15 +240,13 @@ class CausalConv2D(nn.Conv2d):
         if self.training:
             x = mx.pad(
                 x,
-                pad=(
-                    (self._left_padding, self._right_padding),
-                    (self._left_padding, self._right_padding),
-                ),
+                (self._left_padding, self._right_padding),
+                (self._left_padding, self._right_padding),
             )
         else:
             x = mx.pad(
                 x,
-                pad=(self._left_padding, self._right_padding, 0, 0),
+                (self._left_padding, self._right_padding, 0, 0),
             )
         x = super().__call__(x)
         return x
@@ -564,7 +562,7 @@ class NemoConvSubsampling(nn.Module):
     def get_streaming_cache_size(self):
         return [0, self.subsampling_factor + 1]
 
-    def forward(self, x, mask):
+    def __call__(self, x, mask):
         """
         Forward method for NeMo subsampling.
         Args:
@@ -580,10 +578,10 @@ class NemoConvSubsampling(nn.Module):
         """
         # Unsqueeze Channel Axis
         if self.conv2d_subsampling:
-            x = x.unsqueeze(1)
+            x = mx.expand_dims(x, axis=1)
         # Transpose to Channel First mode
         else:
-            x = x.transpose(1, 2)
+            x = x.transpose(0, 2, 1)
 
         # split inputs if chunking_factor is set
         if self.subsampling_conv_chunking_factor != -1 and self.conv2d_subsampling:
@@ -618,10 +616,10 @@ class NemoConvSubsampling(nn.Module):
         # Flatten Channel and Frequency Axes
         if self.conv2d_subsampling:
             b, c, t, f = x.size()
-            x = self.out(x.transpose(1, 2).reshape(b, t, -1))
+            x = self.out(x.transpose(0, 2, 1).reshape(b, t, -1))
         # Transpose to Channel Last mode
         else:
-            x = x.transpose(1, 2)
+            x = x.transpose(0, 2, 1)
 
         if mask is None:
             return x, None
@@ -710,30 +708,38 @@ class NemoConvSubsampling(nn.Module):
             if self.is_causal:
                 chunk = mx.pad(
                     chunk,
-                    pad=(
+                    (
                         self._kernel_size - 1,
                         self._stride - 1,
                         self._kernel_size - 1,
                         self._stride - 1,
                     ),
                 )
+                # MLX's conv2d doesn't accept bias as a keyword argument
+                # Apply bias separately after convolution
                 ch_out = mx.conv2d(
                     chunk,
                     conv.weight[ind : ind + step, :, :, :],
-                    bias=conv.bias[ind : ind + step],
                     stride=self._stride,
                     padding=0,
                     groups=step,
                 )
+                # Add bias manually
+                bias_view = conv.bias[ind : ind + step].reshape(step, 1, 1)
+                ch_out = ch_out + bias_view
             else:
+                # MLX's conv2d doesn't accept bias as a keyword argument
+                # Apply bias separately after convolution
                 ch_out = mx.conv2d(
                     chunk,
                     conv.weight[ind : ind + step, :, :, :],
-                    bias=conv.bias[ind : ind + step],
                     stride=self._stride,
                     padding=self._left_padding,
                     groups=step,
                 )
+                # Add bias manually
+                bias_view = conv.bias[ind : ind + step].reshape(step, 1, 1)
+                ch_out = ch_out + bias_view
             out_chunks.append(ch_out)
             ind += step
 
@@ -1794,7 +1800,7 @@ class AudioModel(nn.Module):
         input_ids = mx.reshape(input_ids, (-1, input_shape[-1]))
 
         # Find positions of audio token IDs
-        positions = mx.nonzero(input_ids == _AUDIO_SPECIAL_TOKEN_ID)
+        positions = mx.array(np.nonzero(input_ids == _AUDIO_SPECIAL_TOKEN_ID)[0])
 
         # Determine target device and dtype from projection layer
         if isinstance(self.audio_projection, dict):

@@ -1,19 +1,26 @@
+import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from enum import Enum
+from functools import partial
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 from transformers import AutoProcessor
 
-from ...trainer.utils import LoRaLayer, set_module_by_name
+from ...trainer.utils import LoRaLayer, apply_lora_layers, set_module_by_name
+from ...utils import get_model_path
 from ..base import BaseModelConfig, LanguageModelOutput, create_attention_mask
 from .multimodal import Phi4MMImageAudioEmbedding
-from .processing_phi4mm import InputMode, Phi4MMProcessor
 from .su_rope import SuScaledRotaryEmbedding
-from .vision import VisionConfig
 
-AutoProcessor.register("phi4mm", Phi4MMProcessor)
+
+class InputMode(Enum):
+    LANGUAGE = 0
+    VISION = 1
+    SPEECH = 2
+    VISION_SPEECH = 3
 
 
 @dataclass
@@ -42,6 +49,7 @@ class ModelConfig(BaseModelConfig):
     speech_lora: Optional[Dict[str, Any]] = None
     resid_pdrop: float = 0.0
     sliding_window: int = 262144
+    eos_token_id: Optional[int] = None
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -143,10 +151,10 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        if mask is not None:
+        if mask is not None and isinstance(mask, mx.array):
             key_len = keys.shape[-2]
             if mask.shape[-1] != key_len:
-                mask = mask[..., :key_len]
+                mask = mask[..., -key_len:]
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
@@ -194,6 +202,21 @@ class TransformerBlock(nn.Module):
         return out
 
 
+@partial(mx.compile)
+def pad_embeddings(embeddings, padding_idx):
+    # Create mask where padding_idx is 0 and everything else is 1
+    mask = mx.where(
+        embeddings == padding_idx,
+        mx.zeros(embeddings.shape, dtype=mx.float32),
+        mx.ones(embeddings.shape, dtype=mx.float32),
+    )
+
+    # Apply mask to zero out padding embeddings
+    masked_embeddings = embeddings * mask
+
+    return masked_embeddings
+
+
 class Phi4Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -220,6 +243,26 @@ class Phi4Model(nn.Module):
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # LoRA related settings
+        assert getattr(config, "speech_lora", None) is not None
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear) or isinstance(module, nn.QuantizedLinear):
+                if re.match(config.speech_lora["layer"], name):
+                    # print(f"Applying Speech LoRA to {name}")
+                    lora_layer = LoRaLayer(
+                        module,
+                        config.speech_lora["r"],
+                        config.speech_lora["lora_alpha"],
+                        config.speech_lora["dp"],
+                        "speech",
+                    )
+
+                    set_module_by_name(self, name, lora_layer)
+
+        self.config.speech_lora["r"] = config.speech_lora["r"]
+        self.config.speech_lora["lora_alpha"] = config.speech_lora["lora_alpha"]
+        self.config.speech_lora["layer"] = config.speech_lora["layer"]
+        self.config.speech_lora["dp"] = config.speech_lora["dp"]
+
         assert getattr(config, "vision_lora", None) is not None
         for name, module in self.named_modules():
 
@@ -233,32 +276,13 @@ class Phi4Model(nn.Module):
                         config.vision_lora["dp"],
                         "vision",
                     )
+                    name = name.replace(".base_layer", "")
                     set_module_by_name(self, name, lora_layer)
 
         self.config.vision_lora["r"] = config.vision_lora["r"]
         self.config.vision_lora["lora_alpha"] = config.vision_lora["lora_alpha"]
         self.config.vision_lora["layer"] = config.vision_lora["layer"]
         self.config.vision_lora["dp"] = config.vision_lora["dp"]
-
-        assert getattr(config, "speech_lora", None) is not None
-        for name, module in self.named_modules():
-            if isinstance(module, nn.Linear) or isinstance(module, nn.QuantizedLinear):
-                if re.match(config.speech_lora["layer"], name):
-                    # print(f"Applying Speech LoRA to {name}")
-                    lora_layer = LoRaLayer(
-                        module,
-                        config.speech_lora["r"],
-                        config.speech_lora["lora_alpha"],
-                        config.speech_lora["dp"],
-                        "speech",
-                    )
-                    name = name.replace(".base_layer", "")
-                    set_module_by_name(self, name, lora_layer)
-
-        self.config.speech_lora["r"] = config.speech_lora["r"]
-        self.config.speech_lora["lora_alpha"] = config.speech_lora["lora_alpha"]
-        self.config.speech_lora["layer"] = config.speech_lora["layer"]
-        self.config.speech_lora["dp"] = config.speech_lora["dp"]
 
     def __call__(
         self,
@@ -276,10 +300,12 @@ class Phi4Model(nn.Module):
         input_mode = InputMode(input_mode)
 
         if input_mode in [InputMode.VISION_SPEECH, InputMode.VISION]:
-            # self.set_lora_adapter("vision")
+            self.unset_lora_adapter()
+            self.set_lora_adapter("vision")
             audio_projection_mode = "vision"
         elif input_mode == InputMode.SPEECH:
-            # self.set_lora_adapter("speech")
+            self.unset_lora_adapter()
+            self.set_lora_adapter("speech")
             audio_projection_mode = "speech"
         elif input_mode == InputMode.LANGUAGE:
             self.unset_lora_adapter()
@@ -287,11 +313,13 @@ class Phi4Model(nn.Module):
         else:
             raise ValueError(f"Invalid input_mode: {input_mode}")
 
-        if pixel_values is None:
+        if input_embeds is None and pixel_values is not None:
             h = self.embed_tokens_extend(
                 input_ids=input_ids,
                 input_embeds=None,
-                input_image_embeds=kwargs.pop("input_image_embeds", None),
+                input_image_embeds=kwargs.pop(
+                    "input_image_embeds", pixel_values.transpose(0, 1, 3, 4, 2)
+                ),
                 input_audio_embeds=kwargs.pop("input_audio_embeds", None),
                 image_sizes=kwargs.pop("image_sizes", None),
                 image_attention_mask=kwargs.pop("image_attention_mask", None),
@@ -300,18 +328,17 @@ class Phi4Model(nn.Module):
                 audio_projection_mode=audio_projection_mode,
                 wte=self.embed_tokens,
             )
-
-        if input_embeds is None:
+        elif input_embeds is None and pixel_values is None:
             h = self.embed_tokens(input_ids)
-            h = self.pad_embeddings(h, self.config.pad_token_id)
+            h = pad_embeddings(h, self.config.pad_token_id)
         else:
             h = input_embeds
 
         if cache is None:
             cache = [None] * len(self.layers)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
+        # if mask is None:
+        mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -325,19 +352,6 @@ class Phi4Model(nn.Module):
 
         return LanguageModelOutput(logits=out)
 
-    def pad_embeddings(self, embeddings, padding_idx):
-        # Create mask where padding_idx is 0 and everything else is 1
-        mask = mx.where(
-            embeddings == padding_idx,
-            mx.zeros(embeddings.shape, dtype=mx.float32),
-            mx.ones(embeddings.shape, dtype=mx.float32),
-        )
-
-        # Apply mask to zero out padding embeddings
-        masked_embeddings = embeddings * mask
-
-        return masked_embeddings
-
     @property
     def head_dim(self):
         return self.config.hidden_size // self.config.num_attention_heads
@@ -346,13 +360,50 @@ class Phi4Model(nn.Module):
     def n_kv_heads(self):
         return self.config.num_key_value_heads
 
-    # def set_lora_adapter(self, adapter_name):
-    #     for name, module in self.parameters():
-    #         if isinstance(module, LoRaLayer):
-    #             if "lora_A." + adapter_name + ".weight" in name:
-    #                 module.disable_adapter = False
-    #             if "lora_B." + adapter_name + ".weight" in name:
-    #                 module.disable_adapter = False
+    def set_lora_adapter(self, adapter_name):
+        if adapter_name == "vision":
+            path = get_model_path("microsoft/Phi-4-multimodal-instruct")
+            adapter_path = path / "vision-lora/adapter_model.safetensors"
+            adapter_config = path / "vision-lora/adapter_config.json"
+
+        elif adapter_name == "speech":
+            path = get_model_path("microsoft/Phi-4-multimodal-instruct")
+            adapter_path = path / "speech-lora/adapter_model.safetensors"
+            adapter_config = path / "speech-lora/adapter_config.json"
+        else:
+            raise ValueError(f"Invalid adapter_name: {adapter_name}")
+
+        with open(adapter_config, "r") as f:
+            adapter_config = json.load(f)
+
+        weights = mx.load(str(adapter_path))
+
+        # Sanitize weights to match the expected format
+        sanitized_weights = {}
+        for k, v in weights.items():
+            if "base_model.model.model.layers" in k and "lora_A.weight" in k:
+                new_k = k.replace("base_model.model.model.layers", "layers")
+                new_k = new_k.replace("lora_A.weight", f"lora_A.{adapter_name}.weight")
+                sanitized_weights[new_k] = v.transpose(1, 0)
+            elif "base_model.model.model.layers" in k and "lora_B.weight" in k:
+                new_k = k.replace("base_model.model.model.layers", "layers")
+                new_k = new_k.replace("lora_B.weight", f"lora_B.{adapter_name}.weight")
+                sanitized_weights[new_k] = v.transpose(1, 0)
+            else:
+                sanitized_weights[k] = v
+
+        weights = sanitized_weights
+
+        self.load_weights(list(weights.items()), strict=False)
+        print(f"Loaded adapter weights for {adapter_name}")
+        self.eval()
+        for module in self.layers:
+            for name, module in module.named_modules():
+                if isinstance(module, LoRaLayer):
+                    if "lora_A." + adapter_name + ".weight" in name:
+                        module.disable_adapter = False
+                    if "lora_B." + adapter_name + ".weight" in name:
+                        module.disable_adapter = False
 
     def unset_lora_adapter(self):
         for module in self.layers:
@@ -382,7 +433,7 @@ class Model(nn.Module):
         **kwargs,
     ):
         out = self.language_model(
-            input_ids, pixel_values, mask=mask, cache=cache, **kwargs
+            input_ids, pixel_values=pixel_values, mask=mask, cache=cache, **kwargs
         )
         return out
 
@@ -399,13 +450,13 @@ class Model(nn.Module):
 
         for k, v in weights.items():
             if "lora_A.vision.weight" in k:
-                weights[k] = v.swapaxes(1, 0)
+                weights[k] = v.transpose(1, 0)
             elif "lora_B.vision.weight" in k:
-                weights[k] = v.swapaxes(1, 0)
+                weights[k] = v.transpose(1, 0)
             elif "lora_A.speech.weight" in k:
-                weights[k] = v.swapaxes(1, 0)
+                weights[k] = v.transpose(1, 0)
             elif "lora_B.speech.weight" in k:
-                weights[k] = v.swapaxes(1, 0)
+                weights[k] = v.transpose(1, 0)
             else:
                 weights[k] = v
 

@@ -3,7 +3,7 @@ import inspect
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -24,6 +24,7 @@ class ModelConfig:
     vision_feature_select_strategy: str = "full"
     vision_feature_layer: int = -1
     vocab_size: int = 32000
+    eos_token_id: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, params):
@@ -68,6 +69,7 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        **kwargs,
     ):
         if pixel_values is None:
             return self.language_model.model.embed_tokens(input_ids)
@@ -97,15 +99,15 @@ class Model(nn.Module):
         image_features = self.multi_modal_projector(selected_image_feature)
 
         # Insert special image tokens in the input_ids
-        final_inputs_embeds = self._merge_input_ids_with_image_features(
-            image_features, inputs_embeds, input_ids
+        final_inputs_embeds = self.merge_input_ids_with_image_features(
+            self.config.image_token_index, image_features, inputs_embeds, input_ids
         )
         return final_inputs_embeds
 
-    def _merge_input_ids_with_image_features(
-        self, image_features, inputs_embeds, input_ids
+    @staticmethod
+    def merge_input_ids_with_image_features(
+        image_token_index, image_features, inputs_embeds, input_ids
     ):
-        image_token_index = self.config.image_token_index
         num_images, num_image_patches, embed_dim = image_features.shape
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
@@ -135,7 +137,7 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        input_embddings = self.get_input_embeddings(input_ids, pixel_values)
+        input_embddings = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
         logits = self.language_model(
             input_ids, cache=cache, inputs_embeds=input_embddings
         )

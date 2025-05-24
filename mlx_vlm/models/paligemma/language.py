@@ -5,7 +5,8 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import KVCache, LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache
 
 
 @dataclass
@@ -24,6 +25,7 @@ class TextConfig:
     attn_logit_softcapping: Optional[float] = None
     final_logit_softcapping: Optional[float] = None
     query_pre_attn_scalar: Optional[float] = None
+    max_position_embeddings: int = 4096
 
     @classmethod
     def from_dict(cls, params):
@@ -119,7 +121,7 @@ class Attention(nn.Module):
             scores = mx.tanh(scores / self.attn_logit_softcapping)
             scores *= self.attn_logit_softcapping
 
-            if mask is not None:
+            if mask is not None and isinstance(mask, mx.array):
                 scores = scores + mask
             scores = mx.softmax(scores, precise=True, axis=-1)
             output = scores @ values
@@ -202,9 +204,9 @@ class GemmaModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
-        inputs_embeds=None,
+        inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
+        cache=None,
     ):
         # for passing merged input embeddings
         if inputs_embeds is None:
@@ -213,11 +215,12 @@ class GemmaModel(nn.Module):
             h = inputs_embeds
 
         h *= self.config.hidden_size**0.5
-        if mask is None or cache[0].offset > 0:
-            mask = create_attention_mask(h)
 
         if cache is None:
             cache = [None] * len(self.layers)
+
+        if mask is None or cache[0].offset > 0:
+            mask = create_attention_mask(h, cache, return_array=True)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -241,11 +244,11 @@ class LanguageModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
-        inputs_embeds=None,
+        inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
+        cache=None,
     ):
-        out = self.model(inputs, cache, inputs_embeds=inputs_embeds, mask=mask)
+        out = self.model(inputs, mask=mask, cache=cache, inputs_embeds=inputs_embeds)
         out = self.model.embed_tokens.as_linear(out)
 
         if self.model_type == "gemma2":

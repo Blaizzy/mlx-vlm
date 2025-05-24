@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
-from .lora import LoRaLayer
+from .lora import LoraAdapter, LoRaLayer
 
 
 def get_module_by_name(model, name):
@@ -35,18 +35,33 @@ def set_module_by_name(model, name, new_module):
             # Keep existing LoRA layer and add new one
             existing_lora = module[int(parts[-1])]
             if hasattr(new_module, "lora_name"):
-                # Add new named LoRA
+                # Add new named LoRA to existing layer
+                if not hasattr(existing_lora, "lora_A"):
+                    existing_lora.lora_A = nn.Module()
+                    existing_lora.lora_B = nn.Module()
+
+                # Get the adapter weight from the new module
+                adapter_name = new_module.lora_name
+                a_weight = getattr(new_module.lora_A, adapter_name).weight
+                b_weight = getattr(new_module.lora_B, adapter_name).weight
+
+                # Set up the same nested structure in the existing module
                 setattr(
-                    existing_lora,
-                    f"lora_A.{new_module.lora_name}.weight",
-                    getattr(new_module, f"lora_A.{new_module.lora_name}.weight"),
+                    existing_lora.lora_A,
+                    adapter_name,
+                    LoraAdapter(a_weight.shape[0], a_weight.shape[1], None),
                 )
                 setattr(
-                    existing_lora,
-                    f"lora_B.{new_module.lora_name}.weight",
-                    getattr(new_module, f"lora_B.{new_module.lora_name}.weight"),
+                    existing_lora.lora_B,
+                    adapter_name,
+                    LoraAdapter(b_weight.shape[0], b_weight.shape[1], None),
                 )
-                existing_lora.lora_name = new_module.lora_name
+
+                # Copy the weights
+                getattr(existing_lora.lora_A, adapter_name).weight = a_weight
+                getattr(existing_lora.lora_B, adapter_name).weight = b_weight
+
+                existing_lora.lora_name = adapter_name
             else:
                 # Add unnamed LoRA
                 existing_lora.A = new_module.A
@@ -58,18 +73,33 @@ def set_module_by_name(model, name, new_module):
             # Keep existing LoRA layer and add new one
             existing_lora = getattr(module, parts[-1])
             if hasattr(new_module, "lora_name"):
-                # Add new named LoRA
+                # Add new named LoRA to existing layer
+                if not hasattr(existing_lora, "lora_A"):
+                    existing_lora.lora_A = nn.Module()
+                    existing_lora.lora_B = nn.Module()
+
+                # Get the adapter weight from the new module
+                adapter_name = new_module.lora_name
+                a_weight = getattr(new_module.lora_A, adapter_name).weight
+                b_weight = getattr(new_module.lora_B, adapter_name).weight
+
+                # Set up the same nested structure in the existing module
                 setattr(
-                    existing_lora,
-                    f"lora_A.{new_module.lora_name}.weight",
-                    getattr(new_module, f"lora_A.{new_module.lora_name}.weight"),
+                    existing_lora.lora_A,
+                    adapter_name,
+                    LoraAdapter(a_weight.shape[0], a_weight.shape[1], None),
                 )
                 setattr(
-                    existing_lora,
-                    f"lora_B.{new_module.lora_name}.weight",
-                    getattr(new_module, f"lora_B.{new_module.lora_name}.weight"),
+                    existing_lora.lora_B,
+                    adapter_name,
+                    LoraAdapter(b_weight.shape[0], b_weight.shape[1], None),
                 )
-                existing_lora.lora_name = new_module.lora_name
+
+                # Copy the weights
+                getattr(existing_lora.lora_A, adapter_name).weight = a_weight
+                getattr(existing_lora.lora_B, adapter_name).weight = b_weight
+
+                existing_lora.lora_name = adapter_name
             else:
                 # Add unnamed LoRA
                 existing_lora.A = new_module.A

@@ -6,7 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import KVCache, LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache
 
 
 @dataclass
@@ -92,7 +93,7 @@ class Attention(nn.Module):
 
         offset = cache.offset if cache else 0
 
-        if mask is not None:
+        if mask is not None and isinstance(mask, mx.array):
             mask = mask[..., : keys.shape[-2]]
 
         queries = self.rotary_emb(queries, offset=offset)
@@ -161,18 +162,20 @@ class Qwen2Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
         inputs_embeds: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
+        cache=None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
         else:
             h = inputs_embeds
 
-        mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        if mask is None:
+            mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -196,11 +199,11 @@ class LanguageModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
+        cache=None,
     ):
-        out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+        out = self.model(inputs, mask=mask, cache=cache, inputs_embeds=inputs_embeds)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:

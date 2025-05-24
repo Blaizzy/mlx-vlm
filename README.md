@@ -29,7 +29,7 @@ pip install mlx-vlm
 Generate output from a model using the CLI:
 
 ```sh
-python -m mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --temp 0.0 --image http://images.cocodataset.org/val2017/000000039769.jpg
+python -m mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --temperature 0.0 --image http://images.cocodataset.org/val2017/000000039769.jpg
 ```
 
 ### Chat UI with Gradio
@@ -57,6 +57,7 @@ config = load_config(model_path)
 
 # Prepare input
 image = ["http://images.cocodataset.org/val2017/000000039769.jpg"]
+# image = [Image.open("...")] can also be used with PIL.Image.Image objects
 prompt = "Describe this image."
 
 # Apply chat template
@@ -68,6 +69,29 @@ formatted_prompt = apply_chat_template(
 output = generate(model, processor, formatted_prompt, image, verbose=False)
 print(output)
 ```
+
+### Server (FastAPI)
+To start the server
+```sh
+python -m mlx_vlm.server
+```
+
+Models can be loaded or unloaded dynamically and they are cached (one at a time) when the server is running.
+
+Usage example:
+```sh
+curl -X POST "http://localhost:8000/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen2.5-VL-32B-Instruct-8bit",
+    "image": ["/path/to/repo/examples/images/renewables_california.png"],
+    "prompt": "This is today'\''s chart for energy demand in California. Can you provide an analysis of the chart and comment on the implications for renewable energy in California?",
+    "system": "You are a helpful assistant.",
+    "stream": true,
+    "max_tokens": 1000
+  }'
+```
+
 
 ## Multi-Image Chat Support
 

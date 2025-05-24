@@ -4,9 +4,9 @@ from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache, RotatingKVCache
 
 
 @dataclass
@@ -26,6 +26,7 @@ class TextConfig:
     layer_norm_bias: bool = False
     sliding_window: int = 4096
     sliding_window_pattern: int = 4
+    max_position_embeddings: int = 4096
 
     @classmethod
     def from_dict(cls, params):
@@ -92,7 +93,7 @@ class Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
-        if self.use_sliding_window and mask is not None:
+        if self.use_sliding_window and mask is not None and isinstance(mask, mx.array):
             key_len = keys.shape[-2]
             if mask.shape[-1] != key_len:
                 mask = mask[..., -key_len:]
@@ -172,8 +173,9 @@ class CohereModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        j = self.config.sliding_window_pattern
-        mask = create_attention_mask(h, cache[j - 1 : j])
+        if mask is None:
+            j = self.config.sliding_window_pattern
+            mask = create_attention_mask(h, cache[j - 1 : j])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)

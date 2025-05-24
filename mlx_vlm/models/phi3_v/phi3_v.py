@@ -2,13 +2,14 @@ import inspect
 import math
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import KVCache, LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache
 from .language import LanguageModel, TextConfig
 from .su_rope import Phi3SuScaledRotaryEmbedding
 from .vision import VisionConfig, VisionModel
@@ -37,6 +38,7 @@ class ModelConfig:
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     max_position_embeddings: int = 131072
     original_max_position_embeddings: int = 4096
+    eos_token_id: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, params):
@@ -176,6 +178,7 @@ class Phi3V(nn.Module):
         inputs: mx.array,
         pixel_values=None,
         image_sizes=None,
+        mask: Optional[mx.array] = None,
         cache=None,
     ):
         h = self.embed_tokens(inputs)
@@ -184,10 +187,11 @@ class Phi3V(nn.Module):
         if pixel_values is not None:
             h = self.vision_embed_tokens(pixel_values, h, image_sizes, p)
 
-        mask = create_attention_mask(h)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        if mask is None:
+            mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -212,8 +216,10 @@ class Model(nn.Module):
         image_sizes=None,
         **kwargs,
     ):
-        out = self.model(inputs, pixel_values, image_sizes, cache)
-        logits = self.lm_head(out).astype(self.lm_head.weight.dtype)
+        out = self.model(inputs, pixel_values, image_sizes, mask=mask, cache=cache)
+        logits = self.lm_head(out)
+        if self.lm_head.weight.dtype in [mx.float16, mx.bfloat16, mx.float32]:
+            logits = logits.astype(self.lm_head.weight.dtype)
         return LanguageModelOutput(logits=logits)
 
     @property

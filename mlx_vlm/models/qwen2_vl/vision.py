@@ -5,33 +5,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-
-@dataclass
-class VisionConfig:
-    model_type: str = "qwen2_vl"
-    depth: int = 32
-    embed_dim: int = 1280
-    hidden_size: int = 1536
-    num_heads: int = 16
-    image_size: int = 384
-    patch_size: int = 14
-    vocab_size: int = 32000
-    mlp_ratio: float = 4.0
-    in_channels: int = 3
-    layer_norm_eps: float = 1e-6
-    spatial_patch_size: int = 14
-    spatial_merge_size: int = 2
-    temporal_patch_size: int = 2
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import VisionConfig
 
 
 def check_array_shape(arr):
@@ -271,7 +245,7 @@ class VisionModel(nn.Module):
             wpos_ids = wpos_ids.flatten()
 
             stacked_pos_ids = mx.stack([hpos_ids, wpos_ids], axis=-1)
-            pos_ids.append(mx.repeat(stacked_pos_ids, t, axis=0))
+            pos_ids.append(mx.tile(stacked_pos_ids, (t, 1)))
 
         pos_ids = mx.concatenate(pos_ids, axis=0)
         max_grid_size = mx.max(grid_thw[:, 1:])
