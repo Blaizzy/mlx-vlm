@@ -188,12 +188,52 @@ class VisionEmbeddings(nn.Module):
         self.num_positions = self.num_patches
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
+        B, H, W, _ = x.shape
         patch_embeddings = self.patch_embedding(x)
         patch_embeddings = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
-        position_ids = mx.array(mx.arange(self.num_positions)[None, :])
+
+        if mask is None:
+            mask = mx.ones(
+                (
+                    B,
+                    H // self.patch_size,
+                    W // self.patch_size,
+                ),
+                dtype=mx.bool_,
+            )
+
+        max_nb_patches_h, max_nb_patches_w = (
+            H // self.patch_size,
+            W // self.patch_size,
+        )
+        boundaries = np.linspace(
+            1 / self.num_patches, 1.0, self.num_patches, endpoint=False
+        )
+        position_ids = np.zeros((B, max_nb_patches_h * max_nb_patches_w), dtype=int)
+
+        for batch_idx, p_attn_mask in enumerate(mask):
+            p_attn_mask = np.array(p_attn_mask)
+            nb_patches_h = p_attn_mask[:, 0].sum()
+            nb_patches_w = p_attn_mask[0, :].sum()
+
+            fractional_coords_h = np.linspace(0, 1, nb_patches_h, endpoint=False)
+            fractional_coords_w = np.linspace(0, 1, nb_patches_w, endpoint=False)
+
+            bucket_coords_h = (
+                np.digitize(fractional_coords_h, boundaries, right=True) - 1
+            )
+            bucket_coords_w = (
+                np.digitize(fractional_coords_w, boundaries, right=True) - 1
+            )
+
+            pos_ids = (
+                bucket_coords_h[:, None] * self.num_patches + bucket_coords_w
+            ).flatten()
+            position_ids[batch_idx][p_attn_mask.reshape(-1)] = pos_ids
+
         embeddings = patch_embeddings
-        embeddings += self.position_embedding(position_ids)
+        embeddings += self.position_embedding(mx.array(position_ids))
         return embeddings
 
 
@@ -299,9 +339,10 @@ class SigLIPVisionModel(nn.Module):
     def __call__(
         self,
         x: mx.array,
+        patch_attention_mask: Optional[mx.array] = None,
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
-        x = self.embeddings(x)
+        x = self.embeddings(x, mask=patch_attention_mask)
         x = x.astype(self.embeddings.patch_embedding.weight.dtype)
         encoder_outputs = self.encoder(
             x=x, output_hidden_states=output_hidden_states, mask=None
@@ -445,12 +486,12 @@ class VisionModel(nn.Module):
 
         # Process the image through the image processor
         if self.freeze_img_processor:
-            # In MLX, we'd need to use a mechanism to stop gradient flow
             if attention_mask is not None:
                 img_processor_output = self.img_processor(
                     img_embeds,
-                    output_hidden_states=True,
                     patch_attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    # patch_attention_mask=attention_mask,
                 )
             else:
                 img_processor_output = self.img_processor(
@@ -460,8 +501,9 @@ class VisionModel(nn.Module):
             if attention_mask is not None:
                 img_processor_output = self.img_processor(
                     img_embeds,
-                    output_hidden_states=True,
                     patch_attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    # patch_attention_mask=attention_mask,
                 )
             else:
                 img_processor_output = self.img_processor(
