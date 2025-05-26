@@ -267,21 +267,20 @@ class SigLipMultiheadAttentionPoolingHead(nn.Module):
         return x[:, 0]
 
 
+import torch
+
+
 class ReflectionPad2d(nn.Module):
     def __init__(self, padding):
         super().__init__()
         self.padding = padding
 
+        self.reflection_pad = torch.nn.ReflectionPad2d(padding)
+
     def __call__(self, x):
-        return mx.pad(
-            x,
-            (
-                (0, 0),
-                (0, 0),
-                (self.padding[0], self.padding[1]),
-                (self.padding[0], self.padding[1]),
-            ),
-        )
+        x = torch.from_dlpack(x)
+        result = self.reflection_pad(x)
+        return mx.array(result)
 
 
 class SigLIPVisionModel(nn.Module):
@@ -344,6 +343,7 @@ class VisionModel(nn.Module):
 
         if H % 2 != 0:
             self.img_processor_padding = ReflectionPad2d((0, 1, 0, 1))
+
             H += 1
 
         image_dim_out = D
@@ -474,116 +474,56 @@ class VisionModel(nn.Module):
             patch_feature = img_feature
 
             if self.image_token_compression is not None:
-                # Reshape to 2D tensor for pooling
+                # reshape to 2D tensor
                 width = int(math.sqrt(patch_feature.shape[1]))
-                patch_feature = mx.reshape(
-                    patch_feature, (-1, width, width, patch_feature.shape[-1])
+                patch_feature = patch_feature.reshape(
+                    -1, width, width, patch_feature.shape[-1]
                 )
-
-                # Convert to NCHW
-                patch_feature = mx.transpose(patch_feature, (0, 3, 1, 2))
-
-                # Apply padding if needed
+                # convert to NCHW
+                patch_feature = patch_feature.transpose(0, 3, 1, 2)
                 if getattr(self, "img_processor_padding", None) is not None:
-                    # Simplified padding with zeros
-                    patch_feature = mx.pad(
-                        patch_feature, ((0, 0), (0, 0), (0, 1), (0, 1))
-                    )
+                    patch_feature = self.img_processor_padding(patch_feature)
 
-                # Apply pooling (simple average pooling as placeholder)
-                patch_feature = mx.mean(
-                    mx.reshape(
-                        patch_feature,
-                        (
-                            patch_feature.shape[0],
-                            patch_feature.shape[1],
-                            patch_feature.shape[2] // 2,
-                            2,
-                            patch_feature.shape[3] // 2,
-                            2,
-                        ),
-                    ),
-                    axis=(3, 5),
+                patch_feature = self.image_token_compression(
+                    patch_feature.transpose(0, 2, 3, 1)
                 )
-
-                # Convert back to NHWC
-                patch_feature = mx.transpose(patch_feature, (0, 2, 3, 1))
-
-                # Reshape back to sequence
-                patch_feature = mx.reshape(
-                    patch_feature,
-                    (
-                        -1,
-                        patch_feature.shape[1] * patch_feature.shape[2],
-                        patch_feature.shape[3],
-                    ),
+                # convert to NHWC
+                patch_feature = patch_feature.reshape(
+                    -1,
+                    patch_feature.shape[1] * patch_feature.shape[2],
+                    patch_feature.shape[-1],
                 )
-
             elif getattr(self, "img_processor_padding", None) is not None:
-                # Handle padding without compression
                 width = int(math.sqrt(patch_feature.shape[1]))
-                patch_feature = mx.reshape(
-                    patch_feature, (-1, width, width, patch_feature.shape[-1])
+                patch_feature = patch_feature.reshape(
+                    -1, width, width, patch_feature.shape[-1]
                 )
-
-                # Convert to NCHW
-                patch_feature = mx.transpose(patch_feature, (0, 3, 1, 2))
-
-                # Apply padding
-                patch_feature = mx.pad(patch_feature, ((0, 0), (0, 0), (0, 1), (0, 1)))
-
-                # Convert back to NHWC
-                patch_feature = mx.transpose(patch_feature, (0, 2, 3, 1))
-
-                # Reshape back to sequence
-                patch_feature = mx.reshape(
-                    patch_feature,
-                    (
-                        -1,
-                        patch_feature.shape[1] * patch_feature.shape[2],
-                        patch_feature.shape[3],
-                    ),
+                # convert to NCHW
+                patch_feature = patch_feature.transpose(0, 3, 1, 2)
+                patch_feature = self.img_processor_padding(patch_feature)
+                # convert to NHWC
+                patch_feature = patch_feature.transpose(0, 2, 3, 1)
+                patch_feature = patch_feature.reshape(
+                    -1,
+                    patch_feature.shape[1] * patch_feature.shape[2],
+                    patch_feature.shape[-1],
                 )
-
             return patch_feature
 
         elif TYPE_FEATURE == "cls_patch":
+
             if self.image_token_compression is not None:
-                # Extract cls token and patches
+                # reshape to 2D tensor
                 patch_feature = img_feature[:, 1:]
-                cls_feature = img_feature[:, 0:1]
-
-                # Reshape patches for compression
-                width = int(math.sqrt(patch_feature.shape[1]))
-                patch_feature = mx.reshape(
-                    patch_feature, (-1, width, width, patch_feature.shape[-1])
+                cls_feature = img_feature[:, 0]
+                width = math.sqrt(patch_feature.shape[1])
+                patch_feature = patch_feature.reshape(
+                    -1, width, width, patch_feature.shape[-1]
                 )
-
-                # Apply pooling (simplified)
-                patch_feature = mx.reshape(
-                    patch_feature,
-                    (
-                        -1,
-                        patch_feature.shape[1] // 2,
-                        2,
-                        patch_feature.shape[2] // 2,
-                        2,
-                        patch_feature.shape[3],
-                    ),
+                patch_feature = self.image_token_compression(patch_feature)
+                patch_feature = patch_feature.reshape(
+                    -1, patch_feature.shape[-2] * patch_feature.shape[-1]
                 )
-                patch_feature = mx.mean(patch_feature, axis=(2, 4))
-
-                # Flatten back to sequence
-                patch_feature = mx.reshape(
-                    patch_feature,
-                    (
-                        -1,
-                        patch_feature.shape[1] * patch_feature.shape[2],
-                        patch_feature.shape[3],
-                    ),
-                )
-
-                # Combine with cls token
                 img_feature = mx.concatenate([cls_feature, patch_feature], axis=1)
 
             return img_feature
@@ -651,6 +591,7 @@ class VisionModel(nn.Module):
 
                 # Process image features
                 if image_attention_mask is not None and len(image_attention_mask) > 0:
+
                     img_features = self.get_img_features(
                         mx.reshape(img_embeds, (-1,) + img_embeds.shape[2:]),
                         attention_mask=mx.reshape(
@@ -659,9 +600,12 @@ class VisionModel(nn.Module):
                         ),
                     )
                 else:
+                    print("No attention mask")
                     img_features = self.get_img_features(
                         mx.reshape(img_embeds, (-1,) + img_embeds.shape[2:])
                     )
+
+                print("img_features", img_features.shape)
 
                 # HD transform parameters
                 base_feat_height_target = self.base_feat_height_target
@@ -672,6 +616,7 @@ class VisionModel(nn.Module):
                 base_feat_height = base_feat_width = int(
                     math.sqrt(img_features.shape[1])
                 )
+
                 assert (
                     base_feat_height == base_feat_height_target
                     and base_feat_width == base_feat_height_target
@@ -915,7 +860,7 @@ class VisionModel(nn.Module):
             if True:  # Equivalent to self.training in PyTorch
                 # Create a dummy image embedding
                 img_embeds = mx.zeros(
-                    (1, 3, self.crop_size, self.crop_size), dtype=target_dtype
+                    (1, self.crop_size, self.crop_size, 3), dtype=target_dtype
                 )
 
                 # Process the dummy embedding
@@ -923,7 +868,7 @@ class VisionModel(nn.Module):
 
                 # Apply projection
                 if self.use_hd_transform:
-                    img_set_tensor = self.img_projection(
+                    h = (
                         mx.reshape(
                             tt,
                             (
@@ -934,6 +879,10 @@ class VisionModel(nn.Module):
                         * self.glb_GN[0]
                         * self.sub_GN[0, 0]
                     )
+
+                    for img_proj in self.img_projection:
+                        h = img_proj(h)
+                    img_set_tensor = h
                 else:
                     img_set_tensor = self.img_projection(tt)
 

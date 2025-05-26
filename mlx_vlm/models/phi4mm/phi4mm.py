@@ -294,7 +294,7 @@ class Phi4Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        input_mode = kwargs.pop("input_mode", 0)
+        input_mode = kwargs.get("input_mode", 0)
         if isinstance(input_mode, mx.array):
             assert len(input_mode) == 1
             input_mode = input_mode[0].item()
@@ -318,20 +318,17 @@ class Phi4Model(nn.Module):
             h = self.embed_tokens_extend(
                 input_ids=input_ids,
                 input_embeds=None,
-                input_image_embeds=kwargs.pop(
+                input_image_embeds=kwargs.get(
                     "input_image_embeds", pixel_values.transpose(0, 1, 3, 4, 2)
                 ),
-                input_audio_embeds=kwargs.pop("input_audio_embeds", None),
-                image_sizes=kwargs.pop("image_sizes", None),
-                image_attention_mask=kwargs.pop("image_attention_mask", None),
-                audio_embed_sizes=kwargs.pop("audio_embed_sizes", None),
-                audio_attention_mask=kwargs.pop("audio_attention_mask", None),
+                input_audio_embeds=kwargs.get("input_audio_embeds", None),
+                image_sizes=kwargs.get("image_sizes", None),
+                image_attention_mask=kwargs.get("image_attention_mask", None),
+                audio_embed_sizes=kwargs.get("audio_embed_sizes", None),
+                audio_attention_mask=kwargs.get("audio_attention_mask", None),
                 audio_projection_mode=audio_projection_mode,
                 wte=self.embed_tokens,
             )
-        elif input_embeds is None and pixel_values is None:
-            h = self.embed_tokens(input_ids)
-            h = pad_embeddings(h, self.config.pad_token_id)
         else:
             h = input_embeds
 

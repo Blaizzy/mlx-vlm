@@ -125,6 +125,7 @@ class Phi4MMImageAudioEmbedding(nn.Module):
 
         # Reshape input ids if necessary
         input_shape = input_ids.shape
+        input_ids = input_ids.astype(mx.int64)
         input_ids = mx.reshape(input_ids, (-1, input_shape[-1]))
 
         # Handle backward compatibility for special token IDs
@@ -159,6 +160,7 @@ class Phi4MMImageAudioEmbedding(nn.Module):
 
         # Process image and audio embeddings
         if input_image_embeds is not None:
+
             image_hidden_states = self.image_embed(
                 input_ids=input_ids,
                 input_embeds=input_image_embeds,
