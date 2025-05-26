@@ -270,10 +270,63 @@ class SigLipMultiheadAttentionPoolingHead(nn.Module):
 class ReflectionPad2d(nn.Module):
     def __init__(self, padding):
         super().__init__()
-        self.padding = padding
+        if isinstance(padding, int):
+            self.padding = (padding, padding, padding, padding)
+        elif len(padding) == 2:
+            self.padding = (padding[0], padding[0], padding[1], padding[1])
+        elif len(padding) == 4:
+            self.padding = padding
+        else:
+            raise ValueError("Padding must be int, tuple of 2 ints, or tuple of 4 ints")
 
     def __call__(self, x):
-        return mx.pad(x, ((0, 0), (0, 0), (0, 1), (0, 1)))
+        # x shape: (batch, height, width, channels) in MLX
+        # padding format: (left, right, top, bottom)
+        left, right, top, bottom = self.padding
+
+        # Get dimensions
+        batch, height, width, channels = x.shape
+
+        # Create padded tensor
+        padded_height = height + top + bottom
+        padded_width = width + left + right
+
+        # Initialize padded array
+        padded = mx.zeros((batch, padded_height, padded_width, channels), dtype=x.dtype)
+
+        # Copy original data to center
+        padded = padded.at[:, top : top + height, left : left + width, :].set(x)
+
+        # Apply reflection padding
+        # Top reflection
+        if top > 0:
+            for i in range(top):
+                padded = padded.at[:, top - 1 - i, left : left + width, :].set(
+                    padded[:, top + 1 + i, left : left + width, :]
+                )
+
+        # Bottom reflection
+        if bottom > 0:
+            for i in range(bottom):
+                padded = padded.at[:, top + height + i, left : left + width, :].set(
+                    padded[:, top + height - 2 - i, left : left + width, :]
+                )
+
+        # Left reflection
+        if left > 0:
+            for i in range(left):
+                padded = padded.at[:, :, left - 1 - i, :].set(
+                    padded[:, :, left + 1 + i, :]
+                )
+
+        # Right reflection
+        if right > 0:
+            for i in range(right):
+                padded = padded.at[:, :, left + width + i, :].set(
+                    padded[:, :, left + width - 2 - i, :]
+                )
+
+        return padded
 
 
 class SigLIPVisionModel(nn.Module):
@@ -559,7 +612,6 @@ class VisionModel(nn.Module):
 
         # Find positions of image tokens
         positions = np.nonzero(input_ids == _IMAGE_SPECIAL_TOKEN_ID)
-        # print("positions", positions[0].shape, positions[1].shape)
 
         # Default values for fake image forward and selection
         fake_image_forward = False
@@ -568,9 +620,9 @@ class VisionModel(nn.Module):
 
         # Get target device and dtype from projection layer
         if isinstance(self.img_projection, list):  # nn.Sequential in MLX
-            target_dtype = mx.float32  # Default dtype
+            target_dtype = self.img_projection[-1].weight.dtype
         else:  # Single linear layer
-            target_dtype = mx.float32
+            target_dtype = self.img_projection[-1].weight.dtype
 
         num_img_tokens = self.num_img_tokens
         if len(positions) > 0:
@@ -594,7 +646,6 @@ class VisionModel(nn.Module):
                         ),
                     )
                 else:
-                    print("No attention mask")
                     img_features = self.get_img_features(
                         mx.reshape(img_embeds, (-1,) + img_embeds.shape[2:])
                     )
@@ -848,37 +899,7 @@ class VisionModel(nn.Module):
                 raise NotImplementedError("Only HD transform is implemented")
             select = True
         else:
-            # Create a fake image tensor for training
-            if True:  # Equivalent to self.training in PyTorch
-                # Create a dummy image embedding
-                img_embeds = mx.zeros(
-                    (1, self.crop_size, self.crop_size, 3), dtype=target_dtype
-                )
-
-                # Process the dummy embedding
-                tt = mx.reshape(self.get_img_features(img_embeds), (-1, 1024))
-
-                # Apply projection
-                if self.use_hd_transform:
-                    h = (
-                        mx.reshape(
-                            tt,
-                            (
-                                -1,
-                                self.image_dim_out * self.base_feat_height_reduction**2,
-                            ),
-                        )
-                        * self.glb_GN[0]
-                        * self.sub_GN[0, 0]
-                    )
-
-                    for img_proj in self.img_projection:
-                        h = img_proj(h)
-                    img_set_tensor = h
-                else:
-                    img_set_tensor = self.img_projection(tt)
-
-                fake_image_forward = True
+            raise NotImplementedError("Only HD transform is implemented")
 
         # Get token embeddings from word embedding table
         hidden_states = kwargs["wte"](input_ids)
@@ -915,15 +936,6 @@ class VisionModel(nn.Module):
                 hidden_states = new_hidden_states
             else:
                 raise NotImplementedError("Only HD transform is implemented")
-
-        # Add the fake image contribution for training stability
-        if fake_image_forward and True:  # Equivalent to self.training
-            # Adding a small contribution that will be zero but maintains gradient flow
-            hidden_states = hidden_states + (0 * img_set_tensor[0]).sum()
-
-        # Apply dropout if needed
-        if self.drop is not None and True:  # Equivalent to self.training
-            hidden_states = nn.Dropout(self.embd_drop)(hidden_states)
 
         return hidden_states
 
