@@ -137,6 +137,7 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
                     "*.model",
                     "*.tiktoken",
                     "*.txt",
+                    "*.jinja",
                 ],
                 resume_download=True,
             )
