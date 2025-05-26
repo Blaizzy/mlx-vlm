@@ -195,6 +195,7 @@ class TransformerBlock(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
+
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
@@ -214,7 +215,7 @@ def pad_embeddings(embeddings, padding_idx):
     # Apply mask to zero out padding embeddings
     masked_embeddings = embeddings * mask
 
-    return masked_embeddings
+    return masked_embeddings.astype(embeddings.dtype)
 
 
 class Phi4Model(nn.Module):
@@ -337,7 +338,6 @@ class Phi4Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        # if mask is None:
         mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
