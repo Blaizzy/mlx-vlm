@@ -68,7 +68,8 @@ class Model(nn.Module):
         inputs_embeds[:, image_indices, :] = image_features
 
         return inputs_embeds
-
+    
+    
     def __call__(
         self,
         input_ids: mx.array,

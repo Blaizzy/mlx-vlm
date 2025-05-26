@@ -10,9 +10,9 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 
-from .language import LanguageModel, TextConfig
-from .vision import VisionConfig, VisionModel
-
+from .config import ModelConfig, TextConfig, VisionConfig
+from .language import LanguageModel
+from .vision import VisionModel
 
 @dataclass
 class ModelConfig:
@@ -52,7 +52,7 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
-        self.language_model = LanguageModel(config.text_config)
+        self.language_model = LanguageModel(config.text_config, config)
 
     def get_input_embeddings(
         self,
@@ -101,12 +101,12 @@ class Model(nn.Module):
         image_indices = np.where(image_positions)[1].tolist()
         inputs_embeds[:, image_indices, :] = image_features
         return inputs_embeds
-
+        
     def __call__(
         self,
         input_ids: mx.array,
-        pixel_values: mx.array,
-        mask: mx.array,
+        pixel_values: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
         cache=None,
         **kwargs,
     ):
@@ -115,10 +115,9 @@ class Model(nn.Module):
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         position_ids = kwargs.pop("position_ids", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
-
+        
         inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
-
-        logits = self.language_model(None, cache=cache, inputs_embeds=inputs_embeds)
+        
         return logits
 
     @staticmethod
