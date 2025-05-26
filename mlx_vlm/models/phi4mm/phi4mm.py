@@ -294,7 +294,7 @@ class Phi4Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        input_mode = kwargs.get("input_mode", 0)
+        input_mode = kwargs.pop("input_mode", 0)
         if isinstance(input_mode, mx.array):
             assert len(input_mode) == 1
             input_mode = input_mode[0].item()
@@ -328,7 +328,8 @@ class Phi4Model(nn.Module):
                 audio_attention_mask=kwargs.get("audio_attention_mask", None),
                 audio_projection_mode=audio_projection_mode,
                 wte=self.embed_tokens,
-            )
+            ).astype(self.embed_tokens.weight.dtype)
+
         else:
             h = input_embeds
 

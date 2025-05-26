@@ -160,7 +160,6 @@ class Phi4MMImageAudioEmbedding(nn.Module):
 
         # Process image and audio embeddings
         if input_image_embeds is not None:
-
             image_hidden_states = self.image_embed(
                 input_ids=input_ids,
                 input_embeds=input_image_embeds,
@@ -205,6 +204,7 @@ class Phi4MMImageAudioEmbedding(nn.Module):
         else:
             # If no special embeddings are provided, just use the word embeddings
             assert wte is not None
+
             hidden_states = wte(input_ids)
 
         return hidden_states

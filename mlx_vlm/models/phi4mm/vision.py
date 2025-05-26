@@ -267,20 +267,13 @@ class SigLipMultiheadAttentionPoolingHead(nn.Module):
         return x[:, 0]
 
 
-import torch
-
-
 class ReflectionPad2d(nn.Module):
     def __init__(self, padding):
         super().__init__()
         self.padding = padding
 
-        self.reflection_pad = torch.nn.ReflectionPad2d(padding)
-
     def __call__(self, x):
-        x = torch.from_dlpack(x)
-        result = self.reflection_pad(x)
-        return mx.array(result)
+        return mx.pad(x, ((0, 0), (0, 0), (0, 1), (0, 1)))
 
 
 class SigLIPVisionModel(nn.Module):
@@ -565,7 +558,8 @@ class VisionModel(nn.Module):
         input_ids = mx.reshape(input_ids, (-1, input_shape[-1]))
 
         # Find positions of image tokens
-        positions = mx.array(np.nonzero(input_ids == _IMAGE_SPECIAL_TOKEN_ID)[0])
+        positions = np.nonzero(input_ids == _IMAGE_SPECIAL_TOKEN_ID)
+        # print("positions", positions[0].shape, positions[1].shape)
 
         # Default values for fake image forward and selection
         fake_image_forward = False
@@ -604,8 +598,6 @@ class VisionModel(nn.Module):
                     img_features = self.get_img_features(
                         mx.reshape(img_embeds, (-1,) + img_embeds.shape[2:])
                     )
-
-                print("img_features", img_features.shape)
 
                 # HD transform parameters
                 base_feat_height_target = self.base_feat_height_target
