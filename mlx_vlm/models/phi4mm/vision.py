@@ -625,6 +625,7 @@ class VisionModel(nn.Module):
             target_dtype = self.img_projection[-1].weight.dtype
 
         num_img_tokens = self.num_img_tokens
+
         if len(positions) > 0:
             if self.use_hd_transform and img_sizes is not None and len(img_sizes) > 0:
                 hd_transform = True
@@ -639,15 +640,12 @@ class VisionModel(nn.Module):
                 if image_attention_mask is not None and len(image_attention_mask) > 0:
 
                     img_features = self.get_img_features(
-                        mx.reshape(img_embeds, (-1,) + img_embeds.shape[2:]),
-                        attention_mask=mx.reshape(
-                            image_attention_mask.astype(mx.bool_),
-                            (-1,) + image_attention_mask.shape[2:],
-                        ),
+                        img_embeds.flatten(start_axis=0, end_axis=1),
+                        attention_mask=None,
                     )
                 else:
                     img_features = self.get_img_features(
-                        mx.reshape(img_embeds, (-1,) + img_embeds.shape[2:])
+                        img_embeds.flatten(start_axis=0, end_axis=1)
                     )
 
                 # HD transform parameters
