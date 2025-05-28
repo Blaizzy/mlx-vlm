@@ -99,7 +99,7 @@ class SFTDataset:
                 self.processor,
                 images if self.image_processor else None,
                 prompts,
-                self.config["image_token_index"],
+                self.config.get("vision_token_id", "image_token_index"),
                 self.image_resize_shape,
             )
 
