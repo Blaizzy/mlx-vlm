@@ -191,8 +191,10 @@ def iterate_batches(
                     batch_dict["pixel_values"] = mx.stack(pixel_values)
                 else:
                     batch_dict["pixel_values"] = mx.array(np.stack(pixel_values))
-            else:
+            elif all(p is None for p in pixel_values):
                 batch_dict["pixel_values"] = None
+            else:
+                raise ValueError("Mixed presence of pixel_values across samples; ensure consistency.")
 
             yield batch_dict
         
@@ -290,10 +292,6 @@ def train_sft(
             # Reset the iterator
             dataset_iterator = iter(dataset_iterator)
             batch = next(dataset_iterator)
-        
-        # Process multi-modal data (if needed)
-        if "pixel_values" in batch and batch["pixel_values"] is not None:
-            pass
         
         # Training step
         lvalue, toks = step(batch)

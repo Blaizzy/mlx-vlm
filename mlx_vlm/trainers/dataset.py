@@ -97,7 +97,7 @@ class SFTDataset:
             from ..utils import prepare_inputs
             inputs = prepare_inputs(
                 self.processor,
-                images,
+                images if self.image_processor else None,
                 prompts,
                 self.config["image_token_index"],
                 self.image_resize_shape,
@@ -197,7 +197,7 @@ class GRPODataset:
 
         inputs = prepare_inputs(
             self.processor,
-            image,
+            image if self.image_processor else None,
             prompt_text,
             image_token_index=self.config.get("vision_token_id", "image_token_index"),
             resize_shape=self.image_resize_shape
@@ -321,6 +321,11 @@ def load_and_prepare_dataset(
 ):
     logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
     loaded_dataset = load_dataset(args.dataset, name=args.dataset_config, split=args.split)
+
+    if "image" not in loaded_dataset.column_names:
+        logger.info("\033[33mNo 'image' column found — assuming text-only training\033[0m")
+        image_processor = None
+        image_field = None
 
     if args.train_mode == "sft":
         logger.info(f"\033[32mPreparing and maping dataset\033[0m")
