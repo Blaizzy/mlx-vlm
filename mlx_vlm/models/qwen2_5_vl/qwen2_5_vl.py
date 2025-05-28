@@ -84,7 +84,6 @@ class Model(nn.Module):
             hidden_states,
             inputs_embeds,
             input_ids,
-            image_grid_thw,
         )
         return final_inputs_embeds
 
@@ -95,7 +94,6 @@ class Model(nn.Module):
         image_features,
         inputs_embeds,
         input_ids,
-        grid_thw=None,
     ):
         """Merge image features into input embeddings at image token positions.
 
