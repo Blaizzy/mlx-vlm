@@ -472,12 +472,6 @@ def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
                 # Add more keys here if needed later
                 other_inputs.append(oi)
 
-            if any(len(p) > max_seq_length for p in prompts_tokens):
-                print(
-                    f"[WARNING] Some prompts are longer than {max_seq_length} tokens. "
-                    "Long prompts will be truncated."
-                )
-
             yield prompts_tokens, answers_tokens, prompts_text, answers_text, types, images, prompt_masks, other_inputs
 
         if not train:

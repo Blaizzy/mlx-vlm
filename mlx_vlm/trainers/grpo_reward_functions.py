@@ -1,7 +1,39 @@
+from typing import Callable, List, Optional, Dict
 import re
-from typing import Callable, List, Optional
 
-RewardFunctions = Callable[[List[str], List[str], List[str]], List[float]]
+RewardFunctions = Callable[[List[str], List[str], List[str], Optional[List[str]]], List[float]]
+
+REWARD_REGISTRY: Dict[str, RewardFunctions] = {}
+
+def register_reward_function(name: str = None):
+    def decorator(func: RewardFunctions):
+        func_name = name or func.__name__
+        REWARD_REGISTRY[func_name] = func
+        return func
+    return decorator
+
+def get_reward_function(name: str) -> RewardFunctions:
+    if name not in REWARD_REGISTRY:
+        raise KeyError(f"Reward function '{name}' not found. Available functions: {list(REWARD_REGISTRY.keys())}")
+    return REWARD_REGISTRY[name]
+
+def get_default_reward_functions() -> List[RewardFunctions]:
+    """
+    Returns the default list of reward functions.
+    """
+    return [
+        r1_accuracy_reward_func,
+        r1_int_reward_func, 
+        r1_strict_format_reward_func,
+        r1_soft_format_reward_func,
+        r1_count_xml
+    ]
+
+def list_available_reward_functions() -> List[str]:
+    """
+    Returns a list of all available reward function names.
+    """
+    return list(REWARD_REGISTRY.keys())
 
 
 def r1_extract_xml_answer(text: str) -> str:
@@ -13,7 +45,7 @@ def r1_extract_xml_answer(text: str) -> str:
         print("r1_extract_xml_answer returned empty string")
         return ""
 
-
+@register_reward_function()
 def r1_int_reward_func(
     prompts: list, completions: list, answer: list, types: Optional[list] = None
 ) -> list[float]:
@@ -22,7 +54,7 @@ def r1_int_reward_func(
     extracted_responses = [r1_extract_xml_answer(r) for r in completions]
     return [0.5 if r and r.isdigit() else 0.0 for r in extracted_responses]
 
-
+@register_reward_function()
 def r1_accuracy_reward_func(
     prompts: list, completions: list, answer: list, types: Optional[list] = None
 ) -> list[float]:
@@ -33,7 +65,7 @@ def r1_accuracy_reward_func(
         2.0 if r and a and r == a else 0.0 for r, a in zip(extracted_responses, answer)
     ]
 
-
+@register_reward_function()
 def r1_soft_format_reward_func(
     prompts: list, completions: list, answer: list, types: Optional[list] = None
 ) -> list[float]:
@@ -66,7 +98,7 @@ def r1_soft_format_reward_func(
         scores.append(0.0)
     return scores
 
-
+@register_reward_function()
 def r1_strict_format_reward_func(
     prompts: list, completions: list, answer: list, types: Optional[list] = None
 ) -> list[float]:
@@ -76,7 +108,7 @@ def r1_strict_format_reward_func(
     matches = [bool(re.search(pattern, r)) if r else False for r in completions]
     return [0.5 if match else 0.0 for match in matches]
 
-
+@register_reward_function()
 def r1_count_xml(
     prompts: list, completions: list, answer: list, types: Optional[list] = None
 ) -> list[float]:
