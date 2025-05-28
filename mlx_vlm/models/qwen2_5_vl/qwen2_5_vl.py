@@ -113,83 +113,53 @@ class Model(nn.Module):
         if mx.sum(image_positions) == 0:
             image_positions = input_ids == video_token_id
 
-        # Get all positions where we need to insert image features
+        # Get dimensions
         batch_size, seq_len = input_ids.shape
 
-        # For batch size 1 (common case), we can do direct assignment
-        if batch_size == 1:
-            # Create a mask for image positions
-            image_mask = image_positions[0]  # Shape: [seq_len]
+        # Process each batch item
+        batch_outputs = []
+        feature_start_idx = 0
 
-            # Count image positions
+        for batch_idx in range(batch_size):
+            # Get mask for this batch
+            image_mask = image_positions[batch_idx]
             num_positions = mx.sum(image_mask).item()
-            num_features = image_features.shape[0]
 
-            if num_positions != num_features:
-                raise ValueError(
-                    f"Number of image token positions ({num_positions}) does not match "
-                    f"number of image features ({num_features})"
-                )
+            if num_positions > 0:
+                # Extract features for this batch
+                batch_features = image_features[
+                    feature_start_idx : feature_start_idx + num_positions
+                ]
 
-            # Expand masks for broadcasting
-            image_mask_expanded = mx.expand_dims(image_mask, axis=-1)  # [seq_len, 1]
-
-            # Create indices for gathering features
-            # We need to map each image position to its corresponding feature
-            cumsum = mx.cumsum(image_mask.astype(mx.int32))
-            feature_indices = mx.where(image_mask, cumsum - 1, 0)
-
-            # Gather the appropriate features for each position
-            # For non-image positions, we'll gather feature 0 but mask it out
-            gathered_features = image_features[feature_indices]  # [seq_len, hidden_dim]
-
-            # Combine original embeddings with image features using the mask
-            output_embeds = mx.where(
-                image_mask_expanded, gathered_features, inputs_embeds[0]
-            )
-
-            # Add batch dimension back
-            output_embeds = mx.expand_dims(output_embeds, axis=0)
-
-            return output_embeds
-        else:
-            # For batch size > 1, process each batch separately
-            batch_outputs = []
-            feature_start_idx = 0
-
-            for batch_idx in range(batch_size):
-                # Get mask for this batch
-                image_mask = image_positions[batch_idx]
-                num_positions = mx.sum(image_mask).item()
-
-                if num_positions > 0:
-                    # Extract features for this batch
-                    batch_features = image_features[
-                        feature_start_idx : feature_start_idx + num_positions
-                    ]
-
-                    # Create indices for gathering
-                    cumsum = mx.cumsum(image_mask.astype(mx.int32))
-                    feature_indices = mx.where(image_mask, cumsum - 1, 0)
-
-                    # Gather features
-                    gathered_features = batch_features[feature_indices]
-
-                    # Combine with original embeddings
-                    image_mask_expanded = mx.expand_dims(image_mask, axis=-1)
-                    batch_output = mx.where(
-                        image_mask_expanded, gathered_features, inputs_embeds[batch_idx]
+                # Validate we have the right number of features
+                if batch_features.shape[0] != num_positions:
+                    raise ValueError(
+                        f"Number of image token positions ({num_positions}) does not match "
+                        f"number of image features ({batch_features.shape[0]}) for batch {batch_idx}"
                     )
 
-                    feature_start_idx += num_positions
-                else:
-                    # No image tokens in this batch item
-                    batch_output = inputs_embeds[batch_idx]
+                # Create indices for gathering
+                cumsum = mx.cumsum(image_mask.astype(mx.int32))
+                feature_indices = mx.where(image_mask, cumsum - 1, 0)
 
-                batch_outputs.append(batch_output)
+                # Gather features
+                gathered_features = batch_features[feature_indices]
 
-            # Stack all batch outputs
-            return mx.stack(batch_outputs, axis=0)
+                # Combine with original embeddings
+                image_mask_expanded = mx.expand_dims(image_mask, axis=-1)
+                batch_output = mx.where(
+                    image_mask_expanded, gathered_features, inputs_embeds[batch_idx]
+                )
+
+                feature_start_idx += num_positions
+            else:
+                # No image tokens in this batch item
+                batch_output = inputs_embeds[batch_idx]
+
+            batch_outputs.append(batch_output)
+
+        # Stack all batch outputs
+        return mx.stack(batch_outputs, axis=0)
 
     def __call__(
         self,
