@@ -18,7 +18,6 @@ from .grpo_reward_functions import (
     RewardFunctions,
     r1_accuracy_reward_func,
     r1_count_xml,
-    r1_extract_xml_answer,
     r1_int_reward_func,
     r1_soft_format_reward_func,
     r1_strict_format_reward_func,
@@ -469,7 +468,6 @@ def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
                     oi["image_grid_thw"] = item["image_grid_thw"]
                 if "video_grid_thw" in item:
                     oi["video_grid_thw"] = item["video_grid_thw"]
-                # Add more keys here if needed later
                 other_inputs.append(oi)
 
             yield prompts_tokens, answers_tokens, prompts_text, answers_text, types, images, prompt_masks, other_inputs
