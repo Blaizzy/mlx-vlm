@@ -137,6 +137,7 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
                     "*.model",
                     "*.tiktoken",
                     "*.txt",
+                    "*.jinja",
                 ],
                 resume_download=True,
             )
@@ -835,9 +836,7 @@ def process_inputs_with_fallback(processor, images, prompts, return_tensors="mlx
             )
             inputs = process_inputs(processor, images, prompts, return_tensors="pt")
         except Exception as e:
-            raise ValueError(
-                f"Failed to process inputs with error: {e}. Please install PyTorch and try again."
-            )
+            raise ValueError(f"Failed to process inputs with error: {e}")
     return inputs
 
 
