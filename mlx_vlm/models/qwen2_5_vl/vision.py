@@ -6,6 +6,7 @@ import numpy as np
 
 from .config import VisionConfig
 
+
 def check_array_shape(arr):
     shape = arr.shape
 

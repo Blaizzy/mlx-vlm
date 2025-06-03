@@ -1,5 +1,5 @@
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 
@@ -34,6 +34,7 @@ class VisionConfig:
                 if k in inspect.signature(cls).parameters
             }
         )
+
 
 @dataclass
 class TextConfig:
@@ -73,6 +74,7 @@ class TextConfig:
             }
         )
 
+
 @dataclass
 class ModelConfig:
     text_config: TextConfig
@@ -104,4 +106,3 @@ class ModelConfig:
                 if k in inspect.signature(cls).parameters
             }
         )
-
