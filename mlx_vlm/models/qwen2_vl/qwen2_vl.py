@@ -47,13 +47,23 @@ class Model(nn.Module):
         # Don't add extra batch dimension
 
         # Insert special image tokens in the input_ids
-        final_inputs_embeds = self._merge_input_ids_with_image_features(
-            hidden_states, inputs_embeds, input_ids
+        final_inputs_embeds = self.merge_input_ids_with_image_features(
+            self.config.image_token_id,
+            self.config.video_token_id,
+            hidden_states,
+            inputs_embeds,
+            input_ids,
         )
         return final_inputs_embeds
 
-    def _merge_input_ids_with_image_features(
-        self, image_features, inputs_embeds, input_ids
+    @staticmethod
+    def merge_input_ids_with_image_features(
+        self,
+        image_token_id,
+        video_token_id,
+        image_features,
+        inputs_embeds,
+        input_ids,
     ):
         """Merge image features into input embeddings at image token positions.
 
@@ -65,8 +75,8 @@ class Model(nn.Module):
         Returns:
             Updated input embeddings with image features inserted
         """
-        image_token_index = self.config.image_token_index
-        video_token_index = self.config.video_token_index
+        image_token_index = self.config.image_token_id
+        video_token_index = self.config.video_token_id
 
         # Positions of <image> tokens in input_ids
         image_positions = input_ids == image_token_index

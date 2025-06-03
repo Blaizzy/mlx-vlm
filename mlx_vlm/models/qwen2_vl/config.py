@@ -79,8 +79,8 @@ class ModelConfig:
     vision_config: VisionConfig
     model_type: str
     ignore_index: int = -100
-    image_token_index: int = 151655
-    video_token_index: int = 151656
+    image_token_id: int = 151655
+    video_token_id: int = 151656
     vision_start_token_id: int = 151652
     vision_feature_select_strategy: str = "default"
     vision_feature_layer: int = -2
