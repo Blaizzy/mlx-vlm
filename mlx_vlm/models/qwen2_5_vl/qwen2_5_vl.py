@@ -171,12 +171,21 @@ class Model(nn.Module):
         **kwargs,
     ):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
-        second_per_grid_ts = kwargs.pop("second_per_grid_ts", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
-        position_ids = kwargs.pop("position_ids", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
+
+        kwargs = {
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "video_grid_thw": video_grid_thw,
+            **kwargs,
+        }
+
+        logits = self.language_model(
+            input_ids, inputs_embeds, mask=mask, cache=cache, **kwargs
+        )
 
         return logits
 
