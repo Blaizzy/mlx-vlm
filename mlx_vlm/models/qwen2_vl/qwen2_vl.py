@@ -58,7 +58,6 @@ class Model(nn.Module):
 
     @staticmethod
     def merge_input_ids_with_image_features(
-        self,
         image_token_id,
         video_token_id,
         image_features,
@@ -75,13 +74,11 @@ class Model(nn.Module):
         Returns:
             Updated input embeddings with image features inserted
         """
-        image_token_index = self.config.image_token_id
-        video_token_index = self.config.video_token_id
 
         # Positions of <image> tokens in input_ids
-        image_positions = input_ids == image_token_index
+        image_positions = input_ids == image_token_id
         if mx.sum(image_positions) == 0:
-            image_positions = input_ids == video_token_index
+            image_positions = input_ids == video_token_id
 
         # Get dimensions
         batch_size, seq_len = input_ids.shape
