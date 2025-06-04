@@ -2,7 +2,7 @@ from functools import partial
 
 
 def get_message_json(
-    model_name, prompt, role="user", skip_image_token=False, num_images=1, **kwargs
+    model_name, prompt, role="user", skip_image_token=False, skip_audio_token=False, num_images=1, num_audios=1, **kwargs
 ):
     """
     Get the appropriate JSON message based on the specified model.
@@ -26,6 +26,10 @@ def get_message_json(
     def create_text_content_message(text):
         return {"type": "text", "content": text}
 
+    def create_message(message_type, content):
+        if message_type == "content": return create_text_content_message(content)
+        else: return create_text_message(content)
+
     def create_video_message(video_path, max_pixels=224 * 224, fps=1):
         return {
             "type": "video",
@@ -42,10 +46,12 @@ def get_message_json(
             content = image_tokens + content if image_first else content + image_tokens
         return {"role": role, "content": content}
 
-    def handle_list_with_image_type():
-        message = {"role": role, "content": [create_text_content_message(prompt)]}
+    def handle_list_with_image_type(message_type="content"):
+        message = {"role": role, "content": [create_message(message_type, prompt)]}
         if role == "user" and not skip_image_token:
             message["content"] = [{"type": "image"}] * num_images + message["content"]
+        if role == "user" and not skip_audio_token:
+            message["content"] = [{"type": "audio"}] * num_audios + message["content"]
         if role == "assistant":
             message["content"] = message["content"][0]["content"]
         return message
@@ -83,6 +89,7 @@ def get_message_json(
             handle_list_with_image, image_first=True
         ),
         "message_list_with_image_type": handle_list_with_image_type,
+        "message_list_with_image_type_text": lambda: handle_list_with_image_type(message_type="text"),
         "message_with_image_token": lambda: handle_image_token("<image>"),
         "message_with_image_token_pipe": lambda: handle_image_token("<|image|>"),
         "message_with_start_image_token": lambda: handle_image_token(
@@ -109,7 +116,7 @@ def get_message_json(
         "internvl_chat": "message_list_with_image_type",
         "kimi_vl": "message_list_with_image",
         "gemma3": "message_with_start_image_token",
-        "gemma3p5_text": "message_with_start_image_token",
+        "gemma3n": "message_list_with_image_type_text",
         "llama4": "message_list_with_image",
         "smolvlm": "message_list_with_image_first",
         "llava": "message_list_with_image",
@@ -192,6 +199,7 @@ def apply_chat_template(
     add_generation_prompt=True,
     return_messages=False,
     num_images=1,
+    num_audios=1,
     **kwargs,
 ):
 
@@ -203,7 +211,9 @@ def apply_chat_template(
                 config["model_type"],
                 p,
                 skip_image_token=not is_first,
+                skip_audio_token=not is_first,
                 num_images=num_images,
+                num_audios=num_audios,
                 **kwargs,
             )
         elif isinstance(p, dict) and "role" in p:

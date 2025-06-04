@@ -204,9 +204,12 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     vision_config = config.get("vision_config", {})
     skip_vision = vision_config.get("skip_vision", False)
 
+    audio_config = config.get("audio_config", {})
+    skip_audio = audio_config.get("skip_audio", False)
+
     # Initialize model config and update it with module configs
     model_config = model_class.ModelConfig.from_dict(config)
-    modules = ["text", "vision", "perceiver", "projector"]
+    modules = ["text", "vision", "perceiver", "projector", "audio"]
     model_config = update_module_configs(model_config, model_class, config, modules)
 
     model = model_class.Model(model_config)
@@ -218,6 +221,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     )
     weights = sanitize_weights(
         model_class.LanguageModel, weights, model_config.text_config
+    )
+    weights = sanitize_weights(
+        model_class.AudioModel, weights, model_config.audio_config
     )
 
     if (quantization := config.get("quantization", None)) is not None:

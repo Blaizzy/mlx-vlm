@@ -13,6 +13,7 @@ from .utils import (
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = []
+DEFAULT_AUDIO = []
 DEFAULT_PROMPT = "What are these?"
 DEFAULT_MAX_TOKENS = 256
 DEFAULT_TEMPERATURE = 0.5
@@ -42,6 +43,13 @@ def parse_arguments():
         nargs="+",
         default=DEFAULT_IMAGE,
         help="URL or path of the image to process.",
+    )
+    parser.add_argument(
+        "--audio",
+        type=str,
+        nargs="+",
+        default=DEFAULT_AUDIO,
+        help="URL or path of the audio to process.",
     )
     parser.add_argument(
         "--resize-shape",
@@ -110,7 +118,7 @@ def main():
 
     prompt = codecs.decode(args.prompt, "unicode_escape")
 
-    prompt = apply_chat_template(processor, config, prompt, num_images=len(args.image))
+    prompt = apply_chat_template(processor, config, prompt, num_images=len(args.image), num_audios=len(args.audio))
 
     kwargs = {}
 
