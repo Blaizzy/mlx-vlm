@@ -43,9 +43,6 @@ class Model(nn.Module):
             pixel_values, grid_thw, output_hidden_states=False
         )
 
-        # hidden_states is already in the correct shape (num_features, hidden_dim)
-        # Don't add extra batch dimension
-
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self.merge_input_ids_with_image_features(
             self.config.image_token_id,
