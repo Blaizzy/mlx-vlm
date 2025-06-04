@@ -1,6 +1,4 @@
-import inspect
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -243,9 +241,6 @@ class LanguageModel(nn.Module):
         self.model = Qwen2Model(args)
         self.rope_deltas = None
 
-        if args.model_type != "qwen2_5_vl":
-            raise ValueError(f"Unsupported model type: {args.model_type}")
-
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
@@ -434,6 +429,7 @@ class LanguageModel(nn.Module):
         cache=None,
         **kwargs,
     ):
+
         position_ids = kwargs.pop("position_ids", None)
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
@@ -469,10 +465,7 @@ class LanguageModel(nn.Module):
                 )
 
         out = self.model(
-            inputs,
-            cache=cache,
-            inputs_embeds=inputs_embeds,
-            position_ids=position_ids,
+            inputs, cache=cache, inputs_embeds=inputs_embeds, position_ids=position_ids
         )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
