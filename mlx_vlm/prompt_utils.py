@@ -123,7 +123,7 @@ def get_message_json(
         "qwen2_5_vl": (
             "message_video_with_text"
             if kwargs.get("video")
-            else "message_list_with_image"
+            else "message_list_with_image_first"
         ),
         # Models using message_with_image_token_new_line format
         "llava-qwen2": "message_with_image_token_new_line",

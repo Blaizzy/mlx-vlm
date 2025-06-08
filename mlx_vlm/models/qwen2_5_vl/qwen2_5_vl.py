@@ -1,50 +1,15 @@
 import glob
-import inspect
 import json
-from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 from huggingface_hub import snapshot_download
 
-from .language import LanguageModel, TextConfig
-from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig:
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    ignore_index: int = -100
-    image_token_id: int = 151655
-    video_token_id: int = 151656
-    vision_start_token_id: int = 151652
-    vision_end_token_id: int = 151653
-    vision_token_id: int = 151654
-    vision_feature_select_strategy: str = "default"
-    vision_feature_layer: int = -2
-    vocab_size: int = 32000
-    eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        # Copy text config parameters from root level
-        excluded_keys = {"vision_config"}
-        params["text_config"] = dict(
-            filter(lambda x: x[0] not in excluded_keys, params.items())
-        )
-
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import ModelConfig, TextConfig, VisionConfig
+from .language import LanguageModel
+from .vision import VisionModel
 
 
 class Model(nn.Module):
@@ -52,7 +17,7 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
-        self.language_model = LanguageModel(config.text_config)
+        self.language_model = LanguageModel(config.text_config, config)
 
     def get_input_embeddings(
         self,
@@ -73,9 +38,6 @@ class Model(nn.Module):
         hidden_states = self.vision_tower(
             pixel_values, image_grid_thw, output_hidden_states=False
         )
-
-        # hidden_states is already in the correct shape (num_features, hidden_dim)
-        # Don't add extra batch dimension
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self.merge_input_ids_with_image_features(
@@ -164,20 +126,28 @@ class Model(nn.Module):
     def __call__(
         self,
         input_ids: mx.array,
-        pixel_values: mx.array,
-        mask: mx.array,
+        pixel_values: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
         cache=None,
         **kwargs,
     ):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
-        second_per_grid_ts = kwargs.pop("second_per_grid_ts", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
-        position_ids = kwargs.pop("position_ids", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
 
-        logits = self.language_model(None, cache=cache, inputs_embeds=inputs_embeds)
+        kwargs = {
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "video_grid_thw": video_grid_thw,
+            **kwargs,
+        }
+
+        logits = self.language_model(
+            input_ids, inputs_embeds, mask=mask, cache=cache, **kwargs
+        )
+
         return logits
 
     @staticmethod
