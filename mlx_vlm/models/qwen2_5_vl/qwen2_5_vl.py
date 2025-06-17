@@ -1,50 +1,15 @@
 import glob
-import inspect
 import json
-from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 from huggingface_hub import snapshot_download
 
-from .language import LanguageModel, TextConfig
-from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig:
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    ignore_index: int = -100
-    image_token_id: int = 151655
-    video_token_id: int = 151656
-    vision_start_token_id: int = 151652
-    vision_end_token_id: int = 151653
-    vision_token_id: int = 151654
-    vision_feature_select_strategy: str = "default"
-    vision_feature_layer: int = -2
-    vocab_size: int = 32000
-    eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        # Copy text config parameters from root level
-        excluded_keys = {"vision_config"}
-        params["text_config"] = dict(
-            filter(lambda x: x[0] not in excluded_keys, params.items())
-        )
-
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import ModelConfig, TextConfig, VisionConfig
+from .language import LanguageModel
+from .vision import VisionModel
 
 
 class Model(nn.Module):
@@ -52,7 +17,7 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
-        self.language_model = LanguageModel(config.text_config)
+        self.language_model = LanguageModel(config.text_config, config)
 
     def get_input_embeddings(
         self,
@@ -74,9 +39,6 @@ class Model(nn.Module):
             pixel_values, image_grid_thw, output_hidden_states=False
         )
 
-        if hidden_states.ndim == 2:
-            hidden_states = hidden_states[None, :, :]
-
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self.merge_input_ids_with_image_features(
             self.config.image_token_id,
@@ -89,36 +51,103 @@ class Model(nn.Module):
 
     @staticmethod
     def merge_input_ids_with_image_features(
-        image_token_id, video_token_id, image_features, inputs_embeds, input_ids
+        image_token_id,
+        video_token_id,
+        image_features,
+        inputs_embeds,
+        input_ids,
     ):
-        image_token_id = image_token_id
-        video_token_id = video_token_id
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
+        """Merge image features into input embeddings at image token positions.
+
+        Args:
+            image_token_id: The token ID for image placeholders
+            video_token_id: The token ID for video placeholders (fallback)
+            image_features: Vision features from the vision tower [num_features, hidden_dim]
+            inputs_embeds: Input embeddings [batch_size, seq_len, hidden_dim]
+            input_ids: Input token IDs [batch_size, seq_len]
+            grid_thw: Grid dimensions for each image (optional, not used in simple case)
+
+        Returns:
+            Updated input embeddings with image features inserted
+        """
+        # Find positions of image tokens
         image_positions = input_ids == image_token_id
         if mx.sum(image_positions) == 0:
             image_positions = input_ids == video_token_id
 
-        image_indices = np.where(image_positions)[1].tolist()
-        inputs_embeds[:, image_indices, :] = image_features
-        return inputs_embeds
+        # Get dimensions
+        batch_size, seq_len = input_ids.shape
+
+        # Process each batch item
+        batch_outputs = []
+        feature_start_idx = 0
+
+        for batch_idx in range(batch_size):
+            # Get mask for this batch
+            image_mask = image_positions[batch_idx]
+            num_positions = mx.sum(image_mask).item()
+
+            if num_positions > 0:
+                # Extract features for this batch
+                batch_features = image_features[
+                    feature_start_idx : feature_start_idx + num_positions
+                ]
+
+                # Validate we have the right number of features
+                if batch_features.shape[0] != num_positions:
+                    raise ValueError(
+                        f"Number of image token positions ({num_positions}) does not match "
+                        f"number of image features ({batch_features.shape[0]}) for batch {batch_idx}"
+                    )
+
+                # Create indices for gathering
+                cumsum = mx.cumsum(image_mask.astype(mx.int32))
+                feature_indices = mx.where(image_mask, cumsum - 1, 0)
+
+                # Gather features
+                gathered_features = batch_features[feature_indices]
+
+                # Combine with original embeddings
+                image_mask_expanded = mx.expand_dims(image_mask, axis=-1)
+                batch_output = mx.where(
+                    image_mask_expanded, gathered_features, inputs_embeds[batch_idx]
+                )
+
+                feature_start_idx += num_positions
+            else:
+                # No image tokens in this batch item
+                batch_output = inputs_embeds[batch_idx]
+
+            batch_outputs.append(batch_output)
+
+        # Stack all batch outputs
+        return mx.stack(batch_outputs, axis=0)
 
     def __call__(
         self,
         input_ids: mx.array,
-        pixel_values: mx.array,
-        mask: mx.array,
+        pixel_values: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
         cache=None,
         **kwargs,
     ):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
-        second_per_grid_ts = kwargs.pop("second_per_grid_ts", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
-        position_ids = kwargs.pop("position_ids", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
 
-        logits = self.language_model(None, cache=cache, inputs_embeds=inputs_embeds)
+        kwargs = {
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "video_grid_thw": video_grid_thw,
+            **kwargs,
+        }
+
+        logits = self.language_model(
+            input_ids, inputs_embeds, mask=mask, cache=cache, **kwargs
+        )
+
         return logits
 
     @staticmethod

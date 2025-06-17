@@ -43,31 +43,87 @@ class Model(nn.Module):
             pixel_values, grid_thw, output_hidden_states=False
         )
 
-        if hidden_states.ndim == 2:
-            hidden_states = hidden_states[None, :, :]
-
         # Insert special image tokens in the input_ids
-        final_inputs_embeds = self._merge_input_ids_with_image_features(
-            hidden_states, inputs_embeds, input_ids
+        final_inputs_embeds = self.merge_input_ids_with_image_features(
+            self.config.image_token_id,
+            self.config.video_token_id,
+            hidden_states,
+            inputs_embeds,
+            input_ids,
         )
         return final_inputs_embeds
 
-    def _merge_input_ids_with_image_features(
-        self, image_features, inputs_embeds, input_ids
+    @staticmethod
+    def merge_input_ids_with_image_features(
+        image_token_id,
+        video_token_id,
+        image_features,
+        inputs_embeds,
+        input_ids,
     ):
-        image_token_index = self.config.image_token_index
-        video_token_index = self.config.video_token_index
+        """Merge image features into input embeddings at image token positions.
 
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = input_ids == image_token_index
+        Args:
+            image_features: Vision features from the vision tower [num_features, hidden_dim]
+            inputs_embeds: Input embeddings [batch_size, seq_len, hidden_dim]
+            input_ids: Input token IDs [batch_size, seq_len]
+
+        Returns:
+            Updated input embeddings with image features inserted
+        """
+
+        # Positions of <image> tokens in input_ids
+        image_positions = input_ids == image_token_id
         if mx.sum(image_positions) == 0:
-            image_positions = input_ids == video_token_index
+            image_positions = input_ids == video_token_id
 
-        image_indices = np.where(image_positions)[1].tolist()
+        # Get dimensions
+        batch_size, seq_len = input_ids.shape
 
-        inputs_embeds[:, image_indices, :] = image_features
+        # Process each batch item
+        batch_outputs = []
+        feature_start_idx = 0
 
-        return inputs_embeds
+        for batch_idx in range(batch_size):
+            # Get mask for this batch
+            image_mask = image_positions[batch_idx]
+            num_positions = mx.sum(image_mask).item()
+
+            if num_positions > 0:
+                # Extract features for this batch
+                batch_features = image_features[
+                    feature_start_idx : feature_start_idx + num_positions
+                ]
+
+                # Validate we have the right number of features
+                if batch_features.shape[0] != num_positions:
+                    raise ValueError(
+                        f"Number of image token positions ({num_positions}) does not match "
+                        f"number of image features ({batch_features.shape[0]}) for batch {batch_idx}"
+                    )
+
+                # Create indices for gathering
+                cumsum = mx.cumsum(image_mask.astype(mx.int32))
+                feature_indices = mx.where(image_mask, cumsum - 1, 0)
+
+                # Gather features
+                gathered_features = batch_features[feature_indices]
+
+                # Combine with original embeddings
+                image_mask_expanded = mx.expand_dims(image_mask, axis=-1)
+                batch_output = mx.where(
+                    image_mask_expanded, gathered_features, inputs_embeds[batch_idx]
+                )
+
+                feature_start_idx += num_positions
+            else:
+                # No image tokens in this batch item
+                batch_output = inputs_embeds[batch_idx]
+
+            batch_outputs.append(batch_output)
+
+        # Stack all batch outputs
+        return mx.stack(batch_outputs, axis=0)
 
     def __call__(
         self,

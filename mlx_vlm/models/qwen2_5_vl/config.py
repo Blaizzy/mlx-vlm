@@ -1,14 +1,15 @@
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 
 @dataclass
 class VisionConfig:
-    model_type: str = "qwen2_vl"
+    model_type: str = "qwen2_5_vl"
     depth: int = 32
-    embed_dim: int = 1280
-    hidden_size: int = 1536
+    hidden_size: int = 1280
+    intermediate_size: int = 3420
+    out_hidden_size: int = 1536
     num_heads: int = 16
     image_size: int = 384
     patch_size: int = 14
@@ -18,7 +19,11 @@ class VisionConfig:
     layer_norm_eps: float = 1e-6
     spatial_patch_size: int = 14
     spatial_merge_size: int = 2
+    tokens_per_second: int = 2
     temporal_patch_size: int = 2
+    window_size: int = 112
+    patch_size: int = 14
+    fullatt_block_indexes: list[int] = field(default_factory=lambda: [7, 15, 23, 31])
 
     @classmethod
     def from_dict(cls, params):
@@ -40,15 +45,12 @@ class TextConfig:
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
-    num_key_value_heads: Optional[int] = 8
-    max_position_embeddings: Optional[int] = 40960
+    num_key_value_heads: Optional[int] = None
+    max_position_embeddings: Optional[int] = 128000
     rope_theta: float = 1000000.0
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    tie_word_embeddings: bool = False
-    sliding_window: int = 32768
-    use_sliding_window: bool = False
-    use_cache: bool = True
+    tie_word_embeddings: bool = True
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -82,6 +84,8 @@ class ModelConfig:
     image_token_id: int = 151655
     video_token_id: int = 151656
     vision_start_token_id: int = 151652
+    vision_end_token_id: int = 151653
+    vision_token_id: int = 151654
     vision_feature_select_strategy: str = "default"
     vision_feature_layer: int = -2
     vocab_size: int = 32000

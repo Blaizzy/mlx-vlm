@@ -1,43 +1,10 @@
-import inspect
-from dataclasses import dataclass, field
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-
-@dataclass
-class VisionConfig:
-    model_type: str = "qwen2_5_vl"
-    depth: int = 32
-    hidden_size: int = 1280
-    intermediate_size: int = 3420
-    out_hidden_size: int = 1536
-    num_heads: int = 16
-    image_size: int = 384
-    patch_size: int = 14
-    vocab_size: int = 32000
-    mlp_ratio: float = 4.0
-    in_channels: int = 3
-    layer_norm_eps: float = 1e-6
-    spatial_patch_size: int = 14
-    spatial_merge_size: int = 2
-    tokens_per_second: int = 2
-    temporal_patch_size: int = 2
-    window_size: int = 112
-    patch_size: int = 14
-    fullatt_block_indexes: list[int] = field(default_factory=lambda: [7, 15, 23, 31])
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import VisionConfig
 
 
 def check_array_shape(arr):

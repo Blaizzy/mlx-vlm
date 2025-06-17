@@ -850,7 +850,7 @@ class TestModels(unittest.TestCase):
             model_type="qwen2_vl",
             text_config=text_config,
             vision_config=vision_config,
-            image_token_index=151655,
+            image_token_id=151655,
             vocab_size=32000,
         )
 
@@ -888,7 +888,7 @@ class TestModels(unittest.TestCase):
             max_position_embeddings=128000,
             rope_theta=1000000.0,
             rope_traditional=False,
-            rope_scaling=None,
+            rope_scaling={"type": "mrope", "mrope_section": [2, 1, 1]},
             tie_word_embeddings=True,
         )
 

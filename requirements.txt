@@ -1,4 +1,4 @@
-mlx>=0.25.0
+mlx>=0.26.0
 datasets>=2.19.1
 tqdm>=4.66.2
 numpy>=1.23.4
@@ -7,5 +7,5 @@ gradio>=5.19.0
 Pillow>=10.3.0
 requests>=2.31.0
 opencv-python==4.10.0.84
-mlx-lm>=0.23.0
+mlx-lm>=0.25.1
 fastapi>=0.95.1
