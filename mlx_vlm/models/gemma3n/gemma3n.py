@@ -75,7 +75,7 @@ class Model(nn.Module):
         if input_features is not None:
             audio_outputs = self.get_audio_features(input_features, input_features_mask)
             return self.merge_multimodal_and_text(
-                input_ids, inputs_embeds, audio_outputs, self.config.audio_token_id
+                input_ids, inputs_embeds, audio_outputs, self.config.audio_token_id, modality="audio"
             )
 
     def get_audio_features(self, input_features, input_features_mask):
@@ -97,7 +97,7 @@ class Model(nn.Module):
         vision_outputs *= self.config.vision_config.hidden_size**0.5
         return self.embed_vision(vision_outputs, is_soft_embedding=True)
 
-    def merge_multimodal_and_text(self, input_ids, inputs_embeds, features, token_id):
+    def merge_multimodal_and_text(self, input_ids, inputs_embeds, features, token_id, modality="image"):
         if input_ids is None:
             special_image_mask = (
                 inputs_embeds
@@ -111,15 +111,18 @@ class Model(nn.Module):
                 special_image_mask, inputs_embeds.shape
             )
 
+        print("special_image_mask.shape", special_image_mask.shape)
+        print("features.shape", features.shape)
+
         # Count special tokens by summing the mask
         special_token_count = mx.sum(special_image_mask[..., 0] if special_image_mask.ndim > 2 else special_image_mask)
         expected_feature_count = features.shape[0] * features.shape[1] if features.ndim > 1 else features.shape[0]
 
         if special_token_count != expected_feature_count:
             raise ValueError(
-                f"Number of images does not match number of special image tokens in the input text. "
-                f"Got {special_token_count} (image/audio) tokens in the text and "
-                f"{expected_feature_count} tokens from (image/audio) embeddings."
+                f"Number of {modality}s does not match number of special {modality} tokens in the input text. "
+                f"Got {special_token_count} {modality} tokens in the text and "
+                f"{expected_feature_count} tokens from {modality} embeddings."
             )
         features = features.astype(inputs_embeds.dtype)
         inputs_embeds = mx.where(special_image_mask, features.flatten(), inputs_embeds)

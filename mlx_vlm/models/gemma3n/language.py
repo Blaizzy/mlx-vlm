@@ -720,7 +720,10 @@ class Gemma3Model(nn.Module):
         **kwargs,
     ):
         per_layer_inputs = kwargs.get("per_layer_inputs", None)
-        h = self.embed_tokens(inputs)
+        if inputs_embeds is None:
+            h = self.embed_tokens(inputs)
+        else:
+            h = inputs_embeds
 
         if per_layer_inputs is None and inputs is not None:
             per_layer_inputs = self.get_per_layer_inputs(inputs)

@@ -137,7 +137,7 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
                     "*.model",
                     "*.tiktoken",
                     "*.txt",
-                    "*.jinja",
+                    "*.jinja"
                 ],
                 resume_download=True,
             )
@@ -1064,6 +1064,10 @@ def generate_step(
 
         n += 1
 
+        # Periodically clear cache to prevent memory accumulation
+        if n % 50 == 0:  # Clear cache every 50 tokens
+            mx.clear_cache()
+
 
 class StoppingCriteria:
     def __init__(self, eos_token_ids: List[int], tokenizer=None):
@@ -1218,6 +1222,9 @@ def stream_generate(
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
         )
+
+        # Cleanup after generation
+        mx.clear_cache()
 
 
 def generate(
