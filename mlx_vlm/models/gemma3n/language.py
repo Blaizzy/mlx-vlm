@@ -1,3 +1,4 @@
+import copy
 import inspect
 from dataclasses import dataclass
 from functools import partial
@@ -7,10 +8,9 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import _BaseCache
 
-from ..base import LanguageModelOutput, create_attention_mask, visualize_attention_mask
-from ..cache import ChunkedKVCache, KVCache, RotatingKVCache
+from ..base import LanguageModelOutput
+from ..cache import SlidingWindowCache, StaticKVCache
 from .config import TextConfig
-
 
 
 class Gemma3nRMSNorm(nn.Module):
@@ -18,34 +18,32 @@ class Gemma3nRMSNorm(nn.Module):
         self,
         dim: int,
         eps: float = 1e-6,
-        scale_shift: float = 1.0,
+        scale_shift: float = 0.0,
         with_scale: bool = True,
     ):
+        super().__init__()
         self.eps = eps
         self.scale_shift = scale_shift
         self.with_scale = with_scale
+
         if self.with_scale:
+            # Make weight a proper parameter
             self.weight = mx.ones(dim)
+        else:
+            self.weight = None
+
+    def _norm(self, x):
+        # Match PyTorch's normalization exactly
+        return x * mx.rsqrt(x.square().mean(axis=-1, keepdims=True) + self.eps)
 
     def __call__(self, x: mx.array) -> mx.array:
-        # Compute variance along last dimension
-        variance = mx.mean(mx.square(x), axis=-1, keepdims=True)
-        # Normalize
-        normed = x / mx.sqrt(variance + self.eps)
+        # Match PyTorch implementation
+        output = self._norm(x.astype(mx.float32))
 
-        # Apply weight scaling
         if self.with_scale:
-            weight = self.weight
-        else:
-            weight = mx.ones(x.shape[-1], dtype=x.dtype)
+            output = output * (self.weight + self.scale_shift)
 
-        scaled_weight = weight + self.scale_shift
-        output = normed * scaled_weight
-
-        return output
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.eps}"
+        return output.astype(x.dtype)
 
 
 class Gemma3nLaurelBlock(nn.Module):
@@ -94,6 +92,42 @@ def apply_rotary_pos_emb(
     return (x * cos) + (rotate_half(x) * sin)
 
 
+def _compute_default_rope_parameters(
+    config: Optional[TextConfig] = None,
+    seq_len: Optional[int] = None,
+    **rope_kwargs,
+) -> tuple[mx.array, float]:
+
+    if config is not None and len(rope_kwargs) > 0:
+        raise ValueError(
+            "Unexpected arguments: `**rope_kwargs` and `config` are mutually exclusive in "
+            f"`_compute_default_rope_parameters`, got `rope_kwargs`={rope_kwargs} and `config`={config}"
+        )
+    if len(rope_kwargs) > 0:
+        base = rope_kwargs["base"]
+        dim = rope_kwargs["dim"]
+    elif config is not None:
+        base = config.rope_theta
+        partial_rotary_factor = (
+            config.partial_rotary_factor
+            if hasattr(config, "partial_rotary_factor")
+            else 1.0
+        )
+        head_dim = (
+            getattr(config, "head_dim", None)
+            or config.hidden_size // config.num_attention_heads
+        )
+        dim = int(head_dim * partial_rotary_factor)
+
+    attention_factor = 1.0  # Unused in this type of RoPE
+
+    # Compute the inverse frequencies
+    inv_freq = 1.0 / (
+        base ** (mx.arange(0, dim, 2, dtype=mx.int64).astype(mx.float32) / dim)
+    )
+    return inv_freq, attention_factor
+
+
 class Gemma3nRotaryEmbedding(nn.Module):
     def __init__(self, config: TextConfig, device=None):
         super().__init__()
@@ -109,13 +143,9 @@ class Gemma3nRotaryEmbedding(nn.Module):
 
         self.config = config
 
-        # TODO: This is a hack to get the RoPE parameters just for testing.
-        # Will be removed...
-        from transformers.modeling_rope_utils import _compute_default_rope_parameters
-
         self.rope_init_fn = _compute_default_rope_parameters
 
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config)
         self._inv_freq = mx.array(inv_freq, dtype=mx.float32)
         self._original_inv_freq = mx.array(inv_freq, dtype=mx.float32)
 
@@ -147,18 +177,17 @@ class Gemma3nAttention(nn.Module):
         self.head_dim = head_dim = config.head_dim
         self.layer_idx = layer_idx
 
-        self.scale = config.query_rescale_scalar / config.query_pre_attn_scalar
+        self.scale = 1.0
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.qkv_norm = Gemma3nRMSNorm(
-            dim=config.head_dim,
-            eps=config.rms_norm_eps,
-            scale_shift=0.0,
-            with_scale=False,
+        self.q_norm = Gemma3nRMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Gemma3nRMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
+        self.v_norm = Gemma3nRMSNorm(
+            dim=config.head_dim, eps=config.rms_norm_eps, with_scale=False
         )
 
         first_kv_shared_layer_idx = (
@@ -191,7 +220,7 @@ class Gemma3nAttention(nn.Module):
 
         queries = self.q_proj(x)
         queries = queries.reshape(hidden_shape)
-        queries = self.qkv_norm(queries)
+        queries = self.q_norm(queries)
         queries = apply_rotary_pos_emb(queries, cos, sin, unsqueeze_dim=2)
         queries = queries.transpose(0, 2, 1, 3)
 
@@ -208,12 +237,12 @@ class Gemma3nAttention(nn.Module):
 
         else:
             keys = self.k_proj(x).reshape(hidden_shape)
-            keys = self.qkv_norm(keys)
+            keys = self.k_norm(keys)
             keys = apply_rotary_pos_emb(keys, cos, sin, unsqueeze_dim=2)
             keys = keys.transpose(0, 2, 1, 3)
 
             values = self.v_proj(x).reshape(hidden_shape)
-            values = self.qkv_norm(values)
+            values = self.v_norm(values)
             values = values.transpose(0, 2, 1, 3)
 
             if cache is not None:
@@ -270,7 +299,7 @@ class MLP(nn.Module):
     def _gaussian_topk(self, inputs: mx.array) -> mx.array:
         # For normal distribution, icdf(p) = -sqrt(2) * erfinv(2p - 1)
         p = mx.array(self.activation_sparsity, dtype=mx.float32)
-        std_multiplier = mx.sqrt(2) * mx.erfinv(2 * p - 1)
+        std_multiplier = mx.sqrt(2.0) * mx.erfinv(2 * p - 1)
         std_multiplier = std_multiplier.astype(inputs.dtype)
         inputs_mean = mx.mean(inputs, axis=-1, keepdims=True)
         inputs_std = mx.std(inputs, axis=-1, keepdims=True)
@@ -593,6 +622,10 @@ class Gemma3Model(nn.Module):
         self._per_layer_input_scale = mx.rsqrt(mx.array(2.0))
 
         self.rope_embedding = Gemma3nRotaryEmbedding(config)
+
+        config = copy.deepcopy(config)
+        config.rope_theta = config.rope_local_base_freq
+        config.rope_scaling = {"rope_type": "default"}
         self.rope_embedding_local = Gemma3nRotaryEmbedding(config)
 
     def _update_causal_mask(
@@ -609,49 +642,44 @@ class Gemma3Model(nn.Module):
         and leaves allowed cells at 0 · 0.
         """
 
-        dtype  = input_tensor.dtype
-        batch  = input_tensor.shape[0]
-        q_len  = input_tensor.shape[1]           # sequence_length
+        dtype = input_tensor.dtype
+        batch = input_tensor.shape[0]
+        q_len = input_tensor.shape[1]  # sequence_length
 
         # -- determine how *wide* the mask must be ---------------------------
-        if (
-            past_key_values                                    # cache list exists
-            and isinstance(past_key_values[0], _BaseCache)     # our KV-cache class
-        ):
+        if past_key_values and isinstance(  # cache list exists
+            past_key_values[0], _BaseCache
+        ):  # our KV-cache class
             layer0 = past_key_values[0]
 
-            if layer0.keys is not None:                        # cache already filled
+            if layer0.keys is not None:  # cache already filled
                 k_len = int(layer0.keys.shape[2])
-            else:                                              # first forward pass
-                k_len = int(layer0.max_size)                   # use full capacity
+            else:  # first forward pass
+                k_len = int(layer0.max_size)  # use full capacity
 
-            k_len = max(k_len, q_len)                          # safety for pre-fill
+            k_len = max(k_len, q_len)  # safety for pre-fill
         else:
             k_len = (
-                int(attention_mask.shape[-1])
-                if attention_mask is not None
-                else q_len
+                int(attention_mask.shape[-1]) if attention_mask is not None else q_len
             )
 
         # -- build / return ---------------------------------------------------
         return self._prepare_4d_causal_attention_mask_with_cache_position(
             attention_mask,
-            sequence_length = q_len,
-            target_length   = k_len,
-            dtype           = dtype,
-            cache_position  = cache_position,
-            batch_size      = batch,
+            sequence_length=q_len,
+            target_length=k_len,
+            dtype=dtype,
+            cache_position=cache_position,
+            batch_size=batch,
         )
-
-
 
     @staticmethod
     def _prepare_4d_causal_attention_mask_with_cache_position(
-        attention_mask: mx.array | None,   # (B ,K) or (B,1,Q,K) or None
-        sequence_length: int,              # Q
-        target_length:   int,              # K
+        attention_mask: mx.array | None,  # (B ,K) or (B,1,Q,K) or None
+        sequence_length: int,  # Q
+        target_length: int,  # K
         dtype,
-        cache_position: mx.array,          # (Q,)  – indices of current tokens
+        cache_position: mx.array,  # (Q,)  – indices of current tokens
         batch_size: int,
     ):
         """
@@ -667,7 +695,7 @@ class Gemma3Model(nn.Module):
         if attention_mask is not None and attention_mask.ndim == 4:
             return attention_mask.astype(dtype)
 
-        min_val = mx.finfo(dtype).min            # -∞  in chosen precision
+        min_val = mx.finfo(dtype).min  # -∞  in chosen precision
 
         # ------------------------------------------------------------------ #
         # 1. causal part  – start full of -∞ then zero-out lower-triangle
@@ -675,41 +703,38 @@ class Gemma3Model(nn.Module):
         causal = mx.full((sequence_length, target_length), min_val, dtype=dtype)
 
         if sequence_length != 1:
-            causal = mx.triu(causal, k=1)        # keep q≥k at 0.0
+            causal = mx.triu(causal, k=1)  # keep q≥k at 0.0
 
         # static-cache shift: forbid keys that have *not* been written yet
         # (i.e. k_index  >  cache_position[q])
-        causal *= (
-            mx.arange(target_length) > cache_position.reshape(-1, 1)
-        )
+        causal *= mx.arange(target_length) > cache_position.reshape(-1, 1)
 
         # shape → (1,1,Q,K) then broadcast batch
-        causal = mx.expand_dims(causal, 0)       # (1,Q,K)
-        causal = mx.expand_dims(causal, 0)       # (1,1,Q,K)
+        causal = mx.expand_dims(causal, 0)  # (1,Q,K)
+        causal = mx.expand_dims(causal, 0)  # (1,1,Q,K)
         causal = mx.repeat(causal, repeats=batch_size, axis=0).astype(dtype)
 
         # ------------------------------------------------------------------ #
         # 2. padding part  – turn “mask = 0” keys into -∞ inside the slice
         # ------------------------------------------------------------------ #
-        if attention_mask is not None:           # (B,K)
-            Kmask_len  = int(attention_mask.shape[-1])
-            key_pad    = attention_mask.astype(dtype)            # 1/0
-            key_pad    = mx.expand_dims(key_pad, 1)               # (B,1,K)
-            key_pad    = mx.expand_dims(key_pad, 2)               # (B,1,1,K)
+        if attention_mask is not None:  # (B,K)
+            Kmask_len = int(attention_mask.shape[-1])
+            key_pad = attention_mask.astype(dtype)  # 1/0
+            key_pad = mx.expand_dims(key_pad, 1)  # (B,1,K)
+            key_pad = mx.expand_dims(key_pad, 2)  # (B,1,1,K)
 
             # slice only the prefix that overlaps real keys
             causal_prefix = causal[:, :, :, :Kmask_len]
             causal_prefix = mx.where(
-                key_pad == 0,                        #==> padding key?
-                min_val,                             # ban
-                causal_prefix                        # keep previous (0 or –∞)
+                key_pad == 0,  # ==> padding key?
+                min_val,  # ban
+                causal_prefix,  # keep previous (0 or –∞)
             )
             causal = mx.concatenate(
                 [causal_prefix, causal[:, :, :, Kmask_len:]], axis=-1
             )
 
         return causal
-
 
     def __call__(
         self,
@@ -868,7 +893,7 @@ class LanguageModel(nn.Module):
         sanitized_weights = {}
 
         for k, v in weights.items():
-            if "language_model" in k:
+            if "language_model.model" not in k and "language_model.lm_head" not in k:
                 new_key = k.replace("language_model", "language_model.model")
                 sanitized_weights[new_key] = v
             elif "self_attn.rotary_emb.inv_freq" in k:
@@ -876,11 +901,12 @@ class LanguageModel(nn.Module):
             else:
                 sanitized_weights[k] = v
 
-
-        if "lm_head.weight" not in sanitized_weights:
+        if "language_model.lm_head.weight" not in sanitized_weights:
             embed_tokens_key = "language_model.model.embed_tokens.weight"
             if embed_tokens_key in sanitized_weights:
-                sanitized_weights["language_model.lm_head.weight"] = sanitized_weights[embed_tokens_key]
+                sanitized_weights["language_model.lm_head.weight"] = sanitized_weights[
+                    embed_tokens_key
+                ]
 
         return sanitized_weights
 
@@ -925,164 +951,3 @@ class LanguageModel(nn.Module):
                 )
 
         return caches
-
-
-class SlidingWindowCache(_BaseCache):
-    """A sliding window cache for local attention layers."""
-
-    def __init__(self, max_size: int, step: int = 256):
-        self.max_size = max_size
-        self.step = step
-        self.keys = None
-        self.values = None
-        self.offset = 0
-
-    def update_and_fetch(
-        self, keys: mx.array, values: mx.array
-    ) -> Tuple[mx.array, mx.array]:
-        B, n_kv_heads, seq_len, k_head_dim = keys.shape
-        v_head_dim = values.shape[-1]
-
-        if self.keys is None:
-            # Initialize cache
-            k_shape = (B, n_kv_heads, self.max_size, k_head_dim)
-            v_shape = (B, n_kv_heads, self.max_size, v_head_dim)
-            self.keys = mx.zeros(k_shape, dtype=keys.dtype)
-            self.values = mx.zeros(v_shape, dtype=values.dtype)
-
-        # Simple sliding window: keep only the last max_size tokens
-        if self.offset + seq_len <= self.max_size:
-            # Fits within current window
-            start_idx = self.offset
-            end_idx = self.offset + seq_len
-            self.keys[:, :, start_idx:end_idx, :] = keys
-            self.values[:, :, start_idx:end_idx, :] = values
-            self.offset += seq_len
-        else:
-            # Need to slide the window
-            # Shift existing content left
-            shift_amount = seq_len
-            if shift_amount < self.max_size:
-                self.keys[:, :, :-shift_amount, :] = self.keys[:, :, shift_amount:, :]
-                self.values[:, :, :-shift_amount, :] = self.values[
-                    :, :, shift_amount:, :
-                ]
-                # Add new tokens at the end
-                self.keys[:, :, -shift_amount:, :] = keys
-                self.values[:, :, -shift_amount:, :] = values
-            else:
-                # New sequence is larger than cache, just keep the last max_size tokens
-                self.keys = keys[:, :, -self.max_size :, :]
-                self.values = values[:, :, -self.max_size :, :]
-            self.offset = self.max_size
-
-        return self.keys, self.values
-
-    @property
-    def state(self):
-        if self.keys is None:
-            return None, None
-        return self.keys, self.values
-
-    @state.setter
-    def state(self, v):
-        if v is not None and len(v) == 2:
-            self.keys, self.values = v
-            if self.keys is not None:
-                self.offset = self.max_size
-
-    def get_max_cache_shape(self):
-        return self.max_size
-
-    @property
-    def meta_state(self):
-        return tuple(map(str, (self.max_size, self.step, self.offset)))
-
-    @meta_state.setter
-    def meta_state(self, v):
-        self.max_size, self.step, self.offset = map(int, v)
-
-    def is_trimmable(self):
-        return False  # Sliding window cache doesn't support trimming
-
-    def trim(self, n):
-        return 0  # No trimming for sliding window
-
-
-class StaticKVCache(_BaseCache):
-    """A static cache that grows to accommodate all tokens."""
-
-    def __init__(self, max_size: int, step: int = 256):
-        self.max_size = max_size
-        self.step = step
-        self.keys = None
-        self.values = None
-        self.offset = 0
-
-    def update_and_fetch(
-        self, keys: mx.array, values: mx.array
-    ) -> Tuple[mx.array, mx.array]:
-        B, n_kv_heads, seq_len, k_head_dim = keys.shape
-        v_head_dim = values.shape[-1]
-
-        # Initialize cache if needed
-        if self.keys is None:
-            k_shape = (B, n_kv_heads, self.max_size, k_head_dim)
-            v_shape = (B, n_kv_heads, self.max_size, v_head_dim)
-            self.keys = mx.zeros(k_shape, dtype=keys.dtype)
-            self.values = mx.zeros(v_shape, dtype=values.dtype)
-
-        # Update cache
-        end_pos = min(self.offset + seq_len, self.max_size)
-        actual_seq_len = end_pos - self.offset
-
-        if actual_seq_len > 0:
-            self.keys = mx.concatenate(
-                [
-                    self.keys[:, :, : self.offset, :],
-                    keys[:, :, :actual_seq_len, :],
-                    self.keys[:, :, end_pos:, :],
-                ],
-                axis=2,
-            )
-            self.values = mx.concatenate(
-                [
-                    self.values[:, :, : self.offset, :],
-                    values[:, :, :actual_seq_len, :],
-                    self.values[:, :, end_pos:, :],
-                ],
-                axis=2,
-            )
-            self.offset = end_pos
-
-        return self.keys, self.values
-
-    @property
-    def state(self):
-        if self.keys is None:
-            return None, None
-        return self.keys, self.values
-
-    @state.setter
-    def state(self, v):
-        if v is not None and len(v) == 2:
-            self.keys, self.values = v
-            if self.keys is not None:
-                # Calculate offset based on non-zero entries
-                self.offset = self.max_size
-
-    @property
-    def meta_state(self):
-        return tuple(map(str, (self.max_size, self.step, self.offset)))
-
-    @meta_state.setter
-    def meta_state(self, v):
-        self.max_size, self.step, self.offset = map(int, v)
-
-    def is_trimmable(self):
-        return True
-
-    def trim(self, n):
-        n = min(self.offset, n)
-        self.offset -= n
-        return n

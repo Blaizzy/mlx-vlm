@@ -1,5 +1,5 @@
-from dataclasses import dataclass
 import inspect
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
 
@@ -22,10 +22,11 @@ class AudioConfig:
     sscp_conv_group_norm_eps: float = 1e-3
     sscp_conv_kernel_size: tuple[tuple[int, int], tuple[int, int]] = ((3, 3), (3, 3))
     sscp_conv_stride_size: tuple[tuple[int, int], tuple[int, int]] = ((2, 2), (2, 2))
-    vocab_size: int = 262144
+    vocab_size: int = 128
     sscp_conv_eps: float = 1e-3
     rms_norm_eps: float = 1e-6
     gradient_clipping: float = 10000000000.0
+    vocab_offset: int = 262_144 + 128 # text vocab size + vision vocab size
 
     @classmethod
     def from_dict(cls, params):
@@ -36,6 +37,7 @@ class AudioConfig:
                 if k in inspect.signature(cls).parameters
             }
         )
+
 
 @dataclass
 class VisionConfig:
@@ -47,7 +49,9 @@ class VisionConfig:
     patch_size: int = 16
     image_size: int = 224
     num_channels: int = 3
-    layer_norm_eps: float = 1e-6
+    vocab_size: int = 128
+    rms_norm_eps: float = 1e-6
+    vocab_offset: int = 262_144
 
     @classmethod
     def from_dict(cls, params):
@@ -58,6 +62,7 @@ class VisionConfig:
                 if k in inspect.signature(cls).parameters
             }
         )
+
 
 @dataclass
 class TextConfig:
@@ -73,6 +78,7 @@ class TextConfig:
     laurel_rank: int = 64
     frac_shared_layers: float = 0.5
     altup_active_idx: int = 0
+    pad_token_id: int = 0
     altup_num_inputs: int = 4
     altup_coef_clip: Optional[float] = None
     altup_correct_scale: bool = True
@@ -116,6 +122,8 @@ class ModelConfig:
     image_token_id: int = 262145
     hidden_size: int = 2048
     pad_token_id: int = 0
+    vision_soft_tokens_per_image: int = 256
+    audio_soft_tokens_per_image: int = 188
     eos_token_id: Optional[List[int]] = None
 
     @classmethod
@@ -127,5 +135,3 @@ class ModelConfig:
                 if k in inspect.signature(cls).parameters
             }
         )
-
-

@@ -16,6 +16,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import requests
+import scipy.signal as signal
+import soundfile as sf
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_reduce, tree_unflatten
 from PIL import Image, ImageOps
@@ -112,7 +114,9 @@ def get_model_and_args(config: dict):
     return arch, model_type
 
 
-def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
+def get_model_path(
+    path_or_hf_repo: str, revision: Optional[str] = None, force_download: bool = False
+) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
     it is downloaded from the Hugging Face Hub.
@@ -137,9 +141,9 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
                     "*.model",
                     "*.tiktoken",
                     "*.txt",
-                    "*.jinja"
+                    "*.jinja",
                 ],
-                resume_download=True,
+                force_download=force_download,
             )
         )
     return model_path
@@ -205,7 +209,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     skip_vision = vision_config.get("skip_vision", False)
 
     audio_config = config.get("audio_config", {})
-    skip_audio = audio_config.get("skip_audio", False)
 
     # Initialize model config and update it with module configs
     model_config = model_class.ModelConfig.from_dict(config)
@@ -321,7 +324,8 @@ def load(
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
-    model_path = get_model_path(path_or_hf_repo, revision=revision)
+    force_download = kwargs.get("force_download", False)
+    model_path = get_model_path(path_or_hf_repo, force_download=force_download)
 
     model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
@@ -814,48 +818,115 @@ def process_image(img, resize_shape, image_processor):
     return img
 
 
-def process_inputs(processor, images, prompts, return_tensors="mlx"):
-    if hasattr(processor, "process"):
-        inputs = processor.process(
-            text=prompts,
+def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    gcd = np.gcd(orig_sr, target_sr)
+    up = target_sr // gcd
+    down = orig_sr // gcd
+    resampled = signal.resample_poly(audio, up, down, padtype="edge")
+    return resampled
+
+
+def load_audio(
+    file: str,
+    sr: int,
+):
+    audio, sample_rate = sf.read(file, always_2d=True)
+    if sample_rate != sr:
+        audio = resample_audio(audio, sample_rate, sr)
+    return np.array(audio).mean(axis=1)
+
+
+def process_inputs(
+    processor,
+    images=None,
+    audio=None,
+    prompts=None,
+    add_special_tokens=False,
+    return_tensors="mlx",
+):
+    process_method = getattr(processor, "process", processor)
+
+    return process_method(
+        text=prompts,
+        images=images,
+        audio=audio,
+        padding=True,
+        add_special_tokens=add_special_tokens,
+        return_tensors=return_tensors,
+    )
+
+
+def process_inputs_with_fallback(
+    processor, images, audio, prompts, add_special_tokens=False, return_tensors="mlx"
+):
+    # First attempt with specified return_tensors
+    try:
+        return process_inputs(
+            processor,
             images=images,
-            padding=True,
+            audio=audio,
+            prompts=prompts,
+            add_special_tokens=add_special_tokens,
             return_tensors=return_tensors,
         )
-    else:
-        inputs = processor(
-            text=prompts, images=images, padding=True, return_tensors=return_tensors
-        )
-    return inputs
-
-
-def process_inputs_with_fallback(processor, images, prompts, return_tensors="mlx"):
-    try:
-        inputs = process_inputs(
-            processor, images, prompts, return_tensors=return_tensors
-        )
     except Exception as e:
-        try:
-            print(
-                f"\033[33mWarning\033[0m: Failed to process inputs with error: {e}",
-                "Trying to process inputs with return_tensors='pt'",
-            )
-            inputs = process_inputs(processor, images, prompts, return_tensors="pt")
-        except Exception as e:
-            raise ValueError(f"Failed to process inputs with error: {e}")
-    return inputs
+        # Fallback to PyTorch tensors if MLX fails
+        if return_tensors != "pt":
+            try:
+                print(
+                    f"\033[33mWarning\033[0m: Failed to process inputs with error: {e}. "
+                    "Trying to process inputs with return_tensors='pt'"
+                )
+                return process_inputs(
+                    processor,
+                    images=images,
+                    audio=audio,
+                    prompts=prompts,
+                    add_special_tokens=add_special_tokens,
+                    return_tensors="pt",
+                )
+            except Exception as fallback_error:
+                raise ValueError(
+                    f"Failed to process inputs with error: {fallback_error}"
+                )
+
+        raise ValueError(f"Failed to process inputs with error: {e}")
 
 
-def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=None):
-
-    if not isinstance(images, list):
-        images = [images]
-
+def prepare_inputs(
+    processor,
+    images=None,
+    audio=None,
+    prompts=None,
+    image_token_index=None,
+    resize_shape=None,
+    add_special_tokens=False,
+):
     # Process images
-    image_processor = (
-        processor.image_processor if hasattr(processor, "image_processor") else None
-    )
-    images = [process_image(img, resize_shape, image_processor) for img in images]
+    if images is not None:
+        if not isinstance(images, list):
+            images = [images]
+
+        image_processor = (
+            processor.image_processor if hasattr(processor, "image_processor") else None
+        )
+        images = [process_image(img, resize_shape, image_processor) for img in images]
+
+    # Process audio
+    if audio is not None:
+        if not isinstance(audio, list):
+            audio = [audio]
+
+        if len(audio) > 1:
+            print(
+                "\033[33mWarning\033[0m: Single prompt with multiple audio files is not supported yet. Using the first audio file.\n"
+            )
+            audio = audio[:1]
+
+        audio = [
+            load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
+            for audio_file in audio
+        ]
 
     model_inputs = {}
 
@@ -894,19 +965,18 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
         if hasattr(processor, "tokenizer"):
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-        inputs = process_inputs_with_fallback(processor, images, prompts)
+        inputs = process_inputs_with_fallback(
+            processor,
+            images=images,
+            audio=audio,
+            prompts=prompts,
+            add_special_tokens=add_special_tokens,
+        )
 
         if "images" in inputs:
             inputs["pixel_values"] = inputs["images"]
             inputs.pop("images")
 
-        if isinstance(inputs["pixel_values"], list):
-            pixel_values = inputs["pixel_values"]
-        else:
-            pixel_values = mx.array(inputs["pixel_values"])
-
-        model_inputs["input_ids"] = mx.array(inputs["input_ids"])
-        model_inputs["pixel_values"] = pixel_values
         model_inputs["attention_mask"] = (
             mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
         )
@@ -1122,6 +1192,7 @@ def stream_generate(
     processor: PreTrainedTokenizer,
     prompt: str,
     image: Union[str, List[str]] = None,
+    audio: Union[str, List[str]] = None,
     **kwargs,
 ) -> Union[str, Generator[str, None, None]]:
     """
@@ -1149,7 +1220,7 @@ def stream_generate(
 
     add_special_tokens = (
         not hasattr(processor, "chat_template")
-        if model.config.model_type == "gemma3"
+        if model.config.model_type in ["gemma3", "gemma3n"]
         else True
     )
     prompt_tokens = mx.array(
@@ -1159,27 +1230,28 @@ def stream_generate(
     resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)
 
-    if kwargs.get("pixel_values") is None:
-        if not image:
-            input_ids = prompt_tokens[None, :]
-            pixel_values = mask = None
-        else:
-            inputs = prepare_inputs(
-                processor, image, prompt, image_token_index, resize_shape
-            )
-            input_ids = inputs["input_ids"]
-            pixel_values = inputs["pixel_values"]
-            mask = inputs["attention_mask"]
-            data_kwargs = {
-                k: v
-                for k, v in inputs.items()
-                if k not in ["input_ids", "pixel_values", "attention_mask"]
-            }
-            kwargs.update(data_kwargs)
-    else:
+    if kwargs.get("input_ids", None) is not None:
         input_ids = kwargs.pop("input_ids")
-        pixel_values = kwargs.pop("pixel_values")
-        mask = kwargs.pop("mask")
+        pixel_values = kwargs.pop("pixel_values", None)
+        mask = kwargs.pop("mask", None)
+    else:
+        inputs = prepare_inputs(
+            processor,
+            images=image,
+            audio=audio,
+            prompts=prompt,
+            image_token_index=image_token_index,
+            resize_shape=resize_shape,
+        )
+        input_ids = inputs.get("input_ids", None)
+        pixel_values = inputs.get("pixel_values", None)
+        mask = inputs.get("attention_mask", None)
+        data_kwargs = {
+            k: v
+            for k, v in inputs.items()
+            if k not in ["input_ids", "pixel_values", "attention_mask"]
+        }
+        kwargs.update(data_kwargs)
 
     with wired_limit(model, [generation_stream]):
         detokenizer = processor.detokenizer
@@ -1232,6 +1304,7 @@ def generate(
     processor: PreTrainedTokenizer,
     prompt: str,
     image: Union[str, List[str]] = None,
+    audio: Union[str, List[str]] = None,
     verbose: bool = False,
     **kwargs,
 ) -> str:
@@ -1254,14 +1327,15 @@ def generate(
 
     if verbose:
         print("=" * 10)
+        files = []
         if image is not None:
-            input_path = image
-        elif kwargs.get("video") is not None:
-            input_path = kwargs.get("video")
-        else:
-            input_path = None
+            files.extend(image)
+        if audio is not None:
+            files.extend(audio)
+        if kwargs.get("video") is not None:
+            files.extend(kwargs.get("video"))
 
-        print(f"Files: {input_path}", "\n")
+        print(f"Files: {files}", "\n")
 
         print("Prompt:", prompt)
 
@@ -1291,7 +1365,7 @@ def generate(
     else:
         tokenizer.stopping_criteria.reset(model.config.eos_token_id)
 
-    for response in stream_generate(model, processor, prompt, image, **kwargs):
+    for response in stream_generate(model, processor, prompt, image, audio, **kwargs):
         if verbose:
             print(response.text, end="", flush=True)
         text += response.text
