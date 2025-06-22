@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import os
 
 import mlx.optimizers as optim
 from datasets import load_dataset
@@ -123,6 +124,10 @@ def main(args):
                         "Loss": f"{loss.item():.4f}",
                     }
                 )
+        # Save the interim adapter after each epoch except the last.
+        if args.save_after_epoch and (epoch < (args.epochs - 1)):
+            head, tail = os.path.split(args.output_path)
+            save_adapter(model, head + os.sep + "epoch_" + str(epoch) + "_" + tail)
 
     # Save the adapter
     save_adapter(model, args.output_path)
@@ -173,7 +178,10 @@ if __name__ == "__main__":
         "--print-every", type=int, default=10, help="Print loss every n steps"
     )
     parser.add_argument(
-        "--lora-alpha", type=int, default=0.1, help="LoRA alpha parameter"
+        "--lora-alpha",
+        type=float,
+        default=0.1,
+        help="LoRA scaling factor (alpha / rank)",
     )
     parser.add_argument("--lora-rank", type=int, default=10, help="LoRA rank")
     parser.add_argument("--lora-dropout", type=float, default=0.1, help="LoRA dropout")
@@ -188,6 +196,11 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Load path to resume training from a previously saved adapter",
+    )
+    parser.add_argument(
+        "--save-after-epoch",
+        action="store_true",
+        help="Save interim versions of adapter files after each epoch",
     )
 
     args = parser.parse_args()
