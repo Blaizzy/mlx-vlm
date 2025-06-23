@@ -3,9 +3,26 @@ import re
 
 RewardFunctions = Callable[[List[str], List[str], List[str], Optional[List[str]]], List[float]]
 
+# Registry to store all reward functions
 REWARD_REGISTRY: Dict[str, RewardFunctions] = {}
 
 def register_reward_function(name: str = None):
+    """
+    Decorator to register a reward function in the global registry.
+    
+    Args:
+        name: Optional custom name for the reward function.
+              If None, the function's name will be used.
+    
+    Returns:
+        Decorator function
+    
+    Example:
+        @register_reward_function()
+        def my_custom_reward(prompts, completions, answers, types=None):
+            # Your reward logic here
+            return [1.0 if condition else 0.0 for _ in completions]
+    """
     def decorator(func: RewardFunctions):
         func_name = name or func.__name__
         REWARD_REGISTRY[func_name] = func
@@ -13,6 +30,18 @@ def register_reward_function(name: str = None):
     return decorator
 
 def get_reward_function(name: str) -> RewardFunctions:
+    """
+    Get a reward function by name from the registry.
+    
+    Args:
+        name: Name of the reward function
+    
+    Returns:
+        The reward function
+        
+    Raises:
+        KeyError: If the reward function is not found
+    """
     if name not in REWARD_REGISTRY:
         raise KeyError(f"Reward function '{name}' not found. Available functions: {list(REWARD_REGISTRY.keys())}")
     return REWARD_REGISTRY[name]

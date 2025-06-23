@@ -123,7 +123,7 @@ class SFTDataset:
             logger.warning(f"Skipping sample at index {idx} due to error: {e}")
             return self.__getitem__((idx + 1) % len(self))
 
-
+    
 class GRPODataset:
     """
     Dataset wrapper for GRPO training data with VLM support.
