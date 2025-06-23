@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-vlm"
+dynamic = ["version", "dependencies"]
+description = "Vision LLMs on Apple silicon with MLX and the Hugging Face Hub"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Prince Canuma", email = "prince.gdt@gmail.com"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/Blaizzy/mlx-vlm"
+Repository = "https://github.com/Blaizzy/mlx-vlm"
+Issues = "https://github.com/Blaizzy/mlx-vlm/issues"
+
+[project.scripts]
+"mlx_vlm.convert" = "mlx_vlm.convert:main"
+"mlx_vlm.generate" = "mlx_vlm.generate:main"
+
+[tool.setuptools]
+packages = ["mlx_vlm"]
+
+[tool.setuptools.dynamic]
+version = {attr = "mlx_vlm.version.__version__"}
+dependencies = {file = ["requirements.txt"]}
