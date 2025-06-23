@@ -829,8 +829,23 @@ def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarra
 def load_audio(
     file: str,
     sr: int,
+    timeout: int = 10,
 ):
-    audio, sample_rate = sf.read(file, always_2d=True)
+    """
+    Helper function to load audio from either a URL or file.
+    """
+    if file.startswith(("http://", "https://")):
+        try:
+            response = requests.get(file, stream=True, timeout=timeout)
+            response.raise_for_status()
+            audio, sample_rate = sf.read(BytesIO(response.content), always_2d=True)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load audio from URL: {file} with error {e}"
+            ) from e
+    else:
+        audio, sample_rate = sf.read(file, always_2d=True)
+
     if sample_rate != sr:
         audio = resample_audio(audio, sample_rate, sr)
     return np.array(audio).mean(axis=1)
@@ -1223,9 +1238,6 @@ def stream_generate(
         if model.config.model_type in ["gemma3", "gemma3n"]
         else True
     )
-    prompt_tokens = mx.array(
-        tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
-    )
 
     resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)
@@ -1242,6 +1254,7 @@ def stream_generate(
             prompts=prompt,
             image_token_index=image_token_index,
             resize_shape=resize_shape,
+            add_special_tokens=add_special_tokens,
         )
         input_ids = inputs.get("input_ids", None)
         pixel_values = inputs.get("pixel_values", None)
@@ -1396,3 +1409,42 @@ def generate(
     }
 
     return text, usage_stats
+
+
+def print_array_report(t: mx.array, label: Optional[str]) -> dict:
+    """
+    Return a dictionary report of an MLX array similar to PyTorch's tensor representation.
+    Args:
+        arr: MLX array to analyze
+    Returns:
+        Dictionary containing shape, dtype, value representation, and statistics
+    """
+
+    from pprint import pprint
+
+    # Get basic statistics
+    mean_val = mx.mean(t)
+    std_val = mx.std(t)
+    min_val = mx.min(t)
+    max_val = mx.max(t)
+
+    report = {
+        "shape": f"{tuple(t.shape)}",
+        "dtype": str(t.dtype),
+        "value": repr(t),
+        "mean": f"array({mean_val}, dtype={t.dtype})",
+        "std": f"array({std_val}, dtype={t.dtype})",
+        "min": f"array({min_val}, dtype={t.dtype})",
+        "max": f"array({max_val}, dtype={t.dtype})",
+        "label": label if label else "array",
+    }
+
+    # Print each field, handling 'value' specially
+    print("{")
+    for key, value in report.items():
+        if key == "value":
+            print(f" '{key}': {value},")  # No quotes around value
+        else:
+            print(f" '{key}': {repr(value)},")
+    print("}")
+    return report

@@ -38,7 +38,6 @@ def convert_torch_to_mlx_pad_width(padding, input_shape):
     return pad_width
 
 
-
 class Gemma3nAudioRelativePositionEmbedding(nn.Module):
 
     def __init__(self, config: AudioConfig, *args, **kwargs):

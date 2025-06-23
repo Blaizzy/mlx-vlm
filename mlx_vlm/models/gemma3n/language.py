@@ -8,8 +8,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import _BaseCache
 
-from ..base import LanguageModelOutput
-from ..cache import SlidingWindowCache, StaticKVCache
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache, RotatingKVCache
 from .config import TextConfig
 
 
@@ -83,7 +83,6 @@ def apply_rotary_pos_emb(
     x: mx.array,
     cos: mx.array,
     sin: mx.array,
-    position_ids: Optional[mx.array] = None,
     unsqueeze_dim: int = 1,
 ):
 
@@ -94,7 +93,6 @@ def apply_rotary_pos_emb(
 
 def _compute_default_rope_parameters(
     config: Optional[TextConfig] = None,
-    seq_len: Optional[int] = None,
     **rope_kwargs,
 ) -> tuple[mx.array, float]:
 
@@ -167,7 +165,7 @@ class Gemma3nRotaryEmbedding(nn.Module):
 class Gemma3nAttention(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
-        self.is_sliding = (layer_idx + 1) % config.sliding_window_pattern
+        self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         self.attn_logit_softcapping = config.attn_logit_softcapping
 
         dim = config.hidden_size
@@ -193,6 +191,7 @@ class Gemma3nAttention(nn.Module):
         first_kv_shared_layer_idx = (
             config.num_hidden_layers - config.num_kv_shared_layers
         )
+
         self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx
 
         # Compute the layer index from which shared KV cache values will be retrieved.
@@ -212,6 +211,7 @@ class Gemma3nAttention(nn.Module):
         cache: Optional[Any] = None,
         caches: Optional[List[Any]] = None,
         position_embeddings: Optional[mx.array] = None,
+        cache_position: Optional[mx.array] = None,
     ) -> mx.array:
         input_shape = x.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -227,9 +227,7 @@ class Gemma3nAttention(nn.Module):
         if (
             self.is_kv_shared_layer
             and self.kv_shared_layer_index is not None
-            and caches is not None
             and cache is not None
-            and cache.offset > 0
         ):
             # For shared layers, retrieve KV from the designated cache layer
             shared_cache = caches[self.kv_shared_layer_index]
@@ -258,7 +256,7 @@ class Gemma3nAttention(nn.Module):
             attn_weights = mx.tanh(attn_weights)
             attn_weights = attn_weights * self.attn_logit_softcapping
         if mask is not None:  # no matter the length, we just slice it
-            causal_mask = mask[:, :, :, : keys.shape[-2]]
+            causal_mask = mask[:, : keys.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
         # upcast attention to fp32
@@ -480,7 +478,14 @@ class Gemma3nDecoderLayer(nn.Module):
             # For FA2, the mask is 2D and is of shape [bs, processed_tokens] (not [bs, max_cache_len]),
             # thus we must slice from the right (at most `effective_seq_len` elements)
 
-            min_dtype = mx.finfo(mask.dtype).min
+            # Handle boolean mask properly
+            if mask.dtype == mx.bool_:
+                # Convert boolean mask to float mask where True=0.0 (allowed) and False=min_value (masked)
+                min_dtype = mx.finfo(mx.float32).min
+                mask = mx.where(mask, 0.0, min_dtype)
+            else:
+                min_dtype = mx.finfo(mask.dtype).min
+
             sliding_window_mask = mx.tril(
                 mx.ones(mask.shape, dtype=mx.bool_), k=-self.sliding_window
             )
@@ -493,7 +498,7 @@ class Gemma3nDecoderLayer(nn.Module):
             # but without data-dependent slicing (i.e. torch.compile friendly)
             mask_indexes = mx.arange(min(effective_seq_len, mask.shape[-1]))
             mask_indexes += offset
-            mask = mask[:, :, :, mask_indexes.astype(mx.int32)]
+            mask = mask[:, mask_indexes.astype(mx.int32)]
 
         predictions = self.altup.predict(x)
         active_prediction = predictions[self.config.altup_active_idx]
@@ -513,6 +518,7 @@ class Gemma3nDecoderLayer(nn.Module):
             cache,
             caches,
             position_embeddings,
+            cache_position,
         )
 
         attn = self.post_attention_layernorm(attn)
@@ -571,6 +577,7 @@ class Gemma3Model(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.vocab_size = config.vocab_size
+        self.vocab_size_per_layer_input = config.vocab_size_per_layer_input
         self.num_hidden_layers = config.num_hidden_layers
         assert self.vocab_size > 0
 
@@ -583,7 +590,7 @@ class Gemma3Model(nn.Module):
         ]
 
         self.embed_tokens_per_layer = Gemma3nTextScaledWordEmbedding(
-            config.vocab_size,
+            config.vocab_size_per_layer_input,
             config.num_hidden_layers * config.hidden_size_per_layer_input,
             embed_scale=config.hidden_size_per_layer_input**0.5,
         )
@@ -628,114 +635,6 @@ class Gemma3Model(nn.Module):
         config.rope_scaling = {"rope_type": "default"}
         self.rope_embedding_local = Gemma3nRotaryEmbedding(config)
 
-    def _update_causal_mask(
-        self,
-        attention_mask: mx.array,
-        input_tensor: mx.array,
-        cache_position: mx.array,
-        past_key_values: list | None,
-    ):
-        """
-        Build a 4-D (B,1,Q,K) mask that bans
-            • every key to the right of the current query token (causality)
-            • every key that is padding (attention_mask == 0)
-        and leaves allowed cells at 0 · 0.
-        """
-
-        dtype = input_tensor.dtype
-        batch = input_tensor.shape[0]
-        q_len = input_tensor.shape[1]  # sequence_length
-
-        # -- determine how *wide* the mask must be ---------------------------
-        if past_key_values and isinstance(  # cache list exists
-            past_key_values[0], _BaseCache
-        ):  # our KV-cache class
-            layer0 = past_key_values[0]
-
-            if layer0.keys is not None:  # cache already filled
-                k_len = int(layer0.keys.shape[2])
-            else:  # first forward pass
-                k_len = int(layer0.max_size)  # use full capacity
-
-            k_len = max(k_len, q_len)  # safety for pre-fill
-        else:
-            k_len = (
-                int(attention_mask.shape[-1]) if attention_mask is not None else q_len
-            )
-
-        # -- build / return ---------------------------------------------------
-        return self._prepare_4d_causal_attention_mask_with_cache_position(
-            attention_mask,
-            sequence_length=q_len,
-            target_length=k_len,
-            dtype=dtype,
-            cache_position=cache_position,
-            batch_size=batch,
-        )
-
-    @staticmethod
-    def _prepare_4d_causal_attention_mask_with_cache_position(
-        attention_mask: mx.array | None,  # (B ,K) or (B,1,Q,K) or None
-        sequence_length: int,  # Q
-        target_length: int,  # K
-        dtype,
-        cache_position: mx.array,  # (Q,)  – indices of current tokens
-        batch_size: int,
-    ):
-        """
-        Exact port of HF Gemma3 · 5 logic (2025-05-29).
-
-        Returned tensor shape → (B, 1, Q, K)   – values are 0.0 (keep) or
-        the minimum finite value of `dtype` (ban).
-        """
-        # ------------------------------------------------------------------ #
-        #  if caller already gave us a 4-D “inverted” mask (Flex, FA2, …) we
-        #  trust it and short-circuit.
-        # ------------------------------------------------------------------ #
-        if attention_mask is not None and attention_mask.ndim == 4:
-            return attention_mask.astype(dtype)
-
-        min_val = mx.finfo(dtype).min  # -∞  in chosen precision
-
-        # ------------------------------------------------------------------ #
-        # 1. causal part  – start full of -∞ then zero-out lower-triangle
-        # ------------------------------------------------------------------ #
-        causal = mx.full((sequence_length, target_length), min_val, dtype=dtype)
-
-        if sequence_length != 1:
-            causal = mx.triu(causal, k=1)  # keep q≥k at 0.0
-
-        # static-cache shift: forbid keys that have *not* been written yet
-        # (i.e. k_index  >  cache_position[q])
-        causal *= mx.arange(target_length) > cache_position.reshape(-1, 1)
-
-        # shape → (1,1,Q,K) then broadcast batch
-        causal = mx.expand_dims(causal, 0)  # (1,Q,K)
-        causal = mx.expand_dims(causal, 0)  # (1,1,Q,K)
-        causal = mx.repeat(causal, repeats=batch_size, axis=0).astype(dtype)
-
-        # ------------------------------------------------------------------ #
-        # 2. padding part  – turn “mask = 0” keys into -∞ inside the slice
-        # ------------------------------------------------------------------ #
-        if attention_mask is not None:  # (B,K)
-            Kmask_len = int(attention_mask.shape[-1])
-            key_pad = attention_mask.astype(dtype)  # 1/0
-            key_pad = mx.expand_dims(key_pad, 1)  # (B,1,K)
-            key_pad = mx.expand_dims(key_pad, 2)  # (B,1,1,K)
-
-            # slice only the prefix that overlaps real keys
-            causal_prefix = causal[:, :, :, :Kmask_len]
-            causal_prefix = mx.where(
-                key_pad == 0,  # ==> padding key?
-                min_val,  # ban
-                causal_prefix,  # keep previous (0 or –∞)
-            )
-            causal = mx.concatenate(
-                [causal_prefix, causal[:, :, :, Kmask_len:]], axis=-1
-            )
-
-        return causal
-
     def __call__(
         self,
         inputs: mx.array = None,
@@ -769,12 +668,10 @@ class Gemma3Model(nn.Module):
                 past_seen_tokens + h.shape[1],
             )
 
-        causal_mask = self._update_causal_mask(
-            mask,
-            h,
-            cache_position,
-            cache,
-        )
+        if mask is None:
+            j = self.config.sliding_window_pattern
+            full_mask = create_attention_mask(h, cache[j - 1 : j], return_array=True)
+            sliding_window_mask = create_attention_mask(h, cache, return_array=True)
 
         h0 = h
 
@@ -802,9 +699,17 @@ class Gemma3Model(nn.Module):
         ):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
+            is_global = self.config.layer_types[i] == "global_attention"
+
+            local_mask = mask
+            if mask is None and is_global:
+                local_mask = full_mask
+            elif mask is None:
+                local_mask = sliding_window_mask
+
             h = layer(
                 h,
-                causal_mask,
+                local_mask,
                 c,
                 per_layer_input,
                 cache,
@@ -828,7 +733,7 @@ class Gemma3Model(nn.Module):
 
     def get_per_layer_inputs(self, input_ids: mx.array) -> mx.array:
         per_layer_inputs_mask = mx.logical_and(
-            input_ids >= 0, input_ids < self.vocab_size
+            input_ids >= 0, input_ids < self.vocab_size_per_layer_input
         )
         tokens = mx.where(per_layer_inputs_mask, input_ids, mx.zeros_like(input_ids))
         result = self.embed_tokens_per_layer(tokens).reshape(
@@ -873,6 +778,9 @@ class LanguageModel(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.final_logit_softcapping = config.final_logit_softcapping
 
+        # Store the actual text vocabulary size for masking
+        self.text_vocab_size = config.vocab_size_per_layer_input  # 262144
+
     def __call__(
         self,
         inputs: mx.array = None,
@@ -885,8 +793,10 @@ class LanguageModel(nn.Module):
             inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache, **kwargs
         )
         out = self.lm_head(out)
-        out = mx.tanh(out / self.final_logit_softcapping)
-        out = out * self.final_logit_softcapping
+        if self.final_logit_softcapping is not None:
+            out = mx.tanh(out / self.final_logit_softcapping)
+            out = out * self.final_logit_softcapping
+
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
@@ -928,12 +838,10 @@ class LanguageModel(nn.Module):
         for i in range(self.config.num_hidden_layers):
             # Normal KVcache and RotatingKVCache work,
             # but results are better with StaticKVCache and SlidingWindowCache.
-            if (
-                i % self.config.sliding_window_pattern
-                == self.config.sliding_window_pattern - 1
-            ):
+            if self.config.layer_types[i] == "sliding_attention":
                 caches.append(
-                    StaticKVCache(
+                    RotatingKVCache(
+                        keep=0,
                         max_size=min(
                             self.config.sliding_window,
                             self.config.max_position_embeddings,
@@ -941,13 +849,6 @@ class LanguageModel(nn.Module):
                     )
                 )
             else:
-                caches.append(
-                    SlidingWindowCache(
-                        max_size=min(
-                            self.config.sliding_window,
-                            self.config.max_position_embeddings,
-                        ),
-                    )
-                )
+                caches.append(KVCache())
 
         return caches

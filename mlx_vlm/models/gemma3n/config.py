@@ -26,7 +26,7 @@ class AudioConfig:
     sscp_conv_eps: float = 1e-3
     rms_norm_eps: float = 1e-6
     gradient_clipping: float = 10000000000.0
-    vocab_offset: int = 262_144 + 128 # text vocab size + vision vocab size
+    vocab_offset: int = 262_144 + 128  # text vocab size + vision vocab size
 
     @classmethod
     def from_dict(cls, params):
@@ -41,7 +41,7 @@ class AudioConfig:
 
 @dataclass
 class VisionConfig:
-    model_type: str = "siglip_vision_model"
+    model_type: str = "gemma3n_vision"
     num_hidden_layers: int = 12
     hidden_size: int = 2048
     intermediate_size: int = 8192
@@ -49,8 +49,8 @@ class VisionConfig:
     patch_size: int = 16
     image_size: int = 224
     num_channels: int = 3
-    vocab_size: int = 128
     rms_norm_eps: float = 1e-6
+    vocab_size: int = 128
     vocab_offset: int = 262_144
 
     @classmethod
@@ -73,7 +73,8 @@ class TextConfig:
     num_attention_heads: int = 2
     head_dim: int = 256
     rms_norm_eps: float = 1.0e-6
-    vocab_size: int = 262144
+    vocab_size: int = 262400
+    vocab_size_per_layer_input: int = 262144
     num_key_value_heads: int = 4
     laurel_rank: int = 64
     frac_shared_layers: float = 0.5
@@ -97,6 +98,7 @@ class TextConfig:
     num_kv_shared_layers: int = 0
     max_position_embeddings: int = 32768
     attn_logit_softcapping: float = 0.0
+    layer_types: List[str] = None
 
     @classmethod
     def from_dict(cls, params):
