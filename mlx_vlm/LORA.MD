@@ -55,6 +55,7 @@ The script accepts the following command-line arguments:
 - `--steps`: Number of steps per epoch (default: 0)
 - `--print-every`: Print loss every n steps (default: 10)
 - `--adapter-path`: Load path to resume training from a previously saved adapter (default: None)
+- `--save-after-epoch`: Save a copy of the adapter file after each epoch
 - `--output-path`: Path to save the trained adapter (default: "adapters.safetensors")
 
 ## Example
