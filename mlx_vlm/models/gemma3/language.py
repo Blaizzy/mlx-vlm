@@ -24,7 +24,7 @@ class TextConfig:
     rope_global_base_freq: float = 1_000_000.0
     rope_local_base_freq: float = 10_000.0
     rope_traditional: bool = False
-    query_pre_attn_scalar: float = 0.0625
+    query_pre_attn_scalar: float = 256
     sliding_window: int = 1024
     rope_scaling: Optional[Dict[str, Union[float, List[float]]]] = None
     mm_tokens_per_image: int = 256
