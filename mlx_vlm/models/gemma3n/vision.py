@@ -989,15 +989,17 @@ class VisionModel(nn.Module):
 
     def sanitize(self, weights):
         sanitized_weights = {}
+        skip_transpose = False
+        _, H, _, C = weights["vision_tower.timm_model.blocks.0.0.conv_exp.weight"].shape
+        if C > H:
+            skip_transpose = True
+
         for k, v in weights.items():
             # PyTorch conv2d weight: [out_channels, in_channels, kH, kW]
             # MLX conv2d weight: [out_channels, kH, KW, in_channels]
             if ("conv" in k and "weight" in k) or ("attn" and "proj.weight") in k:
-                if len(v.shape) == 4:
-                    if check_array_shape(v):
-                        v = v
-                    else:
-                        v = v.transpose(0, 2, 3, 1)
+                if len(v.shape) == 4 and not skip_transpose:
+                    v = v.transpose(0, 2, 3, 1)
             sanitized_weights[k] = v
 
         return sanitized_weights
