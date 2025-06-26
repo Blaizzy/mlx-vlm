@@ -5,7 +5,7 @@ from typing import List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..kernels import nearest_interpolate
+from ..kernels import bicubic_interpolate
 
 
 @dataclass
