@@ -9,17 +9,8 @@ import mlx.nn as nn
 
 from mlx_vlm.models.gemma3n.config import VisionConfig
 
+from ..base import check_array_shape
 from ..kernels import bicubic_interpolate, nearest_interpolate
-
-
-def check_array_shape(arr):
-    if len(arr.shape) != 4:
-        return False
-
-    out_channels, kH, kW, _ = arr.shape
-
-    # Check if out_channels is the largest, and kH and KW are the same
-    return (out_channels >= kH) and (out_channels >= kW) and (kH == kW)
 
 
 # https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/models/mobilenetv5.py#L24
@@ -1003,7 +994,10 @@ class VisionModel(nn.Module):
             # MLX conv2d weight: [out_channels, kH, KW, in_channels]
             if ("conv" in k and "weight" in k) or ("attn" and "proj.weight") in k:
                 if len(v.shape) == 4:
-                    v = v.transpose(0, 2, 3, 1)
+                    if check_array_shape(v):
+                        v = v
+                    else:
+                        v = v.transpose(0, 2, 3, 1)
             sanitized_weights[k] = v
 
         return sanitized_weights
