@@ -12,7 +12,8 @@ from .utils import (
 )
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
-DEFAULT_IMAGE = []
+DEFAULT_IMAGE = None
+DEFAULT_AUDIO = None
 DEFAULT_PROMPT = "What are these?"
 DEFAULT_MAX_TOKENS = 256
 DEFAULT_TEMPERATURE = 0.5
@@ -42,6 +43,13 @@ def parse_arguments():
         nargs="+",
         default=DEFAULT_IMAGE,
         help="URL or path of the image to process.",
+    )
+    parser.add_argument(
+        "--audio",
+        type=str,
+        nargs="+",
+        default=DEFAULT_AUDIO,
+        help="URL or path of the audio to process.",
     )
     parser.add_argument(
         "--resize-shape",
@@ -88,6 +96,11 @@ def parse_arguments():
         action="store_true",
         help="Skip special tokens in the detokenizer.",
     )
+    parser.add_argument(
+        "--force-download",
+        action="store_true",
+        help="Force download the model from Hugging Face.",
+    )
 
     return parser.parse_args()
 
@@ -110,7 +123,13 @@ def main():
 
     prompt = codecs.decode(args.prompt, "unicode_escape")
 
-    prompt = apply_chat_template(processor, config, prompt, num_images=len(args.image))
+    num_images = len(args.image) if args.image is not None else 0
+    num_audios = (
+        1 if args.audio is not None else 0
+    )  # TODO: Support multiple audio files
+    prompt = apply_chat_template(
+        processor, config, prompt, num_images=num_images, num_audios=num_audios
+    )
 
     kwargs = {}
 
@@ -147,6 +166,7 @@ def main():
                 processor,
                 prompt,
                 args.image,
+                args.audio,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
                 **kwargs,
@@ -163,6 +183,7 @@ def main():
             processor,
             prompt,
             image=args.image,
+            audio=args.audio,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             verbose=args.verbose,
