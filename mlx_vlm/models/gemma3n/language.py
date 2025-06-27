@@ -559,24 +559,6 @@ class Gemma3nDecoderLayer(nn.Module):
         return corrected_predictions
 
 
-class Gemma3nTextScaledWordEmbedding(nn.Embedding):
-    """This module overrides nn.Embeddings' forward by multiplying with embeddings scale."""
-
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        embed_scale: Optional[float] = 1.0,
-    ):
-        super().__init__(num_embeddings, embedding_dim)
-        self.embed_scale = embed_scale
-
-    def __call__(self, x: mx.array):
-        return super().__call__(x) * mx.array(self.embed_scale, mx.float32).astype(
-            self.weight.dtype
-        )
-
-
 class Gemma3Model(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -587,19 +569,21 @@ class Gemma3Model(nn.Module):
         self.num_hidden_layers = config.num_hidden_layers
         assert self.vocab_size > 0
 
-        self.embed_tokens = Gemma3nTextScaledWordEmbedding(
-            config.vocab_size, config.hidden_size, embed_scale=config.hidden_size**0.5
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size,
+            config.hidden_size,
         )
+        self._embed_tokens_scale = config.hidden_size**0.5
         self.layers = [
             Gemma3nDecoderLayer(config=config, layer_idx=layer_idx)
             for layer_idx in range(config.num_hidden_layers)
         ]
 
-        self.embed_tokens_per_layer = Gemma3nTextScaledWordEmbedding(
+        self.embed_tokens_per_layer = nn.Embedding(
             config.vocab_size_per_layer_input,
             config.num_hidden_layers * config.hidden_size_per_layer_input,
-            embed_scale=config.hidden_size_per_layer_input**0.5,
         )
+        self._embed_tokens_per_layer_scale = config.hidden_size_per_layer_input**0.5
 
         self.per_layer_model_projection = nn.Linear(
             config.hidden_size,
@@ -652,6 +636,7 @@ class Gemma3Model(nn.Module):
         per_layer_inputs = kwargs.get("per_layer_inputs", None)
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
+            h = (h * mx.array(self._embed_tokens_scale, mx.float32)).astype(h.dtype)
         else:
             h = inputs_embeds
 
@@ -742,7 +727,11 @@ class Gemma3Model(nn.Module):
             input_ids >= 0, input_ids < self.vocab_size_per_layer_input
         )
         tokens = mx.where(per_layer_inputs_mask, input_ids, mx.zeros_like(input_ids))
-        result = self.embed_tokens_per_layer(tokens).reshape(
+        result = self.embed_tokens_per_layer(tokens)
+        result = (result * mx.array(self._embed_tokens_scale, mx.float32)).astype(
+            result.dtype
+        )
+        result = result.reshape(
             *input_ids.shape,
             self.config.num_hidden_layers,
             self.config.hidden_size_per_layer_input,
