@@ -225,9 +225,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     weights = sanitize_weights(
         model_class.LanguageModel, weights, model_config.text_config
     )
-    weights = sanitize_weights(
-        model_class.AudioModel, weights, model_config.audio_config
-    )
+    if hasattr(model_class, "AudioModel"):
+        weights = sanitize_weights(
+            model_class.AudioModel, weights, model_config.audio_config
+        )
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized`
