@@ -728,7 +728,7 @@ class Gemma3Model(nn.Module):
         )
         tokens = mx.where(per_layer_inputs_mask, input_ids, mx.zeros_like(input_ids))
         result = self.embed_tokens_per_layer(tokens)
-        result = (result * mx.array(self._embed_tokens_scale, mx.float32)).astype(
+        result = (result * mx.array(self._embed_tokens_per_layer_scale, mx.float32)).astype(
             result.dtype
         )
         result = result.reshape(
