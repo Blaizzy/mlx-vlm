@@ -2,6 +2,7 @@ import contextlib
 import copy
 import glob
 import importlib
+import inspect
 import json
 import logging
 import shutil
@@ -225,9 +226,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     weights = sanitize_weights(
         model_class.LanguageModel, weights, model_config.text_config
     )
-    weights = sanitize_weights(
-        model_class.AudioModel, weights, model_config.audio_config
-    )
+    if hasattr(model_class, "AudioModel"):
+        weights = sanitize_weights(
+            model_class.AudioModel, weights, model_config.audio_config
+        )
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized`
@@ -853,34 +855,47 @@ def load_audio(
 
 def process_inputs(
     processor,
+    prompts,
     images=None,
     audio=None,
-    prompts=None,
     add_special_tokens=False,
     return_tensors="mlx",
 ):
+    # Get the process method from the processor
     process_method = getattr(processor, "process", processor)
 
-    return process_method(
-        text=prompts,
-        images=images,
-        audio=audio,
-        padding=True,
-        add_special_tokens=add_special_tokens,
-        return_tensors=return_tensors,
-    )
+    # Prepare arguments
+    args = {
+        "text": prompts,
+        "images": images,
+        "padding": True,
+        "return_tensors": return_tensors,
+    }
+
+    # Add special tokens if supported
+    if "add_special_tokens" in inspect.signature(process_method).parameters:
+        args["add_special_tokens"] = add_special_tokens
+
+    # Add audio if provided and supported
+    if audio is not None:
+        if "audio" in inspect.signature(process_method).parameters:
+            args["audio"] = audio
+        else:
+            raise ValueError(f"Processor {processor} does not support audio parameter")
+
+    return process_method(**args)
 
 
 def process_inputs_with_fallback(
-    processor, images, audio, prompts, add_special_tokens=False, return_tensors="mlx"
+    processor, prompts, images, audio, add_special_tokens=False, return_tensors="mlx"
 ):
     # First attempt with specified return_tensors
     try:
         return process_inputs(
             processor,
+            prompts=prompts,
             images=images,
             audio=audio,
-            prompts=prompts,
             add_special_tokens=add_special_tokens,
             return_tensors=return_tensors,
         )
@@ -894,9 +909,9 @@ def process_inputs_with_fallback(
                 )
                 return process_inputs(
                     processor,
+                    prompts=prompts,
                     images=images,
                     audio=audio,
-                    prompts=prompts,
                     add_special_tokens=add_special_tokens,
                     return_tensors="pt",
                 )
