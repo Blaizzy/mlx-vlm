@@ -855,49 +855,47 @@ def load_audio(
 
 def process_inputs(
     processor,
+    prompts,
     images=None,
     audio=None,
-    prompts=None,
     add_special_tokens=False,
     return_tensors="mlx",
 ):
+    # Get the process method from the processor
     process_method = getattr(processor, "process", processor)
 
-    # Check if processor supports audio parameter
-    process_signature = inspect.signature(process_method)
-    supports_audio = "audio" in process_signature.parameters
+    # Prepare arguments
+    args = {
+        "text": prompts,
+        "images": images,
+        "padding": True,
+        "return_tensors": return_tensors,
+    }
 
-    if audio is None:
-        return process_method(
-            text=prompts,
-            images=images,
-            padding=True,
-            add_special_tokens=add_special_tokens,
-            return_tensors=return_tensors,
-        )
-    elif supports_audio and audio is not None:
-        return process_method(
-            text=prompts,
-            images=images,
-            audio=audio,
-            padding=True,
-            add_special_tokens=add_special_tokens,
-            return_tensors=return_tensors,
-        )
-    else:
-        raise ValueError(f"Processor {processor} does not support audio parameter")
+    # Add special tokens if supported
+    if "add_special_tokens" in inspect.signature(process_method).parameters:
+        args["add_special_tokens"] = add_special_tokens
+
+    # Add audio if provided and supported
+    if audio is not None:
+        if "audio" in inspect.signature(process_method).parameters:
+            args["audio"] = audio
+        else:
+            raise ValueError(f"Processor {processor} does not support audio parameter")
+
+    return process_method(**args)
 
 
 def process_inputs_with_fallback(
-    processor, images, audio, prompts, add_special_tokens=False, return_tensors="mlx"
+    processor, prompts, images, audio, add_special_tokens=False, return_tensors="mlx"
 ):
     # First attempt with specified return_tensors
     try:
         return process_inputs(
             processor,
+            prompts=prompts,
             images=images,
             audio=audio,
-            prompts=prompts,
             add_special_tokens=add_special_tokens,
             return_tensors=return_tensors,
         )
@@ -911,9 +909,9 @@ def process_inputs_with_fallback(
                 )
                 return process_inputs(
                     processor,
+                    prompts=prompts,
                     images=images,
                     audio=audio,
-                    prompts=prompts,
                     add_special_tokens=add_special_tokens,
                     return_tensors="pt",
                 )
