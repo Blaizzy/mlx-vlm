@@ -349,7 +349,7 @@ def get_chat_template(
     try:
         processor = (
             processor
-            if hasattr(processor, "apply_chat_template")
+            if "chat_template" in processor.__dict__.keys()
             else processor.tokenizer
         )
 
