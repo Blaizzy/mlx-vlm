@@ -6,7 +6,11 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput, create_attention_mask
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from ..cache import KVCache, SimpleKVCache
 
 
@@ -149,7 +153,7 @@ class Florence2Attention(nn.Module):
             attention_mask = causal_mask
 
         attn_output = (
-            mx.fast.scaled_dot_product_attention(
+            scaled_dot_product_attention(
                 q, k, v, scale=self.scaling, mask=attention_mask
             )
             .transpose(0, 2, 1, 3)

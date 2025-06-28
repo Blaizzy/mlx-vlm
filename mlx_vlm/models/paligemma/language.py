@@ -5,7 +5,11 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput, create_attention_mask
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from ..cache import KVCache
 
 
@@ -104,8 +108,8 @@ class Attention(nn.Module):
             keys = self.rope(keys)
 
         if self.model_type == "gemma":
-            output = mx.fast.scaled_dot_product_attention(
-                queries, keys, values, scale=self.scale, mask=mask
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache, scale=self.scale, mask=mask
             )
         else:
             queries = queries * self.scale

@@ -7,7 +7,11 @@ import mlx.nn as nn
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
 
-from ..base import LanguageModelOutput, create_attention_mask
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from ..cache import ChunkedKVCache, KVCache
 
 
@@ -147,7 +151,7 @@ class Attention(nn.Module):
             if mask.shape[-1] != key_len:
                 mask = mask[..., -key_len:]
 
-        output = mx.fast.scaled_dot_product_attention(
+        output = scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
