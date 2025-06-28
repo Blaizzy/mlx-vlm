@@ -103,7 +103,7 @@ class Attention(nn.Module):
                 mask = mask[..., -key_len:]
 
         output = scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
+            queries, keys, values, cache, scale=self.scale, mask=mask
         )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)

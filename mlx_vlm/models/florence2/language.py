@@ -154,7 +154,7 @@ class Florence2Attention(nn.Module):
 
         attn_output = (
             scaled_dot_product_attention(
-                q, k, v, scale=self.scaling, mask=attention_mask
+                q, k, v, cache, scale=self.scaling, mask=attention_mask
             )
             .transpose(0, 2, 1, 3)
             .reshape(batch_size, tgt_len, -1)
