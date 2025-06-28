@@ -2,6 +2,7 @@ import contextlib
 import copy
 import glob
 import importlib
+import inspect
 import json
 import logging
 import shutil
@@ -862,14 +863,29 @@ def process_inputs(
 ):
     process_method = getattr(processor, "process", processor)
 
-    return process_method(
-        text=prompts,
-        images=images,
-        audio=audio,
-        padding=True,
-        add_special_tokens=add_special_tokens,
-        return_tensors=return_tensors,
-    )
+    # Check if processor supports audio parameter
+    process_signature = inspect.signature(process_method)
+    supports_audio = "audio" in process_signature.parameters
+
+    if audio is None:
+        return process_method(
+            text=prompts,
+            images=images,
+            padding=True,
+            add_special_tokens=add_special_tokens,
+            return_tensors=return_tensors,
+        )
+    elif supports_audio and audio is not None:
+        return process_method(
+            text=prompts,
+            images=images,
+            audio=audio,
+            padding=True,
+            add_special_tokens=add_special_tokens,
+            return_tensors=return_tensors,
+        )
+    else:
+        raise ValueError(f"Processor {processor} does not support audio parameter")
 
 
 def process_inputs_with_fallback(
