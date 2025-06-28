@@ -27,6 +27,8 @@ MODEL_CONFIG = {
     "idefics2": MessageFormat.LIST_WITH_IMAGE,
     "idefics3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "aya_vision": MessageFormat.LIST_WITH_IMAGE,
+    "qwen2_vl": MessageFormat.LIST_WITH_IMAGE,
+    "qwen2_5_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
@@ -177,7 +179,9 @@ class MessageFormatter:
         prompt: str,
         role: str,
         skip_image_token: bool,
+        skip_audio_token: bool,
         num_images: int,
+        num_audios: int,
         image_first: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
@@ -231,7 +235,9 @@ class MessageFormatter:
         prompt: str,
         role: str,
         skip_image_token: bool,
+        skip_audio_token: bool,
         num_images: int,
+        num_audios: int,
         token: str,
         image_first: bool = True,
         **kwargs,
@@ -246,7 +252,14 @@ class MessageFormatter:
         return {"role": role, "content": content}
 
     def _format_numbered_tokens(
-        self, prompt: str, role: str, skip_image_token: bool, num_images: int, **kwargs
+        self,
+        prompt: str,
+        role: str,
+        skip_image_token: bool,
+        skip_audio_token: bool,
+        num_images: int,
+        num_audios: int,
+        **kwargs,
     ) -> Dict[str, Any]:
         """Format with numbered image tokens."""
         content = prompt
@@ -263,7 +276,14 @@ class MessageFormatter:
         return {"role": role, "content": content}
 
     def _format_video_message(
-        self, prompt: str, role: str = "user", **kwargs
+        self,
+        prompt: str,
+        role: str = "user",
+        skip_image_token: bool = False,
+        skip_audio_token: bool = False,
+        num_images: int = 0,
+        num_audios: int = 0,
+        **kwargs,
     ) -> Dict[str, Any]:
         """Format a video message with text."""
         return {
@@ -306,6 +326,7 @@ def get_message_json(
         A dictionary or string representing the message for the specified model
     """
     formatter = MessageFormatter(model_name)
+
     return formatter.format_message(
         prompt,
         role,
@@ -328,7 +349,7 @@ def get_chat_template(
     try:
         processor = (
             processor
-            if hasattr(processor, "apply_chat_template")
+            if "chat_template" in processor.__dict__.keys()
             else processor.tokenizer
         )
 
