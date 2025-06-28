@@ -162,9 +162,6 @@ class Model(nn.Module):
 
         # Vision features
         if pixel_values is not None:
-            pixel_values = pixel_values.astype(
-                self.language_model.model.embed_tokens.weight.dtype
-            )
             image_features = self.get_image_features(pixel_values)
 
             return self.merge_multimodal_and_text(
