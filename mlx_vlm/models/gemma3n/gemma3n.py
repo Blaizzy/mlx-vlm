@@ -279,6 +279,7 @@ class Model(nn.Module):
         )
 
         per_layer_inputs = self.language_model.model.get_per_layer_inputs(input_ids)
+
         logits = self.language_model(
             input_ids=None,
             cache=cache,
@@ -296,56 +297,3 @@ class Model(nn.Module):
             else:
                 sanitized_weights[k] = v
         return sanitized_weights
-
-    @staticmethod
-    def from_pretrained(path_or_hf_repo: str):
-        path = Path(path_or_hf_repo)
-        if not path.exists():
-            path = Path(
-                snapshot_download(
-                    repo_id=path_or_hf_repo,
-                    allow_patterns=[
-                        "*.json",
-                        "*.safetensors",
-                        "*.py",
-                        "tokenizer.model",
-                        "*.tiktoken",
-                    ],
-                )
-            )
-
-        with open(path / "config.json", "r") as f:
-            config = json.load(f)
-
-        # Create nested configs first
-        text_config = TextConfig.from_dict(config.get("text_config", {}))
-        vision_config = VisionConfig.from_dict(config.get("vision_config", {}))
-        audio_config = AudioConfig.from_dict(config.get("audio_config", {}))
-
-        # Create model config with the nested configs
-        model_config = ModelConfig(
-            text_config=text_config,
-            vision_config=vision_config,
-            audio_config=audio_config,
-            model_type=config.get("model_type", "gemma3n"),
-            vocab_size=config.get("vocab_size", 257152),
-            audio_token_id=config.get("audio_token_id", 262273),
-            image_token_id=config.get("image_token_id", 262145),
-            audio_soft_tokens_per_image=config.get("audio_soft_tokens_per_image", 188),
-            eos_token_id=config.get("eos_token_id", None),
-        )
-
-        model = Model(model_config)
-        weight_files = glob.glob(str(path / "*.safetensors"))
-        if not weight_files:
-            raise FileNotFoundError(f"No safetensors found in {path}")
-
-        weights = {}
-        for wf in weight_files:
-            weights.update(mx.load(wf))
-
-        weights = model.sanitize(weights=weights)
-
-        weights = VisionModel(model_config.vision_config).sanitize(weights=weights)
-        model.load_weights(list(weights.items()))
-        return model

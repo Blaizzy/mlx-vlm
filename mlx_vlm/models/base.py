@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import create_attention_mask
+from mlx_lm.models.base import create_attention_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import RotatingKVCache
 from PIL import Image
 from transformers.image_processing_utils import BaseImageProcessor as ImageProcessor

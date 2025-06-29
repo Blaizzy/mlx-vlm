@@ -932,6 +932,19 @@ def prepare_inputs(
     resize_shape=None,
     add_special_tokens=False,
 ):
+
+    if images is None and audio is None:
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        inputs = tokenizer(prompts, add_special_tokens=add_special_tokens)
+        input_ids = mx.array([inputs.input_ids])
+        mask = mx.array([inputs.attention_mask])
+        return {
+            "input_ids": input_ids,
+            "attention_mask": mask,
+        }
+
     # Process images
     if images is not None:
         if not isinstance(images, list):
