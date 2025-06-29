@@ -62,8 +62,6 @@ class Gemma3nLaurelBlock(nn.Module):
         self.post_laurel_norm = Gemma3nRMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
-            scale_shift=0.0,
-            with_scale=True,
         )
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -331,8 +329,6 @@ class Gemma3nAltUp(nn.Module):
         self.router_norm = Gemma3nRMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
-            scale_shift=0.0,
-            with_scale=True,
         )
         self._router_input_scale = mx.array(self.config.hidden_size**-1.0)
 
@@ -434,18 +430,16 @@ class Gemma3nDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.self_attn = Gemma3nAttention(config, layer_idx)
         self.mlp = MLP(config, layer_idx=layer_idx)
-        self.input_layernorm = Gemma3nRMSNorm(
-            self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
-        )
+        self.input_layernorm = Gemma3nRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
 
         self.post_attention_layernorm = Gemma3nRMSNorm(
-            self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
+            self.hidden_size, eps=config.rms_norm_eps
         )
         self.pre_feedforward_layernorm = Gemma3nRMSNorm(
-            self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
+            self.hidden_size, eps=config.rms_norm_eps
         )
         self.post_feedforward_layernorm = Gemma3nRMSNorm(
-            self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
+            self.hidden_size, eps=config.rms_norm_eps
         )
         self.is_sliding = self.self_attn.is_sliding
         self.sliding_window = config.sliding_window
@@ -461,7 +455,7 @@ class Gemma3nDecoderLayer(nn.Module):
             self.hidden_size_per_layer_input, self.hidden_size, bias=False
         )
         self.post_per_layer_input_norm = Gemma3nRMSNorm(
-            self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
+            self.hidden_size, eps=config.rms_norm_eps
         )
 
     def __call__(
@@ -594,8 +588,6 @@ class Gemma3Model(nn.Module):
         self.per_layer_projection_norm = Gemma3nRMSNorm(
             dim=config.hidden_size_per_layer_input,
             eps=config.rms_norm_eps,
-            scale_shift=0.0,
-            with_scale=True,
         )
 
         self.altup_projections = [
@@ -611,8 +603,6 @@ class Gemma3Model(nn.Module):
         self.norm = Gemma3nRMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            scale_shift=0.0,
-            with_scale=True,
         )
 
         self._per_layer_projection_scale = mx.array(self.hidden_size**-0.5)
