@@ -121,7 +121,9 @@ def main():
 
     model, processor, config = get_model_and_processors(args.model, args.adapter_path)
 
-    prompt = codecs.decode(args.prompt, "unicode_escape")
+    # 直接使用原始 prompt，避免对 UTF-8 中文文本进行不必要的 unicode_escape 解码
+    # 这样可以防止中文字符被错误地转换为乱码
+    prompt = args.prompt
 
     num_images = len(args.image) if args.image is not None else 0
     num_audios = (
@@ -143,9 +145,16 @@ def main():
         )
 
     if args.eos_tokens is not None:
-        kwargs["eos_tokens"] = [
-            codecs.decode(token, "unicode_escape") for token in args.eos_tokens
-        ]
+        # 对 eos_tokens 进行安全的 unicode_escape 解码，如果解码失败则使用原始字符串
+        eos_tokens = []
+        for token in args.eos_tokens:
+            try:
+                decoded_token = codecs.decode(token, "unicode_escape")
+                eos_tokens.append(decoded_token)
+            except (UnicodeDecodeError, UnicodeError):
+                # 如果解码失败，使用原始字符串
+                eos_tokens.append(token)
+        kwargs["eos_tokens"] = eos_tokens
 
     if args.skip_special_tokens:
         kwargs["skip_special_tokens"] = args.skip_special_tokens
