@@ -802,7 +802,6 @@ async def generate_endpoint(request: GenerationRequest):
         if request.system:
             system_prompt = request.system
             chat_messages.append({"role": "system", "content": system_prompt})
-        # 直接使用原始 prompt，避免对 UTF-8 中文文本进行不必要的 unicode_escape 解码
         prompt = request.prompt
         chat_messages.append({"role": "user", "content": prompt})
 
