@@ -143,7 +143,6 @@ def main():
         )
 
     if args.eos_tokens is not None:
-        # 对 eos_tokens 进行安全的 unicode_escape 解码，如果解码失败则使用原始字符串
         eos_tokens = []
         for token in args.eos_tokens:
             try:
