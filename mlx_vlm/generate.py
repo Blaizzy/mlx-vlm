@@ -1,28 +1,24 @@
 import argparse
 import codecs
 import contextlib
+import functools
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
-from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
+from mlx_lm.generate import maybe_quantize_kv_cache
+from transformers import PreTrainedTokenizer
 
-from .models.cache import KVCache, SimpleKVCache
+from .models import cache
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
 from .utils import (
     StoppingCriteria,
     apply_repetition_penalty,
-    get_model_path,
     load,
-    load_config,
-    load_image_processor,
     prepare_inputs,
-    process_inputs,
-    process_inputs_with_fallback,
     tree_reduce,
 )
 
@@ -34,6 +30,7 @@ DEFAULT_MAX_TOKENS = 256
 DEFAULT_TEMPERATURE = 0.5
 DEFAULT_TOP_P = 1.0
 DEFAULT_SEED = 0
+DEFAULT_QUANTIZED_KV_START = 5000
 
 
 def parse_arguments():
@@ -105,6 +102,30 @@ def parse_arguments():
         nargs="+",
         default=None,
         help="EOS tokens to add to the tokenizer.",
+    )
+    parser.add_argument(
+        "--max-kv-size",
+        type=int,
+        default=None,
+        help="Maximum KV size for the prompt cache.",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        help="Number of bits to quantize the KV cache to.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for the KV cache.",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=DEFAULT_QUANTIZED_KV_START,
+        help="Start index for the quantized KV cache.",
     )
     parser.add_argument(
         "--skip-special-tokens",
@@ -182,6 +203,11 @@ def generate_step(
     repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
     logit_bias: Optional[Dict[int, float]] = None,
+    prompt_cache: Optional[List[Any]] = None,
+    max_kv_size: Optional[int] = None,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -204,6 +230,13 @@ def generate_step(
         Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
           one token and a vector of log probabilities.
     """
+
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
 
     def sample(logits: mx.array) -> Tuple[mx.array, float]:
         if logit_bias:
@@ -230,20 +263,12 @@ def generate_step(
         )
 
     y = input_ids
-    if hasattr(model.language_model, "make_cache"):
-        cache = model.language_model.make_cache()
-    else:
-        kv_heads = (
-            [model.language_model.n_kv_heads] * len(model.language_model.layers)
-            if isinstance(model.language_model.n_kv_heads, int)
-            else model.language_model.n_kv_heads
+    # Create the KV cache for generation
+    if prompt_cache is None:
+        prompt_cache = cache.make_prompt_cache(
+            model.language_model,
+            max_kv_size=max_kv_size,
         )
-        if model.config.model_type == "florence2":
-            cache = [
-                (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
-            ]
-        else:
-            cache = [KVCache() for n in kv_heads]
 
     repetition_context = input_ids.reshape(-1).tolist()
 
@@ -255,13 +280,13 @@ def generate_step(
             nonlocal repetition_context
             if "decoder_input_ids" in kwargs:
                 outputs = model.language_model(
-                    cache=cache,
+                    cache=prompt_cache,
                     **kwargs,
                 )
             else:
                 outputs = model.language_model(
                     y[None],
-                    cache=cache,
+                    cache=prompt_cache,
                     **kwargs,
                 )
 
@@ -279,11 +304,14 @@ def generate_step(
             if repetition_context_size:
                 if len(repetition_context) > repetition_context_size:
                     repetition_context = repetition_context[-repetition_context_size:]
+
+            quantize_cache_fn(prompt_cache)
             return y, logprobs.squeeze(0)
 
-    outputs = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
+    outputs = model(input_ids, pixel_values, cache=prompt_cache, mask=mask, **kwargs)
 
     logits = outputs.logits[:, -1, :]
+    quantize_cache_fn(prompt_cache)
     y, logprobs = sample(logits)
     mx.async_eval(y)
 
@@ -317,7 +345,7 @@ def generate_step(
         n += 1
 
         # Periodically clear cache to prevent memory accumulation
-        if n % 50 == 0:  # Clear cache every 50 tokens
+        if n % 256 == 0:  # Clear cache every 256 tokens
             mx.clear_cache()
 
 
@@ -603,6 +631,11 @@ def main():
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             verbose=args.verbose,
+            prompt_cache=None,  # TODO: Load prompt cache from file
+            max_kv_size=args.max_kv_size,
+            kv_bits=args.kv_bits,
+            kv_group_size=args.kv_group_size,
+            quantized_kv_start=args.quantized_kv_start,
             **kwargs,
         )
         if not args.verbose:
