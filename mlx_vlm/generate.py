@@ -149,7 +149,6 @@ def main():
                 decoded_token = codecs.decode(token, "unicode_escape")
                 eos_tokens.append(decoded_token)
             except (UnicodeDecodeError, UnicodeError):
-                # 如果解码失败，使用原始字符串
                 eos_tokens.append(token)
         kwargs["eos_tokens"] = eos_tokens
 
