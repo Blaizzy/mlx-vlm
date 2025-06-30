@@ -121,8 +121,6 @@ def main():
 
     model, processor, config = get_model_and_processors(args.model, args.adapter_path)
 
-    # 直接使用原始 prompt，避免对 UTF-8 中文文本进行不必要的 unicode_escape 解码
-    # 这样可以防止中文字符被错误地转换为乱码
     prompt = args.prompt
 
     num_images = len(args.image) if args.image is not None else 0
