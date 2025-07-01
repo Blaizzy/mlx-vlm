@@ -10,6 +10,7 @@ class MessageFormat(Enum):
     LIST_WITH_IMAGE_FIRST = "list_with_image_first"
     LIST_WITH_IMAGE_TYPE = "list_with_image_type"
     LIST_WITH_IMAGE_TYPE_TEXT = "list_with_image_type_text"
+    LIST_WITH_IMAGE_TYPE_TEXT_IMAGE_LAST = "list_with_image_type_text_image_last"
     IMAGE_TOKEN = "image_token"
     IMAGE_TOKEN_PIPE = "image_token_pipe"
     START_IMAGE_TOKEN = "start_image_token"
@@ -33,7 +34,7 @@ MODEL_CONFIG = {
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,
-    "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
+    "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT_IMAGE_LAST,
     "llama4": MessageFormat.LIST_WITH_IMAGE,
     "smolvlm": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "llava": MessageFormat.LIST_WITH_IMAGE,
@@ -141,6 +142,11 @@ class MessageFormatter:
             MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT: partial(
                 self._format_list_with_image_type, message_type="text"
             ),
+            MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT_IMAGE_LAST: partial(
+                self._format_list_with_image_type,
+                message_type="text",
+                image_first=False,
+            ),
             MessageFormat.IMAGE_TOKEN: partial(
                 self._format_with_token, token="<image>"
             ),
@@ -203,6 +209,7 @@ class MessageFormatter:
         num_images: int,
         num_audios: int,
         message_type: str = "content",
+        image_first: bool = True,
         **kwargs,
     ) -> Dict[str, Any]:
         """Format as a list with typed messages."""
@@ -215,9 +222,12 @@ class MessageFormatter:
 
         if role == "user":
             if not skip_image_token:
-                message["content"] = [
-                    MessageBuilder.image_message()
-                ] * num_images + message["content"]
+                message["content"] = (
+                    [MessageBuilder.image_message()] * num_images + message["content"]
+                    if image_first
+                    else message["content"]
+                    + [MessageBuilder.image_message()] * num_images
+                )
             if not skip_audio_token:
                 message["content"] = (
                     message["content"] + [MessageBuilder.audio_message()] * num_audios
