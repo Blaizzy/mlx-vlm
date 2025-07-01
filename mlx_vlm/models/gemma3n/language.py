@@ -123,6 +123,7 @@ class Gemma3nAttention(nn.Module):
     ) -> mx.array:
         B, L, _ = x.shape
 
+
         queries = self.q_proj(x)
         queries = queries.reshape(B, L, -1, self.head_dim)
         queries = self.q_norm(queries)
@@ -134,8 +135,10 @@ class Gemma3nAttention(nn.Module):
             offset = cache.offset
 
         else:
+
             if cache is not None:
                 offset = cache.offset
+
             keys = self.k_proj(x).reshape(B, L, -1, self.head_dim)
             keys = self.k_norm(keys)
             keys = keys.transpose(0, 2, 1, 3)

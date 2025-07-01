@@ -280,7 +280,7 @@ class Model(nn.Module):
             input_features_mask=input_features_mask,
             **kwargs,
         )
-
+        
         logits = self.language_model(
             input_ids=None,
             cache=cache,
