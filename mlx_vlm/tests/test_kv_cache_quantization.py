@@ -1,4 +1,3 @@
-
 import functools
 import sys
 from unittest.mock import MagicMock, Mock, patch
@@ -7,7 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-
+# Import the module to patch
 from mlx_vlm.generate import generate_step
 
 
@@ -79,11 +78,9 @@ class MockCache:
                 self.layers[i].keys = k
                 self.layers[i].values = v
 
-
     def reset(self):
         """Reset the cache."""
         self.offset = 0
-
         for layer in self.layers:
             layer.offset = 0
 
@@ -118,7 +115,6 @@ class TestKVCacheQuantization:
 
     def test_quantize_cache_fn_creation_and_called_during_generation(self):
         """Test that quantize_cache_fn is created correctly and called at the right points during generation."""
-
         # Create a mock for maybe_quantize_kv_cache
         mock_quantize_calls = []
 
@@ -135,11 +131,11 @@ class TestKVCacheQuantization:
                 # Create a proper mock cache
                 mock_cache_instance = MockCache()
                 mock_make_cache.return_value = mock_cache_instance
+
                 input_ids = mx.array([[1, 2, 3, 4, 5]])
                 pixel_values = mx.random.normal((1, 3, 336, 336))
                 mask = mx.ones((1, 5))
                 model = MockModel()
-
 
                 # Generate multiple tokens to test both creation and calling
                 gen = generate_step(
@@ -320,11 +316,11 @@ class TestKVCacheQuantization:
             with patch("mlx_vlm.models.cache.make_prompt_cache") as mock_make_cache:
                 mock_cache_instance = MockCache()
                 mock_make_cache.return_value = mock_cache_instance
+
                 input_ids = mx.array([[1, 2, 3, 4, 5]])
                 pixel_values = mx.random.normal((1, 3, 336, 336))
                 mask = mx.ones((1, 5))
                 model = MockModel()
-
 
                 # Generate without specifying kv_bits (quantization disabled)
                 gen = generate_step(
@@ -344,7 +340,6 @@ class TestKVCacheQuantization:
                 assert len(mock_quantize_calls) > 0
                 first_call_kwargs = mock_quantize_calls[0][1]
                 assert first_call_kwargs["kv_bits"] is None
-                
 
     def test_cache_memory_with_quantization(self):
         """Test that cache memory usage is affected by quantization."""

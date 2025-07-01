@@ -295,7 +295,7 @@ def load(
     if image_processor is not None:
         processor.image_processor = image_processor
 
-    return model, processor, model.config
+    return model, processor
 
 
 def load_config(model_path: Union[str, Path], **kwargs) -> dict:
