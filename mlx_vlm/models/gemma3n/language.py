@@ -123,7 +123,6 @@ class Gemma3nAttention(nn.Module):
     ) -> mx.array:
         B, L, _ = x.shape
 
-
         queries = self.q_proj(x)
         queries = queries.reshape(B, L, -1, self.head_dim)
         queries = self.q_norm(queries)
