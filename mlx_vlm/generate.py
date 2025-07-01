@@ -563,7 +563,8 @@ def main():
     if isinstance(args.image, str):
         args.image = [args.image]
 
-    model, processor, config = load(args.model, args.adapter_path)
+    model, processor = load(args.model, args.adapter_path)
+    config = model.config
 
     prompt = codecs.decode(args.prompt, "unicode_escape")
 
