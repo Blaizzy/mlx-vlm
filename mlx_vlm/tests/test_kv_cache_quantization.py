@@ -96,7 +96,7 @@ class TestKVCacheQuantization:
 
     def test_quantize_cache_fn_creation_and_called_during_generation(self):
         """Test that quantize_cache_fn is created correctly and called at the right points during generation."""
-        with patch("mlx_vlm.generate.maybe_quantize_kv_cache") as mock_quantize:
+        with patch("mlx_lm.generate.maybe_quantize_kv_cache") as mock_quantize:
             input_ids = mx.array([[1, 2, 3, 4, 5]])
             pixel_values = mx.random.normal((1, 3, 336, 336))
             mask = mx.ones((1, 5))
@@ -138,7 +138,7 @@ class TestKVCacheQuantization:
         bit_configs = [2, 4, 8]
 
         for bits in bit_configs:
-            with patch("mlx_vlm.generate.maybe_quantize_kv_cache") as mock_quantize:
+            with patch("mlx_lm.generate.maybe_quantize_kv_cache") as mock_quantize:
                 input_ids = mx.array([[1, 2, 3, 4, 5]])
                 pixel_values = mx.random.normal((1, 3, 336, 336))
                 mask = mx.ones((1, 5))
@@ -168,7 +168,7 @@ class TestKVCacheQuantization:
         group_sizes = [64, 128]
 
         for group_size in group_sizes:
-            with patch("mlx_vlm.generate.maybe_quantize_kv_cache") as mock_quantize:
+            with patch("mlx_lm.generate.maybe_quantize_kv_cache") as mock_quantize:
                 input_ids = mx.array([[1, 2, 3, 4, 5]])
                 pixel_values = mx.random.normal((1, 3, 336, 336))
                 mask = mx.ones((1, 5))
@@ -199,7 +199,7 @@ class TestKVCacheQuantization:
         start_indices = [0, 100, 1000, 5000]
 
         for start_idx in start_indices:
-            with patch("mlx_vlm.generate.maybe_quantize_kv_cache") as mock_quantize:
+            with patch("mlx_lm.generate.maybe_quantize_kv_cache") as mock_quantize:
                 input_ids = mx.array([[1, 2, 3, 4, 5]])
                 pixel_values = mx.random.normal((1, 3, 336, 336))
                 mask = mx.ones((1, 5))
@@ -227,7 +227,7 @@ class TestKVCacheQuantization:
 
     def test_generation_without_quantization(self):
         """Test that generation works without KV cache quantization."""
-        with patch("mlx_vlm.generate.maybe_quantize_kv_cache") as mock_quantize:
+        with patch("mlx_lm.generate.maybe_quantize_kv_cache") as mock_quantize:
             input_ids = mx.array([[1, 2, 3, 4, 5]])
             pixel_values = mx.random.normal((1, 3, 336, 336))
             mask = mx.ones((1, 5))
@@ -301,7 +301,7 @@ class TestKVCacheQuantization:
 
     def test_quantization_with_long_sequences(self):
         """Test KV cache quantization behavior with long sequences."""
-        with patch("mlx_vlm.generate.maybe_quantize_kv_cache") as mock_quantize:
+        with patch("mlx_lm.generate.maybe_quantize_kv_cache") as mock_quantize:
             # Create a longer input sequence
             input_ids = mx.array([[1] * 1000])  # 1000 tokens
             pixel_values = mx.random.normal((1, 3, 336, 336))
@@ -328,7 +328,7 @@ class TestKVCacheQuantization:
 
     def test_quantization_with_prompt_cache(self):
         """Test KV cache quantization when using existing prompt cache."""
-        with patch("mlx_vlm.generate.maybe_quantize_kv_cache") as mock_quantize:
+        with patch("mlx_lm.generate.maybe_quantize_kv_cache") as mock_quantize:
             input_ids = mx.array([[1, 2, 3, 4, 5]])
             pixel_values = mx.random.normal((1, 3, 336, 336))
             mask = mx.ones((1, 5))
