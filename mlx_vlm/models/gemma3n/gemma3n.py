@@ -1,14 +1,10 @@
-import glob
-import json
-from pathlib import Path
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from huggingface_hub import snapshot_download
 
 from .audio import AudioModel
-from .config import AudioConfig, ModelConfig, TextConfig, VisionConfig
+from .config import ModelConfig, TextConfig
 from .language import Gemma3nRMSNorm, LanguageModel
 from .vision import VisionModel
 
@@ -127,16 +123,14 @@ class Model(nn.Module):
         if input_ids is not None:
             inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-            # Ensure no gaps between text, vision, and audio embeddings, in that order
-            assert (
-                self.embed_audio.vocab_offset
-                == self.vocab_size - self.embed_audio.vocab_size
+            per_layer_inputs_mask = mx.logical_and(
+                input_ids >= 0, input_ids < self.vocab_size_per_layer_input
             )
-            assert (
-                self.embed_vision.vocab_offset
-                == self.vocab_size
-                - self.embed_audio.vocab_size
-                - self.embed_vision.vocab_size
+            per_layer_inputs_tokens = mx.where(
+                per_layer_inputs_mask, input_ids, mx.zeros_like(input_ids)
+            )
+            per_layer_inputs = self.language_model.model.get_per_layer_inputs(
+                per_layer_inputs_tokens
             )
 
             # Handle vision tokens (>= embed_vision.vocab_offset and < embed_audio.vocab_offset)
@@ -144,27 +138,34 @@ class Model(nn.Module):
                 input_ids >= self.embed_vision.vocab_offset,
                 input_ids < self.embed_audio.vocab_offset,
             )
-            if vision_mask.any():
-                vision_tokens = mx.where(vision_mask, input_ids, 0)
-                vision_embeds_flat = self.embed_vision(input_ids=vision_tokens)
-                inputs_embeds = mx.where(
-                    vision_mask[..., None], vision_embeds_flat, inputs_embeds
-                )
+            dummy_vision_token_id = (
+                self.embed_vision.vocab_offset + self.embed_vision.vocab_size - 1
+            )
+            vision_tokens = mx.where(vision_mask, input_ids, dummy_vision_token_id)
+            vision_embeds_flat = self.embed_vision(input_ids=vision_tokens)
+            inputs_embeds = mx.where(
+                vision_mask[..., None], vision_embeds_flat, inputs_embeds
+            )
 
             # Handle audio tokens (>= embed_audio.vocab_offset)
             audio_mask = input_ids >= self.embed_audio.vocab_offset
-            if audio_mask.any():
-                audio_tokens = mx.where(audio_mask, input_ids, 0)
-                audio_embeds_flat = self.embed_audio(input_ids=audio_tokens)
-                inputs_embeds = mx.where(
-                    audio_mask[..., None], audio_embeds_flat, inputs_embeds
-                )
+            dummy_audio_token_id = (
+                self.embed_audio.vocab_offset + self.embed_audio.vocab_size - 1
+            )
+
+            audio_tokens = mx.where(audio_mask, input_ids, dummy_audio_token_id)
+            audio_embeds_flat = self.embed_audio(input_ids=audio_tokens)
+            inputs_embeds = mx.where(
+                audio_mask[..., None], audio_embeds_flat, inputs_embeds
+            )
+        else:
+            per_layer_inputs = None
 
         # Vision features
         if pixel_values is not None:
             image_features = self.get_image_features(pixel_values)
 
-            return self.merge_multimodal_and_text(
+            inputs_embeds = self.merge_multimodal_and_text(
                 input_ids,
                 inputs_embeds,
                 image_features,
@@ -195,13 +196,15 @@ class Model(nn.Module):
             audio_features = mx.concatenate(
                 (audio_features, extra_padding_features), axis=1
             )
-            return self.merge_multimodal_and_text(
+            inputs_embeds = self.merge_multimodal_and_text(
                 input_ids,
                 inputs_embeds,
                 audio_features,
                 self.config.audio_token_id,
                 modality="audio",
             )
+
+        return inputs_embeds, per_layer_inputs
 
     def get_audio_features(self, input_features, input_features_mask):
         audio_outputs, audio_mask = self.audio_tower(
@@ -270,15 +273,13 @@ class Model(nn.Module):
         # Audio features
         input_features = kwargs.pop("input_features", None)
         input_features_mask = kwargs.pop("input_features_mask", None)
-        inputs_embeds = self.get_input_embeddings(
+        inputs_embeds, per_layer_inputs = self.get_input_embeddings(
             input_ids=input_ids,
             pixel_values=pixel_values,
             input_features=input_features,
             input_features_mask=input_features_mask,
             **kwargs,
         )
-
-        per_layer_inputs = self.language_model.model.get_per_layer_inputs(input_ids)
 
         logits = self.language_model(
             input_ids=None,
