@@ -4,6 +4,8 @@ import argparse
 
 from .utils import MODEL_CONVERSION_DTYPES, convert
 
+QUANT_RECIPES = ["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6"]
+
 
 def configure_parser() -> argparse.ArgumentParser:
     """
@@ -37,6 +39,13 @@ def configure_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument(
+        "--quant-predicate",
+        help=f"Mixed-bit quantization recipe.",
+        choices=QUANT_RECIPES,
+        type=str,
+        required=False,
+    )
+    parser.add_argument(
         "--upload-repo",
         help="The Hugging Face repo to upload the model to.",
         type=str,
@@ -52,6 +61,12 @@ def configure_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-vision",
         help="Skip vision module quantization.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--skip-audio",
+        help="Skip audio module quantization.",
         action="store_true",
         default=False,
     )

@@ -5,12 +5,10 @@ import inspect
 import json
 import logging
 import shutil
-import time
-from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -19,7 +17,8 @@ import requests
 import scipy.signal as signal
 import soundfile as sf
 from huggingface_hub import snapshot_download
-from mlx.utils import tree_flatten, tree_reduce, tree_unflatten
+from mlx.utils import tree_flatten, tree_map_with_path, tree_reduce, tree_unflatten
+from mlx_lm.utils import quantize_model
 from PIL import Image, ImageOps
 from transformers import (
     AutoConfig,
@@ -29,8 +28,6 @@ from transformers import (
 )
 
 from .models.base import BaseImageProcessor
-from .models.cache import KVCache, SimpleKVCache
-from .sample_utils import top_p_sampling
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
 
@@ -156,8 +153,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     config.setdefault("audio_config", {})
 
     # Get vision config settings with defaults
-    vision_config = config.get("vision_config", {})
-    skip_vision = vision_config.get("skip_vision", False)
+    skip_vision = config.get("vision_config", {}).get("skip_vision", False)
+    skip_audio = config.get("audio_config", {}).get("skip_audio", False)
 
     # Initialize model config and update it with module configs
     model_config = model_class.ModelConfig.from_dict(config)
@@ -181,12 +178,23 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized`
-        class_predicate = get_class_predicate(skip_vision, weights)
+        def get_class_predicate(p, m):
+            # Handle custom per layer quantizations
+            if p in config["quantization"]:
+                return config["quantization"][p]
+            if not hasattr(m, "to_quantized"):
+                return False
+            # Skip layers not divisible by 64
+            if hasattr(m, "weight") and m.weight.size % 64 != 0:
+                return False
+            # Handle legacy models which may not have everything quantized
+            return f"{p}.scales" in weights
 
         nn.quantize(
             model,
-            **quantization,
-            class_predicate=class_predicate,
+            group_size=quantization["group_size"],
+            bits=quantization["bits"],
+            class_predicate=get_class_predicate,
         )
 
     model.load_weights(list(weights.items()))
@@ -228,22 +236,26 @@ def update_module_configs(model_config, model_class, config, modules):
     return model_config
 
 
-def get_class_predicate(skip_vision, weights=None):
+def get_class_predicate(skip_vision, skip_audio=False, weights=None):
     if skip_vision:
         return lambda p, m: hasattr(m, "to_quantized") and not (
             "vision_model" in p or "vision_tower" in p
         )
+    if skip_audio:
+        return lambda p, m: hasattr(m, "to_quantized") and not (
+            "audio_model" in p or "audio_tower" in p
+        )
     else:
-        if weights:
-            return lambda p, m: (
-                hasattr(m, "to_quantized")
-                and m.weight.shape[-1] % 64 == 0
-                and f"{p}.scales" in weights
-            )
-        else:
-            return (
-                lambda _, m: hasattr(m, "to_quantized") and m.weight.shape[-1] % 64 == 0
-            )
+        # Handle custom per layer quantizations
+        if p in config["quantization"]:
+            return config["quantization"][p]
+        if not hasattr(m, "to_quantized"):
+            return False
+        # Skip layers not divisible by 64
+        if hasattr(m, "weight") and m.weight.size % 64 != 0:
+            return False
+        # Handle legacy models which may not have everything quantized
+        return f"{p}.scales" in weights
 
 
 def load(
@@ -541,54 +553,76 @@ def save_weights(
         )
 
 
-def quantize_model(
-    model: nn.Module,
-    config: dict,
-    q_group_size: int,
-    q_bits: int,
-    skip_vision: bool = False,
-) -> Tuple[dict, dict]:
-    """
-    Applies quantization to the model weights.
+def mixed_quant_predicate_builder(
+    recipe: str, model: nn.Module
+) -> Callable[[str, nn.Module, dict], Union[bool, dict]]:
 
-    Args:
-        model (nn.Module): The model to be quantized.
-        config (dict): Model configuration.
-        q_group_size (int): Group size for quantization.
-        q_bits (int): Bits per weight for quantization.
-        skip_vision (bool): Whether to skip quantizing vision model weights.
+    high_bits = 6
+    group_size = 64
 
-    Returns:
-        Tuple[dict, dict]: Tuple containing quantized weights and updated config.
-    """
-    quantized_config = copy.deepcopy(config)
-    quantized_config.setdefault("vision_config", {})
-
-    # Apply quantization
-    if skip_vision:
-        # Quantize only non-vision modules
-        nn.quantize(
-            model,
-            q_group_size,
-            q_bits,
-            class_predicate=get_class_predicate(skip_vision),
-        )
-        quantized_config["vision_config"]["skip_vision"] = skip_vision
-
+    if recipe == "mixed_2_6":
+        low_bits = 2
+    elif recipe == "mixed_3_4":
+        low_bits = 3
+        high_bits = 4
+    elif recipe == "mixed_3_6":
+        low_bits = 3
+    elif recipe == "mixed_4_6":
+        low_bits = 4
     else:
-        # Quantize only layers with to_quantized method and divisible by 64
-        nn.quantize(
-            model,
-            q_group_size,
-            q_bits,
-            class_predicate=get_class_predicate(skip_vision),
+        raise ValueError("Invalid quant recipe {recipe}")
+
+    down_keys = [k for k, _ in model.named_modules() if "down_proj" in k]
+    if len(down_keys) == 0:
+        raise ValueError("Model does not have expected keys for mixed quant.")
+
+    # Look for the layer index location in the path:
+    for layer_location, k in enumerate(down_keys[0].split(".")):
+        if k.isdigit():
+            break
+    num_layers = len(model.layers)
+
+    def mixed_quant_predicate(
+        path: str,
+        module: nn.Module,
+        config: dict,
+    ) -> Union[bool, dict]:
+        """Implements mixed quantization predicates with similar choices to, for example, llama.cpp's Q4_K_M.
+        Ref: https://github.com/ggerganov/llama.cpp/blob/917786f43d0f29b7c77a0c56767c0fa4df68b1c5/src/llama.cpp#L5265
+        By Alex Barron: https://gist.github.com/barronalex/84addb8078be21969f1690c1454855f3
+        """
+
+        if not hasattr(module, "to_quantized"):
+            return False
+        if isinstance(module, nn.Embedding):
+            return False
+        if module.weight.shape[1] % group_size != 0:
+            return False
+
+        # Extract layer index from path, safely handling non-digit elements
+        path_parts = path.split(".")
+        index = 0  # Default to 0 for modules without layer indices
+        if len(path_parts) > layer_location:
+            element = path_parts[layer_location]
+            if element.isdigit():
+                index = int(element)
+        use_more_bits = (
+            index < num_layers // 8
+            or index >= 7 * num_layers // 8
+            or (index - num_layers // 8) % 3 == 2
         )
+        if "v_proj" in path and use_more_bits:
+            return {"group_size": group_size, "bits": high_bits}
+        if "down_proj" in path and use_more_bits:
+            return {"group_size": group_size, "bits": high_bits}
+        if "lm_head" in path:
+            return {"group_size": group_size, "bits": high_bits}
+        if "embed_tokens" in path:
+            return False
 
-    # Update config and get weights
-    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
-    quantized_weights = dict(tree_flatten(model.parameters()))
+        return {"group_size": group_size, "bits": low_bits}
 
-    return quantized_weights, quantized_config
+    return mixed_quant_predicate
 
 
 def _update_vision_config(
@@ -674,7 +708,9 @@ def convert(
     revision: Optional[str] = None,
     dequantize: bool = False,
     skip_vision: bool = False,
+    skip_audio: bool = False,
     trust_remote_code: bool = True,
+    quant_predicate: Optional[str] = None,
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
@@ -682,23 +718,39 @@ def convert(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
 
+    if isinstance(quant_predicate, str):
+        quant_predicate = mixed_quant_predicate_builder(quant_predicate, model)
+
+    quant_predicate = quant_predicate or get_class_predicate(skip_vision, skip_audio)
+
     if dtype is None:
         dtype = config.get("torch_dtype", None)
-    weights = dict(tree_flatten(model.parameters()))
     if dtype in MODEL_CONVERSION_DTYPES:
         print("[INFO] Using dtype:", dtype)
         dtype = getattr(mx, dtype)
-        weights = {k: v.astype(dtype) for k, v in weights.items()}
+        cast_predicate = getattr(model, "cast_predicate", lambda _: True)
+
+        def set_dtype(k, v):
+            if cast_predicate(k) and mx.issubdtype(v.dtype, mx.floating):
+                return v.astype(dtype)
+            else:
+                return v
+
+        model.update(tree_map_with_path(set_dtype, model.parameters()))
 
     if quantize and dequantize:
         raise ValueError("Choose either quantize or dequantize, not both.")
 
     if quantize:
         print("[INFO] Quantizing")
-        model.load_weights(list(weights.items()))
-        weights, config = quantize_model(
-            model, config, q_group_size, q_bits, skip_vision
+        config.setdefault("vision_config", {})
+        model, config = quantize_model(
+            model, config, q_group_size, q_bits, quant_predicate=quant_predicate
         )
+        if skip_vision:
+            config["vision_config"]["skip_vision"] = skip_vision
+
+        weights = dict(tree_flatten(model.parameters()))
 
     if dequantize:
         print("[INFO] Dequantizing")
