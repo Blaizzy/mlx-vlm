@@ -164,7 +164,9 @@ class Model(nn.Module):
 
         # Vision features
         if pixel_values is not None:
-            image_features = self.get_image_features(pixel_values)
+            image_features = self.get_image_features(
+                pixel_values, self.vision_tower, self.config, self.embed_vision
+            )
 
             inputs_embeds = self.merge_multimodal_and_text(
                 input_ids,
@@ -213,21 +215,41 @@ class Model(nn.Module):
         )
         return self.embed_audio(inputs_embeds=audio_outputs), audio_mask
 
-    def get_image_features(self, pixel_values):
-        vision_outputs = self.vision_tower(
+    @staticmethod
+    def get_image_features(pixel_values, vision_tower, config, embed_vision):
+        vision_outputs = vision_tower(
             pixel_values,
             output_hidden_states=True,
         )
         vision_outputs = vision_outputs.transpose(0, 3, 1, 2)
         vision_outputs = vision_outputs.reshape(
             vision_outputs.shape[0],
-            self.config.vision_config.hidden_size,
-            self.config.vision_soft_tokens_per_image,
+            config.vision_config.hidden_size,
+            config.vision_soft_tokens_per_image,
         ).transpose(0, 2, 1)
 
         # Normalize and embed the soft tokens into language model space.
-        vision_outputs *= self.config.vision_config.hidden_size**0.5
-        return self.embed_vision(inputs_embeds=vision_outputs)
+        vision_outputs *= config.vision_config.hidden_size**0.5
+        return embed_vision(inputs_embeds=vision_outputs)
+
+    @staticmethod
+    def prepare_inputs_for_multimodal(
+        inputs_embeds, features, modality, special_modality_mask
+    ):
+        # Count special tokens by summing the mask
+        modality_tokens_in_text = special_modality_mask.sum()
+        feature_tokens = features.size
+
+        if modality_tokens_in_text != feature_tokens:
+            raise ValueError(
+                f"Number of {modality}s does not match number of special {modality} tokens in the input text. "
+                f"Got {modality_tokens_in_text} {modality} tokens in the text and "
+                f"{feature_tokens} tokens from {modality} embeddings."
+            )
+        features = features.astype(inputs_embeds.dtype)
+
+        inputs_embeds = masked_scatter(inputs_embeds, special_modality_mask, features)
+        return inputs_embeds
 
     def merge_multimodal_and_text(
         self, input_ids, inputs_embeds, features, token_id, modality="image"
@@ -247,21 +269,9 @@ class Model(nn.Module):
             special_modality_mask = mx.broadcast_to(
                 special_modality_mask, inputs_embeds.shape
             )
-
-        # Count special tokens by summing the mask
-        modality_tokens_in_text = special_modality_mask.sum()
-        feature_tokens = features.size
-
-        if modality_tokens_in_text != feature_tokens:
-            raise ValueError(
-                f"Number of {modality}s does not match number of special {modality} tokens in the input text. "
-                f"Got {modality_tokens_in_text} {modality} tokens in the text and "
-                f"{feature_tokens} tokens from {modality} embeddings."
-            )
-        features = features.astype(inputs_embeds.dtype)
-
-        inputs_embeds = masked_scatter(inputs_embeds, special_modality_mask, features)
-        return inputs_embeds
+        return self.prepare_inputs_for_multimodal(
+            inputs_embeds, features, modality, special_modality_mask
+        )
 
     def __call__(
         self,
