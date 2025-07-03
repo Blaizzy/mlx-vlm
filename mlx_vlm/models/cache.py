@@ -1,7 +1,38 @@
-from typing import Tuple
+from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx_lm.models.cache import ChunkedKVCache, KVCache, RotatingKVCache, _BaseCache
+
+
+def make_prompt_cache(
+    model: nn.Module,
+    max_kv_size: Optional[int] = None,
+) -> List[Any]:
+    """
+    Construct the model's cache for use in generation.
+
+    This function will defer the cache construction to the model if it has a
+    ``make_cache`` method, otherwise it will make a default KV cache.
+
+    Args:
+        model (nn.Module): The language model.
+        max_kv_size (Optional[int]): If provided and the model does not have a
+            ``make_cache`` method, a ``RotatingKVCache`` is used with a maximum
+            size of ``max_kv_size``
+    """
+    if hasattr(model, "make_cache"):
+        return model.make_cache()
+
+    num_layers = len(model.layers)
+    if model.config.model_type == "florence2":
+        return [(SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers]
+    elif max_kv_size is not None:
+        return [
+            RotatingKVCache(max_size=max_kv_size, keep=4) for _ in range(num_layers)
+        ]
+    else:
+        return [KVCache() for _ in range(num_layers)]
 
 
 class SimpleKVCache:
