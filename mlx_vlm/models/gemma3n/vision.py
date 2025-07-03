@@ -183,6 +183,7 @@ class UniversalInvertedResidual(nn.Module):
             dw_start_stride = stride if not dw_kernel_size_mid else 1
             dw_start_groups = num_groups(group_size, in_chs)
             self.dw_start = ConvNormAct(
+                nn.Conv2d,
                 in_chs,
                 in_chs,
                 kernel_size=dw_kernel_size_start,
@@ -199,6 +200,7 @@ class UniversalInvertedResidual(nn.Module):
 
         mid_chs = make_divisible(in_chs * exp_ratio)
         self.pw_exp = ConvNormAct(
+            nn.Conv2d,
             in_chs,
             mid_chs,
             kernel_size=1,
@@ -212,11 +214,12 @@ class UniversalInvertedResidual(nn.Module):
         if dw_kernel_size_mid:
             dw_mid_groups = num_groups(group_size, mid_chs)
             self.dw_mid = ConvNormAct(
+                Conv2dSame,
                 mid_chs,
                 mid_chs,
                 kernel_size=dw_kernel_size_mid,
                 stride=stride,
-                padding=(dw_kernel_size_mid - 1) // 2,
+                padding=0,
                 dilation=dilation,
                 groups=dw_mid_groups,
                 bias=False,
@@ -226,6 +229,7 @@ class UniversalInvertedResidual(nn.Module):
             self.dw_mid = nn.Identity()
 
         self.pw_proj = ConvNormAct(
+            nn.Conv2d,
             mid_chs,
             out_chs,
             kernel_size=1,
@@ -257,6 +261,7 @@ class UniversalInvertedResidual(nn.Module):
 class ConvNormAct(nn.Module):
     def __init__(
         self,
+        conv_cls,
         in_chs: int,
         out_chs: int,
         kernel_size: int = 3,
@@ -270,8 +275,15 @@ class ConvNormAct(nn.Module):
     ):
         super().__init__()
         self.out_chs = out_chs
-        self.conv = nn.Conv2d(
-            in_chs, out_chs, kernel_size, stride, padding, dilation, groups, bias
+        self.conv = conv_cls(
+            in_chs,
+            out_chs,
+            kernel_size,
+            stride,
+            padding,
+            (dilation, dilation),
+            groups,
+            bias,
         )
         self.bn = RMSNormAct2d(out_chs, eps=eps, apply_act=apply_act)
 
@@ -288,7 +300,10 @@ def pad_same(
     dilation: List[int] = (1, 1),
     value: float = 0,
 ):
-    ih, iw = x.shape[-2:]
+    """
+    Input should be in MLX format
+    """
+    ih, iw = x.shape[1:3]
     pad_h = get_same_padding(ih, kernel_size[0], stride[0], dilation[0])
     pad_w = get_same_padding(iw, kernel_size[1], stride[1], dilation[1])
 
@@ -296,9 +311,9 @@ def pad_same(
     # Padding order is reversed compared to PyTorch F.pad
     pad_widths = [
         (0, 0),  # No padding for batch dimension
-        (0, 0),  # No padding for channel dimension
         (pad_h // 2, pad_h - pad_h // 2),  # Height padding
         (pad_w // 2, pad_w - pad_w // 2),  # Width padding
+        (0, 0),  # No padding for channel dimension
     ]
 
     x = mx.pad(x, pad_widths, constant_values=value)
@@ -373,12 +388,16 @@ def is_static_pad(kernel_size, stride=1, dilation=1, **_):
 class Conv2dSame(nn.Conv2d):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.kernel_size = self.weight.shape[1:3]
 
-    def forward(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array) -> mx.array:
         x = pad_same(x, self.kernel_size, self.stride, self.dilation)
-        return mx.conv2d(
-            x, self.weight, self.bias, self.stride, (0, 0), self.dilation, self.groups
+        y = mx.conv2d(
+            x, self.weight, self.stride, self.padding, self.dilation, self.groups
         )
+        if "bias" in self:
+            y = y + self.bias
+        return y
 
 
 # https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/models/_efficientnet_blocks.py#L629
@@ -409,14 +428,13 @@ class EdgeResidual(nn.Module):
 
         self.has_skip = (in_chs == out_chs and stride == 1) and not noskip
 
-        padding = (exp_kernel_size - 1) // 2
-        self.conv_exp = nn.Conv2d(
+        self.conv_exp = Conv2dSame(
             in_chs,
             mid_chs,
             kernel_size=exp_kernel_size,
             stride=stride,
-            padding=padding,
-            dilation=dilation,
+            padding=0,
+            dilation=(dilation, dilation),
             groups=groups,
             bias=False,
         )
@@ -531,7 +549,6 @@ class MobileAttention(nn.Module):
         # Apply skip connection if available
         if self.has_skip:
             x = self.drop_path(x) + shortcut
-
         return x
 
 
@@ -864,11 +881,12 @@ class VisionTower(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.conv_stem = ConvNormAct(
+            Conv2dSame,
             in_chs=3,
             out_chs=64,
             kernel_size=3,
             stride=2,
-            padding=1,
+            padding=0,
             eps=1e-05,
         )
         msfa_indices = (3, 4)
@@ -954,14 +972,12 @@ class VisionTower(nn.Module):
         x = x.transpose(0, 2, 3, 1)  # Convert from NCHW to NHWC
         x = self.conv_stem(x)
         intermediates = []
-        hidden_states = []
 
         if feat_idx in self.msfa_indices:
             intermediates.append(x)
 
         # MBV5 is constructed of 4 stages, each stage is a group of blocks.
         for block_group in self.blocks:
-            # print_array_report(x.transpose(0,3,1,2), f"Stage {feat_idx + 1} input")
             feat_idx += 1
             for block in block_group:
                 x = block(x)
