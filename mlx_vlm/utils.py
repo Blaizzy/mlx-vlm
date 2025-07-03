@@ -177,8 +177,16 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         )
 
     if (quantization := config.get("quantization", None)) is not None:
-        # Handle legacy models which may not have everything quantized`
+
         def get_class_predicate(p, m):
+            # Always skip vision and audio models
+            if (
+                "vision_model" in p
+                or "vision_tower" in p
+                or "audio_model" in p
+                or "audio_tower" in p
+            ):
+                return False
             # Handle custom per layer quantizations
             if p in config["quantization"]:
                 return config["quantization"][p]
@@ -236,28 +244,6 @@ def update_module_configs(model_config, model_class, config, modules):
     return model_config
 
 
-def get_class_predicate(skip_vision, skip_audio=False, weights=None):
-    if skip_vision:
-        return lambda p, m: hasattr(m, "to_quantized") and not (
-            "vision_model" in p or "vision_tower" in p
-        )
-    if skip_audio:
-        return lambda p, m: hasattr(m, "to_quantized") and not (
-            "audio_model" in p or "audio_tower" in p
-        )
-    else:
-        # Handle custom per layer quantizations
-        if p in config["quantization"]:
-            return config["quantization"][p]
-        if not hasattr(m, "to_quantized"):
-            return False
-        # Skip layers not divisible by 64
-        if hasattr(m, "weight") and m.weight.size % 64 != 0:
-            return False
-        # Handle legacy models which may not have everything quantized
-        return f"{p}.scales" in weights
-
-
 def load(
     path_or_hf_repo: str,
     adapter_path: Optional[str] = None,
@@ -290,10 +276,8 @@ def load(
     model_path = get_model_path(
         path_or_hf_repo, force_download=force_download, revision=revision
     )
-
     model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
-        # TODO: Support more modules than just language_model
         model = apply_lora_layers(model, adapter_path)
         model.eval()
 
@@ -349,8 +333,6 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
     image_processor = None
 
     if hasattr(model_class, "ImageProcessor"):
-        import inspect
-
         init_signature = inspect.signature(model_class.ImageProcessor.__init__)
 
         if "config" in init_signature.parameters:
@@ -592,9 +574,14 @@ def mixed_quant_predicate_builder(
         By Alex Barron: https://gist.github.com/barronalex/84addb8078be21969f1690c1454855f3
         """
 
-        if not hasattr(module, "to_quantized"):
+        if (
+            "vision_model" in path
+            or "vision_tower" in path
+            or "audio_model" in path
+            or "audio_tower" in path
+        ):
             return False
-        if isinstance(module, nn.Embedding):
+        if not hasattr(module, "to_quantized"):
             return False
         if module.weight.shape[1] % group_size != 0:
             return False
@@ -625,21 +612,6 @@ def mixed_quant_predicate_builder(
     return mixed_quant_predicate
 
 
-def _update_vision_config(
-    config: dict,
-    value: Union[int, bool],
-    divisor: int = 64,
-    key: str = "intermediate_size",
-) -> None:
-    """Update vision config with padded sizes."""
-    if key in ["intermediate_size", "hidden_size"]:
-        config["vision_config"][key] = (
-            ((value // divisor) + 1) * divisor if value % divisor != 0 else value
-        )
-    else:
-        config["vision_config"][key] = value
-
-
 def save_config(
     config: dict,
     config_path: Union[str, Path],
@@ -662,39 +634,6 @@ def save_config(
     # write the updated config to the config_path (if provided)
     with open(config_path, "w") as fid:
         json.dump(config, fid, indent=4)
-
-
-def dequantize_model(model: nn.Module) -> nn.Module:
-    """
-    Dequantize the quantized linear layers in the model.
-
-    Args:
-        model (nn.Module): The model with quantized linear layers.
-
-    Returns:
-        nn.Module: The model with dequantized layers.
-    """
-    de_quantize_layers = []
-    for name, module in model.named_modules():
-        if isinstance(module, nn.QuantizedLinear):
-            bias = "bias" in module
-            weight = module.weight
-            weight = mx.dequantize(
-                weight,
-                module.scales,
-                module.biases,
-                module.group_size,
-                module.bits,
-            ).astype(mx.float16)
-            output_dims, input_dims = weight.shape
-            linear = nn.Linear(input_dims, output_dims, bias=bias)
-            linear.weight = weight
-            if bias:
-                linear.bias = module.bias
-            de_quantize_layers.append((name, linear))
-    if len(de_quantize_layers) > 0:
-        model.update_modules(tree_unflatten(de_quantize_layers))
-    return model
 
 
 def convert(

@@ -1,5 +1,3 @@
-# Copyright © 2023-2024 Apple Inc.
-
 import argparse
 
 from .utils import MODEL_CONVERSION_DTYPES, convert
