@@ -698,6 +698,10 @@ class VLMRequest(BaseModel):
         default_factory=list,
         description="List of URLs or local paths of images to process.",
     )
+    audio: List[str] = Field(
+        default_factory=list,
+        description="List of URLs or local paths of audio files to process.",
+    )
     prompt: str = Field(
         DEFAULT_PROMPT, description="Message to be processed by the model."
     )
@@ -780,6 +784,7 @@ async def generate_endpoint(request: GenerationRequest):
     but for now, we just copy the logic from generate.py to avoid merging issues.
     """
     try:
+
         # Get model, processor, config - loading if necessary
         model, processor, config = get_cached_model(request.model, request.adapter_path)
 
@@ -806,8 +811,16 @@ async def generate_endpoint(request: GenerationRequest):
         chat_messages.append({"role": "user", "content": prompt})
 
         formatted_prompt = apply_chat_template(
-            processor, config, chat_messages, num_images=len(request.image)
+            processor,
+            config,
+            chat_messages,
+            num_images=len(request.image),
+            num_audios=len(request.audio),
         )
+
+        print(f"Formatted prompt: {formatted_prompt}")
+        print(f"Images: {request.image}, num_images: {len(request.image)}")
+        print(f"Audio: {request.audio}, num_audios: {len(request.audio)}")
 
         if request.stream:
             # Streaming response
@@ -820,6 +833,7 @@ async def generate_endpoint(request: GenerationRequest):
                         processor=processor,
                         prompt=formatted_prompt,
                         image=request.image,
+                        audio=request.audio,
                         temperature=request.temperature,
                         max_tokens=request.max_tokens,
                         top_p=request.top_p,
@@ -873,6 +887,7 @@ async def generate_endpoint(request: GenerationRequest):
                     processor=processor,
                     prompt=formatted_prompt,
                     image=request.image,
+                    audio=request.audio,
                     temperature=request.temperature,
                     max_tokens=request.max_tokens,
                     top_p=request.top_p,
@@ -945,7 +960,11 @@ async def generate_endpoint(request: GenerationRequest):
         chat_messages = request.prompt
 
         formatted_prompt = apply_chat_template(
-            processor, config, chat_messages, num_images=len(request.image)
+            processor,
+            config,
+            chat_messages,
+            num_images=len(request.image),
+            num_audios=len(request.audio),
         )
 
         if request.stream:
@@ -959,6 +978,7 @@ async def generate_endpoint(request: GenerationRequest):
                         processor=processor,
                         prompt=formatted_prompt,
                         image=request.image,
+                        audio=request.audio,
                         temperature=request.temperature,
                         max_tokens=request.max_tokens,
                         top_p=request.top_p,
@@ -1013,6 +1033,7 @@ async def generate_endpoint(request: GenerationRequest):
                     processor=processor,
                     prompt=formatted_prompt,
                     image=request.image,
+                    audio=request.audio,
                     temperature=request.temperature,
                     max_tokens=request.max_tokens,
                     top_p=request.top_p,
