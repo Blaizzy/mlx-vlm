@@ -160,18 +160,14 @@ def convert(
             model, config, q_group_size, q_bits, quant_predicate=quant_predicate
         )
 
-        weights = dict(tree_flatten(model.parameters()))
-
     if dequantize:
         print("[INFO] Dequantizing")
         model = dequantize_model(model)
-        weights = dict(tree_flatten(model.parameters()))
 
     if isinstance(mlx_path, str):
         mlx_path = Path(mlx_path)
 
-    del model
-    save_weights(mlx_path, weights, donate_weights=True)
+    save_weights(mlx_path, model, donate_weights=True)
 
     # Copy Python and JSON files from the model path to the MLX path
     for pattern in ["*.py", "*.json"]:
