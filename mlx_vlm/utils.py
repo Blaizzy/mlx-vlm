@@ -5,12 +5,10 @@ import inspect
 import json
 import logging
 import shutil
-import time
-from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -19,7 +17,8 @@ import requests
 import scipy.signal as signal
 import soundfile as sf
 from huggingface_hub import snapshot_download
-from mlx.utils import tree_flatten, tree_reduce, tree_unflatten
+from mlx.utils import tree_flatten, tree_map_with_path, tree_reduce, tree_unflatten
+from mlx_lm.utils import quantize_model
 from PIL import Image, ImageOps
 from transformers import (
     AutoConfig,
@@ -29,8 +28,6 @@ from transformers import (
 )
 
 from .models.base import BaseImageProcessor
-from .models.cache import KVCache, SimpleKVCache
-from .sample_utils import top_p_sampling
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
 
@@ -40,6 +37,24 @@ MODEL_REMAPPING = {"llava-qwen2": "llava_bunny", "bunny-llama": "llava_bunny"}
 MAX_FILE_SIZE_GB = 5
 
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
+
+
+def skip_multimodal_module(path: str) -> bool:
+    """
+    Check if a multimodal module (vision/audio) should skip quantization.
+
+    Args:
+        path: The module path to check
+
+    Returns:
+        bool: True if the module is multimodal and should skip quantization, False otherwise
+    """
+    return (
+        "vision_model" in path
+        or "vision_tower" in path
+        or "audio_model" in path
+        or "audio_tower" in path
+    )
 
 
 def get_model_and_args(config: dict):
@@ -155,10 +170,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     config.setdefault("vision_config", {})
     config.setdefault("audio_config", {})
 
-    # Get vision config settings with defaults
-    vision_config = config.get("vision_config", {})
-    skip_vision = vision_config.get("skip_vision", False)
-
     # Initialize model config and update it with module configs
     model_config = model_class.ModelConfig.from_dict(config)
     modules = ["text", "vision", "perceiver", "projector", "audio"]
@@ -180,13 +191,30 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         )
 
     if (quantization := config.get("quantization", None)) is not None:
-        # Handle legacy models which may not have everything quantized`
-        class_predicate = get_class_predicate(skip_vision, weights)
+        # Handle legacy models which may or may not have vision quantized
+        # TODO: Re-upload the models with the new quantization config and remove this
+        skip_vision = config.get("vision_config", {}).get("skip_vision", False)
+
+        def get_class_predicate(p, m):
+            # Always skip vision and audio models
+            if skip_multimodal_module(p) and skip_vision:
+                return False
+            # Handle custom per layer quantizations
+            if p in config["quantization"]:
+                return config["quantization"][p]
+            if not hasattr(m, "to_quantized"):
+                return False
+            # Skip layers not divisible by 64
+            if hasattr(m, "weight") and m.weight.size % 64 != 0:
+                return False
+            # Handle legacy models which may not have everything quantized
+            return f"{p}.scales" in weights
 
         nn.quantize(
             model,
-            **quantization,
-            class_predicate=class_predicate,
+            group_size=quantization["group_size"],
+            bits=quantization["bits"],
+            class_predicate=get_class_predicate,
         )
 
     model.load_weights(list(weights.items()))
@@ -228,24 +256,6 @@ def update_module_configs(model_config, model_class, config, modules):
     return model_config
 
 
-def get_class_predicate(skip_vision, weights=None):
-    if skip_vision:
-        return lambda p, m: hasattr(m, "to_quantized") and not (
-            "vision_model" in p or "vision_tower" in p
-        )
-    else:
-        if weights:
-            return lambda p, m: (
-                hasattr(m, "to_quantized")
-                and m.weight.shape[-1] % 64 == 0
-                and f"{p}.scales" in weights
-            )
-        else:
-            return (
-                lambda _, m: hasattr(m, "to_quantized") and m.weight.shape[-1] % 64 == 0
-            )
-
-
 def load(
     path_or_hf_repo: str,
     adapter_path: Optional[str] = None,
@@ -278,10 +288,8 @@ def load(
     model_path = get_model_path(
         path_or_hf_repo, force_download=force_download, revision=revision
     )
-
     model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
-        # TODO: Support more modules than just language_model
         model = apply_lora_layers(model, adapter_path)
         model.eval()
 
@@ -337,8 +345,6 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
     image_processor = None
 
     if hasattr(model_class, "ImageProcessor"):
-        import inspect
-
         init_signature = inspect.signature(model_class.ImageProcessor.__init__)
 
         if "config" in init_signature.parameters:
@@ -541,71 +547,6 @@ def save_weights(
         )
 
 
-def quantize_model(
-    model: nn.Module,
-    config: dict,
-    q_group_size: int,
-    q_bits: int,
-    skip_vision: bool = False,
-) -> Tuple[dict, dict]:
-    """
-    Applies quantization to the model weights.
-
-    Args:
-        model (nn.Module): The model to be quantized.
-        config (dict): Model configuration.
-        q_group_size (int): Group size for quantization.
-        q_bits (int): Bits per weight for quantization.
-        skip_vision (bool): Whether to skip quantizing vision model weights.
-
-    Returns:
-        Tuple[dict, dict]: Tuple containing quantized weights and updated config.
-    """
-    quantized_config = copy.deepcopy(config)
-    quantized_config.setdefault("vision_config", {})
-
-    # Apply quantization
-    if skip_vision:
-        # Quantize only non-vision modules
-        nn.quantize(
-            model,
-            q_group_size,
-            q_bits,
-            class_predicate=get_class_predicate(skip_vision),
-        )
-        quantized_config["vision_config"]["skip_vision"] = skip_vision
-
-    else:
-        # Quantize only layers with to_quantized method and divisible by 64
-        nn.quantize(
-            model,
-            q_group_size,
-            q_bits,
-            class_predicate=get_class_predicate(skip_vision),
-        )
-
-    # Update config and get weights
-    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
-    quantized_weights = dict(tree_flatten(model.parameters()))
-
-    return quantized_weights, quantized_config
-
-
-def _update_vision_config(
-    config: dict,
-    value: Union[int, bool],
-    divisor: int = 64,
-    key: str = "intermediate_size",
-) -> None:
-    """Update vision config with padded sizes."""
-    if key in ["intermediate_size", "hidden_size"]:
-        config["vision_config"][key] = (
-            ((value // divisor) + 1) * divisor if value % divisor != 0 else value
-        )
-    else:
-        config["vision_config"][key] = value
-
-
 def save_config(
     config: dict,
     config_path: Union[str, Path],
@@ -628,101 +569,6 @@ def save_config(
     # write the updated config to the config_path (if provided)
     with open(config_path, "w") as fid:
         json.dump(config, fid, indent=4)
-
-
-def dequantize_model(model: nn.Module) -> nn.Module:
-    """
-    Dequantize the quantized linear layers in the model.
-
-    Args:
-        model (nn.Module): The model with quantized linear layers.
-
-    Returns:
-        nn.Module: The model with dequantized layers.
-    """
-    de_quantize_layers = []
-    for name, module in model.named_modules():
-        if isinstance(module, nn.QuantizedLinear):
-            bias = "bias" in module
-            weight = module.weight
-            weight = mx.dequantize(
-                weight,
-                module.scales,
-                module.biases,
-                module.group_size,
-                module.bits,
-            ).astype(mx.float16)
-            output_dims, input_dims = weight.shape
-            linear = nn.Linear(input_dims, output_dims, bias=bias)
-            linear.weight = weight
-            if bias:
-                linear.bias = module.bias
-            de_quantize_layers.append((name, linear))
-    if len(de_quantize_layers) > 0:
-        model.update_modules(tree_unflatten(de_quantize_layers))
-    return model
-
-
-def convert(
-    hf_path: str,
-    mlx_path: str = "mlx_model",
-    quantize: bool = False,
-    q_group_size: int = 64,
-    q_bits: int = 4,
-    dtype: Optional[str] = None,
-    upload_repo: str = None,
-    revision: Optional[str] = None,
-    dequantize: bool = False,
-    skip_vision: bool = False,
-    trust_remote_code: bool = True,
-):
-    print("[INFO] Loading")
-    model_path = get_model_path(hf_path, revision=revision)
-    model, config, processor = fetch_from_hub(
-        model_path, lazy=True, trust_remote_code=trust_remote_code
-    )
-
-    if dtype is None:
-        dtype = config.get("torch_dtype", None)
-    weights = dict(tree_flatten(model.parameters()))
-    if dtype in MODEL_CONVERSION_DTYPES:
-        print("[INFO] Using dtype:", dtype)
-        dtype = getattr(mx, dtype)
-        weights = {k: v.astype(dtype) for k, v in weights.items()}
-
-    if quantize and dequantize:
-        raise ValueError("Choose either quantize or dequantize, not both.")
-
-    if quantize:
-        print("[INFO] Quantizing")
-        model.load_weights(list(weights.items()))
-        weights, config = quantize_model(
-            model, config, q_group_size, q_bits, skip_vision
-        )
-
-    if dequantize:
-        print("[INFO] Dequantizing")
-        model = dequantize_model(model)
-        weights = dict(tree_flatten(model.parameters()))
-
-    if isinstance(mlx_path, str):
-        mlx_path = Path(mlx_path)
-
-    del model
-    save_weights(mlx_path, weights, donate_weights=True)
-
-    # Copy Python and JSON files from the model path to the MLX path
-    for pattern in ["*.py", "*.json"]:
-        files = glob.glob(str(model_path / pattern))
-        for file in files:
-            shutil.copy(file, mlx_path)
-
-    processor.save_pretrained(mlx_path)
-
-    save_config(config, config_path=mlx_path / "config.json")
-
-    if upload_repo is not None:
-        upload_to_hub(mlx_path, upload_repo, hf_path)
 
 
 def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):

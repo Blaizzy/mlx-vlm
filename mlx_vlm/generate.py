@@ -563,7 +563,7 @@ def main():
     if isinstance(args.image, str):
         args.image = [args.image]
 
-    model, processor = load(args.model, args.adapter_path)
+    model, processor = load(args.model, args.adapter_path, trust_remote_code=True)
     config = model.config
 
     prompt = args.prompt
