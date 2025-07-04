@@ -6,12 +6,8 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import (
-    LanguageModelOutput,
-    create_attention_mask,
-    scaled_dot_product_attention,
-)
-from ..cache import KVCache, SimpleKVCache
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import SimpleKVCache
 
 
 @dataclass
@@ -75,7 +71,7 @@ class Florence2Attention(nn.Module):
         self,
         hidden_states,
         key_value_states=None,
-        cache: Optional[KVCache] = None,
+        cache: Optional[SimpleKVCache] = None,
         attention_mask=None,
         layer_head_mask=None,
     ):
@@ -153,8 +149,8 @@ class Florence2Attention(nn.Module):
             attention_mask = causal_mask
 
         attn_output = (
-            scaled_dot_product_attention(
-                q, k, v, cache, scale=self.scaling, mask=attention_mask
+            mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scaling, mask=attention_mask
             )
             .transpose(0, 2, 1, 3)
             .reshape(batch_size, tgt_len, -1)
@@ -213,7 +209,7 @@ class Florence2DecoderLayer(nn.Module):
         encoder_hidden_states,
         attention_mask=None,
         encoder_attention_mask=None,
-        cache: Optional[Tuple[KVCache, KVCache]] = None,
+        cache: Optional[Tuple[SimpleKVCache, SimpleKVCache]] = None,
     ):
         residual = hidden_states
 
@@ -485,4 +481,4 @@ class LanguageModel(nn.Module):
         return self.config.decoder_attention_heads
 
     def make_cache(self):
-        return [(SimpleKVCache(), SimpleKVCache())] * len(self.model.decoder.layers)
+        return [(SimpleKVCache(), SimpleKVCache()) for n in self.layers]
