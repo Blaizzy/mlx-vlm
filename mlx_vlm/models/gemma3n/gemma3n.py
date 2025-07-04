@@ -299,3 +299,7 @@ class Model(nn.Module):
             else:
                 sanitized_weights[k] = v
         return sanitized_weights
+
+    @property
+    def layers(self):
+        return self.language_model.model.layers
