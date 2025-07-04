@@ -497,13 +497,17 @@ def apply_repetition_penalty(logits: mx.array, generated_tokens: Any, penalty: f
 
 def save_weights(
     save_path: Union[str, Path],
-    weights: Dict[str, Any],
+    model: nn.Module,
     *,
     donate_weights: bool = False,
 ) -> None:
     """Save model weights into specified directory."""
     if isinstance(save_path, str):
         save_path = Path(save_path)
+
+    weights = dict(tree_flatten(model.parameters()))
+    del model
+
     save_path.mkdir(parents=True, exist_ok=True)
 
     shards = make_shards(weights)
