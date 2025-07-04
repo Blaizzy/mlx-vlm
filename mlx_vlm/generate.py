@@ -535,7 +535,9 @@ def generate(
         print("\n" + "=" * 10)
         if len(text) == 0:
             print("No text generated for this prompt")
-            return
+
+            # TODO: Return single object instead of tuple
+            return text, {}
         print(
             f"Prompt: {last_response.prompt_tokens} tokens, "
             f"{last_response.prompt_tps:.3f} tokens-per-sec"
@@ -546,6 +548,7 @@ def generate(
         )
         print(f"Peak memory: {last_response.peak_memory:.3f} GB")
 
+    # TODO: Return single object instead of tuple
     usage_stats = {
         "input_tokens": last_response.prompt_tokens,
         "output_tokens": last_response.generation_tokens,
@@ -554,7 +557,6 @@ def generate(
         "generation_tps": last_response.generation_tps,
         "peak_memory": last_response.peak_memory,
     }
-
     return text, usage_stats
 
 
