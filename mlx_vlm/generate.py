@@ -181,14 +181,15 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
 
 @dataclass
 class GenerationResult:
-    text: str
-    token: Optional[int]
-    logprobs: Optional[List[float]]
-    prompt_tokens: int
-    generation_tokens: int
-    prompt_tps: float
-    generation_tps: float
-    peak_memory: float
+    text: str = ""
+    token: Optional[int] = None
+    logprobs: Optional[List[float]] = None
+    prompt_tokens: int = 0
+    generation_tokens: int = 0
+    total_tokens: int = 0
+    prompt_tps: float = 0.0
+    generation_tps: float = 0.0
+    peak_memory: float = 0.0
 
 
 def generate_step(
@@ -438,6 +439,7 @@ def stream_generate(
                 logprobs=logprobs,
                 prompt_tokens=input_ids.size,
                 generation_tokens=n + 1,
+                total_tokens=input_ids.size + n + 1,
                 prompt_tps=prompt_tps,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
@@ -450,6 +452,7 @@ def stream_generate(
             logprobs=logprobs,
             prompt_tokens=input_ids.size,
             generation_tokens=n + 1,
+            total_tokens=input_ids.size + n + 1,
             prompt_tps=prompt_tps,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
@@ -467,7 +470,7 @@ def generate(
     audio: Union[str, List[str]] = None,
     verbose: bool = False,
     **kwargs,
-) -> str:
+) -> GenerationResult:
     """
     Generate text from the model.
 
@@ -535,7 +538,17 @@ def generate(
         print("\n" + "=" * 10)
         if len(text) == 0:
             print("No text generated for this prompt")
-            return
+            return GenerationResult(
+                text=text,
+                token=None,
+                logprobs=None,
+                prompt_tokens=0,
+                generation_tokens=0,
+                total_tokens=0,
+                prompt_tps=0.0,
+                generation_tps=0.0,
+                peak_memory=mx.get_peak_memory() / 1e9,
+            )
         print(
             f"Prompt: {last_response.prompt_tokens} tokens, "
             f"{last_response.prompt_tps:.3f} tokens-per-sec"
@@ -546,16 +559,17 @@ def generate(
         )
         print(f"Peak memory: {last_response.peak_memory:.3f} GB")
 
-    usage_stats = {
-        "input_tokens": last_response.prompt_tokens,
-        "output_tokens": last_response.generation_tokens,
-        "total_tokens": last_response.prompt_tokens + last_response.generation_tokens,
-        "prompt_tps": last_response.prompt_tps,
-        "generation_tps": last_response.generation_tps,
-        "peak_memory": last_response.peak_memory,
-    }
-
-    return text, usage_stats
+    return GenerationResult(
+        text=text,
+        token=last_response.token,
+        logprobs=last_response.logprobs,
+        prompt_tokens=last_response.prompt_tokens,
+        generation_tokens=last_response.generation_tokens,
+        total_tokens=last_response.total_tokens,
+        prompt_tps=last_response.prompt_tps,
+        generation_tps=last_response.generation_tps,
+        peak_memory=last_response.peak_memory,
+    )
 
 
 def main():
@@ -628,7 +642,7 @@ def main():
             print()
 
     else:
-        output = generate(
+        result = generate(
             model,
             processor,
             prompt,
@@ -645,7 +659,7 @@ def main():
             **kwargs,
         )
         if not args.verbose:
-            print(output)
+            print(result.text)
 
 
 if __name__ == "__main__":

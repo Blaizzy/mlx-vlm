@@ -729,7 +729,7 @@ def prepare_inputs(
     add_special_tokens=False,
 ):
 
-    if images is None and audio is None:
+    if not images and not audio:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
