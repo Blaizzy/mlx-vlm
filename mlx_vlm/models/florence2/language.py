@@ -483,3 +483,6 @@ class LanguageModel(nn.Module):
     @property
     def n_kv_heads(self):
         return self.config.decoder_attention_heads
+
+    def make_cache(self):
+        return [(SimpleKVCache(), SimpleKVCache())] * len(self.model.decoder.layers)
