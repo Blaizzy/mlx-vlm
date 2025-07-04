@@ -191,10 +191,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         )
 
     if (quantization := config.get("quantization", None)) is not None:
+        # Handle legacy models which may or may not have vision quantized
+        # TODO: Re-upload the models with the new quantization config and remove this
+        skip_vision = config.get("vision_config", {}).get("skip_vision", False)
 
         def get_class_predicate(p, m):
             # Always skip vision and audio models
-            if skip_multimodal_module(p):
+            if skip_multimodal_module(p) and skip_vision:
                 return False
             # Handle custom per layer quantizations
             if p in config["quantization"]:
