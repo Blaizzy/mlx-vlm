@@ -39,6 +39,24 @@ MAX_FILE_SIZE_GB = 5
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
 
+def skip_multimodal_module(path: str) -> bool:
+    """
+    Check if a multimodal module (vision/audio) should skip quantization.
+
+    Args:
+        path: The module path to check
+
+    Returns:
+        bool: True if the module is multimodal and should skip quantization, False otherwise
+    """
+    return (
+        "vision_model" in path
+        or "vision_tower" in path
+        or "audio_model" in path
+        or "audio_tower" in path
+    )
+
+
 def get_model_and_args(config: dict):
     """
     Retrieve the model object based on the configuration.
@@ -152,10 +170,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     config.setdefault("vision_config", {})
     config.setdefault("audio_config", {})
 
-    # Get vision config settings with defaults
-    skip_vision = config.get("vision_config", {}).get("skip_vision", False)
-    skip_audio = config.get("audio_config", {}).get("skip_audio", False)
-
     # Initialize model config and update it with module configs
     model_config = model_class.ModelConfig.from_dict(config)
     modules = ["text", "vision", "perceiver", "projector", "audio"]
@@ -180,12 +194,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
         def get_class_predicate(p, m):
             # Always skip vision and audio models
-            if (
-                "vision_model" in p
-                or "vision_tower" in p
-                or "audio_model" in p
-                or "audio_tower" in p
-            ):
+            if skip_multimodal_module(p):
                 return False
             # Handle custom per layer quantizations
             if p in config["quantization"]:
@@ -535,83 +544,6 @@ def save_weights(
         )
 
 
-def mixed_quant_predicate_builder(
-    recipe: str, model: nn.Module
-) -> Callable[[str, nn.Module, dict], Union[bool, dict]]:
-
-    high_bits = 6
-    group_size = 64
-
-    if recipe == "mixed_2_6":
-        low_bits = 2
-    elif recipe == "mixed_3_4":
-        low_bits = 3
-        high_bits = 4
-    elif recipe == "mixed_3_6":
-        low_bits = 3
-    elif recipe == "mixed_4_6":
-        low_bits = 4
-    else:
-        raise ValueError("Invalid quant recipe {recipe}")
-
-    down_keys = [k for k, _ in model.named_modules() if "down_proj" in k]
-    if len(down_keys) == 0:
-        raise ValueError("Model does not have expected keys for mixed quant.")
-
-    # Look for the layer index location in the path:
-    for layer_location, k in enumerate(down_keys[0].split(".")):
-        if k.isdigit():
-            break
-    num_layers = len(model.layers)
-
-    def mixed_quant_predicate(
-        path: str,
-        module: nn.Module,
-        config: dict,
-    ) -> Union[bool, dict]:
-        """Implements mixed quantization predicates with similar choices to, for example, llama.cpp's Q4_K_M.
-        Ref: https://github.com/ggerganov/llama.cpp/blob/917786f43d0f29b7c77a0c56767c0fa4df68b1c5/src/llama.cpp#L5265
-        By Alex Barron: https://gist.github.com/barronalex/84addb8078be21969f1690c1454855f3
-        """
-
-        if (
-            "vision_model" in path
-            or "vision_tower" in path
-            or "audio_model" in path
-            or "audio_tower" in path
-        ):
-            return False
-        if not hasattr(module, "to_quantized"):
-            return False
-        if module.weight.shape[1] % group_size != 0:
-            return False
-
-        # Extract layer index from path, safely handling non-digit elements
-        path_parts = path.split(".")
-        index = 0  # Default to 0 for modules without layer indices
-        if len(path_parts) > layer_location:
-            element = path_parts[layer_location]
-            if element.isdigit():
-                index = int(element)
-        use_more_bits = (
-            index < num_layers // 8
-            or index >= 7 * num_layers // 8
-            or (index - num_layers // 8) % 3 == 2
-        )
-        if "v_proj" in path and use_more_bits:
-            return {"group_size": group_size, "bits": high_bits}
-        if "down_proj" in path and use_more_bits:
-            return {"group_size": group_size, "bits": high_bits}
-        if "lm_head" in path:
-            return {"group_size": group_size, "bits": high_bits}
-        if "embed_tokens" in path:
-            return False
-
-        return {"group_size": group_size, "bits": low_bits}
-
-    return mixed_quant_predicate
-
-
 def save_config(
     config: dict,
     config_path: Union[str, Path],
@@ -634,86 +566,6 @@ def save_config(
     # write the updated config to the config_path (if provided)
     with open(config_path, "w") as fid:
         json.dump(config, fid, indent=4)
-
-
-def convert(
-    hf_path: str,
-    mlx_path: str = "mlx_model",
-    quantize: bool = False,
-    q_group_size: int = 64,
-    q_bits: int = 4,
-    dtype: Optional[str] = None,
-    upload_repo: str = None,
-    revision: Optional[str] = None,
-    dequantize: bool = False,
-    skip_vision: bool = False,
-    skip_audio: bool = False,
-    trust_remote_code: bool = True,
-    quant_predicate: Optional[str] = None,
-):
-    print("[INFO] Loading")
-    model_path = get_model_path(hf_path, revision=revision)
-    model, config, processor = fetch_from_hub(
-        model_path, lazy=True, trust_remote_code=trust_remote_code
-    )
-
-    if isinstance(quant_predicate, str):
-        quant_predicate = mixed_quant_predicate_builder(quant_predicate, model)
-
-    quant_predicate = quant_predicate or get_class_predicate(skip_vision, skip_audio)
-
-    if dtype is None:
-        dtype = config.get("torch_dtype", None)
-    if dtype in MODEL_CONVERSION_DTYPES:
-        print("[INFO] Using dtype:", dtype)
-        dtype = getattr(mx, dtype)
-        cast_predicate = getattr(model, "cast_predicate", lambda _: True)
-
-        def set_dtype(k, v):
-            if cast_predicate(k) and mx.issubdtype(v.dtype, mx.floating):
-                return v.astype(dtype)
-            else:
-                return v
-
-        model.update(tree_map_with_path(set_dtype, model.parameters()))
-
-    if quantize and dequantize:
-        raise ValueError("Choose either quantize or dequantize, not both.")
-
-    if quantize:
-        print("[INFO] Quantizing")
-        config.setdefault("vision_config", {})
-        model, config = quantize_model(
-            model, config, q_group_size, q_bits, quant_predicate=quant_predicate
-        )
-        if skip_vision:
-            config["vision_config"]["skip_vision"] = skip_vision
-
-        weights = dict(tree_flatten(model.parameters()))
-
-    if dequantize:
-        print("[INFO] Dequantizing")
-        model = dequantize_model(model)
-        weights = dict(tree_flatten(model.parameters()))
-
-    if isinstance(mlx_path, str):
-        mlx_path = Path(mlx_path)
-
-    del model
-    save_weights(mlx_path, weights, donate_weights=True)
-
-    # Copy Python and JSON files from the model path to the MLX path
-    for pattern in ["*.py", "*.json"]:
-        files = glob.glob(str(model_path / pattern))
-        for file in files:
-            shutil.copy(file, mlx_path)
-
-    processor.save_pretrained(mlx_path)
-
-    save_config(config, config_path=mlx_path / "config.json")
-
-    if upload_repo is not None:
-        upload_to_hub(mlx_path, upload_repo, hf_path)
 
 
 def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
