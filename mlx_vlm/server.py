@@ -800,9 +800,9 @@ async def generate_endpoint(request: GenerationRequest):
         # Prepare the prompt using the chat template logic
         chat_messages = []
         if request.system:
-            system_prompt = codecs.decode(request.system, "unicode_escape")
+            system_prompt = request.system
             chat_messages.append({"role": "system", "content": system_prompt})
-        prompt = codecs.decode(request.prompt, "unicode_escape")
+        prompt = request.prompt
         chat_messages.append({"role": "user", "content": prompt})
 
         formatted_prompt = apply_chat_template(

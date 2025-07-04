@@ -566,7 +566,7 @@ def main():
     model, processor = load(args.model, args.adapter_path)
     config = model.config
 
-    prompt = codecs.decode(args.prompt, "unicode_escape")
+    prompt = args.prompt
 
     num_images = len(args.image) if args.image is not None else 0
     num_audios = (
@@ -588,9 +588,14 @@ def main():
         )
 
     if args.eos_tokens is not None:
-        kwargs["eos_tokens"] = [
-            codecs.decode(token, "unicode_escape") for token in args.eos_tokens
-        ]
+        eos_tokens = []
+        for token in args.eos_tokens:
+            try:
+                decoded_token = codecs.decode(token, "unicode_escape")
+                eos_tokens.append(decoded_token)
+            except (UnicodeDecodeError, UnicodeError):
+                eos_tokens.append(token)
+        kwargs["eos_tokens"] = eos_tokens
 
     if args.skip_special_tokens:
         kwargs["skip_special_tokens"] = args.skip_special_tokens
