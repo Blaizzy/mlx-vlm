@@ -19,27 +19,36 @@ from .utils import (
     upload_to_hub,
 )
 
-QUANT_RECIPES = ["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6"]
+QUANT_RECIPES = [
+    "mixed_2_6",
+    "mixed_3_4",
+    "mixed_3_5",
+    "mixed_3_6",
+    "mixed_3_8",
+    "mixed_4_6",
+    "mixed_4_8",
+]
 
 
 def mixed_quant_predicate_builder(
     recipe: str, model: nn.Module
 ) -> Callable[[str, nn.Module, dict], Union[bool, dict]]:
-
-    high_bits = 6
     group_size = 64
 
-    if recipe == "mixed_2_6":
-        low_bits = 2
-    elif recipe == "mixed_3_4":
-        low_bits = 3
-        high_bits = 4
-    elif recipe == "mixed_3_6":
-        low_bits = 3
-    elif recipe == "mixed_4_6":
-        low_bits = 4
-    else:
-        raise ValueError("Invalid quant recipe {recipe}")
+    recipe_config = {
+        "mixed_2_6": (2, 6),
+        "mixed_3_4": (3, 4),
+        "mixed_3_5": (3, 5),
+        "mixed_3_6": (3, 6),
+        "mixed_3_8": (3, 8),
+        "mixed_4_6": (4, 6),
+        "mixed_4_8": (4, 8),
+    }
+
+    if recipe not in recipe_config:
+        raise ValueError(f"Invalid quant recipe {recipe}")
+
+    low_bits, high_bits = recipe_config[recipe]
 
     down_keys = [k for k, _ in model.named_modules() if "down_proj" in k]
     if len(down_keys) == 0:
