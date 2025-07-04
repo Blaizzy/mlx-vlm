@@ -117,21 +117,22 @@ class Model(nn.Module):
         input_features_mask: Optional[mx.array] = None,
         **kwargs,
     ):
+
+        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+
+        per_layer_inputs_mask = mx.logical_and(
+            input_ids >= 0, input_ids < self.vocab_size_per_layer_input
+        )
+        per_layer_inputs_tokens = mx.where(
+            per_layer_inputs_mask, input_ids, mx.zeros_like(input_ids)
+        )
+        per_layer_inputs = self.language_model.model.get_per_layer_inputs(
+            per_layer_inputs_tokens
+        )
         if pixel_values is None and input_features is None:
-            return self.language_model.model.embed_tokens(input_ids)
+            return inputs_embeds, per_layer_inputs
 
         if input_ids is not None:
-            inputs_embeds = self.language_model.model.embed_tokens(input_ids)
-
-            per_layer_inputs_mask = mx.logical_and(
-                input_ids >= 0, input_ids < self.vocab_size_per_layer_input
-            )
-            per_layer_inputs_tokens = mx.where(
-                per_layer_inputs_mask, input_ids, mx.zeros_like(input_ids)
-            )
-            per_layer_inputs = self.language_model.model.get_per_layer_inputs(
-                per_layer_inputs_tokens
-            )
 
             # Handle vision tokens (>= embed_vision.vocab_offset and < embed_audio.vocab_offset)
             vision_mask = mx.logical_and(
