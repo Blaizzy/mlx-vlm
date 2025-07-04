@@ -68,23 +68,24 @@ def mixed_quant_predicate_builder(
         if module.weight.shape[1] % group_size != 0:
             return False
 
-        # Extract layer index from path, safely handling non-digit elements
         path_parts = path.split(".")
-        index = 0  # Default to 0 for modules without layer indices
+        index = 0
+
         if len(path_parts) > layer_location:
             element = path_parts[layer_location]
             if element.isdigit():
                 index = int(element)
+
         use_more_bits = (
             index < num_layers // 8
             or index >= 7 * num_layers // 8
             or (index - num_layers // 8) % 3 == 2
         )
-        if "v_proj" in path and use_more_bits:
+
+        if use_more_bits and ("v_proj" in path or "down_proj" in path):
             return {"group_size": group_size, "bits": high_bits}
-        if "down_proj" in path and use_more_bits:
-            return {"group_size": group_size, "bits": high_bits}
-        if "lm_head" in path:
+
+        if "lm_head" in path or "embed_tokens" in path:
             return {"group_size": group_size, "bits": high_bits}
 
         return {"group_size": group_size, "bits": low_bits}
