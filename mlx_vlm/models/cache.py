@@ -25,9 +25,8 @@ def make_prompt_cache(
         return model.make_cache()
 
     num_layers = len(model.layers)
-    if model.config.model_type == "florence2":
-        return [(SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers]
-    elif max_kv_size is not None:
+
+    if max_kv_size is not None:
         return [
             RotatingKVCache(max_size=max_kv_size, keep=4) for _ in range(num_layers)
         ]
