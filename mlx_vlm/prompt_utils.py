@@ -315,8 +315,8 @@ def get_message_json(
     role: str = "user",
     skip_image_token: bool = False,
     skip_audio_token: bool = False,
-    num_images: int = 1,
-    num_audios: int = 1,
+    num_images: int = 0,
+    num_audios: int = 0,
     **kwargs,
 ) -> Union[str, Dict[str, Any]]:
     """
@@ -459,6 +459,7 @@ def apply_chat_template(
                         skip_audio_token=not is_first
                         or role in ["system", "assistant"],
                         num_images=num_images,
+                        num_audios=num_audios,
                         **kwargs,
                     )
                 )

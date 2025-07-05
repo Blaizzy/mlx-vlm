@@ -30,10 +30,11 @@ from .generate import (
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
-    get_model_and_processors,
+    generate,
+    stream_generate,
 )
 from .prompt_utils import apply_chat_template
-from .utils import generate, stream_generate
+from .utils import load
 
 app = FastAPI(
     title="MLX_VLM Inference API",
@@ -57,8 +58,9 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         print(f"Loading model from: {model_path}")
         if adapter_path:
             print(f"Loading adapter from: {adapter_path}")
-        # Use the function from generate.py which handles path resolution and loading
-        model, processor, config = get_model_and_processors(model_path, adapter_path)
+        # Use the load function from utils.py which handles path resolution and loading
+        model, processor = load(model_path, adapter_path, trust_remote_code=True)
+        config = model.config
         print("Model and processor loaded successfully.")
         return model, processor, config
     except Exception as e:
@@ -617,8 +619,8 @@ async def openai_endpoint(request: Request):
         else:
             # Non-streaming response
             try:
-                # Use generate from utils
-                output = generate(
+                # Use generate from generate.py
+                result = generate(
                     model=model,
                     processor=processor,
                     prompt=formatted_prompt,
@@ -634,7 +636,7 @@ async def openai_endpoint(request: Request):
                 gc.collect()
                 print("Generation finished, cleared cache.")
 
-                result = OpenAIResponse(
+                response = OpenAIResponse(
                     id=response_id,
                     object="response",
                     created_at=int(generated_at),
@@ -648,21 +650,21 @@ async def openai_endpoint(request: Request):
                             "content": [
                                 {
                                     "type": "output_text",
-                                    "text": output[0],
+                                    "text": result.text,
                                 }
                             ],
                         }
                     ],
-                    output_text=output[0],
+                    output_text=result.text,
                     temperature=openai_request.temperature,
                     top_p=openai_request.top_p,
                     usage={
-                        "input_tokens": output[1]["input_tokens"],
-                        "output_tokens": output[1]["output_tokens"],
-                        "total_tokens": output[1]["total_tokens"],
+                        "input_tokens": result.prompt_tokens,
+                        "output_tokens": result.generation_tokens,
+                        "total_tokens": result.total_tokens,
                     },
                 )
-                return result
+                return response
 
             except Exception as e:
                 print(f"Error during generation: {e}")
@@ -697,6 +699,10 @@ class VLMRequest(BaseModel):
     image: List[str] = Field(
         default_factory=list,
         description="List of URLs or local paths of images to process.",
+    )
+    audio: List[str] = Field(
+        default_factory=list,
+        description="List of URLs or local paths of audio files to process.",
     )
     prompt: str = Field(
         DEFAULT_PROMPT, description="Message to be processed by the model."
@@ -780,6 +786,7 @@ async def generate_endpoint(request: GenerationRequest):
     but for now, we just copy the logic from generate.py to avoid merging issues.
     """
     try:
+
         # Get model, processor, config - loading if necessary
         model, processor, config = get_cached_model(request.model, request.adapter_path)
 
@@ -806,8 +813,16 @@ async def generate_endpoint(request: GenerationRequest):
         chat_messages.append({"role": "user", "content": prompt})
 
         formatted_prompt = apply_chat_template(
-            processor, config, chat_messages, num_images=len(request.image)
+            processor,
+            config,
+            chat_messages,
+            num_images=len(request.image),
+            num_audios=len(request.audio),
         )
+
+        print(f"Formatted prompt: {formatted_prompt}")
+        print(f"Images: {request.image}, num_images: {len(request.image)}")
+        print(f"Audio: {request.audio}, num_audios: {len(request.audio)}")
 
         if request.stream:
             # Streaming response
@@ -820,6 +835,7 @@ async def generate_endpoint(request: GenerationRequest):
                         processor=processor,
                         prompt=formatted_prompt,
                         image=request.image,
+                        audio=request.audio,
                         temperature=request.temperature,
                         max_tokens=request.max_tokens,
                         top_p=request.top_p,
@@ -867,12 +883,13 @@ async def generate_endpoint(request: GenerationRequest):
         else:
             # Non-streaming response
             try:
-                # Use generate from utils
-                output = generate(
+                # Use generate from generate.py
+                gen_result = generate(
                     model=model,
                     processor=processor,
                     prompt=formatted_prompt,
                     image=request.image,
+                    audio=request.audio,
                     temperature=request.temperature,
                     max_tokens=request.max_tokens,
                     top_p=request.top_p,
@@ -884,8 +901,16 @@ async def generate_endpoint(request: GenerationRequest):
                 gc.collect()
                 print("Generation finished, cleared cache.")
 
+                usage_stats = UsageStats(
+                    input_tokens=gen_result.prompt_tokens,
+                    output_tokens=gen_result.generation_tokens,
+                    total_tokens=gen_result.total_tokens,
+                    prompt_tps=gen_result.prompt_tps,
+                    generation_tps=gen_result.generation_tps,
+                    peak_memory=gen_result.peak_memory,
+                )
                 result = GenerationResponse(
-                    text=output[0], model=request.model, usage=output[1]
+                    text=gen_result.text, model=request.model, usage=usage_stats
                 )
                 return result
 
@@ -945,7 +970,11 @@ async def generate_endpoint(request: GenerationRequest):
         chat_messages = request.prompt
 
         formatted_prompt = apply_chat_template(
-            processor, config, chat_messages, num_images=len(request.image)
+            processor,
+            config,
+            chat_messages,
+            num_images=len(request.image),
+            num_audios=len(request.audio),
         )
 
         if request.stream:
@@ -959,6 +988,7 @@ async def generate_endpoint(request: GenerationRequest):
                         processor=processor,
                         prompt=formatted_prompt,
                         image=request.image,
+                        audio=request.audio,
                         temperature=request.temperature,
                         max_tokens=request.max_tokens,
                         top_p=request.top_p,
@@ -1007,12 +1037,13 @@ async def generate_endpoint(request: GenerationRequest):
         else:
             # Non-streaming response
             try:
-                # Use generate from utils
-                output = generate(
+                # Use generate from generate.py
+                gen_result = generate(
                     model=model,
                     processor=processor,
                     prompt=formatted_prompt,
                     image=request.image,
+                    audio=request.audio,
                     temperature=request.temperature,
                     max_tokens=request.max_tokens,
                     top_p=request.top_p,
@@ -1024,8 +1055,16 @@ async def generate_endpoint(request: GenerationRequest):
                 gc.collect()
                 print("Generation finished, cleared cache.")
 
+                usage_stats = UsageStats(
+                    input_tokens=gen_result.prompt_tokens,
+                    output_tokens=gen_result.generation_tokens,
+                    total_tokens=gen_result.total_tokens,
+                    prompt_tps=gen_result.prompt_tps,
+                    generation_tps=gen_result.generation_tps,
+                    peak_memory=gen_result.peak_memory,
+                )
                 result = GenerationResponse(
-                    text=output[0], model=request.model, usage=output[1]
+                    text=gen_result.text, model=request.model, usage=usage_stats
                 )
                 return result
 
