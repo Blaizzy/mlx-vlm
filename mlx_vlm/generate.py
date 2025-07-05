@@ -663,4 +663,8 @@ def main():
 
 
 if __name__ == "__main__":
+    print(
+        "Calling `python -m mlx_vlm.generate ...` directly is deprecated."
+        " Use `mlx_vlm generate` or `python -m mlx_vlm generate` instead."
+    )
     main()
