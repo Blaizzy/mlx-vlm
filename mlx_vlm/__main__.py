@@ -16,7 +16,9 @@ if __name__ == "__main__":
     }
 
     if len(sys.argv) < 2:
-        print(f"Usage: python -m mlx_vlm <subcommand> [options]")
+        print(
+            f"Usage: mlx_vlm <subcommand> [options] or python -m mlx_vlm <subcommand> [options]"
+        )
         print(f"Available subcommands: {', '.join(sorted(subcommands))}")
         sys.exit(1)
 
