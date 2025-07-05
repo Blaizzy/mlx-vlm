@@ -5,23 +5,14 @@ import json
 import traceback
 import uuid
 from datetime import datetime
-from typing import (
-    Any,
-    List,
-    Literal,
-    Optional,
-    Required,
-    Tuple,
-    TypeAlias,
-    TypedDict,
-    Union,
-)
+from typing import Any, List, Literal, Optional, Tuple, Union
 
 import mlx.core as mx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from typing_extensions import Required, TypeAlias, TypedDict
 
 from .generate import (
     DEFAULT_MAX_TOKENS,
