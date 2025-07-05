@@ -35,11 +35,12 @@ from .generate import (
 )
 from .prompt_utils import apply_chat_template
 from .utils import load
+from .version import __version__
 
 app = FastAPI(
-    title="MLX_VLM Inference API",
-    description="API for using Vision Language Models (VLM) with MLX.",
-    version="0.1.0",
+    title="MLX-VLM Inference API",
+    description="API for using Vision Language Models (VLMs) and Omni Models (Vision, Audio and Video support) with MLX.",
+    version=__version__,
 )
 
 MAX_IMAGES = 10  # Maximum number of images to process at once
@@ -819,10 +820,6 @@ async def generate_endpoint(request: GenerationRequest):
             num_images=len(request.image),
             num_audios=len(request.audio),
         )
-
-        print(f"Formatted prompt: {formatted_prompt}")
-        print(f"Images: {request.image}, num_images: {len(request.image)}")
-        print(f"Audio: {request.audio}, num_audios: {len(request.audio)}")
 
         if request.stream:
             # Streaming response
