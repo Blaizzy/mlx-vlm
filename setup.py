@@ -22,7 +22,7 @@ from version import __version__
 setup(
     name="mlx-vlm",
     version=__version__,
-    description="Vision LLMs on Apple silicon with MLX and the Hugging Face Hub",
+    description="Vision Language Models (VLMs) and Omni Models (Vision, Audio and Video support) on Apple silicon with MLX and the Hugging Face Hub",
     long_description=open(root_dir / "README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     author_email="prince.gdt@gmail.com",
