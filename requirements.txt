@@ -1,7 +1,6 @@
 mlx>=0.26.0
 datasets>=2.19.1
 tqdm>=4.66.2
-numpy>=1.23.4
 transformers>=4.53.0
 gradio>=5.19.0
 Pillow>=10.3.0
@@ -11,4 +10,5 @@ mlx-lm>=0.23.0
 fastapi>=0.95.1
 soundfile>=0.13.1
 scipy>=1.15.3
+numpy
 mlx-audio
