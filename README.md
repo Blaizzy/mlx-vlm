@@ -118,7 +118,7 @@ config = model.config
 # Prepare inputs
 image = ["/path/to/image.jpg"]
 audio = ["/path/to/audio.wav"]
-prompt = "Describe what you see in the image and what you hear in the audio."
+prompt = ""
 
 # Apply chat template
 formatted_prompt = apply_chat_template(
@@ -186,7 +186,7 @@ curl -X POST "http://localhost:8000/generate" \
     "model": "mlx-community/gemma-3n-E2B-it-4bit",
     "image": ["/path/to/image.jpg"],
     "audio": ["/path/to/audio.wav"],
-    "prompt": "Describe what you see and hear",
+    "prompt": "",
     "max_tokens": 1000
   }'
 ```
