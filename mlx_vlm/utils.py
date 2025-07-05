@@ -703,10 +703,6 @@ def process_inputs_with_fallback(
         # Fallback to PyTorch tensors if MLX fails
         if return_tensors != "pt":
             try:
-                print(
-                    f"\033[33mWarning\033[0m: Failed to process inputs with error: {e}. "
-                    "Trying to process inputs with return_tensors='pt'"
-                )
                 return process_inputs(
                     processor,
                     prompts=prompts,
@@ -733,7 +729,7 @@ def prepare_inputs(
     add_special_tokens=False,
 ):
 
-    if images is None and audio is None:
+    if not images and not audio:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -756,7 +752,7 @@ def prepare_inputs(
         images = [process_image(img, resize_shape, image_processor) for img in images]
 
     # Process audio
-    if audio is not None:
+    if audio:
         if not isinstance(audio, list):
             audio = [audio]
 
@@ -770,6 +766,8 @@ def prepare_inputs(
             load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
             for audio_file in audio
         ]
+    else:
+        audio = None
 
     model_inputs = {}
 
