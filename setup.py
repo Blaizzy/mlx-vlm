@@ -34,8 +34,7 @@ setup(
     python_requires=">=3.8",
     entry_points={
         "console_scripts": [
-            "mlx_vlm.convert = mlx_vlm.convert:main",
-            "mlx_vlm.generate = mlx_vlm.generate:main",
+            "mlx_vlm = mlx_vlm.__main__:main",
         ]
     },
 )
