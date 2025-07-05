@@ -16,16 +16,9 @@ if __name__ == "__main__":
     }
 
     if len(sys.argv) < 2:
-        print(f"Usage: python -m mlx_vlm <subcommand> [options]")
-        print(f"Available subcommands: {', '.join(sorted(subcommands))}")
-        sys.exit(1)
-
+        raise ValueError(f"CLI requires a subcommand in {subcommands}")
     subcommand = sys.argv.pop(1)
     if subcommand not in subcommands:
-        print(f"Error: Unknown subcommand '{subcommand}'")
-        print(f"Available subcommands: {', '.join(sorted(subcommands))}")
-        sys.exit(1)
-
-    # Dynamically import and run the submodule
+        raise ValueError(f"CLI requires a subcommand in {subcommands}")
     submodule = importlib.import_module(f"mlx_vlm.{subcommand}")
     submodule.main()
