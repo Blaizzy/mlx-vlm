@@ -34,7 +34,13 @@ setup(
     python_requires=">=3.8",
     entry_points={
         "console_scripts": [
-            "mlx_vlm = mlx_vlm.__main__:main",
+            "mlx_vlm.chat = mlx_vlm.chat:main",
+            "mlx_vlm.chat_ui = mlx_vlm.chat_ui:main",
+            "mlx_vlm.convert = mlx_vlm.convert:main",
+            "mlx_vlm.generate = mlx_vlm.generate:main",
+            "mlx_vlm.lora = mlx_vlm.lora:main",
+            "mlx_vlm.server = mlx_vlm.server:main",
+            "mlx_vlm.video_generate = mlx_vlm.video_generate:main",
         ]
     },
 )

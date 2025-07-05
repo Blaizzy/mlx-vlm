@@ -1121,7 +1121,12 @@ async def unload_model_endpoint():
     }
 
 
-if __name__ == "__main__":
+def main():
+
     uvicorn.run(
         "mlx_vlm.server:app", host="0.0.0.0", port=8000, workers=1, reload=True
     )  # reload=True for development to automatically restart on code changes.
+
+
+if __name__ == "__main__":
+    main()
