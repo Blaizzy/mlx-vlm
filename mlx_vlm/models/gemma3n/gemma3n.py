@@ -293,11 +293,16 @@ class Model(nn.Module):
     def sanitize(self, weights):
         sanitized_weights = {}
         for k, v in weights.items():
-            # if "vision_tower" not in k and "embed_vision" not in k:
             if k.startswith("model."):
                 sanitized_weights[".".join(k.split(".")[1:])] = v
             else:
                 sanitized_weights[k] = v
+
+        # The language model has tied embeddings, so the lm_head is not needed.
+        # Pop the unused weight if it exists.
+        if "language_model.lm_head.weight" in sanitized_weights:
+            sanitized_weights.pop("language_model.lm_head.weight")
+
         return sanitized_weights
 
     @property
