@@ -13,7 +13,8 @@ from rich.prompt import Prompt
 
 from mlx_vlm import load
 from mlx_vlm.prompt_utils import get_message_json
-from mlx_vlm.utils import generate_step, load_image
+from mlx_vlm.utils import load_image
+from mlx_vlm.generate import generate_step
 
 
 class MLXVisionChat:
