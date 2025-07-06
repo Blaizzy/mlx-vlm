@@ -4,8 +4,9 @@ import gradio as gr
 
 from mlx_vlm import load
 
+from .generate import stream_generate
 from .prompt_utils import get_chat_template, get_message_json
-from .utils import load, load_config, load_image_processor, stream_generate
+from .utils import load_config, load_image_processor
 
 
 def parse_arguments():
