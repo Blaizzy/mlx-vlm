@@ -168,12 +168,17 @@ class Model(nn.Module):
                 pixel_values, self.vision_tower, self.config, self.embed_vision
             )
 
+            modality = "image"
             inputs_embeds = self.merge_multimodal_and_text(
-                input_ids,
                 inputs_embeds,
                 image_features,
-                self.config.image_token_id,
-                modality="image",
+                self.construct_special_modality_mask(
+                    input_ids,
+                    inputs_embeds,
+                    self.config.image_token_id,
+                    modality=modality,
+                ),
+                modality=modality,
             )
 
         # Audio features
@@ -199,12 +204,17 @@ class Model(nn.Module):
             audio_features = mx.concatenate(
                 (audio_features, extra_padding_features), axis=1
             )
+            modality = "audio"
             inputs_embeds = self.merge_multimodal_and_text(
-                input_ids,
                 inputs_embeds,
                 audio_features,
-                self.config.audio_token_id,
-                modality="audio",
+                self.construct_special_modality_mask(
+                    input_ids,
+                    inputs_embeds,
+                    self.config.audio_token_id,
+                    modality=modality,
+                ),
+                modality=modality,
             )
 
         return inputs_embeds, per_layer_inputs
@@ -232,9 +242,28 @@ class Model(nn.Module):
         vision_outputs *= config.vision_config.hidden_size**0.5
         return embed_vision(inputs_embeds=vision_outputs)
 
+    def construct_special_modality_mask(
+        self, input_ids, inputs_embeds, token_id, modality="image"
+    ):
+        if input_ids is None:
+            embed_fn = (
+                self.embed_audio
+                if modality == "audio"
+                else self.language_model.model.embed_tokens
+            )
+            special_modality_mask = inputs_embeds == embed_fn(
+                input_ids=mx.array([token_id])
+            )
+        else:
+            special_modality_mask = mx.expand_dims(input_ids == token_id, -1)
+            special_modality_mask = mx.broadcast_to(
+                special_modality_mask, inputs_embeds.shape
+            )
+        return special_modality_mask
+
     @staticmethod
-    def prepare_inputs_for_multimodal(
-        inputs_embeds, features, modality, special_modality_mask
+    def merge_multimodal_and_text(
+        inputs_embeds, features, special_modality_mask, modality="image"
     ):
         # Count special tokens by summing the mask
         modality_tokens_in_text = special_modality_mask.sum()
@@ -250,28 +279,6 @@ class Model(nn.Module):
 
         inputs_embeds = masked_scatter(inputs_embeds, special_modality_mask, features)
         return inputs_embeds
-
-    def merge_multimodal_and_text(
-        self, input_ids, inputs_embeds, features, token_id, modality="image"
-    ):
-
-        if input_ids is None:
-            embed_fn = (
-                self.embed_audio
-                if modality == "audio"
-                else self.language_model.model.embed_tokens
-            )
-            special_modality_mask = inputs_embeds == embed_fn(
-                input_ids=mx.array([token_id])
-            )
-        else:
-            special_modality_mask = mx.expand_dims(input_ids == token_id, -1)
-            special_modality_mask = mx.broadcast_to(
-                special_modality_mask, inputs_embeds.shape
-            )
-        return self.prepare_inputs_for_multimodal(
-            inputs_embeds, features, modality, special_modality_mask
-        )
 
     def __call__(
         self,
