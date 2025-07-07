@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 
 import mlx.optimizers as optim
 
@@ -88,6 +89,7 @@ def main(args):
         )
     
     model.train()
+###################### my
     
     logger.info(f"\033[32mTraining model with {args.train_mode}\033[0m")
     if args.wandb_project:
@@ -132,6 +134,41 @@ def main(args):
         save_adapter(model, args.output_path)
     
     logger.info(f"\033[32mTraining complete. Model saved to {args.output_path}\033[0m")
+################ new main
+
+    # Training loop
+    logger.info(f"\033[32mTraining model\033[0m")
+    for epoch in range(args.epochs):
+        if args.steps == 0:
+            args.steps = len(dataset) // args.batch_size
+
+        progress_bar = tqdm(range(args.steps), position=0, leave=True)
+        for i in progress_bar:
+            loss = trainer.train_step(
+                dataset[i * args.batch_size : (i + 1) * args.batch_size]
+            )
+            # Update progress bar
+            progress_bar.update(1)
+            progress_bar.set_postfix(
+                {"Epoch": epoch, "Step": i, "Loss": f"{loss.item():.4f}"}
+            )
+
+            if i % args.print_every == 0:
+                # Log additional information
+                custom_print(
+                    {
+                        "Epoch": epoch,
+                        "Step": i,
+                        "Loss": f"{loss.item():.4f}",
+                    }
+                )
+        # Save the interim adapter after each epoch except the last.
+        if args.save_after_epoch and (epoch < (args.epochs - 1)):
+            head, tail = os.path.split(args.output_path)
+            save_adapter(model, head + os.sep + "epoch_" + str(epoch) + "_" + tail)
+
+    # Save the adapter
+    save_adapter(model, args.output_path)
 
 
 if __name__ == "__main__":
@@ -197,7 +234,10 @@ if __name__ == "__main__":
         help="WandB project name to report training metrics. Disabled if None.",
     )
     parser.add_argument(
-        "--lora-alpha", type=int, default=0.1, help="LoRA alpha parameter"
+        "--lora-alpha",
+        type=float,
+        default=0.1,
+        help="LoRA scaling factor (alpha / rank)",
     )
     parser.add_argument("--lora-rank", type=int, default=10, help="LoRA rank")
     parser.add_argument("--lora-dropout", type=float, default=0.1, help="LoRA dropout")
@@ -212,6 +252,11 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Load path to resume training from a previously saved adapter",
+    )
+    parser.add_argument(
+        "--save-after-epoch",
+        action="store_true",
+        help="Save interim versions of adapter files after each epoch",
     )
 
     # GRPO args

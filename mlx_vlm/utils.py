@@ -1,23 +1,24 @@
-import contextlib
 import copy
 import glob
 import importlib
+import inspect
 import json
 import logging
 import shutil
-import time
-from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import requests
+import scipy.signal as signal
+import soundfile as sf
 from huggingface_hub import snapshot_download
-from mlx.utils import tree_flatten, tree_reduce, tree_unflatten
+from mlx.utils import tree_flatten, tree_map_with_path, tree_reduce, tree_unflatten
+from mlx_lm.utils import quantize_model
 from PIL import Image, ImageOps
 from transformers import (
     AutoConfig,
@@ -27,8 +28,6 @@ from transformers import (
 )
 
 from .models.base import BaseImageProcessor
-from .models.cache import KVCache, SimpleKVCache
-from .sample_utils import top_p_sampling
 from .tokenizer_utils import load_tokenizer
 from .trainers import apply_lora_layers
 
@@ -40,54 +39,22 @@ MAX_FILE_SIZE_GB = 5
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
 
-# A stream on the default device just for generation
-generation_stream = mx.new_stream(mx.default_device())
-
-
-@contextlib.contextmanager
-def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
+def skip_multimodal_module(path: str) -> bool:
     """
-    A context manager to temporarily change the wired limit.
+    Check if a multimodal module (vision/audio) should skip quantization.
 
-    Note, the wired limit should not be changed during an async eval.  If an
-    async eval could be running pass in the streams to synchronize with prior
-    to exiting the context manager.
+    Args:
+        path: The module path to check
+
+    Returns:
+        bool: True if the module is multimodal and should skip quantization, False otherwise
     """
-    model_bytes = tree_reduce(
-        lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
+    return (
+        "vision_model" in path
+        or "vision_tower" in path
+        or "audio_model" in path
+        or "audio_tower" in path
     )
-    max_rec_size = mx.metal.device_info()["max_recommended_working_set_size"]
-    if model_bytes > 0.9 * max_rec_size:
-        model_mb = model_bytes // 2**20
-        max_rec_mb = max_rec_size // 2**20
-        print(
-            f"[WARNING] Generating with a model that requires {model_mb} MB "
-            f"which is close to the maximum recommended size of {max_rec_mb} "
-            "MB. This can be slow. See the documentation for possible work-arounds: "
-            "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
-        )
-    old_limit = mx.set_wired_limit(max_rec_size)
-    try:
-        yield None
-    finally:
-        if streams is not None:
-            for s in streams:
-                mx.synchronize(s)
-        else:
-            mx.synchronize()
-        mx.set_wired_limit(old_limit)
-
-
-@dataclass
-class GenerationResult:
-    text: str
-    token: Optional[int]
-    logprobs: Optional[List[float]]
-    prompt_tokens: int
-    generation_tokens: int
-    prompt_tps: float
-    generation_tps: float
-    peak_memory: float
 
 
 def get_model_and_args(config: dict):
@@ -112,7 +79,9 @@ def get_model_and_args(config: dict):
     return arch, model_type
 
 
-def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
+def get_model_path(
+    path_or_hf_repo: str, revision: Optional[str] = None, force_download: bool = False
+) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
     it is downloaded from the Hugging Face Hub.
@@ -139,7 +108,7 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
                     "*.txt",
                     "*.jinja",
                 ],
-                resume_download=True,
+                force_download=force_download,
             )
         )
     return model_path
@@ -199,14 +168,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     # Initialize text and vision configs if not present
     config.setdefault("text_config", {})
     config.setdefault("vision_config", {})
-
-    # Get vision config settings with defaults
-    vision_config = config.get("vision_config", {})
-    skip_vision = vision_config.get("skip_vision", False)
+    config.setdefault("audio_config", {})
 
     # Initialize model config and update it with module configs
     model_config = model_class.ModelConfig.from_dict(config)
-    modules = ["text", "vision", "perceiver", "projector"]
+    modules = ["text", "vision", "perceiver", "projector", "audio"]
     model_config = update_module_configs(model_config, model_class, config, modules)
 
     model = model_class.Model(model_config)
@@ -219,15 +185,36 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     weights = sanitize_weights(
         model_class.LanguageModel, weights, model_config.text_config
     )
+    if hasattr(model_class, "AudioModel"):
+        weights = sanitize_weights(
+            model_class.AudioModel, weights, model_config.audio_config
+        )
 
     if (quantization := config.get("quantization", None)) is not None:
-        # Handle legacy models which may not have everything quantized`
-        class_predicate = get_class_predicate(skip_vision, weights)
+        # Handle legacy models which may or may not have vision quantized
+        # TODO: Re-upload the models with the new quantization config and remove this
+        skip_vision = config.get("vision_config", {}).get("skip_vision", False)
+
+        def get_class_predicate(p, m):
+            # Always skip vision and audio models
+            if skip_multimodal_module(p) and skip_vision:
+                return False
+            # Handle custom per layer quantizations
+            if p in config["quantization"]:
+                return config["quantization"][p]
+            if not hasattr(m, "to_quantized"):
+                return False
+            # Skip layers not divisible by 64
+            if hasattr(m, "weight") and m.weight.size % 64 != 0:
+                return False
+            # Handle legacy models which may not have everything quantized
+            return f"{p}.scales" in weights
 
         nn.quantize(
             model,
-            **quantization,
-            class_predicate=class_predicate,
+            group_size=quantization["group_size"],
+            bits=quantization["bits"],
+            class_predicate=get_class_predicate,
         )
 
     model.load_weights(list(weights.items()))
@@ -269,24 +256,6 @@ def update_module_configs(model_config, model_class, config, modules):
     return model_config
 
 
-def get_class_predicate(skip_vision, weights=None):
-    if skip_vision:
-        return lambda p, m: hasattr(m, "to_quantized") and not (
-            "vision_model" in p or "vision_tower" in p
-        )
-    else:
-        if weights:
-            return lambda p, m: (
-                hasattr(m, "to_quantized")
-                and m.weight.shape[-1] % 64 == 0
-                and f"{p}.scales" in weights
-            )
-        else:
-            return (
-                lambda _, m: hasattr(m, "to_quantized") and m.weight.shape[-1] % 64 == 0
-            )
-
-
 def load(
     path_or_hf_repo: str,
     adapter_path: Optional[str] = None,
@@ -315,11 +284,12 @@ def load(
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
-    model_path = get_model_path(path_or_hf_repo, revision=revision)
-
+    force_download = kwargs.get("force_download", False)
+    model_path = get_model_path(
+        path_or_hf_repo, force_download=force_download, revision=revision
+    )
     model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
-        # TODO: Support more modules than just language_model
         model = apply_lora_layers(model, adapter_path)
         model.eval()
 
@@ -375,8 +345,6 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
     image_processor = None
 
     if hasattr(model_class, "ImageProcessor"):
-        import inspect
-
         init_signature = inspect.signature(model_class.ImageProcessor.__init__)
 
         if "config" in init_signature.parameters:
@@ -529,13 +497,17 @@ def apply_repetition_penalty(logits: mx.array, generated_tokens: Any, penalty: f
 
 def save_weights(
     save_path: Union[str, Path],
-    weights: Dict[str, Any],
+    model: nn.Module,
     *,
     donate_weights: bool = False,
 ) -> None:
     """Save model weights into specified directory."""
     if isinstance(save_path, str):
         save_path = Path(save_path)
+
+    weights = dict(tree_flatten(model.parameters()))
+    del model
+
     save_path.mkdir(parents=True, exist_ok=True)
 
     shards = make_shards(weights)
@@ -579,71 +551,6 @@ def save_weights(
         )
 
 
-def quantize_model(
-    model: nn.Module,
-    config: dict,
-    q_group_size: int,
-    q_bits: int,
-    skip_vision: bool = False,
-) -> Tuple[dict, dict]:
-    """
-    Applies quantization to the model weights.
-
-    Args:
-        model (nn.Module): The model to be quantized.
-        config (dict): Model configuration.
-        q_group_size (int): Group size for quantization.
-        q_bits (int): Bits per weight for quantization.
-        skip_vision (bool): Whether to skip quantizing vision model weights.
-
-    Returns:
-        Tuple[dict, dict]: Tuple containing quantized weights and updated config.
-    """
-    quantized_config = copy.deepcopy(config)
-    quantized_config.setdefault("vision_config", {})
-
-    # Apply quantization
-    if skip_vision:
-        # Quantize only non-vision modules
-        nn.quantize(
-            model,
-            q_group_size,
-            q_bits,
-            class_predicate=get_class_predicate(skip_vision),
-        )
-        quantized_config["vision_config"]["skip_vision"] = skip_vision
-
-    else:
-        # Quantize only layers with to_quantized method and divisible by 64
-        nn.quantize(
-            model,
-            q_group_size,
-            q_bits,
-            class_predicate=get_class_predicate(skip_vision),
-        )
-
-    # Update config and get weights
-    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
-    quantized_weights = dict(tree_flatten(model.parameters()))
-
-    return quantized_weights, quantized_config
-
-
-def _update_vision_config(
-    config: dict,
-    value: Union[int, bool],
-    divisor: int = 64,
-    key: str = "intermediate_size",
-) -> None:
-    """Update vision config with padded sizes."""
-    if key in ["intermediate_size", "hidden_size"]:
-        config["vision_config"][key] = (
-            ((value // divisor) + 1) * divisor if value % divisor != 0 else value
-        )
-    else:
-        config["vision_config"][key] = value
-
-
 def save_config(
     config: dict,
     config_path: Union[str, Path],
@@ -666,101 +573,6 @@ def save_config(
     # write the updated config to the config_path (if provided)
     with open(config_path, "w") as fid:
         json.dump(config, fid, indent=4)
-
-
-def dequantize_model(model: nn.Module) -> nn.Module:
-    """
-    Dequantize the quantized linear layers in the model.
-
-    Args:
-        model (nn.Module): The model with quantized linear layers.
-
-    Returns:
-        nn.Module: The model with dequantized layers.
-    """
-    de_quantize_layers = []
-    for name, module in model.named_modules():
-        if isinstance(module, nn.QuantizedLinear):
-            bias = "bias" in module
-            weight = module.weight
-            weight = mx.dequantize(
-                weight,
-                module.scales,
-                module.biases,
-                module.group_size,
-                module.bits,
-            ).astype(mx.float16)
-            output_dims, input_dims = weight.shape
-            linear = nn.Linear(input_dims, output_dims, bias=bias)
-            linear.weight = weight
-            if bias:
-                linear.bias = module.bias
-            de_quantize_layers.append((name, linear))
-    if len(de_quantize_layers) > 0:
-        model.update_modules(tree_unflatten(de_quantize_layers))
-    return model
-
-
-def convert(
-    hf_path: str,
-    mlx_path: str = "mlx_model",
-    quantize: bool = False,
-    q_group_size: int = 64,
-    q_bits: int = 4,
-    dtype: Optional[str] = None,
-    upload_repo: str = None,
-    revision: Optional[str] = None,
-    dequantize: bool = False,
-    skip_vision: bool = False,
-    trust_remote_code: bool = True,
-):
-    print("[INFO] Loading")
-    model_path = get_model_path(hf_path, revision=revision)
-    model, config, processor = fetch_from_hub(
-        model_path, lazy=True, trust_remote_code=trust_remote_code
-    )
-
-    if dtype is None:
-        dtype = config.get("torch_dtype", None)
-    weights = dict(tree_flatten(model.parameters()))
-    if dtype in MODEL_CONVERSION_DTYPES:
-        print("[INFO] Using dtype:", dtype)
-        dtype = getattr(mx, dtype)
-        weights = {k: v.astype(dtype) for k, v in weights.items()}
-
-    if quantize and dequantize:
-        raise ValueError("Choose either quantize or dequantize, not both.")
-
-    if quantize:
-        print("[INFO] Quantizing")
-        model.load_weights(list(weights.items()))
-        weights, config = quantize_model(
-            model, config, q_group_size, q_bits, skip_vision
-        )
-
-    if dequantize:
-        print("[INFO] Dequantizing")
-        model = dequantize_model(model)
-        weights = dict(tree_flatten(model.parameters()))
-
-    if isinstance(mlx_path, str):
-        mlx_path = Path(mlx_path)
-
-    del model
-    save_weights(mlx_path, weights, donate_weights=True)
-
-    # Copy Python and JSON files from the model path to the MLX path
-    for pattern in ["*.py", "*.json"]:
-        files = glob.glob(str(model_path / pattern))
-        for file in files:
-            shutil.copy(file, mlx_path)
-
-    processor.save_pretrained(mlx_path)
-
-    save_config(config, config_path=mlx_path / "config.json")
-
-    if upload_repo is not None:
-        upload_to_hub(mlx_path, upload_repo, hf_path)
 
 
 def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
@@ -808,48 +620,154 @@ def process_image(img, resize_shape, image_processor):
     return img
 
 
-def process_inputs(processor, images, prompts, return_tensors="mlx"):
-    if hasattr(processor, "process"):
-        inputs = processor.process(
-            text=prompts,
+def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    gcd = np.gcd(orig_sr, target_sr)
+    up = target_sr // gcd
+    down = orig_sr // gcd
+    resampled = signal.resample_poly(audio, up, down, padtype="edge")
+    return resampled
+
+
+def load_audio(
+    file: str,
+    sr: int,
+    timeout: int = 10,
+):
+    """
+    Helper function to load audio from either a URL or file.
+    """
+    if file.startswith(("http://", "https://")):
+        try:
+            response = requests.get(file, stream=True, timeout=timeout)
+            response.raise_for_status()
+            audio, sample_rate = sf.read(BytesIO(response.content), always_2d=True)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load audio from URL: {file} with error {e}"
+            ) from e
+    else:
+        audio, sample_rate = sf.read(file, always_2d=True)
+
+    if sample_rate != sr:
+        audio = resample_audio(audio, sample_rate, sr)
+    return np.array(audio).mean(axis=1)
+
+
+def process_inputs(
+    processor,
+    prompts,
+    images=None,
+    audio=None,
+    add_special_tokens=False,
+    return_tensors="mlx",
+):
+    # Get the process method from the processor
+    process_method = getattr(processor, "process", processor)
+
+    # Prepare arguments
+    args = {
+        "text": prompts,
+        "images": images,
+        "padding": True,
+        "return_tensors": return_tensors,
+    }
+
+    # Add special tokens if supported
+    if "add_special_tokens" in inspect.signature(process_method).parameters:
+        args["add_special_tokens"] = add_special_tokens
+
+    # Add audio if provided and supported
+    if audio is not None:
+        if "audio" in inspect.signature(process_method).parameters:
+            args["audio"] = audio
+        else:
+            raise ValueError(f"Processor {processor} does not support audio parameter")
+
+    return process_method(**args)
+
+
+def process_inputs_with_fallback(
+    processor, prompts, images, audio, add_special_tokens=False, return_tensors="mlx"
+):
+    # First attempt with specified return_tensors
+    try:
+        return process_inputs(
+            processor,
+            prompts=prompts,
             images=images,
-            padding=True,
+            audio=audio,
+            add_special_tokens=add_special_tokens,
             return_tensors=return_tensors,
         )
-    else:
-        inputs = processor(
-            text=prompts, images=images, padding=True, return_tensors=return_tensors
-        )
-    return inputs
-
-
-def process_inputs_with_fallback(processor, images, prompts, return_tensors="mlx"):
-    try:
-        inputs = process_inputs(
-            processor, images, prompts, return_tensors=return_tensors
-        )
     except Exception as e:
-        try:
-            print(
-                f"\033[33mWarning\033[0m: Failed to process inputs with error: {e}",
-                "Trying to process inputs with return_tensors='pt'",
-            )
-            inputs = process_inputs(processor, images, prompts, return_tensors="pt")
-        except Exception as e:
-            raise ValueError(f"Failed to process inputs with error: {e}")
-    return inputs
+        # Fallback to PyTorch tensors if MLX fails
+        if return_tensors != "pt":
+            try:
+                return process_inputs(
+                    processor,
+                    prompts=prompts,
+                    images=images,
+                    audio=audio,
+                    add_special_tokens=add_special_tokens,
+                    return_tensors="pt",
+                )
+            except Exception as fallback_error:
+                raise ValueError(
+                    f"Failed to process inputs with error: {fallback_error}"
+                )
+
+        raise ValueError(f"Failed to process inputs with error: {e}")
 
 
-def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=None):
+def prepare_inputs(
+    processor,
+    images=None,
+    audio=None,
+    prompts=None,
+    image_token_index=None,
+    resize_shape=None,
+    add_special_tokens=False,
+):
 
-    if not isinstance(images, list):
-        images = [images]
+    if not images and not audio:
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        inputs = tokenizer(prompts, add_special_tokens=add_special_tokens)
+        input_ids = mx.array([inputs.input_ids])
+        mask = mx.array([inputs.attention_mask])
+        return {
+            "input_ids": input_ids,
+            "attention_mask": mask,
+        }
 
     # Process images
-    image_processor = (
-        processor.image_processor if hasattr(processor, "image_processor") else None
-    )
-    images = [process_image(img, resize_shape, image_processor) for img in images]
+    if images is not None:
+        if not isinstance(images, list):
+            images = [images]
+
+        image_processor = (
+            processor.image_processor if hasattr(processor, "image_processor") else None
+        )
+        images = [process_image(img, resize_shape, image_processor) for img in images]
+
+    # Process audio
+    if audio:
+        if not isinstance(audio, list):
+            audio = [audio]
+
+        if len(audio) > 1:
+            print(
+                "\033[33mWarning\033[0m: Single prompt with multiple audio files is not supported yet. Using the first audio file.\n"
+            )
+            audio = audio[:1]
+
+        audio = [
+            load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
+            for audio_file in audio
+        ]
+    else:
+        audio = None
 
     model_inputs = {}
 
@@ -888,19 +806,18 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
         if hasattr(processor, "tokenizer"):
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-        inputs = process_inputs_with_fallback(processor, images, prompts)
+        inputs = process_inputs_with_fallback(
+            processor,
+            images=images,
+            audio=audio,
+            prompts=prompts,
+            add_special_tokens=add_special_tokens,
+        )
 
         if "images" in inputs:
             inputs["pixel_values"] = inputs["images"]
             inputs.pop("images")
 
-        if isinstance(inputs["pixel_values"], list):
-            pixel_values = inputs["pixel_values"]
-        else:
-            pixel_values = mx.array(inputs["pixel_values"])
-
-        model_inputs["input_ids"] = mx.array(inputs["input_ids"])
-        model_inputs["pixel_values"] = pixel_values
         model_inputs["attention_mask"] = (
             mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
         )
@@ -910,153 +827,6 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
                 model_inputs[key] = mx.array(value)
 
     return model_inputs
-
-
-def generate_step(
-    input_ids: mx.array,
-    model: nn.Module,
-    pixel_values,
-    mask,
-    *,
-    max_tokens: int = 256,
-    temperature: float = 0.0,
-    repetition_penalty: Optional[float] = None,
-    repetition_context_size: Optional[int] = 20,
-    top_p: float = 1.0,
-    logit_bias: Optional[Dict[int, float]] = None,
-    **kwargs,
-) -> Generator[Tuple[mx.array, mx.array], None, None]:
-    """
-    A generator producing token ids based on the given prompt from the model.
-
-    Args:
-        prompt (mx.array): The input prompt.
-        model (nn.Module): The model to use for generation.
-        temperature (float): The temperature for sampling, if 0 the argmax is used.
-          Default: ``0``.
-        repetition_penalty (float, optional): The penalty factor for repeating
-          tokens.
-        repetition_context_size (int, optional): The number of tokens to
-          consider for repetition penalty. Default: ``20``.
-        top_p (float, optional): Nulceus sampling, higher means model considers
-          more less likely words.
-        logit_bias (dictionary, optional): Additive logit bias.
-
-    Yields:
-        Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
-          one token and a vector of log probabilities.
-    """
-
-    def sample(logits: mx.array) -> Tuple[mx.array, float]:
-        if logit_bias:
-            indices = mx.array(list(logit_bias.keys()))
-            values = mx.array(list(logit_bias.values()))
-            logits[:, indices] += values
-        logprobs = logits - mx.logsumexp(logits)
-
-        if temperature == 0:
-            token = mx.argmax(logits, axis=-1)
-        else:
-            if top_p > 0 and top_p < 1.0:
-                token = top_p_sampling(logits, top_p, temperature)
-            else:
-                token = mx.random.categorical(logits * (1 / temperature))
-
-        return token, logprobs
-
-    if repetition_penalty and (
-        repetition_penalty < 0 or not isinstance(repetition_penalty, float)
-    ):
-        raise ValueError(
-            f"repetition_penalty must be a non-negative float, got {repetition_penalty}"
-        )
-
-    y = input_ids
-    if hasattr(model.language_model, "make_cache"):
-        cache = model.language_model.make_cache()
-    else:
-        kv_heads = (
-            [model.language_model.n_kv_heads] * len(model.language_model.layers)
-            if isinstance(model.language_model.n_kv_heads, int)
-            else model.language_model.n_kv_heads
-        )
-        if model.config.model_type == "florence2":
-            cache = [
-                (SimpleKVCache(), SimpleKVCache()) for n in model.language_model.layers
-            ]
-        else:
-            cache = [KVCache() for n in kv_heads]
-
-    repetition_context = input_ids.reshape(-1).tolist()
-
-    if repetition_context_size:
-        repetition_context = repetition_context[-repetition_context_size:]
-
-    def _step(y, **kwargs):
-        with mx.stream(generation_stream):
-            nonlocal repetition_context
-            if "decoder_input_ids" in kwargs:
-                outputs = model.language_model(
-                    cache=cache,
-                    **kwargs,
-                )
-            else:
-                outputs = model.language_model(
-                    y[None],
-                    cache=cache,
-                    **kwargs,
-                )
-
-            logits = outputs.logits[:, -1, :]
-
-            if repetition_penalty:
-                logits = apply_repetition_penalty(
-                    logits, repetition_context, repetition_penalty
-                )
-                y, logprobs = sample(logits)
-                repetition_context.append(y.item())
-            else:
-                y, logprobs = sample(logits)
-
-            if repetition_context_size:
-                if len(repetition_context) > repetition_context_size:
-                    repetition_context = repetition_context[-repetition_context_size:]
-            return y, logprobs.squeeze(0)
-
-    outputs = model(input_ids, pixel_values, cache=cache, mask=mask, **kwargs)
-
-    logits = outputs.logits[:, -1, :]
-    y, logprobs = sample(logits)
-    mx.async_eval(y)
-
-    if outputs.cross_attention_states is not None:
-        kwargs = {
-            k: v
-            for k, v in zip(
-                ["cross_attention_states"], [outputs.cross_attention_states]
-            )
-        }
-    elif outputs.encoder_outputs is not None:
-        kwargs = {
-            "decoder_input_ids": y[None],
-            "encoder_outputs": outputs.encoder_outputs,
-        }
-    else:
-        kwargs = {}
-
-    n = 0
-    while True:
-        if n != max_tokens:
-            next_y, next_logprobs = _step(y, **kwargs)
-            mx.async_eval(next_y)
-            if "decoder_input_ids" in kwargs:
-                kwargs["decoder_input_ids"] = next_y[None]
-            yield y.item(), logprobs
-            y, logprobs = next_y, next_logprobs
-        if n == max_tokens:
-            break
-
-        n += 1
 
 
 class StoppingCriteria:
@@ -1107,205 +877,40 @@ class StoppingCriteria:
         return input_ids in self.eos_token_ids
 
 
-def stream_generate(
-    model: nn.Module,
-    processor: PreTrainedTokenizer,
-    prompt: str,
-    image: Union[str, List[str]] = None,
-    **kwargs,
-) -> Union[str, Generator[str, None, None]]:
+def print_array_report(t: mx.array, label: Optional[str]) -> dict:
     """
-    A generator producing text based on the given prompt from the model.
-
+    Return a dictionary report of an MLX array similar to PyTorch's tensor representation.
     Args:
-        prompt (mx.array): The input prompt.
-        model (nn.Module): The model to use for generation.
-        max_tokens (int): The ma
-        kwargs: The remaining options get passed to :func:`generate_step`.
-          See :func:`generate_step` for more details.
-
-    Yields:
-        Generator[Tuple[mx.array, mx.array]]: A generator producing text.
-    """
-    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-
-    # Skip special tokens
-    skip_special_tokens = kwargs.pop("skip_special_tokens", False)
-    skip_special_token_ids = (
-        set(tokenizer.all_special_ids)
-        if skip_special_tokens and hasattr(tokenizer, "all_special_ids")
-        else []
-    )
-
-    add_special_tokens = (
-        not hasattr(processor, "chat_template")
-        if model.config.model_type == "gemma3"
-        else True
-    )
-    prompt_tokens = mx.array(
-        tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
-    )
-
-    resize_shape = kwargs.pop("resize_shape", None)
-    image_token_index = getattr(model.config, "image_token_index", None)
-
-    if kwargs.get("pixel_values") is None:
-        if not image:
-            input_ids = prompt_tokens[None, :]
-            pixel_values = mask = None
-        else:
-            inputs = prepare_inputs(
-                processor, image, prompt, image_token_index, resize_shape
-            )
-            input_ids = inputs["input_ids"]
-            pixel_values = inputs["pixel_values"]
-            mask = inputs["attention_mask"]
-            data_kwargs = {
-                k: v
-                for k, v in inputs.items()
-                if k not in ["input_ids", "pixel_values", "attention_mask"]
-            }
-            kwargs.update(data_kwargs)
-    else:
-        input_ids = kwargs.pop("input_ids")
-        pixel_values = kwargs.pop("pixel_values")
-        mask = kwargs.pop("mask")
-
-    with wired_limit(model, [generation_stream]):
-        detokenizer = processor.detokenizer
-        detokenizer.reset()
-        tic = time.perf_counter()
-        for n, (token, logprobs) in enumerate(
-            generate_step(input_ids, model, pixel_values, mask, **kwargs)
-        ):
-            if n == 0:
-                prompt_time = time.perf_counter() - tic
-                prompt_tps = input_ids.size / prompt_time
-                tic = time.perf_counter()
-
-            # Stop generation if the token is in the eos_token_ids
-            if tokenizer.stopping_criteria(token):
-                break
-
-            detokenizer.add_token(token, skip_special_token_ids=skip_special_token_ids)
-
-            # Yield the last segment if streaming
-            yield GenerationResult(
-                text=detokenizer.last_segment,
-                token=token,
-                logprobs=logprobs,
-                prompt_tokens=input_ids.size,
-                generation_tokens=n + 1,
-                prompt_tps=prompt_tps,
-                generation_tps=(n + 1) / (time.perf_counter() - tic),
-                peak_memory=mx.get_peak_memory() / 1e9,
-            )
-
-        detokenizer.finalize()
-        yield GenerationResult(
-            text=detokenizer.last_segment,
-            token=token,
-            logprobs=logprobs,
-            prompt_tokens=input_ids.size,
-            generation_tokens=n + 1,
-            prompt_tps=prompt_tps,
-            generation_tps=(n + 1) / (time.perf_counter() - tic),
-            peak_memory=mx.get_peak_memory() / 1e9,
-        )
-
-
-def generate(
-    model: nn.Module,
-    processor: PreTrainedTokenizer,
-    prompt: str,
-    image: Union[str, List[str]] = None,
-    verbose: bool = False,
-    **kwargs,
-) -> str:
-    """
-    Generate text from the model.
-
-    Args:
-       model (nn.Module): The language model.
-       tokenizer (PreTrainedTokenizer): The tokenizer.
-       prompt (str): The string prompt.
-       temperature (float): The temperature for sampling (default 0).
-       max_tokens (int): The maximum number of tokens (default 100).
-       verbose (bool): If ``True``, print tokens and timing information
-           (default ``False``).
-       formatter (Optional[Callable]): A function which takes a token and a
-           probability and displays it.
-       repetition_penalty (float, optional): The penalty factor for repeating tokens.
-       repetition_context_size (int, optional): The number of tokens to consider for repetition penalty.
+        arr: MLX array to analyze
+    Returns:
+        Dictionary containing shape, dtype, value representation, and statistics
     """
 
-    if verbose:
-        print("=" * 10)
-        if image is not None:
-            input_path = image
-        elif kwargs.get("video") is not None:
-            input_path = kwargs.get("video")
-        else:
-            input_path = None
+    from pprint import pprint
 
-        print(f"Files: {input_path}", "\n")
+    # Get basic statistics
+    mean_val = mx.mean(t)
+    std_val = mx.std(t)
+    min_val = mx.min(t)
+    max_val = mx.max(t)
 
-        print("Prompt:", prompt)
-
-    text = ""
-    last_response = None
-
-    eos_tokens = kwargs.get("eos_tokens", None)
-    stopping_criteria = kwargs.get("stopping_criteria", None)
-
-    # Get the tokenizer
-    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-
-    # Add custom EOS tokens to the stopping criteria
-    if eos_tokens is not None:
-        tokenizer.stopping_criteria.add_eos_token_ids(eos_tokens)
-
-    # Use custom stopping criteria
-    elif stopping_criteria is not None:
-        if isinstance(stopping_criteria, StoppingCriteria) or callable(
-            stopping_criteria
-        ):
-            tokenizer.stopping_criteria = stopping_criteria
-        else:
-            raise ValueError(
-                "stopping_criteria must be an instance of StoppingCriteria or a callable"
-            )
-    else:
-        tokenizer.stopping_criteria.reset(model.config.eos_token_id)
-
-    for response in stream_generate(model, processor, prompt, image, **kwargs):
-        if verbose:
-            print(response.text, end="", flush=True)
-        text += response.text
-        last_response = response
-
-    if verbose:
-        print("\n" + "=" * 10)
-        if len(text) == 0:
-            print("No text generated for this prompt")
-            return
-        print(
-            f"Prompt: {last_response.prompt_tokens} tokens, "
-            f"{last_response.prompt_tps:.3f} tokens-per-sec"
-        )
-        print(
-            f"Generation: {last_response.generation_tokens} tokens, "
-            f"{last_response.generation_tps:.3f} tokens-per-sec"
-        )
-        print(f"Peak memory: {last_response.peak_memory:.3f} GB")
-
-    usage_stats = {
-        "input_tokens": last_response.prompt_tokens,
-        "output_tokens": last_response.generation_tokens,
-        "total_tokens": last_response.prompt_tokens + last_response.generation_tokens,
-        "prompt_tps": last_response.prompt_tps,
-        "generation_tps": last_response.generation_tps,
-        "peak_memory": last_response.peak_memory,
+    report = {
+        "shape": f"{tuple(t.shape)}",
+        "dtype": str(t.dtype),
+        "value": repr(t),
+        "mean": f"array({mean_val}, dtype={t.dtype})",
+        "std": f"array({std_val}, dtype={t.dtype})",
+        "min": f"array({min_val}, dtype={t.dtype})",
+        "max": f"array({max_val}, dtype={t.dtype})",
+        "label": label if label else "array",
     }
 
-    return text, usage_stats
+    # Print each field, handling 'value' specially
+    print("{")
+    for key, value in report.items():
+        if key == "value":
+            print(f" '{key}': {value},")  # No quotes around value
+        else:
+            print(f" '{key}': {repr(value)},")
+    print("}")
+    return report

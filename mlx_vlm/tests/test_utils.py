@@ -40,7 +40,9 @@ class MockProcessor:
             "DummyTokenizer", (), {"pad_token": None, "eos_token": "[EOS]"}
         )()
 
-    def __call__(self, text=None, images=None, padding=None, return_tensors="mlx"):
+    def __call__(
+        self, text=None, images=None, audio=None, padding=None, return_tensors="mlx"
+    ):
         # Count image tokens in text
         image_token_count = text.count("<image>") if text else 0
 
@@ -287,7 +289,7 @@ def test_process_inputs_with_fallback():
 
     # Test MLX tensor output
     inputs = process_inputs_with_fallback(
-        processor, images=None, prompts="test", return_tensors="mlx"
+        processor, images=None, audio=None, prompts="test", return_tensors="mlx"
     )
     assert isinstance(inputs["input_ids"], mx.array)
     assert isinstance(inputs["attention_mask"], mx.array)
@@ -295,7 +297,7 @@ def test_process_inputs_with_fallback():
     try:
         # Test PyTorch tensor output with fallback
         inputs = process_inputs_with_fallback(
-            processor, images=None, prompts="test", return_tensors="pt"
+            processor, images=None, audio=None, prompts="test", return_tensors="pt"
         )
         # Check if the tensors have PyTorch-like attributes without importing torch
         assert hasattr(inputs["input_ids"], "numpy") and hasattr(
@@ -312,7 +314,11 @@ def test_process_inputs_with_fallback():
                 match="Failed to process inputs with error.*PyTorch is not installed.*Please install PyTorch",
             ):
                 process_inputs_with_fallback(
-                    processor, images=None, prompts="test", return_tensors="pt"
+                    processor,
+                    images=None,
+                    audio=None,
+                    prompts="test",
+                    return_tensors="pt",
                 )
 
 

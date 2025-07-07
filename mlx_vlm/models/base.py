@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import create_attention_mask
+from mlx_lm.models.base import create_attention_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import RotatingKVCache
 from PIL import Image
 from transformers.image_processing_utils import BaseImageProcessor as ImageProcessor
@@ -32,6 +32,29 @@ def expand2square(pil_img, background_color):
         result = Image.new(pil_img.mode, (height, height), background_color)
         result.paste(pil_img, ((height - width) // 2, 0))
         return result
+
+
+def check_array_shape(arr):
+    shape = arr.shape
+
+    # Check if the shape has 4 dimensions
+    if len(shape) == 4:
+        out_channels, kH, KW, _ = shape
+        # Check if out_channels is the largest, and kH and KW are the same
+        if (out_channels >= kH) and (out_channels >= KW) and (kH == KW):
+            return True
+        else:
+            return False
+    # Check if the shape has 3 dimensions
+    elif len(shape) == 3:
+        _, kW, out_channels = shape
+        # Check if out_channels is the largest
+        if kW >= out_channels:
+            return True
+        else:
+            return False
+    else:
+        return False
 
 
 class BaseImageProcessor(ImageProcessor):
