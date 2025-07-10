@@ -164,14 +164,21 @@ class Model(nn.Module):
 
         # Vision features
         if pixel_values is not None:
-            image_features = self.get_image_features(pixel_values)
+            image_features = self.get_image_features(
+                pixel_values, self.vision_tower, self.config, self.embed_vision
+            )
 
+            modality = "image"
             inputs_embeds = self.merge_multimodal_and_text(
-                input_ids,
                 inputs_embeds,
                 image_features,
-                self.config.image_token_id,
-                modality="image",
+                self.construct_special_modality_mask(
+                    input_ids,
+                    inputs_embeds,
+                    self.config.image_token_id,
+                    modality=modality,
+                ),
+                modality=modality,
             )
 
         # Audio features
@@ -197,12 +204,17 @@ class Model(nn.Module):
             audio_features = mx.concatenate(
                 (audio_features, extra_padding_features), axis=1
             )
+            modality = "audio"
             inputs_embeds = self.merge_multimodal_and_text(
-                input_ids,
                 inputs_embeds,
                 audio_features,
-                self.config.audio_token_id,
-                modality="audio",
+                self.construct_special_modality_mask(
+                    input_ids,
+                    inputs_embeds,
+                    self.config.audio_token_id,
+                    modality=modality,
+                ),
+                modality=modality,
             )
 
         return inputs_embeds, per_layer_inputs
@@ -213,26 +225,26 @@ class Model(nn.Module):
         )
         return self.embed_audio(inputs_embeds=audio_outputs), audio_mask
 
-    def get_image_features(self, pixel_values):
-        vision_outputs = self.vision_tower(
+    @staticmethod
+    def get_image_features(pixel_values, vision_tower, config, embed_vision):
+        vision_outputs = vision_tower(
             pixel_values,
             output_hidden_states=True,
         )
         vision_outputs = vision_outputs.transpose(0, 3, 1, 2)
         vision_outputs = vision_outputs.reshape(
             vision_outputs.shape[0],
-            self.config.vision_config.hidden_size,
-            self.config.vision_soft_tokens_per_image,
+            config.vision_config.hidden_size,
+            config.vision_soft_tokens_per_image,
         ).transpose(0, 2, 1)
 
         # Normalize and embed the soft tokens into language model space.
-        vision_outputs *= self.config.vision_config.hidden_size**0.5
-        return self.embed_vision(inputs_embeds=vision_outputs)
+        vision_outputs *= config.vision_config.hidden_size**0.5
+        return embed_vision(inputs_embeds=vision_outputs)
 
-    def merge_multimodal_and_text(
-        self, input_ids, inputs_embeds, features, token_id, modality="image"
+    def construct_special_modality_mask(
+        self, input_ids, inputs_embeds, token_id, modality="image"
     ):
-
         if input_ids is None:
             embed_fn = (
                 self.embed_audio
@@ -247,7 +259,12 @@ class Model(nn.Module):
             special_modality_mask = mx.broadcast_to(
                 special_modality_mask, inputs_embeds.shape
             )
+        return special_modality_mask
 
+    @staticmethod
+    def merge_multimodal_and_text(
+        inputs_embeds, features, special_modality_mask, modality="image"
+    ):
         # Count special tokens by summing the mask
         modality_tokens_in_text = special_modality_mask.sum()
         feature_tokens = features.size
