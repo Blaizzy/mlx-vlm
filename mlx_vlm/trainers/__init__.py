@@ -1,6 +1,7 @@
 from .lora import LoRaLayer, replace_lora_with_linear
 from .sft_trainer import TrainingArgs, train_sft
 from .grpo_trainer import GRPOTrainingArgs, train_grpo
+from .orpo_trainer import ORPOTrainingArgs, train_orpo
 from .callback import TrainingCallback, WandBCallback
 from .dataset import SFTDataset
 from .utils import (

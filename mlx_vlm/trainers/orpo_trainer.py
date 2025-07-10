@@ -1,7 +1,6 @@
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Generator, List, Optional, Tuple, Union
 import logging
 
 import mlx.core as mx
@@ -12,16 +11,6 @@ from mlx.utils import tree_flatten, tree_map
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-from .grpo_reward_functions import (
-    RewardFunctions,
-    r1_accuracy_reward_func,
-    r1_count_xml,
-    r1_int_reward_func,
-    r1_soft_format_reward_func,
-    r1_strict_format_reward_func,
-)
 
 from .sft_trainer import TrainingArgs, average_gradients, grad_checkpoint
 from .callback import TrainingCallback
@@ -137,6 +126,8 @@ def iterate_orpo_batches(dataset, batch_size, max_seq_length, train=False):
             preference_scores = np.array(
                 [x.get("preference_score", 1.0) for x in batch], np.float32
             )
+            pixel_values = [x.get("pixel_values") for x in batch]
+            pixel_values = mx.stack(pixel_values) if all(p is not None for p in pixel_values) else None
 
             for j in range(batch_size_per_device):
                 chosen_length = min(chosen_lengths[j], max_length_in_batch)
@@ -155,25 +146,18 @@ def iterate_orpo_batches(dataset, batch_size, max_seq_length, train=False):
                 mx.array(chosen_masks),
                 mx.array(rejected_masks),
                 mx.array(preference_scores),
+                pixel_values
             )
 
         if not train:
             break
 
 
-def train_grpo(
+def train_orpo(
     model: nn.Module,
-    ref_model: Optional[nn.Module],
     processor,
     optimizer,
     dataset,
-    reward_funcs: Optional[List[RewardFunctions]] = [
-        r1_accuracy_reward_func,
-        r1_int_reward_func,
-        r1_strict_format_reward_func,
-        r1_soft_format_reward_func,
-        r1_count_xml,
-    ],
     args: ORPOTrainingArgs = ORPOTrainingArgs(),
     loss_fn: callable = orpo_loss,
     training_callback: TrainingCallback = None,
@@ -191,10 +175,10 @@ def train_grpo(
     state = [model.state, optimizer.state]
 
     def step(batch):
-        chosen, rejected, chosen_masks, rejected_masks, preference_scores = batch
+        chosen, rejected, chosen_masks, rejected_masks, preference_scores, pixel_values = batch
 
-        chosen_logps, chosen_logits_mean = get_logps(model, chosen, chosen_masks)
-        rejected_logps, rejected_logits_mean = get_logps(model, rejected, rejected_masks)
+        chosen_logps, chosen_logits_mean = get_logps(model, chosen, chosen_masks, pixel_values=pixel_values)
+        rejected_logps, rejected_logits_mean = get_logps(model, rejected, rejected_masks, pixel_values=pixel_values)
 
         (lvalue, reward, toks, metrics), grad = loss_value_and_grad(
             chosen_logps,
@@ -219,7 +203,7 @@ def train_grpo(
     def loss_wrapper(
         chosen_logps, chosen_logits_mean, rejected_logps, rejected_logits_mean, chosen_masks, rejected_masks, preference_scores
     ):
-        return loss(
+        return loss_fn(
             chosen_logps=chosen_logps,
             chosen_logits_mean=chosen_logits_mean,
             rejected_logps=rejected_logps,
