@@ -270,7 +270,15 @@ class Trainer:
                 lambda g: mx.clip(g, -self.clip_gradients, self.clip_gradients), grads
             )
 
-        self.optimizer.update(self.model, grads)
+        model_params = self.model.trainable_parameters()
+        grads = {
+            k: v for k, v in grads.items() if "rope_deltas" not in k
+        }
+        model_params = {
+            k: v for k, v in model_params.items() if "rope_deltas" not in k
+        }
+
+        self.optimizer.update(model_params, grads)
 
         return loss
 
