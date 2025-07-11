@@ -888,6 +888,7 @@ class VisionTower(nn.Module):
             stride=2,
             padding=0,
             eps=1e-05,
+            bias=True,
         )
         msfa_indices = (3, 4)
         msfa_output_resolution = (16, 16)
@@ -969,7 +970,7 @@ class VisionTower(nn.Module):
         self, x: mx.array, output_hidden_states: Optional[bool] = None
     ) -> mx.array:
         feat_idx = 0
-        x = x.transpose(0, 3, 2, 1)  # Convert from NCHW to NHWC
+        x = x.transpose(0, 2, 3, 1)  # Convert from NCHW to NHWC
         x = self.conv_stem(x)
         intermediates = []
 
