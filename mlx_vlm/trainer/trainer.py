@@ -86,7 +86,14 @@ class Dataset:
             )
             prompts.append(prompt)
 
-        image_token_index = self.config["image_token_index"]
+        image_token_index = (
+            self.config.get("image_token_index") 
+            or self.config.get("image_token_id") 
+            or self.config.get("image_token_idx")
+        )
+
+        if image_token_index is None:
+            raise KeyError("Missing image token key: expected one of 'image_token_index', 'image_token_id', or 'image_token_idx'")
 
         inputs = prepare_inputs(
             self.processor,
@@ -270,7 +277,15 @@ class Trainer:
                 lambda g: mx.clip(g, -self.clip_gradients, self.clip_gradients), grads
             )
 
-        self.optimizer.update(self.model, grads)
+        model_params = self.model.trainable_parameters()
+        grads = {
+            k: v for k, v in grads.items() if "rope_deltas" not in k
+        }
+        model_params = {
+            k: v for k, v in model_params.items() if "rope_deltas" not in k
+        }
+
+        self.optimizer.update(model_params, grads)
 
         return loss
 
