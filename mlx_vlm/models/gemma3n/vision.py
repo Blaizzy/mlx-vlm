@@ -969,7 +969,7 @@ class VisionTower(nn.Module):
         self, x: mx.array, output_hidden_states: Optional[bool] = None
     ) -> mx.array:
         feat_idx = 0
-        x = x.transpose(0, 3, 2, 1)  # Convert from NCHW to NHWC
+        x = x.transpose(0, 2, 3, 1)  # Convert from NCHW to NHWC
         x = self.conv_stem(x)
         intermediates = []
 
