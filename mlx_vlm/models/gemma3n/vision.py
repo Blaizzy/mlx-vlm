@@ -888,6 +888,7 @@ class VisionTower(nn.Module):
             stride=2,
             padding=0,
             eps=1e-05,
+            bias=True,
         )
         msfa_indices = (3, 4)
         msfa_output_resolution = (16, 16)
