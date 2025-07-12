@@ -60,8 +60,11 @@ class Dataset:
 
         item = self.dataset[idx]
 
-        images = item["images"]
-        conversations = item["messages"]
+        images = item.get("images", item.get("image", None))
+        conversations = item.get("messages", item.get("conversations"))
+        # If we're training on text only, `images` can legitimately be missing or empty.
+        if images in (None, "", []):
+            images = []
         prompts = []
 
         if isinstance(conversations, list) and isinstance(conversations[0], list):
