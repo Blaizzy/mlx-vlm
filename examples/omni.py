@@ -143,7 +143,7 @@ class ImageAudioStreamer:
         else:
             audio_np = audio_data.astype(np.float32)
 
-        energy = np.sum(audio_np**2) / audio_np.size
+        energy = np.linalg.norm(audio_np) / np.sqrt(audio_np.size)
         return energy < self.silence_threshold
 
     def _voice_activity_detection(self, frame):
