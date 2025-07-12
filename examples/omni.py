@@ -143,7 +143,7 @@ class ImageAudioStreamer:
         else:
             audio_np = audio_data.astype(np.float32)
 
-        energy = np.linalg.norm(audio_np) / np.sqrt(audio_np.size)
+        energy = np.sum(audio_np**2) / audio_np.size
         return energy < self.silence_threshold
 
     def _voice_activity_detection(self, frame):
@@ -321,30 +321,16 @@ class ImageAudioStreamer:
                                     temp_audio_filename, temp_image_filename, prompt
                                 )
                             finally:
-                                # Clean up the audio file after transcription
+                                # Clean up temporary files after transcription
                                 try:
-                                    os.remove(temp_audio_filename)
-                                    logger.debug(
-                                        f"Removed audio file: {temp_audio_filename}"
-                                    )
-                                except OSError as e:
-                                    logger.error(
-                                        f"Failed to remove audio file {temp_audio_filename}: {e}"
-                                    )
-
-                                # Clean up the image file if it exists
-                                if temp_image_filename and os.path.exists(
-                                    temp_image_filename
-                                ):
-                                    try:
+                                    if temp_audio_filename:
+                                        os.remove(temp_audio_filename)
+                                    if temp_image_filename:
                                         os.remove(temp_image_filename)
-                                        logger.debug(
-                                            f"Removed image file: {temp_image_filename}"
-                                        )
-                                    except OSError as e:
-                                        logger.error(
-                                            f"Failed to remove image file {temp_image_filename}: {e}"
-                                        )
+                                except Exception as e:
+                                    logger.error(
+                                        f"Failed to remove temporary files: {e}"
+                                    )
 
                             audio_counter += 1
 
