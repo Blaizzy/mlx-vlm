@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools >= 63.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-vlm"
+dynamic = ["version"]
+description = "Vision LLMs on Apple silicon with MLX and the Hugging Face Hub"
+requires-python = ">=3.8"
+readme = "README.md"
+authors = [{name="Prince Canuma", email="prince.gdt@gmail.com"}]
+license = {file="LICENSE"}
+dependencies = [
+    "mlx>=0.26.0",
+    "datasets>=2.19.1",
+    "tqdm>=4.66.2",
+    "numpy>=1.23.4",
+    "transformers>=4.53.0",
+    "scipy>=1.15.3",
+    "gradio>=5.19.0",
+    "Pillow>=10.3.0",
+    "requests>=2.31.0",
+    "opencv-python==4.10.0.84",
+    "mlx-lm>=0.23.0",
+    "fastapi>=0.95.1",
+    "soundfile>=0.13.1",
+    "mlx-audio"
+]
+
+[project.urls]
+homepage = "https://github.com/Blaizzy/mlx-vlm"
+issues = "https://github.com/Blaizzy/mlx-vlm/issues"
+
+[project.scripts]
+"mlx_vlm.convert" = "mlx_vlm.convert:main"
+"mlx_vlm.generate" = "mlx_vlm.generate:main"
+
+[tool.setuptools.packages.find]
+include = ["mlx_vlm*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "mlx_vlm.version.__version__"}
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
