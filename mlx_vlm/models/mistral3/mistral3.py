@@ -277,3 +277,7 @@ class Model(PixtralModel):
             self.config.image_token_index, image_features, inputs_embeds, input_ids
         )
         return final_inputs_embeds
+
+    @property
+    def layers(self):
+        return self.language_model.model.layers
