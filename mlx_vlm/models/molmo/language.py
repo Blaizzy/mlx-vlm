@@ -5,7 +5,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput, create_attention_mask
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from ..cache import KVCache
 
 
@@ -108,7 +112,7 @@ class MolmoBlock(nn.Module):
             k = self.rotary_emb(k)
 
         # Perform attention
-        att = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
+        att = scaled_dot_product_attention(q, k, v, cache, scale=self.scale, mask=mask)
         att = att.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, D)
         att = self.attn_out(att)
 

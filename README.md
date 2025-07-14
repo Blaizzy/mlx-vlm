@@ -1,7 +1,7 @@
 [![Upload Python Package](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml/badge.svg)](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml)
 # MLX-VLM
 
-MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) on your Mac using MLX.
+MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX.
 
 ## Table of Contents
 - [Installation](#installation)
@@ -19,7 +19,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 The easiest way to get started is to install the `mlx-vlm` package using pip:
 
 ```sh
-pip install mlx-vlm
+pip install -U mlx-vlm
 ```
 
 ## Usage
@@ -29,7 +29,14 @@ pip install mlx-vlm
 Generate output from a model using the CLI:
 
 ```sh
-python -m mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --temperature 0.0 --image http://images.cocodataset.org/val2017/000000039769.jpg
+# Image generation
+mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --temperature 0.0 --image http://images.cocodataset.org/val2017/000000039769.jpg
+
+# Audio generation (New)
+mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --prompt "Describe what you hear" --audio /path/to/audio.wav
+
+# Multi-modal generation (Image + Audio)
+mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --prompt "Describe what you see and hear" --image /path/to/image.jpg --audio /path/to/audio.wav
 ```
 
 ### Chat UI with Gradio
@@ -37,7 +44,7 @@ python -m mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max
 Launch a chat interface using Gradio:
 
 ```sh
-python -m mlx_vlm.chat_ui --model mlx-community/Qwen2-VL-2B-Instruct-4bit
+mlx_vlm.chat_ui --model mlx-community/Qwen2-VL-2B-Instruct-4bit
 ```
 
 ### Python Script
@@ -70,15 +77,81 @@ output = generate(model, processor, formatted_prompt, image, verbose=False)
 print(output)
 ```
 
-### Server (FastAPI)
-To start the server
-```sh
-python -m mlx_vlm.server
+#### Audio Example
+
+```python
+from mlx_vlm import load, generate
+from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.utils import load_config
+
+# Load model with audio support
+model_path = "mlx-community/gemma-3n-E2B-it-4bit"
+model, processor = load(model_path)
+config = model.config
+
+# Prepare audio input
+audio = ["/path/to/audio1.wav", "/path/to/audio2.mp3"]
+prompt = "Describe what you hear in these audio files."
+
+# Apply chat template with audio
+formatted_prompt = apply_chat_template(
+    processor, config, prompt, num_audios=len(audio)
+)
+
+# Generate output with audio
+output = generate(model, processor, formatted_prompt, audio=audio, verbose=False)
+print(output)
 ```
 
-Models can be loaded or unloaded dynamically and they are cached (one at a time) when the server is running.
+#### Multi-Modal Example (Image + Audio)
 
-Usage example:
+```python
+from mlx_vlm import load, generate
+from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.utils import load_config
+
+# Load multi-modal model
+model_path = "mlx-community/gemma-3n-E2B-it-4bit"
+model, processor = load(model_path)
+config = model.config
+
+# Prepare inputs
+image = ["/path/to/image.jpg"]
+audio = ["/path/to/audio.wav"]
+prompt = ""
+
+# Apply chat template
+formatted_prompt = apply_chat_template(
+    processor, config, prompt,
+    num_images=len(image),
+    num_audios=len(audio)
+)
+
+# Generate output
+output = generate(model, processor, formatted_prompt, image, audio=audio, verbose=False)
+print(output)
+```
+
+### Server (FastAPI)
+
+Start the server:
+```sh
+mlx_vlm.server
+```
+
+The server provides multiple endpoints for different use cases and supports dynamic model loading/unloading with caching (one model at a time).
+
+#### Available Endpoints
+
+- `/generate` - Main generation endpoint with support for images, audio, and text
+- `/chat` - Chat-style interaction endpoint
+- `/responses` - OpenAI-compatible endpoint
+- `/health` - Check server status
+- `/unload` - Unload current model from memory
+
+#### Usage Examples
+
+##### Basic Image Generation
 ```sh
 curl -X POST "http://localhost:8000/generate" \
   -H "Content-Type: application/json" \
@@ -92,20 +165,86 @@ curl -X POST "http://localhost:8000/generate" \
   }'
 ```
 
+##### Audio Support (New)
+```sh
+curl -X POST "http://localhost:8000/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/gemma-3n-E2B-it-4bit",
+    "audio": ["/path/to/audio1.wav", "https://example.com/audio2.mp3"],
+    "prompt": "Describe what you hear in these audio files",
+    "stream": true,
+    "max_tokens": 500
+  }'
+```
+
+##### Multi-Modal (Image + Audio)
+```sh
+curl -X POST "http://localhost:8000/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/gemma-3n-E2B-it-4bit",
+    "image": ["/path/to/image.jpg"],
+    "audio": ["/path/to/audio.wav"],
+    "prompt": "",
+    "max_tokens": 1000
+  }'
+```
+
+##### Chat Endpoint
+```sh
+curl -X POST "http://localhost:8000/chat" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen2-VL-2B-Instruct-4bit",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is in this image?",
+        "images": ["/path/to/image.jpg"]
+      }
+    ],
+    "max_tokens": 100
+  }'
+```
+
+##### OpenAI-Compatible Endpoint
+```sh
+curl -X POST "http://localhost:8000/responses" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen2-VL-2B-Instruct-4bit",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "input_text", "text": "What is in this image?"},
+          {"type": "input_image", "image": "/path/to/image.jpg"}
+        ]
+      }
+    ],
+    "max_tokens": 100
+  }'
+```
+
+#### Request Parameters
+
+- `model`: Model identifier (required)
+- `prompt`: Text prompt for generation
+- `image`: List of image URLs or local paths (optional)
+- `audio`: List of audio URLs or local paths (optional, new)
+- `system`: System prompt (optional)
+- `messages`: Chat messages for chat/OpenAI endpoints
+- `max_tokens`: Maximum tokens to generate
+- `temperature`: Sampling temperature
+- `top_p`: Top-p sampling parameter
+- `stream`: Enable streaming responses
+
 
 ## Multi-Image Chat Support
 
 MLX-VLM supports analyzing multiple images simultaneously with select models. This feature enables more complex visual reasoning tasks and comprehensive analysis across multiple images in a single conversation.
 
-### Supported Models
-
-The following models support multi-image chat:
-
-1. Idefics 2
-2. LLaVA (Interleave)
-3. Qwen2-VL
-4. Phi3-Vision
-5. Pixtral
 
 ### Usage Examples
 
@@ -118,7 +257,7 @@ from mlx_vlm.utils import load_config
 
 model_path = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
 model, processor = load(model_path)
-config = load_config(model_path)
+config = model.config
 
 images = ["path/to/image1.jpg", "path/to/image2.jpg"]
 prompt = "Compare these two images."
@@ -134,7 +273,7 @@ print(output)
 #### Command Line
 
 ```sh
-python -m mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Compare these images" --image path/to/image1.jpg path/to/image2.jpg
+mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Compare these images" --image path/to/image1.jpg path/to/image2.jpg
 ```
 
 ## Video Understanding
@@ -156,7 +295,7 @@ With more coming soon.
 
 #### Command Line
 ```sh
-python -m mlx_vlm.video_generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --max-pixels 224 224 --fps 1.0
+mlx_vlm.video_generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --max-pixels 224 224 --fps 1.0
 ```
 
 

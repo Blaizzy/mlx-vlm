@@ -16,7 +16,8 @@ import numpy as np
 import requests
 from PIL import Image
 
-from .utils import generate, load, load_image, process_inputs_with_fallback
+from .generate import generate
+from .utils import load, load_image, process_inputs_with_fallback
 
 # This is a beta version of the video generation script.
 # It is not fully tested and may not work as expected.

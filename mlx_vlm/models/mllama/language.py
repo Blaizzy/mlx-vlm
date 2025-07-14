@@ -5,7 +5,11 @@ from typing import Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput, create_attention_mask
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from ..cache import KVCache
 
 
@@ -106,10 +110,11 @@ class MllamaTextCrossAttention(nn.Module):
             key_states, value_states = mx.split(query, 2, axis=1)
             key_states = self.k_norm(key_states)
 
-        attn_output = mx.fast.scaled_dot_product_attention(
+        attn_output = scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
+            cache,
             scale=self.scale,
             mask=attention_mask,  # add a dim for batch processing
         )
@@ -180,8 +185,8 @@ class MllamaTextSelfAttention(nn.Module):
             query_states = self.rope(query_states)
             key_states = self.rope(key_states)
 
-        attn_output = mx.fast.scaled_dot_product_attention(
-            query_states, key_states, value_states, scale=self.scale, mask=mask
+        attn_output = scaled_dot_product_attention(
+            query_states, key_states, value_states, cache, scale=self.scale, mask=mask
         )
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(
             bsz, q_len, self.hidden_size

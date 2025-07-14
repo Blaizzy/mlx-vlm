@@ -123,6 +123,10 @@ class Model(nn.Module):
 
         return inputs_embeds.reshape(B, N, C)
 
+    @property
+    def layers(self):
+        return self.language_model.model.layers
+
     def __call__(
         self,
         input_ids: mx.array,
@@ -134,43 +138,3 @@ class Model(nn.Module):
         input_embddings = self.get_input_embeddings(input_ids, pixel_values)
         logits = self.language_model(None, cache=cache, inputs_embeds=input_embddings)
         return logits
-
-    @staticmethod
-    def from_pretrained(path_or_hf_repo: str):
-        path = Path(path_or_hf_repo)
-        if not path.exists():
-            path = Path(
-                snapshot_download(
-                    repo_id=path_or_hf_repo,
-                    allow_patterns=[
-                        "*.json",
-                        "*.safetensors",
-                        "*.py",
-                        "tokenizer.model",
-                        "*.tiktoken",
-                    ],
-                )
-            )
-
-        with open(path / "config.json", "r") as f:
-            model_config = json.load(f)
-
-        model_config = ModelConfig.from_dict(model_config)
-
-        model_config.vision_config = VisionConfig.from_dict(model_config.vision_config)
-        model_config.text_config = TextConfig.from_dict(model_config)
-
-        model = Model(model_config)
-        weight_files = glob.glob(str(path / "*.safetensors"))
-        if not weight_files:
-            raise FileNotFoundError(f"No safetensors found in {path}")
-
-        weights = {}
-        for wf in weight_files:
-            weights.update(mx.load(wf))
-
-        weights = VisionModel.sanitize(weights)
-        weights = LanguageModel.sanitize(weights)
-
-        model.load_weights(list(weights.items()))
-        return model
