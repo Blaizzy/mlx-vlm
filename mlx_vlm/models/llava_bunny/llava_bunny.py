@@ -187,6 +187,10 @@ class Model(nn.Module):
         # (batch_size, num_image_patches + sequence_len, embed_dim)
         return mx.concatenate(final_embeddings, axis=0)
 
+    @property
+    def layers(self):
+        return self.language_model.model.layers
+
     def __call__(
         self,
         input_ids: mx.array,

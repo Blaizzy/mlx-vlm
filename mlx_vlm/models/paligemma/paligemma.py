@@ -135,6 +135,10 @@ class Model(nn.Module):
         final_embedding = mx.array(final_embedding)
         return final_embedding, final_attention_mask_4d
 
+    @property
+    def layers(self):
+        return self.language_model.model.layers
+
     def __call__(
         self,
         input_ids: mx.array,
