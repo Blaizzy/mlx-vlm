@@ -432,6 +432,10 @@ class Model(nn.Module):
 
         return image_features
 
+    @property
+    def layers(self):
+        return self.language_model.model.layers
+
     def __call__(
         self,
         input_ids: mx.array,

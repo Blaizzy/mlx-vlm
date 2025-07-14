@@ -114,6 +114,10 @@ class Model(nn.Module):
 
         return inputs_embeds
 
+    @property
+    def layers(self):
+        return self.language_model.model.layers
+
     def __call__(
         self,
         input_ids: mx.array,
