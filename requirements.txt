@@ -1,0 +1,14 @@
+mlx>=0.26.0
+datasets>=2.19.1
+tqdm>=4.66.2
+transformers>=4.53.0
+gradio>=5.19.0
+Pillow>=10.3.0
+requests>=2.31.0
+opencv-python==4.10.0.84
+mlx-lm>=0.23.0
+fastapi>=0.95.1
+soundfile>=0.13.1
+scipy>=1.15.3
+numpy
+mlx-audio
