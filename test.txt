@@ -1,0 +1,14 @@
+python -m mlx_vlm.lora \
+--model-path mlx-community/SmolVLM-Instruct-4bit \
+--train-mode orpo \
+--dataset hvgo/chartqa \
+--output-path ./orpo_vlm_adapter \
+--beta 0.1 \
+--reward-scaling 1.0 \
+--steps 500 \
+--batch-size 2 \
+--learning-rate 5e-5 \
+--print-every 20 \
+--lora-rank 8 \
+--lora-alpha 16 \
+--lora-dropout 0.05
