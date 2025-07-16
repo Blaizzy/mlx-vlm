@@ -33,8 +33,9 @@ Issues = "https://github.com/Blaizzy/mlx-vlm/issues"
 "mlx_vlm.convert" = "mlx_vlm.convert:main"
 "mlx_vlm.generate" = "mlx_vlm.generate:main"
 
-[tool.setuptools]
-packages = ["mlx_vlm"]
+[tool.setuptools.packages.find]
+include = ["mlx_vlm*"]
+exclude = ["mlx_vlm.tests*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "mlx_vlm.version.__version__"}
