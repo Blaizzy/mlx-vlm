@@ -40,3 +40,7 @@ exclude = ["mlx_vlm.tests*"]
 [tool.setuptools.dynamic]
 version = {attr = "mlx_vlm.version.__version__"}
 dependencies = {file = ["requirements.txt"]}
+
+[project.optional-dependencies]
+ui = ["gradio>=5.19.0"]
+audio = ["mlx-audio"]
