@@ -1,10 +1,4 @@
-from .multi_modality import (
-    ImageProcessor,
-    LanguageModel,
-    Model,
-    ModelConfig,
-    ProjectorConfig,
-    TextConfig,
-    VisionConfig,
-    VisionModel,
-)
+from .config import ModelConfig, ProjectorConfig, TextConfig, VisionConfig
+from .language import LanguageModel
+from .multi_modality import ImageProcessor, Model
+from .vision import VisionModel

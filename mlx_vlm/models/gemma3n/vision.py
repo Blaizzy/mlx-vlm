@@ -1,15 +1,17 @@
-import inspect
 from collections.abc import Sequence
-from dataclasses import dataclass
 from math import sqrt
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_vlm.models.gemma3n.config import VisionConfig
+from mlx_vlm.models.gemma3n.config import (
+    EdgeResidualConfig,
+    MultiQueryAttentionBlockConfig,
+    UniversalInvertedResidualConfig,
+    VisionConfig,
+)
 
-from ..base import check_array_shape
 from ..kernels import bicubic_interpolate, nearest_interpolate
 
 
@@ -782,15 +784,6 @@ def make_divisible(v, divisor: int = 8, min_value=None, round_limit: float = 0.9
     return new_v
 
 
-@dataclass(frozen=True)
-class EdgeResidualConfig:
-    kernel_size: int = 3
-    filters: int = 32
-    strides: int = 1
-    expand_ratio: float = 4.0
-    is_multiscale: bool = False
-
-
 def _er(kernel_size, filters, strides=1, expand_ratio=4.0, is_multiscale=False):
     return EdgeResidualConfig(
         kernel_size=kernel_size,
@@ -799,16 +792,6 @@ def _er(kernel_size, filters, strides=1, expand_ratio=4.0, is_multiscale=False):
         expand_ratio=expand_ratio,
         is_multiscale=is_multiscale,
     )
-
-
-@dataclass(frozen=True)
-class UniversalInvertedResidualConfig:
-    start_dw_kernel_size: int = 0  # Zero size means no conv
-    mid_dw_kernel_size: int = 0  # Zero size means no conv
-    filters: int = 32
-    strides: int = 1
-    expand_ratio: float = 4.0
-    is_multiscale: bool = False
 
 
 def _uir(
@@ -827,17 +810,6 @@ def _uir(
         expand_ratio=expand_ratio,
         is_multiscale=is_multiscale,
     )
-
-
-@dataclass(frozen=True)
-class MultiQueryAttentionBlockConfig:
-    num_heads: int = 8
-    kv_dim: int = 16
-    kv_strides: int = 1
-    mmqa_avg_pool_kv: bool = False
-    mmqa_dropout: float = 0.0
-    mmqa_dw_kernel_size: int = 3
-    is_multiscale: bool = False
 
 
 def _mmqa(

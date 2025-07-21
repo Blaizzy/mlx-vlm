@@ -29,6 +29,9 @@ pip install -U mlx-vlm
 Generate output from a model using the CLI:
 
 ```sh
+# Text generation
+mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Hello, how are you?"
+
 # Image generation
 mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --temperature 0.0 --image http://images.cocodataset.org/val2017/000000039769.jpg
 
@@ -151,7 +154,21 @@ The server provides multiple endpoints for different use cases and supports dyna
 
 #### Usage Examples
 
-##### Basic Image Generation
+##### Text Generation
+
+```sh
+curl -X POST "http://localhost:8000/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen2-VL-2B-Instruct-4bit",
+    "prompt": "Hello, how are you?",
+    "stream": true,
+    "max_tokens": 100
+  }'
+```
+
+##### Image Generation
+
 ```sh
 curl -X POST "http://localhost:8000/generate" \
   -H "Content-Type: application/json" \
