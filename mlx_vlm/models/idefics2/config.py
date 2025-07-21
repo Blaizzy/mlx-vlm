@@ -18,7 +18,7 @@ class VisionConfig(BaseModelConfig):
 
 
 @dataclass
-class TextConfig:
+class TextConfig(BaseModelConfig):
     model_type: str
     hidden_size: int
     num_hidden_layers: int
