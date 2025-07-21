@@ -1,4 +1,3 @@
-import inspect
 from typing import List, Optional, Tuple
 
 import mlx.core as mx
