@@ -6,7 +6,7 @@ from ..base import BaseModelConfig
 
 
 @dataclass
-class ModelConfig:
+class ModelConfig(BaseModelConfig):
     text_config: "TextConfig" = field(default_factory=lambda: TextConfig())
     vision_config: "VisionConfig" = field(default_factory=lambda: VisionConfig())
     model_type: str = "paligemma"

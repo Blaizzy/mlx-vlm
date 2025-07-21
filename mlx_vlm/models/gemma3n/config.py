@@ -1,4 +1,3 @@
-import inspect
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
@@ -99,3 +98,33 @@ class ModelConfig(BaseModelConfig):
     vision_soft_tokens_per_image: int = 256
     audio_soft_tokens_per_image: int = 188
     eos_token_id: Optional[List[int]] = None
+
+
+@dataclass
+class MultiQueryAttentionBlockConfig(BaseModelConfig):
+    num_heads: int = 8
+    kv_dim: int = 16
+    kv_strides: int = 1
+    mmqa_avg_pool_kv: bool = False
+    mmqa_dropout: float = 0.0
+    mmqa_dw_kernel_size: int = 3
+    is_multiscale: bool = False
+
+
+@dataclass
+class UniversalInvertedResidualConfig(BaseModelConfig):
+    start_dw_kernel_size: int = 0  # Zero size means no conv
+    mid_dw_kernel_size: int = 0  # Zero size means no conv
+    filters: int = 32
+    strides: int = 1
+    expand_ratio: float = 4.0
+    is_multiscale: bool = False
+
+
+@dataclass
+class EdgeResidualConfig(BaseModelConfig):
+    kernel_size: int = 3
+    filters: int = 32
+    strides: int = 1
+    expand_ratio: float = 4.0
+    is_multiscale: bool = False
