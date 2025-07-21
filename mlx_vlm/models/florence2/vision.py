@@ -7,9 +7,11 @@ from typing import List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import BaseModelConfig
+
 
 @dataclass
-class VisionConfig:
+class VisionConfig(BaseModelConfig):
     """Configuration class for Florence2 Vision model (DaViT)."""
 
     model_type: str = "davit"
@@ -33,16 +35,6 @@ class VisionConfig:
     conv_at_ffn: bool = True
     hidden_size: int = 768
     image_size: Tuple[int, int] = (768, 768)
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 def check_array_shape(arr):

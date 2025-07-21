@@ -2,9 +2,11 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
+from ..base import BaseModelConfig
+
 
 @dataclass
-class VisionConfig:
+class VisionConfig(BaseModelConfig):
     model_type: str = "qwen2_5_vl"
     depth: int = 32
     hidden_size: int = 1280
@@ -37,7 +39,7 @@ class VisionConfig:
 
 
 @dataclass
-class TextConfig:
+class TextConfig(BaseModelConfig):
     model_type: str
     hidden_size: int
     num_hidden_layers: int
@@ -76,7 +78,7 @@ class TextConfig:
 
 
 @dataclass
-class ModelConfig:
+class ModelConfig(BaseModelConfig):
     text_config: TextConfig
     vision_config: VisionConfig
     model_type: str

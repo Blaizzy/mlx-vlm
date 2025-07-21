@@ -11,12 +11,13 @@ import mlx.nn as nn
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_map
 
+from ..base import BaseModelConfig
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
 
 @dataclass
-class ModelConfig:
+class ModelConfig(BaseModelConfig):
     """Configuration class for Florence2."""
 
     vision_config: VisionConfig
@@ -38,16 +39,6 @@ class ModelConfig:
         default_factory=lambda: {"type": "learned_abs_2d", "max_pos_embeddings": 50}
     )
     eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 def shift_tokens_right(

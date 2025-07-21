@@ -13,30 +13,20 @@ from PIL import Image
 from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import to_numpy_array
 
-from ..base import BaseImageProcessor, expand2square
+from ..base import BaseImageProcessor, BaseModelConfig, expand2square
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
 
 @dataclass
-class ProjectorConfig:
+class ProjectorConfig(BaseModelConfig):
     cls: str
     model_type: str
     params: dict
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
 
 @dataclass
-class ModelConfig:
+class ModelConfig(BaseModelConfig):
     text_config: TextConfig
     vision_config: VisionConfig
     projector_config: ProjectorConfig

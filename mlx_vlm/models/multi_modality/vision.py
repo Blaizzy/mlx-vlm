@@ -10,11 +10,12 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import BaseModelConfig
 from .sam import SAMEncoder
 
 
 @dataclass
-class VisionConfig:
+class VisionConfig(BaseModelConfig):
     model_type: str
     num_hidden_layers: int = 24
     hidden_size: int = 1024
@@ -31,19 +32,9 @@ class VisionConfig:
         if "high_res_cfg" in self.params:
             self.image_size = self.params["high_res_cfg"]["image_size"]
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
 
 @dataclass
-class MLPConfig:
+class MLPConfig(BaseModelConfig):
     hidden_size: int
     intermediate_size: int
 

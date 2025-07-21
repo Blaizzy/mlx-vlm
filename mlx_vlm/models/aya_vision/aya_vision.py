@@ -10,12 +10,13 @@ import mlx.nn as nn
 import numpy as np
 from mlx_lm.utils import snapshot_download
 
+from ..base import BaseModelConfig
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
 
 @dataclass
-class ModelConfig:
+class ModelConfig(BaseModelConfig):
     text_config: TextConfig
     vision_config: VisionConfig
     model_type: str
@@ -27,16 +28,6 @@ class ModelConfig:
     vision_feature_layer: int = -1
     vision_feature_select_strategy: str = "full"
     eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 class AyaVisionMultiModalProjector(nn.Module):

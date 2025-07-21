@@ -6,11 +6,11 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import interpolate
+from ..base import BaseModelConfig, interpolate
 
 
 @dataclass
-class VisionConfig:
+class VisionConfig(BaseModelConfig):
     model_type: str
     hidden_size: int = 1024
     num_attention_heads: int = 16
@@ -24,16 +24,6 @@ class VisionConfig:
     qkv_bias: bool = True
     qk_normalization: bool = False
     norm_type: str = "layer_norm"
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 def check_array_shape(arr):

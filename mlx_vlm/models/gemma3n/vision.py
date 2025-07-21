@@ -9,7 +9,7 @@ import mlx.nn as nn
 
 from mlx_vlm.models.gemma3n.config import VisionConfig
 
-from ..base import check_array_shape
+from ..base import BaseModelConfig, check_array_shape
 from ..kernels import bicubic_interpolate, nearest_interpolate
 
 
@@ -783,7 +783,7 @@ def make_divisible(v, divisor: int = 8, min_value=None, round_limit: float = 0.9
 
 
 @dataclass(frozen=True)
-class EdgeResidualConfig:
+class EdgeResidualConfig(BaseModelConfig):
     kernel_size: int = 3
     filters: int = 32
     strides: int = 1
@@ -802,7 +802,7 @@ def _er(kernel_size, filters, strides=1, expand_ratio=4.0, is_multiscale=False):
 
 
 @dataclass(frozen=True)
-class UniversalInvertedResidualConfig:
+class UniversalInvertedResidualConfig(BaseModelConfig):
     start_dw_kernel_size: int = 0  # Zero size means no conv
     mid_dw_kernel_size: int = 0  # Zero size means no conv
     filters: int = 32
@@ -830,7 +830,7 @@ def _uir(
 
 
 @dataclass(frozen=True)
-class MultiQueryAttentionBlockConfig:
+class MultiQueryAttentionBlockConfig(BaseModelConfig):
     num_heads: int = 8
     kv_dim: int = 16
     kv_strides: int = 1

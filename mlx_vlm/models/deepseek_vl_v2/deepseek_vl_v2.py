@@ -15,7 +15,7 @@ from transformers import AutoProcessor
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 from transformers.image_utils import to_numpy_array
 
-from ..base import expand2square
+from ..base import BaseModelConfig, expand2square
 from .language import LanguageModel, TextConfig
 from .processing_deepsek_vl_v2 import DeepseekVLV2Processor
 from .vision import VisionConfig, VisionModel
@@ -24,7 +24,7 @@ AutoProcessor.register("deepseek_vl_v2", DeepseekVLV2Processor)
 
 
 @dataclass
-class ProjectorConfig:
+class ProjectorConfig(BaseModelConfig):
     projector_type: str = "downsample_mlp_gelu"
     input_dim: int = 1152
     n_embed: int = 2048
@@ -33,19 +33,9 @@ class ProjectorConfig:
     downsample_ratio: int = 2
     token_pooling: bool = False
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
 
 @dataclass
-class ModelConfig:
+class ModelConfig(BaseModelConfig):
     text_config: TextConfig
     vision_config: VisionConfig
     projector_config: ProjectorConfig

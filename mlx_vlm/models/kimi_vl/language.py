@@ -10,6 +10,7 @@ import mlx.nn as nn
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
+    BaseModelConfig,
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
@@ -18,7 +19,7 @@ from ..cache import KVCache
 
 
 @dataclass
-class TextConfig:
+class TextConfig(BaseModelConfig):
     model_type: str = "deepseek_v3"
     vocab_size: int = 102400
     hidden_size: int = 4096
@@ -48,16 +49,6 @@ class TextConfig:
     rope_theta: float = 10000.0
     rope_scaling: Dict = None
     attention_bias: bool = False
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
     def __post_init__(self):
         if self.num_key_value_heads is None:

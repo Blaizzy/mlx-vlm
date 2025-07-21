@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import (
+    BaseModelConfig,
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
@@ -15,7 +16,7 @@ from ..cache import SimpleKVCache
 
 
 @dataclass
-class TextConfig:
+class TextConfig(BaseModelConfig):
     d_model: int = 768
     model_type: str = "florence2"
     encoder_attention_heads: int = 8
@@ -38,16 +39,6 @@ class TextConfig:
     eos_token_id: int = 2
     encoder_layers: int = 6
     decoder_layers: int = 6
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 class Florence2Attention(nn.Module):
