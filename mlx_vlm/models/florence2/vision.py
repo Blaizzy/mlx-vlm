@@ -1,48 +1,12 @@
 import inspect
 import math
 from collections import OrderedDict
-from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 
-
-@dataclass
-class VisionConfig:
-    """Configuration class for Florence2 Vision model (DaViT)."""
-
-    model_type: str = "davit"
-    in_chans: int = 3
-    num_classes: int = 1000
-    depths: List[int] = field(default_factory=lambda: [1, 1, 9, 1])
-    dim_embed: List[int] = field(default_factory=lambda: [128, 256, 512, 1024])
-    num_heads: List[int] = field(default_factory=lambda: [4, 8, 16, 32])
-    num_groups: List[int] = field(default_factory=lambda: [4, 8, 16, 32])
-    window_size: int = 12
-    mlp_ratio: float = 4.0
-    drop_path_rate: float = 0.1
-    patch_size: List[int] = field(default_factory=lambda: [7, 3, 3, 3])
-    patch_stride: List[int] = field(default_factory=lambda: [4, 2, 2, 2])
-    patch_padding: List[int] = field(default_factory=lambda: [3, 1, 1, 1])
-    patch_prenorm: List[bool] = field(
-        default_factory=lambda: [False, False, False, False]
-    )
-    qkv_bias: bool = True
-    conv_at_attn: bool = True
-    conv_at_ffn: bool = True
-    hidden_size: int = 768
-    image_size: Tuple[int, int] = (768, 768)
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import VisionConfig
 
 
 def check_array_shape(arr):

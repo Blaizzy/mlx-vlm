@@ -1,47 +1,11 @@
 import inspect
-from dataclasses import dataclass
 from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..kernels import bicubic_interpolate
-
-
-@dataclass
-class VisionConfig:
-    model_type: str = "moonvit"
-    depth: int = 27
-    embed_dim: int = 1152
-    hidden_size: int = 1152
-    num_heads: int = 16
-    image_size: int = 384
-    patch_size: int = 14
-    vocab_size: int = 32000
-    mlp_ratio: float = 4.0
-    num_channels: int = 3
-    layer_norm_eps: float = 1e-6
-    intermediate_size: int = 4304
-    init_pos_emb_height: int = 64
-    init_pos_emb_width: int = 64
-    spatial_patch_size: int = 14
-    spatial_merge_size: int = 2
-    temporal_patch_size: int = 2
-    merge_kernel_size: list[int, int] = None
-
-    def __post_init__(self):
-        if self.merge_kernel_size is None:
-            self.merge_kernel_size = (self.spatial_merge_size, self.spatial_merge_size)
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import VisionConfig
 
 
 def check_array_shape(arr):

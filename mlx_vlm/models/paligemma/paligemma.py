@@ -1,7 +1,6 @@
 import glob
 import inspect
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
@@ -9,31 +8,9 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
-from .language import LanguageModel, TextConfig
-from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig:
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    vocab_size: int = 257152
-    ignore_index: int = -100
-    image_token_index: int = 257152
-    hidden_size: int = 2048
-    pad_token_id: int = 0
-    eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import ModelConfig
+from .language import LanguageModel
+from .vision import VisionModel
 
 
 class PaliGemmaMultiModalProjector(nn.Module):

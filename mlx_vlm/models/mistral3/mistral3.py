@@ -9,34 +9,11 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import BaseModelConfig
 from ..pixtral import LanguageModel
 from ..pixtral import Model as PixtralModel
-from ..pixtral import TextConfig, VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig:
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    ignore_index: int = -100
-    image_token_index: int = 10
-    vision_feature_select_strategy: str = "full"
-    vision_feature_layer: int = -1
-    vocab_size: int = 32000
-    spatial_merge_size: int = 2
-    multimodal_projector_bias: bool = False
-    eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from ..pixtral import VisionModel
+from .config import ModelConfig
 
 
 def _pair(x) -> Tuple[int, int]:

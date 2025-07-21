@@ -2,7 +2,6 @@ import glob
 import inspect
 import json
 import re
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Union
 
@@ -10,33 +9,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .language import LanguageModel, TextConfig
-from .vision import Llama4MultiModalProjector, VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig:
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    ignore_index: int = -100
-    image_token_id: int = 200092
-    image_token_index: Optional[int] = None
-    eos_token_id: Optional[List[int]] = None
-
-    def __post_init__(self):
-        if self.image_token_index is None:
-            self.image_token_index = self.image_token_id
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import ModelConfig, TextConfig, VisionConfig
+from .language import LanguageModel
+from .vision import Llama4MultiModalProjector, VisionModel
 
 
 class Model(nn.Module):
