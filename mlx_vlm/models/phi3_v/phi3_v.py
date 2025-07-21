@@ -1,6 +1,5 @@
 import inspect
 import math
-from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -8,37 +7,12 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import BaseModelConfig, LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask
 from ..cache import KVCache
-from .language import LanguageModel, TextConfig
+from .config import ModelConfig, TextConfig
+from .language import LanguageModel
 from .su_rope import Phi3SuScaledRotaryEmbedding
-from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig(BaseModelConfig):
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    vocab_size: int
-
-    num_hidden_layers: int
-    intermediate_size: int
-    num_attention_heads: int
-    rms_norm_eps: float
-
-    ignore_index: int = -100
-    image_token_index: int = 257152
-    hidden_size: int = 2048
-    pad_token_id: int = 0
-
-    num_key_value_heads: int = None
-    rope_theta: float = 10000
-    rope_traditional: bool = False
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    max_position_embeddings: int = 131072
-    original_max_position_embeddings: int = 4096
-    eos_token_id: Optional[List[int]] = None
+from .vision import VisionModel
 
 
 class Attention(nn.Module):

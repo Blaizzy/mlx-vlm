@@ -1,6 +1,4 @@
 import copy
-import inspect
-from dataclasses import dataclass
 from functools import partial
 from math import sqrt
 from typing import Dict, Optional, Union
@@ -10,33 +8,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import BaseModelConfig
+from .config import MLPConfig, VisionConfig
 from .sam import SAMEncoder
-
-
-@dataclass
-class VisionConfig(BaseModelConfig):
-    model_type: str
-    num_hidden_layers: int = 24
-    hidden_size: int = 1024
-    intermediate_size: int = 4096
-    num_attention_heads: int = 16
-    image_size: int = 384
-    patch_size: int = 16
-    num_channels: int = 3
-    layer_norm_eps: float = 1e-5
-    cls: str = None
-    params: dict = None
-
-    def __post_init__(self):
-        if "high_res_cfg" in self.params:
-            self.image_size = self.params["high_res_cfg"]["image_size"]
-
-
-@dataclass
-class MLPConfig(BaseModelConfig):
-    hidden_size: int
-    intermediate_size: int
 
 
 def check_array_shape(arr):

@@ -10,22 +10,9 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 
-from ..base import BaseModelConfig
-from .language import LanguageModel, RMSNorm, TextConfig
-from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig(BaseModelConfig):
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    vocab_size: int = 257152
-    ignore_index: int = -100
-    image_token_index: int = 262144
-    hidden_size: int = 2048
-    pad_token_id: int = 0
-    eos_token_id: Optional[List[int]] = None
+from .config import ModelConfig
+from .language import LanguageModel, RMSNorm
+from .vision import VisionModel
 
 
 class Gemma3MultiModalProjector(nn.Module):

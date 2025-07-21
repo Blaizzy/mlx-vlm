@@ -1,29 +1,12 @@
 import inspect
-from dataclasses import dataclass
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import BaseModelConfig, interpolate
-
-
-@dataclass
-class VisionConfig(BaseModelConfig):
-    model_type: str
-    hidden_size: int = 1024
-    num_attention_heads: int = 16
-    patch_size: int = 14
-    num_hidden_layers: int = 24
-    intermediate_size: int = 4096
-    image_size: int = 448
-    num_channels: int = 3
-    layer_norm_eps: float = 1e-6
-    drop_path_rate: float = 0.1
-    qkv_bias: bool = True
-    qk_normalization: bool = False
-    norm_type: str = "layer_norm"
+from ..base import interpolate
+from .config import VisionConfig
 
 
 def check_array_shape(arr):

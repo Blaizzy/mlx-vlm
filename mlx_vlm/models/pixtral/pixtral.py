@@ -1,7 +1,6 @@
 import glob
 import inspect
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
@@ -10,22 +9,9 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 
-from ..base import BaseModelConfig
-from .language import LanguageModel, TextConfig
-from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig(BaseModelConfig):
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    ignore_index: int = -100
-    image_token_index: int = 10
-    vision_feature_select_strategy: str = "full"
-    vision_feature_layer: int = -1
-    vocab_size: int = 32000
-    eos_token_id: Optional[List[int]] = None
+from .config import ModelConfig
+from .language import LanguageModel
+from .vision import VisionModel
 
 
 class LlavaMultiModalProjector(nn.Module):

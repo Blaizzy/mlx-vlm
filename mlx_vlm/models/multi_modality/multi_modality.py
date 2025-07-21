@@ -1,7 +1,6 @@
 import glob
 import inspect
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -13,46 +12,10 @@ from PIL import Image
 from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import to_numpy_array
 
-from ..base import BaseImageProcessor, BaseModelConfig, expand2square
-from .language import LanguageModel, TextConfig
-from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class ProjectorConfig(BaseModelConfig):
-    cls: str
-    model_type: str
-    params: dict
-
-
-@dataclass
-class ModelConfig(BaseModelConfig):
-    text_config: TextConfig
-    vision_config: VisionConfig
-    projector_config: ProjectorConfig
-    model_type: str
-    ignore_index: int = -100
-    image_token_index: int = 100015
-    vision_feature_select_strategy: str = "default"
-    select_layer: int = -1
-    pad_id: int = 100001
-    num_image_tokens: int = 576
-    vocab_size: int = 32000
-    eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        if "aligner_config" in params:
-            params["projector_config"] = params["aligner_config"]
-            del params["aligner_config"]
-
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from ..base import BaseImageProcessor, expand2square
+from .config import ModelConfig, ProjectorConfig, TextConfig, VisionConfig
+from .language import LanguageModel
+from .vision import VisionModel
 
 
 class ImageProcessor(BaseImageProcessor):

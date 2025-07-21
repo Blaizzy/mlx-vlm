@@ -1,8 +1,2 @@
-from .llava_next import (
-    LanguageModel,
-    Model,
-    ModelConfig,
-    TextConfig,
-    VisionConfig,
-    VisionModel,
-)
+from .config import ModelConfig, TextConfig, VisionConfig
+from .llava_next import LanguageModel, Model, VisionModel

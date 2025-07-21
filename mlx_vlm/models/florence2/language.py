@@ -1,44 +1,17 @@
 import inspect
 import math
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import (
-    BaseModelConfig,
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
 from ..cache import SimpleKVCache
-
-
-@dataclass
-class TextConfig(BaseModelConfig):
-    d_model: int = 768
-    model_type: str = "florence2"
-    encoder_attention_heads: int = 8
-    decoder_attention_heads: int = 8
-    encoder_ffn_dim: int = 3072
-    decoder_ffn_dim: int = 3072
-    dropout: float = 0.1
-    attention_dropout: float = 0.0
-    activation_dropout: float = 0.0
-    activation_function: str = "gelu"
-    init_std: float = 0.02
-    encoder_layerdrop: float = 0.0
-    decoder_layerdrop: float = 0.0
-    scale_embedding: bool = False
-    use_cache: bool = True
-    max_position_embeddings: int = 1024
-    vocab_size: int = 51289
-    pad_token_id: int = 1
-    bos_token_id: int = 0
-    eos_token_id: int = 2
-    encoder_layers: int = 6
-    decoder_layers: int = 6
+from .config import TextConfig
 
 
 class Florence2Attention(nn.Module):

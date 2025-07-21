@@ -7,19 +7,7 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import BaseModelConfig
-
-
-@dataclass
-class VisionConfig(BaseModelConfig):
-    model_type: str
-    hidden_size: int
-    intermediate_size: int
-    num_hidden_layers: int
-    num_attention_heads: int
-    image_size: int
-    patch_size: int
-    layer_norm_eps: float = 1e-6
-    num_channels: int = 3
+from .config import VisionConfig
 
 
 def check_array_shape(arr):

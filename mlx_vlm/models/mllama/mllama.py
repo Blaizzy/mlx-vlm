@@ -11,21 +11,9 @@ from huggingface_hub import snapshot_download
 
 from ..base import BaseModelConfig
 from ..cache import KVCache
-from .language import LanguageModel, TextConfig
-from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig:
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    ignore_index: int = -100
-    image_token_index: int = 128256
-    vision_feature_select_strategy: str = "default"
-    vision_feature_layer: int = -2
-    vocab_size: int = 32000
-    eos_token_id: Optional[List[int]] = None
+from .config import ModelConfig
+from .language import LanguageModel
+from .vision import VisionModel
 
 
 class Model(nn.Module):

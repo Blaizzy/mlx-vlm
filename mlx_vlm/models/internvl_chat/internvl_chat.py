@@ -1,7 +1,6 @@
 import glob
 import inspect
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
@@ -11,23 +10,9 @@ import numpy as np
 from huggingface_hub import snapshot_download
 
 from ..base import BaseModelConfig, pixel_shuffle
-from .language import LanguageModel, TextConfig
-from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig(BaseModelConfig):
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    ignore_index: int = -100
-    image_token_index: int = 151667
-    video_token_index: int = 151656
-    vision_feature_select_strategy: str = "default"
-    vision_feature_layer: int = -1
-    vocab_size: int = 32000
-    downsample_ratio: float = 0.5
-    eos_token_id: Optional[List[int]] = None
+from .config import ModelConfig
+from .language import LanguageModel
+from .vision import VisionModel
 
 
 class Model(nn.Module):
