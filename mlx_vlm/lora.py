@@ -1,24 +1,22 @@
 import argparse
-import json
 import logging
 import os
 
 import mlx.optimizers as optim
-from datasets import load_dataset
-from tqdm import tqdm
 
-from .prompt_utils import apply_chat_template
-from .trainer import Dataset, Trainer, save_adapter
-from .trainer.utils import apply_lora_layers, find_all_linear_names, get_peft_model
+from .trainers import (
+    TrainingArgs, GRPOTrainingArgs, ORPOTrainingArgs,
+    save_adapter, save_full_model, 
+    train_sft, train_grpo, train_orpo
+)
+from .trainers.dataset import load_and_prepare_dataset
+from .trainers.utils import get_peft_model, print_trainable_parameters, apply_lora_layers
+
 from .utils import load, load_image_processor
+from .trainers.callback import WandBCallback, CustomTrainingCallback
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-def custom_print(*args, **kwargs):
-    tqdm.write(" ".join(map(str, args)), **kwargs)
-
 
 def main(args):
     logger.info(f"\033[32mLoading model from {args.model_path}\033[0m")
@@ -28,45 +26,11 @@ def main(args):
     config = model.config.__dict__
     image_processor = load_image_processor(args.model_path)
 
-    logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
-    dataset = load_dataset(args.dataset, split=args.split)
-
-    if "messages" not in dataset.column_names:
-        raise ValueError("Dataset must have a 'messages' column")
-    if "images" not in dataset.column_names:
-        raise ValueError("Dataset must have an 'images' column")
-
-    if args.apply_chat_template:
-        logger.info(f"\033[32mApplying chat template to the dataset\033[0m")
-
-        def process_data(examples):
-            if config["model_type"] == "pixtral":
-                conversations = apply_chat_template(
-                    config=config,
-                    processor=processor,
-                    prompt=examples["messages"],
-                    return_messages=True,
-                )
-                examples["messages"] = [
-                    json.dumps(item, ensure_ascii=False) for item in conversations
-                ]
-            else:
-                examples["messages"] = apply_chat_template(
-                    config=config,
-                    processor=processor,
-                    prompt=examples["messages"],
-                    return_messages=True,
-                )
-            return examples
-
-        dataset = dataset.map(process_data)
-
-    dataset = Dataset(
-        dataset,
-        config,
-        processor,
+    dataset = load_and_prepare_dataset(
+        config=config,
+        args=args,
+        processor=processor,
         image_processor=image_processor,
-        image_resize_shape=args.image_resize_shape,
     )
 
     adapter_path = args.adapter_path
@@ -77,61 +41,119 @@ def main(args):
         )
 
         model = apply_lora_layers(model, adapter_path)
-
+        
+    if args.full_weight_training:
+        logger.info(f"\033[32mUsing full weight training (all parameters will be trained)\033[0m")
     else:
         logger.info(f"\033[32mSetting up LoRA\033[0m")
-
-        list_of_modules = find_all_linear_names(model.language_model)
         model = get_peft_model(
             model,
-            list_of_modules,
             rank=args.lora_rank,
             alpha=args.lora_alpha,
-            dropout=args.lora_dropout,
+            dropout=args.lora_dropout
         )
+    
+    if args.train_mode == "grpo":
+        logger.info(f"\033[32mSetting Reference Model\033[0m")
+        ref_model, _ = load(
+            args.model_path, processor_config={"trust_remote_code": True}
+        )
+
+
+    print_trainable_parameters(model)
 
     logger.info(f"\033[32mSetting up optimizer\033[0m")
     optimizer = optim.Adam(learning_rate=args.learning_rate)
 
-    logger.info(f"\033[32mSetting up trainer\033[0m")
-    trainer = Trainer(model, optimizer)
-
+    logger.info(f"\033[32mSetting up training arguments\033[0m")
+    
+    if args.train_mode == "sft":
+        training_args = TrainingArgs(
+            batch_size=args.batch_size,
+            iters=args.steps,
+            steps_per_report=args.print_every,
+            adapter_file=args.output_path
+        )
+    elif args.train_mode == "grpo":
+        training_args = GRPOTrainingArgs(
+            batch_size=args.batch_size,
+            iters=args.steps,
+            steps_per_report=args.print_every,
+            adapter_file=args.output_path,
+            max_completion_length=args.max_completion_length,
+            group_size=args.group_size,
+            beta=args.beta,
+            epsilon=args.epsilon,
+            temperature=args.temperature,
+            reward_weights=eval(args.reward_weights) if args.reward_weights else None
+        )
+    elif args.train_mode == "orpo":
+        training_args = ORPOTrainingArgs(
+            batch_size=args.batch_size,
+            iters=args.steps,
+            steps_per_report=args.print_every,
+            adapter_file=args.output_path,
+            beta=args.beta,
+            reward_scaling=args.reward_scaling
+        )
+    else:
+        raise ValueError(f"Training mode {args.train_mode} doesnt exist only grpo, orpo, sft.")
+    
     model.train()
 
-    # Training loop
-    logger.info(f"\033[32mTraining model\033[0m")
-    for epoch in range(args.epochs):
-        if args.steps == 0:
-            args.steps = len(dataset) // args.batch_size
-
-        progress_bar = tqdm(range(args.steps), position=0, leave=True)
-        for i in progress_bar:
-            loss = trainer.train_step(
-                dataset[i * args.batch_size : (i + 1) * args.batch_size]
-            )
-            # Update progress bar
-            progress_bar.update(1)
-            progress_bar.set_postfix(
-                {"Epoch": epoch, "Step": i, "Loss": f"{loss.item():.4f}"}
-            )
-
-            if i % args.print_every == 0:
-                # Log additional information
-                custom_print(
-                    {
-                        "Epoch": epoch,
-                        "Step": i,
-                        "Loss": f"{loss.item():.4f}",
-                    }
-                )
-        # Save the interim adapter after each epoch except the last.
-        if args.save_after_epoch and (epoch < (args.epochs - 1)):
-            head, tail = os.path.split(args.output_path)
-            save_adapter(model, head + os.sep + "epoch_" + str(epoch) + "_" + tail)
-
-    # Save the adapter
-    save_adapter(model, args.output_path)
-
+    logger.info(f"\033[32mTraining model with {args.train_mode}\033[0m")
+    if args.wandb_project:
+        logger.info(f"\033[32mUsing WandB for logging\033[0m")
+        callback = WandBCallback(
+            project_name=args.wandb_project,
+            log_dir=training_args.adapter_file,
+            config=training_args.__dict__,
+            wrapped_callback=CustomTrainingCallback(training_args.iters)
+        )
+    else:
+        callback = CustomTrainingCallback(training_args.iters)
+    
+    if args.train_mode == "sft":
+        train_sft(
+            model=model,
+            processor=processor,
+            optimizer=optimizer,
+            dataset=dataset,
+            args=training_args,
+            training_callback=callback,
+            train_on_completions=getattr(args, 'train_on_completions', False),
+            assistant_id=getattr(args, 'assistant_id', 77091),
+            clip_gradients=getattr(args, 'clip_gradients', None)
+        )
+    elif args.train_mode == "orpo":
+        train_orpo(
+            model=model,
+            processor=processor,
+            dataset=dataset,
+            args=training_args,
+            optimizer=optimizer,
+            training_callback=callback,
+            clip_gradients=getattr(args, 'clip_gradients', None)
+        )
+    elif args.train_mode == "grpo":
+        train_grpo(
+            model=model,
+            ref_model=ref_model.freeze(),
+            processor=processor,
+            dataset=dataset,
+            args=training_args,
+            optimizer=optimizer,
+            training_callback=callback,
+            clip_gradients=getattr(args, 'clip_gradients', None)
+        )
+    
+    # Save model weights
+    if args.full_weight_training:
+        save_full_model(model, args.output_path)
+    else:
+        save_adapter(model, args.output_path)
+    
+    logger.info(f"\033[32mTraining complete. Model saved to {args.output_path}\033[0m")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train NanoLLaVA model")
@@ -142,10 +164,25 @@ if __name__ == "__main__":
         help="Path to the pre-trained model",
     )
     parser.add_argument(
+        "--full-weight-training",
+        action="store_true",
+        help="Enable full weight training instead of LoRA. When this flag is set, all LoRA settings (lora-alpha, lora-rank, lora-dropout) will be ignored."
+    )
+    parser.add_argument(
+        "--train-mode",
+        type=str,
+        default="sft",
+        choices=["sft", "grpo", "orpo"],
+        help="Training mode: SFT, DPO, ORPO or GRPO, default is SFT",
+    )
+    parser.add_argument(
         "--dataset", type=str, required=True, help="Path to the dataset"
     )
     parser.add_argument(
         "--split", type=str, default="train", help="Split to use for training"
+    )
+    parser.add_argument(
+        "--dataset-config", type=str, default=None, help="Use a individual configuration from the dataset"
     )
     parser.add_argument(
         "--image-resize-shape",
@@ -169,13 +206,16 @@ if __name__ == "__main__":
         "--batch-size", type=int, default=1, help="Batch size for training"
     )
     parser.add_argument(
-        "--epochs", type=int, default=1, help="Number of epochs to train"
-    )
-    parser.add_argument(
-        "--steps", type=int, default=0, help="Number of steps per epoch"
+        "--steps", type=int, default=1000, help="Number of steps per epoch"
     )
     parser.add_argument(
         "--print-every", type=int, default=10, help="Print loss every n steps"
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default=None,
+        help="WandB project name to report training metrics. Disabled if None.",
     )
     parser.add_argument(
         "--lora-alpha",
@@ -201,6 +241,77 @@ if __name__ == "__main__":
         "--save-after-epoch",
         action="store_true",
         help="Save interim versions of adapter files after each epoch",
+    )
+
+    # GRPO args
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        help="The system prompt thats going to be used to guide the model.",
+        default=None
+    )
+    parser.add_argument(
+        "--group-size",
+        type=int,
+        help="Number of generations.",
+        default=4,
+    )
+    parser.add_argument(
+        "--max-completion-length",
+        type=int,
+        help="Maximum length of the prompt. If the prompt is longer than this value, it will be truncated left.",
+        default=512,
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        help="KL penalty coefficient.",
+        default=0.1,
+    )
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        help="The Epsilon for numerical stability.",
+        default=1e-4,
+    )
+    parser.add_argument(
+        "--use-chat-template",
+        action="store_true",
+        help="If the model is a Chat model, use the Chat template.",
+        default=None,
+    )
+    parser.add_argument(
+        "--use-prompt",
+        action="store_true",
+        help="Rather to use the prompt from the R1 paper.",
+        default=None,
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        help="Temperature for sampling. The higher the temperature, the more random the completions.",
+        default=1.0,
+    )
+    parser.add_argument(
+        "--reward-weights",
+        type=str,
+        help="Weights for each reward function. Must match the number of reward functions and be in this format [0.1, 0.2, 0.3, 0.4, 0.5]. If not given, all rewards are weighted equally with weight `1.0`.",
+        default=None,
+    )
+
+    # DPO args
+
+    # ORPO args
+    # parser.add_argument(
+    #     "--save-after-epoch",
+    #     action="store_true",
+    #     help="Save interim versions of adapter files after each epoch",
+    # )
+    parser.add_argument(
+        "--reward-scaling",
+        type=float,
+        help="reward scaling",
+        default=1.0,
     )
 
     args = parser.parse_args()

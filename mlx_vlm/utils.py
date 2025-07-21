@@ -29,7 +29,7 @@ from transformers import (
 
 from .models.base import BaseImageProcessor
 from .tokenizer_utils import load_tokenizer
-from .trainer import apply_lora_layers
+from .trainers import apply_lora_layers
 
 # Constants
 MODEL_REMAPPING = {"llava-qwen2": "llava_bunny", "bunny-llama": "llava_bunny"}

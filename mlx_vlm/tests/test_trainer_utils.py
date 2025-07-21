@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import mlx.nn as nn
 
-from mlx_vlm.trainer.utils import (
+from mlx_vlm.trainers.utils import (
     find_all_linear_names,
     get_module_by_name,
     get_peft_model,

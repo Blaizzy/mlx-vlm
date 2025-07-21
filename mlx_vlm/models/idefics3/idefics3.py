@@ -114,6 +114,7 @@ class Model(nn.Module):
         self,
         input_ids: mx.array,
         pixel_values: mx.array,
+        mask: Optional[mx.array] = None,
         cache=None,
         **kwargs,
     ):

@@ -1,10 +1,38 @@
 import json
+from typing import Union
 from pathlib import Path
 
 import mlx.nn as nn
+import mlx.core as mx
 from mlx.utils import tree_flatten
 
 from .lora import LoRaLayer
+
+
+class TrainingCallback:
+    def on_train_loss_report(self, train_info: dict):
+        """Called to report training loss at specified intervals."""
+        pass
+
+    def on_val_loss_report(self, val_info: dict):
+        """Called to report validation loss at specified intervals or the beginning."""
+        pass
+
+
+def grad_checkpoint(layer):
+    """
+    Update all instances of type(layer) to use gradient checkpointing.
+    """
+    fn = type(layer).__call__
+
+    def checkpointed_fn(model, *args, **kwargs):
+        def inner_fn(params, *args, **kwargs):
+            model.update(params)
+            return fn(model, *args, **kwargs)
+
+        return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
+
+    type(layer).__call__ = checkpointed_fn
 
 
 def get_module_by_name(model, name):
@@ -33,8 +61,11 @@ def set_module_by_name(model, name, new_module):
 
 
 def get_peft_model(
-    model, linear_layers, rank=10, alpha=0.1, dropout=0.1, freeze=True, verbose=True
+    model, linear_layers=None, rank=10, alpha=0.1, dropout=0.1, freeze=True, verbose=False
 ):
+    if linear_layers is None:
+        linear_layers = find_all_linear_names(model.language_model)
+    
     if freeze:
         freeze_model(model)
 
@@ -50,7 +81,12 @@ def get_peft_model(
     model.config.lora["dropout"] = dropout
 
     if verbose:
-        print_trainable_parameters(model.language_model)
+        if verbose:
+            print("Using LoRA training with the following parameters:")
+            print(f"  Rank: {rank}")
+            print(f"  Alpha: {alpha}")
+            print(f"  Dropout: {dropout}")
+            print_trainable_parameters(model.language_model)
 
     return model
 
@@ -158,3 +194,23 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
     model.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
 
     return model
+
+
+def save_adapter(
+    model: nn.Module,
+    adapter_file: Union[str, Path],
+):
+    path = Path(adapter_file)
+    if hasattr(model.config, "lora"):
+        with open(path.parent / "adapter_config.json", "w") as f:
+            json.dump(model.config.lora, f)
+    flattened_tree = tree_flatten(model.trainable_parameters())
+    mx.save_safetensors(str(adapter_file), dict(flattened_tree))
+
+
+def save_full_model(model: nn.Module, save_path: Union[str, Path]):
+    path = Path(save_path)
+    path.mkdir(exist_ok=True, parents=True)
+    with open(path / "config.json", "w") as f:
+        json.dump(model.config.to_dict(), f)
+    mx.save_safetensors(str(path / "model.safetensors"), dict(tree_flatten(model.parameters())))
