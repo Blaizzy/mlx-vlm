@@ -9,6 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import BaseModelConfig
 from ..pixtral import LanguageModel
 from ..pixtral import Model as PixtralModel
 from ..pixtral import TextConfig, VisionConfig, VisionModel
@@ -27,16 +28,6 @@ class ModelConfig:
     spatial_merge_size: int = 2
     multimodal_projector_bias: bool = False
     eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 def _pair(x) -> Tuple[int, int]:

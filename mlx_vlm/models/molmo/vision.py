@@ -5,9 +5,11 @@ from typing import List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import BaseModelConfig
+
 
 @dataclass
-class VisionConfig:
+class VisionConfig(BaseModelConfig):
     model_type: str = "molmo"
     num_channels: int = 3
     image_default_input_size: Tuple[int, int] = (336, 336)
@@ -51,16 +53,6 @@ class VisionConfig:
         h = (h + self.image_pooling_h - 1) // self.image_pooling_h
         w = (w + self.image_pooling_w - 1) // self.image_pooling_w
         return h, w
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 class MLP(nn.Module):

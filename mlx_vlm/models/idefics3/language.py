@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import (
+    BaseModelConfig,
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
@@ -15,7 +16,7 @@ from ..cache import KVCache
 
 
 @dataclass
-class TextConfig:
+class TextConfig(BaseModelConfig):
     model_type: str
     hidden_size: int
     intermediate_size: int
@@ -28,16 +29,6 @@ class TextConfig:
     rope_traditional: bool = False
     max_position_embeddings: int = 4096
     tie_word_embeddings: bool = False
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
     def __post_init__(self):
         if self.num_key_value_heads is None:

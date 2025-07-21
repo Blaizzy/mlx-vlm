@@ -27,16 +27,6 @@ class VisionConfig(BaseModelConfig):
     patch_size: int = 14
     fullatt_block_indexes: list[int] = field(default_factory=lambda: [7, 15, 23, 31])
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
 
 @dataclass
 class TextConfig(BaseModelConfig):
@@ -65,16 +55,6 @@ class TextConfig(BaseModelConfig):
 
             if not self.rope_scaling["type"] in ["mrope", "default"]:
                 raise ValueError(f"rope_scaling type must be 'mrope' or 'default'")
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 @dataclass

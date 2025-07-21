@@ -8,7 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import LanguageModelOutput, create_attention_mask
+from ..base import BaseModelConfig, LanguageModelOutput, create_attention_mask
 from ..cache import KVCache
 from .language import LanguageModel, TextConfig
 from .su_rope import Phi3SuScaledRotaryEmbedding
@@ -16,7 +16,7 @@ from .vision import VisionConfig, VisionModel
 
 
 @dataclass
-class ModelConfig:
+class ModelConfig(BaseModelConfig):
     text_config: TextConfig
     vision_config: VisionConfig
     model_type: str
@@ -39,16 +39,6 @@ class ModelConfig:
     max_position_embeddings: int = 131072
     original_max_position_embeddings: int = 4096
     eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 class Attention(nn.Module):

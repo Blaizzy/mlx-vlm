@@ -5,9 +5,11 @@ from typing import List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import BaseModelConfig
+
 
 @dataclass
-class VisionConfig:
+class VisionConfig(BaseModelConfig):
     image_size: int = 560
     patch_size: int = 14
     num_channels: int = 3
@@ -35,16 +37,6 @@ class VisionConfig:
         [3, 1],
         [4, 1],
     )
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 def check_array_shape(arr):

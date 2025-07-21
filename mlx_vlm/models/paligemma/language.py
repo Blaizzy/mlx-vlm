@@ -6,6 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import (
+    BaseModelConfig,
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
@@ -14,7 +15,7 @@ from ..cache import KVCache
 
 
 @dataclass
-class TextConfig:
+class TextConfig(BaseModelConfig):
     model_type: str
     hidden_size: int
     num_hidden_layers: int
@@ -30,16 +31,6 @@ class TextConfig:
     final_logit_softcapping: Optional[float] = None
     query_pre_attn_scalar: Optional[float] = None
     max_position_embeddings: int = 4096
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 class RMSNorm(nn.Module):

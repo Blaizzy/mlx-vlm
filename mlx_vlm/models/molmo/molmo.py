@@ -10,12 +10,13 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 
+from ..base import BaseModelConfig
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
 
 @dataclass
-class ModelConfig:
+class ModelConfig(BaseModelConfig):
     text_config: TextConfig = field(default_factory=TextConfig)
     vision_config: VisionConfig = field(default_factory=VisionConfig)
     model_type: str = "molmo"
@@ -25,16 +26,6 @@ class ModelConfig:
     image_pooling_2d: str = "attention"
     image_projector: str = "mlp"
     eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 class Model(nn.Module):

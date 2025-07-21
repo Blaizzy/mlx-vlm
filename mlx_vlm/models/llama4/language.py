@@ -8,6 +8,7 @@ from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
+    BaseModelConfig,
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
@@ -16,7 +17,7 @@ from ..cache import ChunkedKVCache, KVCache
 
 
 @dataclass
-class TextConfig:
+class TextConfig(BaseModelConfig):
     model_type: str
     hidden_size: int
     intermediate_size: int
@@ -51,16 +52,6 @@ class TextConfig:
     floor_scale: float = 8192
     attn_scale: float = 0.1
     moe_layers: list = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
     def __post_init__(self):
         if self.num_key_value_heads is None:

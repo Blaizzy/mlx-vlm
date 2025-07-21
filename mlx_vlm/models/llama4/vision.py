@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import pixel_shuffle
+from ..base import BaseModelConfig, pixel_shuffle
 
 
 @dataclass
@@ -29,16 +29,6 @@ class VisionConfig:
     vision_feature_layer: int
     vision_feature_select_strategy: str
     vision_output_dim: int
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 def check_array_shape(arr):

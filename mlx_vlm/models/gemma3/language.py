@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import (
+    BaseModelConfig,
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
@@ -15,7 +16,7 @@ from ..cache import KVCache, RotatingKVCache
 
 
 @dataclass
-class TextConfig:
+class TextConfig(BaseModelConfig):
     model_type: str
     hidden_size: int
     num_hidden_layers: int
@@ -34,16 +35,6 @@ class TextConfig:
     mm_tokens_per_image: int = 256
     sliding_window_pattern: int = 6
     max_position_embeddings: int = 4096
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 class RMSNorm(nn.Module):

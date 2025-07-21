@@ -3,7 +3,8 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import mlx.core as mx
-import mlx.nn as nn
+
+from ..base import BaseModelConfig
 
 
 @dataclass
@@ -21,16 +22,6 @@ class VisionConfig:
     num_channels: int = 3
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 def check_array_shape(arr):

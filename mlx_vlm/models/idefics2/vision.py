@@ -6,9 +6,11 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import BaseModelConfig
+
 
 @dataclass
-class VisionConfig:
+class VisionConfig(BaseModelConfig):
     model_type: str
     hidden_size: int
     intermediate_size: int
@@ -18,16 +20,6 @@ class VisionConfig:
     patch_size: int
     layer_norm_eps: float = 1e-6
     num_channels: int = 3
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 def check_array_shape(arr):

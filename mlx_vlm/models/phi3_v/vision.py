@@ -8,9 +8,11 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import BaseModelConfig
+
 
 @dataclass
-class VisionConfig:
+class VisionConfig(BaseModelConfig):
     model_type: str = "phi3_v"
     num_hidden_layers: int = 24
     hidden_size: int = 1024
@@ -26,16 +28,6 @@ class VisionConfig:
     model_name: str = "openai/clip-vit-large-patch14-336"
     name: str = "clip_vision_model"
     num_img_tokens: int = 144
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 def check_array_shape(arr):

@@ -9,9 +9,11 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import BaseModelConfig
+
 
 @dataclass
-class VisionConfig:
+class VisionConfig(BaseModelConfig):
     model_type: str
     layers: int = 27
     width: int = 1152
@@ -25,19 +27,9 @@ class VisionConfig:
     cls: str = None
     params: dict = None
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
 
 @dataclass
-class MLPConfig:
+class MLPConfig(BaseModelConfig):
     width: int
     intermediate_size: int
 

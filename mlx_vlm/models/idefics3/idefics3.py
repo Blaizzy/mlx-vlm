@@ -12,12 +12,13 @@ import numpy as np
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig
 
+from ..base import BaseModelConfig
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
 
 @dataclass
-class ModelConfig:
+class ModelConfig(BaseModelConfig):
     text_config: TextConfig
     vision_config: VisionConfig
     model_type: str
@@ -31,16 +32,6 @@ class ModelConfig:
     def __post_init__(self):
         if self.image_token_index is None:
             self.image_token_index = self.image_token_id
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 class MLP(nn.Module):

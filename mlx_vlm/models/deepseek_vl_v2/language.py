@@ -8,6 +8,7 @@ import mlx.nn as nn
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
+    BaseModelConfig,
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
@@ -16,7 +17,7 @@ from ..cache import KVCache, RotatingKVCache
 
 
 @dataclass
-class TextConfig:
+class TextConfig(BaseModelConfig):
     model_type: str = "deepseek_v2"
     vocab_size: int = 102400
     hidden_size: int = 1280
@@ -47,16 +48,6 @@ class TextConfig:
     attention_bias: bool = False
     scoring_func: str = "softmax"
     attn_type: str = "DeepseekV2Attention"
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
     def __post_init__(self):
         if self.qk_nope_head_dim == 0:

@@ -5,11 +5,12 @@ from typing import List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import BaseModelConfig
 from ..kernels import bicubic_interpolate
 
 
 @dataclass
-class VisionConfig:
+class VisionConfig(BaseModelConfig):
     model_type: str = "moonvit"
     depth: int = 27
     embed_dim: int = 1152
@@ -32,16 +33,6 @@ class VisionConfig:
     def __post_init__(self):
         if self.merge_kernel_size is None:
             self.merge_kernel_size = (self.spatial_merge_size, self.spatial_merge_size)
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 def check_array_shape(arr):

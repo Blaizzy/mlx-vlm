@@ -9,6 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
+from ..base import BaseModelConfig
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
@@ -24,16 +25,6 @@ class ModelConfig:
     hidden_size: int = 2048
     pad_token_id: int = 0
     eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 class PaliGemmaMultiModalProjector(nn.Module):

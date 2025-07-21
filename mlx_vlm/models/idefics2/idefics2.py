@@ -12,12 +12,13 @@ import numpy as np
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig
 
+from ..base import BaseModelConfig
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
 
 @dataclass
-class PerceiverConfig:
+class PerceiverConfig(BaseModelConfig):
     model_type: str
     num_key_value_heads: int = 4
     resampler_depth: int = 3
@@ -25,19 +26,9 @@ class PerceiverConfig:
     resampler_n_heads: int = 16
     resampler_n_latents: int = 64
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
 
 @dataclass
-class ModelConfig:
+class ModelConfig(BaseModelConfig):
     text_config: TextConfig
     vision_config: VisionConfig
     perceiver_config: PerceiverConfig
@@ -47,16 +38,6 @@ class ModelConfig:
     vocab_size: int = 151936
     image_token_index: Optional[int] = None
     eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
     def __post_init__(self):
         if self.image_token_index is None:
