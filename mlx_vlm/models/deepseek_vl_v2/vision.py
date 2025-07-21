@@ -10,28 +10,7 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import BaseModelConfig
-
-
-@dataclass
-class VisionConfig(BaseModelConfig):
-    model_type: str
-    layers: int = 27
-    width: int = 1152
-    intermediate_size: int = 4304
-    num_attention_heads: int = 16
-    image_size: int = 384
-    patch_size: int = 16
-    num_channels: int = 3
-    layer_norm_eps: float = 1e-6
-    mlp_ratio: float = 3.7362
-    cls: str = None
-    params: dict = None
-
-
-@dataclass
-class MLPConfig(BaseModelConfig):
-    width: int
-    intermediate_size: int
+from .config import MLPConfig, VisionConfig
 
 
 def check_array_shape(arr):

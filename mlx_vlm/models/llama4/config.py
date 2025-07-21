@@ -16,7 +16,7 @@ class TextConfig(BaseModelConfig):
     rope_theta: float = 500000.0
     num_hidden_layers: int = 48
     rope_traditional: bool = False
-    rope_scaling: Optional[dict] = None  # Add missing rope_scaling attribute
+    rope_scaling: Optional[dict] = None
     tie_word_embeddings: bool = False
     head_dim: int = 128
     hidden_act: str = "silu"

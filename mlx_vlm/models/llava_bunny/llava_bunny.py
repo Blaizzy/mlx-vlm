@@ -23,7 +23,7 @@ from transformers.image_transforms import (
 from transformers.image_utils import to_numpy_array
 
 from ..base import BaseImageProcessor
-from .config import ModelConfig
+from .config import ModelConfig, VisionConfig
 from .language import LanguageModel
 from .vision import VisionModel
 

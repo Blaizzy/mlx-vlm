@@ -1082,7 +1082,7 @@ class TestModels(unittest.TestCase):
     def test_deepseek_vl_v2(self):
         from mlx_vlm.models import deepseek_vl_v2
 
-        text_config = deepseek_vl_v2.TextConfig()
+        text_config = deepseek_vl_v2.TextConfig(model_type="text")
         vision_config = deepseek_vl_v2.VisionConfig(model_type="vision")
         projector_config = deepseek_vl_v2.ProjectorConfig()
         config = deepseek_vl_v2.ModelConfig(
