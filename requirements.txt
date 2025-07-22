@@ -9,4 +9,5 @@ fastapi>=0.95.1
 soundfile>=0.13.1
 scipy>=1.15.3
 numpy
+uvicorn
 opencv-python
