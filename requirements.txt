@@ -8,6 +8,7 @@ mlx-lm>=0.23.0
 fastapi>=0.95.1
 soundfile>=0.13.1
 scipy>=1.15.3
+opencv-python>=4.12.0.88
 numpy
 uvicorn
-opencv-python
+
