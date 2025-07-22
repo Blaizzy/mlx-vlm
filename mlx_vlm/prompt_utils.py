@@ -194,7 +194,7 @@ class MessageFormatter:
         """Format as a list with image tokens."""
         content = [MessageBuilder.text_message(prompt)]
 
-        if role == "user" and not skip_image_token:
+        if role == "user" and not skip_image_token and num_images > 0:
             image_tokens = [MessageBuilder.image_message()] * num_images
             content = image_tokens + content if image_first else content + image_tokens
 
@@ -221,14 +221,14 @@ class MessageFormatter:
         message = {"role": role, "content": [msg_func(prompt)]}
 
         if role == "user":
-            if not skip_image_token:
+            if not skip_image_token and num_images > 0:
                 message["content"] = (
                     [MessageBuilder.image_message()] * num_images + message["content"]
                     if image_first
                     else message["content"]
                     + [MessageBuilder.image_message()] * num_images
                 )
-            if not skip_audio_token:
+            if not skip_audio_token and num_audios > 0:
                 message["content"] = (
                     message["content"] + [MessageBuilder.audio_message()] * num_audios
                 )
@@ -255,7 +255,7 @@ class MessageFormatter:
         """Format with image tokens in the text."""
         content = prompt
 
-        if role == "user" and not skip_image_token:
+        if role == "user" and not skip_image_token and num_images > 0:
             prefix = token * num_images
             content = f"{prefix}{content}" if image_first else f"{content}{prefix}"
 
@@ -274,7 +274,7 @@ class MessageFormatter:
         """Format with numbered image tokens."""
         content = prompt
 
-        if role == "user" and not skip_image_token:
+        if role == "user" and not skip_image_token and num_images > 0:
             # phi3_v uses single token regardless of num_images
             prefix = (
                 "<|image_1|>"
