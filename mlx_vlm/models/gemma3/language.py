@@ -12,38 +12,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
-
-
-@dataclass
-class TextConfig:
-    model_type: str
-    hidden_size: int
-    num_hidden_layers: int
-    intermediate_size: int
-    num_attention_heads: int = 8
-    head_dim: int = 256
-    rms_norm_eps: float = 1.0e-6
-    vocab_size: int = 262208
-    num_key_value_heads: int = 4
-    rope_global_base_freq: float = 1_000_000.0
-    rope_local_base_freq: float = 10_000.0
-    rope_traditional: bool = False
-    query_pre_attn_scalar: float = 256
-    sliding_window: int = 1024
-    rope_scaling: Optional[Dict[str, Union[float, List[float]]]] = None
-    mm_tokens_per_image: int = 256
-    sliding_window_pattern: int = 6
-    max_position_embeddings: int = 4096
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import TextConfig
 
 
 class RMSNorm(nn.Module):

@@ -1,5 +1,4 @@
 import inspect
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import mlx.core as mx
@@ -11,35 +10,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
-
-
-@dataclass
-class TextConfig:
-    model_type: str
-    hidden_size: int
-    num_hidden_layers: int
-    intermediate_size: int
-    num_attention_heads: int
-    num_key_value_heads: int
-    vocab_size: int
-    head_dim: int = 256
-    rms_norm_eps: float = 1e-6
-    rope_theta: float = 10000
-    rope_traditional: bool = False
-    attn_logit_softcapping: Optional[float] = None
-    final_logit_softcapping: Optional[float] = None
-    query_pre_attn_scalar: Optional[float] = None
-    max_position_embeddings: int = 4096
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import TextConfig
 
 
 class RMSNorm(nn.Module):

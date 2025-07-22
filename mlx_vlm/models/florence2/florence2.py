@@ -2,7 +2,6 @@ import glob
 import inspect
 import json
 import math
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -11,43 +10,9 @@ import mlx.nn as nn
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_map
 
-from .language import LanguageModel, TextConfig
-from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig:
-    """Configuration class for Florence2."""
-
-    vision_config: VisionConfig
-    text_config: TextConfig
-    model_type: str = "florence2"
-    vocab_size: int = 50265
-    max_position_embeddings: int = 1024
-    pad_token_id: int = 1
-    bos_token_id: int = 0
-    eos_token_id: int = 2
-    image_token_index: int = 0
-    image_feature_source: List[str] = field(
-        default_factory=lambda: ["temporal_avg_pool", "spatial_avg_pool"]
-    )
-    visual_temporal_embedding: Optional[dict] = field(
-        default_factory=lambda: {"type": "COSINE", "max_temporal_embeddings": 100}
-    )
-    image_pos_embed: Optional[dict] = field(
-        default_factory=lambda: {"type": "learned_abs_2d", "max_pos_embeddings": 50}
-    )
-    eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import ModelConfig
+from .language import LanguageModel
+from .vision import VisionModel
 
 
 def shift_tokens_right(

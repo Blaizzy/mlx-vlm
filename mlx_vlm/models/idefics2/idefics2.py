@@ -12,55 +12,10 @@ import numpy as np
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig
 
-from .language import LanguageModel, TextConfig
-from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class PerceiverConfig:
-    model_type: str
-    num_key_value_heads: int = 4
-    resampler_depth: int = 3
-    resampler_head_dim: int = 96
-    resampler_n_heads: int = 16
-    resampler_n_latents: int = 64
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
-
-@dataclass
-class ModelConfig:
-    text_config: TextConfig
-    vision_config: VisionConfig
-    perceiver_config: PerceiverConfig
-    model_type: str
-    ignore_index: int = -100
-    image_token_id: int = 32001
-    vocab_size: int = 151936
-    image_token_index: Optional[int] = None
-    eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
-    def __post_init__(self):
-        if self.image_token_index is None:
-            self.image_token_index = self.image_token_id
+from ..base import BaseModelConfig
+from .config import ModelConfig, PerceiverConfig
+from .language import LanguageModel
+from .vision import VisionModel
 
 
 class Idefics2PerceiverAttention(nn.Module):

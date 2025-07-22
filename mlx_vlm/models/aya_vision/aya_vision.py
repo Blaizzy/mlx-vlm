@@ -10,33 +10,9 @@ import mlx.nn as nn
 import numpy as np
 from mlx_lm.utils import snapshot_download
 
-from .language import LanguageModel, TextConfig
-from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig:
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    image_token_index: int = 255036
-    max_splits_per_img: int = 12
-    downsample_factor: int = 2
-    alignment_intermediate_size: int = 28672
-    adapter_layer_norm_eps: float = 1e-06
-    vision_feature_layer: int = -1
-    vision_feature_select_strategy: str = "full"
-    eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import ModelConfig
+from .language import LanguageModel
+from .vision import VisionModel
 
 
 class AyaVisionMultiModalProjector(nn.Module):

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mlx-vlm"
 dynamic = ["version", "dependencies"]
-description = "Vision LLMs on Apple silicon with MLX and the Hugging Face Hub"
+description = "MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}

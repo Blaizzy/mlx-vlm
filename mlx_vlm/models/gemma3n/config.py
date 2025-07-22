@@ -1,10 +1,11 @@
-import inspect
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
+from ..base import BaseModelConfig
+
 
 @dataclass
-class AudioConfig:
+class AudioConfig(BaseModelConfig):
     input_feat_size: int = 80
     hidden_size: int = 1536
     conf_attention_chunk_size: int = 12
@@ -28,19 +29,9 @@ class AudioConfig:
     gradient_clipping: float = 10000000000.0
     vocab_offset: int = 262_144 + 128  # text vocab size + vision vocab size
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
 
 @dataclass
-class VisionConfig:
+class VisionConfig(BaseModelConfig):
     model_type: str = "gemma3n_vision"
     num_hidden_layers: int = 12
     hidden_size: int = 2048
@@ -53,19 +44,9 @@ class VisionConfig:
     vocab_size: int = 128
     vocab_offset: int = 262_144
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
 
 @dataclass
-class TextConfig:
+class TextConfig(BaseModelConfig):
     model_type: str
     hidden_size: int
     num_hidden_layers: int
@@ -100,19 +81,9 @@ class TextConfig:
     attn_logit_softcapping: float = 0.0
     layer_types: List[str] = None
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
 
 @dataclass
-class ModelConfig:
+class ModelConfig(BaseModelConfig):
     text_config: TextConfig
     vision_config: VisionConfig
     audio_config: AudioConfig
@@ -128,12 +99,32 @@ class ModelConfig:
     audio_soft_tokens_per_image: int = 188
     eos_token_id: Optional[List[int]] = None
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+
+@dataclass
+class MultiQueryAttentionBlockConfig(BaseModelConfig):
+    num_heads: int = 8
+    kv_dim: int = 16
+    kv_strides: int = 1
+    mmqa_avg_pool_kv: bool = False
+    mmqa_dropout: float = 0.0
+    mmqa_dw_kernel_size: int = 3
+    is_multiscale: bool = False
+
+
+@dataclass
+class UniversalInvertedResidualConfig(BaseModelConfig):
+    start_dw_kernel_size: int = 0  # Zero size means no conv
+    mid_dw_kernel_size: int = 0  # Zero size means no conv
+    filters: int = 32
+    strides: int = 1
+    expand_ratio: float = 4.0
+    is_multiscale: bool = False
+
+
+@dataclass
+class EdgeResidualConfig(BaseModelConfig):
+    kernel_size: int = 3
+    filters: int = 32
+    strides: int = 1
+    expand_ratio: float = 4.0
+    is_multiscale: bool = False

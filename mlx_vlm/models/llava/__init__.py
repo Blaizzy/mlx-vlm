@@ -1,8 +1,2 @@
-from .llava import (
-    LanguageModel,
-    Model,
-    ModelConfig,
-    TextConfig,
-    VisionConfig,
-    VisionModel,
-)
+from .config import ModelConfig, TextConfig, VisionConfig
+from .llava import LanguageModel, Model, VisionModel
