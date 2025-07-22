@@ -1,8 +1,2 @@
-from .aya_vision import (
-    LanguageModel,
-    Model,
-    ModelConfig,
-    TextConfig,
-    VisionConfig,
-    VisionModel,
-)
+from .aya_vision import LanguageModel, Model, VisionModel
+from .config import ModelConfig, TextConfig, VisionConfig

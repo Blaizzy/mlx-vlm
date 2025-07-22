@@ -1,7 +1,6 @@
 import inspect
 import math
 import re
-from dataclasses import dataclass
 from functools import partial
 from typing import Any, Dict, Optional, Tuple
 
@@ -15,53 +14,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
-
-
-@dataclass
-class TextConfig:
-    model_type: str = "deepseek_v3"
-    vocab_size: int = 102400
-    hidden_size: int = 4096
-    intermediate_size: int = 11008
-    moe_intermediate_size: int = 1407
-    num_hidden_layers: int = 30
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 32
-    n_shared_experts: Optional[int] = None
-    n_routed_experts: Optional[int] = None
-    routed_scaling_factor: float = 1.0
-    kv_lora_rank: int = 512
-    q_lora_rank: int = 1536
-    qk_rope_head_dim: int = 64
-    v_head_dim: int = 128
-    qk_nope_head_dim: int = 128
-    topk_method: str = "noaux_tc"
-    scoring_func: str = "sigmoid"
-    norm_topk_prob: bool = True
-    n_group: Optional[int] = None
-    topk_group: Optional[int] = None
-    num_experts_per_tok: Optional[int] = None
-    moe_layer_freq: int = 1
-    first_k_dense_replace: int = 0
-    max_position_embeddings: int = 2048
-    rms_norm_eps: float = 1e-6
-    rope_theta: float = 10000.0
-    rope_scaling: Dict = None
-    attention_bias: bool = False
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
+from .config import TextConfig
 
 
 def yarn_find_correction_dim(
