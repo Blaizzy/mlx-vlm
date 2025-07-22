@@ -123,6 +123,10 @@ class Model(nn.Module):
         # Stack all batch outputs
         return mx.stack(batch_outputs, axis=0)
 
+    @property
+    def layers(self):
+        return self.language_model.model.layers
+
     def __call__(
         self,
         input_ids: mx.array,

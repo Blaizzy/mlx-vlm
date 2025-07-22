@@ -1,10 +1,2 @@
-from .deepseek_vl_v2 import (
-    DeepseekVLV2Processor,
-    LanguageModel,
-    Model,
-    ModelConfig,
-    ProjectorConfig,
-    TextConfig,
-    VisionConfig,
-    VisionModel,
-)
+from .config import MLPConfig, ModelConfig, ProjectorConfig, TextConfig, VisionConfig
+from .deepseek_vl_v2 import DeepseekVLV2Processor, LanguageModel, Model, VisionModel

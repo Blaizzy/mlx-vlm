@@ -1,8 +1,2 @@
-from .kimi_vl import (
-    LanguageModel,
-    Model,
-    ModelConfig,
-    TextConfig,
-    VisionConfig,
-    VisionModel,
-)
+from .config import ModelConfig, TextConfig, VisionConfig
+from .kimi_vl import LanguageModel, Model, VisionModel
