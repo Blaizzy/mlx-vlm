@@ -6,7 +6,7 @@ from ..base import BaseModelConfig
 
 
 @dataclass
-class TextConfig:
+class TextConfig(BaseModelConfig):
     model_type: str
     hidden_size: int = 4096
     num_hidden_layers: int = 32
@@ -34,7 +34,7 @@ class TextConfig:
 
 
 @dataclass
-class VisionConfig:
+class VisionConfig(BaseModelConfig):
     model_type: str
     num_hidden_layers: int = 24
     hidden_size: int = 1024
