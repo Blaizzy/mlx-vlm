@@ -379,6 +379,25 @@ def stream_generate(
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
+    # Handle stopping criteria
+    eos_tokens = kwargs.pop("eos_tokens", None)
+    stopping_criteria = kwargs.get("stopping_criteria", None)
+
+    # Reset to default eos token ids from the model config
+    tokenizer.stopping_criteria.reset(model.config.eos_token_id)
+
+    if eos_tokens is not None:
+        tokenizer.stopping_criteria.add_eos_token_ids(eos_tokens)
+    elif stopping_criteria is not None:
+        if isinstance(stopping_criteria, StoppingCriteria) or callable(
+            stopping_criteria
+        ):
+            tokenizer.stopping_criteria = stopping_criteria
+        else:
+            raise ValueError(
+                "stopping_criteria must be an instance of StoppingCriteria or a callable"
+            )
+
     # Skip special tokens
     skip_special_tokens = kwargs.pop("skip_special_tokens", False)
     skip_special_token_ids = (
@@ -431,11 +450,7 @@ def stream_generate(
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = input_ids.size / prompt_time
                 tic = time.perf_counter()
-
-            # Stop generation if the token is in the eos_token_ids
-            if tokenizer.stopping_criteria(token):
-                break
-
+            
             detokenizer.add_token(token, skip_special_token_ids=skip_special_token_ids)
 
             # Yield the last segment if streaming
@@ -450,6 +465,10 @@ def stream_generate(
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
             )
+
+            # Stop generation if the token is in the eos_token_ids
+            if tokenizer.stopping_criteria(token):
+                break
 
         detokenizer.finalize()
         yield GenerationResult(
@@ -510,29 +529,6 @@ def generate(
 
     text = ""
     last_response = None
-
-    eos_tokens = kwargs.get("eos_tokens", None)
-    stopping_criteria = kwargs.get("stopping_criteria", None)
-
-    # Get the tokenizer
-    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-
-    # Add custom EOS tokens to the stopping criteria
-    if eos_tokens is not None:
-        tokenizer.stopping_criteria.add_eos_token_ids(eos_tokens)
-
-    # Use custom stopping criteria
-    elif stopping_criteria is not None:
-        if isinstance(stopping_criteria, StoppingCriteria) or callable(
-            stopping_criteria
-        ):
-            tokenizer.stopping_criteria = stopping_criteria
-        else:
-            raise ValueError(
-                "stopping_criteria must be an instance of StoppingCriteria or a callable"
-            )
-    else:
-        tokenizer.stopping_criteria.reset(model.config.eos_token_id)
 
     for response in stream_generate(model, processor, prompt, image, audio, **kwargs):
         if verbose:
