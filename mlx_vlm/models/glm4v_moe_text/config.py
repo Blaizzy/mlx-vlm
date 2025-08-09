@@ -38,14 +38,21 @@ class TextConfig(BaseModelConfig):
 @dataclass
 class VisionConfig(BaseModelConfig):
     model_type: str
-    num_hidden_layers: int
+    depth: int
     hidden_size: int
     intermediate_size: int
-    num_attention_heads: int
+    num_heads: int
     patch_size: int
-    image_size: int = 224
-    num_channels: int = 3
-    layer_norm_eps: float = 1e-6
+    image_size: int = 336
+    in_channels: int = 3
+    rms_norm_eps: float = 1e-05
+    attention_bias: bool = False
+    attention_dropout: float = 0.0
+    hidden_act: str = "silu"
+    initializer_range: float = 0.02
+    out_hidden_size: int = 4096
+    spatial_merge_size: int = 2
+    temporal_patch_size: int = 2
 
 
 @dataclass
