@@ -63,7 +63,12 @@ class ModelConfig(BaseModelConfig):
     model_type: str
     vocab_size: int = 257152
     ignore_index: int = -100
-    image_token_index: int = 262144
+    image_token_index: int = 151363
+    image_token_id: int = 151363
+    video_token_index: int = 151364
+    video_token_id: int = 151364
+    vision_start_token_id: int = 151339
+    vision_end_token_id: int = 151340
     hidden_size: int = 2048
     pad_token_id: int = 0
     eos_token_id: Optional[List[int]] = None

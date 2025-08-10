@@ -10,18 +10,18 @@ from .config import VisionConfig
 def check_array_shape(arr):
     shape = arr.shape
 
-    # Check if the shape has 4 dimensions
-    if len(shape) not in [4, 5]:
-        return False
-
-    B, out_channels, kH, KW, t = shape
-
-    if t == 3:
-        return True
-
-    # Check if out_channels is the largest, and kH and KW are the same
-    if (out_channels >= kH) and (out_channels >= KW) and (kH == KW):
-        return True
+    # Check if the shape has 4 or 5 dimensions
+    if len(shape) == 4:
+        out_channels, kH, KW, _ = shape
+        # Check if out_channels is the largest, and kH and KW are the same
+        return (out_channels >= kH) and (out_channels >= KW) and (kH == KW)
+    elif len(shape) == 5:
+        B, out_channels, kH, KW, t = shape
+        # Special case for temporal dimension
+        if t == 3:
+            return True
+        # Check if out_channels is the largest, and kH and KW are the same
+        return (out_channels >= kH) and (out_channels >= KW) and (kH == KW)
     else:
         return False
 
@@ -66,6 +66,92 @@ class VisionRotaryEmbedding(nn.Module):
         return freqs
 
 
+class Glm4vVisionEmbeddings(nn.Module):
+    def __init__(self, config: VisionConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.hidden_size
+        self.image_size = config.image_size
+        self.patch_size = config.patch_size
+
+        self.num_patches = (self.image_size // self.patch_size) ** 2
+        self.num_positions = self.num_patches
+        self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
+
+    def __call__(self, embeddings, lengths, image_shapes, h_coords, w_coords):
+
+        # Get position embedding parameters
+        pos_embed_weight = self.position_embedding.weight
+        hidden_size = pos_embed_weight.shape[1]
+        total_seq = h_coords.shape[0]
+        device = pos_embed_weight.device
+
+        # Move coordinates to correct device
+        h_coords, w_coords = h_coords.to(device), w_coords.to(device)
+
+        # Handle empty sequence case
+        if total_seq == 0:
+            adapted_pos_embed = torch.empty(
+                0, hidden_size, device=device, dtype=pos_embed_weight.dtype
+            )
+        else:
+            # Convert inputs to tensors if needed
+            if isinstance(lengths, list):
+                lengths = torch.tensor(lengths, device=device, dtype=torch.long)
+            if not isinstance(image_shapes, torch.Tensor):
+                image_shapes = torch.tensor(
+                    image_shapes, device=device, dtype=torch.long
+                )
+
+            # Prepare 2D position embedding
+            orig_size_sq = pos_embed_weight.shape[0]
+            orig_size = int(orig_size_sq**0.5)
+            pos_embed_2d = (
+                pos_embed_weight.view(orig_size, orig_size, hidden_size)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+                .to(device=device, dtype=torch.float32)
+            )
+
+            # Calculate target dimensions for each patch
+            target_h = torch.cat(
+                [image_shapes[i, 1].repeat(lengths[i]) for i in range(len(lengths))]
+            ).to(device=device, dtype=torch.float32)
+            target_w = torch.cat(
+                [image_shapes[i, 2].repeat(lengths[i]) for i in range(len(lengths))]
+            ).to(device=device, dtype=torch.float32)
+
+            # Normalize coordinates to [-1, 1] range for grid_sample
+            h_coords = h_coords.to(device=device, dtype=torch.float32)
+            w_coords = w_coords.to(device=device, dtype=torch.float32)
+            norm_w = ((w_coords + 0.5) / target_w) * 2 - 1
+            norm_h = ((h_coords + 0.5) / target_h) * 2 - 1
+
+            # Create sampling grid
+            grid = torch.stack((norm_w, norm_h), dim=-1).unsqueeze(0).unsqueeze(2)
+
+            # Perform bicubic interpolation
+            interpolated_embed_fp32 = F.grid_sample(
+                pos_embed_2d,
+                grid,
+                mode="bicubic",
+                align_corners=False,
+                padding_mode="border",
+            )
+
+            # Reshape and convert back to original dtype
+            adapted_pos_embed_fp32 = (
+                interpolated_embed_fp32.squeeze(0).squeeze(-1).permute(1, 0)
+            )
+            adapted_pos_embed = adapted_pos_embed_fp32.to(pos_embed_weight.dtype).to(
+                embeddings.device
+            )
+
+        # Add adapted position encoding to embeddings
+        embeddings = embeddings + adapted_pos_embed
+        return embeddings
+
+
 class PatchEmbed(nn.Module):
     def __init__(
         self,
@@ -73,6 +159,7 @@ class PatchEmbed(nn.Module):
         temporal_patch_size: int = 2,
         in_channels: int = 3,
         hidden_size: int = 1152,
+        bias: bool = False,
     ) -> None:
         super().__init__()
         self.patch_size = patch_size
@@ -86,7 +173,7 @@ class PatchEmbed(nn.Module):
             hidden_size,
             kernel_size=kernel_size,
             stride=kernel_size,
-            bias=False,
+            bias=bias,
         )
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
@@ -104,21 +191,21 @@ class PatchEmbed(nn.Module):
 
 
 class PatchMerger(nn.Module):
-    def __init__(self, dim: int, context_dim: int, spatial_merge_size: int = 2) -> None:
+    def __init__(self, dim: int, context_dim: int, bias: bool = False) -> None:
         super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size**2)
-        self.ln_q = nn.RMSNorm(context_dim, eps=1e-6)
-        self.mlp = [
-            nn.Linear(self.hidden_size, self.hidden_size),
-            nn.GELU(),
-            nn.Linear(self.hidden_size, dim),
-        ]
+
+        self.proj = nn.Linear(dim, dim, bias=bias)
+        self.post_projection_norm = nn.LayerNorm(dim)
+        self.gate_proj = nn.Linear(dim, context_dim, bias=bias)
+        self.up_proj = nn.Linear(dim, context_dim, bias=bias)
+        self.down_proj = nn.Linear(context_dim, dim, bias=bias)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = self.ln_q(x).reshape(-1, self.hidden_size)
-        for layer in self.mlp:
-            x = layer(x)
-        return x
+        x = self.proj(x)
+        hidden_state = nn.gelu(self.post_projection_norm(hidden_state))
+        return self.down_proj(
+            nn.silu(self.gate_proj(hidden_state)) * self.up_proj(hidden_state)
+        )
 
 
 class Attention(nn.Module):
@@ -127,8 +214,8 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim = dim // num_heads
         self.scale = head_dim**-0.5
-        self.qkv = nn.Linear(dim, dim * 3, bias=True)
-        self.proj = nn.Linear(dim, dim)
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
 
     def __call__(
         self, x: mx.array, cu_seqlens: mx.array, rotary_pos_emb: mx.array = None
@@ -165,9 +252,9 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim)
-        self.up_proj = nn.Linear(dim, hidden_dim)
-        self.down_proj = nn.Linear(hidden_dim, dim)
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -180,7 +267,7 @@ class Qwen2VLVisionBlock(nn.Module):
         self.norm2 = nn.RMSNorm(config.hidden_size, eps=1e-6)
 
         self.attn = Attention(dim=config.hidden_size, num_heads=config.num_heads)
-        self.mlp = MLP(dim=config.hidden_size, hidden_dim=config.intermediate_size)
+        self.mlp = MLP(dim=config.hidden_size, hidden_dim=config.out_hidden_size)
 
     def __call__(self, hidden_states, cu_seqlens, rotary_pos_emb) -> mx.array:
         hidden_states = hidden_states + self.attn(
@@ -202,11 +289,13 @@ class VisionModel(nn.Module):
             raise ValueError(f"Unsupported model type: {self.model_type}")
         self.spatial_merge_size = config.spatial_merge_size
 
+        self.embeddings = Glm4vVisionEmbeddings(config)
         self.patch_embed = PatchEmbed(
             patch_size=config.patch_size,
             temporal_patch_size=config.temporal_patch_size,
             in_channels=config.in_channels,
             hidden_size=config.hidden_size,
+            bias=True,
         )
 
         self.window_size = config.window_size
@@ -218,8 +307,19 @@ class VisionModel(nn.Module):
 
         self.blocks = [Qwen2VLVisionBlock(config) for _ in range(config.depth)]
         self.merger = PatchMerger(
-            dim=config.out_hidden_size, context_dim=config.hidden_size
+            dim=config.out_hidden_size, context_dim=config.intermediate_size
         )
+
+        self.post_conv_layernorm = nn.RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.downsample = nn.Conv2d(
+            in_channels=config.hidden_size,
+            out_channels=config.out_hidden_size,
+            kernel_size=config.spatial_merge_size,
+            stride=config.spatial_merge_size,
+        )
+        self.post_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def rot_pos_emb(self, grid_thw):
         pos_ids = []
@@ -397,7 +497,7 @@ class VisionModel(nn.Module):
             if "position_ids" in k:
                 # Remove unused position_ids
                 continue
-            elif "patch_embed.proj.weight" in k:
+            elif "patch_embed.proj.weight" in k or "downsample.weight" in k:
                 # PyTorch conv2d weight tensors have shape:
                 #   [out_channels, in_channels, kH, KW]
                 # MLX conv2d expects the weight be of shape:
@@ -405,7 +505,10 @@ class VisionModel(nn.Module):
                 if check_array_shape(v):
                     sanitized_weights[k] = v
                 else:
-                    sanitized_weights[k] = v.transpose(0, 2, 3, 4, 1)
+                    if v.ndim == 5:
+                        sanitized_weights[k] = v.transpose(0, 2, 3, 4, 1)
+                    if v.ndim == 4:
+                        sanitized_weights[k] = v.transpose(0, 2, 3, 1)
             else:
                 sanitized_weights[k] = v
 

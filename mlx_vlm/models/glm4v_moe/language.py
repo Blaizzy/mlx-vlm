@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
@@ -14,7 +15,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from .config import TextConfig
+from .config import ModelConfig, TextConfig
 
 
 class Qwen2RotaryEmbedding:
@@ -115,6 +116,14 @@ class Attention(nn.Module):
         self.rope = nn.RoPE(
             int(head_dim * args.partial_rotary_factor),
             traditional=False,
+            base=args.rope_theta,
+        )
+
+        self.rope_scaling = args.rope_scaling
+
+        self.rotary_emb = Qwen2RotaryEmbedding(
+            head_dim,
+            max_position_embeddings=args.max_position_embeddings,
             base=args.rope_theta,
         )
 
@@ -349,12 +358,13 @@ class GLM4VModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    def __init__(self, config: TextConfig):
+    def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
-        self.args = config
-        self.model_type = config.model_type
-        self.model = GLM4VModel(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.args = args
+        self.config = config
+        self.model_type = args.model_type
+        self.model = GLM4VModel(args)
+        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def get_rope_index(
         self,

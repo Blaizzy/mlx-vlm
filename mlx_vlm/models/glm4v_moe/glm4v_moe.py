@@ -17,7 +17,7 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
-        self.language_model = LanguageModel(config.text_config)
+        self.language_model = LanguageModel(config.text_config, config)
 
     def get_input_embeddings(
         self,
