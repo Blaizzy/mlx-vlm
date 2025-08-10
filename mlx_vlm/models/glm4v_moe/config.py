@@ -28,9 +28,9 @@ class TextConfig(BaseModelConfig):
     rope_theta: float
     rope_scaling: Optional[Dict]
     use_qk_norm: bool
-    tie_word_embeddings: bool
     attention_bias: bool
     partial_rotary_factor: float
+    tie_word_embeddings: bool = None
     scoring_func: str = "sigmoid"
     topk_method: str = "noaux_tc"
 
@@ -43,6 +43,7 @@ class VisionConfig(BaseModelConfig):
     intermediate_size: int
     num_heads: int
     patch_size: int
+    window_size: int = 112
     image_size: int = 336
     in_channels: int = 3
     rms_norm_eps: float = 1e-05

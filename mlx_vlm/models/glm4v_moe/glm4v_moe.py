@@ -17,7 +17,7 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
-        self.language_model = LanguageModel(config.text_config, config)
+        self.language_model = LanguageModel(config.text_config)
 
     def get_input_embeddings(
         self,
@@ -156,13 +156,13 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         def transform_key(key):
-            if "vision_tower" not in key:
-                key = key.replace("visual", "vision_tower")
-            if "language_model" not in key:
-                if "model" in key:
-                    key = key.replace("model", "language_model.model")
-                elif "lm_head" in key:
-                    key = key.replace("lm_head", "language_model.lm_head")
+            if "visual" in key:
+                if "vision_tower" not in key:
+                    key = key.replace("model.", "").replace("visual", "vision_tower")
+            if "model.language_model" in key:
+                key = key.replace("model.language_model", "language_model.model")
+            if "lm_head" in key and not key.startswith("language_model"):
+                key = key.replace("lm_head", "language_model.lm_head")
             return key
 
         return {transform_key(k): v for k, v in weights.items()}

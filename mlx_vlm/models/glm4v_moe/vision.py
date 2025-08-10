@@ -198,7 +198,7 @@ class VisionModel(nn.Module):
         super().__init__()
         self.config = config
         self.model_type = config.model_type
-        if self.model_type != "qwen2_5_vl":
+        if self.model_type != "glm4v_moe":
             raise ValueError(f"Unsupported model type: {self.model_type}")
         self.spatial_merge_size = config.spatial_merge_size
 
@@ -212,7 +212,7 @@ class VisionModel(nn.Module):
         self.window_size = config.window_size
         self.patch_size = config.patch_size
         self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
-        self.fullatt_block_indexes = config.fullatt_block_indexes
+        # self.fullatt_block_indexes = config.fullatt_block_indexes
         head_dim = config.hidden_size // config.num_heads
         self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)
 
@@ -376,10 +376,8 @@ class VisionModel(nn.Module):
         encoder_states = (hidden_states,) if output_hidden_states else None
 
         for layer_num, blk in enumerate(self.blocks):
-            if layer_num in self.fullatt_block_indexes:
-                cu_seqlens_now = cu_seqlens
-            else:
-                cu_seqlens_now = cu_window_seqlens
+
+            cu_seqlens_now = cu_window_seqlens
 
             hidden_states = blk(
                 hidden_states, cu_seqlens=cu_seqlens_now, rotary_pos_emb=rotary_pos_emb

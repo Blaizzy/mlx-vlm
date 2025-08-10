@@ -7,13 +7,13 @@ from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..switch_layers import SwitchGLU
 from .config import TextConfig
 
 
@@ -308,7 +308,7 @@ class DecoderLayer(nn.Module):
         return h + r
 
 
-class LanguageModel(nn.Module):
+class GLM4VModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.vocab_size = config.vocab_size
@@ -348,13 +348,12 @@ class LanguageModel(nn.Module):
         return self.norm(h)
 
 
-class Model(nn.Module):
+class LanguageModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.args = config
         self.model_type = config.model_type
-        self.model = LanguageModel(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model = GLM4VModel(config)
 
     def get_rope_index(
         self,
@@ -580,7 +579,7 @@ class Model(nn.Module):
             inputs, cache=cache, inputs_embeds=inputs_embeds, position_ids=position_ids
         )
 
-        out = self.lm_head(out)
+        self.model.embed_tokens.as_linear(out)
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
@@ -588,7 +587,7 @@ class Model(nn.Module):
 
         # Stack experts
         for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}"
+            prefix = f"language_model.model.layers.{l}"
             for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
                 for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
@@ -602,7 +601,7 @@ class Model(nn.Module):
         return {
             k: v
             for k, v in weights.items()
-            if not k.startswith(f"model.layers.{mpt_layer}")
+            if not k.startswith(f"language_model.model.layers.{mpt_layer}")
         }
 
     @property
