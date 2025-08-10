@@ -354,6 +354,7 @@ class LanguageModel(nn.Module):
         self.args = config
         self.model_type = config.model_type
         self.model = GLM4VModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def get_rope_index(
         self,
@@ -579,7 +580,7 @@ class LanguageModel(nn.Module):
             inputs, cache=cache, inputs_embeds=inputs_embeds, position_ids=position_ids
         )
 
-        self.model.embed_tokens.as_linear(out)
+        out = self.lm_head(out)
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
