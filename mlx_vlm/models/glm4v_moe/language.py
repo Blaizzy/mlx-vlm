@@ -18,37 +18,75 @@ from ..base import (
 from .config import ModelConfig, TextConfig
 
 
-class Qwen2RotaryEmbedding:
-    def __init__(self, dim, max_position_embeddings=2048, base=10000):
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
+def _compute_default_rope_parameters(
+    config: Optional[TextConfig] = None,
+    **rope_kwargs,
+) -> tuple[mx.array, float]:
 
-        inv_freq = 1.0 / (
-            self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
+    if config is not None and len(rope_kwargs) > 0:
+        raise ValueError(
+            "Unexpected arguments: `**rope_kwargs` and `config` are mutually exclusive in "
+            f"`_compute_default_rope_parameters`, got `rope_kwargs`={rope_kwargs} and `config`={config}"
         )
-        self.inv_freq = inv_freq
+    if len(rope_kwargs) > 0:
+        base = rope_kwargs["base"]
+        dim = rope_kwargs["dim"]
+    elif config is not None:
+        base = config.rope_theta
+        partial_rotary_factor = (
+            config.partial_rotary_factor
+            if hasattr(config, "partial_rotary_factor")
+            else 1.0
+        )
+        head_dim = (
+            getattr(config, "head_dim", None)
+            or config.hidden_size // config.num_attention_heads
+        )
+        dim = int(head_dim * partial_rotary_factor)
 
-        self._set_cos_sin_cache(seq_len=max_position_embeddings)
+    attention_factor = 1.0  # Unused in this type of RoPE
 
-    def _set_cos_sin_cache(self, seq_len):
-        self.max_seq_len_cached = seq_len
-        t = mx.arange(self.max_seq_len_cached).astype(mx.float32)
+    # Compute the inverse frequencies
+    inv_freq = 1.0 / (
+        base ** (mx.arange(0, dim, 2, dtype=mx.int64).astype(mx.float32) / dim)
+    )
+    return inv_freq, attention_factor
 
-        freqs = mx.outer(t, self.inv_freq)
+
+class Qwen2RotaryEmbedding(nn.Module):
+    def __init__(self, config: TextConfig, device=None):
+        super().__init__()
+
+        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+            self.rope_type = config.rope_scaling.get(
+                "rope_type", config.rope_scaling.get("type")
+            )
+        else:
+            self.rope_type = "default"
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+
+        self.rope_init_fn = _compute_default_rope_parameters
+
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config)
+        self._inv_freq = mx.array(inv_freq, dtype=mx.float32)
+        self._original_inv_freq = mx.array(inv_freq, dtype=mx.float32)
+
+    def __call__(self, x, position_ids):
+        inv_freq_expanded = self._inv_freq[None, None, :, None].astype(mx.float32)
+        position_ids_expanded = position_ids[:, :, None, :].astype(mx.float32)
+
+        freqs = (
+            inv_freq_expanded.astype(mx.float32)
+            @ position_ids_expanded.astype(mx.float32)
+        ).transpose(0, 1, 3, 2)
         emb = mx.concatenate((freqs, freqs), axis=-1)
-        self.cos_cached = mx.cos(emb)
-        self.sin_cached = mx.sin(emb)
+        cos = mx.cos(emb) * self.attention_scaling
+        sin = mx.sin(emb) * self.attention_scaling
 
-    def __call__(self, x, seq_len=None):
-
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len)
-
-        return (
-            self.cos_cached[:seq_len].astype(x.dtype),
-            self.sin_cached[:seq_len].astype(x.dtype),
-        )
+        return cos.astype(x.dtype), sin.astype(x.dtype)
 
 
 def rotate_half(x):
@@ -58,7 +96,7 @@ def rotate_half(x):
     return mx.concatenate([-x2, x1], axis=-1)
 
 
-def apply_multimodal_rotary_pos_emb(q, k, cos, sin, position_ids, mrope_section):
+def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
     """
     Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors.
     Args:
@@ -73,8 +111,6 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, position_ids, mrope_section)
     """
 
     mrope_section = np.cumsum(mrope_section * 2)[:-1].tolist()
-    cos = cos[position_ids]
-    sin = sin[position_ids]
 
     cos = mx.concatenate(
         [m[i % 3] for i, m in enumerate(mx.split(cos, mrope_section, axis=-1))], axis=-1
@@ -85,9 +121,23 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, position_ids, mrope_section)
         [m[i % 3] for i, m in enumerate(mx.split(sin, mrope_section, axis=-1))], axis=-1
     )[:, None, :, :]
 
+    cos = mx.repeat(cos[..., : cos.shape[-1] // 2], 2, axis=-1)
+    sin = mx.repeat(sin[..., : sin.shape[-1] // 2], 2, axis=-1)
+
+    rotary_dim = cos.shape[-1]
+
+    q_rot = q[..., :rotary_dim]
+    q_pass = q[..., rotary_dim:]
+
+    k_rot = k[..., :rotary_dim]
+    k_pass = k[..., rotary_dim:]
+
     # Apply rotary embedding
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+
+    q_embed = mx.concatenate([q_embed, q_pass], axis=-1)
+    k_embed = mx.concatenate([k_embed, k_pass], axis=-1)
 
     return q_embed, k_embed
 
@@ -108,31 +158,14 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=args.attention_bias)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.use_qk_norm = args.use_qk_norm
-        if self.use_qk_norm:
-            self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
-            self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
-
-        self.rope = nn.RoPE(
-            int(head_dim * args.partial_rotary_factor),
-            traditional=False,
-            base=args.rope_theta,
-        )
-
         self.rope_scaling = args.rope_scaling
-
-        self.rotary_emb = Qwen2RotaryEmbedding(
-            head_dim,
-            max_position_embeddings=args.max_position_embeddings,
-            base=args.rope_theta,
-        )
 
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -141,34 +174,21 @@ class Attention(nn.Module):
         queries = queries.reshape(B, L, self.n_heads, -1)
         keys = keys.reshape(B, L, self.n_kv_heads, -1)
 
-        if self.use_qk_norm:
-            queries = self.q_norm(queries)
-            keys = self.k_norm(keys)
-
         queries = queries.transpose(0, 2, 1, 3)
         keys = keys.transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
-        kv_seq_len = keys.shape[-2]
+        cos, sin = position_embeddings
 
-        if position_ids is None:
-            kv_seq_len += cache.offset + 1
-            position_ids = mx.arange(cache.offset, cache.offset + L)
-            position_ids = mx.expand_dims(position_ids, axis=0)
-            position_ids = mx.tile(position_ids, (3, 1, 1))
-        else:
-            kv_seq_len += cache.offset + 1 if cache is not None else 0
-
-        cos, sin = self.rotary_emb(values, kv_seq_len)
-
-        if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., : keys.shape[-2]]
         queries, keys = apply_multimodal_rotary_pos_emb(
-            queries, keys, cos, sin, position_ids, self.rope_scaling["mrope_section"]
+            queries, keys, cos, sin, self.rope_scaling["mrope_section"]
         )
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
+
+        if mask is not None and isinstance(mask, mx.array):
+            mask = mask[..., : keys.shape[-2]]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
@@ -309,9 +329,10 @@ class DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
+
+        r = self.self_attn(self.input_layernorm(x), mask, cache, position_embeddings)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         return h + r
@@ -331,6 +352,8 @@ class GLM4VModel(nn.Module):
 
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        self.rotary_emb = Qwen2RotaryEmbedding(config)
+
     def __call__(
         self,
         inputs: mx.array,
@@ -345,6 +368,13 @@ class GLM4VModel(nn.Module):
         else:
             h = inputs_embeds.astype(self.norm.weight.dtype)
 
+        if position_ids is None:
+            position_ids = mx.arange(cache[0].offset, cache[0].offset + h.shape[-2])
+            position_ids = mx.expand_dims(position_ids, axis=0)
+            position_ids = mx.tile(position_ids, (3, 1, 1))
+
+        position_embeddings = self.rotary_emb(h, position_ids)
+
         if mask is None:
             mask = create_attention_mask(h, cache)
 
@@ -352,7 +382,7 @@ class GLM4VModel(nn.Module):
             cache = [None] * self.num_layers
 
         for i in range(self.num_layers):
-            h = self.layers[self.start_idx + i](h, mask, cache[i], position_ids)
+            h = self.layers[self.start_idx + i](h, mask, cache[i], position_embeddings)
 
         return self.norm(h)
 
