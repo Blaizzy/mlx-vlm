@@ -89,11 +89,11 @@ class Qwen2RotaryEmbedding(nn.Module):
         return cos.astype(x.dtype), sin.astype(x.dtype)
 
 
-def rotate_half(x):
+def rotate_half_llm(x):
     """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return mx.flatten(mx.stack([-x2, x1], axis=-1), start_axis=-2)
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
@@ -131,16 +131,14 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
     sin = sin.reshape(*sin.shape[:-2], -1)
 
     rotary_dim = cos.shape[-1]
-
     q_rot = q[..., :rotary_dim]
     q_pass = q[..., rotary_dim:]
-
     k_rot = k[..., :rotary_dim]
     k_pass = k[..., rotary_dim:]
 
     # Apply rotary embedding
-    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    q_embed = (q_rot * cos) + (rotate_half_llm(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half_llm(k_rot) * sin)
 
     q_embed = mx.concatenate([q_embed, q_pass], axis=-1)
     k_embed = mx.concatenate([k_embed, k_pass], axis=-1)
@@ -614,7 +612,7 @@ class LanguageModel(nn.Module):
                 # Use the prev pre-calculated rope-deltas to get the correct position ids
                 batch_size, seq_length = inputs.shape
                 delta = cache[-1].offset + self.rope_deltas if cache is not None else 0
-                delta = delta[None][None]
+                delta = delta[None, None, ...]
                 position_ids = mx.arange(seq_length).reshape(1, seq_length)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
                 if cache is not None:
