@@ -121,8 +121,14 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
         [m[i % 3] for i, m in enumerate(mx.split(sin, mrope_section, axis=-1))], axis=-1
     )[:, None, :, :]
 
-    cos = mx.repeat(cos[..., : cos.shape[-1] // 2], 2, axis=-1)
-    sin = mx.repeat(sin[..., : sin.shape[-1] // 2], 2, axis=-1)
+    # Repeat interleave to match the shape of q and k
+    cos_half = cos[..., : cos.shape[-1] // 2]
+    cos = mx.stack([cos_half, cos_half], axis=-1)
+    cos = cos.reshape(*cos.shape[:-2], -1)
+
+    sin_half = sin[..., : sin.shape[-1] // 2]
+    sin = mx.stack([sin_half, sin_half], axis=-1)
+    sin = sin.reshape(*sin.shape[:-2], -1)
 
     rotary_dim = cos.shape[-1]
 
@@ -370,6 +376,9 @@ class GLM4VModel(nn.Module):
 
         if position_ids is None:
             position_ids = mx.arange(cache[0].offset, cache[0].offset + h.shape[-2])
+            position_ids = mx.expand_dims(position_ids, axis=0)
+            position_ids = mx.tile(position_ids, (3, 1, 1))
+        elif position_ids.ndim == 2:
             position_ids = mx.expand_dims(position_ids, axis=0)
             position_ids = mx.tile(position_ids, (3, 1, 1))
 
