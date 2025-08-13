@@ -76,6 +76,9 @@ class Qwen2RotaryEmbedding(nn.Module):
 
     def __call__(self, x, position_ids):
         inv_freq_expanded = self._inv_freq[None, None, :, None].astype(mx.float32)
+        inv_freq_expanded = mx.broadcast_to(
+            inv_freq_expanded, (3, position_ids.shape[1], self._inv_freq.shape[0], 1)
+        )
         position_ids_expanded = position_ids[:, :, None, :].astype(mx.float32)
 
         freqs = (
@@ -121,22 +124,13 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
         [m[i % 3] for i, m in enumerate(mx.split(sin, mrope_section, axis=-1))], axis=-1
     )[:, None, :, :]
 
-    # Repeat interleave to match the shape of q and k
-    cos_half = cos[..., : cos.shape[-1] // 2]
-    cos = mx.stack([cos_half, cos_half], axis=-1)
-    cos = cos.reshape(*cos.shape[:-2], -1)
-
-    sin_half = sin[..., : sin.shape[-1] // 2]
-    sin = mx.stack([sin_half, sin_half], axis=-1)
-    sin = sin.reshape(*sin.shape[:-2], -1)
-
     rotary_dim = cos.shape[-1]
     q_rot = q[..., :rotary_dim]
     q_pass = q[..., rotary_dim:]
+
     k_rot = k[..., :rotary_dim]
     k_pass = k[..., rotary_dim:]
 
-    # Apply rotary embedding
     q_embed = (q_rot * cos) + (rotate_half_llm(q_rot) * sin)
     k_embed = (k_rot * cos) + (rotate_half_llm(k_rot) * sin)
 
@@ -376,9 +370,6 @@ class GLM4VModel(nn.Module):
             position_ids = mx.arange(cache[0].offset, cache[0].offset + h.shape[-2])
             position_ids = mx.expand_dims(position_ids, axis=0)
             position_ids = mx.tile(position_ids, (3, 1, 1))
-        elif position_ids.ndim == 2:
-            position_ids = mx.expand_dims(position_ids, axis=0)
-            position_ids = mx.tile(position_ids, (3, 1, 1))
 
         position_embeddings = self.rotary_emb(h, position_ids)
 
@@ -616,7 +607,6 @@ class LanguageModel(nn.Module):
                 position_ids = mx.arange(seq_length).reshape(1, seq_length)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
                 if cache is not None:
-                    # Repeat delta for each batch
                     delta = mx.repeat(delta, batch_size // delta.shape[0], axis=0)
                 position_ids = mx.add(position_ids, delta).reshape(position_ids.shape)
                 position_ids = mx.broadcast_to(

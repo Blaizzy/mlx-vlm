@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 from ..base import BaseModelConfig
@@ -26,10 +26,12 @@ class TextConfig(BaseModelConfig):
     num_key_value_heads: int
     rms_norm_eps: float
     rope_theta: float
-    rope_scaling: Optional[Dict]
     use_qk_norm: bool
     attention_bias: bool
     partial_rotary_factor: float
+    rope_scaling: Dict = field(
+        default_factory=lambda: {"type": "default", "mrope_section": [64, 32, 32]}
+    )
     tie_word_embeddings: bool = None
     scoring_func: str = "sigmoid"
     topk_method: str = "noaux_tc"
@@ -72,3 +74,7 @@ class ModelConfig(BaseModelConfig):
     hidden_size: int = 2048
     pad_token_id: int = 0
     eos_token_id: Optional[List[int]] = None
+
+    def __post_init__(self):
+        if self.eos_token_id is None:
+            self.eos_token_id = [151329, 151336, 151338]
