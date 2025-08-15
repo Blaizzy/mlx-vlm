@@ -1,6 +1,6 @@
 import inspect
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from ..base import BaseModelConfig
 
@@ -65,6 +65,8 @@ class VisionConfig(BaseModelConfig):
     layer_norm_eps: float = 1e-06
     hidden_act: str = "gelu_pytorch_tanh"
     vision_use_head: bool = False
+    num_positions: int = None
+    spatial_shapes: List[Tuple[int, int]] = None
 
 
 @dataclass

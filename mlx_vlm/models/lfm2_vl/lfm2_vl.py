@@ -92,19 +92,21 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        spatial_shapes: Optional[mx.array] = None,
+        pixel_attention_mask: Optional[mx.array] = None,
     ):
-        if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids)
 
-        # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+
+        if pixel_values is None:
+            return inputs_embeds
 
         # Get the ouptut hidden states from the vision model
         *_, hidden_states = self.vision_tower(
-            pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
+            pixel_values, output_hidden_states=True, spatial_shapes=spatial_shapes
         )
 
-        img_feature_lengths = pixel_attention_mask.sum(dim=1)
+        img_feature_lengths = pixel_attention_mask.sum(axis=1).tolist()
         image_features = []
 
         for img_idx in range(hidden_states.shape[0]):
@@ -120,8 +122,10 @@ class Model(nn.Module):
             img_embedding = self.multi_modal_projector(feature)
 
             # flatten here to handle variable length in naflex
-            img_embedding = img_embedding.reshape(-1, img_embedding.size(-1))
+            img_embedding = img_embedding.reshape(-1, img_embedding.shape[-1])
             image_features.append(img_embedding)
+
+        image_features = mx.stack(image_features, axis=0)
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self._merge_input_ids_with_image_features(
@@ -132,29 +136,45 @@ class Model(nn.Module):
     def _merge_input_ids_with_image_features(
         self, image_features, inputs_embeds, input_ids
     ):
-        image_token_index = self.config.image_token_index
 
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids == image_token_index)[1].tolist()
-        num_images, _, vision_hidden_size = image_features.shape
+        special_image_mask = input_ids == self.config.image_token_index
 
-        reshaped_image_hidden_states = image_features.reshape(-1, vision_hidden_size)
+        n_image_tokens = special_image_mask.sum()
+        special_image_mask = special_image_mask[..., None]
 
-        # cast to the dtype of the input_embeds to support quantized models
-        reshaped_image_hidden_states = reshaped_image_hidden_states.astype(
-            inputs_embeds.dtype
-        )
+        special_image_mask = mx.broadcast_to(special_image_mask, inputs_embeds.shape)
+        n_image_features = image_features.shape[0]
 
-        # Pad image_positions to match the length of reshaped_image_hidden_states
-        num_positions_needed = len(image_positions)
-
-        if reshaped_image_hidden_states.shape[0] > num_positions_needed:
-            # TODO: Think about how to handle this case
+        # Calculate the number of elements that would be selected by the mask
+        num_masked_elements = special_image_mask.sum()
+        if num_masked_elements != image_features.size:
             raise ValueError(
-                "Llava model supports only one image per input. Please check your input_ids and pixel_values."
+                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
             )
 
-        inputs_embeds[:, image_positions, :] = reshaped_image_hidden_states
+        # Get the positions where image tokens should be placed
+        image_token_positions = mx.where(special_image_mask)
+        # Get the positions where image tokens should be placed
+        image_token_indices = mx.nonzero(special_image_mask)
+
+        # Flatten image features for assignment
+        image_features_flat = image_features.reshape(-1, image_features.shape[-1])
+
+        # Create a copy of inputs_embeds to modify
+        result_embeds = inputs_embeds.copy()
+
+        # Calculate how many tokens each image contributes
+        tokens_per_image = image_features.shape[1]
+
+        # Assign image features to the appropriate positions
+        for i in range(len(image_token_positions[0])):
+            batch_idx = image_token_positions[0][i]
+            seq_idx = image_token_positions[1][i]
+            feature_idx = i % image_features_flat.shape[0]
+            result_embeds[batch_idx, seq_idx] = image_features_flat[feature_idx]
+
+        inputs_embeds = result_embeds
+
         return inputs_embeds
 
     @property
@@ -169,9 +189,14 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        input_embddings = self.get_input_embeddings(input_ids, pixel_values)
+        spatial_shapes = kwargs.get("spatial_shapes", None)
+        pixel_attention_mask = kwargs.get("pixel_attention_mask", None)
+        input_embeddings = self.get_input_embeddings(
+            input_ids, pixel_values, spatial_shapes, pixel_attention_mask
+        )
+
         logits = self.language_model(
-            input_ids, mask=mask, cache=cache, inputs_embeds=input_embddings
+            input_ids, mask=None, cache=cache, inputs_embeds=input_embeddings
         )
         return logits
 

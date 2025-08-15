@@ -5,6 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..kernels import bicubic_interpolate
 from .config import VisionConfig
 
 
@@ -130,7 +131,7 @@ class Encoder(nn.Module):
 
             h = x
 
-        return (h, encoder_states)
+        return encoder_states
 
 
 class VisionEmbeddings(nn.Module):
@@ -181,18 +182,19 @@ class VisionEmbeddings(nn.Module):
 
         # (height, width, embed_dim) -> (1, embed_dim, height, width) for interpolation
         positional_embeddings = positional_embeddings.transpose(2, 0, 1)[None, :]
-
         for i in range(batch_size):
             # (1, dim, height, width) -> (1, dim, target_height, target_width)
-            height, width = spatial_shapes[i]
-            resized_embeddings = mx.image.resize(
-                positional_embeddings, (height, width), method="bilinear"
+            height, width = spatial_shapes[i].tolist()
+
+            resized_embeddings = bicubic_interpolate(
+                positional_embeddings,
+                size=(height, width),
             )
 
             # (1, dim, target_height, target_width) -> (target_height * target_width, dim)
             resized_embeddings = resized_embeddings.reshape(
                 embed_dim, height * width
-            ).transpose(0, 1)
+            ).transpose(1, 0)
 
             resulted_positional_embeddings[i, : height * width] = resized_embeddings
             resulted_positional_embeddings[i, height * width :] = resized_embeddings[0]
@@ -209,30 +211,21 @@ class VisionEmbeddings(nn.Module):
             spatial_shapes (`mx.array`):
                 Spatial shapes of shape (batch_size, 2) to resize the positional embeddings to
         """
-        if spatial_shapes is not None:
-            # Apply patch embeddings to already patchified pixel values
-            target_dtype = self.patch_embedding.weight.dtype
-            patch_embeds = self.patch_embedding(pixel_values.astype(target_dtype))
+        # Apply patch embeddings to already patchified pixel values
+        target_dtype = self.patch_embedding.weight.dtype
+        patch_embeds = self.patch_embedding(pixel_values.astype(target_dtype))
 
-            # Get positional resized and padded positional embeddings
-            positional_embeddings = self.position_embedding.weight.reshape(
-                self.position_embedding_size, self.position_embedding_size, -1
-            )
-            resized_positional_embeddings = self.resize_positional_embeddings(
-                positional_embeddings, spatial_shapes, max_length=pixel_values.shape[1]
-            )
+        # Get positional resized and padded positional embeddings
+        positional_embeddings = self.position_embedding.weight.reshape(
+            self.position_embedding_size, self.position_embedding_size, -1
+        )
+        resized_positional_embeddings = self.resize_positional_embeddings(
+            positional_embeddings, spatial_shapes, max_length=pixel_values.shape[1]
+        )
 
-            # Add positional embeddings to patch embeddings
-            embeddings = patch_embeds + resized_positional_embeddings
-            return embeddings
-        else:
-            # Original implementation for backward compatibility
-            patch_embeddings = self.patch_embedding(pixel_values)
-            patch_embeddings = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
-            position_ids = mx.arange(self.num_positions)[None, :]
-            embeddings = patch_embeddings
-            embeddings += self.position_embedding(position_ids)
-            return embeddings
+        # Add positional embeddings to patch embeddings
+        embeddings = patch_embeds + resized_positional_embeddings
+        return embeddings
 
 
 class VisionModel(nn.Module):
@@ -250,8 +243,9 @@ class VisionModel(nn.Module):
         self,
         x: mx.array,
         output_hidden_states: Optional[bool] = None,
+        spatial_shapes: Optional[mx.array] = None,
     ) -> mx.array:
-        x = self.embeddings(x)
+        x = self.embeddings(x, spatial_shapes=spatial_shapes)
         x = x.astype(self.embeddings.patch_embedding.weight.dtype)
         encoder_outputs = self.encoder(
             x=x, output_hidden_states=output_hidden_states, mask=None
