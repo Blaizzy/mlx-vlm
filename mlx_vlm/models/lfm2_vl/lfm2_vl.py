@@ -96,11 +96,9 @@ class Model(nn.Module):
         self.vision_tower = VisionModel(config.vision_config)
 
         if config.vision_feature_layer != -1:
-            self.vision_tower.vision_model.encoder.layers = (
-                self.vision_tower.vision_model.encoder.layers[
-                    : config.vision_feature_layer + 1
-                ]
-            )
+            self.vision_tower.encoder.layers = self.vision_tower.encoder.layers[
+                : config.vision_feature_layer + 1
+            ]
         if config.downsample_factor > 1:
             self.pixel_unshuffle = PixelUnshuffleBlock(config.downsample_factor)
         else:
