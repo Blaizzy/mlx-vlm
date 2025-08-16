@@ -943,6 +943,45 @@ class TestModels(unittest.TestCase):
             ),  # image temporals shape (num_images, 3)
         )
 
+    def test_lfm2_vl(self):
+        from mlx_vlm.models import lfm2_vl
+
+        text_config = lfm2_vl.TextConfig(
+            layer_types=[
+                "conv",
+                "conv",
+                "full_attention",
+                "conv",
+                "conv",
+                "full_attention",
+                "conv",
+                "conv",
+                "full_attention",
+                "conv",
+                "full_attention",
+                "conv",
+                "full_attention",
+                "conv",
+                "full_attention",
+                "conv",
+            ],
+        )
+        vision_config = lfm2_vl.VisionConfig()
+        config = lfm2_vl.ModelConfig(
+            text_config=text_config, vision_config=vision_config
+        )
+        model = lfm2_vl.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        # TODO: Add vision test runner for lfm2_vl
+        # Rewrite inputs to be defined by the test classes
+
     def test_mllama(self):
         from mlx_vlm.models import mllama
 

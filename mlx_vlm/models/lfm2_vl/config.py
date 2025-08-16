@@ -52,7 +52,7 @@ class TextConfig(BaseModelConfig):
 
 @dataclass
 class VisionConfig(BaseModelConfig):
-    model_type: str = "siglip2_vision_model"
+    model_type: str = "lfm2_vl"
     hidden_size: int = 768
     intermediate_size: int = 3072
     num_hidden_layers: int = 12

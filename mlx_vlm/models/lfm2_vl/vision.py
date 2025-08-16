@@ -190,7 +190,7 @@ class VisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.model_type = config.model_type
-        if self.model_type != "siglip2_vision_model":
+        if self.model_type not in ["lfm2_vl", "siglip2_vision_model"]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
         self.embeddings = VisionEmbeddings(config)
