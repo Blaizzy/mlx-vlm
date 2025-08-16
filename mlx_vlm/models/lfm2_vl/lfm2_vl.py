@@ -67,6 +67,27 @@ class PixelUnshuffleBlock(nn.Module):
         return x
 
 
+def masked_scatter(
+    final_embedding: mx.array,
+    image_mask_expanded: mx.array,
+    scaled_image_features: mx.array,
+):
+    # Reshape the tensors to 1D
+    final_embedding_shape = final_embedding.shape
+    scaled_image_features_flattened = mx.flatten(scaled_image_features)
+    final_embedding_flattened = mx.flatten(final_embedding)
+    image_mask_expanded_flattened = mx.flatten(image_mask_expanded)
+
+    # Scatter the scaled image features into the special image token positions
+    image_positions = mx.array(np.where(image_mask_expanded_flattened)[0], mx.uint32)
+    final_embedding_flattened[image_positions] = scaled_image_features_flattened
+
+    # Reshape back to the original shape
+    final_embedding = mx.reshape(final_embedding_flattened, final_embedding_shape)
+
+    return final_embedding
+
+
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -111,23 +132,20 @@ class Model(nn.Module):
 
         for img_idx in range(hidden_states.shape[0]):
             feature = hidden_states[img_idx]
-            # unpad the image representation
+
             feature = feature[: img_feature_lengths[img_idx], :][None, ...]
 
             feature_org_h, feature_org_w = spatial_shapes[img_idx]
             feature = feature.reshape(1, feature_org_h, feature_org_w, -1)
             feature = self.pixel_unshuffle(feature)
 
-            # project the image representation
             img_embedding = self.multi_modal_projector(feature)
 
-            # flatten here to handle variable length in naflex
             img_embedding = img_embedding.reshape(-1, img_embedding.shape[-1])
             image_features.append(img_embedding)
 
-        image_features = mx.stack(image_features, axis=0)
+        image_features = mx.concatenate(image_features, axis=0)
 
-        # Insert special image tokens in the input_ids
         final_inputs_embeds = self._merge_input_ids_with_image_features(
             image_features, inputs_embeds, input_ids
         )
@@ -138,42 +156,20 @@ class Model(nn.Module):
     ):
 
         special_image_mask = input_ids == self.config.image_token_index
-
         n_image_tokens = special_image_mask.sum()
         special_image_mask = special_image_mask[..., None]
-
         special_image_mask = mx.broadcast_to(special_image_mask, inputs_embeds.shape)
-        n_image_features = image_features.shape[0]
 
-        # Calculate the number of elements that would be selected by the mask
-        num_masked_elements = special_image_mask.sum()
-        if num_masked_elements != image_features.size:
+        n_image_features = image_features.shape[0]
+        n_image_mask_elements = special_image_mask.sum()
+        if n_image_mask_elements != image_features.size:
             raise ValueError(
                 f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
             )
 
-        # Get the positions where image tokens should be placed
-        image_token_positions = mx.where(special_image_mask)
-        # Get the positions where image tokens should be placed
-        image_token_indices = mx.nonzero(special_image_mask)
-
-        # Flatten image features for assignment
-        image_features_flat = image_features.reshape(-1, image_features.shape[-1])
-
-        # Create a copy of inputs_embeds to modify
-        result_embeds = inputs_embeds.copy()
-
-        # Calculate how many tokens each image contributes
-        tokens_per_image = image_features.shape[1]
-
-        # Assign image features to the appropriate positions
-        for i in range(len(image_token_positions[0])):
-            batch_idx = image_token_positions[0][i]
-            seq_idx = image_token_positions[1][i]
-            feature_idx = i % image_features_flat.shape[0]
-            result_embeds[batch_idx, seq_idx] = image_features_flat[feature_idx]
-
-        inputs_embeds = result_embeds
+        inputs_embeds = masked_scatter(
+            inputs_embeds, special_image_mask, image_features
+        )
 
         return inputs_embeds
 

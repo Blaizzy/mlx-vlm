@@ -1,28 +1,10 @@
-import inspect
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..kernels import bicubic_interpolate
 from .config import VisionConfig
-
-
-def check_array_shape(arr):
-    shape = arr.shape
-
-    # Check if the shape has 4 dimensions
-    if len(shape) != 4:
-        return False
-
-    out_channels, kH, KW, _ = shape
-
-    # Check if out_channels is the largest, and kH and KW are the same
-    if (out_channels >= kH) and (out_channels >= KW) and (kH == KW):
-        return True
-    else:
-        return False
 
 
 class Attention(nn.Module):
@@ -157,20 +139,6 @@ class VisionEmbeddings(nn.Module):
         spatial_shapes: mx.array,
         max_length: int,
     ) -> mx.array:
-        """
-        Resize positional embeddings to image-specific size and pad to a fixed size.
-
-        Args:
-            positional_embeddings (`mx.array`):
-                Position embeddings of shape (height, width, embed_dim)
-            spatial_shapes (`mx.array`):
-                Spatial shapes of shape (batch_size, 2) to resize the positional embeddings to
-            max_length (`int`):
-                Maximum length of the positional embeddings to pad resized positional embeddings to
-
-        Returns:
-            `mx.array`: Embeddings of shape (batch_size, max_length, embed_dim)
-        """
         batch_size = spatial_shapes.shape[0]
         embed_dim = positional_embeddings.shape[-1]
         source_dtype = positional_embeddings.dtype
@@ -183,7 +151,7 @@ class VisionEmbeddings(nn.Module):
         # (height, width, embed_dim) -> (1, embed_dim, height, width) for interpolation
         positional_embeddings = positional_embeddings.transpose(2, 0, 1)[None, :]
         for i in range(batch_size):
-            # (1, dim, height, width) -> (1, dim, target_height, target_width)
+
             height, width = spatial_shapes[i].tolist()
 
             resized_embeddings = bicubic_interpolate(
@@ -191,7 +159,6 @@ class VisionEmbeddings(nn.Module):
                 size=(height, width),
             )
 
-            # (1, dim, target_height, target_width) -> (target_height * target_width, dim)
             resized_embeddings = resized_embeddings.reshape(
                 embed_dim, height * width
             ).transpose(1, 0)
@@ -204,18 +171,10 @@ class VisionEmbeddings(nn.Module):
     def __call__(
         self, pixel_values: mx.array, spatial_shapes: mx.array = None
     ) -> mx.array:
-        """
-        Args:
-            pixel_values (`mx.array`):
-                Pixel values of shape (batch_size, max_num_patches, num_channels * patch_size * patch_size)
-            spatial_shapes (`mx.array`):
-                Spatial shapes of shape (batch_size, 2) to resize the positional embeddings to
-        """
-        # Apply patch embeddings to already patchified pixel values
+
         target_dtype = self.patch_embedding.weight.dtype
         patch_embeds = self.patch_embedding(pixel_values.astype(target_dtype))
 
-        # Get positional resized and padded positional embeddings
         positional_embeddings = self.position_embedding.weight.reshape(
             self.position_embedding_size, self.position_embedding_size, -1
         )
@@ -223,7 +182,6 @@ class VisionEmbeddings(nn.Module):
             positional_embeddings, spatial_shapes, max_length=pixel_values.shape[1]
         )
 
-        # Add positional embeddings to patch embeddings
         embeddings = patch_embeds + resized_positional_embeddings
         return embeddings
 
@@ -250,24 +208,15 @@ class VisionModel(nn.Module):
         encoder_outputs = self.encoder(
             x=x, output_hidden_states=output_hidden_states, mask=None
         )
-        pooler_output = self.post_layernorm(encoder_outputs[0])
-        return pooler_output, x, encoder_outputs[-1]
+        last_hidden_state = self.post_layernorm(encoder_outputs[-1])
+        return encoder_outputs, x, last_hidden_state
 
     def sanitize(self, weights):
         sanitized_weights = {}
         for k, v in weights.items():
             if "position_ids" in k:
-                # Remove unused position_ids
+
                 continue
-            elif "patch_embedding.weight" in k:
-                # PyTorch conv2d weight tensors have shape:
-                #   [out_channels, in_channels, kH, KW]
-                # MLX conv2d expects the weight be of shape:
-                #   [out_channels, kH, KW, in_channels]
-                if check_array_shape(v):
-                    sanitized_weights[k] = v
-                else:
-                    sanitized_weights[k] = v.transpose(1, 0)
             else:
                 sanitized_weights[k] = v
 
