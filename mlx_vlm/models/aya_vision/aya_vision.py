@@ -23,10 +23,11 @@ class AyaVisionMultiModalProjector(nn.Module):
         self.alignment_intermediate_size = getattr(
             config, "alignment_intermediate_size", config.text_config.hidden_size
         )
-        self.layernorm = nn.LayerNorm(
-            config.vision_config.hidden_size * (config.downsample_factor**2),
-            eps=config.adapter_layer_norm_eps,
-        )
+        if config.model_type == "aya_vision":
+            self.layernorm = nn.LayerNorm(
+                config.vision_config.hidden_size * (config.downsample_factor**2),
+                eps=config.adapter_layer_norm_eps,
+            )
 
         self.linear_1 = nn.Linear(
             config.vision_config.hidden_size * (config.downsample_factor**2),
@@ -45,7 +46,8 @@ class AyaVisionMultiModalProjector(nn.Module):
 
     def __call__(self, image_features):
         image_features = self.pixel_shuffle(image_features)
-        image_features = self.layernorm(image_features)
+        if self.config.model_type == "aya_vision":
+            image_features = self.layernorm(image_features)
         hidden_states = self.linear_1(image_features)
 
         # Split along last dimension and apply SwiGLU
@@ -167,3 +169,19 @@ class Model(nn.Module):
             input_ids, cache=cache, inputs_embeds=input_embddings
         )
         return logits
+
+    def sanitize(self, weights):
+        def transform_key(key):
+            if "model.vision_tower" in key:
+                key = key.replace("model.vision_tower", "vision_tower")
+            if "model.multi_modal_projector" in key:
+                key = key.replace(
+                    "model.multi_modal_projector", "multi_modal_projector"
+                )
+            if "model.language_model" in key:
+                key = key.replace("model.language_model", "language_model.model")
+            if "lm_head" in key and not key.startswith("language_model"):
+                key = key.replace("lm_head", "language_model.lm_head")
+            return key
+
+        return {transform_key(k): v for k, v in weights.items()}
