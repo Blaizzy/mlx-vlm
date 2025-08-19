@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..kernels import grid_sample
 from .config import VisionConfig
 
 
@@ -51,7 +52,7 @@ def apply_rotary_pos_emb_vision(tensor, freqs) -> mx.array:
     return output.astype(orig_dtype)
 
 
-class VisionRotaryEmbedding(nn.Module):
+class Glm4vMoeVisionRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
         self.dim = dim
@@ -84,96 +85,73 @@ class Glm4vVisionEmbeddings(nn.Module):
         pos_embed_weight = self.position_embedding.weight
         hidden_size = pos_embed_weight.shape[1]
         total_seq = h_coords.shape[0]
-        device = pos_embed_weight.device
-
-        # Move coordinates to correct device
-        h_coords, w_coords = h_coords.to(device), w_coords.to(device)
 
         # Handle empty sequence case
         if total_seq == 0:
-            adapted_pos_embed = torch.empty(
-                0, hidden_size, device=device, dtype=pos_embed_weight.dtype
-            )
+            adapted_pos_embed = mx.empty(0, hidden_size, dtype=pos_embed_weight.dtype)
         else:
             # Convert inputs to tensors if needed
             if isinstance(lengths, list):
-                lengths = torch.tensor(lengths, device=device, dtype=torch.long)
-            if not isinstance(image_shapes, torch.Tensor):
-                image_shapes = torch.tensor(
-                    image_shapes, device=device, dtype=torch.long
-                )
+                lengths = mx.array(lengths, dtype=mx.int32)
+            if not isinstance(image_shapes, mx.array):
+                image_shapes = mx.array(image_shapes, dtype=mx.int32)
 
             # Prepare 2D position embedding
             orig_size_sq = pos_embed_weight.shape[0]
             orig_size = int(orig_size_sq**0.5)
             pos_embed_2d = (
-                pos_embed_weight.view(orig_size, orig_size, hidden_size)
-                .permute(2, 0, 1)
-                .unsqueeze(0)
-                .to(device=device, dtype=torch.float32)
+                pos_embed_weight.reshape(orig_size, orig_size, hidden_size)
+                .transpose(2, 0, 1)[None, ...]
+                .astype(mx.float32)
             )
 
             # Calculate target dimensions for each patch
-            target_h = torch.cat(
-                [image_shapes[i, 1].repeat(lengths[i]) for i in range(len(lengths))]
-            ).to(device=device, dtype=torch.float32)
-            target_w = torch.cat(
-                [image_shapes[i, 2].repeat(lengths[i]) for i in range(len(lengths))]
-            ).to(device=device, dtype=torch.float32)
+            target_h = mx.concatenate(
+                [mx.repeat(image_shapes[i, 1], lengths[i]) for i in range(len(lengths))]
+            ).astype(mx.float32)
+            target_w = mx.concatenate(
+                [mx.repeat(image_shapes[i, 2], lengths[i]) for i in range(len(lengths))]
+            ).astype(mx.float32)
 
             # Normalize coordinates to [-1, 1] range for grid_sample
-            h_coords = h_coords.to(device=device, dtype=torch.float32)
-            w_coords = w_coords.to(device=device, dtype=torch.float32)
+            h_coords = h_coords.astype(mx.float32)
+            w_coords = w_coords.astype(mx.float32)
             norm_w = ((w_coords + 0.5) / target_w) * 2 - 1
             norm_h = ((h_coords + 0.5) / target_h) * 2 - 1
 
             # Create sampling grid
-            grid = torch.stack((norm_w, norm_h), dim=-1).unsqueeze(0).unsqueeze(2)
+            grid = mx.stack((norm_w, norm_h), axis=-1)[None, :, None, ...]
 
             # Perform bicubic interpolation
-            interpolated_embed_fp32 = F.grid_sample(
-                pos_embed_2d,
+            interpolated_embed_fp32 = grid_sample(
+                pos_embed_2d.transpose(0, 2, 3, 1),
                 grid,
-                mode="bicubic",
-                align_corners=False,
-                padding_mode="border",
             )
 
             # Reshape and convert back to original dtype
-            adapted_pos_embed_fp32 = (
-                interpolated_embed_fp32.squeeze(0).squeeze(-1).permute(1, 0)
-            )
-            adapted_pos_embed = adapted_pos_embed_fp32.to(pos_embed_weight.dtype).to(
-                embeddings.device
-            )
+            adapted_pos_embed_fp32 = interpolated_embed_fp32.squeeze(0).squeeze(1)
+            adapted_pos_embed = adapted_pos_embed_fp32.astype(pos_embed_weight.dtype)
 
         # Add adapted position encoding to embeddings
         embeddings = embeddings + adapted_pos_embed
         return embeddings
 
 
-class PatchEmbed(nn.Module):
-    def __init__(
-        self,
-        patch_size: int = 14,
-        temporal_patch_size: int = 2,
-        in_channels: int = 3,
-        hidden_size: int = 1152,
-        bias: bool = False,
-    ) -> None:
+class Glm4vMoeVisionPatchEmbed(nn.Module):
+    def __init__(self, config: VisionConfig) -> None:
         super().__init__()
-        self.patch_size = patch_size
-        self.temporal_patch_size = temporal_patch_size
-        self.in_channels = in_channels
-        self.hidden_size = hidden_size
+        self.config = config
+        self.patch_size = config.patch_size
+        self.temporal_patch_size = config.temporal_patch_size
+        self.in_channels = config.in_channels
+        self.embed_dim = config.hidden_size
 
-        kernel_size = [temporal_patch_size, patch_size, patch_size]
+        kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
         self.proj = nn.Conv3d(
-            in_channels,
-            hidden_size,
+            self.in_channels,
+            self.embed_dim,
             kernel_size=kernel_size,
             stride=kernel_size,
-            bias=bias,
         )
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
@@ -186,11 +164,11 @@ class PatchEmbed(nn.Module):
         ).moveaxis(1, 4)
 
         hidden_states = self.proj(hidden_states)
-        hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        hidden_states = hidden_states.reshape(-1, self.embed_dim)
         return hidden_states
 
 
-class PatchMerger(nn.Module):
+class Glm4vMoeVisionPatchMerger(nn.Module):
     def __init__(self, dim: int, context_dim: int, bias: bool = False) -> None:
         super().__init__()
 
@@ -202,13 +180,11 @@ class PatchMerger(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.proj(x)
-        hidden_state = nn.gelu(self.post_projection_norm(hidden_state))
-        return self.down_proj(
-            nn.silu(self.gate_proj(hidden_state)) * self.up_proj(hidden_state)
-        )
+        x = nn.gelu(self.post_projection_norm(x))
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Attention(nn.Module):
+class Glm4vMoeVisionAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int = 16) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -228,6 +204,7 @@ class Attention(nn.Module):
 
         q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
         k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
+
         attention_mask = mx.full(
             (1, seq_length, seq_length), mx.finfo(q.dtype).min, dtype=q.dtype
         )
@@ -260,13 +237,15 @@ class MLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Qwen2VLVisionBlock(nn.Module):
+class Glm4vMoeVisionBlock(nn.Module):
     def __init__(self, config: VisionConfig) -> None:
         super().__init__()
         self.norm1 = nn.RMSNorm(config.hidden_size, eps=1e-6)
         self.norm2 = nn.RMSNorm(config.hidden_size, eps=1e-6)
 
-        self.attn = Attention(dim=config.hidden_size, num_heads=config.num_heads)
+        self.attn = Glm4vMoeVisionAttention(
+            dim=config.hidden_size, num_heads=config.num_heads
+        )
         self.mlp = MLP(dim=config.hidden_size, hidden_dim=config.out_hidden_size)
 
     def __call__(self, hidden_states, cu_seqlens, rotary_pos_emb) -> mx.array:
@@ -290,23 +269,19 @@ class VisionModel(nn.Module):
         self.spatial_merge_size = config.spatial_merge_size
 
         self.embeddings = Glm4vVisionEmbeddings(config)
-        self.patch_embed = PatchEmbed(
-            patch_size=config.patch_size,
-            temporal_patch_size=config.temporal_patch_size,
-            in_channels=config.in_channels,
-            hidden_size=config.hidden_size,
-            bias=True,
+        self.patch_embed = Glm4vMoeVisionPatchEmbed(
+            config=config,
         )
 
         self.window_size = config.window_size
         self.patch_size = config.patch_size
         self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
-        # self.fullatt_block_indexes = config.fullatt_block_indexes
-        head_dim = config.hidden_size // config.num_heads
-        self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)
 
-        self.blocks = [Qwen2VLVisionBlock(config) for _ in range(config.depth)]
-        self.merger = PatchMerger(
+        head_dim = config.hidden_size // config.num_heads
+        self.rotary_pos_emb = Glm4vMoeVisionRotaryEmbedding(head_dim // 2)
+
+        self.blocks = [Glm4vMoeVisionBlock(config) for _ in range(config.depth)]
+        self.merger = Glm4vMoeVisionPatchMerger(
             dim=config.out_hidden_size, context_dim=config.intermediate_size
         )
 
@@ -355,74 +330,7 @@ class VisionModel(nn.Module):
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
         rotary_pos_emb = rotary_pos_emb_full[pos_ids]
 
-        return rotary_pos_emb.reshape(pos_ids.shape[0], -1)
-
-    def get_window_index(self, grid_thw):
-        window_index = []
-        cu_window_seqlens = [0]
-        window_index_id = 0
-        vit_merger_window_size = (
-            self.window_size // self.spatial_merge_size // self.patch_size
-        )
-
-        for grid_t, grid_h, grid_w in grid_thw.tolist():
-            llm_grid_h = grid_h // self.spatial_merge_size
-            llm_grid_w = grid_w // self.spatial_merge_size
-
-            index = mx.arange(grid_t * llm_grid_h * llm_grid_w).reshape(
-                grid_t, llm_grid_h, llm_grid_w
-            )
-
-            pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
-            pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size
-            num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
-            num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
-
-            # Replace F.pad with np.pad
-            index_padded = mx.pad(
-                index,
-                ((0, 0), (0, pad_h), (0, pad_w)),
-                mode="constant",
-                constant_values=-100,
-            )
-
-            index_padded = index_padded.reshape(
-                grid_t,
-                num_windows_h,
-                vit_merger_window_size,
-                num_windows_w,
-                vit_merger_window_size,
-            )
-
-            # Replace permute with np.transpose
-            index_padded = mx.transpose(index_padded, (0, 1, 3, 2, 4)).reshape(
-                grid_t,
-                num_windows_h * num_windows_w,
-                vit_merger_window_size,
-                vit_merger_window_size,
-            )
-
-            # Replace torch operations with numpy
-            seqlens = mx.sum(index_padded != -100, axis=(2, 3)).reshape(-1)
-            index_padded = index_padded.reshape(-1)
-            index = np.where(index_padded != -100)[
-                0
-            ].tolist()  # [i for i, x in enumerate(index_padded) if x != -100]
-            index_new = index_padded[index]
-
-            window_index.append(index_new + window_index_id)
-            cu_seqlens_tmp = (
-                mx.cumsum(seqlens, axis=0) * self.spatial_merge_unit
-                + cu_window_seqlens[-1]
-            )
-            cu_window_seqlens.extend(cu_seqlens_tmp.tolist())
-            window_index_id += int(grid_t * llm_grid_h * llm_grid_w)
-
-        # Replace torch.cat with np.concatenate
-        window_index = mx.concatenate(window_index, axis=0)
-        cu_window_seqlens = mx.array(cu_window_seqlens)
-
-        return window_index, cu_window_seqlens
+        return rotary_pos_emb.reshape(pos_ids.shape[0], -1), pos_ids
 
     def __call__(
         self,
@@ -432,63 +340,44 @@ class VisionModel(nn.Module):
     ) -> mx.array:
 
         hidden_states = self.patch_embed(hidden_states)
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
-        window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+        hidden_states = self.post_conv_layernorm(hidden_states)
+        rotary_pos_emb, image_type_ids = self.rot_pos_emb(grid_thw)
 
-        # Get indices of first occurrence of each unique value
-        seen = set()
-        idx = []
-        for i, x in enumerate(cu_window_seqlens):
-            if x not in seen:
-                seen.add(x)
-                idx.append(i)
+        seq_lens = grid_thw[:, 1] * grid_thw[:, 2]
+        repeats = grid_thw[:, 0]
+        repeated_values = []
+        for i, (seq_len, repeat_count) in enumerate(
+            zip(seq_lens.tolist(), repeats.tolist())
+        ):
+            repeated_values.extend([seq_len] * repeat_count)
 
-        idx = mx.array(idx, dtype=mx.int32)
-        cu_window_seqlens = cu_window_seqlens[idx]
-
-        seq_len, _ = hidden_states.shape
-        hidden_states = hidden_states.reshape(
-            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
+        cu_seqlens = mx.array(repeated_values).cumsum(axis=0)
+        cu_seqlens = mx.pad(cu_seqlens, (1, 0), constant_values=0)
+        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        hidden_states = self.embeddings(
+            hidden_states, seqlens, grid_thw, image_type_ids[:, 0], image_type_ids[:, 1]
         )
-        hidden_states = hidden_states[window_index, :, :]
-        hidden_states = hidden_states.reshape(seq_len, -1)
-        rotary_pos_emb = rotary_pos_emb.reshape(
-            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
-        )
-        rotary_pos_emb = rotary_pos_emb[window_index, :, :]
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
 
-        # Assuming grid_thw has shape (batch_size, 3)
-        batch_size = grid_thw.shape[0]
-
-        # Calculate cu_seqlens for each item in the batch
-        cu_seqlens = []
-        for i in range(batch_size):
-            seq_len = grid_thw[i, 1] * grid_thw[i, 2]
-            cu_seqlens.append(mx.repeat(seq_len, grid_thw[i, 0]))
-
-        # Concatenate the cu_seqlens for all items in the batch
-        cu_seqlens = mx.concatenate(cu_seqlens)
-
-        cu_seqlens = mx.cumsum(cu_seqlens.astype(mx.int32), axis=0)
-        cu_seqlens = mx.pad(cu_seqlens, (1, 0), mode="constant", constant_values=0)
-
-        encoder_states = (hidden_states,) if output_hidden_states else None
-
-        for layer_num, blk in enumerate(self.blocks):
-
-            cu_seqlens_now = cu_window_seqlens
-
+        for blk in self.blocks:
             hidden_states = blk(
-                hidden_states, cu_seqlens=cu_seqlens_now, rotary_pos_emb=rotary_pos_emb
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb=rotary_pos_emb,
             )
 
-            if output_hidden_states:
-                encoder_states = encoder_states + (hidden_states,)
+        hidden_states = self.post_layernorm(hidden_states)
+
+        hidden_states = hidden_states.reshape(
+            -1,
+            self.spatial_merge_size,
+            self.spatial_merge_size,
+            hidden_states.shape[-1],
+        )
+        hidden_states = self.downsample(hidden_states).reshape(
+            -1, self.config.out_hidden_size
+        )
 
         hidden_states = self.merger(hidden_states)
-        reverse_indices = mx.argsort(window_index, axis=0)
-        hidden_states = hidden_states[reverse_indices, :]
         return hidden_states
 
     def sanitize(self, weights):
