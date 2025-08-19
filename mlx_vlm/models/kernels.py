@@ -135,6 +135,25 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
     input_dtype = x.dtype
     if input_dtype != mx.float32:
         x_flat = x_flat.astype(mx.float32)
+    
+    header= """
+        // Improved cubic kernel function for better continuity
+        float cubic_kernel(float x) {
+            float absx = fabs(x);
+            float absx2 = absx * absx;
+            float absx3 = absx2 * absx;
+
+            // Use a=-0.5 for smoother interpolation
+            const float a = -0.5f;
+
+            if (absx <= 1.0f) {
+                return (a+2.0f)*absx3 - (a+3.0f)*absx2 + 1.0f;
+            } else if (absx < 2.0f) {
+                return a*absx3 - 5.0f*a*absx2 + 8.0f*a*absx - 4.0f*a;
+            }
+            return 0.0f;
+        };
+    """
 
     # Metal kernel source code
     source = """
@@ -182,23 +201,6 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
         float x_frac = x_in - x0;
         float y_frac = y_in - y0;
 
-        // Improved cubic kernel function for better continuity
-        auto cubic_kernel = [](float x) -> float {
-            float absx = fabs(x);
-            float absx2 = absx * absx;
-            float absx3 = absx2 * absx;
-
-            // Use a=-0.5 for smoother interpolation
-            const float a = -0.5f;
-
-            if (absx <= 1.0f) {
-                return (a+2.0f)*absx3 - (a+3.0f)*absx2 + 1.0f;
-            } else if (absx < 2.0f) {
-                return a*absx3 - 5.0f*a*absx2 + 8.0f*a*absx - 4.0f*a;
-            }
-            return 0.0f;
-        };
-
         // Perform bicubic interpolation with improved boundary handling
         float result = 0.0f;
         float weight_sum = 0.0f;  // Track weight sum for normalization
@@ -243,6 +245,7 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
         input_names=["input", "dims", "params"],
         output_names=["output"],
         source=source,
+        header=header,
     )
 
     # Run the kernel
