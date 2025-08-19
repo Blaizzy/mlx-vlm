@@ -134,6 +134,7 @@ class Model(nn.Module):
         spatial_shapes: Optional[mx.array] = None,
         pixel_attention_mask: Optional[mx.array] = None,
     ):
+
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         if pixel_values is None:
