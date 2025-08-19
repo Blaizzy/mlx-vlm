@@ -53,7 +53,7 @@ def _compute_default_rope_parameters(
     return inv_freq, attention_factor
 
 
-class Qwen2RotaryEmbedding(nn.Module):
+class GLM4VRotaryEmbedding(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
 
@@ -140,7 +140,7 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
     return q_embed, k_embed
 
 
-class Attention(nn.Module):
+class Glm4vMoeAttention(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
 
@@ -157,8 +157,6 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
         self.rope_scaling = args.rope_scaling
-
-        print(self.rope_scaling)
 
     def __call__(
         self,
@@ -197,7 +195,7 @@ class Attention(nn.Module):
         return self.o_proj(output)
 
 
-class MLP(nn.Module):
+class Glm4vMoeMLP(nn.Module):
     def __init__(
         self, config: TextConfig, hidden_size: int = None, intermediate_size: int = None
     ):
@@ -293,7 +291,7 @@ class MoE(nn.Module):
         self.gate = MoEGate(config)
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = MLP(
+            self.shared_experts = Glm4vMoeMLP(
                 config=config, intermediate_size=intermediate_size
             )
 
@@ -307,17 +305,17 @@ class MoE(nn.Module):
         return y
 
 
-class DecoderLayer(nn.Module):
+class Glm4vMoeDecoderLayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
-        self.self_attn = Attention(config)
+        self.self_attn = Glm4vMoeAttention(config)
         self.mlp = (
             MoE(config)
             if (
                 config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
             )
-            else MLP(config)
+            else Glm4vMoeMLP(config)
         )
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
@@ -344,7 +342,7 @@ class GLM4VModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
-            DecoderLayer(config, idx) for idx in range(config.num_hidden_layers)
+            Glm4vMoeDecoderLayer(config, idx) for idx in range(config.num_hidden_layers)
         ]
         self.start_idx = 0
         self.end_idx = len(self.layers)
@@ -352,7 +350,7 @@ class GLM4VModel(nn.Module):
 
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.rotary_emb = Qwen2RotaryEmbedding(config)
+        self.rotary_emb = GLM4VRotaryEmbedding(config)
 
     def __call__(
         self,

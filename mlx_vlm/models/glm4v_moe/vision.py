@@ -2,7 +2,6 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..kernels import grid_sample
 from .config import VisionConfig
@@ -226,7 +225,7 @@ class Glm4vMoeVisionAttention(nn.Module):
         return self.proj(output)
 
 
-class MLP(nn.Module):
+class Glm4vMoeVisionMLP(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
@@ -246,7 +245,9 @@ class Glm4vMoeVisionBlock(nn.Module):
         self.attn = Glm4vMoeVisionAttention(
             dim=config.hidden_size, num_heads=config.num_heads
         )
-        self.mlp = MLP(dim=config.hidden_size, hidden_dim=config.out_hidden_size)
+        self.mlp = Glm4vMoeVisionMLP(
+            dim=config.hidden_size, hidden_dim=config.out_hidden_size
+        )
 
     def __call__(self, hidden_states, cu_seqlens, rotary_pos_emb) -> mx.array:
         hidden_states = hidden_states + self.attn(
