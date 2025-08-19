@@ -88,6 +88,26 @@ def masked_scatter(
     return final_embedding
 
 
+def merge_input_ids_with_image_features(
+    image_features, inputs_embeds, input_ids, image_token_index
+):
+    special_image_mask = input_ids == image_token_index
+    n_image_tokens = special_image_mask.sum()
+    special_image_mask = special_image_mask[..., None]
+    special_image_mask = mx.broadcast_to(special_image_mask, inputs_embeds.shape)
+
+    n_image_features = image_features.shape[0]
+    n_image_mask_elements = special_image_mask.sum()
+    if n_image_mask_elements != image_features.size:
+        raise ValueError(
+            f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+        )
+
+    inputs_embeds = masked_scatter(inputs_embeds, special_image_mask, image_features)
+
+    return inputs_embeds
+
+
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -114,7 +134,6 @@ class Model(nn.Module):
         spatial_shapes: Optional[mx.array] = None,
         pixel_attention_mask: Optional[mx.array] = None,
     ):
-
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         if pixel_values is None:
@@ -144,32 +163,10 @@ class Model(nn.Module):
 
         image_features = mx.concatenate(image_features, axis=0)
 
-        final_inputs_embeds = self._merge_input_ids_with_image_features(
-            image_features, inputs_embeds, input_ids
+        final_inputs_embeds = merge_input_ids_with_image_features(
+            image_features, inputs_embeds, input_ids, self.config.image_token_index
         )
         return final_inputs_embeds
-
-    def _merge_input_ids_with_image_features(
-        self, image_features, inputs_embeds, input_ids
-    ):
-
-        special_image_mask = input_ids == self.config.image_token_index
-        n_image_tokens = special_image_mask.sum()
-        special_image_mask = special_image_mask[..., None]
-        special_image_mask = mx.broadcast_to(special_image_mask, inputs_embeds.shape)
-
-        n_image_features = image_features.shape[0]
-        n_image_mask_elements = special_image_mask.sum()
-        if n_image_mask_elements != image_features.size:
-            raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
-            )
-
-        inputs_embeds = masked_scatter(
-            inputs_embeds, special_image_mask, image_features
-        )
-
-        return inputs_embeds
 
     @property
     def layers(self):
