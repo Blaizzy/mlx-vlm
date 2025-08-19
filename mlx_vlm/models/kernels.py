@@ -135,8 +135,8 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
     input_dtype = x.dtype
     if input_dtype != mx.float32:
         x_flat = x_flat.astype(mx.float32)
-    
-    header= """
+
+    header = """
         // Improved cubic kernel function for better continuity
         float cubic_kernel(float x) {
             float absx = fabs(x);
