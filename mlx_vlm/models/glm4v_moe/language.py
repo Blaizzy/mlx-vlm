@@ -54,7 +54,7 @@ def _compute_default_rope_parameters(
 
 
 class Qwen2RotaryEmbedding(nn.Module):
-    def __init__(self, config: TextConfig, device=None):
+    def __init__(self, config: TextConfig):
         super().__init__()
 
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
@@ -157,6 +157,8 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
         self.rope_scaling = args.rope_scaling
+
+        print(self.rope_scaling)
 
     def __call__(
         self,
@@ -393,6 +395,7 @@ class LanguageModel(nn.Module):
         self.model_type = args.model_type
         self.model = GLM4VModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.rope_deltas = None
 
     def get_rope_index(
         self,
