@@ -144,16 +144,16 @@ class Model(nn.Module):
 
         image_features = mx.concatenate(image_features, axis=0)
 
-        final_inputs_embeds = self._merge_input_ids_with_image_features(
-            image_features, inputs_embeds, input_ids
+        final_inputs_embeds = self.merge_input_ids_with_image_features(
+            image_features, inputs_embeds, input_ids, self.config.image_token_index
         )
         return final_inputs_embeds
 
-    def _merge_input_ids_with_image_features(
-        self, image_features, inputs_embeds, input_ids
+    @staticmethod
+    def merge_input_ids_with_image_features(
+        image_features, inputs_embeds, input_ids, image_token_index
     ):
-
-        special_image_mask = input_ids == self.config.image_token_index
+        special_image_mask = input_ids == image_token_index
         n_image_tokens = special_image_mask.sum()
         special_image_mask = special_image_mask[..., None]
         special_image_mask = mx.broadcast_to(special_image_mask, inputs_embeds.shape)
