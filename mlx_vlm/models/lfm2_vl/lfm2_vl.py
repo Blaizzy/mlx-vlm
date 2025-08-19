@@ -88,26 +88,6 @@ def masked_scatter(
     return final_embedding
 
 
-def merge_input_ids_with_image_features(
-    image_features, inputs_embeds, input_ids, image_token_index
-):
-    special_image_mask = input_ids == image_token_index
-    n_image_tokens = special_image_mask.sum()
-    special_image_mask = special_image_mask[..., None]
-    special_image_mask = mx.broadcast_to(special_image_mask, inputs_embeds.shape)
-
-    n_image_features = image_features.shape[0]
-    n_image_mask_elements = special_image_mask.sum()
-    if n_image_mask_elements != image_features.size:
-        raise ValueError(
-            f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
-        )
-
-    inputs_embeds = masked_scatter(inputs_embeds, special_image_mask, image_features)
-
-    return inputs_embeds
-
-
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -164,10 +144,32 @@ class Model(nn.Module):
 
         image_features = mx.concatenate(image_features, axis=0)
 
-        final_inputs_embeds = merge_input_ids_with_image_features(
+        final_inputs_embeds = self.merge_input_ids_with_image_features(
             image_features, inputs_embeds, input_ids, self.config.image_token_index
         )
         return final_inputs_embeds
+
+    @staticmethod
+    def merge_input_ids_with_image_features(
+        image_features, inputs_embeds, input_ids, image_token_index
+    ):
+        special_image_mask = input_ids == image_token_index
+        n_image_tokens = special_image_mask.sum()
+        special_image_mask = special_image_mask[..., None]
+        special_image_mask = mx.broadcast_to(special_image_mask, inputs_embeds.shape)
+
+        n_image_features = image_features.shape[0]
+        n_image_mask_elements = special_image_mask.sum()
+        if n_image_mask_elements != image_features.size:
+            raise ValueError(
+                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+            )
+
+        inputs_embeds = masked_scatter(
+            inputs_embeds, special_image_mask, image_features
+        )
+
+        return inputs_embeds
 
     @property
     def layers(self):
