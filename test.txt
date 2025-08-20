@@ -1,0 +1,7 @@
+python -m mlx_vlm.lora \
+--model-path mlx-community/Qwen2-VL-2B-Instruct-bf16 \
+--dataset  \
+--output-path  \
+--batch-size 1 \
+--steps 20 \
+--learning-rate 1e-4
