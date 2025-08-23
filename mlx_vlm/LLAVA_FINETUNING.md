@@ -2,8 +2,6 @@
 
 This guide walks through fine-tuning **LLaVA 1.5** using LoRA with `mlx_vlm`.
 
----
-
 ## Project Directory Structure
 ```
 project-directory/
@@ -26,8 +24,6 @@ project-directory/
 - Place JSONL files for train/test/validation splits in `split_dataset/`.
 - Run training commands from the project root directory.
 - After training, create `trained_adapter/` and move your resulting artifacts there for clarity and future use.
-
----
 
 ## Dataset Format
 
