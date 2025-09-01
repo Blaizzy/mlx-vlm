@@ -653,3 +653,7 @@ class LanguageModel(nn.Module):
             return "e_score_correction_bias" not in k
 
         return predicate
+
+    @property
+    def n_kv_heads(self):
+        return self.args.num_key_value_heads
