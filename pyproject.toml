@@ -7,7 +7,7 @@ name = "mlx-vlm"
 dynamic = ["version", "dependencies"]
 description = "MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "Prince Canuma", email = "prince.gdt@gmail.com"},
