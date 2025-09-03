@@ -32,7 +32,12 @@ from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
 
 # Constants
-MODEL_REMAPPING = {"llava-qwen2": "llava_bunny", "bunny-llama": "llava_bunny"}
+MODEL_REMAPPING = {
+    "llava-qwen2": "llava_bunny",
+    "bunny-llama": "llava_bunny",
+    "lfm2-vl": "lfm2_vl",
+    "cohere2_vision": "aya_vision",
+}
 
 MAX_FILE_SIZE_GB = 5
 
@@ -69,6 +74,7 @@ def get_model_and_args(config: dict):
     """
     model_type = config["model_type"]
     model_type = MODEL_REMAPPING.get(model_type, model_type)
+
     try:
         arch = importlib.import_module(f"mlx_vlm.models.{model_type}")
     except ImportError:

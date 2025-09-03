@@ -35,8 +35,8 @@ jobs:
           git checkout -B "${{ github.head_ref }}" "origin/${{ github.head_ref }}"
           git pull origin "${{ github.head_ref }}"
         else
-          git checkout -B "${{ github.ref_name }}" "origin/${{ github.ref_name }}"
-          git pull origin "${{ github.ref_name }}"
+          # For release events, ref_name is the tag name
+          git checkout "${{ github.ref_name }}"
         fi
 
         echo "Running update script..."

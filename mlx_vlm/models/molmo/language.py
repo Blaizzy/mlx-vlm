@@ -151,6 +151,10 @@ class Molmo(nn.Module):
 
         if mask is None:
             mask = create_attention_mask(h, cache)
+        else:
+            seq_len = h.shape[-2]
+            causal_mask = mx.tril(mx.ones((seq_len, seq_len), dtype=mx.bool_))
+            mask = (mask & causal_mask) > 0
 
         for block, c in zip(self.blocks, cache):
             h = block(h, mask, c)

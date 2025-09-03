@@ -98,8 +98,8 @@ class DeepseekV3YarnRotaryEmbedding(nn.Module):
 
 # A clipped silu to prevent fp16 from overflowing
 @partial(mx.compile, shapeless=True)
-def clipped_silu(x):
-    return mx.clip(x * mx.sigmoid(x), a_min=-100, a_max=100)
+def clipped_silu(x, gate):
+    return mx.clip(gate * mx.sigmoid(gate), a_min=-100, a_max=100) * x
 
 
 class DeepseekV3Attention(nn.Module):
