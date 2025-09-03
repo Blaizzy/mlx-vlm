@@ -94,9 +94,9 @@ class GLM4VRotaryEmbedding(nn.Module):
 
 def rotate_half_llm(x):
     """Rotates half the hidden dims of the input."""
-    x1 = x[..., 0::2]
-    x2 = x[..., 1::2]
-    return mx.flatten(mx.stack([-x2, x1], axis=-1), start_axis=-2)
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return mx.concatenate([-x2, x1], axis=-1)
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
@@ -653,3 +653,7 @@ class LanguageModel(nn.Module):
             return "e_score_correction_bias" not in k
 
         return predicate
+
+    @property
+    def n_kv_heads(self):
+        return self.args.num_key_value_heads
