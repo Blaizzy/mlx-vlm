@@ -1,14 +1,12 @@
-import copy
 import glob
 import importlib
 import inspect
 import json
 import logging
-import shutil
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -16,8 +14,7 @@ import numpy as np
 import requests
 import soundfile as sf
 from huggingface_hub import snapshot_download
-from mlx.utils import tree_flatten, tree_map_with_path, tree_reduce, tree_unflatten
-from mlx_lm.utils import quantize_model
+from mlx.utils import tree_flatten
 from PIL import Image, ImageOps
 from transformers import (
     AutoConfig,
