@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-vlm"
+dynamic = ["version", "dependencies"]
+description = "MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Prince Canuma", email = "prince.gdt@gmail.com"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/Blaizzy/mlx-vlm"
+Repository = "https://github.com/Blaizzy/mlx-vlm"
+Issues = "https://github.com/Blaizzy/mlx-vlm/issues"
+
+[project.scripts]
+"mlx_vlm.convert" = "mlx_vlm.convert:main"
+"mlx_vlm.generate" = "mlx_vlm.generate:main"
+"mlx_vlm.server" = "mlx_vlm.server:main"
+
+[tool.setuptools.packages.find]
+include = ["mlx_vlm*"]
+exclude = ["mlx_vlm.tests*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "mlx_vlm.version.__version__"}
+dependencies = {file = ["requirements.txt"]}
+
+[project.optional-dependencies]
+ui = ["gradio>=5.19.0"]
+audio = ["mlx-audio"]
+torch = ["torch", "torchvision", "einops", "blobfile", "tiktoken"]
+

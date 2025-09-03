@@ -1,6 +1,5 @@
 import copy
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Type, Union
+from typing import Optional, Tuple, Type
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -8,18 +7,7 @@ import numpy as np
 from PIL import Image
 from PIL.Image import Resampling
 
-
-@dataclass
-class SAMViTCfg:
-    image_size: Union[Tuple[int, int], int] = 1024
-    width: int = 768
-    layers: int = 12
-    heads: int = 12
-    patch_size: int = 16
-    window_size: int = 14
-    prompt_embed_dim: int = 256
-    global_attn_indexes: Union[List[int], Tuple[int]] = (2, 5, 8, 11)
-    downsample_channels: Union[List[int], Tuple[int]] = (512, 1024)
+from .config import SAMViTCfg
 
 
 class MLPBlock(nn.Module):

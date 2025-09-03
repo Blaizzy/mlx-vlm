@@ -5,38 +5,13 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput, create_attention_mask
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from ..cache import KVCache, RotatingKVCache
-
-
-@dataclass
-class TextConfig:
-    model_type: str
-    hidden_size: int = 8192
-    head_dim: int = 128
-    num_hidden_layers: int = 40
-    intermediate_size: int = 14336
-    num_attention_heads: int = 64
-    num_key_value_heads: int = 8
-    rope_theta: float = 50000.0
-    vocab_size: int = 256000
-    layer_norm_eps: float = 1e-05
-    logit_scale: float = 0.0625
-    attention_bias: bool = False
-    layer_norm_bias: bool = False
-    sliding_window: int = 4096
-    sliding_window_pattern: int = 4
-    max_position_embeddings: int = 4096
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import TextConfig
 
 
 class Attention(nn.Module):
@@ -98,8 +73,8 @@ class Attention(nn.Module):
             if mask.shape[-1] != key_len:
                 mask = mask[..., -key_len:]
 
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache, scale=self.scale, mask=mask
         )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)

@@ -63,7 +63,7 @@ def main():
             {
                 "role": "system",
                 "content": [
-                    {"type": "text", "text": args.video},
+                    {"type": "text", "text": args.system},
                 ],
             },
         )

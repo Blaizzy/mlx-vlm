@@ -60,8 +60,10 @@ class Dataset:
 
         item = self.dataset[idx]
 
-        images = item["images"]
-        conversations = item["messages"]
+        images = item.get("images", item.get("image", None))
+        conversations = item.get("messages", item.get("conversations"))
+        if images in (None, "", []):
+            images = []
         prompts = []
 
         if isinstance(conversations, list) and isinstance(conversations[0], list):

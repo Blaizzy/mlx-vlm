@@ -1,5 +1,4 @@
 import inspect
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -7,60 +6,13 @@ import mlx.nn as nn
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
 
-from ..base import LanguageModelOutput, create_attention_mask
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from ..cache import ChunkedKVCache, KVCache
-
-
-@dataclass
-class TextConfig:
-    model_type: str
-    hidden_size: int
-    intermediate_size: int
-    num_attention_heads: int
-    rms_norm_eps: float
-    vocab_size: int
-    num_key_value_heads: int
-    rope_theta: float = 500000.0
-    num_hidden_layers: int = 48
-    rope_traditional: bool = False
-    rope_scaling: Optional[dict] = None  # Add missing rope_scaling attribute
-    tie_word_embeddings: bool = False
-    head_dim: int = 128
-    hidden_act: str = "silu"
-    intermediate_size_mlp: int = 16384
-    max_position_embeddings: int = 10485760
-    num_experts_per_tok: int = 1
-    num_local_experts: int = 16
-    attention_dropout: float = 0.0
-    use_qk_norm: bool = True
-    bos_token_id: int = 200000
-    eos_token_id: list = None
-    pad_token_id: int = 200018
-    attention_chunk_size: int = 8192
-    attention_bias: bool = False
-    interleave_moe_layer_step: int = 1
-    no_rope_layers: list = 4
-    output_router_logits: bool = False
-    router_aux_loss_coef: float = 0.001
-    router_jitter_noise: float = 0.0
-    attn_temperature_tuning: int = 4
-    floor_scale: float = 8192
-    attn_scale: float = 0.1
-    moe_layers: list = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
+from .config import TextConfig
 
 
 class Attention(nn.Module):
@@ -147,8 +99,8 @@ class Attention(nn.Module):
             if mask.shape[-1] != key_len:
                 mask = mask[..., -key_len:]
 
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)

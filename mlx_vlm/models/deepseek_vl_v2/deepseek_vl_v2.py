@@ -15,65 +15,13 @@ from transformers import AutoProcessor
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 from transformers.image_utils import to_numpy_array
 
-from ..base import expand2square
+from ..base import BaseModelConfig, expand2square
+from .config import ModelConfig, ProjectorConfig, TextConfig, VisionConfig
 from .language import LanguageModel, TextConfig
 from .processing_deepsek_vl_v2 import DeepseekVLV2Processor
 from .vision import VisionConfig, VisionModel
 
 AutoProcessor.register("deepseek_vl_v2", DeepseekVLV2Processor)
-
-
-@dataclass
-class ProjectorConfig:
-    projector_type: str = "downsample_mlp_gelu"
-    input_dim: int = 1152
-    n_embed: int = 2048
-    depth: int = 2
-    mlp_ratio: int = 1
-    downsample_ratio: int = 2
-    token_pooling: bool = False
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
-
-@dataclass
-class ModelConfig:
-    text_config: TextConfig
-    vision_config: VisionConfig
-    projector_config: ProjectorConfig
-    model_type: str
-    ignore_index: int = -100
-    image_token_index: int = 100015
-    vision_feature_select_strategy: str = "default"
-    select_layer: int = -1
-    pad_id: int = 100001
-    num_image_tokens: int = 576
-    vocab_size: int = 32000
-    tile_tag: str = "2D"
-    global_view_pos: str = "head"
-    eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        if "language_config" in params:
-            params["text_config"] = params["language_config"]
-            del params["language_config"]
-
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 class MlpProjector(nn.Module):
@@ -432,6 +380,10 @@ class Model(nn.Module):
 
         return image_features
 
+    @property
+    def layers(self):
+        return self.language_model.model.layers
+
     def __call__(
         self,
         input_ids: mx.array,
@@ -450,49 +402,6 @@ class Model(nn.Module):
             input_ids, cache=cache, inputs_embeds=input_embeddings
         )
         return logits
-
-    @staticmethod
-    def from_pretrained(path_or_hf_repo: str):
-        path = Path(path_or_hf_repo)
-        if not path.exists():
-            path = Path(
-                snapshot_download(
-                    repo_id=path_or_hf_repo,
-                    allow_patterns=[
-                        "*.json",
-                        "*.safetensors",
-                        "*.py",
-                        "tokenizer.model",
-                        "*.tiktoken",
-                    ],
-                )
-            )
-
-        with open(path / "config.json", "r") as f:
-            model_config = json.load(f)
-
-        model_config = ModelConfig.from_dict(model_config)
-
-        model_config.vision_config = VisionConfig.from_dict(model_config.vision_config)
-        model_config.projector_config = ProjectorConfig.from_dict(
-            model_config.projector_config
-        )
-        model_config.text_config = TextConfig.from_dict(model_config.text_config)
-
-        model = Model(model_config)
-        weight_files = glob.glob(str(path / "*.safetensors"))
-        if not weight_files:
-            raise FileNotFoundError(f"No safetensors found in {path}")
-
-        weights = {}
-        for wf in weight_files:
-            weights.update(mx.load(wf))
-
-        weights = VisionModel.sanitize(weights)
-        weights = LanguageModel.sanitize(weights)
-
-        model.load_weights(list(weights.items()))
-        return model
 
     @staticmethod
     def sanitize(weights):

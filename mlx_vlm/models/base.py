@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import create_attention_mask
+from mlx_lm.models.base import create_attention_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import RotatingKVCache
 from PIL import Image
 from transformers.image_processing_utils import BaseImageProcessor as ImageProcessor
@@ -21,18 +21,17 @@ class LanguageModelOutput:
     encoder_outputs: Optional[List[mx.array]] = None
 
 
-def expand2square(pil_img, background_color):
-    width, height = pil_img.size
-    if width == height:
-        return pil_img
-    elif width > height:
-        result = Image.new(pil_img.mode, (width, width), background_color)
-        result.paste(pil_img, (0, (width - height) // 2))
-        return result
-    else:
-        result = Image.new(pil_img.mode, (height, height), background_color)
-        result.paste(pil_img, ((height - width) // 2, 0))
-        return result
+@dataclass
+class BaseModelConfig:
+    @classmethod
+    def from_dict(cls, params):
+        return cls(
+            **{
+                k: v
+                for k, v in params.items()
+                if k in inspect.signature(cls).parameters
+            }
+        )
 
 
 @dataclass
@@ -79,28 +78,41 @@ class BaseImageProcessor(ImageProcessor):
         pass
 
 
-# Add this code to visualize the chunked attention mask
-def visualize_attention_mask(mask):
-    """Visualize attention mask with symbols for better readability."""
-    if mask is None:
-        print("No mask")
-        return
+def expand2square(pil_img, background_color):
+    width, height = pil_img.size
+    if width == height:
+        return pil_img
+    elif width > height:
+        result = Image.new(pil_img.mode, (width, width), background_color)
+        result.paste(pil_img, (0, (width - height) // 2))
+        return result
+    else:
+        result = Image.new(pil_img.mode, (height, height), background_color)
+        result.paste(pil_img, ((height - width) // 2, 0))
+        return result
 
-    seq_len = mask.shape[0]
 
-    print("        ", end="")
-    for i in range(seq_len):
-        print(f"{i:2d} ", end="")
-    print()
+def check_array_shape(arr):
+    shape = arr.shape
 
-    for i in range(seq_len):
-        print(f"Token {i:2d}: ", end="")
-        for j in range(seq_len):
-            if mask[i, j]:
-                print(" ■ ", end="")
-            else:
-                print(" ⬚ ", end="")
-        print()
+    # Check if the shape has 4 dimensions
+    if len(shape) == 4:
+        out_channels, kH, KW, _ = shape
+        # Check if out_channels is the largest, and kH and KW are the same
+        if (out_channels >= kH) and (out_channels >= KW) and (kH == KW):
+            return True
+        else:
+            return False
+    # Check if the shape has 3 dimensions
+    elif len(shape) == 3:
+        _, kW, out_channels = shape
+        # Check if out_channels is the largest
+        if kW >= out_channels:
+            return True
+        else:
+            return False
+    else:
+        return False
 
 
 def check_activation_stats(name, tensor):

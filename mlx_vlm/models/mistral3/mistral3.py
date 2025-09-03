@@ -9,34 +9,11 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import BaseModelConfig
 from ..pixtral import LanguageModel
 from ..pixtral import Model as PixtralModel
-from ..pixtral import TextConfig, VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig:
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    ignore_index: int = -100
-    image_token_index: int = 10
-    vision_feature_select_strategy: str = "full"
-    vision_feature_layer: int = -1
-    vocab_size: int = 32000
-    spatial_merge_size: int = 2
-    multimodal_projector_bias: bool = False
-    eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from ..pixtral import VisionModel
+from .config import ModelConfig
 
 
 def _pair(x) -> Tuple[int, int]:
@@ -273,32 +250,11 @@ class Model(PixtralModel):
         image_features = self.multi_modal_projector(selected_image_feature, image_sizes)
 
         # Insert special image tokens in the input_ids
-        final_inputs_embeds = self._merge_input_ids_with_image_features(
-            image_features, inputs_embeds, input_ids
+        final_inputs_embeds = self.merge_input_ids_with_image_features(
+            self.config.image_token_index, image_features, inputs_embeds, input_ids
         )
         return final_inputs_embeds
 
-    def _merge_input_ids_with_image_features(
-        self, image_features, inputs_embeds, input_ids
-    ):
-        image_token_index = self.config.image_token_index
-        num_images, num_image_patches, embed_dim = image_features.shape
-
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids == image_token_index)[1].tolist()
-
-        text_segments = []
-        start_idx = 0
-
-        for position in image_positions:
-            text_segments.append(inputs_embeds[:, start_idx:position])
-            start_idx = position + 1
-
-        # Split image features into separate embeddings for each image
-        image_embeddings = mx.split(image_features, num_image_patches, axis=1)
-        final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
-        final_embeddings += [inputs_embeds[:, start_idx:]]
-
-        # Create a final embedding of shape
-        # (1, num_image_patches*num_images + sequence_len, embed_dim)
-        return mx.concatenate(final_embeddings, axis=1)
+    @property
+    def layers(self):
+        return self.language_model.model.layers

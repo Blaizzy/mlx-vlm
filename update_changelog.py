@@ -38,7 +38,7 @@ def write_changelog(releases):
 
 def main() -> None:
     repo = os.getenv("GITHUB_REPOSITORY", "Blaizzy/mlx-vlm")
-    token = os.getenv("GITHUB_TOKEN")
+    token = os.getenv("CHANGELOG_TOKEN")
     releases = fetch_releases(repo, token)
     write_changelog(releases)
 

@@ -1,12 +1,14 @@
-import inspect
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import LanguageModelOutput, create_attention_mask
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from ..cache import KVCache
 from .config import ModelConfig, TextConfig
 
@@ -151,8 +153,8 @@ class Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -258,8 +260,8 @@ class LanguageModel(nn.Module):
         position_ids = mx.arange(seq_length, dtype=mx.int32)
         position_ids = mx.broadcast_to(position_ids[None, :], (batch_size, seq_length))
         spatial_merge_size = self.config.vision_config.spatial_merge_size
-        image_token_id = self.config.image_token_index
-        video_token_id = self.config.video_token_index
+        image_token_id = self.config.image_token_id
+        video_token_id = self.config.video_token_id
         vision_start_token_id = self.config.vision_start_token_id
         mrope_position_deltas = []
         if input_ids is not None and (
@@ -443,7 +445,7 @@ class LanguageModel(nn.Module):
         if position_ids is None and (mask is None or mask.ndim == 2):
             # Calculate RoPE index once per generation in the pre-fill stage only
             if (
-                (cache is not None and cache[0] == 0)
+                (cache is not None and cache[0] is not None and cache[0].offset == 0)
                 or self.rope_deltas is None
                 or cache is None
             ):

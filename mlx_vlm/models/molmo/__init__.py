@@ -1,8 +1,4 @@
-from .molmo import (
-    LanguageModel,
-    Model,
-    ModelConfig,
-    TextConfig,
-    VisionConfig,
-    VisionModel,
-)
+from .config import ModelConfig, TextConfig, VisionConfig
+from .language import LanguageModel
+from .molmo import Model
+from .vision import VisionModel

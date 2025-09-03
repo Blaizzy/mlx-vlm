@@ -1,6 +1,5 @@
 import inspect
 import math
-from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -10,45 +9,10 @@ import numpy as np
 
 from ..base import LanguageModelOutput, create_attention_mask
 from ..cache import KVCache
-from .language import LanguageModel, TextConfig
+from .config import ModelConfig, TextConfig
+from .language import LanguageModel
 from .su_rope import Phi3SuScaledRotaryEmbedding
-from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig:
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    vocab_size: int
-
-    num_hidden_layers: int
-    intermediate_size: int
-    num_attention_heads: int
-    rms_norm_eps: float
-
-    ignore_index: int = -100
-    image_token_index: int = 257152
-    hidden_size: int = 2048
-    pad_token_id: int = 0
-
-    num_key_value_heads: int = None
-    rope_theta: float = 10000
-    rope_traditional: bool = False
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    max_position_embeddings: int = 131072
-    original_max_position_embeddings: int = 4096
-    eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .vision import VisionModel
 
 
 class Attention(nn.Module):
@@ -192,6 +156,10 @@ class Phi3V(nn.Module):
 
         if mask is None:
             mask = create_attention_mask(h, cache)
+        else:
+            seq_len = h.shape[-2]
+            causal_mask = mx.tril(mx.ones((seq_len, seq_len), dtype=mx.bool_))
+            mask = (mask & causal_mask) > 0
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)

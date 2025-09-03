@@ -1,48 +1,16 @@
 import inspect
-from dataclasses import dataclass
-from typing import Dict, Optional, Union
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput, create_attention_mask
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from ..cache import KVCache
-
-
-@dataclass
-class TextConfig:
-    model_type: str
-    hidden_size: int
-    num_hidden_layers: int
-    intermediate_size: int
-    num_attention_heads: int
-    rms_norm_eps: float
-    vocab_size: int
-    max_window_layers: int
-    hidden_act: str
-    num_key_value_heads: Optional[int] = 8
-    max_position_embeddings: Optional[int] = 40960
-    rope_theta: float = 1000000.0
-    rope_traditional: bool = False
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    tie_word_embeddings: bool = False
-    sliding_window: int = 32768
-    use_sliding_window: bool = False
-    use_cache: bool = True
-
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import TextConfig
 
 
 class Attention(nn.Module):
@@ -98,8 +66,8 @@ class Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)

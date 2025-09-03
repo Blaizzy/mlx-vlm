@@ -141,7 +141,7 @@ def test_generation(
         if vision_language:
             generate_args["image"] = test_inputs["image"]
 
-        output = generate(**generate_args)
+        output = generate(**generate_args).text
 
         # Deepseek-vl2-tiny and ShowUI outputs are empty on VLM generation
         # Paligemma outputs are empty on language-only generation

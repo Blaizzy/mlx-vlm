@@ -2,9 +2,11 @@ import inspect
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
+from ..base import BaseModelConfig
+
 
 @dataclass
-class VisionConfig:
+class VisionConfig(BaseModelConfig):
     model_type: str = "qwen2_vl"
     depth: int = 32
     embed_dim: int = 1280
@@ -20,19 +22,9 @@ class VisionConfig:
     spatial_merge_size: int = 2
     temporal_patch_size: int = 2
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
 
 @dataclass
-class TextConfig:
+class TextConfig(BaseModelConfig):
     model_type: str
     hidden_size: int
     num_hidden_layers: int
@@ -62,25 +54,15 @@ class TextConfig:
             if not self.rope_scaling["type"] in ["mrope", "default"]:
                 raise ValueError(f"rope_scaling type must be 'mrope' or 'default'")
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
 
 @dataclass
-class ModelConfig:
+class ModelConfig(BaseModelConfig):
     text_config: TextConfig
     vision_config: VisionConfig
     model_type: str
     ignore_index: int = -100
-    image_token_index: int = 151655
-    video_token_index: int = 151656
+    image_token_id: int = 151655
+    video_token_id: int = 151656
     vision_start_token_id: int = 151652
     vision_feature_select_strategy: str = "default"
     vision_feature_layer: int = -2

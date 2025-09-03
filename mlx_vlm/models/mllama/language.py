@@ -5,44 +5,14 @@ from typing import Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput, create_attention_mask
+from ..base import (
+    BaseModelConfig,
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from ..cache import KVCache
-
-
-@dataclass
-class TextConfig:
-    model_type: str = "mllama"
-    vocab_size: int = 32000
-    hidden_size: int = 4096
-    intermediate_size: int = 14336
-    num_hidden_layers: int = 40
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 8
-    hidden_act: str = "silu"
-    max_position_embeddings: int = 131072
-    initializer_range: float = 0.02
-    rms_norm_eps: float = 1e-6
-    tie_word_embeddings: bool = False
-    rope_theta: float = 10000.0
-    rope_traditional: bool = False
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    cross_attention_layers: List[int] = field(
-        default_factory=lambda: [3, 8, 13, 18, 23, 28, 33, 38]
-    )
-
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import TextConfig
 
 
 class MllamaTextCrossAttention(nn.Module):
@@ -106,10 +76,11 @@ class MllamaTextCrossAttention(nn.Module):
             key_states, value_states = mx.split(query, 2, axis=1)
             key_states = self.k_norm(key_states)
 
-        attn_output = mx.fast.scaled_dot_product_attention(
+        attn_output = scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
+            cache,
             scale=self.scale,
             mask=attention_mask,  # add a dim for batch processing
         )
@@ -180,8 +151,8 @@ class MllamaTextSelfAttention(nn.Module):
             query_states = self.rope(query_states)
             key_states = self.rope(key_states)
 
-        attn_output = mx.fast.scaled_dot_product_attention(
-            query_states, key_states, value_states, scale=self.scale, mask=mask
+        attn_output = scaled_dot_product_attention(
+            query_states, key_states, value_states, cache, scale=self.scale, mask=mask
         )
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(
             bsz, q_len, self.hidden_size

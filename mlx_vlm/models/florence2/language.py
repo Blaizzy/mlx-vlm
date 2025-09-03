@@ -1,49 +1,17 @@
 import inspect
 import math
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput, create_attention_mask
-from ..cache import KVCache, SimpleKVCache
-
-
-@dataclass
-class TextConfig:
-    d_model: int = 768
-    model_type: str = "florence2"
-    encoder_attention_heads: int = 8
-    decoder_attention_heads: int = 8
-    encoder_ffn_dim: int = 3072
-    decoder_ffn_dim: int = 3072
-    dropout: float = 0.1
-    attention_dropout: float = 0.0
-    activation_dropout: float = 0.0
-    activation_function: str = "gelu"
-    init_std: float = 0.02
-    encoder_layerdrop: float = 0.0
-    decoder_layerdrop: float = 0.0
-    scale_embedding: bool = False
-    use_cache: bool = True
-    max_position_embeddings: int = 1024
-    vocab_size: int = 51289
-    pad_token_id: int = 1
-    bos_token_id: int = 0
-    eos_token_id: int = 2
-    encoder_layers: int = 6
-    decoder_layers: int = 6
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
+from ..cache import SimpleKVCache
+from .config import TextConfig
 
 
 class Florence2Attention(nn.Module):
@@ -71,7 +39,7 @@ class Florence2Attention(nn.Module):
         self,
         hidden_states,
         key_value_states=None,
-        cache: Optional[KVCache] = None,
+        cache: Optional[SimpleKVCache] = None,
         attention_mask=None,
         layer_head_mask=None,
     ):
@@ -149,8 +117,8 @@ class Florence2Attention(nn.Module):
             attention_mask = causal_mask
 
         attn_output = (
-            mx.fast.scaled_dot_product_attention(
-                q, k, v, scale=self.scaling, mask=attention_mask
+            scaled_dot_product_attention(
+                q, k, v, cache=cache, scale=self.scaling, mask=attention_mask
             )
             .transpose(0, 2, 1, 3)
             .reshape(batch_size, tgt_len, -1)
@@ -209,7 +177,7 @@ class Florence2DecoderLayer(nn.Module):
         encoder_hidden_states,
         attention_mask=None,
         encoder_attention_mask=None,
-        cache: Optional[Tuple[KVCache, KVCache]] = None,
+        cache: Optional[Tuple[SimpleKVCache, SimpleKVCache]] = None,
     ):
         residual = hidden_states
 
@@ -479,3 +447,6 @@ class LanguageModel(nn.Module):
     @property
     def n_kv_heads(self):
         return self.config.decoder_attention_heads
+
+    def make_cache(self):
+        return [(SimpleKVCache(), SimpleKVCache()) for n in self.layers]

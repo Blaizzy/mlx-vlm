@@ -23,43 +23,9 @@ from transformers.image_transforms import (
 from transformers.image_utils import to_numpy_array
 
 from ..base import BaseImageProcessor
-from .language import LanguageModel, TextConfig
-from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig:
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    auto_map: dict
-    hidden_size: int
-    mm_hidden_size: int
-    mm_projector_type: str = "mlp2x_gelu"
-    ignore_index: int = -100
-    image_token_index: int = -200
-    vocab_size: int = 151936
-    eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        if not params.get("text_config", {}):
-            # Copy text config parameters from root level
-            excluded_keys = {"vision_config"}
-            params["text_config"] = dict(
-                filter(lambda x: x[0] not in excluded_keys, params.items())
-            )
-        if not params.get("vision_config", {}).get("model_type", {}):
-            # Set default model type
-            params["vision_config"]["model_type"] = "siglip_vision_model"
-
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import ModelConfig, VisionConfig
+from .language import LanguageModel
+from .vision import VisionModel
 
 
 class ImageProcessor(BaseImageProcessor):
@@ -187,6 +153,10 @@ class Model(nn.Module):
         # (batch_size, num_image_patches + sequence_len, embed_dim)
         return mx.concatenate(final_embeddings, axis=0)
 
+    @property
+    def layers(self):
+        return self.language_model.model.layers
+
     def __call__(
         self,
         input_ids: mx.array,
@@ -203,53 +173,6 @@ class Model(nn.Module):
             mask=None,  # TODO: add mask
         )
         return logits
-
-    @staticmethod
-    def from_pretrained(path_or_hf_repo: str):
-        path = Path(path_or_hf_repo)
-        if not path.exists():
-            path = Path(
-                snapshot_download(
-                    repo_id=path_or_hf_repo,
-                    allow_patterns=[
-                        "*.json",
-                        "*.safetensors",
-                        "*.py",
-                        "tokenizer.model",
-                        "*.tiktoken",
-                    ],
-                )
-            )
-
-        with open(path / "config.json", "r") as f:
-            config = json.load(f)
-
-        siglip_config = AutoConfig.from_pretrained(config["mm_vision_tower"])
-        text_config = AutoConfig.from_pretrained(config["language_model"])
-        siglip_config = siglip_config.to_dict()
-        text_config = text_config.to_dict()
-        config["vision_config"] = siglip_config["vision_config"]
-        config["text_config"] = text_config
-
-        model_config = ModelConfig.from_dict(config)
-        model_config.vision_config = VisionConfig.from_dict(config["vision_config"])
-        model_config.text_config = TextConfig.from_dict(config["text_config"])
-
-        model = Model(model_config)
-        weight_files = glob.glob(str(path / "*.safetensors"))
-        if not weight_files:
-            raise FileNotFoundError(f"No safetensors found in {path}")
-
-        weights = {}
-        for wf in weight_files:
-            weights.update(mx.load(wf))
-
-        weights = model.sanitize(weights=weights)
-
-        weights = VisionModel(model_config.vision_config).sanitize(weights=weights)
-        weights = LanguageModel(model_config.text_config).sanitize(weights=weights)
-        model.load_weights(list(weights.items()))
-        return model
 
     def sanitize(self, weights):
         weights = {

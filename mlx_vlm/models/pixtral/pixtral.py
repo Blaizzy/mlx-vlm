@@ -1,7 +1,6 @@
 import glob
 import inspect
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
@@ -10,31 +9,9 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 
-from .language import LanguageModel, TextConfig
-from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig:
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    ignore_index: int = -100
-    image_token_index: int = 10
-    vision_feature_select_strategy: str = "full"
-    vision_feature_layer: int = -1
-    vocab_size: int = 32000
-    eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import ModelConfig
+from .language import LanguageModel
+from .vision import VisionModel
 
 
 class LlavaMultiModalProjector(nn.Module):
@@ -129,6 +106,10 @@ class Model(nn.Module):
         # (1, num_image_patches*num_images + sequence_len, embed_dim)
         return mx.concatenate(final_embeddings, axis=1)
 
+    @property
+    def layers(self):
+        return self.language_model.model.layers
+
     def __call__(
         self,
         input_ids: mx.array,
@@ -142,46 +123,6 @@ class Model(nn.Module):
             input_ids, cache=cache, inputs_embeds=input_embddings
         )
         return logits
-
-    @staticmethod
-    def from_pretrained(path_or_hf_repo: str):
-        path = Path(path_or_hf_repo)
-        if not path.exists():
-            path = Path(
-                snapshot_download(
-                    repo_id=path_or_hf_repo,
-                    allow_patterns=[
-                        "*.json",
-                        "*.safetensors",
-                        "*.py",
-                        "tokenizer.model",
-                        "*.tiktoken",
-                    ],
-                )
-            )
-
-        with open(path / "config.json", "r") as f:
-            model_config = json.load(f)
-
-        model_config = ModelConfig.from_dict(model_config)
-
-        model_config.vision_config = VisionConfig.from_dict(model_config.vision_config)
-        model_config.text_config = TextConfig.from_dict(model_config.text_config)
-
-        model = Model(model_config)
-        weight_files = glob.glob(str(path / "*.safetensors"))
-        if not weight_files:
-            raise FileNotFoundError(f"No safetensors found in {path}")
-
-        weights = {}
-        for wf in weight_files:
-            weights.update(mx.load(wf))
-
-        weights = VisionModel.sanitize(weights)
-        weights = LanguageModel.sanitize(weights)
-
-        model.load_weights(list(weights.items()))
-        return model
 
     def sanitize(self, weights):
         def transform_key(key):
