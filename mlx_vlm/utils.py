@@ -1,24 +1,20 @@
-import copy
 import glob
 import importlib
 import inspect
 import json
 import logging
-import shutil
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import requests
-import scipy.signal as signal
 import soundfile as sf
 from huggingface_hub import snapshot_download
-from mlx.utils import tree_flatten, tree_map_with_path, tree_reduce, tree_unflatten
-from mlx_lm.utils import quantize_model
+from mlx.utils import tree_flatten
 from PIL import Image, ImageOps
 from transformers import (
     AutoConfig,
@@ -627,10 +623,38 @@ def process_image(img, resize_shape, image_processor):
 
 
 def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    gcd = np.gcd(orig_sr, target_sr)
-    up = target_sr // gcd
-    down = orig_sr // gcd
-    resampled = signal.resample_poly(audio, up, down, padtype="edge")
+    """Resample audio using linear interpolation."""
+    if orig_sr == target_sr:
+        return audio
+
+    # Calculate the resampling ratio
+    ratio = target_sr / orig_sr
+
+    # Handle different audio shapes
+    if audio.ndim == 1:
+        # Mono audio - simple case
+        new_length = int(len(audio) * ratio)
+        old_indices = np.arange(len(audio))
+        new_indices = np.linspace(0, len(audio) - 1, new_length)
+        resampled = np.interp(new_indices, old_indices, audio)
+
+    elif audio.ndim == 2:
+        # Multi-channel audio - transpose to (samples, channels) if needed
+        if audio.shape[0] < audio.shape[1]:
+            audio = audio.T
+
+        # Resample each channel
+        n_samples, n_channels = audio.shape
+        new_length = int(n_samples * ratio)
+        old_indices = np.arange(n_samples)
+        new_indices = np.linspace(0, n_samples - 1, new_length)
+
+        resampled = np.zeros((new_length, n_channels))
+        for i in range(n_channels):
+            resampled[:, i] = np.interp(new_indices, old_indices, audio[:, i])
+    else:
+        raise ValueError(f"Audio array has unsupported shape: {audio.shape}")
+
     return resampled
 
 
