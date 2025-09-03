@@ -627,10 +627,51 @@ def process_image(img, resize_shape, image_processor):
 
 
 def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    gcd = np.gcd(orig_sr, target_sr)
-    up = target_sr // gcd
-    down = orig_sr // gcd
-    resampled = signal.resample_poly(audio, up, down, padtype="edge")
+    """Resample audio using linear interpolation."""
+    if orig_sr == target_sr:
+        return audio
+
+    # Calculate the resampling ratio
+    ratio = target_sr / orig_sr
+
+    # Handle different audio shapes
+    if audio.ndim == 1:
+        # Mono audio - simple case
+        new_length = int(len(audio) * ratio)
+        old_indices = np.arange(len(audio))
+        new_indices = np.linspace(0, len(audio) - 1, new_length)
+        resampled = np.interp(new_indices, old_indices, audio)
+
+    elif audio.ndim == 2:
+        # Multi-channel audio (e.g., stereo)
+        # Check which dimension is channels
+        if audio.shape[0] < audio.shape[1]:
+            # Shape is (channels, samples)
+            n_channels = audio.shape[0]
+            n_samples = audio.shape[1]
+            new_length = int(n_samples * ratio)
+            old_indices = np.arange(n_samples)
+            new_indices = np.linspace(0, n_samples - 1, new_length)
+
+            # Resample each channel separately
+            resampled = np.zeros((n_channels, new_length))
+            for i in range(n_channels):
+                resampled[i] = np.interp(new_indices, old_indices, audio[i])
+        else:
+            # Shape is (samples, channels)
+            n_samples = audio.shape[0]
+            n_channels = audio.shape[1]
+            new_length = int(n_samples * ratio)
+            old_indices = np.arange(n_samples)
+            new_indices = np.linspace(0, n_samples - 1, new_length)
+
+            # Resample each channel separately
+            resampled = np.zeros((new_length, n_channels))
+            for i in range(n_channels):
+                resampled[:, i] = np.interp(new_indices, old_indices, audio[:, i])
+    else:
+        raise ValueError(f"Audio array has unsupported shape: {audio.shape}")
+
     return resampled
 
 
