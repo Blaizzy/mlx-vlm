@@ -7,7 +7,7 @@ from typing import Callable, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map_with_path
-from mlx_lm.utils import dequantize_model, quantize_model, tree_flatten
+from mlx_lm.utils import dequantize_model, quantize_model
 
 from .utils import (
     MODEL_CONVERSION_DTYPES,
