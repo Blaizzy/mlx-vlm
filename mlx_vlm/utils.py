@@ -728,11 +728,11 @@ def process_inputs_with_fallback(
 def prepare_inputs(
     processor,
     images=None,
+    audio=None,
     prompts=None,
     image_token_index=None,
     resize_shape=None,
     add_special_tokens=False,
-    audio=None,
 ):
 
     if not images and not audio:
