@@ -11,7 +11,7 @@
 
 ## Supported Models
 - Qwen2
-- [LLaVA](LLAVA_FINETUNING.md) (except for LLaVA-Next)
+- LLaVA (except for LLaVA-Next)
 - Pixtral
 - Idefics 2
 - Deepseek-VL
