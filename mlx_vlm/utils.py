@@ -643,32 +643,19 @@ def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarra
         resampled = np.interp(new_indices, old_indices, audio)
 
     elif audio.ndim == 2:
-        # Multi-channel audio (e.g., stereo)
-        # Check which dimension is channels
+        # Multi-channel audio - transpose to (samples, channels) if needed
         if audio.shape[0] < audio.shape[1]:
-            # Shape is (channels, samples)
-            n_channels = audio.shape[0]
-            n_samples = audio.shape[1]
-            new_length = int(n_samples * ratio)
-            old_indices = np.arange(n_samples)
-            new_indices = np.linspace(0, n_samples - 1, new_length)
+            audio = audio.T
 
-            # Resample each channel separately
-            resampled = np.zeros((n_channels, new_length))
-            for i in range(n_channels):
-                resampled[i] = np.interp(new_indices, old_indices, audio[i])
-        else:
-            # Shape is (samples, channels)
-            n_samples = audio.shape[0]
-            n_channels = audio.shape[1]
-            new_length = int(n_samples * ratio)
-            old_indices = np.arange(n_samples)
-            new_indices = np.linspace(0, n_samples - 1, new_length)
+        # Resample each channel
+        n_samples, n_channels = audio.shape
+        new_length = int(n_samples * ratio)
+        old_indices = np.arange(n_samples)
+        new_indices = np.linspace(0, n_samples - 1, new_length)
 
-            # Resample each channel separately
-            resampled = np.zeros((new_length, n_channels))
-            for i in range(n_channels):
-                resampled[:, i] = np.interp(new_indices, old_indices, audio[:, i])
+        resampled = np.zeros((new_length, n_channels))
+        for i in range(n_channels):
+            resampled[:, i] = np.interp(new_indices, old_indices, audio[:, i])
     else:
         raise ValueError(f"Audio array has unsupported shape: {audio.shape}")
 
