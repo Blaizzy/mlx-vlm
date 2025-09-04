@@ -133,7 +133,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
         ignore_id: int = -100,
         **kwargs,
     ):
-        super().__init__(tokenizer, **kwargs)
         self.candidate_resolutions = candidate_resolutions
         self.image_size = candidate_resolutions[0][0]
         self.patch_size = patch_size
@@ -179,15 +178,27 @@ class DeepseekVLV2Processor(ProcessorMixin):
         self.tokenizer.add_special_tokens(special_tokens_dict)
         print("Added chat tokens")
 
-        # Add chat template
-        self.chat_template = self.tokenizer.chat_template
-
         self.image_token = image_token
         self.pad_token = pad_token
         self.add_special_token = add_special_token
         self.sft_format = sft_format
         self.mask_prompt = mask_prompt
         self.ignore_id = ignore_id
+        super().__init__(tokenizer, **kwargs)
+
+        # Add chat template
+        self.chat_template = kwargs.pop("chat_template", self.default_chat_template)
+
+    @property
+    def default_chat_template(self):
+        return (
+            "{% for message in messages %}"
+            "{% if message['role'] == 'user' %}<|User|>:"
+            "{% elif message['role'] == 'assistant' %}<|Assistant|>{% endif %} "
+            "{{message['content']}}\n\n"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}<|Assistant|>:{% endif %}"
+        )
 
     @property
     def bos_id(self):
