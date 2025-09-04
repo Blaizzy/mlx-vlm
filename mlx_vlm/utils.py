@@ -8,6 +8,7 @@ from pathlib import Path
 from textwrap import dedent
 from typing import Any, List, Optional, Tuple, Union
 
+import coremltools
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
@@ -33,6 +34,7 @@ MODEL_REMAPPING = {
     "bunny-llama": "llava_bunny",
     "lfm2-vl": "lfm2_vl",
     "cohere2_vision": "aya_vision",
+    "llava_qwen2": "fastvlm",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -91,6 +93,7 @@ def get_model_path(
     Args:
         path_or_hf_repo (str): The local path or Hugging Face repository ID of the model.
         revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
+        force_download (bool, optional): Whether to force downloading the model.
 
     Returns:
         Path: The path to the model.
@@ -116,7 +119,13 @@ def get_model_path(
     return model_path
 
 
-def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
+def load_model(
+    model_path: Path,
+    lazy: bool = False,
+    path_or_hf_repo: str = None,
+    force_download: bool = False,
+    **kwargs,
+) -> nn.Module:
     """
     Load and initialize the model from a given path.
 
@@ -125,8 +134,8 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         lazy (bool): If False eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
-        revision (str, optional): A revision id which can be a branch name,
-            a tag, or a commit hash. Default: ``None``.
+        path_or_hf_repo (str): The path or the huggingface repository to load the model from.
+        force_download (bool): Whether to force download the model from the Hugging Face Hub. Default: ``False``
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -181,9 +190,24 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     # Sanitize weights
     weights = sanitize_weights(model, weights)
-    weights = sanitize_weights(
-        model_class.VisionModel, weights, model_config.vision_config
-    )
+    if hasattr(model_class, "VisionModel"):
+        weights = sanitize_weights(
+            model_class.VisionModel, weights, model_config.vision_config
+        )
+    else:
+        # look for Core ML vision tower
+        print("Looking for CoreML vision tower")
+        from .hf_tools.mlpackage_cache import resolve_coreml_mlpackage
+
+        mlpackage_path = resolve_coreml_mlpackage(
+            model_path, path_or_hf_repo, force_download
+        )
+        if mlpackage_path is not None:
+            only_llm = kwargs.get("only_llm", False)
+            if not only_llm:
+                print(f"Loading {mlpackage_path} vision tower")
+                model.vision_tower = coremltools.models.MLModel(mlpackage_path)
+
     weights = sanitize_weights(
         model_class.LanguageModel, weights, model_config.text_config
     )
@@ -290,7 +314,7 @@ def load(
     model_path = get_model_path(
         path_or_hf_repo, force_download=force_download, revision=revision
     )
-    model = load_model(model_path, lazy, **kwargs)
+    model = load_model(model_path, lazy, path_or_hf_repo=path_or_hf_repo, **kwargs)
     if adapter_path is not None:
         model = apply_lora_layers(model, adapter_path)
         model.eval()
@@ -391,7 +415,7 @@ def load_processor(
 def fetch_from_hub(
     model_path: Path, lazy: bool = False, **kwargs
 ) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
-    model = load_model(model_path, lazy, **kwargs)
+    model = load_model(model_path, lazy, path_or_hf_repo=str(model_path), **kwargs)
     config = load_config(model_path, **kwargs)
     processor = load_processor(
         model_path,
@@ -902,7 +926,7 @@ class StoppingCriteria:
             if isinstance(new_eos_token_ids, str):
                 new_eos_token_ids = [new_eos_token_ids]
             new_eos_token_ids = [
-                self.tokenizer.encode(" " + token, add_special_tokens=False)[-1]
+                self.tokenizer.encode(" " + str(token), add_special_tokens=False)[-1]
                 for token in new_eos_token_ids
             ]
             self.eos_token_ids.extend(new_eos_token_ids)

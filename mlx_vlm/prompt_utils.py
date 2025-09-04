@@ -54,6 +54,7 @@ MODEL_CONFIG = {
     "florence2": MessageFormat.PROMPT_ONLY,
     "molmo": MessageFormat.PROMPT_ONLY,
     "paligemma": MessageFormat.PROMPT_WITH_IMAGE_TOKEN,
+    "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
 }
 
 # Models that don't support multi-image
@@ -363,6 +364,7 @@ def get_chat_template(
         processor = (
             processor
             if "chat_template" in processor.__dict__.keys()
+            and processor.chat_template is not None
             else processor.tokenizer
         )
 

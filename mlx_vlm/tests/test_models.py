@@ -2,6 +2,7 @@ import inspect
 import unittest
 
 import mlx.core as mx
+import numpy as np
 from mlx.utils import tree_map
 
 
@@ -1404,6 +1405,87 @@ class TestModels(unittest.TestCase):
             config.vision_config.num_channels,
             (config.vision_config.image_size, config.vision_config.image_size),
         )
+
+    def test_fastvlm(self):
+        from mlx_vlm.models import fastvlm
+
+        text_config = fastvlm.TextConfig(
+            model_type="llava_qwen2",
+            hidden_size=896,
+            num_hidden_layers=24,
+            intermediate_size=4864,
+            num_attention_heads=14,
+            rms_norm_eps=1e-6,
+            vocab_size=151936,
+        )
+        vision_config = fastvlm.VisionConfig(
+            mm_hidden_size=3072,
+            mm_vision_tower="mobileclip_l_1024",
+        )
+        config = fastvlm.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            eos_token_id=151645,
+            model_type="llava_qwen2",
+        )
+        model = fastvlm.Model(config)
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+        self.mm_projector_test_runner(
+            model.multi_modal_projector,
+            config.vision_config.mm_hidden_size,
+            config.text_config.hidden_size,
+        )
+
+        # additional test for _merge_input_ids_with_image_features
+        for dtype in [mx.float32, mx.float16]:
+            num_images = 2
+            num_image_patches = 3
+            embed_dim = config.text_config.hidden_size
+            seq_len = 10
+
+            # placeholders for images, 1,2,3, 6,7,8 (total 6 = 2*3)
+            image_token = config.image_token_index
+            image_positions = [1, 2, 3, 6, 7, 8]
+            input_ids = mx.array([[0] * seq_len], dtype=mx.int32)
+            input_ids[:, image_positions] = mx.array(image_token, dtype=mx.int32)
+
+            base_embeds = mx.zeros((1, seq_len, embed_dim), dtype=dtype)
+            # sentinel values at non-image positions to verify they remain unchanged
+            for pos in range(seq_len):
+                if pos not in image_positions:
+                    base_embeds[:, pos, :] = 1.0
+
+            img_feats_np = np.arange(
+                num_images * num_image_patches * embed_dim, dtype=np.float32
+            )
+            img_feats_np = img_feats_np.reshape(
+                num_images, num_image_patches, embed_dim
+            )
+            image_features = mx.array(img_feats_np, dtype=mx.float32)
+
+            merged = model._merge_input_ids_with_image_features(
+                image_features, mx.array(base_embeds), input_ids
+            )
+
+            self.assertEqual(merged.dtype, dtype)
+
+            reshaped = mx.array(img_feats_np.reshape(-1, embed_dim)).astype(dtype)
+
+            # check image positions were filled in order
+            for idx, pos in enumerate(image_positions):
+                self.assertTrue(
+                    mx.all(merged[:, pos, :] == reshaped[idx : idx + 1, :]).item()
+                )
+
+            # check non-image positions remain as sentinel (1.0)
+            for pos in range(seq_len):
+                if pos not in image_positions:
+                    self.assertTrue(mx.all(merged[:, pos, :] == 1.0).item())
 
 
 if __name__ == "__main__":
