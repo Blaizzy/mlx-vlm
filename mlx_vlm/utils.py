@@ -581,9 +581,24 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     """
     Helper function to load an image from either a URL or file.
     """
-    if isinstance(image_source, BytesIO) or Path(image_source).is_file():
+    if (
+        isinstance(image_source, BytesIO)
+        or isinstance(image_source, str)
+        or Path(image_source).is_file()
+    ):
         # for base64 encoded images
         try:
+            if image_source.startswith("data:image/"):
+                import base64
+
+                if "," not in image_source:
+                    raise ValueError(
+                        "Invalid data URI format - missing comma separator"
+                    )
+
+                _, data = image_source.split(",", 1)
+                image_source = BytesIO(base64.b64decode(data))
+
             image = Image.open(image_source)
         except IOError as e:
             raise ValueError(
