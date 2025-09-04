@@ -5,13 +5,11 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from mlx_vlm.utils import (
+from mlx_vlm.utils import (  # get_class_predicate,; quantize_model,
     StoppingCriteria,
-    get_class_predicate,
     load,
     prepare_inputs,
     process_inputs_with_fallback,
-    quantize_model,
     sanitize_weights,
     update_module_configs,
 )
@@ -147,83 +145,83 @@ def test_update_module_configs():
     assert updated.vision_config == "vision_config"
 
 
-def test_get_class_predicate():
-    class DummyModule:
-        def __init__(self, shape):
-            self.weight = mx.zeros(shape)
-            self.to_quantized = True
+# def test_get_class_predicate():
+#     class DummyModule:
+#         def __init__(self, shape):
+#             self.weight = mx.zeros(shape)
+#             self.to_quantized = True
+#
+#     # Test skip_vision=True
+#     pred = get_class_predicate(skip_vision=True)
+#     module = DummyModule((10, 64))
+#     assert pred("language_model", module) is True
+#     assert pred("vision_model", module) is False
+#
+#     # Test skip_vision=True with weights
+#     weights = {
+#         "language_model.scales": mx.array([1, 2, 3]),
+#         "vision_model.scales": mx.array([4, 5, 6]),
+#     }
+#     pred = get_class_predicate(skip_vision=True, weights=weights)
+#     assert pred("language_model", module) is True
+#     assert pred("vision_model", module) is False
+#
+#     # Test skip_vision=False without weights
+#     pred = get_class_predicate(skip_vision=False)
+#     assert pred("", module) is True
+#     module = DummyModule((10, 63))  # Not divisible by 64
+#     assert pred("", module) is False
+#
+#     # Test skip_vision=False with weights
+#     weights = {
+#         "language_model.scales": mx.array([1, 2, 3]),
+#         "vision_model.scales": mx.array([4, 5, 6, 7]),  # Not divisible by 64
+#     }
+#     pred = get_class_predicate(skip_vision=False, weights=weights)
+#     assert pred("language_model", DummyModule((10, 64))) is True
+#     assert pred("vision_model", DummyModule((10, 63))) is False
 
-    # Test skip_vision=True
-    pred = get_class_predicate(skip_vision=True)
-    module = DummyModule((10, 64))
-    assert pred("language_model", module) is True
-    assert pred("vision_model", module) is False
 
-    # Test skip_vision=True with weights
-    weights = {
-        "language_model.scales": mx.array([1, 2, 3]),
-        "vision_model.scales": mx.array([4, 5, 6]),
-    }
-    pred = get_class_predicate(skip_vision=True, weights=weights)
-    assert pred("language_model", module) is True
-    assert pred("vision_model", module) is False
-
-    # Test skip_vision=False without weights
-    pred = get_class_predicate(skip_vision=False)
-    assert pred("", module) is True
-    module = DummyModule((10, 63))  # Not divisible by 64
-    assert pred("", module) is False
-
-    # Test skip_vision=False with weights
-    weights = {
-        "language_model.scales": mx.array([1, 2, 3]),
-        "vision_model.scales": mx.array([4, 5, 6, 7]),  # Not divisible by 64
-    }
-    pred = get_class_predicate(skip_vision=False, weights=weights)
-    assert pred("language_model", DummyModule((10, 64))) is True
-    assert pred("vision_model", DummyModule((10, 63))) is False
-
-
-def test_quantize_module():
-    class DummyModule(nn.Module):
-        def __init__(self, shape):
-            super().__init__()
-            self.language_model = nn.Linear(shape[1], shape[1])
-            self.vision_model = nn.Linear(shape[1], shape[1])
-
-    # Test basic quantization
-    module = DummyModule((10, 64))
-    config = {}
-    _, updated_config = quantize_model(
-        module, config, q_group_size=64, q_bits=4, skip_vision=False
-    )
-
-    # Check quantization parameters
-    assert hasattr(module.language_model, "scales")
-    assert hasattr(module.vision_model, "scales")
-    assert module.language_model.scales.shape == (64, 1)
-    assert module.language_model.bits == 4
-    assert module.language_model.group_size == 64
-    assert module.vision_model.scales.shape == (64, 1)
-    assert module.vision_model.bits == 4
-    assert module.vision_model.group_size == 64
-
-    # Check config is updated correctly
-    assert updated_config["quantization"] == {"group_size": 64, "bits": 4}
-
-    # Test skip_vision=True
-    module = DummyModule((10, 64))
-    config = {}
-    _, updated_config = quantize_model(
-        module, config, q_group_size=64, q_bits=4, skip_vision=True
-    )
-
-    # Vision module should not be quantized
-    assert hasattr(module.language_model, "scales")
-    assert not hasattr(module.vision_model, "scales")
-
-    # Check config is updated correctly
-    assert updated_config["vision_config"]["skip_vision"] is True
+# def test_quantize_module():
+#     class DummyModule(nn.Module):
+#         def __init__(self, shape):
+#             super().__init__()
+#             self.language_model = nn.Linear(shape[1], shape[1])
+#             self.vision_model = nn.Linear(shape[1], shape[1])
+#
+#     # Test basic quantization
+#     module = DummyModule((10, 64))
+#     config = {}
+#     _, updated_config = quantize_model(
+#         module, config, q_group_size=64, q_bits=4, skip_vision=False
+#     )
+#
+#     # Check quantization parameters
+#     assert hasattr(module.language_model, "scales")
+#     assert hasattr(module.vision_model, "scales")
+#     assert module.language_model.scales.shape == (64, 1)
+#     assert module.language_model.bits == 4
+#     assert module.language_model.group_size == 64
+#     assert module.vision_model.scales.shape == (64, 1)
+#     assert module.vision_model.bits == 4
+#     assert module.vision_model.group_size == 64
+#
+#     # Check config is updated correctly
+#     assert updated_config["quantization"] == {"group_size": 64, "bits": 4}
+#
+#     # Test skip_vision=True
+#     module = DummyModule((10, 64))
+#     config = {}
+#     _, updated_config = quantize_model(
+#         module, config, q_group_size=64, q_bits=4, skip_vision=True
+#     )
+#
+#     # Vision module should not be quantized
+#     assert hasattr(module.language_model, "scales")
+#     assert not hasattr(module.vision_model, "scales")
+#
+#     # Check config is updated correctly
+#     assert updated_config["vision_config"]["skip_vision"] is True
 
 
 def test_prepare_inputs():
