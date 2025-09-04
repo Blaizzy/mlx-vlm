@@ -3,7 +3,8 @@ import logging
 
 import mlx.core as mx
 
-from .utils import generate, load
+from .generate import generate
+from .utils import load
 
 # This is a proof-of-concept script for video generation with SmolVLM2.
 
@@ -25,7 +26,7 @@ def main():
     )
     parser.add_argument("--system", type=str, required=False, help="System prompt")
     parser.add_argument(
-        "--temp", type=float, default=0.7, help="Temperature for generation"
+        "--temperature", type=float, default=0.7, help="Temperature for generation"
     )
     parser.add_argument(
         "--max-tokens",
@@ -73,7 +74,7 @@ def main():
         tokenize=True,
         add_generation_prompt=True,
         return_dict=True,
-        return_tensors="np",
+        return_tensors="pt",
     )
 
     input_ids = mx.array(inputs["input_ids"])
@@ -89,7 +90,7 @@ def main():
     kwargs["pixel_values"] = pixel_values
     kwargs["mask"] = mask
     kwargs["pixel_mask"] = pixel_mask
-    kwargs["temp"] = args.temp
+    kwargs["temperature"] = args.temperature
     kwargs["max_tokens"] = args.max_tokens
 
     response = generate(
