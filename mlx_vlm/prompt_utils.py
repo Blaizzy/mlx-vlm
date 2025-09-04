@@ -311,7 +311,6 @@ class MessageFormatter:
             ],
         }
 
-
 def get_message_json(
     model_name: str,
     prompt: str,
