@@ -177,66 +177,34 @@ class TrainingArgs:
     )
 
 
-def default_loss(model, batch, train_on_completions=False, assistant_id=77091):
-    """
-    Compute loss for vision-language model with proper handling of padding and masking.
-    """
-    # Extract inputs from batch
-    pixel_values = batch.get("pixel_values")
-    input_ids = batch["input_ids"]
-    attention_mask = batch.get("attention_mask", mx.ones_like(input_ids))
-    
-    # Prepare targets and inputs
-    targets = input_ids[:, 1:]
-    inputs_for_model = input_ids[:, :-1]
-    attention_mask_for_model = attention_mask[:, :-1]
-    
-    # Get additional kwargs
-    kwargs = {
-        k: v
-        for k, v in batch.items()
-        if k not in ["input_ids", "pixel_values", "attention_mask"]
-    }
-    
-    # Forward pass
-    outputs = model(inputs_for_model, pixel_values, attention_mask_for_model, **kwargs)
+def default_loss(model, inputs, targets, lengths, train_on_completions=False, assistant_id=77091):
+    outputs = model(inputs)
     logits = outputs.logits.astype(mx.float32)
-    
-    # Align logits with targets if needed
-    if logits.shape[1] != targets.shape[1]:
-        min_len = min(logits.shape[1], targets.shape[1])
-        logits = logits[:, :min_len, :]
-        targets = targets[:, :min_len]
-        attention_mask = attention_mask[:, 1:min_len+1]
-    else:
-        attention_mask = attention_mask[:, 1:]
-    
-    # Create weight mask for loss computation
+
+    length_mask = mx.arange(inputs.shape[1])[None, :] < lengths[:, None]
+
+    # Build weight_mask according to train_on_completions and assistant_id
     if train_on_completions:
-        # Only train on assistant responses
-        weight_mask = mx.ones_like(attention_mask)
-        for i in range(input_ids.shape[0]):
-            assistant_indices = mx.where(input_ids[i] == assistant_id)[0]
-            if len(assistant_indices) > 0:
-                first_assistant_idx = assistant_indices[0].item()
-                weight_mask[i, :first_assistant_idx] = 0
+        weight_mask = mx.array(length_mask)
+        for i in range(inputs.shape[0]):
+            mask = (inputs[i] == assistant_id)
+            has_any = mx.sum(mask) > 0
+            if bool(has_any.item()):
+                first_idx = int(mx.argmax(mask).item())
+                weight_mask[i, :first_idx] = 0
+            else:
+                weight_mask[i, :] = 0
     else:
-        weight_mask = attention_mask
-    
-    # Compute cross entropy loss
+        weight_mask = length_mask
+
     ce = nn.losses.cross_entropy(logits, targets) * weight_mask
     ntoks = weight_mask.sum()
-    
-    # Avoid division by zero
-    ntoks = mx.maximum(ntoks, 1)
     ce = ce.sum() / ntoks
     mx.clear_cache()
     return ce, ntoks
 
 
 def iterate_batches(dataset, batch_size, max_seq_length, train=False):
-    """Iterate over batches without complex collation."""
-    
     indices = list(range(len(dataset)))
     
     # Distributed training support
@@ -336,7 +304,13 @@ def evaluate(
         desc="Calculating loss...",
         total=min(len(dataset) // batch_size, num_batches) if num_batches != -1 else len(dataset) // batch_size,
     ):
-        losses, toks = loss_fn_partial(model, batch)
+        inputs = batch["input_ids"][:, :-1]
+        targets = batch["input_ids"][:, 1:]
+        if "attention_mask" in batch:
+            lengths = batch["attention_mask"].sum(axis=1)
+        else:
+            lengths = mx.full((inputs.shape[0],), inputs.shape[1])
+        losses, toks = loss_fn_partial(model, inputs, targets, lengths)
         all_losses += losses * toks
         ntokens += toks
         mx.eval(all_losses, ntokens)
@@ -392,7 +366,13 @@ def train(
     
     def step(batch):
         # Forward and backward pass
-        (lvalue, toks), grad = loss_value_and_grad(model, batch)
+        inputs = batch["input_ids"][:, :-1]
+        targets = batch["input_ids"][:, 1:]
+        if "attention_mask" in batch:
+            lengths = batch["attention_mask"].sum(axis=1)
+        else:
+            lengths = mx.full((inputs.shape[0],), inputs.shape[1])
+        (lvalue, toks), grad = loss_value_and_grad(model, inputs, targets, lengths)
 
         grad = clean_gradients(grad)
         
