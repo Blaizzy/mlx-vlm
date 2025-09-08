@@ -230,6 +230,8 @@ def default_loss(model, batch, train_on_completions=False, assistant_id=77091):
     # Avoid division by zero
     ntoks = mx.maximum(ntoks, 1)
     ce = ce.sum() / ntoks
+
+    mx.clear_cache()
     
     return ce, ntoks
 
@@ -389,7 +391,6 @@ def train(
     # Compile training step
     state = [model.state, optimizer.state, mx.random.state]
     
-    @partial(mx.compile, inputs=state, outputs=state)
     def step(batch):
         # Forward and backward pass
         (lvalue, toks), grad = loss_value_and_grad(model, batch)
