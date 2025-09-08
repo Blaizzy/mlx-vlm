@@ -6,23 +6,13 @@ import mlx.optimizers as optim
 from datasets import load_dataset
 
 from .prompt_utils import apply_chat_template
-from .trainer import Dataset, TrainingArgs, Colors, train
+from .trainer import Dataset, TrainingArgs, Colors, train, print_trainable_parameters
 from .trainer.utils import apply_lora_layers, find_all_linear_names, get_peft_model
 from .utils import load, load_image_processor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-def print_param_count(model):
-    """Print basic parameter count information."""
-    from mlx.utils import tree_flatten
-    
-    trainable_params = sum(p.size for _, p in tree_flatten(model.trainable_parameters()))
-    total_params = sum(p.size for _, p in tree_flatten(model.parameters()))
-    percent = (trainable_params / total_params) * 100 if total_params > 0 else 0
-    
-    print(f"{Colors.OKBLUE}Total: {total_params:,} | Trainable: {trainable_params:,} | {percent:.2f}%{Colors.ENDC}")
 
 def main(args):
     logger.info(f"{Colors.HEADER}Loading model from {args.model_path}{Colors.ENDC}")
@@ -114,6 +104,7 @@ def main(args):
     
     elif args.full_finetune:
         logger.info(f"{Colors.UNDERLINE}Training with full weight finetuning{Colors.ENDC}")
+        print_trainable_parameters(model)
     else:
         logger.info(f"{Colors.UNDERLINE}Setting up LoRA{Colors.ENDC}")
         
@@ -125,8 +116,6 @@ def main(args):
             alpha=args.lora_alpha,
             dropout=args.lora_dropout,
         )
-
-    print_param_count(model)
     
     logger.info(f"{Colors.HEADER}Setting up optimizer{Colors.ENDC}")
     optimizer = optim.Adam(learning_rate=args.learning_rate)
@@ -208,7 +197,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=1e-5,
+        default=1e-7,
         help="Learning rate for the optimizer",
     )
     parser.add_argument(
