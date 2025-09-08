@@ -29,12 +29,30 @@ def main(args):
     image_processor = load_image_processor(args.model_path)
 
     logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
-    dataset = load_dataset(args.dataset, split=args.split)
+    if args.dataset_config is not None:
+        dataset = load_dataset(args.dataset, args.dataset_config, split=args.split)
+    else:
+        dataset = load_dataset(args.dataset, split=args.split)
 
+    # Validate image columns
+    if not ("images" in dataset.column_names or "image" in dataset.column_names):
+        raise ValueError("Dataset must have either an 'images' or 'image' column")
+
+    # Validate message columns
     if "messages" not in dataset.column_names:
-        raise ValueError("Dataset must have a 'messages' column")
-    if "images" not in dataset.column_names:
-        raise ValueError("Dataset must have an 'images' column")
+        if "question" in dataset.column_names and "answer" in dataset.column_names:
+            def transform_to_messages(examples):
+                messages_list = []
+                for q, a in zip(examples["question"], examples["answer"]):
+                    messages_list.append([
+                        {"role": "user", "content": q},
+                        {"role": "assistant", "content": a}
+                    ])
+                examples["messages"] = messages_list
+                return examples
+            dataset = dataset.map(transform_to_messages, batched=True)
+        else:
+            raise ValueError("Dataset must have a 'messages' column or both 'question' and 'answer' columns")
 
     if args.apply_chat_template:
         logger.info(f"\033[32mApplying chat template to the dataset\033[0m")
@@ -78,7 +96,11 @@ def main(args):
 
         model = apply_lora_layers(model, adapter_path)
 
-    else:
+
+    if args.full_finetune:
+        logger.info(f"\033[32mTraining with full weight finetuning\033[0m")
+        # No LoRA layers are applied; the optimizer will see all parameters.
+    elif adapter_path and args.full_finetune==False:
         logger.info(f"\033[32mSetting up LoRA\033[0m")
 
         list_of_modules = find_all_linear_names(model.language_model)
@@ -142,10 +164,21 @@ if __name__ == "__main__":
         help="Path to the pre-trained model",
     )
     parser.add_argument(
+        "--full-finetune",
+        action="store_true",
+        help="Train the model with full weight finetuning instead of LoRA",
+    )
+    parser.add_argument(
         "--dataset", type=str, required=True, help="Path to the dataset"
     )
     parser.add_argument(
         "--split", type=str, default="train", help="Split to use for training"
+    )
+    parser.add_argument(
+        "--dataset-config",
+        type=str,
+        default=None,
+        help="Optional dataset configuration name ",
     )
     parser.add_argument(
         "--image-resize-shape",
