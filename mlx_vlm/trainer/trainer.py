@@ -266,7 +266,6 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                 try:
                     item = dataset[idx]
                     
-                    # Simple truncation instead of padding
                     if "input_ids" in item:
                         if len(item["input_ids"]) > max_seq_length:
                             item["input_ids"] = item["input_ids"][:max_seq_length]
@@ -281,11 +280,9 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
             if not batch_data:
                 continue
             
-            # For batch size 1, just yield the item
             if batch_size == 1 and len(batch_data) == 1:
                 yield batch_data[0]
             else:
-                # Simple stacking - assumes prepare_inputs handles padding
                 batch = {}
                 for key in batch_data[0].keys():
                     try:
@@ -298,6 +295,8 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                         batch[key] = values[0] if len(values) == 1 else values
                 
                 yield batch
+                del batch_data
+                mx.clear_cache()
         
         if not train:
             break
@@ -346,6 +345,8 @@ def evaluate(
     
     all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
     ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
+
+    mx.clear_cache()
     
     return (all_losses / mx.maximum(ntokens, 1)).item()
 
@@ -410,6 +411,9 @@ def train(
         
         # Model update
         optimizer.update(model, grad)
+
+        mx.eval(lvalue, toks)
+        mx.clear_cache()
         
         return lvalue, toks
     
