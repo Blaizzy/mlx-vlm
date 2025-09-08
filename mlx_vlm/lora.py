@@ -199,7 +199,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--apply-chat-template",
-        action="store_false",
+        action="store_true",
+        default=True,
         help="Apply chat template to the dataset",
     )
     
@@ -207,7 +208,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=1e-4,
+        default=3e-5,
         help="Learning rate for the optimizer",
     )
     parser.add_argument(

@@ -230,9 +230,7 @@ def default_loss(model, batch, train_on_completions=False, assistant_id=77091):
     # Avoid division by zero
     ntoks = mx.maximum(ntoks, 1)
     ce = ce.sum() / ntoks
-
     mx.clear_cache()
-    
     return ce, ntoks
 
 
@@ -395,8 +393,7 @@ def train(
     def step(batch):
         # Forward and backward pass
         (lvalue, toks), grad = loss_value_and_grad(model, batch)
-        
-        # Clean gradients - remove non-trainable parameters
+
         grad = clean_gradients(grad)
         
         # Gradient clipping
@@ -412,11 +409,7 @@ def train(
         # Model update
         optimizer.update(model, grad)
 
-        mx.eval(lvalue, toks)
-        mx.clear_cache()
-        
         return lvalue, toks
-    
     loss_value_and_grad = nn.value_and_grad(model, loss_fn_partial)
     
     def clean_gradients(grads):
@@ -483,6 +476,7 @@ def train(
         
         # Training step
         lvalue, toks = step(batch)
+        mx.clear_cache()
         losses += lvalue
         n_tokens += toks
         steps += 1
