@@ -1,14 +1,12 @@
 import argparse
 import json
 import logging
-import os
-from pathlib import Path
 
 import mlx.optimizers as optim
 from datasets import load_dataset
 
 from .prompt_utils import apply_chat_template
-from .trainer import Dataset, TrainingArgs, train, save_adapter
+from .trainer import Dataset, TrainingArgs, Colors, train
 from .trainer.utils import apply_lora_layers, find_all_linear_names, get_peft_model
 from .utils import load, load_image_processor
 
@@ -17,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 def main(args):
-    logger.info(f"\033[32mLoading model from {args.model_path}\033[0m")
+    logger.info(f"{Colors.HEADER}Loading model from {args.model_path}{Colors.ENDC}")
     model, processor = load(
         args.model_path, processor_config={"trust_remote_code": True}
     )
@@ -26,13 +24,13 @@ def main(args):
     model_type = getattr(getattr(model, "config", None), "model_type", None)
     if model_type in unsupported_for_training:
         raise ValueError(
-            f"Model type {model_type} not supported for training. "
-            "Please choose a different model or remove it from the unsupported list."
+            f"{Colors.FAIL}Model type {model_type} not supported for training. "
+            "Please choose a different model or remove it from the unsupported list.{Colors.ENDC}"
         )
     config = model.config.__dict__
     image_processor = load_image_processor(args.model_path)
     
-    logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
+    logger.info(f"{Colors.HEADER}Loading dataset from {args.dataset}{Colors.ENDC}")
     if args.dataset_config is not None:
         dataset = load_dataset(args.dataset, args.dataset_config, split=args.split)
     else:
@@ -40,7 +38,7 @@ def main(args):
     
     # Validate image columns
     if not ("images" in dataset.column_names or "image" in dataset.column_names):
-        raise ValueError("Dataset must have either an 'images' or 'image' column")
+        raise ValueError(f"{Colors.FAIL}Dataset must have either an 'images' or 'image' column{Colors.ENDC}")
     
     # Validate message columns
     if "messages" not in dataset.column_names:
@@ -56,10 +54,10 @@ def main(args):
                 return examples
             dataset = dataset.map(transform_to_messages, batched=True)
         else:
-            raise ValueError("Dataset must have a 'messages' column or both 'question' and 'answer' columns")
+            raise ValueError(f"{Colors.FAIL}Dataset must have a 'messages' column or both 'question' and 'answer' columns{Colors.ENDC}")
     
     if args.apply_chat_template:
-        logger.info(f"\033[32mApplying chat template to the dataset\033[0m")
+        logger.info(f"{Colors.OKBLUE}Applying chat template to the dataset{Colors.ENDC}")
         
         def process_data(examples):
             if config["model_type"] == "pixtral":
@@ -97,18 +95,17 @@ def main(args):
     
     adapter_path = args.adapter_path
     if adapter_path:
-        logger.info(f"\033[32mResuming from adapter path {adapter_path}\033[0m")
+        logger.info(f"{Colors.UNDERLINE}Resuming from adapter path {adapter_path}{Colors.ENDC}")
         logger.info(
-            f"\033[32mLora rank, alpha, and dropout will be loaded from adapter_config.json file\033[0m"
+            f"\033[32mLora rank, alpha, and dropout will be loaded from adapter_config.json file{Colors.ENDC}"
         )
         
         model = apply_lora_layers(model, adapter_path)
     
     elif args.full_finetune:
-        logger.info(f"\033[32mTraining with full weight finetuning\033[0m")
-        # No LoRA layers are applied; the optimizer will see all parameters.
+        logger.info(f"{Colors.UNDERLINE}Training with full weight finetuning{Colors.ENDC}")
     else:
-        logger.info(f"\033[32mSetting up LoRA\033[0m")
+        logger.info(f"{Colors.UNDERLINE}Setting up LoRA{Colors.ENDC}")
         
         list_of_modules = find_all_linear_names(model.language_model)
         model = get_peft_model(
@@ -119,7 +116,7 @@ def main(args):
             dropout=args.lora_dropout,
         )
     
-    logger.info(f"\033[32mSetting up optimizer\033[0m")
+    logger.info(f"{Colors.HEADER}Setting up optimizer{Colors.ENDC}")
     optimizer = optim.Adam(learning_rate=args.learning_rate)
     
     # Create TrainingArgs
@@ -138,7 +135,7 @@ def main(args):
     )
     
     # Train the model
-    logger.info(f"\033[32mTraining model\033[0m")
+    logger.info(f"{Colors.HEADER}Training model{Colors.ENDC}")
     train(
         model=model,
         optimizer=optimizer,
@@ -149,7 +146,7 @@ def main(args):
         assistant_id=args.assistant_id,
     )
     
-    logger.info(f"\033[32mTraining completed! Model saved to {args.output_path}\033[0m")
+    logger.info(f"{Colors.HEADER}Training completed! Model saved to {args.output_path}{Colors.ENDC}")
 
 
 if __name__ == "__main__":

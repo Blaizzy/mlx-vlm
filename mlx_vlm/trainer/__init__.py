@@ -1,5 +1,5 @@
 from .lora import LoRaLayer, replace_lora_with_linear
-from .trainer import Dataset, TrainingArgs, train, save_adapter
+from .trainer import Dataset, TrainingArgs, Colors, train, save_adapter
 from .utils import (
     apply_lora_layers,
     count_parameters,

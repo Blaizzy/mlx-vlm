@@ -16,7 +16,6 @@ from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
 
-# Terminal color codes
 class Colors:
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'
@@ -236,34 +235,24 @@ def default_loss(model, batch, train_on_completions=False, assistant_id=77091):
 
 
 def iterate_batches(dataset, batch_size, max_seq_length, train=False):
-    """
-    Iterate over batches with proper padding and length handling.
-    """
-    # Sort by sequence length for efficiency
-    def get_length(idx):
-        try:
-            item = dataset[idx]
-            return len(item.get("input_ids", []))
-        except:
-            return 0
+    """Iterate over batches without complex collation."""
     
     indices = list(range(len(dataset)))
-    indices.sort(key=get_length)
     
     # Distributed training support
     offset = mx.distributed.init().rank()
     step = mx.distributed.init().size()
+    
     if batch_size % step != 0:
         raise ValueError("The batch size must be divisible by the number of workers")
     
-    # Create batches
+    # Create batch indices
     batch_indices = [
         indices[i + offset : i + offset + batch_size : step]
         for i in range(0, len(indices) - batch_size + 1, batch_size)
     ]
     
     while True:
-        # Shuffle batches for training
         if train:
             batch_order = np.random.permutation(len(batch_indices))
         else:
@@ -274,93 +263,42 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
             for idx in batch_indices[batch_idx]:
                 try:
                     item = dataset[idx]
+                    
+                    # Simple truncation instead of padding
+                    if "input_ids" in item:
+                        if len(item["input_ids"]) > max_seq_length:
+                            item["input_ids"] = item["input_ids"][:max_seq_length]
+                            if "attention_mask" in item:
+                                item["attention_mask"] = item["attention_mask"][:max_seq_length]
+                    
                     batch_data.append(item)
                 except Exception as e:
-                    print(f"{Colors.WARNING}Warning: Error loading item {idx}: {e}{Colors.ENDC}")
+                    print(f"Warning: Error loading item {idx}: {e}")
                     continue
             
             if not batch_data:
                 continue
             
-            # Collate batch
-            batch = collate_fn(batch_data, max_seq_length)
-            yield batch
+            # For batch size 1, just yield the item
+            if batch_size == 1 and len(batch_data) == 1:
+                yield batch_data[0]
+            else:
+                # Simple stacking - assumes prepare_inputs handles padding
+                batch = {}
+                for key in batch_data[0].keys():
+                    try:
+                        values = [item[key] for item in batch_data]
+                        if all(isinstance(v, mx.array) for v in values):
+                            batch[key] = mx.stack(values)
+                        else:
+                            batch[key] = values
+                    except:
+                        batch[key] = values[0] if len(values) == 1 else values
+                
+                yield batch
         
         if not train:
             break
-
-
-def collate_fn(batch_data, max_seq_length):
-    """
-    Collate function to create padded batches.
-    """
-    import numpy as np
-    
-    batch = {}
-    
-    # Get all keys from the first item
-    keys = batch_data[0].keys()
-    
-    for key in keys:
-        if key == "input_ids":
-            # Pad input_ids to same length
-            sequences = [item[key] for item in batch_data]
-            lengths = [len(seq) for seq in sequences]
-            max_len = min(max(lengths), max_seq_length)
-            
-            padded = np.zeros((len(sequences), max_len), dtype=np.int32)
-            for i, seq in enumerate(sequences):
-                length = min(len(seq), max_len)
-                # Convert to numpy if it's an mlx array
-                if hasattr(seq, 'tolist'):
-                    seq = np.array(seq.tolist())
-                padded[i, :length] = seq[:length]
-            
-            batch[key] = mx.array(padded)
-            
-        elif key == "attention_mask":
-            # Pad attention_mask
-            masks = [item.get(key, mx.ones(len(item["input_ids"]))) for item in batch_data]
-            lengths = [len(mask) if hasattr(mask, '__len__') else 1 for mask in masks]
-            max_len = min(max(lengths), max_seq_length)
-            
-            padded = np.zeros((len(masks), max_len), dtype=np.float32)
-            for i, mask in enumerate(masks):
-                if mask is not None:
-                    length = min(len(mask) if hasattr(mask, '__len__') else 1, max_len)
-                    # Convert to numpy if it's an mlx array
-                    if hasattr(mask, 'tolist'):
-                        mask_np = np.array(mask.tolist())
-                    elif isinstance(mask, (list, np.ndarray)):
-                        mask_np = np.array(mask)
-                    else:
-                        mask_np = np.ones(length)
-                    
-                    if mask_np.ndim == 0:  # scalar
-                        padded[i, 0] = mask_np
-                    else:
-                        padded[i, :length] = mask_np[:length]
-            
-            batch[key] = mx.array(padded)
-            
-        elif key == "pixel_values":
-            # Stack pixel values
-            pixel_values = [item.get(key) for item in batch_data]
-            if all(pv is not None for pv in pixel_values):
-                batch[key] = mx.stack(pixel_values)
-            else:
-                batch[key] = None
-        else:
-            # Handle other keys
-            values = [item.get(key) for item in batch_data]
-            if all(v is not None for v in values):
-                try:
-                    batch[key] = mx.stack(values)
-                except:
-                    batch[key] = values
-    
-    return batch
-
 
 def evaluate(
     model,
