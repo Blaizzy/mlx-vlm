@@ -8,19 +8,14 @@ from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_reduce
 from mlx_lm.generate import maybe_quantize_kv_cache
 from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
-from .utils import (
-    StoppingCriteria,
-    apply_repetition_penalty,
-    load,
-    prepare_inputs,
-    tree_reduce,
-)
+from .utils import StoppingCriteria, apply_repetition_penalty, load, prepare_inputs
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None

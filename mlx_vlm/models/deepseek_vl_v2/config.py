@@ -1,3 +1,4 @@
+import inspect
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -95,6 +96,7 @@ class ModelConfig(BaseModelConfig):
     tile_tag: str = "2D"
     global_view_pos: str = "head"
     eos_token_id: Optional[List[int]] = None
+    quantization: Optional[Dict] = None
 
     @classmethod
     def from_dict(cls, params):
@@ -109,7 +111,8 @@ class ModelConfig(BaseModelConfig):
             **{
                 k: v
                 for k, v in params.items()
-                if k not in ["text_config", "vision_config", "projector_config"]
+                if k in inspect.signature(cls).parameters
+                and k not in ["text_config", "vision_config", "projector_config"]
             },
         )
 
