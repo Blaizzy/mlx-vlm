@@ -1,9 +1,2 @@
-from .idefics2 import (
-    LanguageModel,
-    Model,
-    ModelConfig,
-    PerceiverConfig,
-    TextConfig,
-    VisionConfig,
-    VisionModel,
-)
+from .config import ModelConfig, PerceiverConfig, TextConfig, VisionConfig
+from .idefics2 import LanguageModel, Model, VisionModel

@@ -9,37 +9,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-
-@dataclass
-class VisionConfig:
-    model_type: str
-    layers: int = 27
-    width: int = 1152
-    intermediate_size: int = 4304
-    num_attention_heads: int = 16
-    image_size: int = 384
-    patch_size: int = 16
-    num_channels: int = 3
-    layer_norm_eps: float = 1e-6
-    mlp_ratio: float = 3.7362
-    cls: str = None
-    params: dict = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
-
-@dataclass
-class MLPConfig:
-    width: int
-    intermediate_size: int
+from ..base import BaseModelConfig
+from .config import MLPConfig, VisionConfig
 
 
 def check_array_shape(arr):

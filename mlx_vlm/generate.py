@@ -8,19 +8,14 @@ from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_reduce
 from mlx_lm.generate import maybe_quantize_kv_cache
 from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
-from .utils import (
-    StoppingCriteria,
-    apply_repetition_penalty,
-    load,
-    prepare_inputs,
-    tree_reduce,
-)
+from .utils import StoppingCriteria, apply_repetition_penalty, load, prepare_inputs
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
@@ -154,6 +149,12 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
     async eval could be running pass in the streams to synchronize with prior
     to exiting the context manager.
     """
+    if not mx.metal.is_available():
+        try:
+            yield
+        finally:
+            return
+
     model_bytes = tree_reduce(
         lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
     )
@@ -169,7 +170,7 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
         )
     old_limit = mx.set_wired_limit(max_rec_size)
     try:
-        yield None
+        yield
     finally:
         if streams is not None:
             for s in streams:

@@ -1,5 +1,4 @@
 import inspect
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -11,45 +10,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
-
-
-@dataclass
-class TextConfig:
-    model_type: str = "molmo"
-    max_position_embeddings: int = 4096
-    d_model: int = 3584
-    n_heads: int = 28
-    n_kv_heads: int = 4
-    n_layers: int = 28
-    mlp_ratio: int = 4
-    max_sequence_length: int = 1024
-    act_output_multiplier: int = 0.5
-    mlp_hidden_size: int = 37888
-    vocab_size: int = 152064
-    embedding_size: Optional[int] = 152064
-    additional_vocab_size: Optional[int] = None
-    attention_dropout: float = 0.1
-    residual_dropout: float = 0.1
-    embedding_dropout: float = 0.1
-    layer_norm_eps: float = 1e-5
-    initializer_range: float = 0.02
-    pad_token_id: int = -1
-    rope: bool = True
-    rope_theta: float = 1000000.0
-    weight_tying: bool = False
-    rope_full_precision: bool = True
-    rope_impl: str = "interleave"
-    additional_vocab_size: Optional[int] = 128
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import TextConfig
 
 
 class SwiGLU(nn.Module):
@@ -190,6 +151,10 @@ class Molmo(nn.Module):
 
         if mask is None:
             mask = create_attention_mask(h, cache)
+        else:
+            seq_len = h.shape[-2]
+            causal_mask = mx.tril(mx.ones((seq_len, seq_len), dtype=mx.bool_))
+            mask = (mask & causal_mask) > 0
 
         for block, c in zip(self.blocks, cache):
             h = block(h, mask, c)

@@ -1,3 +1,4 @@
+import inspect
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -18,6 +19,50 @@ class LanguageModelOutput:
     logits: mx.array
     cross_attention_states: Optional[List[mx.array]] = None
     encoder_outputs: Optional[List[mx.array]] = None
+
+
+@dataclass
+class BaseModelConfig:
+    @classmethod
+    def from_dict(cls, params):
+        return cls(
+            **{
+                k: v
+                for k, v in params.items()
+                if k in inspect.signature(cls).parameters
+            }
+        )
+
+
+class BaseImageProcessor(ImageProcessor):
+    def __init__(
+        self,
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
+        size=(384, 384),
+        crop_size: Dict[str, int] = None,
+        resample=PILImageResampling.BICUBIC,
+        rescale_factor=1 / 255,
+        data_format=ChannelDimension.FIRST,
+    ):
+        crop_size = (
+            crop_size if crop_size is not None else {"height": 384, "width": 384}
+        )
+        crop_size = get_size_dict(
+            crop_size, default_to_square=True, param_name="crop_size"
+        )
+
+        self.image_mean = image_mean
+        self.image_std = image_std
+        self.size = size
+        self.resample = resample
+        self.rescale_factor = rescale_factor
+        self.data_format = data_format
+        self.crop_size = crop_size
+
+    @abstractmethod
+    def preprocess(self, images):
+        pass
 
 
 def expand2square(pil_img, background_color):
@@ -55,61 +100,6 @@ def check_array_shape(arr):
             return False
     else:
         return False
-
-
-class BaseImageProcessor(ImageProcessor):
-    def __init__(
-        self,
-        image_mean=(0.5, 0.5, 0.5),
-        image_std=(0.5, 0.5, 0.5),
-        size=(384, 384),
-        crop_size: Dict[str, int] = None,
-        resample=PILImageResampling.BICUBIC,
-        rescale_factor=1 / 255,
-        data_format=ChannelDimension.FIRST,
-    ):
-        crop_size = (
-            crop_size if crop_size is not None else {"height": 384, "width": 384}
-        )
-        crop_size = get_size_dict(
-            crop_size, default_to_square=True, param_name="crop_size"
-        )
-
-        self.image_mean = image_mean
-        self.image_std = image_std
-        self.size = size
-        self.resample = resample
-        self.rescale_factor = rescale_factor
-        self.data_format = data_format
-        self.crop_size = crop_size
-
-    @abstractmethod
-    def preprocess(self, images):
-        pass
-
-
-# Add this code to visualize the chunked attention mask
-def visualize_attention_mask(mask):
-    """Visualize attention mask with symbols for better readability."""
-    if mask is None:
-        print("No mask")
-        return
-
-    seq_len = mask.shape[0]
-
-    print("        ", end="")
-    for i in range(seq_len):
-        print(f"{i:2d} ", end="")
-    print()
-
-    for i in range(seq_len):
-        print(f"Token {i:2d}: ", end="")
-        for j in range(seq_len):
-            if mask[i, j]:
-                print(" ■ ", end="")
-            else:
-                print(" ⬚ ", end="")
-        print()
 
 
 def check_activation_stats(name, tensor):

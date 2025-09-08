@@ -5,46 +5,8 @@ from typing import List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-
-@dataclass
-class VisionConfig:
-    image_size: int = 560
-    patch_size: int = 14
-    num_channels: int = 3
-    hidden_size: int = 1280
-    intermediate_size: int = 5120
-    num_hidden_layers: int = 32
-    num_attention_heads: int = 16
-    max_num_tiles: int = 4
-    max_aspect_ratio_id: int = 8
-    num_global_layers: int = 8
-    norm_eps: float = 1e-5
-    attention_dropout: float = 0.0
-    hidden_dropout: float = 0.0
-    vision_output_dim: int = 7680
-    intermediate_layers_indices: List[int] = field(
-        default_factory=lambda: [3, 7, 15, 23, 30]
-    )
-    supported_aspect_ratios: Tuple[List[int]] = (
-        [1, 1],
-        [1, 2],
-        [1, 3],
-        [1, 4],
-        [2, 1],
-        [2, 2],
-        [3, 1],
-        [4, 1],
-    )
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from ..base import BaseModelConfig
+from .config import VisionConfig
 
 
 def check_array_shape(arr):

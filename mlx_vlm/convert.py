@@ -7,7 +7,7 @@ from typing import Callable, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map_with_path
-from mlx_lm.utils import dequantize_model, quantize_model, tree_flatten
+from mlx_lm.utils import dequantize_model, quantize_model
 
 from .utils import (
     MODEL_CONVERSION_DTYPES,
@@ -32,7 +32,7 @@ QUANT_RECIPES = [
 
 def mixed_quant_predicate_builder(
     recipe: str, model: nn.Module
-) -> Callable[[str, nn.Module, dict], Union[bool, dict]]:
+) -> Callable[[str, nn.Module], Union[bool, dict]]:
     group_size = 64
 
     recipe_config = {
@@ -63,7 +63,6 @@ def mixed_quant_predicate_builder(
     def mixed_quant_predicate(
         path: str,
         module: nn.Module,
-        config: dict,
     ) -> Union[bool, dict]:
         """Implements mixed quantization predicates with similar choices to, for example, llama.cpp's Q4_K_M.
         Ref: https://github.com/ggerganov/llama.cpp/blob/917786f43d0f29b7c77a0c56767c0fa4df68b1c5/src/llama.cpp#L5265
@@ -121,7 +120,7 @@ def convert(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
 
-    def base_quant_predicate(path, module, config):
+    def base_quant_predicate(path, module):
         if skip_multimodal_module(path):
             return False
         if not hasattr(module, "to_quantized"):

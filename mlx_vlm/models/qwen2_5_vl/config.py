@@ -2,9 +2,11 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
+from ..base import BaseModelConfig
+
 
 @dataclass
-class VisionConfig:
+class VisionConfig(BaseModelConfig):
     model_type: str = "qwen2_5_vl"
     depth: int = 32
     hidden_size: int = 1280
@@ -25,19 +27,9 @@ class VisionConfig:
     patch_size: int = 14
     fullatt_block_indexes: list[int] = field(default_factory=lambda: [7, 15, 23, 31])
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
 
 @dataclass
-class TextConfig:
+class TextConfig(BaseModelConfig):
     model_type: str
     hidden_size: int
     num_hidden_layers: int
@@ -64,19 +56,9 @@ class TextConfig:
             if not self.rope_scaling["type"] in ["mrope", "default"]:
                 raise ValueError(f"rope_scaling type must be 'mrope' or 'default'")
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
 
 @dataclass
-class ModelConfig:
+class ModelConfig(BaseModelConfig):
     text_config: TextConfig
     vision_config: VisionConfig
     model_type: str

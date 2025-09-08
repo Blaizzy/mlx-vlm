@@ -136,6 +136,25 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
     if input_dtype != mx.float32:
         x_flat = x_flat.astype(mx.float32)
 
+    header = """
+        // Improved cubic kernel function for better continuity
+        float cubic_kernel(float x) {
+            float absx = fabs(x);
+            float absx2 = absx * absx;
+            float absx3 = absx2 * absx;
+
+            // Use a=-0.5 for smoother interpolation
+            const float a = -0.5f;
+
+            if (absx <= 1.0f) {
+                return (a+2.0f)*absx3 - (a+3.0f)*absx2 + 1.0f;
+            } else if (absx < 2.0f) {
+                return a*absx3 - 5.0f*a*absx2 + 8.0f*a*absx - 4.0f*a;
+            }
+            return 0.0f;
+        };
+    """
+
     # Metal kernel source code
     source = """
         // Get thread position
@@ -182,23 +201,6 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
         float x_frac = x_in - x0;
         float y_frac = y_in - y0;
 
-        // Improved cubic kernel function for better continuity
-        auto cubic_kernel = [](float x) -> float {
-            float absx = fabs(x);
-            float absx2 = absx * absx;
-            float absx3 = absx2 * absx;
-
-            // Use a=-0.5 for smoother interpolation
-            const float a = -0.5f;
-
-            if (absx <= 1.0f) {
-                return (a+2.0f)*absx3 - (a+3.0f)*absx2 + 1.0f;
-            } else if (absx < 2.0f) {
-                return a*absx3 - 5.0f*a*absx2 + 8.0f*a*absx - 4.0f*a;
-            }
-            return 0.0f;
-        };
-
         // Perform bicubic interpolation with improved boundary handling
         float result = 0.0f;
         float weight_sum = 0.0f;  // Track weight sum for normalization
@@ -243,6 +245,7 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
         input_names=["input", "dims", "params"],
         output_names=["output"],
         source=source,
+        header=header,
     )
 
     # Run the kernel
@@ -261,6 +264,94 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
         result = result.astype(input_dtype)
 
     return result
+
+
+def grid_sample(x, grid):
+    """
+    Grid sample using MLX's built-in interpolate function.
+    Args:
+        x: MLX tensor of shape [B, C, H, W]
+        grid: MLX tensor of shape [B, gN, gM, 2]
+
+    Returns:
+        Interpolated MLX tensor
+    """
+
+    assert x.ndim == 4, "`x` must be 4D."
+    assert grid.ndim == 4, "`grid` must be 4D."
+
+    B, _, _, C = x.shape
+    _, gN, gM, D = grid.shape
+    out_shape = (B, gN, gM, C)
+
+    assert D == 2, "Last dim of `grid` must be size 2."
+
+    source = """
+        uint elem = thread_position_in_grid.x;
+        int H = x_shape[1];
+        int W = x_shape[2];
+        int C = x_shape[3];
+        int gH = grid_shape[1];
+        int gW = grid_shape[2];
+
+        int w_stride = C;
+        int h_stride = W * w_stride;
+        int b_stride = H * h_stride;
+
+        uint grid_idx = elem / C * 2;
+        float ix = ((grid[grid_idx] + 1) * W - 1) / 2;
+        float iy = ((grid[grid_idx + 1] + 1) * H - 1) / 2;
+
+        int ix_nw = floor(ix);
+        int iy_nw = floor(iy);
+
+        int ix_ne = ix_nw + 1;
+        int iy_ne = iy_nw;
+
+        int ix_sw = ix_nw;
+        int iy_sw = iy_nw + 1;
+
+        int ix_se = ix_nw + 1;
+        int iy_se = iy_nw + 1;
+
+        T nw = (ix_se - ix)    * (iy_se - iy);
+        T ne = (ix    - ix_sw) * (iy_sw - iy);
+        T sw = (ix_ne - ix)    * (iy    - iy_ne);
+        T se = (ix    - ix_nw) * (iy    - iy_nw);
+
+        int batch_idx = elem / C / gH / gW * b_stride;
+        int channel_idx = elem % C;
+        int base_idx = batch_idx + channel_idx;
+
+        T I_nw = x[base_idx + iy_nw * h_stride + ix_nw * w_stride];
+        T I_ne = x[base_idx + iy_ne * h_stride + ix_ne * w_stride];
+        T I_sw = x[base_idx + iy_sw * h_stride + ix_sw * w_stride];
+        T I_se = x[base_idx + iy_se * h_stride + ix_se * w_stride];
+
+        I_nw = iy_nw >= 0 && iy_nw <= H - 1 && ix_nw >= 0 && ix_nw <= W - 1 ? I_nw : 0;
+        I_ne = iy_ne >= 0 && iy_ne <= H - 1 && ix_ne >= 0 && ix_ne <= W - 1 ? I_ne : 0;
+        I_sw = iy_sw >= 0 && iy_sw <= H - 1 && ix_sw >= 0 && ix_sw <= W - 1 ? I_sw : 0;
+        I_se = iy_se >= 0 && iy_se <= H - 1 && ix_se >= 0 && ix_se <= W - 1 ? I_se : 0;
+
+        out[elem] = nw * I_nw + ne * I_ne + sw * I_sw + se * I_se;
+    """
+
+    kernel = mx.fast.metal_kernel(
+        name="grid_sample",
+        input_names=["x", "grid"],
+        output_names=["out"],
+        source=source,
+    )
+
+    outputs = kernel(
+        inputs=[x, grid],
+        template=[("T", x.dtype)],
+        output_shapes=[out_shape],
+        output_dtypes=[x.dtype],
+        grid=(mx.prod(mx.array(out_shape)), 1, 1),
+        threadgroup=(256, 1, 1),
+    )
+    return outputs[0]
 
 
 def get_optimal_threadgroup(out_w, out_h):

@@ -1,44 +1,12 @@
 import inspect
 import math
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import pixel_shuffle
-
-
-@dataclass
-class VisionConfig:
-    model_type: str
-    hidden_size: int
-    image_size: int
-    initializer_range: float
-    intermediate_size: int
-    norm_eps: float
-    num_attention_heads: int
-    num_channels: int
-    num_hidden_layers: int
-    patch_size: int
-    pixel_shuffle_ratio: float
-    projector_dropout: float
-    projector_input_dim: int
-    projector_output_dim: int
-    rope_theta: float
-    vision_feature_layer: int
-    vision_feature_select_strategy: str
-    vision_output_dim: int
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import VisionConfig
 
 
 def check_array_shape(arr):

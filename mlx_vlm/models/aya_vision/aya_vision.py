@@ -10,33 +10,9 @@ import mlx.nn as nn
 import numpy as np
 from mlx_lm.utils import snapshot_download
 
-from .language import LanguageModel, TextConfig
-from .vision import VisionConfig, VisionModel
-
-
-@dataclass
-class ModelConfig:
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    image_token_index: int = 255036
-    max_splits_per_img: int = 12
-    downsample_factor: int = 2
-    alignment_intermediate_size: int = 28672
-    adapter_layer_norm_eps: float = 1e-06
-    vision_feature_layer: int = -1
-    vision_feature_select_strategy: str = "full"
-    eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+from .config import ModelConfig
+from .language import LanguageModel
+from .vision import VisionModel
 
 
 class AyaVisionMultiModalProjector(nn.Module):
@@ -47,10 +23,11 @@ class AyaVisionMultiModalProjector(nn.Module):
         self.alignment_intermediate_size = getattr(
             config, "alignment_intermediate_size", config.text_config.hidden_size
         )
-        self.layernorm = nn.LayerNorm(
-            config.vision_config.hidden_size * (config.downsample_factor**2),
-            eps=config.adapter_layer_norm_eps,
-        )
+        if config.model_type == "aya_vision":
+            self.layernorm = nn.LayerNorm(
+                config.vision_config.hidden_size * (config.downsample_factor**2),
+                eps=config.adapter_layer_norm_eps,
+            )
 
         self.linear_1 = nn.Linear(
             config.vision_config.hidden_size * (config.downsample_factor**2),
@@ -69,7 +46,8 @@ class AyaVisionMultiModalProjector(nn.Module):
 
     def __call__(self, image_features):
         image_features = self.pixel_shuffle(image_features)
-        image_features = self.layernorm(image_features)
+        if self.config.model_type == "aya_vision":
+            image_features = self.layernorm(image_features)
         hidden_states = self.linear_1(image_features)
 
         # Split along last dimension and apply SwiGLU
@@ -173,6 +151,10 @@ class Model(nn.Module):
         inputs_embeds[:, image_positions, :] = reshaped_image_hidden_states
         return inputs_embeds
 
+    @property
+    def layers(self):
+        return self.language_model.model.layers
+
     def __call__(
         self,
         input_ids: mx.array,
@@ -187,3 +169,19 @@ class Model(nn.Module):
             input_ids, cache=cache, inputs_embeds=input_embddings
         )
         return logits
+
+    def sanitize(self, weights):
+        def transform_key(key):
+            if "model.vision_tower" in key:
+                key = key.replace("model.vision_tower", "vision_tower")
+            if "model.multi_modal_projector" in key:
+                key = key.replace(
+                    "model.multi_modal_projector", "multi_modal_projector"
+                )
+            if "model.language_model" in key:
+                key = key.replace("model.language_model", "language_model.model")
+            if "lm_head" in key and not key.startswith("language_model"):
+                key = key.replace("lm_head", "language_model.lm_head")
+            return key
+
+        return {transform_key(k): v for k, v in weights.items()}
