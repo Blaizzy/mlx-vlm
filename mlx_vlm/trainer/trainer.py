@@ -1,19 +1,38 @@
+# Copyright © 2024 MLX-VLM
+
 import json
+import time
 import warnings
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten, tree_map
+from tqdm import tqdm
+
+
+# Terminal color codes
+class Colors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
 
 def get_prompt(model_type, processor, conversation):
     if model_type == "paligemma":
         return conversation
-
+    
     if "chat_template" in processor.__dict__.keys():
         prompt = processor.apply_chat_template(
             conversation,
@@ -26,7 +45,7 @@ def get_prompt(model_type, processor, conversation):
             tokenize=False,
             add_generation_prompt=False,
         )
-
+    
     return prompt
 
 
@@ -51,21 +70,21 @@ class Dataset:
         self.config = config
         self.image_processor = image_processor
         self.image_resize_shape = image_resize_shape
-
+    
     def __len__(self):
         return len(self.dataset)
-
+    
     def __getitem__(self, idx):
         from mlx_vlm.utils import prepare_inputs
-
+        
         item = self.dataset[idx]
-
+        
         images = item.get("images", item.get("image", None))
         conversations = item.get("messages", item.get("conversations"))
         if images in (None, "", []):
             images = []
         prompts = []
-
+        
         if isinstance(conversations, list) and isinstance(conversations[0], list):
             for conversation in conversations:
                 if self.config["model_type"] == "pixtral":
@@ -74,12 +93,12 @@ class Dataset:
                         warnings.warn(
                             "Pixtral batch processing is not supported yet. Set batch size to 1."
                         )
-
+                
                 prompt = get_prompt(
                     self.config["model_type"], self.processor, conversation
                 )
                 prompts.append(prompt)
-
+        
         else:
             if self.config["model_type"] == "pixtral":
                 conversations = [json.loads(i) for i in conversations]
@@ -87,34 +106,19 @@ class Dataset:
                 self.config["model_type"], self.processor, conversations
             )
             prompts.append(prompt)
-
-        image_token_index = self.config["image_token_index"]
-
+        
+        image_token_index = getattr(self.config, "image_token_index", "image_token_id")
+        
         inputs = prepare_inputs(
-            self.processor,
-            images,
-            prompts,
-            image_token_index,
-            self.image_resize_shape,
+            processor=self.processor,
+            images=images,
+            audio=None,
+            prompts=prompts,
+            image_token_index=image_token_index,
+            resize_shape=self.image_resize_shape
         )
-        input_ids = inputs["input_ids"]
-        pixel_values = inputs["pixel_values"]
-        mask = inputs["attention_mask"]
-        kwargs = {
-            k: v
-            for k, v in inputs.items()
-            if k not in ["input_ids", "pixel_values", "attention_mask"]
-        }
-
-        if mask is None:
-            mask = mx.ones_like(input_ids)
-
-        return {
-            "pixel_values": pixel_values,
-            "input_ids": input_ids,
-            "attention_mask": mask,
-            **kwargs,
-        }
+        
+        return inputs
 
 
 def grad_checkpoint(layer):
@@ -164,135 +168,441 @@ class TrainingArgs:
         default=False,
         metadata={"help": "Use gradient checkpointing to reduce memory use."},
     )
+    learning_rate: float = field(
+        default=1e-5,
+        metadata={"help": "Learning rate."},
+    )
+    grad_clip: float = field(
+        default=None,
+        metadata={"help": "Gradient clipping value."},
+    )
 
 
-def default_loss(model, inputs, targets, lengths):
-    logits = model(inputs)
-    logits = logits.astype(mx.float32)
-
-    length_mask = mx.arange(inputs.shape[1])[None, :] < lengths[:, None]
-
-    ce = nn.losses.cross_entropy(logits, targets) * length_mask
-    ntoks = length_mask.sum()
+def default_loss(model, batch, train_on_completions=False, assistant_id=77091):
+    """
+    Compute loss for vision-language model with proper handling of padding and masking.
+    """
+    # Extract inputs from batch
+    pixel_values = batch.get("pixel_values")
+    input_ids = batch["input_ids"]
+    attention_mask = batch.get("attention_mask", mx.ones_like(input_ids))
+    
+    # Prepare targets and inputs
+    targets = input_ids[:, 1:]
+    inputs_for_model = input_ids[:, :-1]
+    attention_mask_for_model = attention_mask[:, :-1]
+    
+    # Get additional kwargs
+    kwargs = {
+        k: v
+        for k, v in batch.items()
+        if k not in ["input_ids", "pixel_values", "attention_mask"]
+    }
+    
+    # Forward pass
+    outputs = model(inputs_for_model, pixel_values, attention_mask_for_model, **kwargs)
+    logits = outputs.logits.astype(mx.float32)
+    
+    # Align logits with targets if needed
+    if logits.shape[1] != targets.shape[1]:
+        min_len = min(logits.shape[1], targets.shape[1])
+        logits = logits[:, :min_len, :]
+        targets = targets[:, :min_len]
+        attention_mask = attention_mask[:, 1:min_len+1]
+    else:
+        attention_mask = attention_mask[:, 1:]
+    
+    # Create weight mask for loss computation
+    if train_on_completions:
+        # Only train on assistant responses
+        weight_mask = mx.ones_like(attention_mask)
+        for i in range(input_ids.shape[0]):
+            assistant_indices = mx.where(input_ids[i] == assistant_id)[0]
+            if len(assistant_indices) > 0:
+                first_assistant_idx = assistant_indices[0].item()
+                weight_mask[i, :first_assistant_idx] = 0
+    else:
+        weight_mask = attention_mask
+    
+    # Compute cross entropy loss
+    ce = nn.losses.cross_entropy(logits, targets) * weight_mask
+    ntoks = weight_mask.sum()
+    
+    # Avoid division by zero
+    ntoks = mx.maximum(ntoks, 1)
     ce = ce.sum() / ntoks
-
+    
     return ce, ntoks
 
 
-class Trainer:
-    def __init__(
-        self,
-        model,
-        optimizer,
-        train_on_completions=False,
-        assistant_id=77091,
-        clip_gradients=None,
-    ):
-        self.model = model
-        self.optimizer = optimizer
-        self.train_on_completions = train_on_completions
-        self.assistant_id = assistant_id
-        self.clip_gradients = clip_gradients
-
-    def loss_fn(self, model, batch):
-        pixel_values = batch["pixel_values"]
-        input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"]
-        lengths = mx.sum(attention_mask, axis=1)
-        labels = input_ids[:, 1:]
-
-        batch_size, seq_length = input_ids.shape
-
-        if self.train_on_completions:
-            weight_mask = mx.ones_like(attention_mask)
-
-            assistant_response_index = np.where(input_ids == self.assistant_id)[1]
-            range_matrix = mx.repeat(
-                mx.expand_dims(mx.arange(seq_length), 0), batch_size, axis=0
-            )
-            assistant_mask = range_matrix <= mx.array(assistant_response_index).reshape(
-                -1, 1
-            )
-            # Apply the mask to weight_mask
-            weight_mask = mx.where(
-                assistant_mask, mx.zeros_like(weight_mask), weight_mask
-            )[:, 1:]
+def iterate_batches(dataset, batch_size, max_seq_length, train=False):
+    """
+    Iterate over batches with proper padding and length handling.
+    """
+    # Sort by sequence length for efficiency
+    def get_length(idx):
+        try:
+            item = dataset[idx]
+            return len(item.get("input_ids", []))
+        except:
+            return 0
+    
+    indices = list(range(len(dataset)))
+    indices.sort(key=get_length)
+    
+    # Distributed training support
+    offset = mx.distributed.init().rank()
+    step = mx.distributed.init().size()
+    if batch_size % step != 0:
+        raise ValueError("The batch size must be divisible by the number of workers")
+    
+    # Create batches
+    batch_indices = [
+        indices[i + offset : i + offset + batch_size : step]
+        for i in range(0, len(indices) - batch_size + 1, batch_size)
+    ]
+    
+    while True:
+        # Shuffle batches for training
+        if train:
+            batch_order = np.random.permutation(len(batch_indices))
         else:
-            weight_mask = None
-
-        input_ids = input_ids[:, :-1]
-
-        kwargs = {
-            k: v
-            for k, v in batch.items()
-            if k not in ["input_ids", "pixel_values", "attention_mask"]
-        }
-
-        # Forward pass
-        outputs = model(input_ids, pixel_values, attention_mask, **kwargs)
-
-        # Cast to float32
-        logits = outputs.logits.astype(mx.float32)
-
-        # Ensure logits and labels have the same sequence length
-        def align_logits_with_labels(logits, labels):
-            if logits.shape[1] < labels.shape[1]:
-                pad_length = labels.shape[1] - logits.shape[1]
-                pad_width = ((0, 0), (0, pad_length), (0, 0))
-                return mx.pad(logits, pad_width, mode="constant", constant_values=-100)
-            elif logits.shape[1] > labels.shape[1]:
-                return logits[:, -labels.shape[1] :, :]
-            return logits
-
-        logits = align_logits_with_labels(logits, labels)
-
-        length_mask = mx.arange(input_ids.shape[1])[None, :] < lengths[:, None]
-
-        # Compute loss only on non-padded tokens
-        ce = (
-            nn.losses.cross_entropy(
-                logits,
-                labels,
-                weights=weight_mask,
-            )
-            * length_mask
-        )
-        ntoks = length_mask.sum()
-        ce = ce.sum() / ntoks
-
-        return ce
-
-    def train_step(self, batch):
-        loss_and_grad_fn = nn.value_and_grad(self.model, self.loss_fn)
-        loss, grads = loss_and_grad_fn(self.model, batch)
-
-        # Add gradient clipping
-        if self.clip_gradients is not None:
-            grads = tree_map(
-                lambda g: mx.clip(g, -self.clip_gradients, self.clip_gradients), grads
-            )
-
-        self.optimizer.update(self.model, grads)
-
-        return loss
-
-    @mx.compile
-    def train_epoch(self, dataloader):
-        total_loss = 0
-        for batch in dataloader:
-            loss = self.train_step(batch)
-            mx.eval(self.model, self.optimizer.state)
-            total_loss += loss
-        return total_loss / len(dataloader)
+            batch_order = range(len(batch_indices))
+        
+        for batch_idx in batch_order:
+            batch_data = []
+            for idx in batch_indices[batch_idx]:
+                try:
+                    item = dataset[idx]
+                    batch_data.append(item)
+                except Exception as e:
+                    print(f"{Colors.WARNING}Warning: Error loading item {idx}: {e}{Colors.ENDC}")
+                    continue
+            
+            if not batch_data:
+                continue
+            
+            # Collate batch
+            batch = collate_fn(batch_data, max_seq_length)
+            yield batch
+        
+        if not train:
+            break
 
 
-def save_adapter(
-    model: nn.Module,
-    adapter_file: Union[str, Path],
+def collate_fn(batch_data, max_seq_length):
+    """
+    Collate function to create padded batches.
+    """
+    import numpy as np
+    
+    batch = {}
+    
+    # Get all keys from the first item
+    keys = batch_data[0].keys()
+    
+    for key in keys:
+        if key == "input_ids":
+            # Pad input_ids to same length
+            sequences = [item[key] for item in batch_data]
+            lengths = [len(seq) for seq in sequences]
+            max_len = min(max(lengths), max_seq_length)
+            
+            padded = np.zeros((len(sequences), max_len), dtype=np.int32)
+            for i, seq in enumerate(sequences):
+                length = min(len(seq), max_len)
+                # Convert to numpy if it's an mlx array
+                if hasattr(seq, 'tolist'):
+                    seq = np.array(seq.tolist())
+                padded[i, :length] = seq[:length]
+            
+            batch[key] = mx.array(padded)
+            
+        elif key == "attention_mask":
+            # Pad attention_mask
+            masks = [item.get(key, mx.ones(len(item["input_ids"]))) for item in batch_data]
+            lengths = [len(mask) if hasattr(mask, '__len__') else 1 for mask in masks]
+            max_len = min(max(lengths), max_seq_length)
+            
+            padded = np.zeros((len(masks), max_len), dtype=np.float32)
+            for i, mask in enumerate(masks):
+                if mask is not None:
+                    length = min(len(mask) if hasattr(mask, '__len__') else 1, max_len)
+                    # Convert to numpy if it's an mlx array
+                    if hasattr(mask, 'tolist'):
+                        mask_np = np.array(mask.tolist())
+                    elif isinstance(mask, (list, np.ndarray)):
+                        mask_np = np.array(mask)
+                    else:
+                        mask_np = np.ones(length)
+                    
+                    if mask_np.ndim == 0:  # scalar
+                        padded[i, 0] = mask_np
+                    else:
+                        padded[i, :length] = mask_np[:length]
+            
+            batch[key] = mx.array(padded)
+            
+        elif key == "pixel_values":
+            # Stack pixel values
+            pixel_values = [item.get(key) for item in batch_data]
+            if all(pv is not None for pv in pixel_values):
+                batch[key] = mx.stack(pixel_values)
+            else:
+                batch[key] = None
+        else:
+            # Handle other keys
+            values = [item.get(key) for item in batch_data]
+            if all(v is not None for v in values):
+                try:
+                    batch[key] = mx.stack(values)
+                except:
+                    batch[key] = values
+    
+    return batch
+
+
+def evaluate(
+    model,
+    dataset,
+    batch_size,
+    num_batches,
+    max_seq_length=2048,
+    loss_fn=default_loss,
+    train_on_completions=False,
+    assistant_id=77091,
 ):
+    """
+    Evaluate the model on validation dataset.
+    """
+    model.eval()
+    all_losses = mx.array(0.0)
+    ntokens = mx.array(0)
+    
+    loss_fn_partial = partial(
+        loss_fn,
+        train_on_completions=train_on_completions,
+        assistant_id=assistant_id
+    )
+    
+    index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
+    
+    for _, batch in tqdm(
+        zip(
+            index_iterator,
+            iterate_batches(
+                dataset=dataset,
+                batch_size=batch_size,
+                max_seq_length=max_seq_length,
+            ),
+        ),
+        desc="Calculating loss...",
+        total=min(len(dataset) // batch_size, num_batches) if num_batches != -1 else len(dataset) // batch_size,
+    ):
+        losses, toks = loss_fn_partial(model, batch)
+        all_losses += losses * toks
+        ntokens += toks
+        mx.eval(all_losses, ntokens)
+    
+    all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
+    ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
+    
+    return (all_losses / mx.maximum(ntokens, 1)).item()
+
+
+def train(
+    model,
+    optimizer,
+    train_dataset,
+    val_dataset,
+    args: TrainingArgs = TrainingArgs(),
+    loss_fn=default_loss,
+    train_on_completions=False,
+    assistant_id=77091,
+):
+    """
+    Main training function for vision-language models.
+    """
+    # Set memory limit if using Metal
+    if mx.metal.is_available():
+        mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
+    
+    print(f"{Colors.HEADER}Starting training..., iterations: {args.iters}{Colors.ENDC}")
+    
+    # Initialize distributed training
+    world = mx.distributed.init()
+    world_size = world.size()
+    rank = world.rank()
+    if world_size > 1:
+        print(f"Node {rank} of {world_size}")
+    
+    # Enable gradient checkpointing if requested
+    if args.grad_checkpoint:
+        if hasattr(model, 'layers'):
+            grad_checkpoint(model.layers[0])
+    
+    # Create loss function with partial application
+    loss_fn_partial = partial(
+        loss_fn,
+        train_on_completions=train_on_completions,
+        assistant_id=assistant_id
+    )
+    
+    # Compile training step
+    state = [model.state, optimizer.state, mx.random.state]
+    
+    @partial(mx.compile, inputs=state, outputs=state)
+    def step(batch):
+        # Forward and backward pass
+        (lvalue, toks), grad = loss_value_and_grad(model, batch)
+        
+        # Clean gradients - remove non-trainable parameters
+        grad = clean_gradients(grad)
+        
+        # Gradient clipping
+        if args.grad_clip is not None:
+            grad = tree_map(
+                lambda g: mx.clip(g, -args.grad_clip, args.grad_clip),
+                grad
+            )
+        
+        # All reduce the gradients if running in distributed mode
+        grad = average_gradients(grad)
+        
+        # Model update
+        optimizer.update(model, grad)
+        
+        return lvalue, toks
+    
+    loss_value_and_grad = nn.value_and_grad(model, loss_fn_partial)
+    
+    def clean_gradients(grads):
+        """Remove non-trainable gradients like rope_deltas."""
+        if isinstance(grads, dict):
+            cleaned = {}
+            for key, value in grads.items():
+                if key in ['rope_deltas', 'position_ids', 'cache', 'attention_mask']:
+                    continue
+                elif isinstance(value, dict):
+                    cleaned_value = clean_gradients(value)
+                    if cleaned_value:
+                        cleaned[key] = cleaned_value
+                else:
+                    cleaned[key] = value
+            return cleaned
+        return grads
+    
+    # Training metrics
+    model.train()
+    losses = 0
+    n_tokens = 0
+    steps = 0
+    trained_tokens = 0
+    train_time = 0
+    
+    # Main training loop
+    for it, batch in zip(
+        range(1, args.iters + 1),
+        iterate_batches(
+            dataset=train_dataset,
+            batch_size=args.batch_size,
+            max_seq_length=args.max_seq_length,
+            train=True,
+        ),
+    ):
+        tic = time.perf_counter()
+        
+        # Validation
+        if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
+            tic_val = time.perf_counter()
+            val_loss = evaluate(
+                model=model,
+                dataset=val_dataset,
+                batch_size=args.batch_size,
+                num_batches=args.val_batches,
+                max_seq_length=args.max_seq_length,
+                loss_fn=loss_fn,
+                train_on_completions=train_on_completions,
+                assistant_id=assistant_id,
+            )
+            model.train()
+            val_time = time.perf_counter() - tic_val
+            
+            if rank == 0:
+                print(
+                    f"{Colors.OKCYAN}Iter {it}: "
+                    f"Val loss {val_loss:.3f}, "
+                    f"Val took {val_time:.3f}s{Colors.ENDC}",
+                    flush=True,
+                )
+            
+            tic = time.perf_counter()
+        
+        # Training step
+        lvalue, toks = step(batch)
+        losses += lvalue
+        n_tokens += toks
+        steps += 1
+        mx.eval(state, losses, n_tokens)
+        train_time += time.perf_counter() - tic
+        
+        # Report training metrics
+        if it % args.steps_per_report == 0 or it == args.iters:
+            train_loss = mx.distributed.all_sum(losses, stream=mx.cpu).item()
+            train_loss /= steps * world_size
+            n_tokens_total = mx.distributed.all_sum(n_tokens, stream=mx.cpu).item()
+            learning_rate = optimizer.learning_rate.item() if hasattr(optimizer.learning_rate, 'item') else args.learning_rate
+            it_sec = args.steps_per_report / train_time
+            tokens_sec = float(n_tokens_total) / train_time
+            trained_tokens += n_tokens_total
+            peak_mem = mx.get_peak_memory() / 1e9
+            
+            if rank == 0:
+                print(
+                    f"Iter {it}: Train loss {Colors.OKGREEN}{train_loss:.3f}{Colors.ENDC}, "
+                    f"Learning Rate {learning_rate:.3e}, "
+                    f"It/sec {it_sec:.3f}, "
+                    f"Tokens/sec {tokens_sec:.3f}, "
+                    f"Trained Tokens {trained_tokens}, "
+                    f"Peak mem {peak_mem:.3f} GB",
+                    flush=True,
+                )
+            
+            # Reset metrics
+            losses = 0
+            n_tokens = 0
+            steps = 0
+            train_time = 0
+        
+        # Save checkpoint
+        if it % args.steps_per_save == 0 and rank == 0:
+            save_adapter(model, args.adapter_file)
+            checkpoint = (
+                Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
+            )
+            save_adapter(model, checkpoint)
+            print(
+                f"{Colors.OKBLUE}Iter {it}: Saved adapter weights to "
+                f"{args.adapter_file} and {checkpoint}.{Colors.ENDC}",
+                flush=True,
+            )
+    
+    # Save final weights
+    if rank == 0:
+        save_adapter(model, args.adapter_file)
+        print(f"{Colors.OKGREEN}Saved final adapter weights to {args.adapter_file}.{Colors.ENDC}")
+
+
+def save_adapter(model: nn.Module, adapter_file: Union[str, Path]):
+    """Save adapter weights and config."""
     path = Path(adapter_file)
-    if hasattr(model.config, "lora"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Save adapter config if available
+    if hasattr(model, 'config') and hasattr(model.config, "lora"):
         with open(path.parent / "adapter_config.json", "w") as f:
-            json.dump(model.config.lora, f)
+            json.dump(model.config.lora, f, indent=2)
+    
+    # Save weights
     flattened_tree = tree_flatten(model.trainable_parameters())
     mx.save_safetensors(str(adapter_file), dict(flattened_tree))
