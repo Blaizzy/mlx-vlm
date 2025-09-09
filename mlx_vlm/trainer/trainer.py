@@ -2,7 +2,6 @@
 
 import json
 import time
-import warnings
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -15,126 +14,7 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
-
-class Colors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-
-
-def get_prompt(model_type, processor, conversation):
-    if model_type == "paligemma":
-        return conversation
-    
-    if "chat_template" in processor.__dict__.keys():
-        prompt = processor.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-    elif "tokenizer" in processor.__dict__.keys():
-        prompt = processor.tokenizer.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-    
-    return prompt
-
-
-class Dataset:
-    def __init__(
-        self,
-        hf_dataset,
-        config,
-        processor,
-        image_processor=None,
-        take=None,
-        split=None,
-        image_resize_shape=None,
-    ):
-        if split is not None:
-            self.dataset = hf_dataset[split]
-        else:
-            self.dataset = hf_dataset
-        if take is not None:
-            self.dataset = self.dataset.take(take)
-        self.processor = processor
-        self.config = config
-        self.image_processor = image_processor
-        self.image_resize_shape = image_resize_shape
-    
-    def __len__(self):
-        return len(self.dataset)
-    
-    def __getitem__(self, idx):
-        from mlx_vlm.utils import prepare_inputs
-        
-        item = self.dataset[idx]
-        
-        images = item.get("images", item.get("image", None))
-        conversations = item.get("messages", item.get("conversations"))
-        if images in (None, "", []):
-            images = []
-        prompts = []
-        
-        if isinstance(conversations, list) and isinstance(conversations[0], list):
-            for conversation in conversations:
-                if self.config["model_type"] == "pixtral":
-                    conversation = [json.loads(i) for i in conversation]
-                    if len(conversations) > 1:
-                        warnings.warn(
-                            "Pixtral batch processing is not supported yet. Set batch size to 1."
-                        )
-                
-                prompt = get_prompt(
-                    self.config["model_type"], self.processor, conversation
-                )
-                prompts.append(prompt)
-        
-        else:
-            if self.config["model_type"] == "pixtral":
-                conversations = [json.loads(i) for i in conversations]
-            prompt = get_prompt(
-                self.config["model_type"], self.processor, conversations
-            )
-            prompts.append(prompt)
-        
-        image_token_index = getattr(self.config, "image_token_index", "image_token_id")
-        
-        inputs = prepare_inputs(
-            processor=self.processor,
-            images=images,
-            audio=None,
-            prompts=prompts,
-            image_token_index=image_token_index,
-            resize_shape=self.image_resize_shape
-        )
-        
-        return inputs
-
-
-def grad_checkpoint(layer):
-    """
-    Update all instances of type(layer) to use gradient checkpointing.
-    """
-    fn = type(layer).__call__
-
-    def checkpointed_fn(model, *args, **kwargs):
-        def inner_fn(params, *args, **kwargs):
-            model.update(params)
-            return fn(model, *args, **kwargs)
-
-        return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
-
-    type(layer).__call__ = checkpointed_fn
-
+from .utils import grad_checkpoint, Colors
 
 @dataclass
 class TrainingArgs:
@@ -180,26 +60,23 @@ class TrainingArgs:
 def default_loss(model, inputs, targets, lengths, train_on_completions=False, assistant_id=77091):
     outputs = model(inputs)
     logits = outputs.logits.astype(mx.float32)
-    
-    # Clip for stability
-    logits = mx.clip(logits, -50.0, 50.0)
-    
-    # Simple length-based masking (like MLX-LM)
+
     batch_size, seq_len = targets.shape
-    steps = mx.arange(seq_len)[None, :]  # (1, seq_len)
-    mask = steps < lengths[:, None]  # (batch_size, seq_len)
-    
+    steps = mx.arange(seq_len)[None, :]
+
+    base_mask = steps < lengths[:, None]
+
     if train_on_completions:
-        # Simple approach: mask out first 50% of each sequence
-        # This avoids complex assistant_id logic that can cause issues
-        half_lengths = lengths // 2
-        start_mask = steps >= half_lengths[:, None]
-        mask = mask & start_mask
-    
-    # Convert to float for computation
+        eq = (inputs == assistant_id)
+        idxs = mx.arange(seq_len)[None, :]
+        last_ass_idx = mx.where(eq, idxs, mx.full_like(idxs, -1)).max(axis=1)  # (B,)
+        comp_mask = steps > last_ass_idx[:, None]
+        mask = base_mask & comp_mask
+    else:
+        mask = base_mask
+
     weight_mask = mask.astype(mx.float32)
-    
-    # Compute loss
+
     ce = nn.losses.cross_entropy(logits, targets) * weight_mask
     ntoks = mx.maximum(weight_mask.sum(), 1)
     ce = ce.sum() / ntoks
@@ -396,7 +273,7 @@ def train(
     model,
     optimizer,
     train_dataset,
-    val_dataset,
+    val_dataset = None,
     args: TrainingArgs = TrainingArgs(),
     loss_fn=default_loss,
     train_on_completions=False,
@@ -410,6 +287,8 @@ def train(
         mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
     
     print(f"{Colors.HEADER}Starting training..., iterations: {args.iters}{Colors.ENDC}")
+    from .utils import print_trainable_parameters
+    print_trainable_parameters(model)
     
     # Initialize distributed training
     world = mx.distributed.init()
@@ -417,6 +296,9 @@ def train(
     rank = world.rank()
     if world_size > 1:
         print(f"Node {rank} of {world_size}")
+
+    if val_dataset is None and rank == 0:
+        print(f"{Colors.OKBLUE}No validation dataset provided — training will run without validation.{Colors.ENDC}")
     
     # Enable gradient checkpointing if requested
     if args.grad_checkpoint:
@@ -438,40 +320,59 @@ def train(
         inputs = batch["input_ids"][:, :-1]
         targets = batch["input_ids"][:, 1:]
         lengths = batch["attention_mask"].sum(axis=1)
-        
+
         (lvalue, toks), grad = loss_value_and_grad(model, inputs, targets, lengths)
-        
+
         # Gradient clipping
         if args.grad_clip is not None:
             grad = tree_map(
                 lambda g: mx.clip(g, -args.grad_clip, args.grad_clip),
                 grad
             )
-        
+
         # Average gradients for distributed training
         grad = average_gradients(grad)
-        
+
+        # Sanitize gradients before optimizer update
+        grad = clean_gradients(grad)
+        grad = prune_to_structure(grad, model.trainable_parameters())
+
         # Update model
         optimizer.update(model, grad)
-        
+
         return lvalue, toks
     
     loss_value_and_grad = nn.value_and_grad(model, loss_fn_partial)
     
     def clean_gradients(grads):
-        """Remove non-trainable gradients like rope_deltas."""
+        """Remove non-trainable / transient gradients like rope_deltas, cache etc."""
         if isinstance(grads, dict):
             cleaned = {}
             for key, value in grads.items():
                 if key in ['rope_deltas', 'position_ids', 'cache', 'attention_mask']:
                     continue
-                elif isinstance(value, dict):
-                    cleaned_value = clean_gradients(value)
-                    if cleaned_value:
-                        cleaned[key] = cleaned_value
+                if isinstance(value, dict):
+                    nested = clean_gradients(value)
+                    if nested:
+                        cleaned[key] = nested
                 else:
                     cleaned[key] = value
             return cleaned
+        return grads
+
+    def prune_to_structure(grads, ref):
+        """Prune gradient tree to match the structure of the reference (trainable parameters).
+        This avoids KeyError in optimizers when grads contain extra keys.
+        """
+        if isinstance(grads, dict) and isinstance(ref, dict):
+            pruned = {}
+            for k, v in grads.items():
+                if k in ref:
+                    pruned_child = prune_to_structure(v, ref[k])
+                    if pruned_child is not None:
+                        pruned[k] = pruned_child
+            return pruned
+        # For non-dict leaves, just return as-is
         return grads
     
     # Training metrics
@@ -493,9 +394,9 @@ def train(
         ),
     ):
         tic = time.perf_counter()
-        
-        # Validation
-        if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
+
+        # Validation (only if a validation dataset is provided)
+        if val_dataset is not None and (it == 1 or it % args.steps_per_eval == 0 or it == args.iters):
             tic_val = time.perf_counter()
             val_loss = evaluate(
                 model=model,
@@ -509,7 +410,7 @@ def train(
             )
             model.train()
             val_time = time.perf_counter() - tic_val
-            
+
             if rank == 0:
                 print(
                     f"{Colors.OKCYAN}Iter {it}: "
@@ -517,9 +418,9 @@ def train(
                     f"Val took {val_time:.3f}s{Colors.ENDC}",
                     flush=True,
                 )
-            
+
             tic = time.perf_counter()
-        
+
         # Training step
         lvalue, toks = step(batch)
         mx.clear_cache()
@@ -528,7 +429,7 @@ def train(
         steps += 1
         mx.eval(state, losses, n_tokens)
         train_time += time.perf_counter() - tic
-        
+
         # Report training metrics
         if it % args.steps_per_report == 0 or it == args.iters:
             train_loss = mx.distributed.all_sum(losses, stream=mx.cpu).item()
@@ -539,7 +440,7 @@ def train(
             tokens_sec = float(n_tokens_total) / train_time
             trained_tokens += n_tokens_total
             peak_mem = mx.get_peak_memory() / 1e9
-            
+
             if rank == 0:
                 print(
                     f"Iter {it}: Train loss {Colors.OKGREEN}{train_loss:.3f}{Colors.ENDC}, "
@@ -550,13 +451,13 @@ def train(
                     f"Peak mem {peak_mem:.3f} GB",
                     flush=True,
                 )
-            
+
             # Reset metrics
             losses = 0
             n_tokens = 0
             steps = 0
             train_time = 0
-        
+
         # Save checkpoint
         if it % args.steps_per_save == 0 and rank == 0:
             save_adapter(model, args.adapter_file)

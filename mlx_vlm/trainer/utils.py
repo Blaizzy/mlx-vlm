@@ -2,9 +2,38 @@ import json
 from pathlib import Path
 
 import mlx.nn as nn
+import mlx.core as mx
 from mlx.utils import tree_flatten
 
 from .lora import LoRaLayer
+
+
+class Colors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+
+def grad_checkpoint(layer):
+    """
+    Update all instances of type(layer) to use gradient checkpointing.
+    """
+    fn = type(layer).__call__
+
+    def checkpointed_fn(model, *args, **kwargs):
+        def inner_fn(params, *args, **kwargs):
+            model.update(params)
+            return fn(model, *args, **kwargs)
+
+        return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
+
+    type(layer).__call__ = checkpointed_fn
 
 
 def get_module_by_name(model, name):
@@ -148,7 +177,7 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
             raise ValueError("The adapter does not have lora params in the config")
 
     # TODO: add lora params to the config and load them here
-    list_of_modules = find_all_linear_names(model.language_model.model)
+    list_of_modules = find_all_linear_names(model.language_model)
     if config is not None:
         model = get_peft_model(model, list_of_modules, **config)
     else:
@@ -158,3 +187,24 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
     model.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
 
     return model
+
+
+def unfreeze_modules(model: nn.Module, module_names):
+    """Unfreeze modules whose qualified names match any of the given patterns.
+
+    This scans model.named_modules() so nested components like
+    "vision_tower.layers.0" are handled as well.
+    """
+    targets = set(module_names)
+    found = set()
+    for full_name, sub in model.named_modules():
+        top = full_name.split(".")[0] if full_name else ""
+        if any((name == top) or (name in full_name) for name in targets):
+            if hasattr(sub, "unfreeze"):
+                sub.unfreeze()
+                found.add(top or full_name)
+    if not found:
+        print(
+            "[warn] unfreeze_modules: no matching modules found for patterns:",
+            ", ".join(module_names),
+        )

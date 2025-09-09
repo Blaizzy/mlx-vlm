@@ -7,7 +7,12 @@ from datasets import load_dataset
 
 from .prompt_utils import apply_chat_template
 from .trainer import Dataset, TrainingArgs, Colors, train, print_trainable_parameters
-from .trainer.utils import apply_lora_layers, find_all_linear_names, get_peft_model
+from .trainer.utils import (
+    apply_lora_layers,
+    find_all_linear_names,
+    get_peft_model,
+    unfreeze_modules,
+)
 from .utils import load, load_image_processor
 
 logging.basicConfig(level=logging.INFO)
@@ -25,7 +30,7 @@ def main(args):
     if model_type in unsupported_for_training:
         raise ValueError(
             f"{Colors.FAIL}Model type {model_type} not supported for training. "
-            "Please choose a different model or remove it from the unsupported list.{Colors.ENDC}"
+            f"Please choose a different model or remove it from the unsupported list.{Colors.ENDC}"
         )
     config = model.config.__dict__
     image_processor = load_image_processor(args.model_path)
@@ -91,7 +96,7 @@ def main(args):
     )
     
     # Use train dataset for validation if no validation dataset is provided
-    val_dataset = train_dataset
+    val_dataset = None
     
     adapter_path = args.adapter_path
     if adapter_path:
@@ -115,7 +120,22 @@ def main(args):
             rank=args.lora_rank,
             alpha=args.lora_alpha,
             dropout=args.lora_dropout,
+            verbose=False,
         )
+        if args.train_vision:
+            logger.info(f"{Colors.OKBLUE}Unfreezing vision stack for training as requested (--train-vision).{Colors.ENDC}")
+            unfreeze_modules(
+                model,
+                [
+                    "vision_model",
+                    "vision_tower",
+                    "mm_projector",
+                    "multi_modal_projector",
+                    "aligner",
+                    "connector",
+                    "vision_resampler",
+                ],
+            )
     
     logger.info(f"{Colors.HEADER}Setting up optimizer{Colors.ENDC}")
     optimizer = optim.Adam(learning_rate=args.learning_rate)
@@ -164,6 +184,11 @@ if __name__ == "__main__":
         "--full-finetune",
         action="store_true",
         help="Train the model with full weight finetuning instead of LoRA",
+    )
+    parser.add_argument(
+        "--train-vision",
+        action="store_true",
+        help="Also train vision tower / projector modules (useful with LoRA to fine-tune visual stack).",
     )
     
     # Dataset arguments
