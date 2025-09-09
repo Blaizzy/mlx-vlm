@@ -109,7 +109,6 @@ def main(args):
     
     elif args.full_finetune:
         logger.info(f"{Colors.UNDERLINE}Training with full weight finetuning{Colors.ENDC}")
-        print_trainable_parameters(model)
     else:
         logger.info(f"{Colors.UNDERLINE}Setting up LoRA{Colors.ENDC}")
         
@@ -136,6 +135,8 @@ def main(args):
                     "vision_resampler",
                 ],
             )
+    
+    print_trainable_parameters(model)
     
     logger.info(f"{Colors.HEADER}Setting up optimizer{Colors.ENDC}")
     optimizer = optim.Adam(learning_rate=args.learning_rate)

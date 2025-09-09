@@ -287,9 +287,7 @@ def train(
         mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
     
     print(f"{Colors.HEADER}Starting training..., iterations: {args.iters}{Colors.ENDC}")
-    from .utils import print_trainable_parameters
-    print_trainable_parameters(model)
-    
+
     # Initialize distributed training
     world = mx.distributed.init()
     world_size = world.size()
