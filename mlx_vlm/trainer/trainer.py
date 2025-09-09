@@ -60,23 +60,23 @@ class TrainingArgs:
 def default_loss(model, inputs, targets, lengths, train_on_completions=False, assistant_id=77091):
     outputs = model(inputs)
     logits = outputs.logits.astype(mx.float32)
-
+    
     batch_size, seq_len = targets.shape
     steps = mx.arange(seq_len)[None, :]
-
+    
     base_mask = steps < lengths[:, None]
-
+    
     if train_on_completions:
         eq = (inputs == assistant_id)
         idxs = mx.arange(seq_len)[None, :]
-        last_ass_idx = mx.where(eq, idxs, mx.full_like(idxs, -1)).max(axis=1)  # (B,)
+        last_ass_idx = mx.where(eq, idxs, mx.full(idxs.shape, -1)).max(axis=1)
         comp_mask = steps > last_ass_idx[:, None]
         mask = base_mask & comp_mask
     else:
         mask = base_mask
-
+    
     weight_mask = mask.astype(mx.float32)
-
+    
     ce = nn.losses.cross_entropy(logits, targets) * weight_mask
     ntoks = mx.maximum(weight_mask.sum(), 1)
     ce = ce.sum() / ntoks
