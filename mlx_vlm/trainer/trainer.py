@@ -68,7 +68,6 @@ class TrainingArgs:
 def default_loss(model, inputs, targets, lengths, train_on_completions=False, assistant_id=77091):
     outputs = model(inputs)
     logits = outputs.logits.astype(mx.float32)
-    
     _, seq_len = targets.shape
     steps = mx.arange(seq_len)[None, :]
     base_mask = steps < lengths[:, None]
