@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import math
 
 import mlx.nn as nn
 import mlx.core as mx
@@ -34,6 +35,15 @@ def grad_checkpoint(layer):
         return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
 
     type(layer).__call__ = checkpointed_fn
+
+
+def get_learning_rate(iters: int, step: int, warmup_steps: int, learning_rate: float, min_learning_rate: float):
+    if step < warmup_steps:
+        return learning_rate * (step / warmup_steps)
+    
+    progress = (step - warmup_steps) / (iters - warmup_steps)
+    cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+    return min_learning_rate + (learning_rate - min_learning_rate) * cosine_decay
 
 
 def get_module_by_name(model, name):

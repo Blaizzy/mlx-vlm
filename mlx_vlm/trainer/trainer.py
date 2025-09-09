@@ -14,7 +14,7 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
-from .utils import grad_checkpoint, Colors
+from .utils import grad_checkpoint, Colors, get_learning_rate
 
 @dataclass
 class TrainingArgs:
@@ -52,8 +52,16 @@ class TrainingArgs:
         metadata={"help": "Learning rate."},
     )
     grad_clip: float = field(
-        default=None,
+        default=1.0,
         metadata={"help": "Gradient clipping value."},
+    )
+    warmup_steps: int = field(
+        default=100,
+        metadata={"help": "Number of warmup steps for learning rate."},
+    )
+    min_learning_rate: float = field(
+        default=1e-6,
+        metadata={"help": "Minimum learning rate after decay."},
     )
 
 
@@ -61,11 +69,9 @@ def default_loss(model, inputs, targets, lengths, train_on_completions=False, as
     outputs = model(inputs)
     logits = outputs.logits.astype(mx.float32)
     
-    batch_size, seq_len = targets.shape
+    _, seq_len = targets.shape
     steps = mx.arange(seq_len)[None, :]
-    
     base_mask = steps < lengths[:, None]
-    
     if train_on_completions:
         eq = (inputs == assistant_id)
         idxs = mx.arange(seq_len)[None, :]
@@ -81,7 +87,6 @@ def default_loss(model, inputs, targets, lengths, train_on_completions=False, as
     ntoks = mx.maximum(weight_mask.sum(), 1)
     ce = ce.sum() / ntoks
     return ce, ntoks
-
 
 def iterate_batches(dataset, batch_size, max_seq_length, train=False):
     # Simple indices without sorting
