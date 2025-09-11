@@ -5,7 +5,6 @@ import logging
 import mlx.optimizers as optim
 from datasets import load_dataset
 
-from .prompt_utils import apply_chat_template
 from .trainer import Dataset, TrainingArgs, Colors, train, print_trainable_parameters
 from .trainer.utils import (
     apply_lora_layers,
@@ -61,31 +60,6 @@ def main(args):
         else:
             raise ValueError(f"{Colors.FAIL}Dataset must have a 'messages' column or both 'question' and 'answer' columns{Colors.ENDC}")
     
-    if args.apply_chat_template:
-        logger.info(f"{Colors.OKBLUE}Applying chat template to the dataset{Colors.ENDC}")
-        
-        def process_data(examples):
-            if config["model_type"] == "pixtral":
-                conversations = apply_chat_template(
-                    config=config,
-                    processor=processor,
-                    prompt=examples["messages"],
-                    return_messages=True,
-                )
-                examples["messages"] = [
-                    json.dumps(item, ensure_ascii=False) for item in conversations
-                ]
-            else:
-                examples["messages"] = apply_chat_template(
-                    config=config,
-                    processor=processor,
-                    prompt=examples["messages"],
-                    return_messages=True,
-                )
-            return examples
-        
-        dataset = dataset.map(process_data)
-    
     # Create Dataset objects
     train_dataset = Dataset(
         dataset,
@@ -94,6 +68,14 @@ def main(args):
         image_processor=image_processor,
         image_resize_shape=args.image_resize_shape,
     )
+    
+    if args.epochs is not None:
+        dataset_size = len(train_dataset)
+        steps_per_epoch = dataset_size // args.batch_size
+        total_steps = steps_per_epoch * args.epochs
+        iters = total_steps
+    else:
+        iters = args.iters
     
     # Use train dataset for validation if no validation dataset is provided
     val_dataset = None
@@ -144,7 +126,7 @@ def main(args):
     # Create TrainingArgs
     training_args = TrainingArgs(
         batch_size=args.batch_size,
-        iters=args.iters,
+        iters=iters,
         steps_per_report=args.steps_per_report,
         steps_per_eval=args.steps_per_eval,
         steps_per_save=args.steps_per_save,
@@ -231,6 +213,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--iters", type=int, default=1000, help="Number of iterations to train for"
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Number of epochs to train for. If provided, overrides --iters and computes steps from dataset size and batch size.",
     )
     parser.add_argument(
         "--steps-per-report", type=int, default=10, help="Number of training steps between loss reporting"

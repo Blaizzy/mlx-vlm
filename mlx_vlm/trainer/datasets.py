@@ -2,26 +2,6 @@ import warnings
 import json
 
 
-def get_prompt(model_type, processor, conversation):
-    if model_type == "paligemma":
-        return conversation
-    
-    if "chat_template" in processor.__dict__.keys():
-        prompt = processor.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-    elif "tokenizer" in processor.__dict__.keys():
-        prompt = processor.tokenizer.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-    
-    return prompt
-
-
 class Dataset:
     def __init__(
         self,
@@ -53,9 +33,21 @@ class Dataset:
         item = self.dataset[idx]
         
         images = item.get("images", item.get("image", None))
-        conversations = item.get("messages", item.get("conversations"))
-        if images in (None, "", []):
+
+        if images is None or images == "" or images == []:
             images = []
+        elif not isinstance(images, list):
+            images = [images]
+
+        image_paths = []
+        image_data = []
+        for img in images:
+            if isinstance(img, str):
+                image_paths.append(img)
+            else:
+                image_data.append(img)
+        
+        conversations = item.get("messages", item.get("conversations"))
         prompts = []
         
         if isinstance(conversations, list) and isinstance(conversations[0], list):
@@ -67,27 +59,52 @@ class Dataset:
                             "Pixtral batch processing is not supported yet. Set batch size to 1."
                         )
                 
-                prompt = get_prompt(
-                    self.config["model_type"], self.processor, conversation
-                )
+                if "chat_template" in self.processor.__dict__:
+                    prompt = self.processor.apply_chat_template(
+                        conversation,
+                        tokenize=False,
+                        add_generation_prompt=False,
+                        num_images=len(images),
+                        num_audios=0,
+                    )
+                else:
+                    prompt = self.processor.tokenizer.apply_chat_template(
+                        conversation,
+                        tokenize=False,
+                        add_generation_prompt=False,
+                        num_images=len(images),
+                        num_audios=0,
+                    )
                 prompts.append(prompt)
         
         else:
             if self.config["model_type"] == "pixtral":
                 conversations = [json.loads(i) for i in conversations]
-            prompt = get_prompt(
-                self.config["model_type"], self.processor, conversations
-            )
+            if "chat_template" in self.processor.__dict__:
+                prompt = self.processor.apply_chat_template(
+                    conversations,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                    num_images=len(images),
+                    num_audios=0,
+                )
+            else:
+                prompt = self.processor.tokenizer.apply_chat_template(
+                    conversations,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                    num_images=len(images),
+                    num_audios=0,
+                )
             prompts.append(prompt)
         
-        image_token_index = getattr(self.config, "image_token_index", "image_token_id")
         
         inputs = prepare_inputs(
             processor=self.processor,
-            images=images,
+            images=image_data,
             audio=None,
             prompts=prompts,
-            image_token_index=image_token_index,
+            image_token_index=getattr(self.config, "image_token_index", "image_token_id"),
             resize_shape=self.image_resize_shape
         )
         
