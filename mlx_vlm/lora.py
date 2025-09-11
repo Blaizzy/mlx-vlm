@@ -12,6 +12,7 @@ from .trainer.utils import (
     find_all_linear_names,
     get_peft_model,
     unfreeze_modules,
+    supported_for_training
 )
 from .utils import load, load_image_processor
 
@@ -25,9 +26,8 @@ def main(args):
         args.model_path, processor_config={"trust_remote_code": True}
     )
     
-    unsupported_for_training = {"lfm2-vl", "", ""}
     model_type = getattr(getattr(model, "config", None), "model_type", None)
-    if model_type in unsupported_for_training:
+    if model_type not in supported_for_training:
         raise ValueError(
             f"{Colors.FAIL}Model type {model_type} not supported for training. "
             f"Please choose a different model or remove it from the unsupported list.{Colors.ENDC}"

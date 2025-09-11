@@ -8,4 +8,5 @@ from .utils import (
     get_peft_model,
     print_trainable_parameters,
     Colors,
+    supported_for_training
 )
