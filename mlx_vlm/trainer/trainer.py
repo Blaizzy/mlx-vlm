@@ -67,12 +67,13 @@ class TrainingArgs:
 
 def default_loss(model, inputs, targets, lengths, train_on_completions=False, assistant_id=77091):
     outputs = model(inputs)
-    logits = outputs.logits.astype(mx.float32)
+    logits = outputs.logits[:, :-1].astype(mx.float32)
+    targets = targets[:, 1:]
     _, seq_len = targets.shape
     steps = mx.arange(seq_len)[None, :]
     base_mask = steps < lengths[:, None]
     if train_on_completions:
-        eq = (inputs == assistant_id)
+        eq = (inputs[:, :-1] == assistant_id)
         idxs = mx.arange(seq_len)[None, :]
         last_ass_idx = mx.where(eq, idxs, mx.full(idxs.shape, -1)).max(axis=1)
         comp_mask = steps > last_ass_idx[:, None]
@@ -81,11 +82,16 @@ def default_loss(model, inputs, targets, lengths, train_on_completions=False, as
         mask = base_mask
     
     weight_mask = mask.astype(mx.float32)
+
+    length_mask = mx.arange(targets.shape[1])[None, :] < (lengths - 1)[:, None]
     
-    ce = nn.losses.cross_entropy(logits, targets) * weight_mask
-    ntoks = mx.maximum(weight_mask.sum(), 1)
+    ce = nn.losses.cross_entropy(logits, targets, weights=weight_mask) * length_mask
+    ntoks = length_mask.sum()
     ce = ce.sum() / ntoks
+
+    mx.clear_cache()
     return ce, ntoks
+
 
 def iterate_batches(dataset, batch_size, max_seq_length, train=False):
     # Simple indices without sorting
@@ -319,8 +325,8 @@ def train(
     
     @partial(mx.compile, inputs=state, outputs=state)
     def step(batch):
-        inputs = batch["input_ids"][:, :-1]
-        targets = batch["input_ids"][:, 1:]
+        inputs = batch["input_ids"]
+        targets = batch["input_ids"]
         lengths = batch["attention_mask"].sum(axis=1)
 
         (lvalue, toks), grad = loss_value_and_grad(model, inputs, targets, lengths)
