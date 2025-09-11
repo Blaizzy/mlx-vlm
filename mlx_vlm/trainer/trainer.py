@@ -94,132 +94,50 @@ def default_loss(model, inputs, targets, lengths, train_on_completions=False, as
 
 
 def iterate_batches(dataset, batch_size, max_seq_length, train=False):
-    # Simple indices without sorting
     indices = list(range(len(dataset)))
-    
     if len(dataset) < batch_size:
-        raise ValueError(
-            f"Dataset must have at least batch_size={batch_size} "
-            f"examples but only has {len(dataset)}."
-        )
-    
-    # Distributed training support
-    offset = mx.distributed.init().rank()
-    step = mx.distributed.init().size()
+        raise ValueError(f"Dataset must have at least {batch_size} examples")
+
+    offset, step = mx.distributed.init().rank(), mx.distributed.init().size()
     if batch_size % step != 0:
-        raise ValueError("The batch size must be divisible by the number of workers")
-    
-    # Create batch indices
+        raise ValueError("Batch size must be divisible by number of workers")
+
     batch_indices = [
         indices[i + offset : i + offset + batch_size : step]
         for i in range(0, len(indices) - batch_size + 1, batch_size)
     ]
-    
+
     while True:
-        # Shuffle batch order if training
-        if train:
-            batch_order = np.random.permutation(len(batch_indices))
-        else:
-            batch_order = range(len(batch_indices))
-        
-        for batch_idx in batch_order:
-            # Load batch data
-            batch_data = []
-            batch_lengths = []
-            
-            for idx in batch_indices[batch_idx]:
-                try:
-                    item = dataset[idx]
-                    if "input_ids" in item:
-                        input_ids = item["input_ids"]
-                        
-                        # Convert MLX array to numpy and flatten if needed
-                        if hasattr(input_ids, 'shape'):
-                            if isinstance(input_ids, mx.array):
-                                input_ids_np = np.array(input_ids)
-                            else:
-                                input_ids_np = input_ids
-                            
-                            # Flatten if multidimensional
-                            if len(input_ids_np.shape) > 1:
-                                input_ids_np = input_ids_np.flatten()
-                        else:
-                            input_ids_np = np.array(input_ids)
-                        
-                        seq_len = len(input_ids_np)
-                        
-                        # Truncate if needed
-                        if seq_len > max_seq_length:
-                            input_ids_np = input_ids_np[:max_seq_length]
-                            seq_len = max_seq_length
-                        
-                        # Handle attention mask
-                        attention_mask_np = None
-                        if "attention_mask" in item:
-                            attention_mask = item["attention_mask"]
-                            if hasattr(attention_mask, 'shape'):
-                                if isinstance(attention_mask, mx.array):
-                                    attention_mask_np = np.array(attention_mask)
-                                else:
-                                    attention_mask_np = attention_mask
-                                
-                                if len(attention_mask_np.shape) > 1:
-                                    attention_mask_np = attention_mask_np.flatten()
-                            else:
-                                attention_mask_np = np.array(attention_mask)
-                            
-                            attention_mask_np = attention_mask_np[:seq_len]
-                        
-                        processed_item = {
-                            "input_ids": input_ids_np,
-                            "attention_mask": attention_mask_np
-                        }
-                        
-                        batch_data.append(processed_item)
-                        batch_lengths.append(seq_len)
-                        
-                except Exception as e:
-                    print(f"Warning: Error loading item {idx}: {e}")
-                    continue
-            
-            if not batch_data:
-                continue
-        
-            # MLX-LM style padding with pad_to=32
+        order = np.random.permutation(len(batch_indices)) if train else range(len(batch_indices))
+        for b in order:
+            items = [dataset[idx] for idx in batch_indices[b]]
+            lengths = [min(len(x["input_ids"]), max_seq_length) for x in items]
+
+            max_len = min(max(lengths), max_seq_length)
             pad_to = 32
-            max_length_in_batch = max(batch_lengths)
-            
-            # Pad to nearest multiple of pad_to
-            padded_length = 1 + pad_to * ((max_length_in_batch + pad_to - 1) // pad_to)
-            padded_length = min(padded_length, max_seq_length)
-            
-            # Create padded batch arrays
-            actual_batch_size = len(batch_data)
-            input_ids_batch = np.zeros((actual_batch_size, padded_length), dtype=np.int32)
-            attention_mask_batch = np.zeros((actual_batch_size, padded_length), dtype=np.int32)
-            
-            # Fill batch arrays
-            for i, (item, length) in enumerate(zip(batch_data, batch_lengths)):
-                truncated_length = min(length, padded_length)
-                
-                input_ids_batch[i, :truncated_length] = item["input_ids"][:truncated_length]
-                
-                if item["attention_mask"] is not None:
-                    attention_mask_batch[i, :truncated_length] = item["attention_mask"][:truncated_length]
+            padded_len = 1 + pad_to * ((max_len + pad_to - 1) // pad_to)
+            padded_len = min(padded_len, max_seq_length)
+
+            input_ids_batch = np.zeros((len(items), padded_len), dtype=np.int32)
+            attention_mask_batch = np.zeros((len(items), padded_len), dtype=np.int32)
+
+            for i, item in enumerate(items):
+                arr = np.array(item["input_ids"]).reshape(-1)  # flatten input_ids
+                L = min(len(arr), padded_len)
+                input_ids_batch[i, :L] = arr[:L]
+
+                if "attention_mask" in item:
+                    mask = np.array(item["attention_mask"]).reshape(-1)  # flatten mask
+                    attention_mask_batch[i, :L] = mask[:L]
                 else:
-                    attention_mask_batch[i, :truncated_length] = 1
-            
-            # Convert to MLX arrays
-            batch = {
+                    attention_mask_batch[i, :L] = 1
+
+            yield {
                 "input_ids": mx.array(input_ids_batch),
-                "attention_mask": mx.array(attention_mask_batch)
+                "attention_mask": mx.array(attention_mask_batch),
             }
-            
-            yield batch
-        
         if not train:
             break
-        
         mx.clear_cache()
 
 
