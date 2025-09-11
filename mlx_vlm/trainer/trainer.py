@@ -259,47 +259,12 @@ def train(
         # Average gradients for distributed training
         grad = average_gradients(grad)
 
-        # Sanitize gradients before optimizer update
-        grad = clean_gradients(grad)
-        grad = prune_to_structure(grad, model.trainable_parameters())
-
         # Update model
         optimizer.update(model, grad)
 
         return lvalue, toks
     
     loss_value_and_grad = nn.value_and_grad(model, loss_fn_partial)
-    
-    def clean_gradients(grads):
-        """Remove non-trainable / transient gradients like rope_deltas, cache etc."""
-        if isinstance(grads, dict):
-            cleaned = {}
-            for key, value in grads.items():
-                if key in ['rope_deltas', 'position_ids', 'cache', 'attention_mask']:
-                    continue
-                if isinstance(value, dict):
-                    nested = clean_gradients(value)
-                    if nested:
-                        cleaned[key] = nested
-                else:
-                    cleaned[key] = value
-            return cleaned
-        return grads
-
-    def prune_to_structure(grads, ref):
-        """Prune gradient tree to match the structure of the reference (trainable parameters).
-        This avoids KeyError in optimizers when grads contain extra keys.
-        """
-        if isinstance(grads, dict) and isinstance(ref, dict):
-            pruned = {}
-            for k, v in grads.items():
-                if k in ref:
-                    pruned_child = prune_to_structure(v, ref[k])
-                    if pruned_child is not None:
-                        pruned[k] = pruned_child
-            return pruned
-        # For non-dict leaves, just return as-is
-        return grads
     
     # Training metrics
     model.train()
