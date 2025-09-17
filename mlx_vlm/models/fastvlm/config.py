@@ -52,10 +52,9 @@ class ModelConfig(BaseModelConfig):
     model_type: str = "llava_qwen2"     # fastvlm?
     ignore_index: int = -100
     image_token_index: int = -200
-    # vision_feature_select_strategy: str = "default"
-    # vision_feature_layer: int = -2
-    # vocab_size: int = 32000
     eos_token_id: int = 151645
+    mm_projector_type: str = "mlp2x_gelu"
+    mm_hidden_size: int = 3072
 
     @classmethod
     def from_dict(cls, params):
@@ -68,7 +67,7 @@ class ModelConfig(BaseModelConfig):
         # The vision config is retrieved in the original repo from separate config files
         # https://github.com/apple/ml-fastvlm/blob/592b4add3c1c8a518e77d95dc6248e76c1dd591f/llava/model/multimodal_encoder/mobileclip/configs/mobileclip_l.json
         # Not from the Hub config https://huggingface.co/apple/FastVLM-0.5B/blob/main/config.json
-        # We hardcode it for now
+        # We hardcode everything in the config for now
         if not params.get("vision_config", {}):
             params["vision_config"] = {}
 

@@ -1,16 +1,12 @@
-import inspect
-import math
-from dataclasses import dataclass
 from typing import Optional, List, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from .config import VisionConfig
 
 
-# Copied from gemma3n by Chris
+# Copied from gemma3n by Chris @FL33TW00D
 class NamedSequential(nn.Module):
     def __init__(self):
         super().__init__()
@@ -224,11 +220,10 @@ class ReparamLargeKernelConv(nn.Module):
         kernel_size: int,
         stride: int,
         groups: int,
-        small_kernel: int,
         activation: nn.Module = nn.GELU(),
     ) -> None:
         super(ReparamLargeKernelConv, self).__init__()
-
+        self.activation = activation
         self.lkb_reparam = nn.Conv2d(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -263,7 +258,6 @@ class PatchEmbed(nn.Module):
                 kernel_size=patch_size,
                 stride=stride,
                 groups=in_channels,
-                small_kernel=3,
             )
         )
         self.proj.append(
@@ -338,10 +332,7 @@ class RepMixerBlock(nn.Module):
             act_layer=act_layer,
         )
 
-        # # Drop Path
-        # self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-
-    def __call__(self, inputs: mx.array) -> mx.array:
+    def __call__(self, x: mx.array) -> mx.array:
         x = self.token_mixer(x)
         x = x + self.convffn(x)
         return x
