@@ -33,6 +33,7 @@ MODEL_REMAPPING = {
     "bunny-llama": "llava_bunny",
     "lfm2-vl": "lfm2_vl",
     "cohere2_vision": "aya_vision",
+    "llava_qwen2": "fastvlm",
 }
 
 MAX_FILE_SIZE_GB = 5
