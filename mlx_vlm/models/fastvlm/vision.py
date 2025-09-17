@@ -129,6 +129,26 @@ class ConvFFN(nn.Module):
         return x
 
 
+class LayerNormChannel(nn.Module):
+    """
+    LayerNorm only for Channel Dimension.
+    Input: tensor in shape [B, C, H, W]
+    """
+    def __init__(self, num_features, eps=1e-05) -> None:
+        super().__init__()
+        self.weight = mx.ones(num_features)
+        self.bias = mx.zeros(num_features)
+        self.eps = eps
+
+    def __call__(self, x: mx.array) -> mx.array:
+        u = x.mean(1, keepdims=True)
+        s = (x - u).pow(2).mean(1, keepdims=True)
+        x = (x - u) / mx.sqrt(s + self.eps)
+        x = self.weight[:, None][:, None] * x \
+            + self.bias[:, None][:, None]
+        return x
+
+
 class AttentionBlock(nn.Module):
     """Implementation of metaformer block with MHSA as token mixer.
 
@@ -394,6 +414,7 @@ def build_fast_vit_network(config: VisionConfig):
             token_mixer_type=config.token_mixers[i],
             kernel_size=config.repmixer_kernel_size,
             mlp_ratio=config.mlp_ratios[i],
+            norm_layer=LayerNormChannel,
         )
         network.append(stage)
 
@@ -615,7 +636,8 @@ class VisionModel(nn.Module):
         # Replace projection head, same as in
         # https://github.com/apple/ml-fastvlm/blob/592b4add3c1c8a518e77d95dc6248e76c1dd591f/llava/model/multimodal_encoder/mobileclip/__init__.py#L49
         if config.projection_dim is not None:
-            self.vision_model.head = GlobalPool2D(config.num_classes, config.projection_dim)
+            in_dim = int(config.embed_dims[-1] * config.cls_ratio)
+            self.vision_model.head = GlobalPool2D(in_dim, config.projection_dim)
 
     def __call__(
         self, x: mx.array, output_hidden_states: Optional[bool] = None
@@ -630,7 +652,7 @@ class VisionModel(nn.Module):
             if ".fc2.weight" in k: return True
             if ".lkb_reparam.weight" in k: return True
             if ".reduce.weight" in k: return True
-            if ".reduce.expand" in k: return True
+            if ".expand.weight" in k: return True
             return False
         
         sanitized_weights = {}
