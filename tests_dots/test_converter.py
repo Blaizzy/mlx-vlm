@@ -98,3 +98,20 @@ def test_preview_npz_prints_subset(capsys):
         preview_npz(path, limit=1)
         out = capsys.readouterr().out
         assert "tensors" in out and "vision.patch.norm.weight" in out
+
+def test_npz_key_shapes_match_expectations(tmp_path):
+    p = tmp_path / "shapes.npz"
+    np.savez(
+        p,
+        **{
+            "vision.patch.proj.weight": np.zeros((1536, 3, 14, 14), dtype=np.float32),
+            "vision.blocks.0.attn.qkv.weight": np.zeros(
+                (1536 * 3, 1536), dtype=np.float32
+            ),
+            "vision.blocks.0.attn.proj.weight": np.zeros((1536, 1536), dtype=np.float32),
+        },
+    )
+    z: npyio.NpzFile = np.load(p)
+    assert z["vision.patch.proj.weight"].shape == (1536, 3, 14, 14)
+    assert z["vision.blocks.0.attn.qkv.weight"].shape == (1536 * 3, 1536)
+    assert z["vision.blocks.0.attn.proj.weight"].shape == (1536, 1536)
