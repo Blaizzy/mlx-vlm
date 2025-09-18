@@ -76,3 +76,11 @@ def test_vision_block_forward_shape():
     mask = mx.ones((seq, seq), dtype=mx.bool_)
     y = VisionBlock(dim, heads)(x, mask, cos, sin)
     assert y.shape == (seq, dim)
+from mlx_vlm.models.dots_ocr.dots_vision import PatchMerger
+
+
+def test_patch_merger_shapes():
+    H, W, D = 16, 16, 1536
+    x = mx.random.uniform(shape=(H * W, D))
+    y = PatchMerger(D)(x, H, W)
+    assert y.shape == ((H // 2) * (W // 2), D)

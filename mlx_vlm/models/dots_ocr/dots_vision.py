@@ -189,3 +189,38 @@ class VisionBlock(nn.Module):
         x = x + self.attn(self.norm1(x), mask, cos, sin)
         x = x + self.mlp(self.norm2(x))
         return x
+
+# ---- PatchMerger (2x2) + post path ----
+class PatchMerger(nn.Module):
+    """
+    Merges non-overlapping 2x2 token windows spatially:
+      x -> RMSNorm -> [concat 4 tokens] -> Linear -> GELU -> Linear
+    Input:  x [H*W, D] (single image token sequence)
+    Output: y [(H/2)*(W/2), D]
+    """
+
+    def __init__(self, dim=1536, merge=2, eps=1e-6):
+        super().__init__()
+        assert merge == 2, "dots.ocr uses 2x2 merger"
+        self.merge = merge
+        self.ln = RMSNorm(dim, eps)
+        # merger MLP commonly uses bias (per HF weights)
+        self.mlp0 = nn.Linear(dim * merge * merge, dim, bias=True)
+        self.mlp2 = nn.Linear(dim, dim, bias=True)
+        self.act = nn.GELU()
+
+    def __call__(self, x: mx.array, H: int, W: int) -> mx.array:
+        # x: [H*W, D]
+        m = self.merge
+        H2, W2 = H // m, W // m
+        # pre-norm
+        x = self.ln(x)
+        # reshape to grid
+        x = x.reshape(H, W, -1)[: H2 * m, : W2 * m, :]
+        # group 2x2 windows -> concat 4 tokens
+        x = x.reshape(H2, m, W2, m, -1)
+        x = x.transpose(0, 2, 1, 3, 4)
+        x = x.reshape(H2 * W2, m * m * x.shape[-1])
+        # MLP with GELU
+        x = self.mlp2(self.act(self.mlp0(x)))
+        return x
