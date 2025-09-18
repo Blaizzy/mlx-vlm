@@ -15,14 +15,17 @@ HERE = pathlib.Path(__file__).parent
 
 
 def iter_safetensors(path: str | os.PathLike) -> Iterable[str]:
+    """Recursively yield all safetensors files under path."""
+
     p = pathlib.Path(path)
     if p.is_file() and p.suffix == ".safetensors":
         yield str(p)
-    elif p.is_dir():
-        for f in sorted(p.glob("*.safetensors")):
+        return
+    if p.is_dir():
+        for f in sorted(p.rglob("*.safetensors")):
             yield str(f)
-    else:
-        raise FileNotFoundError(f"No .safetensors found at {path}")
+        return
+    raise FileNotFoundError(f"No .safetensors found at {path}")
 
 
 def list_vision_keys(st_path: str | os.PathLike) -> list[str]:
