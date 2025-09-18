@@ -64,7 +64,7 @@ def build_2d_rotary_cos_sin(H: int, W: int, head_dim_half: int, theta: float = 1
     freqs = 1.0 / (theta ** (np.arange(head_dim_half, dtype=np.float32) / head_dim_half))
     # positions
     pos_h = np.arange(H, dtype=np.float32)[:, None]  # [H,1]
-    pos_w = np.arange(W, dtype=np.float32)[None, :]  # [1,W]
+    pos_w = np.arange(W, dtype=np.float32)[:, None]  # [W,1]
     ang_h = pos_h * freqs[None, :]  # [H, head_dim_half]
     ang_w = pos_w * freqs[None, :]  # [W, head_dim_half]
     # broadcast to grid and flatten
@@ -88,7 +88,7 @@ def build_2d_rotary_cos_sin(H: int, W: int, head_dim_half: int, theta: float = 1
     )
     import mlx.core as mx
 
-    return mx.array(cos), mx.array(sin)
+    return mx.array(cos, dtype=mx.float32), mx.array(sin, dtype=mx.float32)
 
 
 def apply_rotary(q, k, cos, sin):
@@ -104,9 +104,74 @@ def apply_rotary(q, k, cos, sin):
     # split last dimension
     q1, q2 = mx.split(q, 2, axis=-1)
     k1, k2 = mx.split(k, 2, axis=-1)
-    cos = cos[..., : q1.shape[-1]]  # [seq, hd/2]
-    sin = sin[..., : q1.shape[-1]]
+    cos = cos[:, None, : q1.shape[-1]]  # [seq, 1, hd/2]
+    sin = sin[:, None, : q1.shape[-1]]
     # (a + jb) * (cos + j sin) = (a cos - b sin) + j(a sin + b cos)
     q_rot = mx.concatenate([q1 * cos - q2 * sin, q1 * sin + q2 * cos], axis=-1)
     k_rot = mx.concatenate([k1 * cos - k2 * sin, k1 * sin + k2 * cos], axis=-1)
     return q_rot, k_rot
+
+
+# ---- Attention with fused QKV and optional block-diag mask ----
+
+
+def build_block_mask_from_cu(cu):
+    """
+    cu: cumulative lengths [0, L0, L0+L1, ...]
+    returns bool mask [total, total] where mask[i,j]==True if in same block
+    """
+
+    import numpy as np
+
+    if hasattr(cu, "tolist"):
+        cu_np = np.array(cu.tolist(), dtype=np.int64)
+    else:
+        cu_np = np.array(cu, dtype=np.int64)
+
+    total = int(cu_np[-1]) if len(cu_np) > 0 else 0
+    mask = np.zeros((total, total), dtype=bool)
+    for start, end in zip(cu_np[:-1], cu_np[1:]):
+        s, e = int(start), int(end)
+        mask[s:e, s:e] = True
+
+    return mx.array(mask, dtype=mx.bool_)
+
+
+class VisionAttention(nn.Module):
+    def __init__(self, dim=1536, heads=12):
+        super().__init__()
+        assert dim % heads == 0
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+
+    def _sdpa(self, q, k, v, mask):
+        # q,k,v: [seq, heads, head_dim]
+        scale = self.head_dim ** -0.5
+        q_t = q.transpose(1, 0, 2)  # [heads, seq, head_dim]
+        k_t = k.transpose(1, 0, 2)
+        v_t = v.transpose(1, 0, 2)
+
+        attn = mx.matmul(q_t, k_t.transpose(0, 2, 1)) * scale  # [heads, seq, seq]
+
+        if mask is not None:
+            mask_bool = mask.astype(mx.bool_)[None, ...]
+            large_neg = mx.array(-1e9, dtype=attn.dtype)
+            attn = mx.where(mask_bool, attn, large_neg)
+
+        attn = mx.softmax(attn, axis=-1)
+        out = mx.matmul(attn, v_t)  # [heads, seq, head_dim]
+        return out.transpose(1, 0, 2)  # [seq, heads, head_dim]
+
+    def __call__(self, x: mx.array, mask: mx.array | None, cos: mx.array, sin: mx.array):
+        # x: [seq, dim]
+        seq = x.shape[0]
+        qkv = self.qkv(x)  # [seq, 3*dim]
+        qkv = qkv.reshape(seq, 3, self.heads, self.head_dim)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        q, k = apply_rotary(q, k, cos, sin)
+        attn_out = self._sdpa(q, k, v, mask)
+        attn_out = attn_out.reshape(seq, self.dim)
+        return self.proj(attn_out)

@@ -1,30 +1,34 @@
 import mlx.core as mx
 
-from mlx_vlm.models.dots_ocr.dots_vision import RMSNorm
+from mlx_vlm.models.dots_ocr.dots_vision import (
+    RMSNorm,
+    SwiGLU,
+    PatchEmbed,
+    VisionAttention,
+    apply_rotary,
+    build_2d_rotary_cos_sin,
+    build_block_mask_from_cu,
+)
 
 
 def test_rmsnorm_shapes_and_numerics():
     x = mx.arange(8, dtype=mx.float32).reshape(2, 4)
     y = RMSNorm(4)(x)
     assert y.shape == (2, 4)
-    # Check finite and roughly scaled
     assert float(mx.max(mx.abs(y))) > 0.0
-from mlx_vlm.models.dots_ocr.dots_vision import SwiGLU
 
 
 def test_swish_glu_shapes():
     x = mx.random.uniform(shape=(10, 1536))
     y = SwiGLU()(x)
     assert y.shape == (10, 1536)
-from mlx_vlm.models.dots_ocr.dots_vision import PatchEmbed
 
 
 def test_patch_embed_shapes_224():
-    x = mx.random.uniform(shape=(1, 3, 224, 224))  # divisible by 14
+    x = mx.random.uniform(shape=(1, 3, 224, 224))
     tok, Hp, Wp = PatchEmbed()(x)
     assert (Hp, Wp) == (16, 16)
     assert tok.shape == (16 * 16, 1536)
-from mlx_vlm.models.dots_ocr.dots_vision import build_2d_rotary_cos_sin, apply_rotary
 
 
 def test_rotary_build_and_apply_shapes():
@@ -39,3 +43,25 @@ def test_rotary_build_and_apply_shapes():
     k = mx.random.uniform(shape=(seq, heads, head_dim))
     q2, k2 = apply_rotary(q, k, cos, sin)
     assert q2.shape == q.shape and k2.shape == k.shape
+
+
+def test_attention_shapes_all_allow():
+    H, W = 8, 8
+    seq = H * W
+    heads, dim = 12, 1536
+    x = mx.random.uniform(shape=(seq, dim))
+    cos, sin = build_2d_rotary_cos_sin(H, W, (dim // heads) // 2)
+    mask = mx.ones((seq, seq), dtype=mx.bool_)
+    y = VisionAttention(dim, heads)(x, mask, cos, sin)
+    assert y.shape == (seq, dim)
+
+
+def test_attention_block_mask_basic():
+    H1, W1 = 8, 8
+    H2, W2 = 4, 4
+    seq1, seq2 = H1 * W1, H2 * W2
+    total = seq1 + seq2
+    cu = mx.array([0, seq1, total], dtype=mx.int32)
+    mask = build_block_mask_from_cu(cu)
+    assert bool(mask[0, 0]) is True
+    assert bool(mask[seq1 - 1, seq1]) is False
