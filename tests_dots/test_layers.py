@@ -84,3 +84,14 @@ def test_patch_merger_shapes():
     x = mx.random.uniform(shape=(H * W, D))
     y = PatchMerger(D)(x, H, W)
     assert y.shape == ((H // 2) * (W // 2), D)
+from mlx_vlm.models.dots_ocr.dots_ocr import DotsOCRConfig
+from mlx_vlm.models.dots_ocr.dots_vision import DotsVisionTransformer_MLX
+
+
+def test_vision_wrapper_single_image_224():
+    cfg = DotsOCRConfig({"vision_config": {"num_layers": 2}})
+    model = DotsVisionTransformer_MLX(cfg)
+    x = mx.random.uniform(shape=(1, 3, 224, 224))
+    grid = [[1, 16, 16]]
+    y = model(x, grid)
+    assert y.shape == (64, 1536)

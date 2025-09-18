@@ -206,8 +206,8 @@ class PatchMerger(nn.Module):
         self.ln = RMSNorm(dim, eps)
         # merger MLP commonly uses bias (per HF weights)
         self.mlp0 = nn.Linear(dim * merge * merge, dim, bias=True)
-        self.mlp2 = nn.Linear(dim, dim, bias=True)
         self.act = nn.GELU()
+        self.mlp2 = nn.Linear(dim, dim, bias=True)
 
     def __call__(self, x: mx.array, H: int, W: int) -> mx.array:
         # x: [H*W, D]
@@ -224,3 +224,66 @@ class PatchMerger(nn.Module):
         # MLP with GELU
         x = self.mlp2(self.act(self.mlp0(x)))
         return x
+
+
+# ---- Vision wrapper ----
+
+
+class DotsVisionTransformer_MLX(nn.Module):
+    """
+    End-to-end vision tower:
+      PatchEmbed -> [Blocks]*N -> (optional) RMSNorm -> per-image PatchMerger
+    __call__(pixels, grid_thw):
+      pixels: [B, 3, H, W] (for tests we use B=1)
+      grid_thw: list of [1, H', W'] for each image (H',W' are patch grids)
+    Returns:
+      concatenated merged tokens of shape [sum_i(H'W'/4), D]
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        v = cfg.vision
+        self.patch = PatchEmbed(3, v.embed_dim, v.patch_size, v.rms_eps)
+        self.blocks = [
+            VisionBlock(v.embed_dim, v.num_heads, 4224, v.rms_eps)
+            for _ in range(v.num_layers)
+        ]
+        self.post = RMSNorm(v.embed_dim, v.rms_eps) if v.post_norm else None
+        self.merger = PatchMerger(v.embed_dim, v.merge_size, v.rms_eps)
+
+    @staticmethod
+    def build_cu_from_grid(grid_thw):
+        # grid_thw: list of [1,H',W']
+        cu = [0]
+        for _, H, W in grid_thw:
+            cu.append(cu[-1] + H * W)
+        return mx.array(cu, dtype=mx.int32)
+
+    def __call__(self, pixels: mx.array, grid_thw: list[list[int]]) -> mx.array:
+        tokens, Hp, Wp = self.patch(pixels)
+        v = self.cfg.vision
+        cos_list, sin_list = [], []
+        for _, H, W in grid_thw:
+            cos, sin = build_2d_rotary_cos_sin(
+                H, W, (v.embed_dim // v.num_heads) // 2, v.rotary_theta
+            )
+            cos_list.append(cos)
+            sin_list.append(sin)
+        cos = mx.concatenate(cos_list, axis=0)
+        sin = mx.concatenate(sin_list, axis=0)
+        cu = self.build_cu_from_grid(grid_thw)
+        mask = build_block_mask_from_cu(cu)
+        x = tokens
+        for blk in self.blocks:
+            x = blk(x, mask, cos, sin)
+        if self.post is not None:
+            x = self.post(x)
+        outs = []
+        start = 0
+        for _, H, W in grid_thw:
+            n = H * W
+            xi = x[start : start + n]
+            start += n
+            outs.append(self.merger(xi, H, W))
+        return mx.concatenate(outs, axis=0)
