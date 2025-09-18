@@ -116,15 +116,32 @@ def cli_convert(target: str, out_npz: str):
     return 0
 
 
+def preview_npz(npz_path: str, limit: int = 12):
+    import numpy as np
+
+    z = np.load(npz_path)
+    print(f"[preview] {npz_path}: {len(z.files)} tensors")
+    for name in sorted(z.files)[:limit]:
+        arr = z[name]
+        print(f"  {name:48s} {arr.shape} {arr.dtype}")
+    return 0
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "scan":
         sys.exit(cli_scan(sys.argv[2]))
     if len(sys.argv) >= 4 and sys.argv[1] == "to-npz":
         sys.exit(cli_convert(sys.argv[2], sys.argv[3]))
+    if len(sys.argv) >= 3 and sys.argv[1] == "preview":
+        sys.exit(preview_npz(sys.argv[2]))
     print("Usage:")
     print("  python -m mlx_vlm.convert.convert_dots_ocr scan /path/to/model_or_dir")
     print(
         "  python -m mlx_vlm.convert.convert_dots_ocr to-npz /path/to/model_or_dir "
+        "weights/dots_ocr_vision.npz"
+    )
+    print(
+        "  python -m mlx_vlm.convert.convert_dots_ocr preview "
         "weights/dots_ocr_vision.npz"
     )
     sys.exit(1)

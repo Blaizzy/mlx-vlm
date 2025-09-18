@@ -8,6 +8,7 @@ from safetensors.numpy import save_file
 from mlx_vlm.convert.convert_dots_ocr import (
     convert_dir_or_file_to_npz,
     list_vision_keys,
+    preview_npz,
 )
 
 
@@ -85,3 +86,15 @@ def test_convert_minimal_mapping_npz_roundtrip():
         assert "vision.blocks.0.attn.qkv.weight" in npz.files
         assert "vision.post.weight" in npz.files
         assert "vision.merger.mlp.0.bias" in npz.files
+
+
+def test_preview_npz_prints_subset(capsys):
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "a.npz")
+        np.savez(
+            path,
+            **{"vision.patch.norm.weight": np.ones((1536,), dtype=np.float32)},
+        )
+        preview_npz(path, limit=1)
+        out = capsys.readouterr().out
+        assert "tensors" in out and "vision.patch.norm.weight" in out
