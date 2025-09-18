@@ -58,6 +58,89 @@ def skip_multimodal_module(path: str) -> bool:
     )
 
 
+def get_class_predicate(skip_vision: bool = False, weights=None, quantization=None):
+    """Build a predicate used to decide which modules should be quantized.
+
+    Args:
+        skip_vision: When True, vision/audio modules are skipped entirely.
+        weights: Optional mapping of parameter names to arrays; used to detect
+            legacy quantized layers that already provide scale tensors.
+        quantization: Optional mapping providing per-path overrides. This is a
+            subset of the quantization config (excluding ``group_size`` and
+            ``bits``) where each key corresponds to a module path.
+
+    Returns:
+        Callable[[str, nn.Module], bool]: Predicate consumed by ``nn.quantize``.
+    """
+
+    weights = weights or {}
+    quantization = quantization or {}
+
+    def predicate(path, module):
+        # Skip multimodal modules when requested.
+        if skip_multimodal_module(path) and skip_vision:
+            return False
+
+        # Allow explicit overrides from the quantization config.
+        if path in quantization:
+            return quantization[path]
+
+        # Modules that cannot be quantized should be ignored.
+        if not hasattr(module, "to_quantized"):
+            return False
+
+        weight = getattr(module, "weight", None)
+        if weight is not None:
+            size = getattr(weight, "size", None)
+            if size is None:
+                # Fall back to computing the total number of elements.
+                shape = getattr(weight, "shape", None)
+                if shape is not None:
+                    size = 1
+                    for dim in shape:
+                        size *= dim
+            if isinstance(size, int) and size % 64 != 0:
+                return False
+
+        # For legacy checkpoints ensure accompanying scale tensors exist.
+        if weights:
+            return f"{path}.scales" in weights
+
+        return True
+
+    return predicate
+
+
+def quantize_model(
+    model: nn.Module,
+    config: dict,
+    q_group_size: int,
+    q_bits: int,
+    skip_vision: bool = False,
+):
+    """Quantize a model in-place and update the configuration dictionary.
+
+    This is a lightweight helper used both by the loader and unit tests.
+    """
+
+    predicate = get_class_predicate(skip_vision=skip_vision)
+    nn.quantize(
+        model,
+        group_size=q_group_size,
+        bits=q_bits,
+        class_predicate=predicate,
+    )
+
+    quant_cfg = config.setdefault("quantization", {})
+    quant_cfg.update({"group_size": q_group_size, "bits": q_bits})
+
+    if skip_vision:
+        vision_cfg = config.setdefault("vision_config", {})
+        vision_cfg["skip_vision"] = True
+
+    return model, config
+
+
 def get_model_and_args(config: dict):
     """
     Retrieve the model object based on the configuration.
@@ -196,27 +279,21 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # Handle legacy models which may or may not have vision quantized
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
-
-        def get_class_predicate(p, m):
-            # Always skip vision and audio models
-            if skip_multimodal_module(p) and skip_vision:
-                return False
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
-            # Skip layers not divisible by 64
-            if hasattr(m, "weight") and m.weight.size % 64 != 0:
-                return False
-            # Handle legacy models which may not have everything quantized
-            return f"{p}.scales" in weights
-
+        quantization_overrides = {
+            k: v
+            for k, v in quantization.items()
+            if k not in {"group_size", "bits"}
+        }
+        predicate = get_class_predicate(
+            skip_vision=skip_vision,
+            weights=weights,
+            quantization=quantization_overrides,
+        )
         nn.quantize(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
-            class_predicate=get_class_predicate,
+            class_predicate=predicate,
         )
 
     model.load_weights(list(weights.items()))
