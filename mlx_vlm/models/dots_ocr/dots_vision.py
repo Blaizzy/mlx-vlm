@@ -22,7 +22,11 @@ class SwiGLU(nn.Module):
         self.fc2 = nn.Linear(hidden, in_features, bias=False)  # down
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.fc2(mx.silu(self.fc1(x)) * self.fc3(x))
+        up = self.fc1(x)
+        gate = self.fc3(x)
+        sigmoid = 1.0 / (1.0 + mx.exp(-up))
+        silu = up * sigmoid
+        return self.fc2(silu * gate)
 
 
 class PatchEmbed(nn.Module):
@@ -39,8 +43,9 @@ class PatchEmbed(nn.Module):
         x: [B,3,H,W]
         returns: tokens [B*Hp*Wp, embed_dim], Hp, Wp
         """
-        y = self.proj(x)  # [B, D, Hp, Wp]
-        B, D, Hp, Wp = y.shape
-        y = y.transpose(0, 2, 3, 1).reshape(B * Hp * Wp, D)
+        x_nhwc = x.transpose(0, 2, 3, 1)  # [B, H, W, C]
+        y = self.proj(x_nhwc)  # [B, Hp, Wp, D]
+        B, Hp, Wp, D = y.shape
+        y = y.reshape(B * Hp * Wp, D)
         y = self.norm(y)
         return y, int(Hp), int(Wp)
