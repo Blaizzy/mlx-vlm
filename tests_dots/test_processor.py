@@ -2,7 +2,11 @@ import numpy as np
 from PIL import Image
 
 from mlx_vlm.models.dots_ocr.dots_ocr import DotsOCRConfig
-from mlx_vlm.models.dots_ocr.processor import DotsOCRProcessor
+from mlx_vlm.models.dots_ocr.processor import (
+    DotsOCRProcessor,
+    build_cu_seqlens,
+)
+from mlx_vlm.models.dots_ocr.dots_vision import DotsVisionTransformer_MLX
 
 
 def test_processor_single_image_shapes():
@@ -14,3 +18,16 @@ def test_processor_single_image_shapes():
     H, W = pixels.shape[-2], pixels.shape[-1]
     assert H % 14 == 0 and W % 14 == 0
     assert grid == [[1, H // 14, W // 14]]
+
+def test_cu_seqlens_and_encode_integration():
+    cfg = DotsOCRConfig({"vision_config": {"num_layers": 2}})
+    proc = DotsOCRProcessor(cfg)
+    im = Image.fromarray((np.random.rand(320, 480, 3) * 255).astype("uint8"))
+    pixels, grid = proc.process_one(im)
+    cu = build_cu_seqlens(grid)
+    assert cu.shape[0] == 2 and int(cu[-1]) == grid[0][1] * grid[0][2]
+    model = DotsVisionTransformer_MLX(cfg)
+    y = model(pixels, grid)
+    expected = (grid[0][1] * grid[0][2]) // (cfg.vision.merge_size**2)
+    assert y.shape[0] == expected
+    assert y.shape[1] == 1536

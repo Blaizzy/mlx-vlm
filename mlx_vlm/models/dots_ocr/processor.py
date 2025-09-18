@@ -65,11 +65,24 @@ class DotsOCRProcessor:
         std = np.array(p.std, dtype=np.float32)[:, None, None]
         x = (x - mean) / std
 
-        x = self._pad_to_multiple(x, v.patch_size)
+        multiple = v.patch_size * v.merge_size
+        x = self._pad_to_multiple(x, multiple)
         H, W = x.shape[-2], x.shape[-1]
-        grid_thw = [[1, H // v.patch_size, W // v.patch_size]]
+        grid_thw = [[1, (H // v.patch_size), (W // v.patch_size)]]
 
         return mx.array(x), grid_thw
 
     def process(self, images: list[Image.Image]):
         return [self.process_one(im) for im in images]
+
+
+def build_cu_seqlens(grid_thw: list[list[int]]):
+    """
+    grid_thw: [[1,H',W'], ...]
+    returns: mx.array[int32] of shape [B+1], cumulative sums of H'*W'
+    """
+
+    cu = [0]
+    for _, H, W in grid_thw:
+        cu.append(cu[-1] + int(H) * int(W))
+    return mx.array(cu, dtype=mx.int32)

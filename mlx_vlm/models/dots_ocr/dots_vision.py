@@ -252,14 +252,6 @@ class DotsVisionTransformer_MLX(nn.Module):
         self.post = RMSNorm(v.embed_dim, v.rms_eps) if v.post_norm else None
         self.merger = PatchMerger(v.embed_dim, v.merge_size, v.rms_eps)
 
-    @staticmethod
-    def build_cu_from_grid(grid_thw):
-        # grid_thw: list of [1,H',W']
-        cu = [0]
-        for _, H, W in grid_thw:
-            cu.append(cu[-1] + H * W)
-        return mx.array(cu, dtype=mx.int32)
-
     def __call__(self, pixels: mx.array, grid_thw: list[list[int]]) -> mx.array:
         tokens, Hp, Wp = self.patch(pixels)
         v = self.cfg.vision
@@ -272,7 +264,9 @@ class DotsVisionTransformer_MLX(nn.Module):
             sin_list.append(sin)
         cos = mx.concatenate(cos_list, axis=0)
         sin = mx.concatenate(sin_list, axis=0)
-        cu = self.build_cu_from_grid(grid_thw)
+        from .processor import build_cu_seqlens
+
+        cu = build_cu_seqlens(grid_thw)
         mask = build_block_mask_from_cu(cu)
         x = tokens
         for blk in self.blocks:
