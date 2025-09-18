@@ -9,3 +9,10 @@ def test_rmsnorm_shapes_and_numerics():
     assert y.shape == (2, 4)
     # Check finite and roughly scaled
     assert float(mx.max(mx.abs(y))) > 0.0
+from mlx_vlm.models.dots_ocr.dots_vision import SwiGLU
+
+
+def test_swish_glu_shapes():
+    x = mx.random.uniform(shape=(10, 1536))
+    y = SwiGLU()(x)
+    assert y.shape == (10, 1536)
