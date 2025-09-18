@@ -175,3 +175,17 @@ class VisionAttention(nn.Module):
         attn_out = self._sdpa(q, k, v, mask)
         attn_out = attn_out.reshape(seq, self.dim)
         return self.proj(attn_out)
+
+
+class VisionBlock(nn.Module):
+    def __init__(self, dim=1536, heads=12, mlp_hidden=4224, eps=1e-6):
+        super().__init__()
+        self.norm1 = RMSNorm(dim, eps)
+        self.attn = VisionAttention(dim, heads)
+        self.norm2 = RMSNorm(dim, eps)
+        self.mlp = SwiGLU(dim, mlp_hidden)
+
+    def __call__(self, x, mask, cos, sin):
+        x = x + self.attn(self.norm1(x), mask, cos, sin)
+        x = x + self.mlp(self.norm2(x))
+        return x

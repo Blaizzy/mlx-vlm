@@ -65,3 +65,14 @@ def test_attention_block_mask_basic():
     mask = build_block_mask_from_cu(cu)
     assert bool(mask[0, 0]) is True
     assert bool(mask[seq1 - 1, seq1]) is False
+from mlx_vlm.models.dots_ocr.dots_vision import VisionBlock
+
+
+def test_vision_block_forward_shape():
+    H, W = 8, 8
+    seq, dim, heads = H * W, 1536, 12
+    x = mx.random.uniform(shape=(seq, dim))
+    cos, sin = build_2d_rotary_cos_sin(H, W, (dim // heads) // 2)
+    mask = mx.ones((seq, seq), dtype=mx.bool_)
+    y = VisionBlock(dim, heads)(x, mask, cos, sin)
+    assert y.shape == (seq, dim)
