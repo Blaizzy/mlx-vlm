@@ -16,3 +16,11 @@ def test_swish_glu_shapes():
     x = mx.random.uniform(shape=(10, 1536))
     y = SwiGLU()(x)
     assert y.shape == (10, 1536)
+from mlx_vlm.models.dots_ocr.dots_vision import PatchEmbed
+
+
+def test_patch_embed_shapes_224():
+    x = mx.random.uniform(shape=(1, 3, 224, 224))  # divisible by 14
+    tok, Hp, Wp = PatchEmbed()(x)
+    assert (Hp, Wp) == (16, 16)
+    assert tok.shape == (16 * 16, 1536)

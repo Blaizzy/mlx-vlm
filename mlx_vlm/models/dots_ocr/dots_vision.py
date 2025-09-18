@@ -23,3 +23,24 @@ class SwiGLU(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.fc2(mx.silu(self.fc1(x)) * self.fc3(x))
+
+
+class PatchEmbed(nn.Module):
+    def __init__(self, in_ch=3, embed_dim=1536, patch=14, eps=1e-6):
+        super().__init__()
+        self.proj = nn.Conv2d(
+            in_ch, embed_dim, kernel_size=patch, stride=patch, bias=False
+        )
+        self.norm = RMSNorm(embed_dim, eps=eps)
+        self.patch = patch
+
+    def __call__(self, x: mx.array):
+        """
+        x: [B,3,H,W]
+        returns: tokens [B*Hp*Wp, embed_dim], Hp, Wp
+        """
+        y = self.proj(x)  # [B, D, Hp, Wp]
+        B, D, Hp, Wp = y.shape
+        y = y.transpose(0, 2, 3, 1).reshape(B * Hp * Wp, D)
+        y = self.norm(y)
+        return y, int(Hp), int(Wp)
