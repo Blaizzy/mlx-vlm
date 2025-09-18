@@ -4,6 +4,8 @@ from PIL import Image
 from mlx_vlm.models.dots_ocr.dots_ocr import DotsOCRConfig
 from mlx_vlm.models.dots_ocr.processor import (
     DotsOCRProcessor,
+    MicroBatchPacker,
+    OOMBackoffRunner,
     build_cu_seqlens,
 )
 from mlx_vlm.models.dots_ocr.dots_vision import DotsVisionTransformer_MLX
@@ -31,3 +33,23 @@ def test_cu_seqlens_and_encode_integration():
     expected = (grid[0][1] * grid[0][2]) // (cfg.vision.merge_size**2)
     assert y.shape[0] == expected
     assert y.shape[1] == 1536
+
+
+def test_microbatch_and_runner_happy_path():
+    cfg = DotsOCRConfig({"vision_config": {"num_layers": 1}})
+    proc = DotsOCRProcessor(cfg)
+    ims = [
+        Image.fromarray((np.random.rand(200, 300, 3) * 255).astype("uint8")),
+        Image.fromarray((np.random.rand(180, 260, 3) * 255).astype("uint8")),
+    ]
+    processed = proc.process(ims)
+    packer = MicroBatchPacker(max_tokens_per_batch=10_000)
+    model = DotsVisionTransformer_MLX(cfg)
+
+    def fn(px, gr):
+        y = model(px, gr)
+        assert y.shape[1] == 1536
+
+    runner = OOMBackoffRunner()
+    ok = runner.run(packer, processed, fn)
+    assert ok is True

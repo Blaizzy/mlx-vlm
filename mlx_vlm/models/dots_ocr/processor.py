@@ -86,3 +86,50 @@ def build_cu_seqlens(grid_thw: list[list[int]]):
     for _, H, W in grid_thw:
         cu.append(cu[-1] + int(H) * int(W))
     return mx.array(cu, dtype=mx.int32)
+
+
+class MicroBatchPacker:
+    """
+    Conservative packer: one image per batch.
+    Extend later to group by total tokens if desired.
+    """
+
+    def __init__(self, max_tokens_per_batch: int = 1_000_000):
+        self.max_tokens = max_tokens_per_batch
+
+    def pack(self, processed: list[tuple[mx.array, list[list[int]]]]):
+        for pixels, grid in processed:
+            HtW = grid[0][1] * grid[0][2]
+            if HtW > self.max_tokens:
+                raise ValueError(
+                    "single image tokens {} exceed max_tokens_per_batch {}".format(
+                        HtW, self.max_tokens
+                    )
+                )
+            yield pixels, grid
+
+
+class OOMBackoffRunner:
+    """
+    Wrapper to execute a callable on micro-batches; on OOM (RuntimeError),
+    reduces max_tokens and retries up to N times.
+    """
+
+    def __init__(self, retries: int = 2, factor: float = 0.5):
+        self.retries = retries
+        self.factor = factor
+
+    def run(self, packer: MicroBatchPacker, processed, fn):
+        mt = packer.max_tokens
+        for _ in range(self.retries + 1):
+            try:
+                for px, gr in packer.pack(processed):
+                    fn(px, gr)
+                return True
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and mt > 1024:
+                    mt = int(max(1024, mt * self.factor))
+                    packer.max_tokens = mt
+                else:
+                    raise
+        return False
