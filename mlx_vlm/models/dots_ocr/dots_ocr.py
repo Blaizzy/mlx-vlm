@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 
 from .dots_vision import DotsVisionTransformer_MLX
+from .weight_loader import load_npz_into_vision
 
 @dataclass
 class VisionCfg:
@@ -76,6 +77,11 @@ class DotsOCRForCausalLM_MLX:
             grids.append(tuple(grid[0]))
         tokens_out = tokens[0] if len(tokens) == 1 else mx.concatenate(tokens, axis=0)
         return tokens_out, grids
+
+    def load_vision_npz(self, npz_path: str):
+        """Load converted NPZ weights into the vision tower."""
+
+        return load_npz_into_vision(self.vision, npz_path)
 
 
 def splice_image_tokens(input_ids, image_token_id: int, vision_tokens):
