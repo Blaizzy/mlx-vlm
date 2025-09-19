@@ -99,3 +99,24 @@ def splice_image_tokens(input_ids, image_token_id: int, vision_tokens):
 
     fused_len = len(ids) - 1 + vision_count
     return positions[0], fused_len
+
+
+def splice_image_tokens_multi(input_ids, image_token_id: int, vision_token_list):
+    """Return placeholder positions and fused length for multiple images."""
+
+    ids = [int(tok) for tok in input_ids]
+    positions = [idx for idx, tok in enumerate(ids) if tok == image_token_id]
+    if len(positions) != len(vision_token_list):
+        raise ValueError(
+            "placeholders ({}) != images ({})".format(
+                len(positions), len(vision_token_list)
+            )
+        )
+
+    try:
+        vision_total = sum(int(v.shape[0]) for v in vision_token_list)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise TypeError("Each vision token chunk must expose shape[0]") from exc
+
+    fused_len = len(ids) - len(positions) + vision_total
+    return positions, fused_len

@@ -9,6 +9,7 @@ from mlx_vlm.models.dots_ocr.dots_ocr import (
     DotsOCRConfig,
     DotsOCRForCausalLM_MLX,
     splice_image_tokens,
+    splice_image_tokens_multi,
 )
 
 
@@ -66,3 +67,14 @@ def test_adapter_loads_npz_into_vision():
         report = adapter.load_vision_npz(npz_path)
         assert report["loaded"] >= 12
         assert report["missing"] == 0
+
+
+def test_multi_splice_len_and_positions():
+    ids = mx.array([999, 151652, 42, 151652, 7], dtype=mx.int32)
+    vt1 = mx.zeros((80, 1536))
+    vt2 = mx.zeros((96, 1536))
+
+    positions, fused_len = splice_image_tokens_multi(ids, 151652, [vt1, vt2])
+
+    assert positions == [1, 3]
+    assert fused_len == len(ids) - 2 + 80 + 96
