@@ -9,9 +9,24 @@ from typing import Iterable
 import re
 
 import numpy as np
-from safetensors import safe_open
+from safetensors import deserialize, safe_open
 
 HERE = pathlib.Path(__file__).parent
+
+_DTYPE_MAP = {
+    "F64": np.float64,
+    "F32": np.float32,
+    "F16": np.float16,
+    "BF16": "BF16",
+    "I64": np.int64,
+    "I32": np.int32,
+    "I16": np.int16,
+    "I8": np.int8,
+    "U64": np.uint64,
+    "U32": np.uint32,
+    "U16": np.uint16,
+    "U8": np.uint8,
+}
 
 
 def iter_safetensors(path: str | os.PathLike) -> Iterable[str]:
@@ -87,20 +102,42 @@ def map_key_hf_to_mlx(hf_key: str) -> str | None:
     return None
 
 
+def _bf16_to_float32(raw: np.ndarray) -> np.ndarray:
+    raw_uint32 = raw.astype(np.uint32) << 16
+    return raw_uint32.view(np.float32)
+
+
+def _tensor_to_numpy(data: bytes, dtype: str, shape: list[int]) -> np.ndarray:
+    np_dtype = _DTYPE_MAP.get(dtype)
+    if np_dtype is None:
+        raise TypeError(f"Unsupported dtype {dtype}")
+    if np_dtype == "BF16":
+        raw = np.frombuffer(data, dtype=np.uint16)
+        arr = _bf16_to_float32(raw)
+    else:
+        arr = np.frombuffer(data, dtype=np_dtype)
+    arr = arr.reshape(shape)
+    if arr.dtype in (np.float16, np.float64) or np_dtype == "BF16":
+        arr = arr.astype(np.float32, copy=False)
+    return arr.copy()
+
+
 def convert_dir_or_file_to_npz(target: str, out_npz: str) -> dict:
     arrays: dict[str, np.ndarray] = {}
     num_skipped = 0
     files = list(iter_safetensors(target))
     for st in files:
-        with safe_open(st, framework="np") as handle:
-            for hf_key in handle.keys():
-                if not hf_key.startswith("vision_tower"):
-                    continue
-                mlx_key = map_key_hf_to_mlx(hf_key)
-                if mlx_key is None:
-                    num_skipped += 1
-                    continue
-                arrays[mlx_key] = np.array(handle.get_tensor(hf_key))
+        with open(st, "rb") as handle:
+            content = handle.read()
+        for hf_key, tensor in deserialize(content):
+            if not hf_key.startswith("vision_tower"):
+                continue
+            mlx_key = map_key_hf_to_mlx(hf_key)
+            if mlx_key is None:
+                num_skipped += 1
+                continue
+            arr = _tensor_to_numpy(tensor["data"], tensor["dtype"], tensor["shape"])
+            arrays[mlx_key] = arr
     if not arrays:
         raise RuntimeError(f"No mapped vision weights found under {target}")
     out_dir = os.path.dirname(out_npz)
