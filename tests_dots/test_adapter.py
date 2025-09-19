@@ -1,7 +1,12 @@
 import numpy as np
 from PIL import Image
+import mlx.core as mx
 
-from mlx_vlm.models.dots_ocr.dots_ocr import DotsOCRConfig, DotsOCRForCausalLM_MLX
+from mlx_vlm.models.dots_ocr.dots_ocr import (
+    DotsOCRConfig,
+    DotsOCRForCausalLM_MLX,
+    splice_image_tokens,
+)
 
 
 def test_adapter_encode_single_and_multi():
@@ -18,3 +23,11 @@ def test_adapter_encode_single_and_multi():
     vt2, g2 = adapter.encode_images([img1, img2])
     assert len(g2) == 2
     assert vt2.shape[1] == cfg.vision.embed_dim
+
+
+def test_splice_single_placeholder():
+    ids = mx.array([10, 20, 151652, 30], dtype=mx.int32)
+    vision_tokens = mx.zeros((96, 1536))
+    pos, fused_len = splice_image_tokens(ids, 151652, vision_tokens)
+    assert pos == 2
+    assert fused_len == len(ids) - 1 + 96

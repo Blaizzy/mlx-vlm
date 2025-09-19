@@ -76,3 +76,20 @@ class DotsOCRForCausalLM_MLX:
             grids.append(tuple(grid[0]))
         tokens_out = tokens[0] if len(tokens) == 1 else mx.concatenate(tokens, axis=0)
         return tokens_out, grids
+
+
+def splice_image_tokens(input_ids, image_token_id: int, vision_tokens):
+    """Return the placeholder position and fused length when splicing tokens."""
+
+    ids = [int(tok) for tok in input_ids]
+    positions = [idx for idx, tok in enumerate(ids) if tok == image_token_id]
+    if len(positions) != 1:
+        raise ValueError(f"Expected exactly 1 image token, found {len(positions)}")
+
+    try:
+        vision_count = int(vision_tokens.shape[0])
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise TypeError("vision_tokens must expose shape[0]") from exc
+
+    fused_len = len(ids) - 1 + vision_count
+    return positions[0], fused_len
