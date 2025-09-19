@@ -1,5 +1,9 @@
 from dataclasses import dataclass
 
+import mlx.core as mx
+
+from .dots_vision import DotsVisionTransformer_MLX
+
 @dataclass
 class VisionCfg:
     embed_dim: int = 1536
@@ -44,3 +48,31 @@ class DotsOCRConfig:
         assert self.vision.merge_size == 2, "merge_size must be 2"
         assert self.vision.bias is False, "vision layers must use bias=False"
         assert self.vision.num_layers > 0, "num_layers > 0"
+
+
+class DotsOCRForCausalLM_MLX:
+    """
+    Thin vision adapter that preprocesses PIL images and returns merged tokens.
+    """
+
+    def __init__(self, cfg: DotsOCRConfig):
+        self.cfg = cfg
+        from .processor import DotsOCRProcessor
+
+        self.processor = DotsOCRProcessor(cfg)
+        self.vision = DotsVisionTransformer_MLX(cfg)
+
+    def encode_images(self, pil_images):
+        images = list(pil_images)
+        if not images:
+            raise ValueError("encode_images requires at least one image")
+
+        processed = self.processor.process(images)
+        tokens = []
+        grids = []
+        for pixels, grid in processed:
+            vt = self.vision(pixels, grid)
+            tokens.append(vt)
+            grids.append(tuple(grid[0]))
+        tokens_out = tokens[0] if len(tokens) == 1 else mx.concatenate(tokens, axis=0)
+        return tokens_out, grids
