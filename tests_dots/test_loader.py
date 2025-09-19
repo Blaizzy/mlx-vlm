@@ -48,3 +48,27 @@ def test_loader_assigns_and_forward_pass():
         grid = [[1, 16, 16]]
         out = model(x, grid)
         assert out.shape == (64, dim)
+
+
+def test_real_npz_has_critical_tensors_if_present():
+    import os
+
+    npz_path = "weights/dots_ocr_vision.npz"
+    if not os.path.exists(npz_path):
+        import pytest
+
+        pytest.skip("local NPZ not present")
+
+    z: npyio.NpzFile = np.load(npz_path)
+
+    def has(name: str) -> bool:
+        return name in z.files
+
+    assert has("vision.patch.proj.weight")
+    assert z["vision.patch.proj.weight"].shape == (1536, 3, 14, 14)
+    assert has("vision.blocks.0.attn.qkv.weight")
+    assert z["vision.blocks.0.attn.qkv.weight"].shape == (1536 * 3, 1536)
+    assert has("vision.post.weight")
+    assert z["vision.post.weight"].shape == (1536,)
+    assert has("vision.merger.mlp.0.weight")
+    assert has("vision.merger.mlp.2.weight")
