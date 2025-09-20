@@ -95,3 +95,12 @@ def test_vision_wrapper_single_image_224():
     grid = [[1, 16, 16]]
     y = model(x, grid)
     assert y.shape == (64, 1536)
+
+
+def test_vision_wrapper_multi_batch_same_grid():
+    cfg = DotsOCRConfig({"vision_config": {"num_layers": 1}})
+    model = DotsVisionTransformer_MLX(cfg)
+    x = mx.random.uniform(shape=(2, 3, 224, 224))
+    grids = [[1, 16, 16], [1, 16, 16]]
+    y = model(x, grids)
+    assert y.shape == (128, 1536)

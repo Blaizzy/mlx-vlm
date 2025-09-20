@@ -281,6 +281,12 @@ class DotsVisionTransformer_MLX(nn.Module):
         self.merger = maybe_compile(PatchMerger(v.embed_dim, v.merge_size, v.rms_eps))
 
     def __call__(self, pixels: mx.array, grid_thw: list[list[int]]) -> mx.array:
+        """
+        pixels: [B, 3, H, W] with identical spatial resolution per batch.
+        grid_thw: [[1, H', W']] per image.
+        Returns merged tokens concatenated over the batch.
+        """
+
         def _cast_module(obj, seen: set[int]):
             obj_id = id(obj)
             if obj_id in seen:
