@@ -1,4 +1,5 @@
 import os
+from collections import defaultdict
 
 import numpy as np
 from PIL import Image
@@ -144,3 +145,44 @@ class OOMBackoffRunner:
                 else:
                     raise
         return False
+
+
+class GroupedBatchPacker:
+    """
+    Packer that groups samples by identical patch grids and batches them together.
+    """
+
+    def __init__(self, max_tokens_per_batch: int | None = None):
+        if max_tokens_per_batch is None:
+            max_tokens_per_batch = getenv_int("MLX_MAX_TOKENS", 1_000_000)
+        self.max_tokens = max_tokens_per_batch
+
+    def pack(self, processed: list[tuple[mx.array, list[list[int]]]]):
+        buckets: dict[tuple[int, int], list[tuple[mx.array, list[list[int]]]]] = defaultdict(list)
+        for pixels, grid in processed:
+            Hp, Wp = grid[0][1], grid[0][2]
+            buckets[(Hp, Wp)].append((pixels, grid))
+
+        for (Hp, Wp), items in buckets.items():
+            cur_pixels: list[mx.array] = []
+            cur_grids: list[list[int]] = []
+            cur_tokens = 0
+            token_per_sample = Hp * Wp
+
+            for pixels, grid in items:
+                if cur_tokens > 0 and cur_tokens + token_per_sample > self.max_tokens:
+                    yield self._stack(cur_pixels), cur_grids
+                    cur_pixels, cur_grids, cur_tokens = [], [], 0
+
+                cur_pixels.append(pixels)
+                cur_grids.extend(grid)
+                cur_tokens += token_per_sample
+
+            if cur_pixels:
+                yield self._stack(cur_pixels), cur_grids
+
+    @staticmethod
+    def _stack(pixels_list: list[mx.array]) -> mx.array:
+        arrays = [np.array(px) for px in pixels_list]
+        stacked = np.concatenate(arrays, axis=0)
+        return mx.array(stacked)

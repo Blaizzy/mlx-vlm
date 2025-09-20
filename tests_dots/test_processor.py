@@ -4,6 +4,7 @@ from PIL import Image
 from mlx_vlm.models.dots_ocr.dots_ocr import DotsOCRConfig
 from mlx_vlm.models.dots_ocr.processor import (
     DotsOCRProcessor,
+    GroupedBatchPacker,
     MicroBatchPacker,
     OOMBackoffRunner,
     build_cu_seqlens,
@@ -53,3 +54,20 @@ def test_microbatch_and_runner_happy_path():
     runner = OOMBackoffRunner()
     ok = runner.run(packer, processed, fn)
     assert ok is True
+
+
+def test_grouped_packer_batches_by_grid():
+    cfg = DotsOCRConfig({})
+    proc = DotsOCRProcessor(cfg)
+    images = [
+        Image.fromarray((np.random.rand(300, 420, 3) * 255).astype("uint8")),
+        Image.fromarray((np.random.rand(302, 421, 3) * 255).astype("uint8")),
+        Image.fromarray((np.random.rand(256, 400, 3) * 255).astype("uint8")),
+    ]
+    processed = proc.process(images)
+    packer = GroupedBatchPacker(max_tokens_per_batch=10_000)
+    batches = list(packer.pack(processed))
+
+    assert len(batches) >= 2
+    for pixels, grids in batches:
+        assert pixels.shape[0] == len(grids)
