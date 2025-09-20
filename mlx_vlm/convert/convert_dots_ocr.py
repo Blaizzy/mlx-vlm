@@ -167,6 +167,26 @@ def preview_npz(npz_path: str, limit: int = 12):
     return 0
 
 
+def scan_text_prefixes(target: str, limit: int = 40):
+    import collections
+
+    counter = collections.Counter()
+    files = list(iter_safetensors(target))
+    if not files:
+        print(f"[text-scan] no .safetensors under {target}")
+        return []
+    for st_path in files:
+        with safe_open(st_path, framework="np") as handle:
+            for key in handle.keys():
+                if key.startswith("vision_tower"):
+                    continue
+                top = key.split(".", 1)[0]
+                counter[top] += 1
+    tops = counter.most_common()
+    print("[text-scan] top prefixes:", tops[:limit])
+    return tops
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "scan":
         sys.exit(cli_scan(sys.argv[2]))
@@ -174,8 +194,12 @@ if __name__ == "__main__":
         sys.exit(cli_convert(sys.argv[2], sys.argv[3]))
     if len(sys.argv) >= 3 and sys.argv[1] == "preview":
         sys.exit(preview_npz(sys.argv[2]))
+    if len(sys.argv) >= 3 and sys.argv[1] == "scan-text":
+        scan_text_prefixes(sys.argv[2])
+        sys.exit(0)
     print("Usage:")
     print("  python -m mlx_vlm.convert.convert_dots_ocr scan /path/to/model_or_dir")
+    print("  python -m mlx_vlm.convert.convert_dots_ocr scan-text /path/to/model_or_dir")
     print(
         "  python -m mlx_vlm.convert.convert_dots_ocr to-npz /path/to/model_or_dir "
         "weights/dots_ocr_vision.npz"
