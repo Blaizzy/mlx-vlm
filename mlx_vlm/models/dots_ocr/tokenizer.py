@@ -57,3 +57,27 @@ class SimpleTokenizer:
 def render_chat(prompt: str) -> str:
     """Placeholder chat templating hook."""
     return prompt
+
+
+def try_hf_tokenizer(model_or_dir: str, image_token: str = "<image>"):
+    """Attempt to load a Hugging Face tokenizer if transformers is available."""
+
+    try:
+        from transformers import AutoTokenizer
+    except Exception:
+        return None
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_or_dir, use_fast=True)
+    except Exception:
+        return None
+
+    image_id = None
+    try:
+        vocab = tokenizer.get_vocab()
+        if image_token in vocab:
+            image_id = tokenizer.convert_tokens_to_ids(image_token)
+    except Exception:
+        image_id = None
+
+    return tokenizer, image_id

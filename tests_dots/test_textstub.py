@@ -1,4 +1,8 @@
-from mlx_vlm.models.dots_ocr.tokenizer import SimpleTokenizer, render_chat
+from mlx_vlm.models.dots_ocr.tokenizer import (
+    SimpleTokenizer,
+    render_chat,
+    try_hf_tokenizer,
+)
 
 
 def test_simple_tokenizer_image_and_words():
@@ -25,3 +29,8 @@ def test_prepare_and_generate_stub_single_image():
 
     assert "fused_len" in result
     assert result["tokens_shape"][1] == cfg.vision.embed_dim
+
+
+def test_try_hf_tokenizer_skip_if_missing():
+    maybe_tok = try_hf_tokenizer("nonexistent-model-xyz")
+    assert maybe_tok is None or (isinstance(maybe_tok, tuple) and len(maybe_tok) == 2)
