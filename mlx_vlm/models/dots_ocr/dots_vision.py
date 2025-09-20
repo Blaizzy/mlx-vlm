@@ -2,6 +2,19 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
+def maybe_compile(module):
+    """Optionally JIT compile MLX modules when MLX_COMPILE=1."""
+
+    import os
+
+    if os.environ.get("MLX_COMPILE", "0") == "1":
+        try:
+            return mx.compile(module)
+        except Exception:
+            return module
+    return module
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -246,11 +259,11 @@ class DotsVisionTransformer_MLX(nn.Module):
         v = cfg.vision
         self.patch = PatchEmbed(3, v.embed_dim, v.patch_size, v.rms_eps)
         self.blocks = [
-            VisionBlock(v.embed_dim, v.num_heads, 4224, v.rms_eps)
+            maybe_compile(VisionBlock(v.embed_dim, v.num_heads, 4224, v.rms_eps))
             for _ in range(v.num_layers)
         ]
         self.post = RMSNorm(v.embed_dim, v.rms_eps) if v.post_norm else None
-        self.merger = PatchMerger(v.embed_dim, v.merge_size, v.rms_eps)
+        self.merger = maybe_compile(PatchMerger(v.embed_dim, v.merge_size, v.rms_eps))
 
     def __call__(self, pixels: mx.array, grid_thw: list[list[int]]) -> mx.array:
         tokens, Hp, Wp = self.patch(pixels)
