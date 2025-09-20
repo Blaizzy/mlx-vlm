@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 
 from .dots_vision import DotsVisionTransformer_MLX
+from .tokenizer import SimpleTokenizer, render_chat
 from .weight_loader import load_npz_into_vision
 
 @dataclass
@@ -82,6 +83,48 @@ class DotsOCRForCausalLM_MLX:
         """Load converted NPZ weights into the vision tower."""
 
         return load_npz_into_vision(self.vision, npz_path)
+
+    def prepare_inputs(
+        self,
+        prompt: str,
+        tokenizer: SimpleTokenizer,
+        vision_tokens,
+        image_token_id: int | None = None,
+    ):
+        """Tokenize prompt and compute fused length after vision splicing."""
+
+        token_id = image_token_id or tokenizer.image_token_id
+        text = render_chat(prompt)
+        input_ids = tokenizer.encode(text)
+
+        if isinstance(vision_tokens, list):
+            positions, fused_len = splice_image_tokens_multi(
+                input_ids, token_id, vision_tokens
+            )
+        else:
+            position, fused_len = splice_image_tokens(input_ids, token_id, vision_tokens)
+            positions = [position]
+
+        return input_ids, positions, fused_len
+
+    def generate(self, prompt: str, pil_images, npz_path: str | None = None):
+        """Vision-only demo that returns splice bookkeeping information."""
+
+        if npz_path:
+            self.load_vision_npz(npz_path)
+
+        vision_tokens, grids = self.encode_images(pil_images)
+        tokenizer = SimpleTokenizer(image_token_id=self.cfg.tokens.image_token_id)
+        input_ids, positions, fused_len = self.prepare_inputs(
+            prompt, tokenizer, vision_tokens
+        )
+        return {
+            "input_len": len(input_ids),
+            "image_pos": positions,
+            "fused_len": fused_len,
+            "tokens_shape": tuple(vision_tokens.shape),
+            "grids": grids,
+        }
 
 
 def splice_image_tokens(input_ids, image_token_id: int, vision_tokens):
