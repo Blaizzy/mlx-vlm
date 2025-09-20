@@ -15,6 +15,19 @@ def maybe_compile(module):
     return module
 
 
+def resolve_vision_dtype():
+    """Read MLX_VISION_DTYPE env and return an mx dtype."""
+
+    import os
+
+    mode = os.environ.get("MLX_VISION_DTYPE", "fp32").lower()
+    if mode in ("bf16", "bfloat16"):
+        return mx.bfloat16
+    if mode in ("fp16", "float16", "half"):
+        return mx.float16
+    return mx.float32
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -258,6 +271,8 @@ class DotsVisionTransformer_MLX(nn.Module):
         self.cfg = cfg
         v = cfg.vision
         self.patch = PatchEmbed(3, v.embed_dim, v.patch_size, v.rms_eps)
+        self._dtype = resolve_vision_dtype()
+        self._cast_done = False
         self.blocks = [
             maybe_compile(VisionBlock(v.embed_dim, v.num_heads, 4224, v.rms_eps))
             for _ in range(v.num_layers)
@@ -266,6 +281,32 @@ class DotsVisionTransformer_MLX(nn.Module):
         self.merger = maybe_compile(PatchMerger(v.embed_dim, v.merge_size, v.rms_eps))
 
     def __call__(self, pixels: mx.array, grid_thw: list[list[int]]) -> mx.array:
+        def _cast_module(obj, seen: set[int]):
+            obj_id = id(obj)
+            if obj_id in seen:
+                return
+            seen.add(obj_id)
+
+            if isinstance(obj, list):
+                for item in obj:
+                    _cast_module(item, seen)
+                return
+
+            if hasattr(obj, "__dict__"):
+                for key, value in list(obj.__dict__.items()):
+                    if hasattr(value, "astype") and hasattr(value, "dtype"):
+                        try:
+                            setattr(obj, key, value.astype(self._dtype))
+                        except Exception:
+                            pass
+                    else:
+                        _cast_module(value, seen)
+
+        pixels = pixels.astype(self._dtype)
+        if not self._cast_done:
+            _cast_module(self, set())
+            self._cast_done = True
+
         tokens, Hp, Wp = self.patch(pixels)
         v = self.cfg.vision
         cos_list, sin_list = [], []
