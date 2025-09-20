@@ -64,18 +64,23 @@ class DotsOCRForCausalLM_MLX:
         self.processor = DotsOCRProcessor(cfg)
         self.vision = DotsVisionTransformer_MLX(cfg)
 
-    def encode_images(self, pil_images):
+    def encode_images(self, pil_images, max_tokens_per_batch: int | None = None):
         images = list(pil_images)
         if not images:
             raise ValueError("encode_images requires at least one image")
 
         processed = self.processor.process(images)
+        from .processor import GroupedBatchPacker
+
+        packer = GroupedBatchPacker(max_tokens_per_batch)
         tokens = []
-        grids = []
-        for pixels, grid in processed:
-            vt = self.vision(pixels, grid)
+        grids: list[tuple[int, int, int]] = []
+        for px_batch, grid_batch in packer.pack(processed):
+            vt = self.vision(px_batch, grid_batch)
             tokens.append(vt)
-            grids.append(tuple(grid[0]))
+            for gr in grid_batch:
+                grids.append(tuple(gr))
+
         tokens_out = tokens[0] if len(tokens) == 1 else mx.concatenate(tokens, axis=0)
         return tokens_out, grids
 

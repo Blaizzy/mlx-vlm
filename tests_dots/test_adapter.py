@@ -69,6 +69,19 @@ def test_adapter_loads_npz_into_vision():
         assert report["missing"] == 0
 
 
+def test_adapter_encode_batched_two_same_grid():
+    cfg = DotsOCRConfig({"vision_config": {"num_layers": 1}})
+    adapter = DotsOCRForCausalLM_MLX(cfg)
+
+    img1 = Image.fromarray((np.random.rand(300, 420, 3) * 255).astype("uint8"))
+    img2 = Image.fromarray((np.random.rand(302, 421, 3) * 255).astype("uint8"))
+
+    tokens, grids = adapter.encode_images([img1, img2], max_tokens_per_batch=10_000)
+
+    assert len(grids) == 2
+    assert tokens.shape[1] == cfg.vision.embed_dim
+
+
 def test_multi_splice_len_and_positions():
     ids = mx.array([999, 151652, 42, 151652, 7], dtype=mx.int32)
     vt1 = mx.zeros((80, 1536))
