@@ -1,8 +1,17 @@
+import os
+
 import numpy as np
 from PIL import Image
 import mlx.core as mx
 
 from .dots_ocr import DotsOCRConfig
+
+
+def getenv_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except Exception:
+        return default
 
 
 class DotsOCRProcessor:
@@ -94,7 +103,9 @@ class MicroBatchPacker:
     Extend later to group by total tokens if desired.
     """
 
-    def __init__(self, max_tokens_per_batch: int = 1_000_000):
+    def __init__(self, max_tokens_per_batch: int | None = None):
+        if max_tokens_per_batch is None:
+            max_tokens_per_batch = getenv_int("MLX_MAX_TOKENS", 1_000_000)
         self.max_tokens = max_tokens_per_batch
 
     def pack(self, processed: list[tuple[mx.array, list[list[int]]]]):
