@@ -16,8 +16,10 @@ def test_simple_tokenizer_image_and_words():
 
 import numpy as np
 from PIL import Image
+import mlx.core as mx
 
 from mlx_vlm.models.dots_ocr.dots_ocr import DotsOCRConfig, DotsOCRForCausalLM_MLX
+from mlx_vlm.text.embedding_fuser import fuse_embeddings_from_image_tokens
 
 
 def test_prepare_and_generate_stub_single_image():
@@ -43,3 +45,17 @@ def test_qwen_loader_imports():
         import pytest
 
         pytest.skip("mlx-lm not installed")
+
+
+def test_embedding_fuser_shapes():
+    vocab, hidden = 32000, 1024
+    embedding = mx.random.uniform(shape=(vocab, hidden))
+    input_ids = np.array([10, 151652, 20, 30], dtype=np.int32)
+    projected = mx.random.uniform(shape=(96, hidden))
+
+    fused, pos = fuse_embeddings_from_image_tokens(
+        embedding, input_ids, 151652, projected
+    )
+
+    assert fused.shape == (len(input_ids) - 1 + projected.shape[0], hidden)
+    assert pos == 1
