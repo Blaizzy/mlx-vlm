@@ -213,6 +213,122 @@ def discover_projector(target: str):
     return candidates
 
 
+def iter_tensor_entries(target: str):
+    for st_path in iter_safetensors(target):
+        with open(st_path, "rb") as handle:
+            data = handle.read()
+        for key, tensor in deserialize(data):
+            yield st_path, key, tensor
+
+
+def sample_model_keys(target: str, limit: int = 100) -> list[str]:
+    keys: list[str] = []
+    for _, key, _ in iter_tensor_entries(target):
+        if key.startswith("model."):
+            keys.append(key)
+            if len(keys) >= limit:
+                break
+    return keys
+
+
+def infer_hidden_size_and_projector(target: str):
+    hidden_size = None
+    style = "unknown"
+    projectors: list[tuple[str, tuple[int, ...]]] = []
+
+    for _, key, tensor in iter_tensor_entries(target):
+        if key.endswith("model.embed_tokens.weight"):
+            hidden_size = int(tensor["shape"][1])
+            break
+
+    keys = sample_model_keys(target, limit=80)
+    if any(".self_attn.q_proj.weight" in k for k in keys):
+        style = "llama"
+    if any(".attention.wq.weight" in k for k in keys):
+        style = "qwen"
+    if any(".attention.query_key_value.weight" in k for k in keys):
+        style = "phi"
+
+    vision_dim = 1536
+    exclude = (".attention.", ".attn.", ".mlp.", ".norm", "embed_tokens", "lm_head")
+    hints = (
+        "project",
+        "vision",
+        "visual",
+        "connector",
+        "mm_",
+        "multi_modal",
+        "image",
+    )
+
+    for _, key, tensor in iter_tensor_entries(target):
+        if not key.startswith("model."):
+            continue
+        if any(token in key for token in exclude):
+            continue
+        if hidden_size is None:
+            continue
+        shape = tuple(int(x) for x in tensor["shape"])
+        if len(shape) != 2:
+            continue
+        shape_matches = shape in ((hidden_size, vision_dim), (vision_dim, hidden_size))
+        name_matches = any(h in key.lower() for h in hints)
+        if shape_matches and name_matches:
+            projectors.append((key, shape))
+
+    identity_ok = hidden_size == vision_dim and not projectors
+    info = {
+        "hidden_size": hidden_size,
+        "style": style,
+        "projectors": projectors,
+        "identity_ok": identity_ok,
+    }
+    print(info)
+    return info
+
+
+def convert_projector_to_npz(target: str, out_npz: str):
+    import numpy as np
+
+    info = infer_hidden_size_and_projector(target)
+    hidden_size = info["hidden_size"]
+    projectors = info["projectors"]
+    identity_ok = info["identity_ok"]
+
+    if projectors:
+        key, _ = projectors[0]
+        array = None
+        for _, key_entry, tensor in iter_tensor_entries(target):
+            if key_entry == key:
+                array = _tensor_to_numpy(tensor["data"], tensor["dtype"], tensor["shape"])
+                break
+        if array is None:
+            raise RuntimeError(f"Projector tensor {key} not found at load time")
+        if array.shape[0] == 1536:
+            array = array.T
+        np.savez(out_npz, **{"projector.proj.weight": array})
+        print(f"[projector] wrote {out_npz} key={key} -> shape={array.shape}")
+        return {
+            "npz": out_npz,
+            "key": key,
+            "shape": tuple(array.shape),
+            "hidden_size": hidden_size,
+        }
+
+    if identity_ok:
+        array = np.eye(1536, dtype=np.float32)
+        np.savez(out_npz, **{"projector.proj.weight": array})
+        print("[projector] wrote", out_npz, "identity 1536x1536 (fallback)")
+        return {
+            "npz": out_npz,
+            "key": "identity",
+            "shape": (1536, 1536),
+            "hidden_size": hidden_size,
+        }
+
+    raise RuntimeError("No projector found and hidden size != 1536; cannot fallback to identity")
+
+
 def write_text_summary(
     target: str,
     out_json: str = "mlx_vlm/convert/reports/dots_text_summary.json",
@@ -258,6 +374,9 @@ if __name__ == "__main__":
         sys.exit(0)
     if len(sys.argv) >= 3 and sys.argv[1] == "summarize-text":
         write_text_summary(sys.argv[2])
+        sys.exit(0)
+    if len(sys.argv) >= 4 and sys.argv[1] == "convert-proj":
+        convert_projector_to_npz(sys.argv[2], sys.argv[3])
         sys.exit(0)
     print("Usage:")
     print("  python -m mlx_vlm.convert.convert_dots_ocr scan /path/to/model_or_dir")
