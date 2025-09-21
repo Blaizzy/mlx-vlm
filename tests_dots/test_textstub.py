@@ -59,3 +59,29 @@ def test_embedding_fuser_shapes():
 
     assert fused.shape == (len(input_ids) - 1 + projected.shape[0], hidden)
     assert pos == 1
+
+
+def test_qwen_generate_prefix_stub_smoke():
+    try:
+        from mlx_vlm.text.mlx_qwen_loader import MLXQwen, QwenLoadOpts
+    except Exception:
+        return
+    import os
+    import pytest
+
+    model_dir = os.environ.get("DOTS_QWEN_DIR")
+    if not model_dir or not os.path.exists(model_dir):
+        pytest.skip("DOTS_QWEN_DIR not set or path missing")
+
+    os.environ.setdefault("TRANSFORMERS_TRUST_REMOTE_CODE", "1")
+    os.environ.setdefault("HF_ALLOW_CODE_EVAL", "1")
+
+    from transformers import AutoTokenizer
+
+    AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+
+    loader = MLXQwen(QwenLoadOpts(model_dir=model_dir))
+    hidden = loader.embed_weight().shape[1]
+    fused = mx.random.uniform(shape=(8, hidden))
+    out = loader.generate_with_prefix_embeddings(fused, max_new_tokens=8)
+    assert isinstance(out, str)
