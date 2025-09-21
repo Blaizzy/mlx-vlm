@@ -1,6 +1,6 @@
 from .lora import LoRaLayer, replace_lora_with_linear
 from .trainer import TrainingArgs, train, save_adapter
-from .datasets import Dataset
+from .datasets import Dataset, PreferenceDataset
 from .utils import (
     apply_lora_layers,
     count_parameters,
