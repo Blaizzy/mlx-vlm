@@ -34,3 +34,12 @@ def test_prepare_and_generate_stub_single_image():
 def test_try_hf_tokenizer_skip_if_missing():
     maybe_tok = try_hf_tokenizer("nonexistent-model-xyz")
     assert maybe_tok is None or (isinstance(maybe_tok, tuple) and len(maybe_tok) == 2)
+
+
+def test_qwen_loader_imports():
+    try:
+        from mlx_vlm.text.mlx_qwen_loader import MLXQwen, QwenLoadOpts  # noqa: F401
+    except Exception:
+        import pytest
+
+        pytest.skip("mlx-lm not installed")
