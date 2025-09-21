@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import math
+from typing import Union
 
 import mlx.nn as nn
 import mlx.core as mx
@@ -36,6 +37,21 @@ def grad_checkpoint(layer):
         return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
 
     type(layer).__call__ = checkpointed_fn
+
+
+def save_adapter(model: nn.Module, adapter_file: Union[str, Path]):
+    """Save adapter weights and config."""
+    path = Path(adapter_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Save adapter config if available
+    if hasattr(model, 'config') and hasattr(model.config, "lora"):
+        with open(path.parent / "adapter_config.json", "w") as f:
+            json.dump(model.config.lora, f, indent=2)
+    
+    # Save weights
+    flattened_tree = tree_flatten(model.trainable_parameters())
+    mx.save_safetensors(str(adapter_file), dict(flattened_tree))
 
 
 def get_learning_rate(iters: int, step: int, warmup_steps: int, learning_rate: float, min_learning_rate: float):

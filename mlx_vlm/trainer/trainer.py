@@ -5,7 +5,6 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -14,7 +13,7 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
-from .utils import grad_checkpoint, Colors, get_learning_rate
+from .utils import grad_checkpoint, Colors, get_learning_rate, save_adapter
 
 @dataclass
 class TrainingArgs:
@@ -366,18 +365,3 @@ def train(
     if rank == 0:
         save_adapter(model, args.adapter_file)
         print(f"{Colors.OKGREEN}Saved final adapter weights to {args.adapter_file}.{Colors.ENDC}")
-
-
-def save_adapter(model: nn.Module, adapter_file: Union[str, Path]):
-    """Save adapter weights and config."""
-    path = Path(adapter_file)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Save adapter config if available
-    if hasattr(model, 'config') and hasattr(model.config, "lora"):
-        with open(path.parent / "adapter_config.json", "w") as f:
-            json.dump(model.config.lora, f, indent=2)
-    
-    # Save weights
-    flattened_tree = tree_flatten(model.trainable_parameters())
-    mx.save_safetensors(str(adapter_file), dict(flattened_tree))

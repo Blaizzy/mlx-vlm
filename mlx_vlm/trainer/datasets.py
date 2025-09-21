@@ -227,7 +227,7 @@ class PreferenceDataset:
             processor=self.processor,
             images=image_data,
             audio=None,
-            prompts=chosen_conversation,
+            prompts=rejected_conversation,
             image_token_index=getattr(self.config, "image_token_index", "image_token_id"),
             resize_shape=self.image_resize_shape
         )
