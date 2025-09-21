@@ -81,3 +81,17 @@ def try_hf_tokenizer(model_or_dir: str, image_token: str = "<image>"):
         image_id = None
 
     return tokenizer, image_id
+
+
+def load_qwen_tokenizer(model_dir: str):
+    try:
+        from transformers import AutoTokenizer
+    except Exception as exc:
+        raise RuntimeError(
+            "transformers not installed; run `pip install transformers`"
+        ) from exc
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_dir, use_fast=True, trust_remote_code=True
+    )
+    return tokenizer

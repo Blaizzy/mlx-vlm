@@ -119,10 +119,34 @@ class DotsOCRForCausalLM_MLX:
             self.load_vision_npz(npz_path)
 
         vision_tokens, grids = self.encode_images(pil_images)
-        tokenizer = SimpleTokenizer(image_token_id=self.cfg.tokens.image_token_id)
-        input_ids, positions, fused_len = self.prepare_inputs(
-            prompt, tokenizer, vision_tokens
-        )
+
+        tok_path = None
+        try:
+            tok_path = os.environ.get("DOTS_TOKENIZER_DIR")
+        except Exception:
+            tok_path = None
+
+        if tok_path:
+            from .tokenizer import load_qwen_tokenizer
+
+            hf_tok = load_qwen_tokenizer(tok_path)
+            text = render_chat(prompt)
+            encoded = hf_tok(
+                text, add_special_tokens=True, return_tensors="np"
+            )
+            ids = encoded["input_ids"][0].tolist()
+            if "<image>" in hf_tok.get_vocab():
+                image_tok_id = hf_tok.convert_tokens_to_ids("<image>")
+            else:
+                image_tok_id = self.cfg.tokens.image_token_id
+            position, fused_len = splice_image_tokens(ids, image_tok_id, vision_tokens)
+            positions = [position]
+            input_ids = ids
+        else:
+            tokenizer = SimpleTokenizer(image_token_id=self.cfg.tokens.image_token_id)
+            input_ids, positions, fused_len = self.prepare_inputs(
+                prompt, tokenizer, vision_tokens
+            )
         return {
             "input_len": len(input_ids),
             "image_pos": positions,
