@@ -187,6 +187,32 @@ def scan_text_prefixes(target: str, limit: int = 40):
     return tops
 
 
+def discover_projector(target: str):
+    """Find potential projector weights (vision -> text adapters)."""
+
+    candidates: list[tuple[str, tuple[int, ...]]] = []
+    files = list(iter_safetensors(target))
+    if not files:
+        print(f"[projector] no .safetensors under {target}")
+        return []
+
+    for st_path in files:
+        with safe_open(st_path, framework="np") as handle:
+            for key in handle.keys():
+                if "vision_tower" in key:
+                    continue
+                if any(p in key for p in ("proj", "projector", "vision_proj", "visual_proj")):
+                    try:
+                        tensor = handle.get_tensor(key)
+                        candidates.append((key, tuple(tensor.shape)))
+                    except Exception:
+                        continue
+
+    candidates = sorted(set(candidates), key=lambda x: x[0])
+    print("[projector] candidates:", candidates[:20])
+    return candidates
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "scan":
         sys.exit(cli_scan(sys.argv[2]))
@@ -197,9 +223,13 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "scan-text":
         scan_text_prefixes(sys.argv[2])
         sys.exit(0)
+    if len(sys.argv) >= 3 and sys.argv[1] == "discover-proj":
+        discover_projector(sys.argv[2])
+        sys.exit(0)
     print("Usage:")
     print("  python -m mlx_vlm.convert.convert_dots_ocr scan /path/to/model_or_dir")
     print("  python -m mlx_vlm.convert.convert_dots_ocr scan-text /path/to/model_or_dir")
+    print("  python -m mlx_vlm.convert.convert_dots_ocr discover-proj /path/to/model_or_dir")
     print(
         "  python -m mlx_vlm.convert.convert_dots_ocr to-npz /path/to/model_or_dir "
         "weights/dots_ocr_vision.npz"
