@@ -7,6 +7,9 @@ import mlx.core as mx
 
 from .dots_ocr import DotsOCRConfig
 
+MAX_DOTS_PIXELS = 11_289_600  # ~11.29M pixels cap from dots.ocr docs
+RECOMMENDED_DPI = 200
+
 
 def getenv_int(name: str, default: int) -> int:
     try:
@@ -64,6 +67,13 @@ class DotsOCRProcessor:
 
     def process_one(self, im: Image.Image) -> tuple[mx.array, list[list[int]]]:
         im = im.convert("RGB")
+        w0, h0 = im.size
+        if w0 * h0 > MAX_DOTS_PIXELS * 4:
+            scale = (MAX_DOTS_PIXELS * 4 / (w0 * h0)) ** 0.5
+            new_w = max(1, int(w0 * scale))
+            new_h = max(1, int(h0 * scale))
+            if new_w != w0 or new_h != h0:
+                im = im.resize((new_w, new_h), Image.BICUBIC)
         p = self.cfg.processor
         v = self.cfg.vision
 
@@ -78,6 +88,9 @@ class DotsOCRProcessor:
         multiple = v.patch_size * v.merge_size
         x = self._pad_to_multiple(x, multiple)
         H, W = x.shape[-2], x.shape[-1]
+        assert (
+            H * W <= MAX_DOTS_PIXELS
+        ), f"pixels after pad exceed cap ({H*W} > {MAX_DOTS_PIXELS}); lower DPI or shrink"
         grid_thw = [[1, (H // v.patch_size), (W // v.patch_size)]]
 
         return mx.array(x), grid_thw

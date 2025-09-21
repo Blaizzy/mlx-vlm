@@ -3,22 +3,10 @@ from __future__ import annotations
 import argparse
 import os
 
-from PIL import Image
-
 from mlx_vlm.convert.convert_dots_ocr import cli_convert
 from mlx_vlm.models.dots_ocr.dots_ocr import DotsOCRConfig, DotsOCRForCausalLM_MLX
-
-
-def load_pdf_images(pdf_path: str, dpi: int = 200) -> list[Image.Image]:
-    try:
-        from pdf2image import convert_from_path
-    except ImportError as exc:
-        raise RuntimeError(
-            "pdf2image is required for --pdf support; install via `pip install pdf2image`"
-        ) from exc
-
-    pages = convert_from_path(pdf_path, dpi=dpi)
-    return [page.convert("RGB") for page in pages]
+from mlx_vlm.models.dots_ocr.processor import RECOMMENDED_DPI
+from mlx_vlm.utils.pdf_io import pdf_to_images
 
 
 def main() -> None:
@@ -30,7 +18,7 @@ def main() -> None:
         help="NPZ destination for vision weights",
     )
     parser.add_argument("--pdf", help="Optional PDF path to encode")
-    parser.add_argument("--dpi", type=int, default=200)
+    parser.add_argument("--dpi", type=int, default=RECOMMENDED_DPI)
     args = parser.parse_args()
 
     out_dir = os.path.dirname(args.out)
@@ -42,7 +30,7 @@ def main() -> None:
     if not args.pdf:
         return
 
-    pages = load_pdf_images(args.pdf, dpi=args.dpi)
+    pages = pdf_to_images(args.pdf, dpi=args.dpi)
     if not pages:
         print("[vision] no pages extracted from PDF; skipping encode")
         return
