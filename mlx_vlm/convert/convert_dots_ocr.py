@@ -213,6 +213,36 @@ def discover_projector(target: str):
     return candidates
 
 
+def write_text_summary(
+    target: str,
+    out_json: str = "mlx_vlm/convert/reports/dots_text_summary.json",
+):
+    import json
+    import os
+
+    prefix_counts = scan_text_prefixes(target, limit=200)
+    projector_candidates = discover_projector(target)
+
+    payload = {
+        "prefix_counts": [
+            {"prefix": prefix, "count": count} for prefix, count in prefix_counts
+        ],
+        "projector_candidates": [
+            {"key": key, "shape": list(shape)} for key, shape in projector_candidates
+        ],
+    }
+
+    out_dir = os.path.dirname(out_json)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    with open(out_json, "w") as handle:
+        json.dump(payload, handle, indent=2)
+
+    print("[summary] wrote", out_json)
+    return out_json
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "scan":
         sys.exit(cli_scan(sys.argv[2]))
@@ -226,10 +256,16 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "discover-proj":
         discover_projector(sys.argv[2])
         sys.exit(0)
+    if len(sys.argv) >= 3 and sys.argv[1] == "summarize-text":
+        write_text_summary(sys.argv[2])
+        sys.exit(0)
     print("Usage:")
     print("  python -m mlx_vlm.convert.convert_dots_ocr scan /path/to/model_or_dir")
     print("  python -m mlx_vlm.convert.convert_dots_ocr scan-text /path/to/model_or_dir")
     print("  python -m mlx_vlm.convert.convert_dots_ocr discover-proj /path/to/model_or_dir")
+    print(
+        "  python -m mlx_vlm.convert.convert_dots_ocr summarize-text /path/to/model_or_dir"
+    )
     print(
         "  python -m mlx_vlm.convert.convert_dots_ocr to-npz /path/to/model_or_dir "
         "weights/dots_ocr_vision.npz"

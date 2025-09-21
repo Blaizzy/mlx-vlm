@@ -1,0 +1,13 @@
+{
+  "prefix_counts": [
+    {
+      "prefix": "model",
+      "count": 338
+    },
+    {
+      "prefix": "lm_head",
+      "count": 1
+    }
+  ],
+  "projector_candidates": []
+}
