@@ -25,3 +25,5 @@ var/
 # virtual environment
 .myenv
 .venv
+
+.vscode

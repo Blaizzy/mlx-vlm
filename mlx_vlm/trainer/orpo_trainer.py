@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from typing import Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -13,58 +14,15 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
+from .trainer import TrainingArgs
 from .utils import grad_checkpoint, Colors, get_learning_rate, save_adapter
 
 @dataclass
-class TrainingArgs:
-    batch_size: int = field(default=4, metadata={"help": "Minibatch size."})
-    iters: int = field(default=100, metadata={"help": "Iterations to train for."})
-    val_batches: int = field(
-        default=25,
-        metadata={
-            "help": "Number of validation batches, -1 uses the entire validation set."
-        },
-    )
-    steps_per_report: int = field(
-        default=10,
-        metadata={"help": "Number of training steps between loss reporting."},
-    )
-    steps_per_eval: int = field(
-        default=200, metadata={"help": "Number of training steps between validations."}
-    )
-    steps_per_save: int = field(
-        default=100, metadata={"help": "Save the model every number steps"}
-    )
-    max_seq_length: int = field(
-        default=2048, metadata={"help": "Maximum sequence length."}
-    )
-    adapter_file: str = field(
-        default="adapters.safetensors",
-        metadata={"help": "Save/load path for the trained adapter weights."},
-    )
-    grad_checkpoint: bool = field(
-        default=False,
-        metadata={"help": "Use gradient checkpointing to reduce memory use."},
-    )
-    learning_rate: float = field(
-        default=1e-5,
-        metadata={"help": "Learning rate."},
-    )
-    grad_clip: float = field(
-        default=1.0,
-        metadata={"help": "Gradient clipping value."},
-    )
-    warmup_steps: int = field(
-        default=100,
-        metadata={"help": "Number of warmup steps for learning rate."},
-    )
-    min_learning_rate: float = field(
-        default=1e-6,
-        metadata={"help": "Minimum learning rate after decay."},
-    )
+class OrpoTrainingArgs(TrainingArgs):
+    beta: float = field(default=0.1, metadata={"help": "Exponential moving average parameter for reward normalization"})
 
 
-def default_loss(model, inputs, targets, lengths, train_on_completions=False, assistant_id=77091):
+def get_logps(model, inputs, targets, lengths, train_on_completions=False, assistant_id=77091):
     outputs = model(inputs)
     logits = outputs.logits[:, :-1].astype(mx.float32)
     targets = targets[:, 1:]
@@ -80,16 +38,47 @@ def default_loss(model, inputs, targets, lengths, train_on_completions=False, as
     else:
         mask = base_mask
     
-    weight_mask = mask.astype(mx.float32)
+    log_probs = -nn.losses.cross_entropy(logits, targets, reduction="none")
+    logp_seq_avg = (log_probs * mask).sum(-1) / mask.sum(-1)
+    logits_mean = logits.sum() / mask.sum()
+    return logp_seq_avg, logits_mean
 
-    length_mask = mx.arange(targets.shape[1])[None, :] < (lengths - 1)[:, None]
-    
-    ce = nn.losses.cross_entropy(logits, targets, weights=weight_mask) * length_mask
-    ntoks = length_mask.sum()
-    ce = ce.sum() / ntoks
+
+def orpo_loss(
+    chosen_logps,
+    chosen_logits_mean,
+    rejected_logps,
+    rejected_logits_mean,
+    chosen_masks,
+    rejected_masks,
+    preference_scores,
+    beta: float = 0.1,
+):
+    chosen_logps = chosen_logps * preference_scores
+
+    # Stable log-odds computation
+    log_odds = chosen_logps - rejected_logps
+    ratio = nn.log_sigmoid(log_odds)
+    loss = -beta * ratio
+
+    # Reward estimation
+    chosen_reward = beta * chosen_logps
+    rejected_reward = beta * rejected_logps
+    reward = mx.stack([mx.mean(chosen_reward), mx.mean(rejected_reward)])
+
+    num_tokens = chosen_masks.sum() + rejected_masks.sum()
+
+    metrics = {
+        "accuracies": mx.mean((chosen_reward > rejected_reward).astype(mx.float32)),
+        "margins": mx.mean(chosen_reward - rejected_reward),
+        "policy_chosen_logps": mx.mean(chosen_logps),
+        "policy_rejected_logps": mx.mean(rejected_logps),
+        "chosen_logits_mean": chosen_logits_mean,
+        "rejected_logits_mean": rejected_logits_mean,
+    }
 
     mx.clear_cache()
-    return ce, ntoks
+    return mx.mean(loss), reward, num_tokens, metrics
 
 
 def iterate_batches(dataset, batch_size, max_seq_length, train=False):
@@ -110,43 +99,69 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
         order = np.random.permutation(len(batch_indices)) if train else range(len(batch_indices))
         for b in order:
             items = [dataset[idx] for idx in batch_indices[b]]
-            lengths = [min(len(x["input_ids"]), max_seq_length) for x in items]
 
-            max_len = min(max(lengths), max_seq_length)
+            chosen_lengths = [min(len(x["chosen"]["input_ids"]), max_seq_length) for x in items]
+            rejected_lengths = [min(len(x["rejected"]["input_ids"]), max_seq_length) for x in items]
+
+            max_chosen_len = min(max(chosen_lengths), max_seq_length)
+            max_rejected_len = min(max(rejected_lengths), max_seq_length)
+
             pad_to = 32
-            padded_len = 1 + pad_to * ((max_len + pad_to - 1) // pad_to)
-            padded_len = min(padded_len, max_seq_length)
+            padded_chosen_len = 1 + pad_to * ((max_chosen_len + pad_to - 1) // pad_to)
+            padded_chosen_len = min(padded_chosen_len, max_seq_length)
 
-            input_ids_batch = np.zeros((len(items), padded_len), dtype=np.int32)
-            attention_mask_batch = np.zeros((len(items), padded_len), dtype=np.int32)
+            padded_rejected_len = 1 + pad_to * ((max_rejected_len + pad_to - 1) // pad_to)
+            padded_rejected_len = min(padded_rejected_len, max_seq_length)
+
+            chosen_input_ids_batch = np.zeros((len(items), padded_chosen_len), dtype=np.int32)
+            chosen_attention_mask_batch = np.zeros((len(items), padded_chosen_len), dtype=np.int32)
+
+            rejected_input_ids_batch = np.zeros((len(items), padded_rejected_len), dtype=np.int32)
+            rejected_attention_mask_batch = np.zeros((len(items), padded_rejected_len), dtype=np.int32)
 
             for i, item in enumerate(items):
-                arr = np.array(item["input_ids"]).reshape(-1)  # flatten input_ids
-                L = min(len(arr), padded_len)
-                input_ids_batch[i, :L] = arr[:L]
+                chosen_arr = np.array(item["chosen"]["input_ids"]).reshape(-1)
+                Lc = min(len(chosen_arr), padded_chosen_len)
+                chosen_input_ids_batch[i, :Lc] = chosen_arr[:Lc]
 
-                if "attention_mask" in item:
-                    mask = np.array(item["attention_mask"]).reshape(-1)  # flatten mask
-                    attention_mask_batch[i, :L] = mask[:L]
+                if "attention_mask" in item["chosen"]:
+                    chosen_mask = np.array(item["chosen"]["attention_mask"]).reshape(-1)
+                    chosen_attention_mask_batch[i, :Lc] = chosen_mask[:Lc]
                 else:
-                    attention_mask_batch[i, :L] = 1
+                    chosen_attention_mask_batch[i, :Lc] = 1
 
-            yield {
-                "input_ids": mx.array(input_ids_batch),
-                "attention_mask": mx.array(attention_mask_batch),
+                rejected_arr = np.array(item["rejected"]["input_ids"]).reshape(-1)
+                Lr = min(len(rejected_arr), padded_rejected_len)
+                rejected_input_ids_batch[i, :Lr] = rejected_arr[:Lr]
+
+                if "attention_mask" in item["rejected"]:
+                    rejected_mask = np.array(item["rejected"]["attention_mask"]).reshape(-1)
+                    rejected_attention_mask_batch[i, :Lr] = rejected_mask[:Lr]
+                else:
+                    rejected_attention_mask_batch[i, :Lr] = 1
+
+            chosen_batch = {
+                "input_ids": mx.array(chosen_input_ids_batch),
+                "attention_mask": mx.array(chosen_attention_mask_batch),
             }
+            rejected_batch = {
+                "input_ids": mx.array(rejected_input_ids_batch),
+                "attention_mask": mx.array(rejected_attention_mask_batch),
+            }
+
+            yield (chosen_batch, rejected_batch)
         if not train:
             break
         mx.clear_cache()
 
 
-def evaluate(
+def evaluate_orpo(
     model,
     dataset,
     batch_size,
     num_batches,
     max_seq_length=2048,
-    loss_fn=default_loss,
+    loss_fn=orpo_loss,
     train_on_completions=False,
     assistant_id=77091,
 ):
@@ -154,18 +169,12 @@ def evaluate(
     Evaluate the model on validation dataset.
     """
     model.eval()
-    all_losses = mx.array(0.0)
-    ntokens = mx.array(0)
-    
-    loss_fn_partial = partial(
-        loss_fn,
-        train_on_completions=train_on_completions,
-        assistant_id=assistant_id
-    )
-    
+    total_loss = mx.array(0.0)
+    total_tokens = mx.array(0)
+
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
-    
-    for _, batch in tqdm(
+
+    for _, (chosen_batch, rejected_batch) in tqdm(
         zip(
             index_iterator,
             iterate_batches(
@@ -177,32 +186,64 @@ def evaluate(
         desc="Calculating loss...",
         total=min(len(dataset) // batch_size, num_batches) if num_batches != -1 else len(dataset) // batch_size,
     ):
-        inputs = batch["input_ids"][:, :-1]
-        targets = batch["input_ids"][:, 1:]
-        if "attention_mask" in batch:
-            lengths = batch["attention_mask"].sum(axis=1)
-        else:
-            lengths = mx.full((inputs.shape[0],), inputs.shape[1])
-        losses, toks = loss_fn_partial(model, inputs, targets, lengths)
-        all_losses += losses * toks
-        ntokens += toks
-        mx.eval(all_losses, ntokens)
-    
-    all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
-    ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
+        chosen_inputs = chosen_batch["input_ids"][:, :-1]
+        chosen_targets = chosen_batch["input_ids"][:, 1:]
+        chosen_lengths = chosen_batch["attention_mask"].sum(axis=1)
+
+        rejected_inputs = rejected_batch["input_ids"][:, :-1]
+        rejected_targets = rejected_batch["input_ids"][:, 1:]
+        rejected_lengths = rejected_batch["attention_mask"].sum(axis=1)
+
+        chosen_logps, chosen_logits_mean = get_logps(
+            model,
+            chosen_inputs,
+            chosen_targets,
+            chosen_lengths,
+            train_on_completions=train_on_completions,
+            assistant_id=assistant_id,
+        )
+        rejected_logps, rejected_logits_mean = get_logps(
+            model,
+            rejected_inputs,
+            rejected_targets,
+            rejected_lengths,
+            train_on_completions=train_on_completions,
+            assistant_id=assistant_id,
+        )
+
+        preference_scores = mx.ones_like(chosen_logps) # TODO: change this if preference scores are available
+
+        losses, reward, num_tokens, metrics = loss_fn(
+            chosen_logps,
+            chosen_logits_mean,
+            rejected_logps,
+            rejected_logits_mean,
+            chosen_lengths,
+            rejected_lengths,
+            preference_scores,
+            beta=0.1,
+        )
+
+        total_loss += losses * num_tokens
+        total_tokens += num_tokens
+        mx.eval(total_loss, total_tokens)
+
+    total_loss = mx.distributed.all_sum(total_loss, stream=mx.cpu)
+    total_tokens = mx.distributed.all_sum(total_tokens, stream=mx.cpu)
 
     mx.clear_cache()
-    
-    return (all_losses / mx.maximum(ntokens, 1)).item()
+
+    return (total_loss / mx.maximum(total_tokens, 1)).item()
 
 
-def train(
+
+def train_orpo(
     model,
     optimizer,
     train_dataset,
     val_dataset = None,
     args: TrainingArgs = TrainingArgs(),
-    loss_fn=default_loss,
+    loss_fn=orpo_loss,
     train_on_completions=False,
     assistant_id=77091,
 ):
@@ -241,12 +282,48 @@ def train(
     state = [model.state, optimizer.state, mx.random.state]
     
     @partial(mx.compile, inputs=state, outputs=state)
-    def step(batch):
-        inputs = batch["input_ids"]
-        targets = batch["input_ids"]
-        lengths = batch["attention_mask"].sum(axis=1)
+    def step(chosen_batch, rejected_batch):
+        chosen_inputs = chosen_batch["input_ids"][:, :-1]
+        chosen_targets = chosen_batch["input_ids"][:, 1:]
+        chosen_lengths = chosen_batch["attention_mask"].sum(axis=1)
 
-        (lvalue, toks), grad = loss_value_and_grad(model, inputs, targets, lengths)
+        rejected_inputs = rejected_batch["input_ids"][:, :-1]
+        rejected_targets = rejected_batch["input_ids"][:, 1:]
+        rejected_lengths = rejected_batch["attention_mask"].sum(axis=1)
+
+        chosen_logps, chosen_logits_mean = get_logps(
+            model,
+            chosen_inputs,
+            chosen_targets,
+            chosen_lengths,
+            train_on_completions=train_on_completions,
+            assistant_id=assistant_id,
+        )
+        rejected_logps, rejected_logits_mean = get_logps(
+            model,
+            rejected_inputs,
+            rejected_targets,
+            rejected_lengths,
+            train_on_completions=train_on_completions,
+            assistant_id=assistant_id,
+        )
+
+        preference_scores = mx.ones_like(chosen_logps) # TODO: change this if preference scores are available
+
+        def loss_fn_wrapper():
+            losses, reward, num_tokens, metrics = loss_fn_partial(
+                chosen_logps,
+                chosen_logits_mean,
+                rejected_logps,
+                rejected_logits_mean,
+                chosen_lengths,
+                rejected_lengths,
+                preference_scores,
+                beta=args.beta,
+            )
+            return losses, num_tokens
+
+        (lvalue, toks), grad = nn.value_and_grad(loss_fn_wrapper)()
 
         # Gradient clipping
         if args.grad_clip is not None:
@@ -263,8 +340,6 @@ def train(
 
         return lvalue, toks
     
-    loss_value_and_grad = nn.value_and_grad(model, loss_fn_partial)
-    
     # Training metrics
     model.train()
     losses = 0
@@ -274,7 +349,7 @@ def train(
     train_time = 0
     
     # Main training loop
-    for it, batch in zip(
+    for it, (chosen_batch, rejected_batch) in zip(
         range(1, args.iters + 1),
         iterate_batches(
             dataset=train_dataset,
@@ -288,7 +363,7 @@ def train(
         # Validation (only if a validation dataset is provided)
         if val_dataset is not None and (it == 1 or it % args.steps_per_eval == 0 or it == args.iters):
             tic_val = time.perf_counter()
-            val_loss = evaluate(
+            val_loss = evaluate_orpo(
                 model=model,
                 dataset=val_dataset,
                 batch_size=args.batch_size,
@@ -312,7 +387,7 @@ def train(
             tic = time.perf_counter()
 
         # Training step
-        lvalue, toks = step(batch)
+        lvalue, toks = step(chosen_batch, rejected_batch)
         mx.clear_cache()
         losses += lvalue
         n_tokens += toks
