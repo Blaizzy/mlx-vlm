@@ -155,7 +155,7 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
         mx.clear_cache()
 
 
-def evaluate(
+def evaluate_orpo(
     model,
     dataset,
     batch_size,
@@ -164,7 +164,7 @@ def evaluate(
     loss_fn=orpo_loss,
     train_on_completions=False,
     assistant_id=77091,
-): # TODO updat this with the new iterate batches and orpo loss return report
+):
     """
     Evaluate the model on validation dataset.
     """
@@ -234,3 +234,209 @@ def evaluate(
     mx.clear_cache()
 
     return (total_loss / mx.maximum(total_tokens, 1)).item()
+
+
+
+def train_orpo(
+    model,
+    optimizer,
+    train_dataset,
+    val_dataset = None,
+    args: TrainingArgs = TrainingArgs(),
+    loss_fn=orpo_loss,
+    train_on_completions=False,
+    assistant_id=77091,
+):
+    """
+    Main training function for vision-language models.
+    """
+    # Set memory limit if using Metal
+    if mx.metal.is_available():
+        mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
+    
+    print(f"{Colors.HEADER}Starting training..., iterations: {args.iters}{Colors.ENDC}")
+
+    # Initialize distributed training
+    world = mx.distributed.init()
+    world_size = world.size()
+    rank = world.rank()
+    if world_size > 1:
+        print(f"Node {rank} of {world_size}")
+
+    if val_dataset is None and rank == 0:
+        print(f"{Colors.OKBLUE}No validation dataset provided — training will run without validation.{Colors.ENDC}")
+    
+    # Enable gradient checkpointing if requested
+    if args.grad_checkpoint:
+        if hasattr(model, 'layers'):
+            grad_checkpoint(model.layers[0])
+    
+    # Create loss function with partial application
+    loss_fn_partial = partial(
+        loss_fn,
+        train_on_completions=train_on_completions,
+        assistant_id=assistant_id
+    )
+    
+    # Compile the training step (like MLX-LM)
+    state = [model.state, optimizer.state, mx.random.state]
+    
+    @partial(mx.compile, inputs=state, outputs=state)
+    def step(chosen_batch, rejected_batch):
+        chosen_inputs = chosen_batch["input_ids"][:, :-1]
+        chosen_targets = chosen_batch["input_ids"][:, 1:]
+        chosen_lengths = chosen_batch["attention_mask"].sum(axis=1)
+
+        rejected_inputs = rejected_batch["input_ids"][:, :-1]
+        rejected_targets = rejected_batch["input_ids"][:, 1:]
+        rejected_lengths = rejected_batch["attention_mask"].sum(axis=1)
+
+        chosen_logps, chosen_logits_mean = get_logps(
+            model,
+            chosen_inputs,
+            chosen_targets,
+            chosen_lengths,
+            train_on_completions=train_on_completions,
+            assistant_id=assistant_id,
+        )
+        rejected_logps, rejected_logits_mean = get_logps(
+            model,
+            rejected_inputs,
+            rejected_targets,
+            rejected_lengths,
+            train_on_completions=train_on_completions,
+            assistant_id=assistant_id,
+        )
+
+        preference_scores = mx.ones_like(chosen_logps) # TODO: change this if preference scores are available
+
+        def loss_fn_wrapper():
+            losses, reward, num_tokens, metrics = loss_fn_partial(
+                chosen_logps,
+                chosen_logits_mean,
+                rejected_logps,
+                rejected_logits_mean,
+                chosen_lengths,
+                rejected_lengths,
+                preference_scores,
+                beta=args.beta,
+            )
+            return losses, num_tokens
+
+        (lvalue, toks), grad = nn.value_and_grad(loss_fn_wrapper)()
+
+        # Gradient clipping
+        if args.grad_clip is not None:
+            grad = tree_map(
+                lambda g: mx.clip(g, -args.grad_clip, args.grad_clip),
+                grad
+            )
+
+        # Average gradients for distributed training
+        grad = average_gradients(grad)
+
+        # Update model
+        optimizer.update(model, grad)
+
+        return lvalue, toks
+    
+    # Training metrics
+    model.train()
+    losses = 0
+    n_tokens = 0
+    steps = 0
+    trained_tokens = 0
+    train_time = 0
+    
+    # Main training loop
+    for it, (chosen_batch, rejected_batch) in zip(
+        range(1, args.iters + 1),
+        iterate_batches(
+            dataset=train_dataset,
+            batch_size=args.batch_size,
+            max_seq_length=args.max_seq_length,
+            train=True,
+        ),
+    ):
+        tic = time.perf_counter()
+
+        # Validation (only if a validation dataset is provided)
+        if val_dataset is not None and (it == 1 or it % args.steps_per_eval == 0 or it == args.iters):
+            tic_val = time.perf_counter()
+            val_loss = evaluate_orpo(
+                model=model,
+                dataset=val_dataset,
+                batch_size=args.batch_size,
+                num_batches=args.val_batches,
+                max_seq_length=args.max_seq_length,
+                loss_fn=loss_fn,
+                train_on_completions=train_on_completions,
+                assistant_id=assistant_id,
+            )
+            model.train()
+            val_time = time.perf_counter() - tic_val
+
+            if rank == 0:
+                print(
+                    f"{Colors.OKCYAN}Iter {it}: "
+                    f"Val loss {val_loss:.3f}, "
+                    f"Val took {val_time:.3f}s{Colors.ENDC}",
+                    flush=True,
+                )
+
+            tic = time.perf_counter()
+
+        # Training step
+        lvalue, toks = step(chosen_batch, rejected_batch)
+        mx.clear_cache()
+        losses += lvalue
+        n_tokens += toks
+        steps += 1
+        mx.eval(state, losses, n_tokens)
+        train_time += time.perf_counter() - tic
+
+        # Report training metrics
+        if it % args.steps_per_report == 0 or it == args.iters:
+            train_loss = mx.distributed.all_sum(losses, stream=mx.cpu).item()
+            train_loss /= steps * world_size
+            n_tokens_total = mx.distributed.all_sum(n_tokens, stream=mx.cpu).item()
+            learning_rate = optimizer.learning_rate.item() if hasattr(optimizer.learning_rate, 'item') else args.learning_rate
+            it_sec = args.steps_per_report / train_time
+            tokens_sec = float(n_tokens_total) / train_time
+            trained_tokens += n_tokens_total
+            peak_mem = mx.get_peak_memory() / 1e9
+
+            if rank == 0:
+                print(
+                    f"Iter {it}: Train loss {Colors.OKGREEN}{train_loss:.3f}{Colors.ENDC}, "
+                    f"Learning Rate {learning_rate:.3e}, "
+                    f"It/sec {it_sec:.3f}, "
+                    f"Tokens/sec {tokens_sec:.3f}, "
+                    f"Trained Tokens {trained_tokens}, "
+                    f"Peak mem {peak_mem:.3f} GB",
+                    flush=True,
+                )
+
+            # Reset metrics
+            losses = 0
+            n_tokens = 0
+            steps = 0
+            train_time = 0
+
+        # Save checkpoint
+        if it % args.steps_per_save == 0 and rank == 0:
+            save_adapter(model, args.adapter_file)
+            checkpoint = (
+                Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
+            )
+            save_adapter(model, checkpoint)
+            print(
+                f"{Colors.OKBLUE}Iter {it}: Saved adapter weights to "
+                f"{args.adapter_file} and {checkpoint}.{Colors.ENDC}",
+                flush=True,
+            )
+    
+    # Save final weights
+    if rank == 0:
+        save_adapter(model, args.adapter_file)
+        print(f"{Colors.OKGREEN}Saved final adapter weights to {args.adapter_file}.{Colors.ENDC}")
