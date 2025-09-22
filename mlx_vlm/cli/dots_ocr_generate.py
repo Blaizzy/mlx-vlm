@@ -7,7 +7,7 @@ import numpy as np
 import mlx.core as mx
 
 from mlx_vlm.models.dots_ocr.dots_ocr import DotsOCRConfig, DotsOCRForCausalLM_MLX
-from mlx_vlm.text.mlx_qwen_loader import MLXQwen, QwenLoadOpts
+from mlx_vlm.text.mlx_qwen_loader import MLXQwen, QwenLoadOpts, pick_vision_token_id
 
 
 def mx_to_numpy(arr):
@@ -106,12 +106,14 @@ def main():
             temperature=0.0,
         )
     )
-    image_id = qwen.image_token_id()
-    if image_id is None:
-        image_id = 151652
+    tok_str, tok_id = pick_vision_token_id(qwen.tokenizer)
+    if tok_id is None:
+        tok_str, tok_id = "<image>", 151652
 
-    base_prompt = args.prompt.replace("<image>", " ").strip()
-    prompt = (base_prompt + " <image>").strip()
+    base_prompt = (
+        args.prompt.replace(tok_str, " ").replace("<image>", " ").strip()
+    )
+    prompt = (base_prompt + f" {tok_str}").strip()
     guard = " Do not include the literal token <image> in your answer. Output only the extracted text."
     prompt = prompt + guard
 
@@ -137,15 +139,16 @@ def main():
 
     out = qwen.generate_with_image_embedding(
         prompt,
-        image_id=image_id,
+        image_id=tok_id,
         vision_projected_seq=vproj_np,
         reduce=args.reduce,
         max_new_tokens=args.max_new,
         temperature=0.0,
         blend=0.65,
     )
-    text = out.replace("<image>", "")
-    print(text.strip())
+    for t in [tok_str, "<image>", "<|vision_start|>", "<|vision_end|>"]:
+        out = out.replace(t, "")
+    print(out.strip())
 
 
 if __name__ == "__main__":

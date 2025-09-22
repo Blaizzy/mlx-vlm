@@ -7,6 +7,26 @@ from typing import Optional
 import numpy as np
 import mlx.core as mx
 
+VISION_TOKEN_CANDIDATES = [
+    "<|vision_start|>",
+    "<|vision_end|>",
+    "<image>",
+    "<img>",
+    "<image_patch>",
+    "<image_placeholder>",
+]
+
+
+def pick_vision_token_id(tokenizer) -> tuple[str | None, int | None]:
+    """Return the first known vision token string and its id, if present."""
+
+    vocab = tokenizer.get_vocab()
+    for tok in VISION_TOKEN_CANDIDATES:
+        tid = vocab.get(tok)
+        if tid is not None:
+            return tok, tid
+    return None, None
+
 
 @dataclass
 class QwenLoadOpts:
