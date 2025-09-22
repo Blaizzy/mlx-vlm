@@ -93,7 +93,22 @@ class MLXQwen:
         vocab = self.tokenizer.get_vocab()
         return vocab.get("<image>", None)
 
-    def set_image_embedding_row(self, image_id: int, new_vec_np: np.ndarray):
+    def set_image_embedding_row(
+        self,
+        image_id: int,
+        new_vec_np: np.ndarray,
+        blend: float = 0.65,
+    ):
+        """Blend the stored `<image>` embedding row with a new vector.
+
+        The update follows ``W[image_id] = (1 - blend) * W_orig + blend * new_vec``
+        so that the model conditions on the image features without making the
+        placeholder token itself overwhelmingly likely.
+        """
+
+        if not 0.0 <= blend <= 1.0:
+            raise ValueError(f"blend must be within [0, 1]; received {blend}")
+
         W = self.embed_weight()
         target_dtype = getattr(W, "dtype", None)
         W_np = np.array(mx.array(W, dtype=mx.float32))
@@ -108,7 +123,11 @@ class MLXQwen:
                 f"image embedding shape mismatch: {tuple(new_vec_np.shape)} vs {target_shape}"
             )
 
-        W_np[image_id, :] = new_vec_np.astype(np.float32, copy=False)
+        orig = self._embed_backup if self._embed_backup is not None else W_np[image_id]
+        new_row = new_vec_np.astype(np.float32, copy=False)
+        mixed = (1.0 - blend) * orig + blend * new_row
+
+        W_np[image_id, :] = mixed
         updated = mx.array(W_np, dtype=target_dtype) if target_dtype is not None else mx.array(W_np)
         self._set_embed_weight(updated)
 
@@ -127,9 +146,14 @@ class MLXQwen:
         self._backup_index = None
 
     @contextlib.contextmanager
-    def temp_image_embedding(self, image_id: int, vec_np: np.ndarray):
+    def temp_image_embedding(
+        self,
+        image_id: int,
+        vec_np: np.ndarray,
+        blend: float = 0.65,
+    ):
         try:
-            self.set_image_embedding_row(image_id, vec_np)
+            self.set_image_embedding_row(image_id, vec_np, blend=blend)
             yield
         finally:
             self.restore_image_embedding_row()
@@ -159,6 +183,7 @@ class MLXQwen:
         reduce: str = "mean",
         max_new_tokens: int | None = None,
         temperature: float | None = None,
+        blend: float = 0.65,
     ) -> str:
         if vision_projected_seq.ndim != 2:
             raise ValueError("vision_projected_seq must be [Tv, H]")
@@ -177,7 +202,7 @@ class MLXQwen:
                 " the vision projector output."
             )
 
-        with self.temp_image_embedding(image_id, vec):
+        with self.temp_image_embedding(image_id, vec, blend=blend):
             return self.generate_text(
                 prompt,
                 max_new_tokens=max_new_tokens,

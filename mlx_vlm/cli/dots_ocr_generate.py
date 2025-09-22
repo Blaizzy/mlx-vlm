@@ -110,7 +110,8 @@ def main():
     if image_id is None:
         image_id = 151652
 
-    prompt = args.prompt if "<image>" in args.prompt else (args.prompt.strip() + " <image>")
+    base_prompt = args.prompt.replace("<image>", " ").strip()
+    prompt = (base_prompt + " <image>").strip()
 
     vt, _ = adapter.encode_images([page])
     vproj = adapter.projector(vt) if projector_loaded and hasattr(adapter, "projector") else vt
@@ -139,6 +140,7 @@ def main():
         reduce=args.reduce,
         max_new_tokens=args.max_new,
         temperature=0.0,
+        blend=0.65,
     )
     print(out)
 
