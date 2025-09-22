@@ -6,7 +6,20 @@ import os
 from mlx_vlm.convert.convert_dots_ocr import cli_convert
 from mlx_vlm.models.dots_ocr.dots_ocr import DotsOCRConfig, DotsOCRForCausalLM_MLX
 from mlx_vlm.models.dots_ocr.processor import RECOMMENDED_DPI
-from mlx_vlm.utils.pdf_io import pdf_to_images
+
+try:  # Prefer packaged helper, but fall back when utils is a module.
+    from mlx_vlm.utils.pdf_io import pdf_to_images
+except ModuleNotFoundError:  # pragma: no cover - fallback mirrors shared helper.
+    def pdf_to_images(path: str, dpi: int = RECOMMENDED_DPI):
+        try:
+            from pdf2image import convert_from_path
+        except ImportError as exc:
+            raise RuntimeError(
+                "pdf2image is required to convert PDFs; install via `pip install pdf2image`"
+            ) from exc
+
+        pages = convert_from_path(path, dpi=dpi)
+        return [page.convert("RGB") for page in pages]
 
 
 def main() -> None:

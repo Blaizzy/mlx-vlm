@@ -6,6 +6,11 @@ from .dots_vision import DotsVisionTransformer_MLX
 from .tokenizer import SimpleTokenizer, render_chat
 from .weight_loader import load_npz_into_vision
 
+try:
+    import numpy as _np
+except Exception:  # pragma: no cover - numpy is required for projector loading.
+    _np = None
+
 @dataclass
 class VisionCfg:
     embed_dim: int = 1536
@@ -63,6 +68,7 @@ class DotsOCRForCausalLM_MLX:
 
         self.processor = DotsOCRProcessor(cfg)
         self.vision = DotsVisionTransformer_MLX(cfg)
+        self.projector_weight: mx.array | None = None
 
     def encode_images(self, pil_images, max_tokens_per_batch: int | None = None):
         images = list(pil_images)
@@ -88,6 +94,51 @@ class DotsOCRForCausalLM_MLX:
         """Load converted NPZ weights into the vision tower."""
 
         return load_npz_into_vision(self.vision, npz_path)
+
+    def load_projector_npz(self, npz_path: str):
+        """Load linear projector weights (vision -> text hidden)."""
+
+        if _np is None:
+            raise RuntimeError("numpy is required to load projector weights")
+
+        if not npz_path:
+            raise ValueError("Projector NPZ path is required")
+
+        try:
+            with _np.load(npz_path) as data:
+                weight = data.get("projector.proj.weight")
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"Projector NPZ not found: {npz_path}") from exc
+
+        if weight is None:
+            raise ValueError(
+                f"projector.proj.weight missing from NPZ {npz_path}"
+            )
+        if weight.ndim != 2:
+            raise ValueError(
+                f"Projector weight must be 2D, got shape {weight.shape}"
+            )
+
+        vision_dim = self.cfg.vision.embed_dim
+        out_dim, in_dim = weight.shape
+        if in_dim == vision_dim:
+            proj = weight.astype(_np.float32, copy=False)
+        elif out_dim == vision_dim:
+            proj = weight.T.astype(_np.float32, copy=False)
+        else:
+            raise ValueError(
+                "Projector weight dimensions do not match vision embedding dimension: "
+                f"expected one axis to equal {vision_dim}, got {weight.shape}"
+            )
+
+        self.projector_weight = mx.array(proj)
+
+        def _project(tokens: mx.array) -> mx.array:
+            tokens32 = mx.array(tokens, dtype=mx.float32)
+            return mx.matmul(tokens32, self.projector_weight.T)
+
+        self.projector = _project
+        return {"shape": tuple(proj.shape)}
 
     def prepare_inputs(
         self,

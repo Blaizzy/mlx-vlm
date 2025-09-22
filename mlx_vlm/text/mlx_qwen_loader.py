@@ -21,6 +21,7 @@ class MLXQwen:
     def __init__(self, opts: QwenLoadOpts):
         try:
             from mlx_lm import generate, load
+            from mlx_lm.sample_utils import make_sampler
         except Exception as exc:
             raise RuntimeError("mlx-lm not installed; run `pip install mlx-lm`") from exc
 
@@ -45,8 +46,9 @@ class MLXQwen:
             AutoTokenizer.from_pretrained = original_from_pretrained
 
         self._generate = generate
+        self._make_sampler = make_sampler
         self.opts = opts
-        self._embed_backup: Optional[mx.array] = None
+        self._embed_backup: Optional[np.ndarray] = None
         self._backup_index: Optional[int] = None
 
     def _set_embed_weight(self, new_weight: mx.array) -> None:
@@ -93,28 +95,34 @@ class MLXQwen:
 
     def set_image_embedding_row(self, image_id: int, new_vec_np: np.ndarray):
         W = self.embed_weight()
+        target_dtype = getattr(W, "dtype", None)
+        W_np = np.array(mx.array(W, dtype=mx.float32))
+
         if self._embed_backup is None:
-            self._embed_backup = W[image_id].copy()
+            self._embed_backup = W_np[image_id].copy()
             self._backup_index = image_id
 
-        new_row = mx.array(new_vec_np.astype(np.float32))
-        if new_row.shape != W[image_id].shape:
+        target_shape = tuple(W_np[image_id].shape)
+        if new_vec_np.shape != target_shape:
             raise ValueError(
-                f"image embedding shape mismatch: {tuple(new_row.shape)} vs {tuple(W[image_id].shape)}"
+                f"image embedding shape mismatch: {tuple(new_vec_np.shape)} vs {target_shape}"
             )
 
-        W_np = np.array(W)
-        W_np[image_id, :] = np.array(new_row)
-        self._set_embed_weight(mx.array(W_np))
+        W_np[image_id, :] = new_vec_np.astype(np.float32, copy=False)
+        updated = mx.array(W_np, dtype=target_dtype) if target_dtype is not None else mx.array(W_np)
+        self._set_embed_weight(updated)
 
     def restore_image_embedding_row(self):
         if self._embed_backup is None or self._backup_index is None:
             return
 
         W = self.embed_weight()
-        W_np = np.array(W)
-        W_np[self._backup_index, :] = np.array(self._embed_backup)
-        self._set_embed_weight(mx.array(W_np))
+        target_dtype = getattr(W, "dtype", None)
+        W_np = np.array(mx.array(W, dtype=mx.float32))
+
+        W_np[self._backup_index, :] = self._embed_backup.astype(np.float32, copy=False)
+        restored = mx.array(W_np, dtype=target_dtype) if target_dtype is not None else mx.array(W_np)
+        self._set_embed_weight(restored)
         self._embed_backup = None
         self._backup_index = None
 
@@ -134,12 +142,13 @@ class MLXQwen:
     ) -> str:
         max_new = self.opts.max_new_tokens if max_new_tokens is None else max_new_tokens
         temp = self.opts.temperature if temperature is None else temperature
+        sampler = self._make_sampler(temp=float(temp))
         return self._generate(
             self.model,
             self.tokenizer,
             prompt,
             max_tokens=max_new,
-            temp=temp,
+            sampler=sampler,
         )
 
     def generate_with_image_embedding(
@@ -158,6 +167,15 @@ class MLXQwen:
             vec = vision_projected_seq.mean(axis=0)
         else:
             raise ValueError(f"Unknown reduce method: {reduce}")
+
+        embed_dim = int(self.embed_weight().shape[1])
+        if vec.shape[0] != embed_dim:
+            raise ValueError(
+                "Projected vision hidden size does not match text embedding dimension: "
+                f"{vec.shape[0]} vs {embed_dim}. Load a projector (see convert_dots_ocr.py"
+                " convert-projector) or supply a text checkpoint whose hidden size matches"
+                " the vision projector output."
+            )
 
         with self.temp_image_embedding(image_id, vec):
             return self.generate_text(
