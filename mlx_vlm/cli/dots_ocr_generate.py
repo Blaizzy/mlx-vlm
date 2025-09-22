@@ -112,6 +112,8 @@ def main():
 
     base_prompt = args.prompt.replace("<image>", " ").strip()
     prompt = (base_prompt + " <image>").strip()
+    guard = " Do not include the literal token <image> in your answer. Output only the extracted text."
+    prompt = prompt + guard
 
     vt, _ = adapter.encode_images([page])
     vproj = adapter.projector(vt) if projector_loaded and hasattr(adapter, "projector") else vt
@@ -142,7 +144,8 @@ def main():
         temperature=0.0,
         blend=0.65,
     )
-    print(out)
+    text = out.replace("<image>", "")
+    print(text.strip())
 
 
 if __name__ == "__main__":
