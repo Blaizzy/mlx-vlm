@@ -70,6 +70,8 @@ class MLXQwen:
         self.opts = opts
         self._embed_backup: Optional[np.ndarray] = None
         self._backup_index: Optional[int] = None
+        self._lmhead_backup_rows: Optional[np.ndarray] = None
+        self._banned_ids: Optional[list[int]] = None
 
     def _set_embed_weight(self, new_weight: mx.array) -> None:
         model_sub = getattr(self.model, "model", None)
@@ -112,6 +114,49 @@ class MLXQwen:
     def image_token_id(self) -> int | None:
         vocab = self.tokenizer.get_vocab()
         return vocab.get("<image>", None)
+
+    def lm_head_weight(self) -> mx.array:
+        head = getattr(self.model, "lm_head", None)
+        if head is None or getattr(head, "weight", None) is None:
+            raise AttributeError("Unable to locate lm_head weight on loaded model")
+        return head.weight
+
+    def ban_token_ids(self, token_ids: list[int], scale: float = 0.0):
+        """Temporarily scale lm_head rows for the provided token ids."""
+
+        if not token_ids:
+            return
+
+        W = self.lm_head_weight()
+        target_dtype = getattr(W, "dtype", None)
+        W_np = np.array(mx.array(W, dtype=mx.float32))
+        unique_ids = list(dict.fromkeys(int(t) for t in token_ids))
+        self._banned_ids = unique_ids
+        self._lmhead_backup_rows = W_np[unique_ids, :].copy()
+        W_np[unique_ids, :] *= scale
+        updated = mx.array(W_np, dtype=target_dtype) if target_dtype is not None else mx.array(W_np)
+        self.model.lm_head.weight = updated
+
+    def restore_banned_token_ids(self):
+        if self._lmhead_backup_rows is None or self._banned_ids is None:
+            return
+
+        W = self.lm_head_weight()
+        target_dtype = getattr(W, "dtype", None)
+        W_np = np.array(mx.array(W, dtype=mx.float32))
+        W_np[self._banned_ids, :] = self._lmhead_backup_rows
+        restored = mx.array(W_np, dtype=target_dtype) if target_dtype is not None else mx.array(W_np)
+        self.model.lm_head.weight = restored
+        self._lmhead_backup_rows = None
+        self._banned_ids = None
+
+    @contextlib.contextmanager
+    def temp_ban_tokens(self, token_ids: list[int], scale: float = 0.0):
+        try:
+            self.ban_token_ids(token_ids, scale=scale)
+            yield
+        finally:
+            self.restore_banned_token_ids()
 
     def set_image_embedding_row(
         self,
@@ -222,7 +267,12 @@ class MLXQwen:
                 " the vision projector output."
             )
 
-        with self.temp_image_embedding(image_id, vec, blend=blend):
+        vocab = self.tokenizer.get_vocab()
+        ban_ids = [vocab[tok] for tok in VISION_TOKEN_CANDIDATES if tok in vocab]
+
+        with self.temp_image_embedding(image_id, vec, blend=blend), self.temp_ban_tokens(
+            ban_ids, scale=0.0
+        ):
             return self.generate_text(
                 prompt,
                 max_new_tokens=max_new_tokens,
