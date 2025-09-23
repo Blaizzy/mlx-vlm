@@ -115,38 +115,69 @@ class MLXQwen:
         vocab = self.tokenizer.get_vocab()
         return vocab.get("<image>", None)
 
-    def lm_head_weight(self) -> mx.array:
-        head = getattr(self.model, "lm_head", None)
-        if head is None or getattr(head, "weight", None) is None:
-            raise AttributeError("Unable to locate lm_head weight on loaded model")
-        return head.weight
+    @staticmethod
+    def _try_get_attr(obj, path: str):
+        cur = obj
+        for seg in path.split("."):
+            if not hasattr(cur, seg):
+                return None
+            cur = getattr(cur, seg)
+        return cur
+
+    def lm_head_weight(self):
+        for path in (
+            "lm_head.weight",
+            "model.lm_head.weight",
+            "output.weight",
+            "model.output.weight",
+        ):
+            w = self._try_get_attr(self.model, path)
+            if w is None:
+                continue
+            if hasattr(w, "weight"):
+                w = w.weight
+            try:
+                _ = w.shape
+                return w
+            except Exception:
+                continue
+        return None
 
     def ban_token_ids(self, token_ids: list[int], scale: float = 0.0):
-        """Temporarily scale lm_head rows for the provided token ids."""
-
         if not token_ids:
             return
-
         W = self.lm_head_weight()
-        target_dtype = getattr(W, "dtype", None)
+        if W is None:
+            return
         W_np = np.array(mx.array(W, dtype=mx.float32))
-        unique_ids = list(dict.fromkeys(int(t) for t in token_ids))
-        self._banned_ids = unique_ids
-        self._lmhead_backup_rows = W_np[unique_ids, :].copy()
-        W_np[unique_ids, :] *= scale
+        self._banned_ids = list(dict.fromkeys(int(t) for t in token_ids))
+        self._lmhead_backup_rows = W_np[self._banned_ids, :].copy()
+        W_np[self._banned_ids, :] *= scale
+        target_dtype = getattr(W, "dtype", None)
         updated = mx.array(W_np, dtype=target_dtype) if target_dtype is not None else mx.array(W_np)
-        self.model.lm_head.weight = updated
+        for base in ("lm_head", "model.lm_head", "output", "model.output"):
+            mod = self._try_get_attr(self.model, base)
+            if mod is not None and hasattr(mod, "weight"):
+                mod.weight = updated
+                break
 
     def restore_banned_token_ids(self):
         if self._lmhead_backup_rows is None or self._banned_ids is None:
             return
-
         W = self.lm_head_weight()
-        target_dtype = getattr(W, "dtype", None)
+        if W is None:
+            self._lmhead_backup_rows = None
+            self._banned_ids = None
+            return
         W_np = np.array(mx.array(W, dtype=mx.float32))
         W_np[self._banned_ids, :] = self._lmhead_backup_rows
+        target_dtype = getattr(W, "dtype", None)
         restored = mx.array(W_np, dtype=target_dtype) if target_dtype is not None else mx.array(W_np)
-        self.model.lm_head.weight = restored
+        for base in ("lm_head", "model.lm_head", "output", "model.output"):
+            mod = self._try_get_attr(self.model, base)
+            if mod is not None and hasattr(mod, "weight"):
+                mod.weight = restored
+                break
         self._lmhead_backup_rows = None
         self._banned_ids = None
 
