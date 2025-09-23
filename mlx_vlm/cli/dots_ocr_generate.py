@@ -117,6 +117,18 @@ def main():
     guard = " Do not include the literal token <image> in your answer. Output only the extracted text."
     prompt = prompt + guard
 
+    print(f"[diag] vision token: {tok_str} (id={tok_id})")
+    try:
+        with np.load(args.proj_npz) as diag_npz:
+            keys = list(diag_npz.keys())
+            shape = diag_npz["projector.proj.weight"].shape
+            print(
+                f"[diag] projector npz: {args.proj_npz} keys={keys} "
+                f"shape={shape}"
+            )
+    except Exception as exc:
+        print(f"[diag] projector npz read error: {exc}")
+
     vt, _ = adapter.encode_images([page])
     vproj = adapter.projector(vt) if projector_loaded and hasattr(adapter, "projector") else vt
     vproj_np = mx_to_numpy(vproj)
