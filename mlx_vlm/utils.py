@@ -202,6 +202,17 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
             quantization = legacy_quant
             config["quantization"] = quantization
 
+    if isinstance(quantization, dict) and quantization.get("mode") == "mxfp4":
+        quantization["group_size"] = 32
+        quantization["bits"] = 4
+        for key, params in list(quantization.items()):
+            if isinstance(params, dict):
+                params["group_size"] = 32
+                params["bits"] = 4
+                params["mode"] = "mxfp4"
+        config["quantization"] = quantization
+        config["quantization_config"] = quantization
+
     # Find all .safetensors files in the model_path, excluding consolidated model weights
     weight_files = [
         wf
@@ -389,6 +400,14 @@ def quantize_model(
         if not is_divisible(q_group_size):
             return False
         return True
+
+    if mode == "mxfp4":
+        if q_group_size != 32 or q_bits != 4:
+            print(
+                "[INFO] MXFP4 requires group_size=32 and bits=4; overriding provided values."
+            )
+        q_group_size = 32
+        q_bits = 4
 
     quantized_model, quantized_config = lm_quantize_model(
         model,
