@@ -6,7 +6,7 @@ import logging
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -15,6 +15,7 @@ import requests
 import soundfile as sf
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
+from mlx_lm.utils import quantize_model as lm_quantize_model
 from PIL import Image, ImageOps
 from transformers import AutoProcessor, PreTrainedTokenizer, PreTrainedTokenizerFast
 
@@ -56,6 +57,63 @@ def skip_multimodal_module(path: str) -> bool:
         or "audio_tower" in path
         or "code_predictor" in path
     )
+
+
+def get_class_predicate(
+    *,
+    skip_vision: bool,
+    quantization: Optional[Dict[str, Any]] = None,
+    weights: Optional[Dict[str, mx.array]] = None,
+) -> Callable[[str, nn.Module], Union[bool, Dict[str, Any]]]:
+    """Build a predicate suitable for ``nn.quantize`` that respects multimodal skips and config overrides."""
+
+    quantization = quantization or {}
+    default_group_size = quantization.get("group_size", 64)
+
+    def _feature_dim(module: nn.Module) -> Optional[int]:
+        weight = getattr(module, "weight", None)
+        shape = getattr(weight, "shape", None)
+        if shape is None or len(shape) == 0:
+            return None
+        try:
+            return int(shape[-1])
+        except (TypeError, ValueError):
+            return None
+
+    def _is_divisible(module: nn.Module, group_size: Optional[int]) -> bool:
+        if group_size in (None, 0):
+            return True
+        feature_dim = _feature_dim(module)
+        if feature_dim is None:
+            return False
+        return feature_dim % int(group_size) == 0
+
+    def predicate(path: str, module: nn.Module) -> Union[bool, Dict[str, Any]]:
+        if skip_vision and skip_multimodal_module(path):
+            return False
+        # Allow explicit per-path overrides from the config
+        if path in quantization:
+            params = quantization[path]
+            if isinstance(params, dict):
+                if not _is_divisible(
+                    module, params.get("group_size", default_group_size)
+                ):
+                    return False
+                return params
+            return params
+
+        if not hasattr(module, "to_quantized"):
+            return False
+
+        if not _is_divisible(module, default_group_size):
+            return False
+
+        if weights is not None:
+            return f"{path}.scales" in weights
+
+        return True
+
+    return predicate
 
 
 def get_model_and_args(config: dict):
@@ -137,7 +195,12 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
     config = load_config(model_path, **kwargs)
-    quantization = config.get("quantization", None)
+    quantization = config.get("quantization")
+    if quantization is None:
+        legacy_quant = config.get("quantization_config")
+        if isinstance(legacy_quant, dict):
+            quantization = legacy_quant
+            config["quantization"] = quantization
 
     # Find all .safetensors files in the model_path, excluding consolidated model weights
     weight_files = [
@@ -214,31 +277,20 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     model_class.AudioModel, weights, model_config.audio_config
                 )
 
-    if (quantization := config.get("quantization", None)) is not None:
-        # Handle legacy models which may or may not have vision quantized
-        # TODO: Re-upload the models with the new quantization config and remove this
+    if quantization is not None:
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
-
-        def get_class_predicate(p, m):
-            # Always skip vision and audio models
-            if skip_multimodal_module(p) and skip_vision:
-                return False
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
-            # Skip layers not divisible by 64
-            if hasattr(m, "weight") and m.weight.size % 64 != 0:
-                return False
-            # Handle legacy models which may not have everything quantized
-            return f"{p}.scales" in weights
+        class_predicate = get_class_predicate(
+            skip_vision=skip_vision,
+            quantization=quantization,
+            weights=weights,
+        )
 
         nn.quantize(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
-            class_predicate=get_class_predicate,
+            mode=quantization.get("mode", "affine"),
+            class_predicate=class_predicate,
         )
 
     model.load_weights(list(weights.items()))
@@ -280,6 +332,80 @@ def update_module_configs(model_config, model_class, config, modules):
     return model_config
 
 
+def quantize_model(
+    model: nn.Module,
+    config: dict,
+    q_group_size: int,
+    q_bits: int,
+    *,
+    mode: str = "affine",
+    skip_vision: bool = False,
+    quant_predicate: Optional[
+        Callable[[str, nn.Module], Union[bool, Dict[str, Any]]]
+    ] = None,
+) -> Tuple[nn.Module, dict]:
+    """Quantize a multimodal model while optionally skipping vision/audio towers."""
+
+    def _feature_dim(module: nn.Module) -> Optional[int]:
+        weight = getattr(module, "weight", None)
+        shape = getattr(weight, "shape", None)
+        if shape is None or len(shape) == 0:
+            return None
+        try:
+            return int(shape[-1])
+        except (TypeError, ValueError):
+            return None
+
+    def predicate(path: str, module: nn.Module) -> Union[bool, Dict[str, Any]]:
+        if skip_vision and skip_multimodal_module(path):
+            return False
+        if not hasattr(module, "to_quantized"):
+            return False
+
+        feature_dim = _feature_dim(module)
+
+        def is_divisible(group_size: Optional[int]) -> bool:
+            if group_size in (None, 0):
+                return True
+            if feature_dim is None:
+                return False
+            return feature_dim % int(group_size) == 0
+
+        if quant_predicate is not None:
+            result = quant_predicate(path, module)
+            if isinstance(result, dict):
+                group_size_override = result.get("group_size", q_group_size)
+                if not is_divisible(group_size_override):
+                    return False
+                return result
+            if isinstance(result, bool):
+                if not result:
+                    return False
+                if not is_divisible(q_group_size):
+                    return False
+                return True
+            return result
+
+        if not is_divisible(q_group_size):
+            return False
+        return True
+
+    quantized_model, quantized_config = lm_quantize_model(
+        model,
+        config,
+        q_group_size,
+        q_bits,
+        mode=mode,
+        quant_predicate=predicate,
+    )
+
+    if skip_vision:
+        quantized_config.setdefault("vision_config", {})
+        quantized_config["vision_config"]["skip_vision"] = True
+
+    return quantized_model, quantized_config
+
+
 def load(
     path_or_hf_repo: str,
     adapter_path: Optional[str] = None,
@@ -308,10 +434,13 @@ def load(
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
-    force_download = kwargs.get("force_download", False)
-    model_path = get_model_path(
-        path_or_hf_repo, force_download=force_download, revision=revision
-    )
+    if "force_download" in kwargs:
+        force_download = kwargs.get("force_download")
+        model_path = get_model_path(
+            path_or_hf_repo, force_download=force_download, revision=revision
+        )
+    else:
+        model_path = get_model_path(path_or_hf_repo, revision=revision)
     model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
         model = apply_lora_layers(model, adapter_path)
@@ -815,21 +944,54 @@ def prepare_inputs(
     **kwargs,
 ):
 
-    if not images and not audio:
-        tokenizer = (
-            processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        )
-        # Ensure pad_token exists when padding text-only inputs
-        if padding and tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        inputs = tokenizer(
-            prompts,
-            add_special_tokens=add_special_tokens,
-            padding=padding,
-            padding_side=padding_side,
-        )
-        input_ids = mx.array([inputs.input_ids])
-        mask = mx.array([inputs.attention_mask])
+    no_images = images is None or (isinstance(images, list) and len(images) == 0)
+    no_audio = audio is None or (isinstance(audio, list) and len(audio) == 0)
+    if no_images and no_audio:
+        tokenizer = getattr(processor, "tokenizer", None)
+        if tokenizer is None or not callable(tokenizer):
+            tokenizer = processor
+
+        call_kwargs = {}
+        try:
+            parameters = inspect.signature(tokenizer).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+
+        if "add_special_tokens" in parameters:
+            call_kwargs["add_special_tokens"] = add_special_tokens
+        if "padding" in parameters:
+            call_kwargs["padding"] = padding
+        if "padding_side" in parameters:
+            call_kwargs["padding_side"] = padding_side
+
+        # If we're going to pad, ensure pad_token exists.
+        will_pad = bool(call_kwargs.get("padding", False))
+        if will_pad and hasattr(tokenizer, "pad_token") and getattr(tokenizer, "pad_token") is None:
+            eos_token = getattr(tokenizer, "eos_token", None)
+            if eos_token is None:
+                raise ValueError("padding=True but tokenizer.pad_token is None and tokenizer.eos_token is unavailable")
+            try:
+                tokenizer.pad_token = eos_token
+            except (AttributeError, TypeError) as exc:
+                raise ValueError("padding=True but tokenizer.pad_token cannot be set") from exc
+
+        inputs = tokenizer(prompts, **call_kwargs)
+
+        raw_input_ids = getattr(inputs, "input_ids", None)
+        raw_attention_mask = getattr(inputs, "attention_mask", None)
+        if isinstance(inputs, dict):
+            raw_input_ids = inputs.get("input_ids", raw_input_ids)
+            raw_attention_mask = inputs.get("attention_mask", raw_attention_mask)
+
+        if raw_input_ids is None or raw_attention_mask is None:
+            raise ValueError("Tokenizer output missing input_ids or attention_mask")
+
+        input_ids = mx.array(raw_input_ids)
+        mask = mx.array(raw_attention_mask)
+        if input_ids.ndim == 1:
+            input_ids = input_ids[None, :]
+        if mask.ndim == 1:
+            mask = mask[None, :]
         return {
             "input_ids": input_ids,
             "attention_mask": mask,

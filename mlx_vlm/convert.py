@@ -7,12 +7,13 @@ from typing import Callable, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map_with_path
-from mlx_lm.utils import dequantize_model, quantize_model
+from mlx_lm.utils import dequantize_model
 
 from .utils import (
     MODEL_CONVERSION_DTYPES,
     fetch_from_hub,
     get_model_path,
+    quantize_model,
     save_config,
     save_weights,
     skip_multimodal_module,
@@ -107,6 +108,7 @@ def convert(
     quantize: bool = False,
     q_group_size: int = 64,
     q_bits: int = 4,
+    q_mode: str = "affine",
     dtype: Optional[str] = None,
     upload_repo: str = None,
     revision: Optional[str] = None,
@@ -156,7 +158,12 @@ def convert(
         print("[INFO] Quantizing")
         config.setdefault("vision_config", {})
         model, config = quantize_model(
-            model, config, q_group_size, q_bits, quant_predicate=quant_predicate
+            model,
+            config,
+            q_group_size,
+            q_bits,
+            mode=q_mode,
+            quant_predicate=quant_predicate,
         )
 
     if dequantize:
@@ -214,6 +221,13 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--q-bits", help="Bits per weight for quantization.", type=int, default=4
+    )
+    parser.add_argument(
+        "--q-mode",
+        help="The quantization mode.",
+        type=str,
+        choices=["affine", "mxfp4"],
+        default="affine",
     )
     parser.add_argument(
         "--dtype",

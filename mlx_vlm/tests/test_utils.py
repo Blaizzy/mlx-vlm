@@ -209,7 +209,27 @@ def test_quantize_module():
     assert module.vision_model.group_size == 64
 
     # Check config is updated correctly
-    assert updated_config["quantization"] == {"group_size": 64, "bits": 4}
+    assert updated_config["quantization"] == {
+        "group_size": 64,
+        "bits": 4,
+        "mode": "affine",
+    }
+
+    # Test mxfp4 quantization
+    module = DummyModule((10, 64))
+    config = {}
+    _, updated_config = quantize_model(
+        module,
+        config,
+        q_group_size=32,
+        q_bits=4,
+        mode="mxfp4",
+    )
+    assert updated_config["quantization"] == {
+        "group_size": 32,
+        "bits": 4,
+        "mode": "mxfp4",
+    }
 
     # Test skip_vision=True
     module = DummyModule((10, 64))
