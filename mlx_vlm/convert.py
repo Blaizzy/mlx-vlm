@@ -1,5 +1,6 @@
 import argparse
 import glob
+import os
 import shutil
 from pathlib import Path
 from typing import Callable, Optional, Union
@@ -113,11 +114,12 @@ def convert(
     dequantize: bool = False,
     trust_remote_code: bool = True,
     quant_predicate: Optional[str] = None,
+    only_llm: bool = False,
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
     model, config, processor = fetch_from_hub(
-        model_path, lazy=True, trust_remote_code=trust_remote_code
+        model_path, lazy=True, trust_remote_code=trust_remote_code, only_llm=only_llm
     )
 
     def base_quant_predicate(path, module):
@@ -178,6 +180,12 @@ def convert(
 
     save_config(config, config_path=mlx_path / "config.json")
 
+    # Copy over any coreml files if found
+    coreml_files = glob.glob(str(model_path / "*.mlpackage"))
+    for file in coreml_files:
+        des_path = os.path.join(mlx_path, file.split(os.path.sep)[-1])
+        shutil.copytree(file, des_path)
+
     if upload_repo is not None:
         upload_to_hub(mlx_path, upload_repo, hf_path)
 
@@ -230,6 +238,12 @@ def configure_parser() -> argparse.ArgumentParser:
         "-d",
         "--dequantize",
         help="Dequantize a quantized model.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--only-llm",
+        help="Convert only LLM.",
         action="store_true",
         default=False,
     )

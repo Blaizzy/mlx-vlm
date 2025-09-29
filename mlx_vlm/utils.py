@@ -1,3 +1,4 @@
+import os
 import glob
 import importlib
 import inspect
@@ -13,6 +14,7 @@ import mlx.nn as nn
 import numpy as np
 import requests
 import soundfile as sf
+import coremltools
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
 from PIL import Image, ImageOps
@@ -33,6 +35,7 @@ MODEL_REMAPPING = {
     "bunny-llama": "llava_bunny",
     "lfm2-vl": "lfm2_vl",
     "cohere2_vision": "aya_vision",
+    "llava_qwen2": "fastvlm",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -181,9 +184,19 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     # Sanitize weights
     weights = sanitize_weights(model, weights)
-    weights = sanitize_weights(
-        model_class.VisionModel, weights, model_config.vision_config
-    )
+    if hasattr(model_class, 'VisionModel'):
+        weights = sanitize_weights(
+            model_class.VisionModel, weights, model_config.vision_config
+        )
+    else:
+        # Load CoreML vision tower
+        print("Looking for CoreML vision tower")
+        coreml_file = glob.glob(str(model_path / "*.mlpackage"))
+        if len(coreml_file) > 0:
+            assert len(coreml_file) == 1, "Found multiple vision model files."
+            print(f"Loading {coreml_file[0]} vision tower")
+            model.vision_tower = coremltools.models.MLModel(coreml_file[0])
+
     weights = sanitize_weights(
         model_class.LanguageModel, weights, model_config.text_config
     )
@@ -219,7 +232,21 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             class_predicate=get_class_predicate,
         )
 
-    model.load_weights(list(weights.items()))
+    if kwargs.get("only_llm", False):
+        # Ignore vision tower weights
+        new_weights = dict()
+        for k, v in weights.items():
+            if 'vision_tower' in k:
+                continue
+            if 'mm_projector' in k:
+                new_k = k.replace('model.mm_projector.', 'multi_modal_projector.linear_')
+                new_weights[new_k] = v
+            else:
+                new_weights['language_model.'+k] = v
+
+        model.load_weights(list(new_weights.items()))
+    else:
+        model.load_weights(list(weights.items()))
     if not lazy:
         mx.eval(model.parameters())
 
