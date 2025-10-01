@@ -69,6 +69,15 @@ def get_model_and_args(config: dict):
         A tuple containing the Model class and the ModelArgs class.
     """
     model_type = config["model_type"]
+
+    if model_type == "llava":
+        text_type = config.get("text_config", {}).get("model_type")
+        vision_type = config.get("vision_config", {}).get("model_type")
+
+        if text_type == "mistral" and vision_type == "pixtral":
+            model_type = "pixtral"
+            config["model_type"] = model_type
+
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
     try:

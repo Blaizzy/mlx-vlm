@@ -43,7 +43,7 @@ MODEL_CONFIG = {
     "llava": MessageFormat.LIST_WITH_IMAGE,
     "llava_next": MessageFormat.LIST_WITH_IMAGE,
     "mllama": MessageFormat.LIST_WITH_IMAGE,
-    "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE,
+    "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "bunny-llama": MessageFormat.IMAGE_TOKEN_NEWLINE,
