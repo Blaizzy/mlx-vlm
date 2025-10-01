@@ -160,9 +160,9 @@ class LanguageModel(nn.Module):
         super().__init__()
         self.config = config
         self.model_type = config.model_type
-        if self.model_type not in ["llama", "qwen2"]:
+        if self.model_type not in ["llama", "qwen2", "mistral", "pixtral"]:
             raise ValueError(
-                f"Model type {self.model_type} not supported. Currently only 'llama' is supported"
+                f"Model type {self.model_type} not supported. Supported types: 'llama', 'qwen2', 'mistral', 'pixtral'"
             )
         self.model = Llama(config)
         if not config.tie_word_embeddings:
