@@ -1,24 +1,20 @@
-import copy
 import glob
 import importlib
 import inspect
 import json
 import logging
-import shutil
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import requests
-import scipy.signal as signal
 import soundfile as sf
 from huggingface_hub import snapshot_download
-from mlx.utils import tree_flatten, tree_map_with_path, tree_reduce, tree_unflatten
-from mlx_lm.utils import quantize_model
+from mlx.utils import tree_flatten
 from PIL import Image, ImageOps
 from transformers import (
     AutoConfig,
@@ -73,6 +69,7 @@ def get_model_and_args(config: dict):
         A tuple containing the Model class and the ModelArgs class.
     """
     model_type = config["model_type"]
+
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
     try:
@@ -169,7 +166,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(mx.load(wf))
 
-    model_class, model_type = get_model_and_args(config=config)
+    model_class, _ = get_model_and_args(config=config)
 
     # Initialize text and vision configs if not present
     config.setdefault("text_config", {})
@@ -585,9 +582,24 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     """
     Helper function to load an image from either a URL or file.
     """
-    if isinstance(image_source, BytesIO) or Path(image_source).is_file():
+    if (
+        isinstance(image_source, BytesIO)
+        or isinstance(image_source, str)
+        or Path(image_source).is_file()
+    ):
         # for base64 encoded images
         try:
+            if image_source.startswith("data:image/"):
+                import base64
+
+                if "," not in image_source:
+                    raise ValueError(
+                        "Invalid data URI format - missing comma separator"
+                    )
+
+                _, data = image_source.split(",", 1)
+                image_source = BytesIO(base64.b64decode(data))
+
             image = Image.open(image_source)
         except IOError as e:
             raise ValueError(
@@ -613,6 +625,7 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
 
 
 def resize_image(img, max_size):
+
     ratio = min(max_size[0] / img.width, max_size[1] / img.height)
     new_size = (int(img.width * ratio), int(img.height * ratio))
     return img.resize(new_size)
@@ -627,10 +640,38 @@ def process_image(img, resize_shape, image_processor):
 
 
 def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    gcd = np.gcd(orig_sr, target_sr)
-    up = target_sr // gcd
-    down = orig_sr // gcd
-    resampled = signal.resample_poly(audio, up, down, padtype="edge")
+    """Resample audio using linear interpolation."""
+    if orig_sr == target_sr:
+        return audio
+
+    # Calculate the resampling ratio
+    ratio = target_sr / orig_sr
+
+    # Handle different audio shapes
+    if audio.ndim == 1:
+        # Mono audio - simple case
+        new_length = int(len(audio) * ratio)
+        old_indices = np.arange(len(audio))
+        new_indices = np.linspace(0, len(audio) - 1, new_length)
+        resampled = np.interp(new_indices, old_indices, audio)
+
+    elif audio.ndim == 2:
+        # Multi-channel audio - transpose to (samples, channels) if needed
+        if audio.shape[0] < audio.shape[1]:
+            audio = audio.T
+
+        # Resample each channel
+        n_samples, n_channels = audio.shape
+        new_length = int(n_samples * ratio)
+        old_indices = np.arange(n_samples)
+        new_indices = np.linspace(0, n_samples - 1, new_length)
+
+        resampled = np.zeros((new_length, n_channels))
+        for i in range(n_channels):
+            resampled[:, i] = np.interp(new_indices, old_indices, audio[:, i])
+    else:
+        raise ValueError(f"Audio array has unsupported shape: {audio.shape}")
+
     return resampled
 
 

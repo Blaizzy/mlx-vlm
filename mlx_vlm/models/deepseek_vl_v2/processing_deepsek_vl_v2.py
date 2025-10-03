@@ -184,8 +184,21 @@ class DeepseekVLV2Processor(ProcessorMixin):
         self.sft_format = sft_format
         self.mask_prompt = mask_prompt
         self.ignore_id = ignore_id
-
         super().__init__(tokenizer, **kwargs)
+
+        # Add chat template
+        self.chat_template = kwargs.pop("chat_template", self.default_chat_template)
+
+    @property
+    def default_chat_template(self):
+        return (
+            "{% for message in messages %}"
+            "{% if message['role'] == 'user' %}<|User|>:"
+            "{% elif message['role'] == 'assistant' %}<|Assistant|>{% endif %} "
+            "{{message['content']}}\n\n"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}<|Assistant|>:{% endif %}"
+        )
 
     @property
     def bos_id(self):
