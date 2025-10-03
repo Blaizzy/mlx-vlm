@@ -69,6 +69,7 @@ def get_model_and_args(config: dict):
         A tuple containing the Model class and the ModelArgs class.
     """
     model_type = config["model_type"]
+
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
     try:
@@ -165,7 +166,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(mx.load(wf))
 
-    model_class, model_type = get_model_and_args(config=config)
+    model_class, _ = get_model_and_args(config=config)
 
     # Initialize text and vision configs if not present
     config.setdefault("text_config", {})
@@ -581,9 +582,24 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     """
     Helper function to load an image from either a URL or file.
     """
-    if isinstance(image_source, BytesIO) or Path(image_source).is_file():
+    if (
+        isinstance(image_source, BytesIO)
+        or isinstance(image_source, str)
+        or Path(image_source).is_file()
+    ):
         # for base64 encoded images
         try:
+            if image_source.startswith("data:image/"):
+                import base64
+
+                if "," not in image_source:
+                    raise ValueError(
+                        "Invalid data URI format - missing comma separator"
+                    )
+
+                _, data = image_source.split(",", 1)
+                image_source = BytesIO(base64.b64decode(data))
+
             image = Image.open(image_source)
         except IOError as e:
             raise ValueError(
@@ -609,6 +625,7 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
 
 
 def resize_image(img, max_size):
+
     ratio = min(max_size[0] / img.width, max_size[1] / img.height)
     new_size = (int(img.width * ratio), int(img.height * ratio))
     return img.resize(new_size)
