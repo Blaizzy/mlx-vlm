@@ -88,14 +88,23 @@ class Dataset:
             )
             prompts.append(prompt)
 
-        image_token_index = self.config["image_token_index"]
+        image_token_index = (
+            self.config.get("image_token_index")
+            or self.config.get("image_token_id")
+            or self.config.get("image_token_idx")
+        )
+
+        if image_token_index is None:
+            raise KeyError(
+                "Missing image token key: expected one of 'image_token_index', 'image_token_id', or 'image_token_idx'"
+            )
 
         inputs = prepare_inputs(
             self.processor,
-            images,
-            prompts,
-            image_token_index,
-            self.image_resize_shape,
+            images=images,
+            prompts=prompts,
+            image_token_index=image_token_index,
+            resize_shape=self.image_resize_shape,
         )
         input_ids = inputs["input_ids"]
         pixel_values = inputs["pixel_values"]
@@ -196,31 +205,44 @@ class Trainer:
 
     def loss_fn(self, model, batch):
         pixel_values = batch["pixel_values"]
-        input_ids = batch["input_ids"]
+        full_input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
-        lengths = mx.sum(attention_mask, axis=1)
-        labels = input_ids[:, 1:]
 
-        batch_size, seq_length = input_ids.shape
+        # Teacher-forcing shift: labels are next tokens; inputs drop the last token
+        labels = full_input_ids[:, 1:]
+        input_ids = full_input_ids[:, :-1]
+
+        # Align attention_mask (and lengths) with shifted inputs to avoid shape mismatches
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, :-1]
+            lengths = mx.sum(attention_mask, axis=1)
+        else:
+            lengths = mx.full((input_ids.shape[0],), input_ids.shape[1])
+
+        batch_size, seq_length = full_input_ids.shape
 
         if self.train_on_completions:
-            weight_mask = mx.ones_like(attention_mask)
+            # Start with a weight mask aligned to the shifted sequence length
+            weight_mask = (
+                mx.ones_like(attention_mask)
+                if attention_mask is not None
+                else mx.ones_like(input_ids)
+            )
 
-            assistant_response_index = np.where(input_ids == self.assistant_id)[1]
+            # Use the unshifted IDs to find the assistant token boundary
+            assistant_response_index = np.where(full_input_ids == self.assistant_id)[1]
             range_matrix = mx.repeat(
                 mx.expand_dims(mx.arange(seq_length), 0), batch_size, axis=0
             )
             assistant_mask = range_matrix <= mx.array(assistant_response_index).reshape(
                 -1, 1
             )
-            # Apply the mask to weight_mask
+            # Zero out tokens up to and including the assistant marker; then drop the first step
             weight_mask = mx.where(
                 assistant_mask, mx.zeros_like(weight_mask), weight_mask
             )[:, 1:]
         else:
             weight_mask = None
-
-        input_ids = input_ids[:, :-1]
 
         kwargs = {
             k: v
@@ -272,7 +294,20 @@ class Trainer:
                 lambda g: mx.clip(g, -self.clip_gradients, self.clip_gradients), grads
             )
 
-        self.optimizer.update(self.model, grads)
+        # Collect params and prune any nested keys containing "rope_deltas"
+        def _prune_keys(tree, substrings=("rope_deltas",)):
+            if isinstance(tree, dict):
+                return {
+                    k: _prune_keys(v, substrings)
+                    for k, v in tree.items()
+                    if not any(s in k for s in substrings)
+                }
+            return tree
+
+        model_params = _prune_keys(self.model.trainable_parameters())
+        grads = _prune_keys(grads)
+
+        self.optimizer.update(model_params, grads)
 
         return loss
 
