@@ -91,11 +91,12 @@ class Dataset:
         image_token_index = self.config["image_token_index"]
 
         inputs = prepare_inputs(
-            self.processor,
-            images,
-            prompts,
-            image_token_index,
-            self.image_resize_shape,
+            processor=self.processor,
+            images=images,
+            audio=None,
+            prompts=prompts,
+            image_token_index=image_token_index,
+            resize_shape=self.image_resize_shape,
         )
         input_ids = inputs["input_ids"]
         pixel_values = inputs["pixel_values"]

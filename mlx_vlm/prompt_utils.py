@@ -43,7 +43,7 @@ MODEL_CONFIG = {
     "llava": MessageFormat.LIST_WITH_IMAGE,
     "llava_next": MessageFormat.LIST_WITH_IMAGE,
     "mllama": MessageFormat.LIST_WITH_IMAGE,
-    "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE,
+    "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "bunny-llama": MessageFormat.IMAGE_TOKEN_NEWLINE,
@@ -73,12 +73,12 @@ class MessageBuilder:
     @staticmethod
     def text_message(text: str) -> Dict[str, str]:
         """Create a simple text message."""
-        return {"type": "text", "text": text}
+        return {"type": "text", "text": text, "content": text}
 
     @staticmethod
     def content_message(content: str) -> Dict[str, str]:
         """Create a content-type text message."""
-        return {"type": "text", "content": content}
+        return {"type": "text", "text": content, "content": content}
 
     @staticmethod
     def image_message() -> Dict[str, str]:

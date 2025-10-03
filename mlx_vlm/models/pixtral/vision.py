@@ -52,7 +52,7 @@ def generate_block_attention_mask(patch_embeds_list, tensor):
     causal_mask = mx.broadcast_to(
         causal_mask[None, None, :, :], (tensor.shape[0], 1, seq_len, seq_len)
     )
-    return causal_mask
+    return causal_mask.astype(tensor.dtype)
 
 
 def rotate_half(x):
@@ -230,6 +230,10 @@ class PixtralVisionModel(nn.Module):
         x: List[mx.array],
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
+
+        if x.dtype != self.patch_conv.weight.dtype:
+            x = x.astype(self.patch_conv.weight.dtype)
+
         patch_embeds_list = self.patch_conv(x)
         patch_embeds = patch_embeds_list.reshape(1, -1, patch_embeds_list.shape[-1])
 
