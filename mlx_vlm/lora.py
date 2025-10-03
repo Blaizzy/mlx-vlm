@@ -41,18 +41,24 @@ def main(args):
     # Validate message columns
     if "messages" not in dataset.column_names:
         if "question" in dataset.column_names and "answer" in dataset.column_names:
+
             def transform_to_messages(examples):
                 messages_list = []
                 for q, a in zip(examples["question"], examples["answer"]):
-                    messages_list.append([
-                        {"role": "user", "content": q},
-                        {"role": "assistant", "content": a}
-                    ])
+                    messages_list.append(
+                        [
+                            {"role": "user", "content": q},
+                            {"role": "assistant", "content": a},
+                        ]
+                    )
                 examples["messages"] = messages_list
                 return examples
+
             dataset = dataset.map(transform_to_messages, batched=True)
         else:
-            raise ValueError("Dataset must have a 'messages' column or both 'question' and 'answer' columns")
+            raise ValueError(
+                "Dataset must have a 'messages' column or both 'question' and 'answer' columns"
+            )
 
     if args.apply_chat_template:
         logger.info(f"\033[32mApplying chat template to the dataset\033[0m")
