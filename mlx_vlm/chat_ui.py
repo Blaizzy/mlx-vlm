@@ -69,12 +69,12 @@ def chat(message, history, temperature, max_tokens):
 
     response = ""
     for chunk in stream_generate(
-            model,
-            processor,
-            messages,
-            image=image_file,
-            max_tokens=max_tokens,
-            temperature=temperature,
+        model,
+        processor,
+        messages,
+        image=image_file,
+        max_tokens=max_tokens,
+        temperature=temperature,
     ):
         response += chunk.text
         yield response
