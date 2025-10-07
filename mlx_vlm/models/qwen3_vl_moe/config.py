@@ -32,26 +32,26 @@ class VisionConfig(BaseModelConfig):
 @dataclass
 class TextConfig(BaseModelConfig):
     model_type: str
-    hidden_size: int = 2048
-    num_hidden_layers: int = 48
-    intermediate_size: int = 6144
-    num_attention_heads: int = 32
-    num_experts: int = 128
-    num_experts_per_tok: int = 8
-    decoder_sparse_step: int = 1
-    mlp_only_layers: List[int] = field(default_factory=list)
-    moe_intermediate_size: int = 768
-    rms_norm_eps: float = 1e-06
-    vocab_size: int = 151936
-    num_key_value_heads: Optional[int] = 4
-    head_dim: int = 128
-    rope_theta: float = 5_000_000.0
-    max_position_embeddings: int = 262144
+    num_hidden_layers: int
+    hidden_size: int
+    intermediate_size: int
+    num_attention_heads: int
+    num_experts: int
+    num_experts_per_tok: int
+    decoder_sparse_step: int
+    mlp_only_layers: List[int]
+    moe_intermediate_size: int
+    rms_norm_eps: float
+    vocab_size: int
+    num_key_value_heads: Optional[int]
+    head_dim: int
+    rope_theta: float
+    max_position_embeddings: int
     norm_topk_prob: bool = True
     rope_scaling: Optional[Dict[str, Union[float, str, bool, List[int]]]] = field(
         default_factory=lambda: {"type": "default", "mrope_section": [24, 20, 20]}
     )
-    tie_word_embeddings: bool = True
+    tie_word_embeddings: bool = False
     attention_bias: bool = False
     hidden_act: str = "silu"
 
@@ -90,11 +90,6 @@ class ModelConfig(BaseModelConfig):
 
     @classmethod
     def from_dict(cls, params):
-        # Copy text config parameters from root level
-        excluded_keys = {"vision_config"}
-        params["text_config"] = dict(
-            filter(lambda x: x[0] not in excluded_keys, params.items())
-        )
 
         return cls(
             **{
