@@ -1,13 +1,9 @@
-import glob
-import json
-from pathlib import Path
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from huggingface_hub import snapshot_download
 
-from .config import ModelConfig, TextConfig, VisionConfig
+from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
 
@@ -35,7 +31,7 @@ class Model(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
-        hidden_states = self.vision_tower(
+        hidden_states, _ = self.vision_tower(
             pixel_values, image_grid_thw, output_hidden_states=False
         )
 
@@ -155,14 +151,33 @@ class Model(nn.Module):
         return logits
 
     def sanitize(self, weights):
-        def transform_key(key):
-            if "vision_tower" not in key:
-                key = key.replace("visual", "vision_tower")
-            if "language_model" not in key:
-                if "model" in key:
-                    key = key.replace("model", "language_model.model")
-                elif "lm_head" in key:
-                    key = key.replace("lm_head", "language_model.lm_head")
-            return key
+        sanitized_weights = {}
+        for key, value in weights.items():
+            if "model" in key:
+                if "model.language_model" in key:
+                    key = key.replace("model.language_model", "language_model.model")
+                    if "gate_up_proj" in key:
+                        gate_key = key.replace("gate_up_proj", "gate_proj")
+                        up_key = key.replace("gate_up_proj", "up_proj")
 
-        return {transform_key(k): v for k, v in weights.items()}
+                        mid_dim = value.shape[-1] // 2
+                        sanitized_weights[gate_key] = value[..., :mid_dim].transpose(
+                            0, 2, 1
+                        )
+                        sanitized_weights[up_key] = value[..., mid_dim:].transpose(
+                            0, 2, 1
+                        )
+
+                        continue
+                    if "down_proj" in key:
+                        sanitized_weights[key] = value.transpose(0, 2, 1)
+                        continue
+
+                elif "model.visual" in key:
+                    key = key.replace("model.visual", "vision_tower")
+            elif "lm_head" in key:
+                key = key.replace("lm_head", "language_model.lm_head")
+
+            sanitized_weights[key] = value
+
+        return sanitized_weights

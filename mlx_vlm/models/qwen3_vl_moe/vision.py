@@ -86,7 +86,7 @@ class PatchEmbed(nn.Module):
             hidden_size,
             kernel_size=kernel_size,
             stride=kernel_size,
-            bias=False,
+            bias=True,
         )
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
@@ -167,19 +167,19 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim)
-        self.up_proj = nn.Linear(dim, hidden_dim)
-        self.down_proj = nn.Linear(hidden_dim, dim)
+        self.linear_fc1 = nn.Linear(dim, hidden_dim, bias=True)
+        self.linear_fc2 = nn.Linear(hidden_dim, dim, bias=True)
+        self.act_fn = nn.GELU(approx="fast")
 
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+    def call(self, x: mx.array) -> mx.array:
+        return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
 
 
 class Qwen3VLMoEVisionBlock(nn.Module):
     def __init__(self, config: VisionConfig) -> None:
         super().__init__()
-        self.norm1 = nn.RMSNorm(config.hidden_size, eps=1e-6)
-        self.norm2 = nn.RMSNorm(config.hidden_size, eps=1e-6)
+        self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
+        self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
 
         self.attn = Attention(dim=config.hidden_size, num_heads=config.num_heads)
         self.mlp = MLP(dim=config.hidden_size, hidden_dim=config.intermediate_size)
@@ -200,7 +200,7 @@ class VisionModel(nn.Module):
         super().__init__()
         self.config = config
         self.model_type = config.model_type
-        if self.model_type != "qwen2_5_vl":
+        if self.model_type != "qwen3_vl_moe":
             raise ValueError(f"Unsupported model type: {self.model_type}")
         self.spatial_merge_size = config.spatial_merge_size
 
@@ -217,6 +217,11 @@ class VisionModel(nn.Module):
         self.fullatt_block_indexes = config.fullatt_block_indexes
         head_dim = config.hidden_size // config.num_heads
         self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)
+
+        self.pos_embed = nn.Embedding(
+            config.num_position_embeddings, config.hidden_size
+        )
+        self.num_grid_per_side = int(config.num_position_embeddings**0.5)
 
         self.blocks = [Qwen3VLMoEVisionBlock(config) for _ in range(config.depth)]
         self.merger = PatchMerger(config=config, use_postshuffle_norm=False)
@@ -334,7 +339,100 @@ class VisionModel(nn.Module):
         return window_index, cu_window_seqlens
 
     def fast_pos_embed_interpolate(self, grid_thw):
-        raise NotImplementedError("Fast pos embed interpolate is not implemented")
+        grid_ts = grid_thw[:, 0]
+        grid_hs = grid_thw[:, 1]
+        grid_ws = grid_thw[:, 2]
+
+        idx_list = [[] for _ in range(4)]
+        weight_list = [[] for _ in range(4)]
+
+        for t, h, w in zip(grid_ts.tolist(), grid_hs.tolist(), grid_ws.tolist()):
+            t, h, w = int(t), int(h), int(w)
+
+            # Create linearly spaced indices
+            h_idxs = mx.linspace(0, self.num_grid_per_side - 1, h)
+            w_idxs = mx.linspace(0, self.num_grid_per_side - 1, w)
+
+            # Floor and ceiling indices
+            h_idxs_floor = h_idxs.astype(mx.int32)
+            w_idxs_floor = w_idxs.astype(mx.int32)
+            h_idxs_ceil = mx.clip(h_idxs_floor + 1, 0, self.num_grid_per_side - 1)
+            w_idxs_ceil = mx.clip(w_idxs_floor + 1, 0, self.num_grid_per_side - 1)
+
+            # Compute interpolation weights
+            dh = h_idxs - h_idxs_floor
+            dw = w_idxs - w_idxs_floor
+
+            # Base indices for height
+            base_h = h_idxs_floor * self.num_grid_per_side
+            base_h_ceil = h_idxs_ceil * self.num_grid_per_side
+
+            # Four corner indices for bilinear interpolation
+            indices = [
+                (base_h[:, None] + w_idxs_floor[None, :]).flatten(),
+                (base_h[:, None] + w_idxs_ceil[None, :]).flatten(),
+                (base_h_ceil[:, None] + w_idxs_floor[None, :]).flatten(),
+                (base_h_ceil[:, None] + w_idxs_ceil[None, :]).flatten(),
+            ]
+
+            # Four corner weights for bilinear interpolation
+            weights = [
+                ((1 - dh)[:, None] * (1 - dw)[None, :]).flatten(),
+                ((1 - dh)[:, None] * dw[None, :]).flatten(),
+                (dh[:, None] * (1 - dw)[None, :]).flatten(),
+                (dh[:, None] * dw[None, :]).flatten(),
+            ]
+
+            for i in range(4):
+                idx_list[i].extend(indices[i].tolist())
+                weight_list[i].extend(weights[i].tolist())
+
+        # Convert to arrays
+        idx_tensor = mx.array(idx_list, dtype=mx.int32)
+        weight_tensor = mx.array(weight_list, dtype=self.pos_embed.weight.dtype)
+
+        # Lookup embeddings and apply weights
+        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
+
+        # Sum the four corners
+        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+
+        # Split by sample
+        split_sizes = [int(h * w) for h, w in zip(grid_hs.tolist(), grid_ws.tolist())]
+        patch_pos_embeds_list = mx.split(
+            patch_pos_embeds, mx.cumsum(mx.array(split_sizes))[:-1]
+        )
+
+        # Apply temporal repetition and spatial merging
+        patch_pos_embeds_permute = []
+        merge_size = self.spatial_merge_size
+
+        for pos_embed, t, h, w in zip(
+            patch_pos_embeds_list, grid_ts.tolist(), grid_hs.tolist(), grid_ws.tolist()
+        ):
+            t, h, w = int(t), int(h), int(w)
+
+            # Repeat for temporal dimension
+            pos_embed = mx.repeat(pos_embed, t, axis=0)
+
+            # Reshape and permute for spatial merging
+            embed_dim = pos_embed.shape[-1]
+            pos_embed = pos_embed.reshape(
+                t, h // merge_size, merge_size, w // merge_size, merge_size, embed_dim
+            )
+
+            # Permute: (0, 1, 3, 2, 4, 5) -> (t, h//merge, w//merge, merge, merge, embed_dim)
+            pos_embed = mx.transpose(pos_embed, (0, 1, 3, 2, 4, 5))
+
+            # Flatten spatial dimensions
+            pos_embed = pos_embed.reshape(-1, embed_dim)
+
+            patch_pos_embeds_permute.append(pos_embed)
+
+        # Concatenate all samples
+        patch_pos_embeds = mx.concatenate(patch_pos_embeds_permute, axis=0)
+
+        return patch_pos_embeds
 
     def __call__(
         self,

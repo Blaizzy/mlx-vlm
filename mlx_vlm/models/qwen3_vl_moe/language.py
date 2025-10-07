@@ -3,6 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -96,13 +97,16 @@ class Attention(nn.Module):
         assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
-        self.head_dim = head_dim = args.hidden_size // n_heads
+        self.head_dim = head_dim = args.head_dim
         self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
+
+        self.q_norm = nn.RMSNorm(dims=head_dim, eps=args.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(dims=head_dim, eps=args.rms_norm_eps)
 
         self.rope_scaling = args.rope_scaling
 
@@ -124,10 +128,12 @@ class Attention(nn.Module):
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
         # Prepare the queries, keys and values for the attention computation
-        queries = queries.reshape(B, L, self.n_heads, self.head_dim).transpose(
-            0, 2, 1, 3
-        )
-        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        queries = self.q_norm(
+            queries.reshape(B, L, self.n_heads, self.head_dim)
+        ).transpose(0, 2, 1, 3)
+        keys = self.k_norm(
+            keys.reshape(B, L, self.n_kv_heads, self.head_dim)
+        ).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(
             0, 2, 1, 3
         )
@@ -171,18 +177,56 @@ class MLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Qwen3VLDecoderLayer(nn.Module):
+class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
-        self.num_attention_heads = args.num_attention_heads
+        dim = args.hidden_size
+        intermediate_size = args.moe_intermediate_size
+
+        self.num_experts = num_experts = args.num_experts
+        self.top_k = args.num_experts_per_tok
+        self.norm_topk_prob = args.norm_topk_prob
+
+        self.gate = nn.Linear(dim, num_experts, bias=False)
+        self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
+
+    def __call__(
+        self,
+        x: mx.array,
+    ):
+        gates = self.gate(x)
+        gates = mx.softmax(gates, axis=-1, precise=True)
+
+        k = self.top_k
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores /= mx.sum(scores, axis=-1, keepdims=True)
+
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2)
+
+        return y
+
+
+class Qwen3VLMoEDecoderLayer(nn.Module):
+    def __init__(self, args: TextConfig, layer_idx: int):
+        super().__init__()
         self.hidden_size = args.hidden_size
         self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size)
+
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
         self.args = args
+
+        if (layer_idx not in args.mlp_only_layers) and (
+            args.num_experts > 0 and (layer_idx + 1) % args.decoder_sparse_step == 0
+        ):
+            self.mlp = Qwen3MoeSparseMoeBlock(args)
+        else:
+            self.mlp = MLP(args.hidden_size, args.intermediate_size)
 
     def __call__(
         self,
@@ -198,7 +242,7 @@ class Qwen3VLDecoderLayer(nn.Module):
         return out
 
 
-class Qwen3Model(nn.Module):
+class Qwen3VLMoEModel(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
         self.args = args
@@ -207,7 +251,8 @@ class Qwen3Model(nn.Module):
         assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            Qwen3VLDecoderLayer(args=args) for _ in range(args.num_hidden_layers)
+            Qwen3VLMoEDecoderLayer(args=args, layer_idx=layer_idx)
+            for layer_idx in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
@@ -237,12 +282,12 @@ class Qwen3Model(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    def __init__(self, args: TextConfig, config: ModelConfig):
+    def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
         self.args = args
         self.config = config
         self.model_type = args.model_type
-        self.model = Qwen3Model(args)
+        self.model = Qwen3VLMoEModel(args)
         self.rope_deltas = None
 
         if not args.tie_word_embeddings:
@@ -476,6 +521,25 @@ class LanguageModel(nn.Module):
         else:
             out = self.lm_head(out)
         return LanguageModelOutput(logits=out)
+
+    def sanitize(self, weights):
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"language_model.model.layers.{l}.mlp"
+            # Only sanitize MoE layer weights
+            if f"{prefix}.experts.up_proj" in weights:
+                for n in ["up_proj", "down_proj", "gate_proj"]:
+                    to_join = weights.pop(f"{prefix}.experts.{n}")
+                    weights[f"{prefix}.switch_mlp.{n}.weight"] = to_join
+        return weights
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("mlp.gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
 
     @property
     def layers(self):

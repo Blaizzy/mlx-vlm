@@ -23,32 +23,47 @@ class VisionConfig(BaseModelConfig):
     spatial_merge_size: int = 2
     tokens_per_second: int = 2
     temporal_patch_size: int = 2
+    num_position_embeddings: int = 2304
     window_size: int = 112
-    patch_size: int = 14
     fullatt_block_indexes: list[int] = field(default_factory=lambda: [7, 15, 23, 31])
+    deepstack_visual_indexes: list[int] = field(default_factory=list)
 
 
 @dataclass
 class TextConfig(BaseModelConfig):
     model_type: str
-    hidden_size: int
-    num_hidden_layers: int
-    intermediate_size: int
-    num_attention_heads: int
-    rms_norm_eps: float
-    vocab_size: int
-    num_key_value_heads: Optional[int] = None
-    max_position_embeddings: Optional[int] = 128000
-    rope_theta: float = 1000000.0
-    rope_traditional: bool = False
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    hidden_size: int = 2048
+    num_hidden_layers: int = 48
+    intermediate_size: int = 6144
+    num_attention_heads: int = 32
+    num_experts: int = 128
+    num_experts_per_tok: int = 8
+    decoder_sparse_step: int = 1
+    mlp_only_layers: List[int] = field(default_factory=list)
+    moe_intermediate_size: int = 768
+    rms_norm_eps: float = 1e-06
+    vocab_size: int = 151936
+    num_key_value_heads: Optional[int] = 4
+    head_dim: int = 128
+    rope_theta: float = 5_000_000.0
+    max_position_embeddings: int = 262144
+    norm_topk_prob: bool = True
+    rope_scaling: Optional[Dict[str, Union[float, str, bool, List[int]]]] = field(
+        default_factory=lambda: {"type": "default", "mrope_section": [24, 20, 20]}
+    )
     tie_word_embeddings: bool = True
+    attention_bias: bool = False
+    hidden_act: str = "silu"
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
         if self.rope_scaling:
+            # Normalize rope_scaling keys (accept both 'rope_type' and 'type')
+            if "type" not in self.rope_scaling and "rope_type" in self.rope_scaling:
+                self.rope_scaling["type"] = self.rope_scaling.pop("rope_type")
+
             required_keys = {"mrope_section", "type"}
             if not all(key in self.rope_scaling for key in required_keys):
                 raise ValueError(f"rope_scaling must contain keys {required_keys}")

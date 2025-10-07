@@ -32,6 +32,7 @@ MODEL_CONFIG = {
     "cohere2_vision": MessageFormat.LIST_WITH_IMAGE,
     "qwen2_vl": MessageFormat.LIST_WITH_IMAGE,
     "qwen2_5_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "qwen3_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
