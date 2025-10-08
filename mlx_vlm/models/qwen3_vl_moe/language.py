@@ -307,7 +307,7 @@ class Qwen3VLMoEModel(nn.Module):
         visual_indices = np.where(visual_pos_masks)[0].tolist()
         if len(visual_indices) > 0:
             local_this = hidden_states[:, visual_indices, :] + visual_embeds
-            hidden_states = hidden_states.at[:, visual_indices, :].add(visual_embeds)
+            hidden_states[:, visual_indices, :] = local_this
         return hidden_states
 
 
