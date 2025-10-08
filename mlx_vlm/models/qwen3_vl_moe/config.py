@@ -80,6 +80,8 @@ class ModelConfig(BaseModelConfig):
     ignore_index: int = -100
     image_token_id: int = 151655
     video_token_id: int = 151656
+    image_token_index: Optional[int] = None
+    video_token_index: Optional[int] = None
     vision_start_token_id: int = 151652
     vision_end_token_id: int = 151653
     vision_token_id: int = 151654
@@ -87,6 +89,12 @@ class ModelConfig(BaseModelConfig):
     vision_feature_layer: int = -2
     vocab_size: int = 32000
     eos_token_id: Optional[List[int]] = None
+
+    def __post_init__(self):
+        if self.image_token_index is None:
+            self.image_token_index = self.image_token_id
+        if self.video_token_index is None:
+            self.video_token_index = self.video_token_id
 
     @classmethod
     def from_dict(cls, params):

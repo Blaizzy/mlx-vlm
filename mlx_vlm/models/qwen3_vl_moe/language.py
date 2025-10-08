@@ -265,6 +265,9 @@ class Qwen3VLMoEModel(nn.Module):
         mask: Optional[mx.array] = None,
         cache=None,
         position_ids: Optional[mx.array] = None,
+        # args for deepstack
+        visual_pos_masks: Optional[mx.array] = None,
+        deepstack_visual_embeds: Optional[mx.array] = None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -277,10 +280,35 @@ class Qwen3VLMoEModel(nn.Module):
         if mask is None:
             mask = create_attention_mask(h, cache)
 
-        for layer, c in zip(self.layers, cache):
+        for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
             h = layer(h, mask, c, position_ids)
 
+            # Add deepstack visual embeds
+            # add visual features to the hidden states of first several layers
+            if deepstack_visual_embeds is not None and layer_idx in range(
+                len(deepstack_visual_embeds)
+            ):
+                h = self._deepstack_process(
+                    h,
+                    visual_pos_masks,
+                    deepstack_visual_embeds[layer_idx],
+                )
+
         return self.norm(h)
+
+    def _deepstack_process(
+        self,
+        hidden_states: mx.array,
+        visual_pos_masks: mx.array,
+        visual_embeds: mx.array,
+    ):
+        visual_embeds = visual_embeds.astype(hidden_states.dtype)
+        # Convert boolean mask to indices using numpy
+        visual_indices = np.where(visual_pos_masks)[0].tolist()
+        if len(visual_indices) > 0:
+            local_this = hidden_states[:, visual_indices, :] + visual_embeds
+            hidden_states = hidden_states.at[:, visual_indices, :].add(visual_embeds)
+        return hidden_states
 
 
 class LanguageModel(nn.Module):
@@ -478,6 +506,9 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        # args for deepstack
+        visual_pos_masks: Optional[mx.array] = None,
+        deepstack_visual_embeds: Optional[mx.array] = None,
         **kwargs,
     ):
 
@@ -516,7 +547,12 @@ class LanguageModel(nn.Module):
                 )
 
         out = self.model(
-            inputs, cache=cache, inputs_embeds=inputs_embeds, position_ids=position_ids
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
         )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)

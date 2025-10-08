@@ -2,10 +2,32 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
+
+
+def masked_scatter(
+    final_embedding: mx.array,
+    image_mask_expanded: mx.array,
+    scaled_image_features: mx.array,
+):
+    # Reshape the tensors to 1D
+    final_embedding_shape = final_embedding.shape
+    scaled_image_features_flattened = mx.flatten(scaled_image_features)
+    final_embedding_flattened = mx.flatten(final_embedding)
+    image_mask_expanded_flattened = mx.flatten(image_mask_expanded)
+
+    # Scatter the scaled image features into the special image token positions
+    image_positions = mx.array(np.where(image_mask_expanded_flattened)[0], mx.uint32)
+    final_embedding_flattened[image_positions] = scaled_image_features_flattened
+
+    # Reshape back to the original shape
+    final_embedding = mx.reshape(final_embedding_flattened, final_embedding_shape)
+
+    return final_embedding
 
 
 class Model(nn.Module):
@@ -22,7 +44,7 @@ class Model(nn.Module):
         image_grid_thw: Optional[mx.array] = None,
     ):
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids)
+            return self.language_model.model.embed_tokens(input_ids), None, None
 
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
         pixel_values = pixel_values.astype(dtype)
@@ -31,93 +53,60 @@ class Model(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
-        hidden_states, _ = self.vision_tower(
-            pixel_values, image_grid_thw, output_hidden_states=False
+        hidden_states, deepstack_image_embeds = self.vision_tower(
+            pixel_values, image_grid_thw
         )
 
+        split_sizes = (
+            image_grid_thw.prod(-1) // self.vision_tower.spatial_merge_size**2
+        ).tolist()
+        hidden_states = mx.split(hidden_states, split_sizes)
+
+        hidden_states = mx.concatenate(hidden_states, axis=0).astype(
+            hidden_states[0].dtype
+        )
+
+        visual_pos_masks = None
+        deepstack_visual_embeds = None
+
         # Insert special image tokens in the input_ids
-        final_inputs_embeds = self.merge_input_ids_with_image_features(
-            self.config.image_token_id,
-            self.config.video_token_id,
+        inputs_embeds, image_mask = self.merge_input_ids_with_image_features(
             hidden_states,
             inputs_embeds,
             input_ids,
+            self.config.image_token_index,
+            self.config.video_token_index,
         )
-        return final_inputs_embeds
+
+        image_mask = image_mask[..., 0]
+        visual_pos_masks = image_mask
+        deepstack_visual_embeds = deepstack_image_embeds
+
+        return inputs_embeds, visual_pos_masks, deepstack_visual_embeds
 
     @staticmethod
     def merge_input_ids_with_image_features(
-        image_token_id,
-        video_token_id,
-        image_features,
-        inputs_embeds,
-        input_ids,
+        image_features, inputs_embeds, input_ids, image_token_index, video_token_index
     ):
-        """Merge image features into input embeddings at image token positions.
+        special_image_mask = input_ids == image_token_index
+        # special_video_mask = input_ids == video_token_index
+        # special_image_mask = special_image_mask | special_video_mask
+        n_image_tokens = special_image_mask.sum()
+        special_image_mask = special_image_mask[..., None]
+        special_image_mask = mx.broadcast_to(special_image_mask, inputs_embeds.shape)
 
-        Args:
-            image_token_id: The token ID for image placeholders
-            video_token_id: The token ID for video placeholders (fallback)
-            image_features: Vision features from the vision tower [num_features, hidden_dim]
-            inputs_embeds: Input embeddings [batch_size, seq_len, hidden_dim]
-            input_ids: Input token IDs [batch_size, seq_len]
-            grid_thw: Grid dimensions for each image (optional, not used in simple case)
+        n_image_features = image_features.shape[0]
+        n_image_mask_elements = special_image_mask.sum()
+        if n_image_mask_elements != image_features.size:
+            raise ValueError(
+                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+            )
 
-        Returns:
-            Updated input embeddings with image features inserted
-        """
-        # Find positions of image tokens
-        image_positions = input_ids == image_token_id
-        if mx.sum(image_positions) == 0:
-            image_positions = input_ids == video_token_id
+        inputs_embeds = masked_scatter(
+            inputs_embeds, special_image_mask, image_features
+        )
 
-        # Get dimensions
-        batch_size, seq_len = input_ids.shape
-
-        # Process each batch item
-        batch_outputs = []
-        feature_start_idx = 0
-
-        for batch_idx in range(batch_size):
-            # Get mask for this batch
-            image_mask = image_positions[batch_idx]
-            num_positions = mx.sum(image_mask).item()
-
-            if num_positions > 0:
-                # Extract features for this batch
-                batch_features = image_features[
-                    feature_start_idx : feature_start_idx + num_positions
-                ]
-
-                # Validate we have the right number of features
-                if batch_features.shape[0] != num_positions:
-                    raise ValueError(
-                        f"Number of image token positions ({num_positions}) does not match "
-                        f"number of image features ({batch_features.shape[0]}) for batch {batch_idx}"
-                    )
-
-                # Create indices for gathering
-                cumsum = mx.cumsum(image_mask.astype(mx.int32))
-                feature_indices = mx.where(image_mask, cumsum - 1, 0)
-
-                # Gather features
-                gathered_features = batch_features[feature_indices]
-
-                # Combine with original embeddings
-                image_mask_expanded = mx.expand_dims(image_mask, axis=-1)
-                batch_output = mx.where(
-                    image_mask_expanded, gathered_features, inputs_embeds[batch_idx]
-                )
-
-                feature_start_idx += num_positions
-            else:
-                # No image tokens in this batch item
-                batch_output = inputs_embeds[batch_idx]
-
-            batch_outputs.append(batch_output)
-
-        # Stack all batch outputs
-        return mx.stack(batch_outputs, axis=0)
+        return inputs_embeds, special_image_mask
 
     @property
     def layers(self):
@@ -135,12 +124,16 @@ class Model(nn.Module):
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
-        inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
+        inputs_embeds, visual_pos_masks, deepstack_visual_embeds = (
+            self.get_input_embeddings(input_ids, pixel_values, grid_thw)
+        )
 
         kwargs = {
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
             "video_grid_thw": video_grid_thw,
+            "visual_pos_masks": visual_pos_masks,
+            "deepstack_visual_embeds": deepstack_visual_embeds,
             **kwargs,
         }
 

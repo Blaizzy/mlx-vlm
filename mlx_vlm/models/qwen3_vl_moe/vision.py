@@ -171,7 +171,7 @@ class MLP(nn.Module):
         self.linear_fc2 = nn.Linear(hidden_dim, dim, bias=True)
         self.act_fn = nn.GELU(approx="fast")
 
-    def call(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array) -> mx.array:
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
 
 
@@ -438,7 +438,7 @@ class VisionModel(nn.Module):
         self,
         hidden_states: mx.array,
         grid_thw: mx.array,
-        output_hidden_states: Optional[bool] = None,
+        **kwargs,
     ) -> mx.array:
 
         hidden_states = self.patch_embed(hidden_states)
@@ -485,8 +485,6 @@ class VisionModel(nn.Module):
         cu_seqlens = mx.cumsum(cu_seqlens.astype(mx.int32), axis=0)
         cu_seqlens = mx.pad(cu_seqlens, (1, 0), mode="constant", constant_values=0)
 
-        encoder_states = (hidden_states,) if output_hidden_states else None
-
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
@@ -503,12 +501,8 @@ class VisionModel(nn.Module):
                 ](hidden_states)
                 deepstack_feature_lists.append(deepstack_feature)
 
-            if output_hidden_states:
-                encoder_states = encoder_states + (hidden_states,)
-
         hidden_states = self.merger(hidden_states)
-        reverse_indices = mx.argsort(window_index, axis=0)
-        hidden_states = hidden_states[reverse_indices, :]
+
         return hidden_states, deepstack_feature_lists
 
     def sanitize(self, weights):
