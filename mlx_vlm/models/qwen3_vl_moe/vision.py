@@ -61,7 +61,7 @@ class VisionRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (
             self.theta ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
         )
-        seq = mx.arange(seqlen.item(), dtype=inv_freq.dtype)
+        seq = mx.arange(seqlen, dtype=inv_freq.dtype)
         freqs = mx.outer(seq, inv_freq)
         return freqs
 
@@ -236,40 +236,65 @@ class VisionModel(nn.Module):
         ]
 
     def rot_pos_emb(self, grid_thw):
+        merge_size = self.spatial_merge_size
+
+        # Get max grid size for frequency table
+        max_hw = int(mx.max(grid_thw[:, 1:]).item())
+        freq_table = self.rotary_pos_emb(max_hw)  # Shape: (max_hw, dim // 2)
+
         pos_ids = []
 
-        for t, h, w in grid_thw.tolist():
-            hpos_ids = mx.expand_dims(mx.arange(h), 1)
-            hpos_ids = mx.repeat(hpos_ids, w, axis=1)
-            hpos_ids = hpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
+        for num_frames, height, width in grid_thw.tolist():
+            num_frames, height, width = int(num_frames), int(height), int(width)
+            merged_h, merged_w = height // merge_size, width // merge_size
+
+            # Create block indices
+            block_rows = mx.arange(merged_h)
+            block_cols = mx.arange(merged_w)
+
+            # Create intra-block indices
+            intra_row = mx.arange(merge_size)
+            intra_col = mx.arange(merge_size)
+
+            # Compute full-resolution positions
+            row_idx = (
+                block_rows[:, None, None, None] * merge_size
+                + intra_row[None, None, :, None]
             )
-            hpos_ids = mx.transpose(hpos_ids, (0, 2, 1, 3))
-            hpos_ids = hpos_ids.flatten()
-
-            wpos_ids = mx.expand_dims(mx.arange(w), 0)
-            wpos_ids = mx.repeat(wpos_ids, h, axis=0)
-            wpos_ids = wpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
+            col_idx = (
+                block_cols[None, :, None, None] * merge_size
+                + intra_col[None, None, None, :]
             )
-            wpos_ids = mx.transpose(wpos_ids, (0, 2, 1, 3))
-            wpos_ids = wpos_ids.flatten()
 
-            stacked_pos_ids = mx.stack([hpos_ids, wpos_ids], axis=-1)
-            pos_ids.append(mx.tile(stacked_pos_ids, (t, 1)))
+            # Broadcast and flatten
+            row_idx = mx.broadcast_to(
+                row_idx, (merged_h, merged_w, merge_size, merge_size)
+            ).reshape(-1)
+            col_idx = mx.broadcast_to(
+                col_idx, (merged_h, merged_w, merge_size, merge_size)
+            ).reshape(-1)
 
+            # Stack into coordinate pairs
+            coords = mx.stack([row_idx, col_idx], axis=-1)
+
+            # Repeat for temporal dimension
+            if num_frames > 1:
+                coords = mx.tile(coords, (num_frames, 1))
+
+            pos_ids.append(coords)
+
+        # Concatenate all position IDs - shape: (total_tokens, 2)
         pos_ids = mx.concatenate(pos_ids, axis=0)
-        max_grid_size = mx.max(grid_thw[:, 1:])
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
-        rotary_pos_emb = rotary_pos_emb_full[pos_ids]
 
-        return rotary_pos_emb.reshape(pos_ids.shape[0], -1)
+        # Lookup embeddings: freq_table[h_pos] and freq_table[w_pos]
+        # pos_ids[:, 0] = height positions, pos_ids[:, 1] = width positions
+        h_embeddings = freq_table[pos_ids[:, 0]]  # (total_tokens, dim // 2)
+        w_embeddings = freq_table[pos_ids[:, 1]]  # (total_tokens, dim // 2)
+
+        # Concatenate height and width embeddings
+        embeddings = mx.concatenate([h_embeddings, w_embeddings], axis=-1)
+
+        return embeddings
 
     def get_window_index(self, grid_thw):
         window_index = []
@@ -413,7 +438,7 @@ class VisionModel(nn.Module):
             t, h, w = int(t), int(h), int(w)
 
             # Repeat for temporal dimension
-            pos_embed = mx.repeat(pos_embed, t, axis=0)
+            pos_embed = mx.tile(pos_embed, (t, 1))
 
             # Reshape and permute for spatial merging
             embed_dim = pos_embed.shape[-1]
