@@ -159,6 +159,15 @@ class Attention(nn.Module):
         )
 
         kv_seq_len = keys.shape[-2]
+
+        if position_ids is None:
+            kv_seq_len += cache.offset + 1
+            position_ids = mx.arange(cache.offset, cache.offset + L)
+            position_ids = mx.expand_dims(position_ids, axis=0)
+            position_ids = mx.tile(position_ids, (3, 1, 1))
+        else:
+            kv_seq_len += cache.offset + 1 if cache is not None else 0
+
         cos, sin = self.rotary_emb(values, position_ids)
 
         if mask is not None and isinstance(mask, mx.array):
