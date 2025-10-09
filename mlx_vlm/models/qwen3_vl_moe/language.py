@@ -14,8 +14,10 @@ from ..cache import KVCache
 from .config import ModelConfig, TextConfig
 
 
-class Qwen3RotaryEmbedding:
-    def __init__(self, dim, max_position_embeddings=2048, base=10000):
+class Qwen3VLMoERotaryEmbedding:
+    def __init__(
+        self, dim, max_position_embeddings=2048, base=10000, rope_scaling=None
+    ):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
@@ -24,27 +26,53 @@ class Qwen3RotaryEmbedding:
             self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
         )
         self.inv_freq = inv_freq
+        self.attention_scaling = 1.0  # type: default
 
-        self._set_cos_sin_cache(seq_len=max_position_embeddings)
+        self.mrope_section = rope_scaling.get("mrope_section", [24, 20, 20])
 
-    def _set_cos_sin_cache(self, seq_len):
-        self.max_seq_len_cached = seq_len
-        t = mx.arange(self.max_seq_len_cached).astype(mx.float32)
+    def apply_interleaved_mrope(self, freqs, mrope_section):
+        """Apply interleaved MRoPE to 3D rotary embeddings.
+        Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
+        interleaved [THTHWHTHW...TT], preserving frequency continuity.
+        args:
+            x: (3, bs, seq_len, head_dim // 2)
+            mrope_section: (3,)
+        returns:
+            x_t: (bs, seq_len, head_dim // 2)
+        """
+        freqs_t = freqs[0]  # just overwrite the first dimension T
+        for dim, offset in enumerate((1, 2), start=1):  # H, W
+            length = mrope_section[dim] * 3
+            idx = slice(offset, length, 3)
+            freqs_t[..., idx] = freqs[dim, ..., idx]
+        return freqs_t
 
-        freqs = mx.outer(t, self.inv_freq)
-        emb = mx.concatenate((freqs, freqs), axis=-1)
-        self.cos_cached = mx.cos(emb)
-        self.sin_cached = mx.sin(emb)
+    def __call__(self, x, position_ids):
 
-    def __call__(self, x, seq_len=None):
+        # In contrast to other models, Qwen3VLMoe has different position ids for the grids
+        # So we expand the inv_freq to shape (3, ...)
+        if position_ids.ndim == 2:
+            position_ids = mx.broadcast_to(
+                position_ids[None, ...],
+                (3, position_ids.shape[0], position_ids.shape[1]),
+            )
 
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len)
-
-        return (
-            self.cos_cached[:seq_len].astype(x.dtype),
-            self.sin_cached[:seq_len].astype(x.dtype),
+        inv_freq_expanded = mx.broadcast_to(
+            self.inv_freq[None, None, :, None].astype(mx.float32),
+            (3, position_ids.shape[1], self.inv_freq.shape[0], 1),
         )
+        position_ids_expanded = position_ids[:, :, None, :].astype(
+            mx.float32
+        )  # shape (3, bs, 1, positions)
+
+        freqs = inv_freq_expanded @ position_ids_expanded
+        freqs = mx.swapaxes(freqs, 2, 3)
+        freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
+        emb = mx.concatenate([freqs, freqs], axis=-1)
+        cos = mx.cos(emb) * self.attention_scaling
+        sin = mx.sin(emb) * self.attention_scaling
+
+        return cos.astype(x.dtype), sin.astype(x.dtype)
 
 
 def rotate_half(x):
@@ -54,7 +82,7 @@ def rotate_half(x):
     return mx.concatenate([-x2, x1], axis=-1)
 
 
-def apply_multimodal_rotary_pos_emb(q, k, cos, sin, position_ids, mrope_section):
+def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
     """
     Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors.
     Args:
@@ -62,24 +90,13 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, position_ids, mrope_section)
         k (mx.array): The key tensor.
         cos (mx.array): The cosine part of the rotary embedding.
         sin (mx.array): The sine part of the rotary embedding.
-        mrope_section (List[int]): Multimodal rope section for channel dimension of temporal, height and width.
         unsqueeze_dim (int, optional): Dimension to unsqueeze. Defaults to 1.
     Returns:
         tuple(mx.array): The rotated query and key tensors.
     """
 
-    mrope_section = np.cumsum(mrope_section * 2)[:-1].tolist()
-    cos = cos[position_ids]
-    sin = sin[position_ids]
-
-    cos = mx.concatenate(
-        [m[i % 3] for i, m in enumerate(mx.split(cos, mrope_section, axis=-1))], axis=-1
-    )[
-        :, None, :, :
-    ]  # unsqueeze dim 1
-    sin = mx.concatenate(
-        [m[i % 3] for i, m in enumerate(mx.split(sin, mrope_section, axis=-1))], axis=-1
-    )[:, None, :, :]
+    cos = mx.expand_dims(cos, axis=unqueeze_dim)
+    sin = mx.expand_dims(sin, axis=unqueeze_dim)
 
     # Apply rotary embedding
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -112,10 +129,11 @@ class Attention(nn.Module):
 
         self.rope_scaling = args.rope_scaling
 
-        self.rotary_emb = Qwen3RotaryEmbedding(
+        self.rotary_emb = Qwen3VLMoERotaryEmbedding(
             head_dim,
             max_position_embeddings=args.max_position_embeddings,
             base=args.rope_theta,
+            rope_scaling=self.rope_scaling,
         )
 
     def __call__(
@@ -150,13 +168,12 @@ class Attention(nn.Module):
         else:
             kv_seq_len += cache.offset + 1 if cache is not None else 0
 
-        cos, sin = self.rotary_emb(values, kv_seq_len)
+        cos, sin = self.rotary_emb(values, position_ids)
 
         if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., : keys.shape[-2]]
-        queries, keys = apply_multimodal_rotary_pos_emb(
-            queries, keys, cos, sin, position_ids, self.rope_scaling["mrope_section"]
-        )
+            mask = mask[..., :kv_seq_len]
+
+        queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
