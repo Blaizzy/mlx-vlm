@@ -29,11 +29,19 @@ image_processor = load_image_processor(args.model)
 
 
 def chat(message, history, temperature, max_tokens):
+    image_file = ""
+    if "files" in message and len(message["files"]) > 0:
+        image_file = message["files"][-1]
+
+    num_images = 1 if image_file else 0
+
     if config["model_type"] != "paligemma":
         chat_history = []
         for item in history:
             if isinstance(item[0], str):
                 chat_history.append({"role": "user", "content": item[0]})
+            elif isinstance(item[0], dict) and "text" in item[0]:
+                chat_history.append({"role": "user", "content": item[0]["text"]})
             if item[1] is not None:
                 chat_history.append({"role": "assistant", "content": item[1]})
 
@@ -42,7 +50,7 @@ def chat(message, history, temperature, max_tokens):
         messages = []
         for i, m in enumerate(chat_history):
             skip_token = True
-            if i == len(chat_history) - 1 and m["role"] == "user":
+            if i == len(chat_history) - 1 and m["role"] == "user" and image_file:
                 skip_token = False
             messages.append(
                 get_message_json(
@@ -50,6 +58,7 @@ def chat(message, history, temperature, max_tokens):
                     m["content"],
                     role=m["role"],
                     skip_image_token=skip_token,
+                    num_images=num_images if not skip_token else 0,
                 )
             )
 
@@ -58,16 +67,12 @@ def chat(message, history, temperature, max_tokens):
     else:
         messages = message["text"]
 
-    files = ""
-    if "files" in message and len(message["files"]) > 0:
-        files = message["files"][-1]
-
     response = ""
     for chunk in stream_generate(
         model,
         processor,
         messages,
-        files,
+        image=image_file,
         max_tokens=max_tokens,
         temperature=temperature,
     ):
