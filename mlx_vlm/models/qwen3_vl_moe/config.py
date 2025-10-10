@@ -43,7 +43,6 @@ class TextConfig(BaseModelConfig):
     initializer_range: float = 0.02
     eos_token_id: Optional[int] = None
     use_cache: bool = True
-    # MoE-specific config
     num_experts: int = 128
     num_experts_per_tok: int = 8
     moe_intermediate_size: int = 768

@@ -88,7 +88,6 @@ class Model(nn.Module):
     ):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Collect all visual features
         all_features = []
 
         if pixel_values is not None:
@@ -104,12 +103,10 @@ class Model(nn.Module):
         if not all_features:
             return inputs_embeds
 
-        # Concatenate all features and cast to embeddings dtype
         combined_features = mx.concatenate(all_features, axis=0).astype(
             inputs_embeds.dtype
         )
 
-        # Use the static method to merge features
         return self.merge_input_ids_with_image_features(
             self.config.image_token_id,
             self.config.video_token_id,
