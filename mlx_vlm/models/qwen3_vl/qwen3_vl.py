@@ -89,8 +89,8 @@ class Model(nn.Module):
         image_features, inputs_embeds, input_ids, image_token_index, video_token_index
     ):
         special_image_mask = input_ids == image_token_index
-        # special_video_mask = input_ids == video_token_index
-        # special_image_mask = special_image_mask | special_video_mask
+        special_video_mask = input_ids == video_token_index
+        special_image_mask = special_image_mask | special_video_mask
         n_image_tokens = special_image_mask.sum()
         special_image_mask = special_image_mask[..., None]
         special_image_mask = mx.broadcast_to(special_image_mask, inputs_embeds.shape)
