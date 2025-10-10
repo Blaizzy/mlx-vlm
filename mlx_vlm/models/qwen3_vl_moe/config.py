@@ -51,14 +51,18 @@ class TextConfig(BaseModelConfig):
     mlp_only_layers: List[int] = field(default_factory=list)
     router_aux_loss_coef: float = 0.001
     norm_topk_prob: bool = True
-    
+
     def __post_init__(self):
         if self.rope_scaling:
-            rope_type = self.rope_scaling.get("rope_type", self.rope_scaling.get("type"))
+            rope_type = self.rope_scaling.get(
+                "rope_type", self.rope_scaling.get("type")
+            )
             if not rope_type:
                 raise ValueError("rope_scaling must contain 'rope_type' or 'type'")
             if rope_type not in ["mrope", "default"]:
-                raise ValueError(f"rope_scaling type must be 'mrope' or 'default', got '{rope_type}'")
+                raise ValueError(
+                    f"rope_scaling type must be 'mrope' or 'default', got '{rope_type}'"
+                )
             if "mrope_section" not in self.rope_scaling:
                 raise ValueError("rope_scaling with mrope must contain 'mrope_section'")
 

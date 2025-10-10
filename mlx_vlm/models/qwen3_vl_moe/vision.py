@@ -60,7 +60,9 @@ class VisionRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (
             self.theta ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
         )
-        seq = mx.arange(seqlen.item() if hasattr(seqlen, 'item') else seqlen, dtype=inv_freq.dtype)
+        seq = mx.arange(
+            seqlen.item() if hasattr(seqlen, "item") else seqlen, dtype=inv_freq.dtype
+        )
         freqs = mx.outer(seq, inv_freq)
         return freqs
 
@@ -103,13 +105,14 @@ class PatchEmbed(nn.Module):
 
 
 class PatchMerger(nn.Module):
-    def __init__(self, config: VisionConfig, use_postshuffle_norm: bool = False) -> None:
+    def __init__(
+        self, config: VisionConfig, use_postshuffle_norm: bool = False
+    ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
         self.use_postshuffle_norm = use_postshuffle_norm
         self.norm = nn.LayerNorm(
-            self.hidden_size if use_postshuffle_norm else config.hidden_size, 
-            eps=1e-6
+            self.hidden_size if use_postshuffle_norm else config.hidden_size, eps=1e-6
         )
         self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
         self.act_fn = nn.GELU()
@@ -131,7 +134,7 @@ class MLP(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.linear_fc1 = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
         self.linear_fc2 = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
-        
+
         if config.hidden_act in ["gelu", "gelu_pytorch_tanh"]:
             self.act_fn = nn.GELU()
         elif config.hidden_act == "silu":
@@ -222,7 +225,9 @@ class VisionModel(nn.Module):
             hidden_size=config.hidden_size,
         )
 
-        self.pos_embed = nn.Embedding(config.num_position_embeddings, config.hidden_size)
+        self.pos_embed = nn.Embedding(
+            config.num_position_embeddings, config.hidden_size
+        )
         self.num_grid_per_side = int(config.num_position_embeddings**0.5)
 
         head_dim = config.hidden_size // config.num_heads
@@ -258,11 +263,11 @@ class VisionModel(nn.Module):
             intra_col = mx.arange(merge_size)
 
             row_idx = (
-                block_rows[:, None, None, None] * merge_size 
+                block_rows[:, None, None, None] * merge_size
                 + intra_row[None, None, :, None]
             )
             col_idx = (
-                block_cols[None, :, None, None] * merge_size 
+                block_cols[None, :, None, None] * merge_size
                 + intra_col[None, None, None, :]
             )
 
@@ -294,7 +299,7 @@ class VisionModel(nn.Module):
             h = int(h)
             w = int(w)
             t = int(t)
-            
+
             h_idxs = mx.linspace(0, self.num_grid_per_side - 1, h)
             w_idxs = mx.linspace(0, self.num_grid_per_side - 1, w)
 
@@ -329,7 +334,7 @@ class VisionModel(nn.Module):
 
         idx_tensor = mx.array(idx_list, dtype=mx.int32)
         weight_tensor = mx.array(weight_list, dtype=self.pos_embed.weight.dtype)
-        
+
         pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
@@ -342,7 +347,7 @@ class VisionModel(nn.Module):
 
         patch_pos_embeds_permute = []
         merge_size = self.config.spatial_merge_size
-        
+
         for pos_embed, (t, h, w) in zip(patch_pos_embeds_split, grid_thw_list):
             t, h, w = int(t), int(h), int(w)
             feature_dim = pos_embed.shape[-1]
@@ -350,13 +355,18 @@ class VisionModel(nn.Module):
             pos_embed = pos_embed.reshape(t, h, w, feature_dim)
             pos_embed = (
                 pos_embed.reshape(
-                    t, h // merge_size, merge_size, w // merge_size, merge_size, feature_dim
+                    t,
+                    h // merge_size,
+                    merge_size,
+                    w // merge_size,
+                    merge_size,
+                    feature_dim,
                 )
                 .transpose(0, 1, 3, 2, 4, 5)
                 .reshape(-1, feature_dim)
             )
             patch_pos_embeds_permute.append(pos_embed)
-        
+
         patch_pos_embeds = mx.concatenate(patch_pos_embeds_permute)
         return patch_pos_embeds
 
@@ -376,7 +386,7 @@ class VisionModel(nn.Module):
         seq_len = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(seq_len, -1)
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-        
+
         emb = mx.concatenate((rotary_pos_emb, rotary_pos_emb), axis=-1)
         position_embeddings = (mx.cos(emb), mx.sin(emb))
 
@@ -385,7 +395,7 @@ class VisionModel(nn.Module):
         for i in range(batch_size):
             seq_len = grid_thw[i, 1] * grid_thw[i, 2]
             cu_seqlens.append(mx.repeat(seq_len, int(grid_thw[i, 0].item())))
-        
+
         cu_seqlens = mx.concatenate(cu_seqlens)
         cu_seqlens = mx.cumsum(cu_seqlens.astype(mx.int32), axis=0)
         cu_seqlens = mx.pad(cu_seqlens, (1, 0), mode="constant", constant_values=0)
@@ -420,4 +430,3 @@ class VisionModel(nn.Module):
             else:
                 sanitized_weights[k] = v
         return sanitized_weights
-

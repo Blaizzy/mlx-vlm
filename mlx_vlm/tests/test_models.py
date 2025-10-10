@@ -1469,7 +1469,7 @@ class TestModels(unittest.TestCase):
         # For grid_thw = [1, 28, 28], we have 1*28*28 = 784 patches
         grid_thw = mx.array([[1, 28, 28]], dtype=mx.int64)
         num_patches = int(grid_thw[0, 0] * grid_thw[0, 1] * grid_thw[0, 2])
-        
+
         # Create input tensor
         pixel_values = mx.random.uniform(
             shape=(
@@ -1488,9 +1488,9 @@ class TestModels(unittest.TestCase):
 
         # Check output shape
         # After spatial merge (2x2), we should have 28/2 * 28/2 = 14*14 = 196 patches
-        expected_patches = (grid_thw[0, 1] // config.vision_config.spatial_merge_size) * (
-            grid_thw[0, 2] // config.vision_config.spatial_merge_size
-        )
+        expected_patches = (
+            grid_thw[0, 1] // config.vision_config.spatial_merge_size
+        ) * (grid_thw[0, 2] // config.vision_config.spatial_merge_size)
         self.assertEqual(hidden_states.shape[0], expected_patches)
         self.assertEqual(hidden_states.shape[1], config.vision_config.out_hidden_size)
 

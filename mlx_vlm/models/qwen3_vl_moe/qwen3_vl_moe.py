@@ -88,30 +88,36 @@ class Model(nn.Module):
     ):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         batch_size, _ = input_ids.shape
-        
+
         image_features = None
         if pixel_values is not None:
             image_embeds, _ = self.get_image_features(pixel_values, image_grid_thw)
-            image_features = mx.concatenate(image_embeds, axis=0).astype(inputs_embeds.dtype)
-        
+            image_features = mx.concatenate(image_embeds, axis=0).astype(
+                inputs_embeds.dtype
+            )
+
         video_features = None
         if pixel_values_videos is not None:
-            video_embeds, _ = self.get_video_features(pixel_values_videos, video_grid_thw)
-            video_features = mx.concatenate(video_embeds, axis=0).astype(inputs_embeds.dtype)
-        
+            video_embeds, _ = self.get_video_features(
+                pixel_values_videos, video_grid_thw
+            )
+            video_features = mx.concatenate(video_embeds, axis=0).astype(
+                inputs_embeds.dtype
+            )
+
         if image_features is None and video_features is None:
             return inputs_embeds
-        
+
         batch_outputs = []
         feature_start_idx = 0
-        
+
         for batch_idx in range(batch_size):
             batch_output = inputs_embeds[batch_idx]
-            
+
             if image_features is not None:
                 image_mask = input_ids[batch_idx] == self.config.image_token_id
                 num_image_positions = mx.sum(image_mask).item()
-                
+
                 if num_image_positions > 0:
                     batch_features = image_features[
                         feature_start_idx : feature_start_idx + num_image_positions
@@ -124,11 +130,11 @@ class Model(nn.Module):
                         image_mask_expanded, gathered_features, batch_output
                     )
                     feature_start_idx += num_image_positions
-            
+
             if video_features is not None:
                 video_mask = input_ids[batch_idx] == self.config.video_token_id
                 num_video_positions = mx.sum(video_mask).item()
-                
+
                 if num_video_positions > 0:
                     batch_features = video_features[
                         feature_start_idx : feature_start_idx + num_video_positions
@@ -141,9 +147,9 @@ class Model(nn.Module):
                         video_mask_expanded, gathered_features, batch_output
                     )
                     feature_start_idx += num_video_positions
-            
+
             batch_outputs.append(batch_output)
-        
+
         return mx.stack(batch_outputs, axis=0)
 
     @property
