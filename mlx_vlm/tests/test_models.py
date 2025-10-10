@@ -943,6 +943,177 @@ class TestModels(unittest.TestCase):
             ),  # image temporals shape (num_images, 3)
         )
 
+    def test_qwen3_vl(self):
+        from mlx_vlm.models import qwen3_vl
+
+        text_config = qwen3_vl.TextConfig(
+            model_type="qwen3_vl_text",
+            hidden_size=128,
+            num_hidden_layers=4,
+            intermediate_size=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            head_dim=32,
+            vocab_size=10_000,
+            rope_theta=1000,
+            max_position_embeddings=1000,
+            tie_word_embeddings=False,
+            norm_topk_prob=True,
+            rope_scaling={"rope_type": "mrope", "mrope_section": [8, 6, 6]},
+        )
+
+        vision_config = qwen3_vl.VisionConfig(
+            model_type="qwen3_vl",
+            depth=4,
+            hidden_size=128,
+            intermediate_size=256,
+            out_hidden_size=128,
+            num_heads=4,
+            patch_size=14,
+            in_channels=3,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            num_position_embeddings=144,
+            deepstack_visual_indexes=[],
+        )
+
+        config = qwen3_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="qwen3_vl",
+            image_token_id=151655,
+            video_token_id=151656,
+            vocab_size=10_000,
+        )
+
+        model = qwen3_vl.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        # Test vision model with proper input format
+        # Input shape: (total_patches, channels, temporal_patch_size, patch_size, patch_size)
+        # For grid_thw = [1, 28, 28], we have 1*28*28 = 784 patches
+        grid_thw = mx.array([[1, 28, 28]], dtype=mx.int64)
+        num_patches = int(grid_thw[0, 0] * grid_thw[0, 1] * grid_thw[0, 2])
+
+        # Create input tensor
+        pixel_values = mx.random.uniform(
+            shape=(
+                num_patches,
+                config.vision_config.in_channels,
+                config.vision_config.temporal_patch_size,
+                config.vision_config.patch_size,
+                config.vision_config.patch_size,
+            )
+        )
+
+        # Forward pass
+        hidden_states, _ = model.vision_tower(
+            pixel_values, grid_thw, output_hidden_states=False
+        )
+
+        # Check output shape
+        # After spatial merge (2x2), we should have 28/2 * 28/2 = 14*14 = 196 patches
+        expected_patches = (
+            grid_thw[0, 1] // config.vision_config.spatial_merge_size
+        ) * (grid_thw[0, 2] // config.vision_config.spatial_merge_size)
+        self.assertEqual(hidden_states.shape[0], expected_patches)
+        self.assertEqual(hidden_states.shape[1], config.vision_config.out_hidden_size)
+
+    def test_qwen3_vl_moe(self):
+        from mlx_vlm.models import qwen3_vl_moe
+
+        text_config = qwen3_vl_moe.TextConfig(
+            model_type="qwen3_vl_moe_text",
+            hidden_size=128,
+            num_hidden_layers=4,
+            intermediate_size=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            head_dim=32,
+            vocab_size=10_000,
+            decoder_sparse_step=1,
+            mlp_only_layers=[],
+            num_experts_per_tok=2,
+            num_experts=4,
+            moe_intermediate_size=128,
+            rope_theta=1000,
+            max_position_embeddings=1000,
+            tie_word_embeddings=False,
+            norm_topk_prob=True,
+            rope_scaling={"rope_type": "mrope", "mrope_section": [8, 6, 6]},
+        )
+
+        vision_config = qwen3_vl_moe.VisionConfig(
+            model_type="qwen3_vl_moe",
+            depth=4,
+            hidden_size=128,
+            intermediate_size=256,
+            out_hidden_size=128,
+            num_heads=4,
+            patch_size=14,
+            in_channels=3,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            num_position_embeddings=144,
+            deepstack_visual_indexes=[],
+        )
+
+        config = qwen3_vl_moe.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="qwen3_vl_moe",
+            image_token_id=151655,
+            video_token_id=151656,
+            vocab_size=10_000,
+        )
+
+        model = qwen3_vl_moe.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        # Test vision model with proper input format
+        # Input shape: (total_patches, channels, temporal_patch_size, patch_size, patch_size)
+        # For grid_thw = [1, 28, 28], we have 1*28*28 = 784 patches
+        grid_thw = mx.array([[1, 28, 28]], dtype=mx.int64)
+        num_patches = int(grid_thw[0, 0] * grid_thw[0, 1] * grid_thw[0, 2])
+
+        # Create input tensor
+        pixel_values = mx.random.uniform(
+            shape=(
+                num_patches,
+                config.vision_config.in_channels,
+                config.vision_config.temporal_patch_size,
+                config.vision_config.patch_size,
+                config.vision_config.patch_size,
+            )
+        )
+
+        # Forward pass
+        hidden_states, _ = model.vision_tower(
+            pixel_values, grid_thw, output_hidden_states=False
+        )
+
+        # Check output shape
+        # After spatial merge (2x2), we should have 28/2 * 28/2 = 14*14 = 196 patches
+        expected_patches = (
+            grid_thw[0, 1] // config.vision_config.spatial_merge_size
+        ) * (grid_thw[0, 2] // config.vision_config.spatial_merge_size)
+        self.assertEqual(hidden_states.shape[0], expected_patches)
+        self.assertEqual(hidden_states.shape[1], config.vision_config.out_hidden_size)
+
     def test_glm4v_moe(self):
         from mlx_vlm.models import glm4v_moe
 
