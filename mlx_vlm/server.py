@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import codecs
 import gc
@@ -1110,10 +1111,30 @@ async def unload_model_endpoint():
 
 
 def main():
+    parser = argparse.ArgumentParser(description="MLX-VLM Inference Server")
+
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="Host to bind the server to (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port to bind the server to (default: 8000)",
+    )
+
+    args = parser.parse_args()
 
     uvicorn.run(
-        "mlx_vlm.server:app", host="0.0.0.0", port=8000, workers=1, reload=True
-    )  # reload=True for development to automatically restart on code changes.
+        "mlx_vlm.server:app",
+        host=args.host,
+        port=args.port,
+        workers=1,
+        reload=False,
+    )
 
 
 if __name__ == "__main__":
