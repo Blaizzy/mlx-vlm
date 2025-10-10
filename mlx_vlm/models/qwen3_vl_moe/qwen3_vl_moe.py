@@ -87,70 +87,36 @@ class Model(nn.Module):
         video_grid_thw: Optional[mx.array] = None,
     ):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
-        batch_size, _ = input_ids.shape
 
-        image_features = None
+        # Collect all visual features
+        all_features = []
+
         if pixel_values is not None:
             image_embeds, _ = self.get_image_features(pixel_values, image_grid_thw)
-            image_features = mx.concatenate(image_embeds, axis=0).astype(
-                inputs_embeds.dtype
-            )
+            all_features.extend(image_embeds)
 
-        video_features = None
         if pixel_values_videos is not None:
             video_embeds, _ = self.get_video_features(
                 pixel_values_videos, video_grid_thw
             )
-            video_features = mx.concatenate(video_embeds, axis=0).astype(
-                inputs_embeds.dtype
-            )
+            all_features.extend(video_embeds)
 
-        if image_features is None and video_features is None:
+        if not all_features:
             return inputs_embeds
 
-        batch_outputs = []
-        feature_start_idx = 0
+        # Concatenate all features and cast to embeddings dtype
+        combined_features = mx.concatenate(all_features, axis=0).astype(
+            inputs_embeds.dtype
+        )
 
-        for batch_idx in range(batch_size):
-            batch_output = inputs_embeds[batch_idx]
-
-            if image_features is not None:
-                image_mask = input_ids[batch_idx] == self.config.image_token_id
-                num_image_positions = mx.sum(image_mask).item()
-
-                if num_image_positions > 0:
-                    batch_features = image_features[
-                        feature_start_idx : feature_start_idx + num_image_positions
-                    ]
-                    cumsum = mx.cumsum(image_mask.astype(mx.int32))
-                    feature_indices = mx.where(image_mask, cumsum - 1, 0)
-                    gathered_features = batch_features[feature_indices]
-                    image_mask_expanded = mx.expand_dims(image_mask, axis=-1)
-                    batch_output = mx.where(
-                        image_mask_expanded, gathered_features, batch_output
-                    )
-                    feature_start_idx += num_image_positions
-
-            if video_features is not None:
-                video_mask = input_ids[batch_idx] == self.config.video_token_id
-                num_video_positions = mx.sum(video_mask).item()
-
-                if num_video_positions > 0:
-                    batch_features = video_features[
-                        feature_start_idx : feature_start_idx + num_video_positions
-                    ]
-                    cumsum = mx.cumsum(video_mask.astype(mx.int32))
-                    feature_indices = mx.where(video_mask, cumsum - 1, 0)
-                    gathered_features = batch_features[feature_indices]
-                    video_mask_expanded = mx.expand_dims(video_mask, axis=-1)
-                    batch_output = mx.where(
-                        video_mask_expanded, gathered_features, batch_output
-                    )
-                    feature_start_idx += num_video_positions
-
-            batch_outputs.append(batch_output)
-
-        return mx.stack(batch_outputs, axis=0)
+        # Use the static method to merge features
+        return self.merge_input_ids_with_image_features(
+            self.config.image_token_id,
+            self.config.video_token_id,
+            combined_features,
+            inputs_embeds,
+            input_ids,
+        )
 
     @property
     def layers(self):
