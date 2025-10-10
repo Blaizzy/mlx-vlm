@@ -133,7 +133,12 @@ class MessageFormatter:
             )
 
         # Handle video format for specific models
-        if self.model_name in ["qwen2_vl", "qwen2_5_vl"] and kwargs.get("video"):
+        if self.model_name in [
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+        ] and kwargs.get("video"):
             return self._format_video_message(prompt, kwargs)
 
         # Route to appropriate formatter
