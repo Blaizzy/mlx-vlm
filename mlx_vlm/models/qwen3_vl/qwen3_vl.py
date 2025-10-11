@@ -41,8 +41,12 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        image_grid_thw: Optional[mx.array] = None,
+        **kwargs,
     ):
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+
         if pixel_values is None:
             return self.language_model.model.embed_tokens(input_ids), None, None
 
@@ -54,11 +58,11 @@ class Model(nn.Module):
 
         # Get the ouptut hidden states from the vision model
         hidden_states, deepstack_image_embeds = self.vision_tower(
-            pixel_values, image_grid_thw
+            pixel_values, grid_thw
         )
 
         split_sizes = (
-            image_grid_thw.prod(-1) // self.vision_tower.spatial_merge_size**2
+            grid_thw.prod(-1) // self.vision_tower.spatial_merge_size**2
         ).tolist()
         hidden_states = mx.split(hidden_states, split_sizes)
 
@@ -122,10 +126,14 @@ class Model(nn.Module):
     ):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
-        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         inputs_embeds, visual_pos_masks, deepstack_visual_embeds = (
-            self.get_input_embeddings(input_ids, pixel_values, grid_thw)
+            self.get_input_embeddings(
+                input_ids,
+                pixel_values,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+            )
         )
 
         kwargs = {
