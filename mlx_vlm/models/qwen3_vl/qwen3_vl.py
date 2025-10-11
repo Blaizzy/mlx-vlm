@@ -149,22 +149,6 @@ class Model(nn.Module):
             if "model" in key:
                 if "model.language_model" in key:
                     key = key.replace("model.language_model", "language_model.model")
-                    if "gate_up_proj" in key:
-                        gate_key = key.replace("gate_up_proj", "gate_proj")
-                        up_key = key.replace("gate_up_proj", "up_proj")
-
-                        mid_dim = value.shape[-1] // 2
-                        sanitized_weights[gate_key] = value[..., :mid_dim].transpose(
-                            0, 2, 1
-                        )
-                        sanitized_weights[up_key] = value[..., mid_dim:].transpose(
-                            0, 2, 1
-                        )
-
-                        continue
-                    if "down_proj" in key:
-                        sanitized_weights[key] = value.transpose(0, 2, 1)
-                        continue
 
                 elif "model.visual" in key:
                     key = key.replace("model.visual", "vision_tower")
