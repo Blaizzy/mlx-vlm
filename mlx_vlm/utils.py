@@ -29,11 +29,11 @@ from .trainer import apply_lora_layers
 
 # Constants
 MODEL_REMAPPING = {
+    "llava_qwen2": "fastvlm",       # Apple's FastVLM, note it's different to the one below
     "llava-qwen2": "llava_bunny",
     "bunny-llama": "llava_bunny",
     "lfm2-vl": "lfm2_vl",
     "cohere2_vision": "aya_vision",
-    "llava_qwen2": "fastvlm",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -584,7 +584,7 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     """
     if (
         isinstance(image_source, BytesIO)
-        or isinstance(image_source, str)
+        or (isinstance(image_source, str) and image_source.startswith("data:image/"))
         or Path(image_source).is_file()
     ):
         # for base64 encoded images

@@ -645,7 +645,13 @@ class VisionModel(nn.Module):
         return self.vision_model(x, output_hidden_states)
 
     def sanitize(self, weights):
+        # Only transpose during conversion from transformers
+        W, C = weights["vision_tower.vision_model.patch_embed.blocks.1.reparam_conv.weight"].shape[-2:]
+        skip_transpose = W > C
+
         def is_conv(k):
+            if skip_transpose:
+                return False
             if ".reparam_conv.weight" in k: return True
             if ".conv.weight" in k: return True
             if ".fc1.weight" in k: return True

@@ -125,14 +125,22 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         def transform_key(key):
+            if "patch_embed" in key:
+                print("patch_embed")
+            if "blocks" in key:
+                print("blocks")
             if "vision_tower" in key:
-                key = key.replace("model.vision_tower.vision_tower.model", "vision_tower.vision_model")
-                key = key.replace("patch_embed", "patch_embed.blocks")
+                if "model.vision_tower" in key:
+                    # conversion from transformers
+                    key = key.replace("model.vision_tower.vision_tower.model", "vision_tower.vision_model")
+                    key = key.replace("patch_embed", "patch_embed.blocks")
                 return key
             if "lm_head" in key:
                 return key
             if "mm_projector" in key:
                 return key.replace("model.", "")
-            return "language_model." + key
+            if "language_model" not in key:
+                return "language_model." + key
+            return key
 
         return {transform_key(k): v for k, v in weights.items()}

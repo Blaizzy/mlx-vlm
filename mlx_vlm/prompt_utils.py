@@ -46,6 +46,7 @@ MODEL_CONFIG = {
     "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
+    "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,       # fastvlm
     "bunny-llama": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "phi3_v": MessageFormat.NUMBERED_IMAGE_TOKENS,
     "multi_modality": MessageFormat.IMAGE_TOKEN,

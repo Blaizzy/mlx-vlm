@@ -43,8 +43,10 @@ class LanguageModel(nn.Module):
     def layers(self):
         return self.model.layers
 
-    def make_cache(self):
-        return [
-            KVCache() if l.is_attention_layer else ArraysCache(size=1)
-            for l in self.layers
-        ]
+    @property
+    def head_dim(self):
+        return self.args.hidden_size // self.args.num_attention_heads
+
+    @property
+    def n_kv_heads(self):
+        return self.args.num_key_value_heads
