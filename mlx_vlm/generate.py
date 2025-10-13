@@ -593,6 +593,7 @@ class BatchGenerationResult:
 def _left_pad_prompts(prompts, max_length=None):
     if max_length is None:
         max_length = max(len(p) for p in prompts)
+
     return mx.array([[0] * (max_length - len(p)) + p for p in prompts])
 
 
@@ -618,10 +619,80 @@ def _make_cache(model, left_padding):
             raise ValueError(f"{type(c)} does not yet support batching")
 
     if hasattr(model, "make_cache"):
-        cache = model.make_cache()
-        return [to_batch_cache(c) for c in cache]
+        model_cache = model.make_cache()
+        return [to_batch_cache(c) for c in model_cache]
     else:
         return [cache.BatchKVCache(left_padding) for _ in model.layers]
+
+
+@dataclass
+class BatchStats:
+    """
+    An data object to hold generation stats.
+
+    Args:
+        prompt_tokens (int): The number of prompt tokens processed.
+        prompt_tps (float): The prompt processing tokens-per-second.
+        prompt_time (float): The time in seconds spent in prompt processing.
+        generation_tokens (int): The number of generated tokens.
+        generation_tps (float): The tokens-per-second for generation.
+        generation_time (float): The time in seconds spent in generation .
+        peak_memory (float): The peak memory used so far in GB.
+    """
+
+    prompt_tokens: int = 0
+    prompt_tps: float = 0
+    prompt_time: float = 0
+    generation_tokens: int = 0
+    generation_tps: float = 0
+    generation_time: float = 0
+    peak_memory: float = 0
+
+
+@dataclass
+class BatchResponse:
+    """
+    An data object to hold a batch generation response.
+
+    Args:
+        texts: (List[str]): The generated text for each prompt.
+        stats (BatchStats): Statistics about the generation.
+    """
+
+    texts: List[str]
+    stats: BatchStats
+
+
+@dataclass
+class Batch:
+    uids: List[int]
+    y: mx.array
+    logprobs: mx.array
+    max_tokens: List[int]
+    num_tokens: List[int]
+    cache: List[Any]
+
+    def __len__(self):
+        return len(self.uids)
+
+    def filter(self, keep_idx: List[int]):
+        self.uids = [self.uids[k] for k in keep_idx]
+        self.max_tokens = [self.max_tokens[k] for k in keep_idx]
+        self.num_tokens = [self.num_tokens[k] for k in keep_idx]
+        keep_idx = mx.array(keep_idx, mx.int32)
+        self.y = self.y[keep_idx]
+        self.logprobs = self.logprobs[keep_idx]
+        for c in self.cache:
+            c.filter(keep_idx)
+
+    def extend(self, other):
+        self.uids.extend(other.uids)
+        self.y = mx.concatenate([self.y, other.y])
+        self.logprobs = mx.concatenate([self.logprobs, other.logprobs])
+        self.num_tokens.extend(other.num_tokens)
+        self.max_tokens.extend(other.max_tokens)
+        for c, o in zip(self.cache, other.cache):
+            c.extend(o)
 
 
 class BatchGenerator:
@@ -697,8 +768,8 @@ class BatchGenerator:
         )
 
     def _step(self, input_tokens: mx.array, prompt_cache: List[Any]):
-        logits = self.model(input_tokens, cache=prompt_cache)
-        logits = logits[:, -1, :]
+        output = self.model(input_tokens, cache=prompt_cache)
+        logits = output.logits[:, -1, :]
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         sampled = self.sampler(logprobs)
         return sampled, logprobs
@@ -821,11 +892,10 @@ def batch_generate(
     processor.detokenizer.reset()
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
-    num_images = len(images) if images is not None else 0
-    num_audios = 1 if audios is not None else 0  # TODO: Support multiple audio files
-    prompt = apply_chat_template(
-        processor, model.config, prompt, num_images=num_images, num_audios=num_audios
-    )
+    prompts = [
+        apply_chat_template(processor, model.config, p, num_images=1, num_audios=1)
+        for p in prompts
+    ]
 
     add_special_tokens = (
         not hasattr(processor, "chat_template")
@@ -854,29 +924,27 @@ def batch_generate(
         if k not in ["input_ids", "pixel_values", "attention_mask"]
     }
 
-    gen = BatchGenerator(model, stop_tokens=tokenizer.eos_token_ids, **kwargs)
+    gen = BatchGenerator(
+        model.language_model, stop_tokens=[tokenizer.eos_token_ids], **kwargs
+    )
     num_samples = len(prompts)
     fin = 0
     if verbose:
         print(f"[batch_generate] Finished processing 0/{num_samples} ...", end="\r")
 
     with wired_limit(model, [generation_stream]):
-        inputs_embeds, visual_pos_masks, deepstack_visual_embeds = (
-            model.get_input_embeddings(input_ids, pixel_values, grid_thw)
-        )
+        inputs_embeds = model.get_input_embeddings(input_ids, pixel_values)
         kwargs.update(
             {
                 "input_ids": None,
                 "input_embeds": inputs_embeds,
                 "pixel_values": None,
                 "mask": None,
-                "visual_pos_masks": visual_pos_masks,
-                "deepstack_visual_embeds": deepstack_visual_embeds,
             }
         )
-        uids = gen.insert(prompts, max_tokens)
+        uids = gen.insert(input_ids[0].tolist(), max_tokens)
         results = {uid: [] for uid in uids}
-        while responses := gen.next(kwargs):
+        while responses := gen.next():
             for r in responses:
                 if verbose and r.finish_reason != None:
                     fin += 1
@@ -901,7 +969,7 @@ def batch_generate(
             f"{stats.generation_tps:.3f} tokens-per-sec"
         )
         print(f"[batch_generate] Peak memory: {stats.peak_memory:.3f} GB")
-    return texts, stats
+    return BatchResponse(texts, stats)
 
 
 def main():
