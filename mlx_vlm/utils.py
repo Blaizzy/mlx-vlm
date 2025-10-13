@@ -583,7 +583,7 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     """
     if (
         isinstance(image_source, BytesIO)
-        or isinstance(image_source, str)
+        or (isinstance(image_source, str) and image_source.startswith("data:image/"))
         or Path(image_source).is_file()
     ):
         # for base64 encoded images
