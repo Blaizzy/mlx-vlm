@@ -943,14 +943,16 @@ def batch_generate(
             inputs_embeds = model.get_input_embeddings(
                 input_ids, pixel_values, **data_kwargs
             )
+
             kwargs.update(
                 {
-                    "inputs_embeds": inputs_embeds[0],
                     "pixel_values": pixel_values,
-                    "image_grid_thw": data_kwargs.get("image_grid_thw", None),
-                    "video_grid_thw": data_kwargs.get("video_grid_thw", None),
-                    "visual_pos_masks": inputs_embeds[1],
-                    "deepstack_visual_embeds": inputs_embeds[2],
+                    **data_kwargs,
+                    **(
+                        inputs_embeds
+                        if isinstance(inputs_embeds, dict)
+                        else {"inputs_embeds": inputs_embeds}
+                    ),
                 }
             )
 
