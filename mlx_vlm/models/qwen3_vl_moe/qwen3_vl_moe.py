@@ -82,7 +82,11 @@ class Model(nn.Module):
         visual_pos_masks = image_mask
         deepstack_visual_embeds = deepstack_image_embeds
 
-        return inputs_embeds, visual_pos_masks, deepstack_visual_embeds
+        return {
+            "inputs_embeds": inputs_embeds,
+            "visual_pos_masks": visual_pos_masks,
+            "deepstack_visual_embeds": deepstack_visual_embeds,
+        }
 
     @staticmethod
     def merge_input_ids_with_image_features(
@@ -123,23 +127,17 @@ class Model(nn.Module):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
-
-        inputs_embeds, visual_pos_masks, deepstack_visual_embeds = (
-            self.get_input_embeddings(input_ids, pixel_values, grid_thw)
-        )
+        inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
 
         kwargs = {
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
             "video_grid_thw": video_grid_thw,
-            "visual_pos_masks": visual_pos_masks,
-            "deepstack_visual_embeds": deepstack_visual_embeds,
+            **inputs_embeds,
             **kwargs,
         }
 
-        logits = self.language_model(
-            input_ids, inputs_embeds, mask=mask, cache=cache, **kwargs
-        )
+        logits = self.language_model(input_ids, mask=mask, cache=cache, **kwargs)
 
         return logits
 
