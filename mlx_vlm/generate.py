@@ -713,6 +713,7 @@ class BatchGenerator:
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
+        prompt_cache=None,
     ):
         self.model = model
         self.unprocessed_prompts = []
@@ -723,6 +724,7 @@ class BatchGenerator:
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = completion_batch_size
+        self.prompt_cache = prompt_cache
         self._stats = BatchStats()
 
         self.active_batch = None
@@ -743,7 +745,7 @@ class BatchGenerator:
         )
         return uids
 
-    def _process_prompts(self, prompts):
+    def _process_prompts(self, prompts, **kwargs) -> Batch:
         uids, inputs, max_tokens = zip(*prompts)
         lengths = [len(p) for p in inputs]
         max_length = max(lengths)
@@ -752,23 +754,27 @@ class BatchGenerator:
         left_padding = [max_length - l for l in lengths]
         inputs = _left_pad_prompts(inputs, max_length=max_length)
 
-        prompt_cache = _make_cache(self.model, left_padding)
+        prompt_cache = (
+            _make_cache(self.model, left_padding)
+            if self.prompt_cache is None
+            else self.prompt_cache
+        )
 
-        while inputs.shape[1] > 1:
+        while inputs.shape[1] > 1 and kwargs.get("pixel_values", None) is None:
             n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
             self.model(inputs[:, :n_to_process], cache=prompt_cache)
             mx.eval([c.state for c in prompt_cache])
             inputs = inputs[:, n_to_process:]
             mx.clear_cache()
 
-        y, logprobs = self._step(inputs, prompt_cache)
+        y, logprobs = self._step(inputs, prompt_cache, **kwargs)
         mx.async_eval(y, logprobs)
         return Batch(
             list(uids), y, logprobs, list(max_tokens), [0] * len(uids), prompt_cache
         )
 
-    def _step(self, input_tokens: mx.array, prompt_cache: List[Any]):
-        output = self.model(input_tokens, cache=prompt_cache)
+    def _step(self, input_tokens: mx.array, prompt_cache: List[Any], **kwargs):
+        output = self.model(input_tokens, cache=prompt_cache, **kwargs)
         logits = output.logits[:, -1, :]
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         sampled = self.sampler(logprobs)
@@ -782,7 +788,7 @@ class BatchGenerator:
         self._stats.peak_memory = mx.get_peak_memory() / 1e9
         return self._stats
 
-    def _next(self):
+    def _next(self, **kwargs):
         tic = time.perf_counter()
 
         prompt_processing = False
@@ -805,7 +811,7 @@ class BatchGenerator:
                 self._stats.generation_time += time.perf_counter() - tic
                 tic = time.perf_counter()
 
-            batch = self._process_prompts(prompts)
+            batch = self._process_prompts(prompts, **kwargs)
             self.unprocessed_prompts = self.unprocessed_prompts[
                 self.prefill_batch_size :
             ]
@@ -860,9 +866,9 @@ class BatchGenerator:
         self._stats.generation_tokens += len(responses)
         return responses
 
-    def next(self):
+    def next(self, **kwargs):
         with mx.stream(generation_stream):
-            return self._next()
+            return self._next(**kwargs)
 
 
 def batch_generate(
@@ -933,18 +939,24 @@ def batch_generate(
         print(f"[batch_generate] Finished processing 0/{num_samples} ...", end="\r")
 
     with wired_limit(model, [generation_stream]):
-        inputs_embeds = model.get_input_embeddings(input_ids, pixel_values)
-        kwargs.update(
-            {
-                "input_ids": None,
-                "input_embeds": inputs_embeds,
-                "pixel_values": None,
-                "mask": None,
-            }
-        )
-        uids = gen.insert(input_ids[0].tolist(), max_tokens)
+        if pixel_values is not None:
+            inputs_embeds = model.get_input_embeddings(
+                input_ids, pixel_values, **data_kwargs
+            )
+            kwargs.update(
+                {
+                    "inputs_embeds": inputs_embeds[0],
+                    "pixel_values": pixel_values,
+                    "image_grid_thw": data_kwargs.get("image_grid_thw", None),
+                    "video_grid_thw": data_kwargs.get("video_grid_thw", None),
+                    "visual_pos_masks": inputs_embeds[1],
+                    "deepstack_visual_embeds": inputs_embeds[2],
+                }
+            )
+
+        uids = gen.insert(input_ids.tolist(), max_tokens)
         results = {uid: [] for uid in uids}
-        while responses := gen.next():
+        while responses := gen.next(**kwargs):
             for r in responses:
                 if verbose and r.finish_reason != None:
                     fin += 1
