@@ -150,10 +150,6 @@ class LanguageModel(nn.Module):
         }
 
     @property
-    def layers(self):
-        return self.model.layers
-
-    @property
     def head_dim(self):
         return self.config.hidden_size // self.config.num_attention_heads
 
