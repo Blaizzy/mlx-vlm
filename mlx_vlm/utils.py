@@ -706,6 +706,8 @@ def process_inputs(
     images=None,
     audio=None,
     add_special_tokens=False,
+    padding=True,
+    padding_side="left",
     return_tensors="mlx",
 ):
     # Get the process method from the processor
@@ -715,7 +717,8 @@ def process_inputs(
     args = {
         "text": prompts,
         "images": images,
-        "padding": True,
+        "padding": padding,
+        "padding_side": padding_side,
         "return_tensors": return_tensors,
     }
 
@@ -774,13 +777,20 @@ def prepare_inputs(
     image_token_index=None,
     resize_shape=None,
     add_special_tokens=False,
+    padding=True,
+    padding_side="left",
 ):
 
     if not images and not audio:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
-        inputs = tokenizer(prompts, add_special_tokens=add_special_tokens)
+        inputs = tokenizer(
+            prompts,
+            add_special_tokens=add_special_tokens,
+            padding=padding,
+            padding_side=padding_side,
+        )
         input_ids = mx.array([inputs.input_ids])
         mask = mx.array([inputs.attention_mask])
         return {
