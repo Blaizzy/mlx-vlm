@@ -956,7 +956,7 @@ def batch_generate(
                 }
             )
 
-        uids = gen.insert(input_ids.tolist(), max_tokens)
+        uids = gen.insert(mx.squeeze(input_ids).tolist(), max_tokens)
         results = {uid: [] for uid in uids}
         while responses := gen.next(**kwargs):
             for r in responses:
