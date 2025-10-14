@@ -36,74 +36,85 @@ class Model(nn.Module):
         self.language_model = LanguageModel(config.text_config)
         self.mm_projector = build_vision_projector(config)
 
-    # def get_input_embeddings(
-    #     self,
-    #     input_ids: Optional[mx.array] = None,
-    #     pixel_values: Optional[mx.array] = None,
-    # ):
-    #     if pixel_values is None:
-    #         return self.language_model.model.embed_tokens(input_ids)
+    def get_input_embeddings(
+        self,
+        input_ids: Optional[mx.array] = None,
+        pixel_values: Optional[mx.array] = None,
+    ):
+        if pixel_values is None:
+            return self.language_model.model.embed_tokens(input_ids)
 
-    #     # Get the input embeddings from the language model
-    #     inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+        # Encode images
+        _, image_features, _ = self.vision_tower(pixel_values.transpose(0, 2, 3, 1))
+        B, H, W, C = image_features.shape
+        image_features = image_features.reshape(B, H*W, C)
+        image_features = self.mm_projector(image_features)
 
-    #     # Get the ouptut hidden states from the vision model
-    #     *_, hidden_states = self.vision_tower(
-    #         pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
-    #     )
+        final_inputs_embeds = self.prepare_inputs_for_multimodal(
+            image_features, input_ids
+        )
+        return final_inputs_embeds
 
-    #     # Select the hidden states from the desired layer
-    #     selected_image_feature = hidden_states[self.vision_feature_layer]
+    # Adapted from https://github.com/apple/ml-fastvlm/blob/592b4add3c1c8a518e77d95dc6248e76c1dd591f/llava/model/llava_arch.py#L146
+    def prepare_inputs_for_multimodal(self, image_features, input_ids):
+        # TODO: padding, attention_mask
 
-    #     if isinstance(self.vision_feature_layer, int):
-    #         if self.vision_feature_select_strategy == "default":
-    #             selected_image_feature = selected_image_feature[:, 1:]
+        new_input_embeds = []
+        cur_image_idx = 0
+        for batch_idx, cur_input_ids in enumerate(input_ids):
+            num_images = (cur_input_ids == self.config.image_token_index).sum()
+            if num_images == 0:
+                cur_image_features = image_features[cur_image_idx]
+                cur_input_embeds_1 = self.language_model.model.embed_tokens(cur_input_ids)
+                cur_input_embeds = mx.concatenate([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
+                new_input_embeds.append(cur_input_embeds)
+                cur_image_idx += 1
+                continue
 
-    #     else:
-    #         hs_pool = [
-    #             hidden_states[layer_idx] for layer_idx in self.vision_feature_layer
-    #         ]
-    #         # For default; crop CLS from each hidden state in the hidden state pool
-    #         if self.vision_feature_select_strategy == "default":
-    #             hs_pool = [hs[:, 1:] for hs in hs_pool]
-    #         selected_image_feature = mx.concatenate(hs_pool, axis=-1)
+            # Go to numpy for np.where() with a single arg (returns the matching positions)
+            image_token_indices = [-1] + np.where(np.array(cur_input_ids == self.config.image_token_index))[0].tolist() + [cur_input_ids.shape[0]]
+            cur_input_ids_noim = []
+            for i in range(len(image_token_indices) - 1):
+                cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
+            split_sizes = image_token_indices[1:] #[x.shape[0] for x in cur_input_ids_noim]
+            cur_input_embeds = self.language_model.model.embed_tokens(mx.concatenate(cur_input_ids_noim))
+            cur_input_embeds_no_im = mx.split(cur_input_embeds, split_sizes)
 
-    #     # Pass image features through the multi-modal projector
-    #     image_features = self.multi_modal_projector(selected_image_feature)
+            cur_new_input_embeds = []
+            for i in range(num_images.item() + 1):
+                cur_new_input_embeds.append(cur_input_embeds_no_im[i])
+                if i < num_images:
+                    cur_image_features = image_features[cur_image_idx]
+                    cur_image_idx += 1
+                    cur_new_input_embeds.append(cur_image_features)
+            cur_new_input_embeds = mx.concatenate(cur_new_input_embeds)
 
-    #     # Insert special image tokens in the input_ids
-    #     final_inputs_embeds = self._merge_input_ids_with_image_features(
-    #         image_features, inputs_embeds, input_ids
-    #     )
-    #     return final_inputs_embeds
+            new_input_embeds.append(cur_new_input_embeds)
 
-    # def _merge_input_ids_with_image_features(
-    #     self, image_features, inputs_embeds, input_ids
-    # ):
-    #     image_token_index = self.config.image_token_index
+        # Truncate sequences to max length as image embeddings can make the sequence longer
+        if self.config.tokenizer_model_max_length is not None:
+            new_input_embeds = [x[:self.config.tokenizer_model_max_length] for x in new_input_embeds]
 
-    #     # Positions of <image> tokens in input_ids, assuming batch size is 1
-    #     image_positions = np.where(input_ids == image_token_index)[1].tolist()
-    #     num_images, _, vision_hidden_size = image_features.shape
-
-    #     reshaped_image_hidden_states = image_features.reshape(-1, vision_hidden_size)
-
-    #     # cast to the dtype of the input_embeds to support quantized models
-    #     reshaped_image_hidden_states = reshaped_image_hidden_states.astype(
-    #         inputs_embeds.dtype
-    #     )
-
-    #     # Pad image_positions to match the length of reshaped_image_hidden_states
-    #     num_positions_needed = len(image_positions)
-
-    #     if reshaped_image_hidden_states.shape[0] > num_positions_needed:
-    #         # TODO: Think about how to handle this case
-    #         raise ValueError(
-    #             "Llava model supports only one image per input. Please check your input_ids and pixel_values."
-    #         )
-
-    #     inputs_embeds[:, image_positions, :] = reshaped_image_hidden_states
-    #     return inputs_embeds
+        # Combine them
+        max_len = max(x.shape[0] for x in new_input_embeds)
+        new_input_embeds_padded = []
+        for i, cur_new_embed in enumerate(new_input_embeds):
+            cur_len = cur_new_embed.shape[0]
+            padded = cur_new_embed
+            if max_len > cur_len:
+                if self.config.tokenizer_padding_side == "left":
+                    padded = mx.concatenate((
+                        mx.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype),
+                        cur_new_embed
+                    ), dim=0)
+                else:
+                    padded = mx.concatenate((
+                        cur_new_embed,
+                        mx.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype)
+                    ), dim=0)
+            new_input_embeds_padded.append(padded)
+        new_input_embeds = mx.stack(new_input_embeds_padded)
+        return new_input_embeds
 
     @property
     def layers(self):
@@ -117,18 +128,14 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        input_embddings = self.get_input_embeddings(input_ids, pixel_values)
+        input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
         logits = self.language_model(
-            input_ids, mask=mask, cache=cache, inputs_embeds=input_embddings
+            input_ids, mask=mask, cache=cache, inputs_embeds=input_embeddings
         )
         return logits
 
     def sanitize(self, weights):
         def transform_key(key):
-            if "patch_embed" in key:
-                print("patch_embed")
-            if "blocks" in key:
-                print("blocks")
             if "vision_tower" in key:
                 if "model.vision_tower" in key:
                     # conversion from transformers

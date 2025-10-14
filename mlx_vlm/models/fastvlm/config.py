@@ -55,6 +55,8 @@ class ModelConfig(BaseModelConfig):
     eos_token_id: int = 151645
     mm_projector_type: str = "mlp2x_gelu"
     mm_hidden_size: int = 3072
+    tokenizer_model_max_length: int = 8192
+    tokenizer_padding_side: str = "right"
 
     @classmethod
     def from_dict(cls, params):
