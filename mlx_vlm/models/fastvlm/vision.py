@@ -57,36 +57,29 @@ class MHSA(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def __call__(self, x: mx.array) -> mx.array:
-        shape = x.shape
-        B, C, H, W = shape
+        # BHWC->BCHW just to keep a ~close implementation to the source
+        # See https://github.com/apple/ml-fastvlm/blob/592b4add3c1c8a518e77d95dc6248e76c1dd591f/llava/model/multimodal_encoder/mobileclip/mci.py#L661
+        x = x.transpose(0, 3, 1, 2)
+        B, C, H, W = x.shape
         N = H * W
-        if len(shape) == 4:
-            x = x.flatten(start_axis=2).transpose(-2, -1)  # (B, N, C)
+        x = x.flatten(start_axis=2).transpose(0, 2, 1)  # (B, N, C)
         qkv = (
             self.qkv(x)
             .reshape(B, N, 3, self.num_heads, self.head_dim)
-            .permute(2, 0, 3, 1, 4)
+            .transpose(2, 0, 3, 1, 4)
         )
-        q, k, v = qkv   #.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv
 
-        output = mx.fast.scaled_dot_product_attention(
+        x = mx.fast.scaled_dot_product_attention(
             q, k, v, scale=self.scale, mask=None
         )
-        output = output.transpose(0, 2, 1, 3).reshape(B, C, H, W)
-        return output
+        x = x.transpose(0, 2, 1, 3).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
 
-        # # trick here to make q@k.t more stable
-        # attn = (q * self.scale) @ k.transpose(-2, -1)
-        # attn = attn.softmax(dim=-1)
-        # attn = self.attn_drop(attn)
-
-        # x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        # x = self.proj(x)
-        # x = self.proj_drop(x)
-        # if len(shape) == 4:
-        #     x = x.transpose(-2, -1).reshape(B, C, H, W)
-
-        # return x
+        # Reorder back
+        x = x.reshape(B, H, W, C)
+        return x
 
 
 class ConvFFN(nn.Module):
@@ -132,7 +125,7 @@ class ConvFFN(nn.Module):
 class LayerNormChannel(nn.Module):
     """
     LayerNorm only for Channel Dimension.
-    Input: tensor in shape [B, C, H, W]
+    Input: tensor in shape [B, H, W, C]
     """
     def __init__(self, num_features, eps=1e-05) -> None:
         super().__init__()
@@ -141,11 +134,10 @@ class LayerNormChannel(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        u = x.mean(1, keepdims=True)
-        s = (x - u).pow(2).mean(1, keepdims=True)
+        u = x.mean(-1, keepdims=True)
+        s = mx.power(x - u, 2).mean(-1, keepdims=True)
         x = (x - u) / mx.sqrt(s + self.eps)
-        x = self.weight[:, None][:, None] * x \
-            + self.bias[:, None][:, None]
+        x = self.weight * x + self.bias
         return x
 
 
@@ -177,12 +169,12 @@ class AttentionBlock(nn.Module):
             act_layer=act_layer,
         )
 
-        # # Drop path
-        # self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.layer_scale_1 = mx.ones((1, 1, dim))
+        self.layer_scale_2 = mx.ones((1, 1, dim))
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = x + self.token_mixer(self.norm(x))
-        x = x + self.convffn(x)
+        x = x + self.layer_scale_1 * self.token_mixer(self.norm(x))
+        x = x + self.layer_scale_2 * self.convffn(x)
         return x
 
 
@@ -351,10 +343,11 @@ class RepMixerBlock(nn.Module):
             hidden_channels=mlp_hidden_dim,
             act_layer=act_layer,
         )
+        self.layer_scale = mx.ones((1, 1, dim))
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.token_mixer(x)
-        x = x + self.convffn(x)
+        x = x + self.layer_scale * self.convffn(x)
         return x
 
 
@@ -368,7 +361,7 @@ def basic_blocks(
     act_layer: nn.Module = nn.GELU,
     norm_layer: nn.Module = nn.BatchNorm,
 ):
-    blocks = []
+    blocks = CallableModuleList()
     for _ in range(num_blocks[block_index]):
         if token_mixer_type == "repmixer":
             blocks.append(
@@ -464,13 +457,13 @@ class SEBlock(nn.Module):
         )
 
     def __call__(self, inputs: mx.array) -> mx.array:
-        _, c, h, w = inputs.shape
+        _, h, w, c = inputs.shape
         x = nn.AvgPool2d(kernel_size=[h, w])(inputs)
         x = self.reduce(x)
         x = nn.layers.relu(x)
         x = self.expand(x)
         x = mx.sigmoid(x)
-        x = x.reshape(-1, c, 1, 1)
+        x = x.reshape(-1, 1, 1, c)
         return inputs * x
 
 
@@ -592,7 +585,7 @@ class FastViTHDModel(nn.Module):
         x = self.patch_embed(x)
 
         encoder_states = (x,) if output_hidden_states else None
-        for layer in self.network.layers:
+        for layer in self.network:
             x = layer(x)
             if output_hidden_states:
                 encoder_states = encoder_states + (x,)
@@ -611,13 +604,13 @@ class GlobalPool2D(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         assert (
-            x.dim() == 4
+            x.ndim == 4
         ), "Input should be 4-dimensional (Batch x in_dim x in_height x in_width). Got: {}".format(
             x.shape
         )
 
-        # [batch, in_dim, in_height, in_width] --> [batch, in_dim]
-        x = x.mean(axis=[-2, -1])
+        # [batch, in_height, in_width, in_dim] --> [batch, in_dim]
+        x = x.mean(axis=[1, 2])
         # [batch, in_dim] x [in_dim, out_dim] --> [batch, out_dim]
         x = x @ self.proj
         return x
@@ -672,9 +665,8 @@ class VisionModel(nn.Module):
                     sanitized_weights[k] = v.transpose(0, 2, 3, 1)
                 else:
                     sanitized_weights[k] = v
-            elif "layer_scale" in k:
-                # Ignoring this because we are just modeling inference_mode for now
-                continue
+            elif "layer_scale" in k and not skip_transpose:
+                sanitized_weights[k] = v.transpose(1, 2, 0)
             elif "num_batches_tracked" in k:
                 # I don't think we need this
                 continue
