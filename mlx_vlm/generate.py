@@ -898,8 +898,9 @@ def batch_generate(
     processor.detokenizer.reset()
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
+    # TODO:Handle cases where image/audios might be None or uneven with prompts
     prompts = [
-        apply_chat_template(processor, model.config, p, num_images=1, num_audios=1)
+        apply_chat_template(processor, model.config, p, num_images=1, num_audios=0)
         for p in prompts
     ]
 
@@ -955,8 +956,10 @@ def batch_generate(
                     ),
                 }
             )
+        else:
+            input_ids = mx.squeeze(input_ids, axis=0)
 
-        uids = gen.insert(mx.squeeze(input_ids).tolist(), max_tokens)
+        uids = gen.insert(input_ids.tolist(), max_tokens)
         results = {uid: [] for uid in uids}
         while responses := gen.next(**kwargs):
             for r in responses:
