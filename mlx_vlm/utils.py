@@ -779,6 +779,7 @@ def prepare_inputs(
     add_special_tokens=False,
     padding=True,
     padding_side="left",
+    pad_to_uniform_size=False,
 ):
 
     if not images and not audio:
@@ -808,8 +809,29 @@ def prepare_inputs(
         )
         images = [process_image(img, resize_shape, image_processor) for img in images]
 
+        # Pad all images to the size of the largest
+        if len(images) > 1 and pad_to_uniform_size:
+            max_width = max(img.width for img in images)
+            max_height = max(img.height for img in images)
+
+            padded_images = []
+            for img in images:
+                if img.width != max_width or img.height != max_height:
+                    # Create a new image with the max dimensions, filled with black
+                    padded_img = Image.new(
+                        "RGB", (max_width, max_height), (255, 255, 255)
+                    )
+                    # Center the original image
+                    x_offset = (max_width - img.width) // 2
+                    y_offset = (max_height - img.height) // 2
+                    padded_img.paste(img, (x_offset, y_offset))
+                    padded_images.append(padded_img)
+                else:
+                    padded_images.append(img)
+            images = padded_images
+
     # Process audio
-    if audio:
+    if audio is not None:
         if not isinstance(audio, list):
             audio = [audio]
 
@@ -823,8 +845,6 @@ def prepare_inputs(
             load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
             for audio_file in audio
         ]
-    else:
-        audio = None
 
     model_inputs = {}
 
