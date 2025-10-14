@@ -876,6 +876,7 @@ def batch_generate(
     processor,
     images: Union[str, List[str]] = None,
     audios: Union[str, List[str]] = None,
+    pad_to_uniform_size: bool = True,
     prompts: List[int] = None,
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
@@ -888,6 +889,8 @@ def batch_generate(
        model (nn.Module): The language model.
        tokenizer (PreTrainedTokenizer): The tokenizer.
        prompt (List[List[int]]): The input prompts.
+       pad_to_uniform_size (bool): If ``True``, pad images/audios to the same size.
+          Default: ``True``.
        verbose (bool): If ``True``, print tokens and timing information.
           Default: ``False``.
        max_tokens (Union[int, List[int]): Maximum number of output tokens. This
@@ -898,7 +901,7 @@ def batch_generate(
     processor.detokenizer.reset()
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
-    # TODO:Handle cases where image/audios might be None or uneven with prompts
+    # TODO: Handle interleaved cases where image/audios might be None or uneven with prompts
     prompts = [
         apply_chat_template(processor, model.config, p, num_images=1, num_audios=0)
         for p in prompts
@@ -921,6 +924,7 @@ def batch_generate(
         image_token_index=image_token_index,
         resize_shape=resize_shape,
         add_special_tokens=add_special_tokens,
+        pad_to_uniform_size=pad_to_uniform_size,
     )
     input_ids = inputs.get("input_ids", None)
     pixel_values = inputs.get("pixel_values", None)
