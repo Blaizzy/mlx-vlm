@@ -128,15 +128,11 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        image_grid_thw = kwargs.pop("image_grid_thw", None)
-        video_grid_thw = kwargs.pop("video_grid_thw", None)
-        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
-        inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
+
+        inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
 
         kwargs = {
             "pixel_values": pixel_values,
-            "image_grid_thw": image_grid_thw,
-            "video_grid_thw": video_grid_thw,
             **inputs_embeds,
             **kwargs,
         }
