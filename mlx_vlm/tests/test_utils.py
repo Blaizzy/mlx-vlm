@@ -372,14 +372,17 @@ def test_load_passes_revision():
     model_mock.config = MagicMock(eos_token_id=None)
     processor_mock = MagicMock()
 
-    with patch("mlx_vlm.utils.get_model_path") as mock_get_model_path, patch(
-        "mlx_vlm.utils.load_model",
-        return_value=model_mock,
-    ) as mock_load_model, patch(
-        "mlx_vlm.utils.load_processor",
-        return_value=processor_mock,
-    ) as mock_load_processor, patch(
-        "mlx_vlm.utils.load_image_processor", return_value=None
+    with (
+        patch("mlx_vlm.utils.get_model_path") as mock_get_model_path,
+        patch(
+            "mlx_vlm.utils.load_model",
+            return_value=model_mock,
+        ) as mock_load_model,
+        patch(
+            "mlx_vlm.utils.load_processor",
+            return_value=processor_mock,
+        ) as mock_load_processor,
+        patch("mlx_vlm.utils.load_image_processor", return_value=None),
     ):
         mock_get_model_path.return_value = Path("/tmp/model")
 
