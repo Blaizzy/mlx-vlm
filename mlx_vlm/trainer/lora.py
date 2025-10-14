@@ -5,6 +5,19 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
+class LoraAdapter(nn.Module):
+    def __init__(self, input_dims, rank, std_dev=None):
+        super().__init__()
+        if std_dev is None:
+            self.weight = mx.ones((input_dims, rank))
+        else:
+            self.weight = mx.random.uniform(
+                low=-std_dev,
+                high=std_dev,
+                shape=(input_dims, rank),
+            )
+
+
 class LoRaLayer(nn.Module):
     def __init__(
         self,
@@ -12,11 +25,13 @@ class LoRaLayer(nn.Module):
         rank: int,
         alpha: float = 0.1,
         dropout: float = 0.0,
+        name: str = None,
+        disable_adapter: bool = False,
     ):
         super().__init__()
+        self.disable_adapter = disable_adapter
 
-        self.original_layer = linear
-
+        self.base_layer = linear
         self.dropout = nn.Dropout(p=dropout)
 
         output_dims, input_dims = linear.weight.shape
@@ -25,17 +40,38 @@ class LoRaLayer(nn.Module):
 
         std_dev = 1 / math.sqrt(rank)
 
-        self.A = mx.random.uniform(
-            low=-std_dev,
-            high=std_dev,
-            shape=(input_dims, rank),
-        )
-        self.B = mx.zeros((rank, output_dims))
+        # Create A and B as proper nested modules
+        if name is not None:
+            self.lora_name = name
+            self.lora_A = nn.Module()
+            self.lora_B = nn.Module()
+            setattr(self.lora_A, name, LoraAdapter(input_dims, rank))
+            setattr(self.lora_B, name, LoraAdapter(rank, output_dims))
+
+        else:
+            self.A = mx.random.uniform(
+                low=-std_dev,
+                high=std_dev,
+                shape=(input_dims, rank),
+            )
+            self.B = mx.ones((rank, output_dims))
+
         self.alpha = alpha
 
     def __call__(self, x):
-        y = self.original_layer(x)
-        lora_update = (self.dropout(x) @ self.A) @ self.B
+        y = self.base_layer(x)
+
+        if self.disable_adapter:
+            return y
+
+        if hasattr(self, "lora_name"):
+            A = getattr(self.lora_A, self.lora_name).weight
+            B = getattr(self.lora_B, self.lora_name).weight
+
+            lora_update = (self.dropout(x) @ A) @ B
+        else:
+            lora_update = (self.dropout(x) @ self.A) @ self.B
+
         return y + (self.alpha * lora_update).astype(x.dtype)
 
 

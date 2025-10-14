@@ -34,6 +34,19 @@ class BaseModelConfig:
         )
 
 
+@dataclass
+class BaseModelConfig:
+    @classmethod
+    def from_dict(cls, params):
+        return cls(
+            **{
+                k: v
+                for k, v in params.items()
+                if k in inspect.signature(cls).parameters
+            }
+        )
+
+
 class BaseImageProcessor(ImageProcessor):
     def __init__(
         self,

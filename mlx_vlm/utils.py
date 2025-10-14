@@ -861,6 +861,11 @@ def prepare_inputs(
             add_special_tokens=add_special_tokens,
         )
 
+        # For Phi4MM
+        if "input_image_embeds" in inputs:
+            inputs["pixel_values"] = inputs["input_image_embeds"]
+            inputs.pop("input_image_embeds")
+
         if "images" in inputs:
             inputs["pixel_values"] = inputs["images"]
             inputs.pop("images")
@@ -871,7 +876,8 @@ def prepare_inputs(
         # Convert inputs to model_inputs with mx.array if present
         for key, value in inputs.items():
             if key not in model_inputs and not isinstance(value, (str, list)):
-                model_inputs[key] = mx.array(value)
+                if value is not None:
+                    model_inputs[key] = mx.array(value)
 
     return model_inputs
 

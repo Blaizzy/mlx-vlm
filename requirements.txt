@@ -10,4 +10,3 @@ soundfile>=0.13.1
 opencv-python>=4.12.0.88
 numpy
 uvicorn
-
