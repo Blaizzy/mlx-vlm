@@ -108,7 +108,7 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.language_model.model.layers
+        return self.language_model.layers
 
     def __call__(
         self,
