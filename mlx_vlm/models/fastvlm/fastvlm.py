@@ -1,13 +1,13 @@
+import re
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-import re
 
 from .config import ModelConfig
 from .language import LanguageModel
-from .vision import VisionModel, CallableModuleList
+from .vision import CallableModuleList, VisionModel
 
 
 def build_vision_projector(config):

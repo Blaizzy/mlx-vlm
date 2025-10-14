@@ -1,4 +1,4 @@
-from typing import Optional, List, Tuple
+from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
