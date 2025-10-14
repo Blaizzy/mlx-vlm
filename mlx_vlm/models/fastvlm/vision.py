@@ -37,6 +37,7 @@ class MHSA(nn.Module):
     Source modified from:
     https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
     """
+
     def __init__(
         self,
         dim: int,
@@ -70,9 +71,7 @@ class MHSA(nn.Module):
         )
         q, k, v = qkv
 
-        x = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.scale, mask=None
-        )
+        x = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=None)
         x = x.transpose(0, 2, 1, 3).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -84,6 +83,7 @@ class MHSA(nn.Module):
 
 class ConvFFN(nn.Module):
     """Convolutional FFN Module."""
+
     def __init__(
         self,
         in_channels: int,
@@ -104,7 +104,7 @@ class ConvFFN(nn.Module):
                 padding=3,
                 groups=in_channels,
                 bias=False,
-            )
+            ),
         )
         self.conv.add_module(
             "bn",
@@ -127,6 +127,7 @@ class LayerNormChannel(nn.Module):
     LayerNorm only for Channel Dimension.
     Input: tensor in shape [B, H, W, C]
     """
+
     def __init__(self, num_features, eps=1e-05) -> None:
         super().__init__()
         self.weight = mx.ones(num_features)
@@ -147,6 +148,7 @@ class AttentionBlock(nn.Module):
     For more details on Metaformer structure, please refer to:
     `MetaFormer Is Actually What You Need for Vision <https://arxiv.org/pdf/2111.11418.pdf>`_
     """
+
     def __init__(
         self,
         dim: int,
@@ -184,11 +186,12 @@ class RepCPE(nn.Module):
     For more details refer to paper:
     `Conditional Positional Encodings for Vision Transformers <https://arxiv.org/pdf/2102.10882.pdf>`_
     """
+
     def __init__(
         self,
         in_channels: int,
         embed_dim: int = 768,
-        spatial_shape = (7, 7),
+        spatial_shape=(7, 7),
     ) -> None:
         super().__init__()
         if isinstance(spatial_shape, int):
@@ -294,6 +297,7 @@ class RepMixer(nn.Module):
     For more details, please refer to Apple's paper:
     `FastViT: A Fast Hybrid Vision Transformer using Structural Reparameterization <https://arxiv.org/pdf/2303.14189.pdf>`_
     """
+
     def __init__(
         self,
         dim,
@@ -323,6 +327,7 @@ class RepMixerBlock(nn.Module):
     For more details on Metaformer structure, please refer to:
     `MetaFormer Is Actually What You Need for Vision <https://arxiv.org/pdf/2111.11418.pdf>`_
     """
+
     def __init__(
         self,
         dim: int,
@@ -433,6 +438,7 @@ class SEBlock(nn.Module):
     MLX implementation of `Squeeze-and-Excitation Networks` -
     https://arxiv.org/pdf/1709.01507.pdf
     """
+
     def __init__(self, in_channels: int, rd_ratio: float = 0.0625):
         """Construct a Squeeze and Excite Module.
 
@@ -472,6 +478,7 @@ class MobileOneBlock(nn.Module):
 
     This implementation only uses the inference time CNN architecture and uses FastViTHD conventions.
     """
+
     def __init__(
         self,
         in_channels: int,
@@ -519,32 +526,34 @@ class ConvolutionalStem(nn.Module):
         super().__init__()
         in_channels = 3
         out_channels = config.embed_dims[0]
-        self.blocks = CallableModuleList([
-            MobileOneBlock(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=3,
-                stride=2,
-                padding=1,
-                groups=1,
-            ),
-            MobileOneBlock(
-                in_channels=out_channels,
-                out_channels=out_channels,
-                kernel_size=3,
-                stride=2,
-                padding=1,
-                groups=out_channels,
-            ),
-            MobileOneBlock(
-                in_channels=out_channels,
-                out_channels=out_channels,
-                kernel_size=1,
-                stride=1,
-                padding=0,
-                groups=1,
-            ),
-        ])
+        self.blocks = CallableModuleList(
+            [
+                MobileOneBlock(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    groups=1,
+                ),
+                MobileOneBlock(
+                    in_channels=out_channels,
+                    out_channels=out_channels,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    groups=out_channels,
+                ),
+                MobileOneBlock(
+                    in_channels=out_channels,
+                    out_channels=out_channels,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    groups=1,
+                ),
+            ]
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.blocks(x)
@@ -557,6 +566,7 @@ class FastViTHDModel(nn.Module):
     - FastViTHD variant
     - Use inference_mode (i.e., modules contain the convolutional reparameterized versions of the architecture)
     """
+
     def __init__(self, config: VisionConfig):
         super().__init__()
         if config.pos_embs_shapes is None:
@@ -575,7 +585,9 @@ class FastViTHDModel(nn.Module):
             groups=config.embed_dims[-1],
             use_se=True,
         )
-        self.head = nn.Linear(int(config.embed_dims[-1] * config.cls_ratio), config.num_classes)
+        self.head = nn.Linear(
+            int(config.embed_dims[-1] * config.cls_ratio), config.num_classes
+        )
 
     def __call__(
         self,
@@ -598,6 +610,7 @@ class FastViTHDModel(nn.Module):
 
 class GlobalPool2D(nn.Module):
     """This class implements global pooling with linear projection."""
+
     def __init__(self, in_dim: int, out_dim: int) -> None:
         super().__init__()
         self.proj = mx.zeros((in_dim, out_dim))
@@ -639,21 +652,30 @@ class VisionModel(nn.Module):
 
     def sanitize(self, weights):
         # Only transpose during conversion from transformers
-        W, C = weights["vision_tower.vision_model.patch_embed.blocks.1.reparam_conv.weight"].shape[-2:]
+        W, C = weights[
+            "vision_tower.vision_model.patch_embed.blocks.1.reparam_conv.weight"
+        ].shape[-2:]
         skip_transpose = W > C
 
         def is_conv(k):
             if skip_transpose:
                 return False
-            if ".reparam_conv.weight" in k: return True
-            if ".conv.weight" in k: return True
-            if ".fc1.weight" in k: return True
-            if ".fc2.weight" in k: return True
-            if ".lkb_reparam.weight" in k: return True
-            if ".reduce.weight" in k: return True
-            if ".expand.weight" in k: return True
+            if ".reparam_conv.weight" in k:
+                return True
+            if ".conv.weight" in k:
+                return True
+            if ".fc1.weight" in k:
+                return True
+            if ".fc2.weight" in k:
+                return True
+            if ".lkb_reparam.weight" in k:
+                return True
+            if ".reduce.weight" in k:
+                return True
+            if ".expand.weight" in k:
+                return True
             return False
-        
+
         sanitized_weights = {}
         for k, v in weights.items():
             if is_conv(k):

@@ -13,10 +13,10 @@ from .vision import VisionModel, CallableModuleList
 def build_vision_projector(config):
     hidden_size = config.text_config.hidden_size
     projector_type = getattr(config, "mm_projector_type", "mlp2x_gelu")
-    if projector_type == 'linear':
+    if projector_type == "linear":
         return nn.Linear(config.mm_hidden_size, hidden_size)
 
-    mlp_gelu_match = re.match(r'^mlp(\d+)x_gelu$', projector_type)
+    mlp_gelu_match = re.match(r"^mlp(\d+)x_gelu$", projector_type)
     if mlp_gelu_match:
         mlp_depth = int(mlp_gelu_match.group(1))
         modules = CallableModuleList()
@@ -25,7 +25,7 @@ def build_vision_projector(config):
             modules.append(nn.GELU())
             modules.append(nn.Linear(hidden_size, hidden_size))
         return modules
-    raise ValueError(f'Unknown projector type: {projector_type}')
+    raise ValueError(f"Unknown projector type: {projector_type}")
 
 
 class Model(nn.Module):
@@ -47,7 +47,7 @@ class Model(nn.Module):
         # Encode images
         _, image_features, _ = self.vision_tower(pixel_values.transpose(0, 2, 3, 1))
         B, H, W, C = image_features.shape
-        image_features = image_features.reshape(B, H*W, C)
+        image_features = image_features.reshape(B, H * W, C)
         image_features = self.mm_projector(image_features)
 
         final_inputs_embeds = self.prepare_inputs_for_multimodal(
@@ -65,19 +65,37 @@ class Model(nn.Module):
             num_images = (cur_input_ids == self.config.image_token_index).sum()
             if num_images == 0:
                 cur_image_features = image_features[cur_image_idx]
-                cur_input_embeds_1 = self.language_model.model.embed_tokens(cur_input_ids)
-                cur_input_embeds = mx.concatenate([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
+                cur_input_embeds_1 = self.language_model.model.embed_tokens(
+                    cur_input_ids
+                )
+                cur_input_embeds = mx.concatenate(
+                    [cur_input_embeds_1, cur_image_features[0:0]], dim=0
+                )
                 new_input_embeds.append(cur_input_embeds)
                 cur_image_idx += 1
                 continue
 
             # Go to numpy for np.where() with a single arg (returns the matching positions)
-            image_token_indices = [-1] + np.where(np.array(cur_input_ids == self.config.image_token_index))[0].tolist() + [cur_input_ids.shape[0]]
+            image_token_indices = (
+                [-1]
+                + np.where(np.array(cur_input_ids == self.config.image_token_index))[
+                    0
+                ].tolist()
+                + [cur_input_ids.shape[0]]
+            )
             cur_input_ids_noim = []
             for i in range(len(image_token_indices) - 1):
-                cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
-            split_sizes = image_token_indices[1:] #[x.shape[0] for x in cur_input_ids_noim]
-            cur_input_embeds = self.language_model.model.embed_tokens(mx.concatenate(cur_input_ids_noim))
+                cur_input_ids_noim.append(
+                    cur_input_ids[
+                        image_token_indices[i] + 1 : image_token_indices[i + 1]
+                    ]
+                )
+            split_sizes = image_token_indices[
+                1:
+            ]  # [x.shape[0] for x in cur_input_ids_noim]
+            cur_input_embeds = self.language_model.model.embed_tokens(
+                mx.concatenate(cur_input_ids_noim)
+            )
             cur_input_embeds_no_im = mx.split(cur_input_embeds, split_sizes)
 
             cur_new_input_embeds = []
@@ -93,7 +111,9 @@ class Model(nn.Module):
 
         # Truncate sequences to max length as image embeddings can make the sequence longer
         if self.config.tokenizer_model_max_length is not None:
-            new_input_embeds = [x[:self.config.tokenizer_model_max_length] for x in new_input_embeds]
+            new_input_embeds = [
+                x[: self.config.tokenizer_model_max_length] for x in new_input_embeds
+            ]
 
         # Combine them
         max_len = max(x.shape[0] for x in new_input_embeds)
@@ -103,15 +123,27 @@ class Model(nn.Module):
             padded = cur_new_embed
             if max_len > cur_len:
                 if self.config.tokenizer_padding_side == "left":
-                    padded = mx.concatenate((
-                        mx.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype),
-                        cur_new_embed
-                    ), dim=0)
+                    padded = mx.concatenate(
+                        (
+                            mx.zeros(
+                                (max_len - cur_len, cur_new_embed.shape[1]),
+                                dtype=cur_new_embed.dtype,
+                            ),
+                            cur_new_embed,
+                        ),
+                        dim=0,
+                    )
                 else:
-                    padded = mx.concatenate((
-                        cur_new_embed,
-                        mx.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype)
-                    ), dim=0)
+                    padded = mx.concatenate(
+                        (
+                            cur_new_embed,
+                            mx.zeros(
+                                (max_len - cur_len, cur_new_embed.shape[1]),
+                                dtype=cur_new_embed.dtype,
+                            ),
+                        ),
+                        dim=0,
+                    )
             new_input_embeds_padded.append(padded)
         new_input_embeds = mx.stack(new_input_embeds_padded)
         return new_input_embeds
@@ -139,7 +171,10 @@ class Model(nn.Module):
             if "vision_tower" in key:
                 if "model.vision_tower" in key:
                     # conversion from transformers
-                    key = key.replace("model.vision_tower.vision_tower.model", "vision_tower.vision_model")
+                    key = key.replace(
+                        "model.vision_tower.vision_tower.model",
+                        "vision_tower.vision_model",
+                    )
                     key = key.replace("patch_embed", "patch_embed.blocks")
                 return key
             if "lm_head" in key:
