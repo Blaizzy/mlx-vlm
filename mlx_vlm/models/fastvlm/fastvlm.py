@@ -88,9 +88,7 @@ class Model(nn.Module):
                         image_token_indices[i] + 1 : image_token_indices[i + 1]
                     ]
                 )
-            split_sizes = image_token_indices[
-                1:
-            ]
+            split_sizes = image_token_indices[1:]
             cur_input_embeds = self.language_model.model.embed_tokens(
                 mx.concatenate(cur_input_ids_noim)
             )
