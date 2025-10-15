@@ -59,7 +59,10 @@ class Model(nn.Module):
     def prepare_inputs_for_multimodal(self, image_features, input_ids, mask):
         if mask is not None:
             input_ids = [
-                cur_input_ids[(start := mx.argmax(cur_mask).item()) : start + cur_mask.sum().item()]
+                cur_input_ids[
+                    (start := mx.argmax(cur_mask).item()) : start
+                    + cur_mask.sum().item()
+                ]
                 for cur_input_ids, cur_mask in zip(input_ids, mask)
             ]
 
