@@ -40,6 +40,7 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
     ):
         if pixel_values is None:
             return self.language_model.model.embed_tokens(input_ids)
@@ -50,13 +51,17 @@ class Model(nn.Module):
         image_features = self.mm_projector(image_features)
 
         final_inputs_embeds = self.prepare_inputs_for_multimodal(
-            image_features, input_ids
+            image_features, input_ids, mask
         )
         return final_inputs_embeds
 
     # Source: https://github.com/apple/ml-fastvlm/blob/592b4add3c1c8a518e77d95dc6248e76c1dd591f/llava/model/llava_arch.py#L146
-    def prepare_inputs_for_multimodal(self, image_features, input_ids):
-        # TODO: padding, attention_mask
+    def prepare_inputs_for_multimodal(self, image_features, input_ids, mask):
+        if mask is not None:
+            input_ids = [
+                cur_input_ids[(start := mx.argmax(cur_mask).item()) : start + cur_mask.sum().item()]
+                for cur_input_ids, cur_mask in zip(input_ids, mask)
+            ]
 
         new_input_embeds = []
         cur_image_idx = 0
@@ -154,7 +159,7 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
+        input_embeddings = self.get_input_embeddings(input_ids, pixel_values, mask)
         logits = self.language_model(
             input_ids, mask=mask, cache=cache, inputs_embeds=input_embeddings
         )
