@@ -44,7 +44,6 @@ class Model(nn.Module):
         if pixel_values is None:
             return self.language_model.model.embed_tokens(input_ids)
 
-        # Encode images
         _, image_features, _ = self.vision_tower(pixel_values.transpose(0, 2, 3, 1))
         B, H, W, C = image_features.shape
         image_features = image_features.reshape(B, H * W, C)
@@ -55,7 +54,7 @@ class Model(nn.Module):
         )
         return final_inputs_embeds
 
-    # Adapted from https://github.com/apple/ml-fastvlm/blob/592b4add3c1c8a518e77d95dc6248e76c1dd591f/llava/model/llava_arch.py#L146
+    # Source: https://github.com/apple/ml-fastvlm/blob/592b4add3c1c8a518e77d95dc6248e76c1dd591f/llava/model/llava_arch.py#L146
     def prepare_inputs_for_multimodal(self, image_features, input_ids):
         # TODO: padding, attention_mask
 
@@ -75,7 +74,6 @@ class Model(nn.Module):
                 cur_image_idx += 1
                 continue
 
-            # Go to numpy for np.where() with a single arg (returns the matching positions)
             image_token_indices = (
                 [-1]
                 + np.where(np.array(cur_input_ids == self.config.image_token_index))[
@@ -92,7 +90,7 @@ class Model(nn.Module):
                 )
             split_sizes = image_token_indices[
                 1:
-            ]  # [x.shape[0] for x in cur_input_ids_noim]
+            ]
             cur_input_embeds = self.language_model.model.embed_tokens(
                 mx.concatenate(cur_input_ids_noim)
             )
@@ -109,13 +107,11 @@ class Model(nn.Module):
 
             new_input_embeds.append(cur_new_input_embeds)
 
-        # Truncate sequences to max length as image embeddings can make the sequence longer
         if self.config.tokenizer_model_max_length is not None:
             new_input_embeds = [
                 x[: self.config.tokenizer_model_max_length] for x in new_input_embeds
             ]
 
-        # Combine them
         max_len = max(x.shape[0] for x in new_input_embeds)
         new_input_embeds_padded = []
         for i, cur_new_embed in enumerate(new_input_embeds):
@@ -170,7 +166,6 @@ class Model(nn.Module):
         def transform_key(key):
             if "vision_tower" in key:
                 if "model.vision_tower" in key:
-                    # conversion from transformers
                     key = key.replace(
                         "model.vision_tower.vision_tower.model",
                         "vision_tower.vision_model",

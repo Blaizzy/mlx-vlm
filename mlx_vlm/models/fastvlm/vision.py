@@ -6,7 +6,6 @@ import mlx.nn as nn
 from .config import VisionConfig
 
 
-# Copied from gemma3n by Chris @FL33TW00D
 class NamedSequential(nn.Module):
     def __init__(self):
         super().__init__()
@@ -23,7 +22,6 @@ class NamedSequential(nn.Module):
 
 
 # This is like Sequential but without names
-# TODO: check items are callable modules
 class CallableModuleList(list):
     def __call__(self, x: mx.array):
         for item in self:
@@ -58,8 +56,7 @@ class MHSA(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def __call__(self, x: mx.array) -> mx.array:
-        # BHWC->BCHW just to keep a ~close implementation to the source
-        # See https://github.com/apple/ml-fastvlm/blob/592b4add3c1c8a518e77d95dc6248e76c1dd591f/llava/model/multimodal_encoder/mobileclip/mci.py#L661
+        # Source: https://github.com/apple/ml-fastvlm/blob/592b4add3c1c8a518e77d95dc6248e76c1dd591f/llava/model/multimodal_encoder/mobileclip/mci.py#L661
         x = x.transpose(0, 3, 1, 2)
         B, C, H, W = x.shape
         N = H * W
@@ -76,7 +73,6 @@ class MHSA(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
 
-        # Reorder back
         x = x.reshape(B, H, W, C)
         return x
 

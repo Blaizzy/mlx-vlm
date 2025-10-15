@@ -9,7 +9,6 @@ from ..base import LanguageModelOutput
 from .config import TextConfig
 
 
-# Copied from mlx_lm.models.qwen2.Model
 class LanguageModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -19,7 +18,7 @@ class LanguageModel(nn.Module):
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    # Note: mask is going away in mlx-lm, see https://github.com/ml-explore/mlx-lm/pull/430
+    # TODO: mask is going away in mlx-lm, see https://github.com/ml-explore/mlx-lm/pull/430
     def __call__(
         self,
         inputs: mx.array,
@@ -27,7 +26,6 @@ class LanguageModel(nn.Module):
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
     ):
-        # mask=None so it uses `causal` when inputs_embeds are present
         out = self.model(inputs, None, cache, inputs_embeds)
         out = self.model.embed_tokens.as_linear(out)
         return LanguageModelOutput(out)
@@ -35,7 +33,6 @@ class LanguageModel(nn.Module):
     def sanitize(self, weights):
         if self.config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
-        # Remove unused precomputed rotary freqs
         return {
             k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
         }
