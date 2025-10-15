@@ -21,7 +21,6 @@ class NamedSequential(nn.Module):
         return x
 
 
-# This is like Sequential but without names
 class CallableModuleList(list):
     def __call__(self, x: mx.array):
         for item in self:
