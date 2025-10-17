@@ -145,7 +145,7 @@ class Model(nn.Module):
         # Sum over patch dimensions and check if any pixels are active
         patch_attention_mask = reshaped.sum(axis=(-1, -2)) > 0
 
-        pooler_output, embeddings, hidden_state = self.vision_model(
+        pooler_output, *_ = self.vision_model(
             pixel_values.transpose(0, 2, 3, 1),
             patch_attention_mask=patch_attention_mask,
             output_hidden_states=True,
