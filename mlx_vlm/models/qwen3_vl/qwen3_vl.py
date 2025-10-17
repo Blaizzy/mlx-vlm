@@ -48,7 +48,11 @@ class Model(nn.Module):
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids), None, None
+            return {
+                "inputs_embeds": self.language_model.model.embed_tokens(input_ids),
+                "visual_pos_masks": None,
+                "deepstack_visual_embeds": None,
+            }
 
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
         pixel_values = pixel_values.astype(dtype)
