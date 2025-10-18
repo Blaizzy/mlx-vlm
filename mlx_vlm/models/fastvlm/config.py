@@ -66,10 +66,7 @@ class ModelConfig(BaseModelConfig):
             params["text_config"] = dict(
                 filter(lambda x: x[0] not in excluded_keys, params.items())
             )
-        # The vision config is retrieved in the original repo from separate config files
-        # https://github.com/apple/ml-fastvlm/blob/592b4add3c1c8a518e77d95dc6248e76c1dd591f/llava/model/multimodal_encoder/mobileclip/configs/mobileclip_l.json
-        # Not from the Hub config https://huggingface.co/apple/FastVLM-0.5B/blob/main/config.json
-        # We hardcode everything in the config for now
+
         if not params.get("vision_config", {}):
             params["vision_config"] = {}
 
