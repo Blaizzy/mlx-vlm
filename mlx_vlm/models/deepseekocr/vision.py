@@ -1,10 +1,12 @@
-from functools import partial
+import math
 from math import sqrt
 from typing import Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
+from ..base import interpolate
 from .config import MLPConfig, VisionConfig
 
 
@@ -213,30 +215,66 @@ class VisionEmbeddings(nn.Module):
         self.num_positions = self.num_patches + 1
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
 
+    def _get_abs_pos(self, abs_pos, tgt_size):
+        """
+        Resize absolute positional embeddings
+
+        Args:
+            abs_pos: Tensor of shape (L, C) - absolute position embeddings
+            tgt_size: int - target size M
+
+        Returns:
+            Tensor of shape (M, C) - resized position embeddings
+        """
+        dim = abs_pos.shape[-1]
+        abs_pos_new = mx.squeeze(abs_pos, axis=0)
+        cls_token, old_pos_embed = abs_pos_new[:1], abs_pos_new[1:]
+        src_size = int(math.sqrt(abs_pos_new.shape[0] - 1))
+        tgt_size_2d = int(math.sqrt(tgt_size))
+        dtype = abs_pos.dtype
+
+        if src_size != tgt_size_2d:
+            # Reshape to (1, src_size, src_size, dim) then transpose to (1, dim, src_size, src_size)
+            old_pos_embed = mx.reshape(old_pos_embed, (1, src_size, src_size, dim))
+            old_pos_embed = mx.transpose(old_pos_embed, (0, 3, 1, 2))
+            old_pos_embed = old_pos_embed.astype(mx.float32)
+
+            # MLX doesn't have F.interpolate, so we'll implement bicubic interpolation
+            # using available operations or a simpler alternative
+            new_pos_embed = interpolate(old_pos_embed, (tgt_size_2d, tgt_size_2d))
+
+            new_pos_embed = new_pos_embed.astype(dtype)
+            new_pos_embed = mx.transpose(new_pos_embed, (0, 2, 3, 1))
+            new_pos_embed = mx.reshape(new_pos_embed, (tgt_size_2d * tgt_size_2d, dim))
+            vision_pos_embed = mx.concatenate([cls_token, new_pos_embed], axis=0)
+            vision_pos_embed = mx.reshape(
+                vision_pos_embed, (1, tgt_size_2d * tgt_size_2d + 1, dim)
+            )
+            return vision_pos_embed
+        else:
+            return abs_pos
+
     def __call__(
         self, x: mx.array, patch_embeds: Optional[mx.array] = None
     ) -> mx.array:
-        batch_size, _, height, width = x.shape
+        batch_size, height, width, _ = x.shape
+        print("VisionEmbeddings input shape:", x.shape)
         target_dtype = self.position_embedding.weight.dtype
-
         if patch_embeds is not None:
             patch_embeddings = patch_embeds
         else:
             patch_embeddings = self.patch_embedding(x)
 
-        patch_embeds = mx.flatten(patch_embeddings, start_axis=2).transpose(0, 2, 1)
+        patch_embeds = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
         class_embeds = mx.broadcast_to(
             self.class_embedding, (batch_size, 1, self.embed_dim)
         ).astype(target_dtype)
         embeddings = mx.concatenate([class_embeds, patch_embeds], axis=1)
-        position_embedding = mx.concatenate(
-            [
-                self.position_embedding[:, :1, :],
-                self._get_pos_embed(self.position_embedding[:, 1:, :], height, width),
-            ],
-            axis=1,
-        )
-        embeddings = embeddings + position_embedding.astype(target_dtype)
+        position_ids = mx.array(np.arange(self.num_positions)[None, :])
+
+        embeddings = embeddings + self._get_abs_pos(
+            self.position_embedding(position_ids), embeddings.shape[1]
+        ).astype(target_dtype)
 
         return embeddings
 

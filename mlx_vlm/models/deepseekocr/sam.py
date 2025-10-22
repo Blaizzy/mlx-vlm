@@ -6,6 +6,27 @@ import numpy as np
 from PIL import Image
 from PIL.Image import Resampling
 
+from ..base import interpolate
+from ..kernels import bicubic_interpolate
+
+
+def get_abs_pos_sam(abs_pos, tgt_size):
+
+    dtype = abs_pos.dtype
+
+    src_size = abs_pos.shape[1]
+
+    if src_size != tgt_size:
+        old_pos_embed = abs_pos.transpose(0, 3, 1, 2)
+        old_pos_embed = old_pos_embed.astype(mx.float32)
+        new_pos_embed = bicubic_interpolate(
+            old_pos_embed, size=(tgt_size, tgt_size)
+        ).astype(dtype)
+        new_pos_embed = new_pos_embed.transpose(0, 2, 3, 1)
+        return new_pos_embed
+    else:
+        return abs_pos
+
 
 class MLPBlock(nn.Module):
     def __init__(
@@ -177,7 +198,7 @@ class SAMEncoder(nn.Module):
     def __call__(self, x: mx.array):
         x = self.patch_embed(x)
         if self.pos_embed is not None:
-            x += self.pos_embed
+            x += get_abs_pos_sam(self.pos_embed, x.shape[1])
 
         for _, blk in enumerate(self.blocks):
             x = blk(x)
@@ -185,10 +206,7 @@ class SAMEncoder(nn.Module):
         for _, n in enumerate(self.neck):
             x = n(x)
 
-        x = x.transpose(0, 3, 1, 2)
-        x = resize_image(x)
-
-        x = x.transpose(0, 2, 3, 1)
+        x = x.transpose(0, 2, 1, 3)
 
         x2 = self.net_2(x)
         x3 = self.net_3(x2)
@@ -304,45 +322,58 @@ class Attention(nn.Module):
     def __call__(self, x: mx.array):
         B, H, W, _ = x.shape
         x = mx.array(x)
-        # qkv with shape (3, B, nHead, H * W, C)
         qkv = (
             self.qkv(x)
             .reshape(B, H * W, 3, self.num_heads, -1)
             .transpose(2, 0, 3, 1, 4)
         )
         # q, k, v with shape (B * nHead, H * W, C)
-        q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1)
+        qkv_reshaped = qkv.reshape(3, B * self.num_heads, H * W, -1)
+        q, k, v = qkv_reshaped[0], qkv_reshaped[1], qkv_reshaped[2]
 
-        def do_attention(q, k, v):
-            attn = (q * self.scale) @ k.transpose(0, -1, -2)
-            if self.use_rel_pos:
-                attn = add_decomposed_rel_pos(
-                    attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W)
-                )
-
-            attn = mx.softmax(attn, axis=-1)
-            x = (
-                (attn @ v)
-                .reshape(B, self.num_heads, H, W, -1)
-                .transpose(0, 2, 3, 1, 4)
-                .reshape(B, H, W, -1)
+        rel_h, rel_w = None, None
+        if self.use_rel_pos:
+            rel_h, rel_w = add_decomposed_rel_pos(
+                q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W)
             )
 
-            return x
+        q = q.reshape(B, self.num_heads, H * W, -1)
+        k = k.reshape(B, self.num_heads, H * W, -1)
+        v = v.reshape(B, self.num_heads, H * W, -1)
 
-        x = do_attention(q, k, v)
+        if self.use_rel_pos:
+            rel_h = rel_h.reshape(
+                B, self.num_heads, rel_h.shape[1], rel_h.shape[2], rel_h.shape[3]
+            )
+            rel_w = rel_w.reshape(
+                B, self.num_heads, rel_w.shape[1], rel_w.shape[2], rel_w.shape[3]
+            )
+            attn_bias = (rel_h + rel_w).reshape(
+                B, self.num_heads, rel_h.shape[2], rel_h.shape[3] * rel_w.shape[4]
+            )
+            x = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scale, mask=attn_bias
+            )
+            # x = _attention_rel_h_rel_w(q, k, v, rel_h, rel_w)
+        else:
+            x = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
+
+        x = (
+            x.reshape(B, self.num_heads, H, W, -1)
+            .transpose(0, 2, 3, 1, 4)
+            .reshape(B, H, W, -1)
+        )
+
         x = self.proj(x)
 
         return x
 
 
-def window_partition(
-    x: np.ndarray, window_size: int
-) -> Tuple[np.ndarray, Tuple[int, int]]:
+def window_partition(x: mx.array, window_size: int) -> Tuple[mx.array, Tuple[int, int]]:
     """
     Partition into non-overlapping windows with padding if needed.
     Args:
-        x (ndarray): input tokens with [B, H, W, C].
+        x (mx.array): input tokens with [B, H, W, C].
         window_size (int): window size.
 
     Returns:
@@ -354,7 +385,8 @@ def window_partition(
     pad_h = (window_size - H % window_size) % window_size
     pad_w = (window_size - W % window_size) % window_size
     if pad_h > 0 or pad_w > 0:
-        x = np.pad(x, ((0, 0), (0, pad_h), (0, pad_w), (0, 0)))
+        x = mx.pad(x, [(0, 0), (0, pad_h), (0, pad_w), (0, 0)])
+
     Hp, Wp = H + pad_h, W + pad_w
 
     x = x.reshape(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
@@ -392,45 +424,55 @@ def window_unpartition(
     return x
 
 
-def get_rel_pos(q_size: int, k_size: int, rel_pos: np.ndarray) -> np.ndarray:
+def get_rel_pos(q_size: int, k_size: int, rel_pos: mx.array) -> mx.array:
     """
     Get relative positional embeddings according to the relative positions of
         query and key sizes.
     Args:
         q_size (int): size of query q.
         k_size (int): size of key k.
-        rel_pos (ndarray): relative position embeddings (L, C).
+        rel_pos (mx.array): relative position embeddings (L, C).
 
     Returns:
         Extracted positional embeddings according to relative positions.
     """
-
-    rel_pos = np.array(rel_pos.tolist())
     max_rel_dist = int(2 * max(q_size, k_size) - 1)
+    print("max_rel_dist: ", max_rel_dist)
+    print("rel_pos shape: ", rel_pos.shape)
+
     # Interpolate rel pos if needed.
     if rel_pos.shape[0] != max_rel_dist:
         # Interpolate rel pos.
-        rel_pos_resized = np.expand_dims(rel_pos, axis=0)
-        rel_pos_resized = np.transpose(rel_pos_resized, (0, 2, 1))
-        rel_pos_resized = np.interp(
-            np.linspace(0, max_rel_dist - 1, num=max_rel_dist),
-            np.arange(rel_pos.shape[0]),
-            rel_pos_resized[0],
+        dtype = rel_pos.dtype
+        rel_pos = rel_pos.astype(mx.float32)
+        rel_pos_resized = mx.transpose(
+            rel_pos.reshape(1, rel_pos.shape[0], -1), (0, 2, 1)
         )
-        rel_pos_resized = np.transpose(rel_pos_resized, (1, 0))
+
+        # Linear interpolation
+        scale = rel_pos_resized.shape[2] / max_rel_dist
+        indices = mx.arange(max_rel_dist) * scale
+        idx_floor = mx.floor(indices).astype(mx.int32)
+        idx_ceil = mx.minimum(idx_floor + 1, rel_pos_resized.shape[2] - 1)
+        weight = indices - idx_floor
+
+        rel_pos_resized = (
+            mx.take(rel_pos_resized, idx_floor, axis=2) * (1 - weight)
+            + mx.take(rel_pos_resized, idx_ceil, axis=2) * weight
+        ).astype(dtype)
+        rel_pos_resized = rel_pos_resized.reshape(-1, max_rel_dist).transpose(1, 0)
     else:
         rel_pos_resized = rel_pos
 
     # Scale the coords with short length if shapes for q and k are different.
-    q_coords = np.arange(q_size)[:, np.newaxis] * max(k_size / q_size, 1.0)
-    k_coords = np.arange(k_size)[np.newaxis, :] * max(q_size / k_size, 1.0)
+    q_coords = mx.arange(q_size, dtype=mx.float32)[:, None] * max(k_size / q_size, 1.0)
+    k_coords = mx.arange(k_size, dtype=mx.float32)[None, :] * max(q_size / k_size, 1.0)
     relative_coords = (q_coords - k_coords) + (k_size - 1) * max(q_size / k_size, 1.0)
-    relative_coords = relative_coords.astype(np.int64)
-    return rel_pos_resized[relative_coords]
+
+    return rel_pos_resized[relative_coords.astype(mx.int32)]
 
 
 def add_decomposed_rel_pos(
-    attn: np.ndarray,
     q: np.ndarray,
     rel_pos_h: np.ndarray,
     rel_pos_w: np.ndarray,
@@ -453,22 +495,20 @@ def add_decomposed_rel_pos(
     """
     q_h, q_w = q_size
     k_h, k_w = k_size
+
     Rh = get_rel_pos(q_h, k_h, rel_pos_h)
     Rw = get_rel_pos(q_w, k_w, rel_pos_w)
 
     B, _, dim = q.shape
     r_q = q.reshape(B, q_h, q_w, dim)
+    rel_h = mx.einsum("bhwc,hkc->bhwk", r_q, Rh)
+    rel_w = mx.einsum("bhwc,wkc->bhwk", r_q, Rw)
+    rel_h = rel_h[..., None]
+    rel_w = rel_w[..., None, :]
+    rel_h = rel_h.reshape(B, q_h * q_w, k_h, 1)
+    rel_w = rel_w.reshape(B, q_h * q_w, 1, k_w)
 
-    rel_h = np.einsum("bhwc,hkc->bhwk", r_q, Rh)
-    rel_w = np.einsum("bhwc,wkc->bhwk", r_q, Rw)
-
-    attn = (
-        attn.reshape(B, q_h, q_w, k_h, k_w)
-        + rel_h[:, :, :, :, np.newaxis]
-        + rel_w[:, :, :, np.newaxis, :]
-    ).reshape(B, q_h * q_w, k_h * k_w)
-
-    return attn
+    return rel_h, rel_w
 
 
 class PatchEmbed(nn.Module):
