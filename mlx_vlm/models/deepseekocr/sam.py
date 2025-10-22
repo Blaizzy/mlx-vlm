@@ -437,8 +437,6 @@ def get_rel_pos(q_size: int, k_size: int, rel_pos: mx.array) -> mx.array:
         Extracted positional embeddings according to relative positions.
     """
     max_rel_dist = int(2 * max(q_size, k_size) - 1)
-    print("max_rel_dist: ", max_rel_dist)
-    print("rel_pos shape: ", rel_pos.shape)
 
     # Interpolate rel pos if needed.
     if rel_pos.shape[0] != max_rel_dist:
