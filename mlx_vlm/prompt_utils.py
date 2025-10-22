@@ -32,6 +32,8 @@ MODEL_CONFIG = {
     "cohere2_vision": MessageFormat.LIST_WITH_IMAGE,
     "qwen2_vl": MessageFormat.LIST_WITH_IMAGE,
     "qwen2_5_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "qwen3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "qwen3_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
@@ -43,7 +45,7 @@ MODEL_CONFIG = {
     "llava": MessageFormat.LIST_WITH_IMAGE,
     "llava_next": MessageFormat.LIST_WITH_IMAGE,
     "mllama": MessageFormat.LIST_WITH_IMAGE,
-    "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE,
+    "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "bunny-llama": MessageFormat.IMAGE_TOKEN_NEWLINE,
@@ -73,12 +75,12 @@ class MessageBuilder:
     @staticmethod
     def text_message(text: str) -> Dict[str, str]:
         """Create a simple text message."""
-        return {"type": "text", "text": text}
+        return {"type": "text", "text": text, "content": text}
 
     @staticmethod
     def content_message(content: str) -> Dict[str, str]:
         """Create a content-type text message."""
-        return {"type": "text", "content": content}
+        return {"type": "text", "text": content, "content": content}
 
     @staticmethod
     def image_message() -> Dict[str, str]:
@@ -132,7 +134,12 @@ class MessageFormatter:
             )
 
         # Handle video format for specific models
-        if self.model_name in ["qwen2_vl", "qwen2_5_vl"] and kwargs.get("video"):
+        if self.model_name in [
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+        ] and kwargs.get("video"):
             return self._format_video_message(prompt, kwargs)
 
         # Route to appropriate formatter

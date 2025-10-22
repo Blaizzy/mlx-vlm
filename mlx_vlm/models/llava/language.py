@@ -162,7 +162,7 @@ class LanguageModel(nn.Module):
         self.model_type = config.model_type
         if self.model_type not in ["llama", "qwen2"]:
             raise ValueError(
-                f"Model type {self.model_type} not supported. Currently only 'llama' is supported"
+                f"Model type {self.model_type} not supported. Supported types: 'llama', 'qwen2'"
             )
         self.model = Llama(config)
         if not config.tie_word_embeddings:
