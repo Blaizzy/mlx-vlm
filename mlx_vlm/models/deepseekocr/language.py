@@ -129,7 +129,7 @@ class DeepseekV2Attention(nn.Module):
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=config.attention_bias,
         )
-        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank)
+        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=1e-6)
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank,
             self.num_heads
@@ -214,7 +214,7 @@ class DeepseekV2Attention(nn.Module):
         queries = mx.concatenate([q_nope, q_pe], axis=-1)
 
         output = scaled_dot_product_attention(
-            queries, keys, values, cache, scale=self.scale, mask=mask
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -309,15 +309,12 @@ class MoEGate(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
-        self.scoring_func = config.scoring_func
         self.top_k = config.num_experts_per_tok
         self.n_routed_experts = config.n_routed_experts
         self.routed_scaling_factor = config.routed_scaling_factor
         self.topk_method = config.topk_method
         self.n_group = config.n_group
         self.topk_group = config.topk_group
-        if self.topk_method == "noaux_tc":
-            self.e_score_correction_bias = mx.zeros((self.n_routed_experts))
         self.weight = mx.zeros((self.n_routed_experts, config.hidden_size))
 
     def __call__(self, x):
@@ -386,6 +383,7 @@ class MoEGate(nn.Module):
             raise ValueError(f"Unknown topk method: {self.topk_method}")
 
         scores = scores * self.routed_scaling_factor
+
         return inds, scores
 
 

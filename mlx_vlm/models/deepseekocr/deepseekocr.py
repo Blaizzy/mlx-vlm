@@ -128,6 +128,7 @@ class MlpProjector(nn.Module):
                     patches.append(mx.reshape(patch, (bs, -1)))
 
             x = mx.stack(patches, axis=1)  # B, N_patches, C*ds*ds
+
         if self.config.projector_config.projector_type in ["indentity", "linear"]:
             x = self.layers(x)
         else:
@@ -352,14 +353,17 @@ class Model(nn.Module):
         input_embeddings = self.get_input_embeddings(
             input_ids, pixel_values, images_spatial_crop, images_seq_mask
         )
-        logits = self.language_model(None, cache=cache, inputs_embeds=input_embeddings)
+
+        logits = self.language_model(
+            input_ids, cache=cache, inputs_embeds=input_embeddings
+        )
         return logits
 
     @staticmethod
     def sanitize(weights):
         def transform_key(key):
             if "model.layers" in key and "language_model" not in key:
-                key = key.replace("model", "language_model.model")
+                key = key.replace("model.layers", "language_model.model.layers")
 
             if "model.embed_tokens" in key and "language_model" not in key:
                 key = key.replace(
