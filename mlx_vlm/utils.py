@@ -36,6 +36,16 @@ MODEL_REMAPPING = {
     "lfm2-vl": "lfm2_vl",
     "cohere2_vision": "aya_vision",
     "llava_qwen2": "fastvlm",
+    "internvl": "internvl_chat",
+}
+
+# Optional submodule remapping for nested configs
+SUBMODULE_REMAPPING = {
+    "vision": {
+        # Some InternVL variants label vision as "internvl_vision"
+        # Map to the implemented InternVL ViT backend
+        "internvl_vision": "intern_vit_6b",
+    }
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -169,33 +179,77 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         weights.update(mx.load(wf))
 
     model_class, model_type = get_model_and_args(config=config)
+    only_llm = kwargs.get("only_llm", False)
 
     # Initialize text and vision configs if not present
     config.setdefault("text_config", {})
     config.setdefault("vision_config", {})
     config.setdefault("audio_config", {})
 
+    # If needed, adapt text config for architectures with non-standard head_dim
+    if only_llm and model_type == "internvl_chat":
+        # Try to infer head_dim from q_proj weight shape in the source weights
+        try:
+            # Look for the first q_proj.weight
+            q_keys = [k for k in weights.keys() if k.endswith("self_attn.q_proj.weight")]
+            if len(q_keys) > 0:
+                out_dim, in_dim = weights[q_keys[0]].shape
+                n_heads = config.get("text_config", {}).get("num_attention_heads")
+                if n_heads and out_dim % n_heads == 0:
+                    head_dim = out_dim // n_heads
+                    config.setdefault("text_config", {})["head_dim"] = int(head_dim)
+        except Exception:
+            pass
+
     # Initialize model config and update it with module configs
     model_config = model_class.ModelConfig.from_dict(config)
-    modules = ["text", "vision", "perceiver", "projector", "audio"]
+    # Update module configs; include vision so attributes exist, but we will
+    # stub the actual VisionModel and skip loading its weights when only_llm.
+    modules = [
+        "text",
+        "vision",
+        "perceiver",
+        "projector",
+        "audio",
+    ]
     model_config = update_module_configs(model_config, model_class, config, modules)
+
+    # In LLM-only mode, stub out VisionModel to avoid initializing vision stacks
+    # in model.__init__ for architectures that always construct vision.
+    if only_llm and hasattr(model_class, "Model"):
+        import sys as _sys
+        class _DummyVisionModel(nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+            def sanitize(self, weights):
+                return weights
+        # Replace VisionModel symbol in the module that defines Model
+        try:
+            _model_cls = getattr(model_class, "Model")
+            _model_module_name = _model_cls.__module__
+            _model_module = _sys.modules.get(_model_module_name)
+            if _model_module is not None and hasattr(_model_module, "VisionModel"):
+                setattr(_model_module, "VisionModel", _DummyVisionModel)
+        except Exception:
+            pass
 
     model = model_class.Model(model_config)
 
     # Sanitize weights
     weights = sanitize_weights(model, weights)
-    if hasattr(model_class, 'VisionModel'):
-        weights = sanitize_weights(
-            model_class.VisionModel, weights, model_config.vision_config
-        )
-    else:
-        # Load CoreML vision tower
-        print("Looking for CoreML vision tower")
-        coreml_file = glob.glob(str(model_path / "*.mlpackage"))
-        if len(coreml_file) > 0:
-            assert len(coreml_file) == 1, "Found multiple vision model files."
-            print(f"Loading {coreml_file[0]} vision tower")
-            model.vision_tower = coremltools.models.MLModel(coreml_file[0])
+    if not only_llm:
+        if hasattr(model_class, 'VisionModel'):
+            weights = sanitize_weights(
+                model_class.VisionModel, weights, getattr(model_config, 'vision_config', None)
+            )
+        else:
+            # Load CoreML vision tower
+            print("Looking for CoreML vision tower")
+            coreml_file = glob.glob(str(model_path / "*.mlpackage"))
+            if len(coreml_file) > 0:
+                assert len(coreml_file) == 1, "Found multiple vision model files."
+                print(f"Loading {coreml_file[0]} vision tower")
+                model.vision_tower = coremltools.models.MLModel(coreml_file[0])
 
     weights = sanitize_weights(
         model_class.LanguageModel, weights, model_config.text_config
@@ -232,19 +286,29 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             class_predicate=get_class_predicate,
         )
 
-    if kwargs.get("only_llm", False):
-        # Ignore vision tower weights
-        new_weights = dict()
+    if only_llm:
+        # Load only language model weights; skip any vision-related parameters.
+        # Expect either already-prefixed keys or HF-style; prefix if needed.
+        new_weights = {}
         for k, v in weights.items():
-            if 'vision_tower' in k:
+            top = k.split(".", 1)[0]
+            if top.startswith("vision") or top.startswith("vision_model"):
                 continue
-            if 'mm_projector' in k:
-                new_k = k.replace('model.mm_projector.', 'multi_modal_projector.linear_')
-                new_weights[new_k] = v
+            if top in ("language_model", "model"):
+                new_weights[k] = v
             else:
-                new_weights['language_model.'+k] = v
-
-        model.load_weights(list(new_weights.items()))
+                new_weights[f"language_model.{k}"] = v
+        # Filter to only parameters present in the current model to avoid errors
+        current_params = dict(tree_flatten(model.parameters()))
+        expected = set(current_params.keys())
+        # Build a complete payload: use provided weights where available, otherwise keep existing params
+        load_payload = []
+        for name in current_params.keys():
+            if name in new_weights:
+                load_payload.append((name, new_weights[name]))
+            else:
+                load_payload.append((name, current_params[name]))
+        model.load_weights(load_payload)
     else:
         model.load_weights(list(weights.items()))
     if not lazy:
@@ -278,10 +342,16 @@ def update_module_configs(model_config, model_class, config, modules):
     for config_name in modules:
         config_attr = f"{config_name}_config"
         if hasattr(model_config, config_attr):
+            # Apply submodule remapping on nested model_type if needed
+            nested = dict(config[config_attr])
+            if isinstance(nested, dict):
+                nested_model_type = nested.get("model_type")
+                remap = SUBMODULE_REMAPPING.get(config_name, {})
+                if nested_model_type in remap:
+                    nested["model_type"] = remap[nested_model_type]
+
             config_class = getattr(model_class, f"{config_name.title()}Config")
-            setattr(
-                model_config, config_attr, config_class.from_dict(config[config_attr])
-            )
+            setattr(model_config, config_attr, config_class.from_dict(nested))
     return model_config
 
 
@@ -351,8 +421,11 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
     if isinstance(model_path, str):
         model_path = get_model_path(model_path)
 
+    # Strip internal-only kwargs not supported by HF
+    _kwargs = dict(kwargs)
+    _kwargs.pop("only_llm", None)
     try:
-        return AutoConfig.from_pretrained(model_path, **kwargs).to_dict()
+        return AutoConfig.from_pretrained(model_path, **_kwargs).to_dict()
     except ValueError:
         try:
             with open(model_path / "config.json", encoding="utf-8") as f:
@@ -388,7 +461,9 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
 
-    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
+    _kwargs = dict(kwargs)
+    _kwargs.pop("only_llm", None)
+    processor = AutoProcessor.from_pretrained(model_path, **_kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 

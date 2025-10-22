@@ -108,6 +108,16 @@ def dynamic_preprocess(
     if orig_width == 0 or orig_height == 0:
         # Handle potential zero dimensions
         return []
+    
+    # Quick and dirty: Scale image down to 500px on shortest dimension
+    shortest_dim = min(orig_width, orig_height)
+    if shortest_dim > 300:
+        scale_factor = 300.0 / shortest_dim
+        new_width = int(orig_width * scale_factor)
+        new_height = int(orig_height * scale_factor)
+        image = image.resize((new_width, new_height), resample=Image.Resampling.BICUBIC)
+        orig_width, orig_height = new_width, new_height
+    
     aspect_ratio = orig_width / orig_height
 
     # Calculate the possible target aspect ratios
