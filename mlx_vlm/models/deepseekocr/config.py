@@ -20,9 +20,9 @@ class TextConfig(BaseModelConfig):
     routed_scaling_factor: float = 1.0
     kv_lora_rank: int = 512
     q_lora_rank: int = 1536
-    qk_rope_head_dim: int = 64
+    qk_rope_head_dim: int = 0
     v_head_dim: int = 128
-    qk_nope_head_dim: int = 128
+    qk_nope_head_dim: int = 0
     topk_method: str = "greedy"
     n_group: Optional[int] = 1
     topk_group: Optional[int] = 1
@@ -72,9 +72,9 @@ class MLPConfig(BaseModelConfig):
 
 @dataclass
 class ProjectorConfig(BaseModelConfig):
-    projector_type: str = "downsample_mlp_gelu"
-    input_dim: int = 1152
-    n_embed: int = 2048
+    projector_type: str = "linear"
+    input_dim: int = 2048
+    n_embed: int = 1280
     depth: int = 2
     mlp_ratio: int = 1
     downsample_ratio: int = 2

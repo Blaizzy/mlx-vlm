@@ -128,9 +128,11 @@ class MlpProjector(nn.Module):
                     patches.append(mx.reshape(patch, (bs, -1)))
 
             x = mx.stack(patches, axis=1)  # B, N_patches, C*ds*ds
-
-        for layer in self.layers:
-            x = layer(x)
+        if self.config.projector_config.projector_type in ["indentity", "linear"]:
+            x = self.layers(x)
+        else:
+            for layer in self.layers:
+                x = layer(x)
         return x
 
 
@@ -190,44 +192,38 @@ class Model(nn.Module):
 
             idx = 0
 
-            for image, crop_shape in zip(pixel_values, images_spatial_crop):
+            for crop_shape in images_spatial_crop:
                 images_in_this_batch = []
-
-                patches = image[0]
-                image_ori = image[1]
-
+                patches = pixel_values[0]
+                image_ori = pixel_values[1]
                 if mx.sum(patches).item() != 0:
                     # P, C, H, W = patches.shape
-                    print(patches.shape)
+
                     crop_flag = 1
-                    local_features_1 = self.sam_model(
-                        patches.transpose(1, 2, 0)[None, ...]
-                    )
+                    local_features_1 = self.sam_model(patches.transpose(0, 2, 3, 1))
 
-                    print("SAM done", local_features_1.shape)
-
-                    local_features_2 = self.vision_model(
-                        patches.transpose(1, 2, 0)[None, ...], local_features_1
+                    local_features_2, _ = self.vision_model(
+                        patches.transpose(0, 2, 3, 1), patch_embeds=local_features_1
                     )
-                    print("VIT done", local_features_2.shape)
 
                     local_features = mx.concatenate(
                         (
                             local_features_2[:, 1:],
-                            mx.flatten(local_features_1, end_axis=2).transpose(1, 2, 0),
+                            mx.flatten(local_features_1, start_axis=1, end_axis=2),
                         ),
                         axis=-1,
                     )
+
                     local_features = self.projector(local_features)
 
-                    global_features_1 = self.sam_model(image_ori)
-                    global_features_2 = self.vision_model(image_ori, global_features_1)
+                    global_features_1 = self.sam_model(image_ori.transpose(0, 2, 3, 1))
+                    global_features_2, _ = self.vision_model(
+                        image_ori.transpose(0, 2, 3, 1), global_features_1
+                    )
                     global_features = mx.concatenate(
                         (
                             global_features_2[:, 1:],
-                            mx.flatten(global_features_1, end_axis=2).transpose(
-                                0, 2, 1
-                            ),
+                            mx.flatten(global_features_1, start_axis=1, end_axis=2),
                         ),
                         axis=-1,
                     )
@@ -244,14 +240,19 @@ class Model(nn.Module):
                     _2, hw2, n_dim2 = local_features.shape
                     h2 = w2 = int(hw2**0.5)
 
-                    width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
+                    width_crop_num, height_crop_num = (
+                        crop_shape[0].tolist(),
+                        crop_shape[1].tolist(),
+                    )
 
                     global_features = global_features.reshape(h, w, n_dim)
 
                     global_features = mx.concatenate(
                         [
                             global_features,
-                            self.image_newline[None, None, :].expand(h, 1, n_dim),
+                            mx.broadcast_to(
+                                self.image_newline[None, None, :], (h, 1, n_dim)
+                            ),
                         ],
                         axis=1,
                     )
@@ -268,8 +269,9 @@ class Model(nn.Module):
                     local_features = mx.concatenate(
                         [
                             local_features,
-                            self.image_newline[None, None, :].expand(
-                                height_crop_num * h2, 1, n_dim2
+                            mx.broadcast_to(
+                                self.image_newline[None, None, :],
+                                (height_crop_num * h2, 1, n_dim2),
                             ),
                         ],
                         axis=1,
@@ -277,25 +279,19 @@ class Model(nn.Module):
                     local_features = local_features.reshape(-1, n_dim2)
 
                     global_local_features = mx.concatenate(
-                        [local_features, global_features, self.view_seperator[None, :]],
+                        [local_features, global_features, self.view_separator[None, :]],
                         axis=0,
                     )
 
-                    # end_time = time.time()
-
-                    # print('sam: ', sam_time - start_time)
-                    # print('vit: ', vit_time - sam_time)
-                    # print('all: ', end_time - start_time)
-
-                    # exit()
-
                 else:
-                    global_features_1 = self.sam_model(image_ori)
-                    global_features_2 = self.vision_model(image_ori, global_features_1)
+                    global_features_1 = self.sam_model(image_ori.transpose(0, 2, 3, 1))
+                    global_features_2, _ = self.vision_model(
+                        image_ori.transpose(0, 2, 3, 1), global_features_1
+                    )
                     global_features = mx.concatenate(
                         (
                             global_features_2[:, 1:],
-                            global_features_1.flatten(2).permute(0, 2, 1),
+                            mx.flatten(global_features_1, start_axis=1, end_axis=2),
                         ),
                         axis=-1,
                     )
@@ -312,7 +308,9 @@ class Model(nn.Module):
                     global_features = mx.concatenate(
                         [
                             global_features,
-                            self.image_newline[None, None, :].expand(h, 1, n_dim),
+                            mx.broadcast_to(
+                                self.image_newline[None, None, :], (h, 1, n_dim)
+                            ),
                         ],
                         axis=1,
                     )
@@ -320,21 +318,19 @@ class Model(nn.Module):
                     global_features = global_features.reshape(-1, n_dim)
 
                     global_local_features = mx.concatenate(
-                        [global_features, self.view_seperator[None, :]], axis=0
+                        [global_features, self.view_separator[None, :]], axis=0
                     )
 
                 images_in_this_batch.append(global_local_features)
 
-            # print(inputs_embeds.shape)
+                if images_in_this_batch:
+                    images_in_this_batch = mx.concatenate(images_in_this_batch, axis=0)
+                    # Find positions where images should be placed
+                    image_indices = np.where(images_seq_mask[idx])[0].tolist()
+                    # Directly assign the image features to those positions
+                    input_embeds[idx, image_indices] = images_in_this_batch
 
-            if images_in_this_batch:
-                images_in_this_batch = mx.concatenate(images_in_this_batch, axis=0)
-                # Find positions where images should be placed
-                image_indices = np.where(images_seq_mask[idx])[0].tolist()
-                # Directly assign the image features to those positions
-                input_embeds[idx, image_indices] = images_in_this_batch
-
-            idx += 1
+                idx += 1
 
         return input_embeds
 
@@ -356,9 +352,7 @@ class Model(nn.Module):
         input_embeddings = self.get_input_embeddings(
             input_ids, pixel_values, images_spatial_crop, images_seq_mask
         )
-        logits = self.language_model(
-            input_ids, cache=cache, inputs_embeds=input_embeddings
-        )
+        logits = self.language_model(None, cache=cache, inputs_embeds=input_embeddings)
         return logits
 
     @staticmethod

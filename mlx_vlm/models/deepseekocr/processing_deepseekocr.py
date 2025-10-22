@@ -232,7 +232,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
         return (
             "{% for message in messages %}"
             "{% if message['role'] == 'user' %}"
-            "{% elif message['role'] == 'assistant' %}{% endif %} "
+            "{% elif message['role'] == 'assistant' %}{% endif %}"
             "{{message['content']}}"
             "{% endfor %}"
             "{% if add_generation_prompt %}{% endif %}"
@@ -319,7 +319,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
             "attention_mask": input_ids != self.pad_id,
             "labels": target_ids,
             "images": images_list,
-            "images_seq_mask": images_seq_mask,
+            "images_seq_mask": images_seq_mask[None, ...],
             "images_spatial_crop": images_spatial_crop,
             "num_image_tokens": num_image_tokens,
         }
@@ -487,7 +487,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
                 tokenized_str += tokenized_image
                 images_seq_mask += [True] * len(tokenized_image)
 
-        """process the last text split"""
         tokenized_sep = self.encode(text_splits[-1], bos=False, eos=False)
         tokenized_str += tokenized_sep
         images_seq_mask += [False] * len(tokenized_sep)
@@ -530,7 +529,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
         text: str = None,
         images: List[Image.Image] = None,
         apply_sft_format: bool = False,
-        force_batchify: bool = False,
         inference_mode: bool = True,
         system_prompt: str = "",
         **kwargs,
@@ -563,8 +561,5 @@ class DeepseekVLV2Processor(ProcessorMixin):
             inference_mode=inference_mode,
             system_prompt=system_prompt,
         )
-
-        if force_batchify:
-            prepare = self.batchify([prepare])
 
         return prepare

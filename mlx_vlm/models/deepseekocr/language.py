@@ -119,7 +119,7 @@ class DeepseekV2Attention(nn.Module):
             self.q_a_proj = nn.Linear(
                 self.hidden_size, self.q_lora_rank, bias=config.attention_bias
             )
-            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank)
+            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=1e-6)
             self.q_b_proj = nn.Linear(
                 self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
             )

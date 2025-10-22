@@ -258,7 +258,6 @@ class VisionEmbeddings(nn.Module):
         self, x: mx.array, patch_embeds: Optional[mx.array] = None
     ) -> mx.array:
         batch_size, height, width, _ = x.shape
-        print("VisionEmbeddings input shape:", x.shape)
         target_dtype = self.position_embedding.weight.dtype
         if patch_embeds is not None:
             patch_embeddings = patch_embeds
