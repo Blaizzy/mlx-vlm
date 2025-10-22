@@ -16,32 +16,69 @@ from transformers.processing_utils import ProcessorMixin
 from .conversation import get_conv_template
 
 
-def select_best_resolution(image_size, candidate_resolutions):
-    # used for cropping
-    original_width, original_height = image_size
-    best_fit = None
-    max_effective_resolution = 0
-    min_wasted_resolution = float("inf")
+def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+    best_ratio_diff = float("inf")
+    best_ratio = (1, 1)
+    area = width * height
+    for ratio in target_ratios:
+        target_aspect_ratio = ratio[0] / ratio[1]
+        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+        if ratio_diff < best_ratio_diff:
+            best_ratio_diff = ratio_diff
+            best_ratio = ratio
+        elif ratio_diff == best_ratio_diff:
+            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                best_ratio = ratio
+    # print(f'width: {width}, height: {height}, best_ratio: {best_ratio}')
+    return best_ratio
 
-    for width, height in candidate_resolutions:
-        scale = min(width / original_width, height / original_height)
-        downscaled_width, downscaled_height = int(original_width * scale), int(
-            original_height * scale
+
+def dynamic_preprocess(
+    image, min_num=2, max_num=9, image_size=640, use_thumbnail=False
+):
+    orig_width, orig_height = image.size
+    aspect_ratio = orig_width / orig_height
+
+    # calculate the existing image aspect ratio
+    target_ratios = set(
+        (i, j)
+        for n in range(min_num, max_num + 1)
+        for i in range(1, n + 1)
+        for j in range(1, n + 1)
+        if i * j <= max_num and i * j >= min_num
+    )
+    # print(target_ratios)
+    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+    # find the closest aspect ratio to the target
+    target_aspect_ratio = find_closest_aspect_ratio(
+        aspect_ratio, target_ratios, orig_width, orig_height, image_size
+    )
+
+    # print(target_aspect_ratio)
+    # calculate the target width and height
+    target_width = image_size * target_aspect_ratio[0]
+    target_height = image_size * target_aspect_ratio[1]
+    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+    # resize the image
+    resized_img = image.resize((target_width, target_height))
+    processed_images = []
+    for i in range(blocks):
+        box = (
+            (i % (target_width // image_size)) * image_size,
+            (i // (target_width // image_size)) * image_size,
+            ((i % (target_width // image_size)) + 1) * image_size,
+            ((i // (target_width // image_size)) + 1) * image_size,
         )
-        effective_resolution = min(
-            downscaled_width * downscaled_height, original_width * original_height
-        )
-        wasted_resolution = (width * height) - effective_resolution
-
-        if effective_resolution > max_effective_resolution or (
-            effective_resolution == max_effective_resolution
-            and wasted_resolution < min_wasted_resolution
-        ):
-            max_effective_resolution = effective_resolution
-            min_wasted_resolution = wasted_resolution
-            best_fit = (width, height)
-
-    return best_fit
+        # split the image
+        split_img = resized_img.crop(box)
+        processed_images.append(split_img)
+    assert len(processed_images) == blocks
+    if use_thumbnail and len(processed_images) != 1:
+        thumbnail_img = image.resize((image_size, image_size))
+        processed_images.append(thumbnail_img)
+    return processed_images, target_aspect_ratio
 
 
 class DictOutput(object):
@@ -194,11 +231,11 @@ class DeepseekVLV2Processor(ProcessorMixin):
     def default_chat_template(self):
         return (
             "{% for message in messages %}"
-            "{% if message['role'] == 'user' %}<|User|>:"
-            "{% elif message['role'] == 'assistant' %}<|Assistant|>{% endif %} "
-            "{{message['content']}}\n\n"
+            "{% if message['role'] == 'user' %}"
+            "{% elif message['role'] == 'assistant' %}{% endif %} "
+            "{{message['content']}}"
             "{% endfor %}"
-            "{% if add_generation_prompt %}<|Assistant|>:{% endif %}"
+            "{% if add_generation_prompt %}{% endif %}"
         )
 
     @property
@@ -252,9 +289,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
             images_seq_mask,
             images_spatial_crop,
             num_image_tokens,
-        ) = self.tokenize_with_images(
-            sft_format, images, bos=True, eos=True, cropping=len(images) <= 2
-        )
+        ) = self.tokenize_with_images(sft_format, images, cropping=len(images) <= 2)
         masked_tokenized_str = []
         for token_index in tokenized_str:
             if token_index != self.image_token_id:
@@ -279,22 +314,15 @@ class DeepseekVLV2Processor(ProcessorMixin):
             target_ids = target_ids[:-1]
             images_seq_mask = images_seq_mask[:-1]
 
-        if len(images_list) == 0:
-            images = mx.zeros((1, 3, self.image_size, self.image_size))
-            images_spatial_crop = mx.zeros((1, 2))
-        else:
-            images = mx.stack(images_list)
-            images_spatial_crop = mx.array(images_spatial_crop)
-
-        return VLChatProcessorOutput(
-            sft_format=sft_format,
-            input_ids=input_ids,
-            target_ids=target_ids,
-            images=images,
-            images_seq_mask=images_seq_mask,
-            images_spatial_crop=images_spatial_crop,
-            num_image_tokens=num_image_tokens,
-        )
+        return {
+            "input_ids": input_ids[None, :],
+            "attention_mask": input_ids != self.pad_id,
+            "labels": target_ids,
+            "images": images_list,
+            "images_seq_mask": images_seq_mask,
+            "images_spatial_crop": images_spatial_crop,
+            "num_image_tokens": num_image_tokens,
+        }
 
     def pad_sequence(self, sequences, padding_value):
         # Get max length of sequences
@@ -317,92 +345,172 @@ class DeepseekVLV2Processor(ProcessorMixin):
         self,
         conversation: str,
         images: List[Image.Image],
-        bos: bool = True,
-        eos: bool = True,
+        base_size: int = 1024,
+        image_size: int = 640,
         cropping: bool = True,
     ):
+
+        patch_size = 16
+        downsample_ratio = 4
+        valid_img_tokens = 0
+        ratio = 1
+
+        image_draw = images[0].copy()
+
+        w, h = image_draw.size
+
+        ratio = 1 - ((max(w, h) - min(w, h)) / (max(w, h)))
+
         """Tokenize text with <image> tags."""
         assert conversation.count(self.image_token) == len(images)
         text_splits = conversation.split(self.image_token)
-        images_list, images_seq_mask, images_spatial_crop = [], [], []
-        num_image_tokens = []
+
+        images_list, images_crop_list, images_seq_mask = [], [], []
         tokenized_str = []
+        images_spatial_crop = []
         for text_sep, image in zip(text_splits, images):
-            """encode text_sep"""
+
             tokenized_sep = self.encode(text_sep, bos=False, eos=False)
             tokenized_str += tokenized_sep
             images_seq_mask += [False] * len(tokenized_sep)
 
-            """select best resolution for anyres"""
             if cropping:
-                best_width, best_height = select_best_resolution(
-                    image.size, self.candidate_resolutions
+
+                if image.size[0] <= 640 and image.size[1] <= 640:
+                    crop_ratio = [1, 1]
+
+                else:
+                    if cropping:
+                        # best_width, best_height = select_best_resolution(image.size, self.candidate_resolutions)
+                        images_crop_raw, crop_ratio = dynamic_preprocess(image)
+
+                    else:
+                        # best_width, best_height = self.image_size, self.image_size
+                        crop_ratio = [1, 1]
+
+                """process the global view"""
+                # image = image.resize((base_size, base_size))
+                global_view = ImageOps.pad(
+                    image,
+                    (base_size, base_size),
+                    color=tuple(int(x * 255) for x in self.image_transform.mean),
                 )
-            else:
-                best_width, best_height = self.image_size, self.image_size
 
-            """process the global view"""
-            global_view = ImageOps.pad(
-                image,
-                (self.image_size, self.image_size),
-                color=tuple(int(x * 255) for x in self.image_transform.mean),
-            )
-            images_list.append(self.image_transform(global_view))
+                if base_size == 1024:
+                    valid_img_tokens += int(256 * ratio)
+                elif base_size == 1280:
+                    valid_img_tokens += int(400 * ratio)
+                # elif base_size == 640:
+                #     valid_img_tokens += int(100 * ratio)
 
-            """process the local views"""
-            local_view = ImageOps.pad(
-                image,
-                (best_width, best_height),
-                color=tuple(int(x * 255) for x in self.image_transform.mean),
-            )
-            for i in range(0, best_height, self.image_size):
-                for j in range(0, best_width, self.image_size):
-                    images_list.append(
-                        self.image_transform(
-                            local_view.crop(
-                                (j, i, j + self.image_size, i + self.image_size)
-                            )
+                images_list.append(
+                    self.image_transform(global_view).astype(mx.bfloat16)
+                )
+
+                # global_view_tensor = image_transform(global_view).to(torch.bfloat16)
+
+                width_crop_num, height_crop_num = crop_ratio
+
+                images_spatial_crop.append([width_crop_num, height_crop_num])
+
+                if width_crop_num > 1 or height_crop_num > 1:
+                    """process the local views"""
+
+                    for i in range(len(images_crop_raw)):
+                        images_crop_list.append(
+                            self.image_transform(images_crop_raw[i]).astype(mx.bfloat16)
                         )
-                    )
 
-            """record height / width crop num"""
-            num_width_tiles, num_height_tiles = (
-                best_width // self.image_size,
-                best_height // self.image_size,
-            )
-            images_spatial_crop.append([num_width_tiles, num_height_tiles])
+                if image_size == 640:
+                    valid_img_tokens += len(images_crop_list) * 100
 
-            """add image tokens"""
-            h = w = math.ceil(
-                (self.image_size // self.patch_size) / self.downsample_ratio
-            )
-            # global views tokens h * (w + 1), 1 is for line seperator
-            tokenized_image = [self.image_token_id] * h * (w + 1)
-            # add a seperator between global and local views
-            tokenized_image += [self.image_token_id]
-            # local views tokens, (num_height_tiles * h) * (num_width_tiles * w + 1)
-            tokenized_image += (
-                [self.image_token_id]
-                * (num_height_tiles * h)
-                * (num_width_tiles * w + 1)
-            )
+                num_queries = math.ceil((image_size // patch_size) / downsample_ratio)
+                num_queries_base = math.ceil(
+                    (base_size // patch_size) / downsample_ratio
+                )
 
-            tokenized_str += tokenized_image
-            images_seq_mask += [True] * len(tokenized_image)
-            num_image_tokens.append(len(tokenized_image))
+                """add image tokens"""
+
+                tokenized_image = (
+                    [self.image_token_id] * num_queries_base + [self.image_token_id]
+                ) * num_queries_base
+                tokenized_image += [self.image_token_id]
+                if width_crop_num > 1 or height_crop_num > 1:
+                    tokenized_image += (
+                        [self.image_token_id] * (num_queries * width_crop_num)
+                        + [self.image_token_id]
+                    ) * (num_queries * height_crop_num)
+                tokenized_str += tokenized_image
+                images_seq_mask += [True] * len(tokenized_image)
+                # num_image_tokens.append(len(tokenized_image))
+
+            else:
+                # best_width, best_height = self.image_size, self.image_size
+                # print(image.size, (best_width, best_height)) # check the select_best_resolutions func
+
+                """process the global view"""
+                if image_size <= 640:
+                    print("directly resize")
+                    image = image.resize((image_size, image_size))
+                # else:
+                global_view = ImageOps.pad(
+                    image,
+                    (image_size, image_size),
+                    color=tuple(int(x * 255) for x in self.image_transform.mean),
+                )
+                images_list.append(
+                    self.image_transform(global_view).astype(mx.bfloat16)
+                )
+
+                if base_size == 1024:
+                    valid_img_tokens += int(256 * ratio)
+                elif base_size == 1280:
+                    valid_img_tokens += int(400 * ratio)
+                elif base_size == 640:
+                    valid_img_tokens += int(100 * 1)
+                elif base_size == 512:
+                    valid_img_tokens += int(64 * 1)
+
+                width_crop_num, height_crop_num = 1, 1
+
+                images_spatial_crop.append([width_crop_num, height_crop_num])
+
+                """add image tokens"""
+                num_queries = math.ceil((image_size // patch_size) / downsample_ratio)
+
+                tokenized_image = (
+                    [self.image_token_id] * num_queries + [self.image_token_id]
+                ) * num_queries
+                tokenized_image += [self.image_token_id]
+                # tokenized_image += ([self.image_token_id] * (num_queries * width_crop_num) + [self.image_token_id]) * (
+                #             num_queries * height_crop_num)
+                tokenized_str += tokenized_image
+                images_seq_mask += [True] * len(tokenized_image)
 
         """process the last text split"""
         tokenized_sep = self.encode(text_splits[-1], bos=False, eos=False)
         tokenized_str += tokenized_sep
         images_seq_mask += [False] * len(tokenized_sep)
 
-        """add the bos and eos tokens"""
-        if bos:
-            tokenized_str = [self.bos_id] + tokenized_str
-            images_seq_mask = [False] + images_seq_mask
-        if eos:
-            tokenized_str = tokenized_str + [self.eos_id]
-            images_seq_mask = images_seq_mask + [False]
+        """add the bos tokens"""
+        bos_id = 0
+        tokenized_str = [bos_id] + tokenized_str
+        images_seq_mask = [False] + images_seq_mask
+
+        images_seq_mask = mx.array(images_seq_mask)
+
+        if len(images_list) == 0:
+            images_ori = mx.zeros((1, 3, image_size, image_size))
+            images_spatial_crop = mx.zeros((1, 2))
+            images_crop = mx.zeros((1, 3, base_size, base_size))
+
+        else:
+            images_ori = mx.stack(images_list, axis=0)
+            images_spatial_crop = mx.array(images_spatial_crop)
+            if images_crop_list:
+                images_crop = mx.stack(images_crop_list, axis=0)
+            else:
+                images_crop = mx.zeros((1, 3, base_size, base_size))
 
         assert len(tokenized_str) == len(
             images_seq_mask
@@ -410,89 +518,11 @@ class DeepseekVLV2Processor(ProcessorMixin):
 
         return (
             tokenized_str,
-            images_list,
+            [images_crop, images_ori],
             images_seq_mask,
             images_spatial_crop,
-            num_image_tokens,
+            valid_img_tokens,
         )
-
-    def batchify(
-        self,
-        sample_list: List[VLChatProcessorOutput],
-        padding: Literal["left", "right"] = "left",
-    ) -> BatchCollateOutput:
-        batched_sft_format = [sample.sft_format for sample in sample_list]
-        batched_input_ids = [sample.input_ids for sample in sample_list]
-        batched_labels = [sample.target_ids for sample in sample_list]
-        batched_images_seq_mask = [sample.images_seq_mask for sample in sample_list]
-        seq_lens = [len(sample) for sample in sample_list]
-
-        # Padding
-        if padding == "left":
-            # MLX implementation of padding
-            max_len = max(len(ids) for ids in batched_input_ids)
-
-            def pad_left(sequence, pad_val):
-                pad_len = max_len - len(sequence)
-                if pad_len > 0:
-                    padding = mx.full((pad_len,), pad_val)
-                    return mx.concatenate([padding, sequence])
-                return sequence
-
-            batched_input_ids = mx.stack(
-                [pad_left(ids, self.pad_id) for ids in batched_input_ids]
-            )
-            batched_labels = mx.stack(
-                [pad_left(ids, self.ignore_id) for ids in batched_labels]
-            )
-            batched_images_seq_mask = mx.stack(
-                [pad_left(mask, False) for mask in batched_images_seq_mask]
-            )
-            batched_attention_mask = batched_input_ids != self.pad_id
-
-        else:
-            batched_input_ids = self.pad_sequence(batched_input_ids, self.pad_id)
-            batched_labels = self.pad_sequence(batched_labels, self.ignore_id)
-            batched_images_seq_mask = self.pad_sequence(batched_images_seq_mask, False)
-            batched_attention_mask = batched_input_ids != self.pad_id
-
-        # Padding images
-        max_n_patches = max(sample.images.shape[0] for sample in sample_list)
-        batched_images = []
-        for sample in sample_list:
-            images = sample.images
-            n_pads = max_n_patches - images.shape[0]
-            if n_pads > 0:
-                pad_shape = (n_pads,) + images.shape[1:]
-                pad_images = mx.zeros(pad_shape)
-                images = mx.concatenate([images, pad_images])
-            batched_images.append(images)
-        batched_images = mx.stack(batched_images)
-
-        # Padding spatial crop info
-        max_n_images = max(
-            sample.images_spatial_crop.shape[0] for sample in sample_list
-        )
-        batched_images_spatial_crop = []
-        for sample in sample_list:
-            spatial_crop = sample.images_spatial_crop
-            n_pads = max_n_images - spatial_crop.shape[0]
-            if n_pads > 0:
-                pad_spatial = mx.zeros((n_pads, 2))
-                spatial_crop = mx.concatenate([spatial_crop, pad_spatial])
-            batched_images_spatial_crop.append(spatial_crop)
-        batched_images_spatial_crop = mx.stack(batched_images_spatial_crop)
-
-        return {
-            "input_ids": batched_input_ids,
-            "attention_mask": batched_attention_mask,
-            "labels": batched_labels,
-            "images": batched_images,
-            "images_seq_mask": batched_images_seq_mask,
-            "images_spatial_crop": batched_images_spatial_crop,
-            "sft_format": batched_sft_format,
-            "seq_lens": seq_lens,
-        }
 
     def __call__(
         self,
@@ -500,7 +530,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
         text: str = None,
         images: List[Image.Image] = None,
         apply_sft_format: bool = False,
-        force_batchify: bool = True,
+        force_batchify: bool = False,
         inference_mode: bool = True,
         system_prompt: str = "",
         **kwargs,
