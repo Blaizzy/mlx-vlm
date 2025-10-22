@@ -309,6 +309,7 @@ class MoEGate(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
+        self.scoring_func = config.scoring_func
         self.top_k = config.num_experts_per_tok
         self.n_routed_experts = config.n_routed_experts
         self.routed_scaling_factor = config.routed_scaling_factor
