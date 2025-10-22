@@ -1,0 +1,324 @@
+from functools import partial
+from math import sqrt
+from typing import Dict, Optional, Union
+
+import mlx.core as mx
+import mlx.nn as nn
+
+from .config import MLPConfig, VisionConfig
+
+
+def check_array_shape(arr):
+    shape = arr.shape
+
+    # Check if the shape has 4 dimensions
+    if len(shape) != 4:
+        return False
+
+    out_channels, kH, KW, _ = shape
+
+    # Check if out_channels is the largest, and kH and KW are the same
+    if (out_channels >= kH) and (out_channels >= KW) and (kH == KW):
+        return True
+    else:
+        return False
+
+
+class AttentionPoolLatent(nn.Module):
+    """Attention pooling w/ latent query"""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int = None,
+        embed_dim: int = None,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        qk_norm: bool = False,
+        latent_len: int = 1,
+        latent_dim: int = None,
+        pos_embed: str = "",
+        pool_type: str = "token",
+        norm_layer: Optional[nn.Module] = None,
+        drop: float = 0.0,
+    ):
+        super().__init__()
+
+        embed_dim = embed_dim or in_features
+        out_features = out_features or in_features
+        assert embed_dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim**-0.5
+        self.pool = pool_type
+
+        self.latent_dim = latent_dim or embed_dim
+        self.latent_len = latent_len
+        self.latent = mx.zeros((self.latent_len, embed_dim))[None, :]
+
+        self.q = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
+        self.kv = nn.Linear(embed_dim, embed_dim * 2, bias=qkv_bias)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.proj_drop = nn.Dropout(drop)
+
+        if pos_embed == "abs":
+            spatial_len = self.feat_size
+            self.pos_embed = mx.zeros((spatial_len, in_features))
+        else:
+            self.pos_embed = None
+
+        self.norm = nn.LayerNorm(out_features)
+        config = MLPConfig(
+            hidden_size=embed_dim, intermediate_size=int(embed_dim * mlp_ratio)
+        )
+        self.mlp = MLP(config)
+
+    def __call__(self, x: mx.array):
+        B, N, C = x.shape
+
+        if self.pos_embed is not None:
+            x = x + self.pos_embed.unsqueeze(0).to(x.dtype)
+
+        q_latent = mx.array(self.latent)
+
+        q = (
+            self.q(q_latent)
+            .reshape(B, self.latent_len, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+
+        kv = (
+            self.kv(x)
+            .reshape(B, N, 2, self.num_heads, self.head_dim)
+            .transpose(2, 0, 3, 1, 4)
+        )
+        k, v = mx.split(kv, 2, axis=0)
+
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        x = mx.fast.scaled_dot_product_attention(
+            q, k[0], v[0], scale=(1.0 / sqrt(q.shape[-1])), mask=None
+        )
+
+        x = x.transpose(0, 2, 1, 3).reshape(B, self.latent_len, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        x = x + self.mlp(self.norm(x))
+
+        # optional pool if latent seq_len > 1 and pooled output is desired
+        if self.pool == "token":
+            x = x[:, 0]
+        elif self.pool == "avg":
+            x = x.mean(1)
+        return x
+
+
+class Attention(nn.Module):
+    def __init__(
+        self,
+        dims: int,
+        num_heads: int,
+        qkv_bias: bool = True,
+    ):
+        super().__init__()
+
+        if (dims % num_heads) != 0:
+            raise ValueError(
+                "The input feature dimensions should be divisible by the "
+                f"number of heads ({dims} % {num_heads}) != 0"
+            )
+
+        self.num_heads = num_heads = num_heads
+        head_dim = dims // num_heads
+        self.scale = head_dim**-0.5
+
+        self.qkv_proj = nn.Linear(dims, dims * 3, bias=qkv_bias)
+        self.out_proj = nn.Linear(dims, dims, bias=True)
+
+    def __call__(self, x, mask=None):
+        qkv = self.qkv_proj(x)
+        queries, keys, values = mx.split(qkv, 3, axis=-1)
+
+        num_heads = self.num_heads
+        B, L, D = queries.shape
+        _, S, _ = keys.shape
+        queries = queries.reshape(B, L, num_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
+
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=self.scale, mask=mask
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+
+        return self.out_proj(output)
+
+
+class MLP(nn.Module):
+    def __init__(self, config: Union[VisionConfig, Dict], bias: bool = True):
+        super().__init__()
+        self.activation_fn = nn.GELU(approx="precise")
+        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=bias)
+        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=bias)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x = self.activation_fn(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+
+class EncoderLayer(nn.Module):
+    def __init__(self, config: VisionConfig):
+        super().__init__()
+        self.embed_dim = config.hidden_size
+        self.self_attn = Attention(
+            config.hidden_size, config.num_attention_heads, qkv_bias=True
+        )
+        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+        self.mlp = MLP(config)
+        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+
+    def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
+        y = self.layer_norm1(x)
+        y = self.self_attn(y, mask)
+        x = x + y
+        y = self.layer_norm2(x)
+        y = self.mlp(y)
+        return x + y
+
+
+class VisionEmbeddings(nn.Module):
+    def __init__(self, config: VisionConfig, norm_layer: bool = False):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.hidden_size
+        self.image_size = 224
+        self.patch_size = config.patch_size
+
+        self.class_embedding = mx.random.normal((self.embed_dim,))
+
+        self.patch_embedding = nn.Conv2d(
+            in_channels=config.num_channels,
+            out_channels=self.embed_dim,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+            bias=False,
+        )
+
+        self.num_patches = (self.image_size // self.patch_size) ** 2
+        self.num_positions = self.num_patches + 1
+        self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
+
+    def __call__(
+        self, x: mx.array, patch_embeds: Optional[mx.array] = None
+    ) -> mx.array:
+        batch_size, _, height, width = x.shape
+        target_dtype = self.position_embedding.weight.dtype
+
+        if patch_embeds is not None:
+            patch_embeddings = patch_embeds
+        else:
+            patch_embeddings = self.patch_embedding(x)
+
+        patch_embeds = mx.flatten(patch_embeddings, start_axis=2).transpose(0, 2, 1)
+        class_embeds = mx.broadcast_to(
+            self.class_embedding, (batch_size, 1, self.embed_dim)
+        ).astype(target_dtype)
+        embeddings = mx.concatenate([class_embeds, patch_embeds], axis=1)
+        position_embedding = mx.concatenate(
+            [
+                self.position_embedding[:, :1, :],
+                self._get_pos_embed(self.position_embedding[:, 1:, :], height, width),
+            ],
+            axis=1,
+        )
+        embeddings = embeddings + position_embedding.astype(target_dtype)
+
+        return embeddings
+
+
+class NoTPTransformer(nn.Module):
+    def __init__(self, config: VisionConfig):
+        super().__init__()
+        self.num_layers = config.layers
+        self.layers = [EncoderLayer(config) for _ in range(config.layers)]
+
+    def __call__(
+        self,
+        x: mx.array,
+        output_hidden_states: Optional[bool] = None,
+    ) -> mx.array:
+        encoder_states = (x,) if output_hidden_states else None
+        for l in self.layers:
+            x = l(x, mask=None)
+            if output_hidden_states:
+                encoder_states = encoder_states + (x,)
+
+        return x, encoder_states
+
+
+class VisionModel(nn.Module):
+    def __init__(self, config: VisionConfig):
+        super().__init__()
+
+        self.model_type = config.model_type
+        self.config = config
+        if self.model_type != "vision":
+            raise ValueError(f"Unsupported model type: {self.model_type}")
+
+        self.embeddings = VisionEmbeddings(config)
+        self.pre_layrnorm = nn.LayerNorm(config.hidden_size)
+        self.transformer = NoTPTransformer(config)
+
+    def __call__(
+        self,
+        x: mx.array,
+        patch_embeds: mx.array = None,
+        output_hidden_states: Optional[bool] = None,
+    ) -> mx.array:
+        x = self.embeddings(x, patch_embeds)
+        x = self.pre_layrnorm(x)
+
+        x, encoder_states = self.transformer(
+            x, output_hidden_states=output_hidden_states
+        )
+
+        return x, encoder_states
+
+    def sanitize(self, weights):
+        sanitized_weights = {}
+        weight_keys = {
+            "neck.0.weight",
+            "neck.2.weight",
+            "neck_hd.0.weight",
+            "neck_hd.2.weight",
+            "sam_model.net_2.weight",
+            "sam_model.net_3.weight",
+            "downsamples.0.weight",
+            "downsamples.1.weight",
+            "patch_embed.proj.weight",
+            "embeddings.patch_embedding.weight",
+        }
+        for k, v in weights.items():
+            if "position_ids" in k:
+                # Remove unused position_ids
+                continue
+
+            elif ".".join(k.split(".")[-3:]) in weight_keys:
+                # PyTorch conv2d weight tensors have shape:
+                #   [out_channels, in_channels, kH, KW]
+                # MLX conv2d expects the weight be of shape:
+                #   [out_channels, kH, KW, in_channels]
+                if check_array_shape(v):
+                    sanitized_weights[k] = v
+                else:
+                    sanitized_weights[k] = v.transpose(0, 2, 3, 1)
+
+            else:
+                sanitized_weights[k] = v
+
+        return sanitized_weights
