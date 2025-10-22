@@ -233,7 +233,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
             "{% for message in messages %}"
             "{% if message['role'] == 'user' %}"
             "{% elif message['role'] == 'assistant' %}{% endif %}"
-            "{{message['content']}}"
+            "{{message['content']}} "
             "{% endfor %}"
             "{% if add_generation_prompt %}{% endif %}"
         )
