@@ -166,7 +166,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(mx.load(wf))
 
-    model_class, model_type = get_model_and_args(config=config)
+    model_class, _ = get_model_and_args(config=config)
 
     # Initialize text and vision configs if not present
     config.setdefault("text_config", {})
