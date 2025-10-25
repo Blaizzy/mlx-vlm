@@ -1,11 +1,14 @@
+import inspect
 import math
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
+    BaseModelConfig,
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
@@ -64,9 +67,9 @@ class DeepseekV2YarnRotaryEmbedding(nn.Module):
         self.mscale = yarn_get_mscale(scaling_factor, mscale) / yarn_get_mscale(
             scaling_factor, mscale_all_dim
         )
-        freq_extra = base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim)
-        freq_inter = scaling_factor * base ** (
-            mx.arange(0, dim, 2, dtype=mx.float32) / dim
+        freq_extra = 1.0 / (base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim))
+        freq_inter = 1.0 / (
+            scaling_factor * base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim)
         )
         low, high = yarn_find_correction_range(
             beta_fast,
@@ -76,9 +79,7 @@ class DeepseekV2YarnRotaryEmbedding(nn.Module):
             original_max_position_embeddings,
         )
         freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2)
-        self._freqs = (freq_inter * freq_extra) / (
-            freq_inter * freq_mask + freq_extra * (1 - freq_mask)
-        )
+        self._freqs = freq_inter * (1 - freq_mask) + freq_extra * freq_mask
 
     def __call__(self, x, offset=0):
         if self.mscale != 1.0:
@@ -119,7 +120,7 @@ class DeepseekV2Attention(nn.Module):
             self.q_a_proj = nn.Linear(
                 self.hidden_size, self.q_lora_rank, bias=config.attention_bias
             )
-            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=1e-6)
+            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank)
             self.q_b_proj = nn.Linear(
                 self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
             )
@@ -129,7 +130,7 @@ class DeepseekV2Attention(nn.Module):
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=config.attention_bias,
         )
-        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=1e-6)
+        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank)
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank,
             self.num_heads
@@ -143,37 +144,30 @@ class DeepseekV2Attention(nn.Module):
             bias=config.attention_bias,
         )
 
-        if self.config.rope_scaling is None:
-            self.rope = nn.RoPE(
-                self.qk_rope_head_dim,
-                traditional=self.config.rope_traditional,
-                base=self.rope_theta,
-            )
-        else:
-            mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
-            scaling_factor = self.config.rope_scaling.get("factor", 1)
-            if mscale_all_dim:
-                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-                self.scale = self.scale * mscale * mscale
+        mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
+        scaling_factor = self.config.rope_scaling.get("factor", 1)
+        if mscale_all_dim:
+            mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+            self.scale = self.scale * mscale * mscale
 
-                rope_kwargs = {
-                    key: self.config.rope_scaling[key]
-                    for key in [
-                        "original_max_position_embeddings",
-                        "beta_fast",
-                        "beta_slow",
-                        "mscale",
-                        "mscale_all_dim",
-                    ]
-                    if key in self.config.rope_scaling
-                }
-                self.rope = DeepseekV2YarnRotaryEmbedding(
-                    dim=self.qk_rope_head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                    base=self.rope_theta,
-                    **rope_kwargs,
-                )
+            rope_kwargs = {
+                key: self.config.rope_scaling[key]
+                for key in [
+                    "original_max_position_embeddings",
+                    "beta_fast",
+                    "beta_slow",
+                    "mscale",
+                    "mscale_all_dim",
+                ]
+                if key in self.config.rope_scaling
+            }
+            self.rope = DeepseekV2YarnRotaryEmbedding(
+                dim=self.qk_rope_head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                scaling_factor=scaling_factor,
+                base=self.rope_theta,
+                **rope_kwargs,
+            )
 
     def __call__(
         self,
@@ -214,7 +208,7 @@ class DeepseekV2Attention(nn.Module):
         queries = mx.concatenate([q_nope, q_pe], axis=-1)
 
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            queries, keys, values, cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -316,6 +310,8 @@ class MoEGate(nn.Module):
         self.topk_method = config.topk_method
         self.n_group = config.n_group
         self.topk_group = config.topk_group
+        if self.topk_method == "noaux_tc":
+            self.e_score_correction_bias = mx.zeros((self.n_routed_experts))
         self.weight = mx.zeros((self.n_routed_experts, config.hidden_size))
 
     def __call__(self, x):
@@ -384,7 +380,6 @@ class MoEGate(nn.Module):
             raise ValueError(f"Unknown topk method: {self.topk_method}")
 
         scores = scores * self.routed_scaling_factor
-
         return inds, scores
 
 
