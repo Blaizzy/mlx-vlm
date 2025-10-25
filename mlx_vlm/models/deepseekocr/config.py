@@ -101,7 +101,7 @@ class ModelConfig(BaseModelConfig):
     projector_config: ProjectorConfig
     model_type: str
     ignore_index: int = -100
-    image_token_index: int = 100015
+    image_token_index: int = 128815
     vision_feature_select_strategy: str = "default"
     select_layer: int = -1
     pad_id: int = 100001
