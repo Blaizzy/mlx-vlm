@@ -19,26 +19,12 @@ class MlpProjector(nn.Module):
     def __init__(self, config: ProjectorConfig):
         super().__init__()
         self.config = config
-        if config.projector_config.projector_type == "identity":
-            modules = nn.Identity()
-        elif config.projector_config.projector_type == "linear":
+
+        if config.projector_config.projector_type == "linear":
             modules = nn.Linear(
                 config.projector_config.input_dim, config.projector_config.n_embed
             )
-        elif config.projector_config.projector_type == "mlp_gelu":
-            mlp_depth = config.projector_config.depth
-            modules = [
-                nn.Linear(
-                    config.projector_config.input_dim, config.projector_config.n_embed
-                )
-            ]
-            for _ in range(1, mlp_depth):
-                modules.append(nn.GELU())
-                modules.append(
-                    nn.Linear(
-                        config.projector_config.n_embed, config.projector_config.n_embed
-                    )
-                )
+
         elif config.projector_config.projector_type == "downsample_mlp_gelu":
             mlp_depth = config.projector_config.depth
             mlp_ratio = config.projector_config.mlp_ratio
@@ -70,36 +56,10 @@ class MlpProjector(nn.Module):
                 f"Unknown projector type: {config.projector_config.projector_type}"
             )
 
-        if config.projector_config.token_pooling:
-            self.token_pooling_layer = nn.Linear(
-                config.projector_config.input_dim * 4, config.projector_config.input_dim
-            )
         self.layers = modules
 
     def __call__(self, x):
-        if self.config.projector_config.token_pooling:
-            batch_size, wxh, channels = x.shape
-            w = h = int(math.sqrt(wxh))
-            x = mx.reshape(x, (batch_size, w, h, channels))
-            x = mx.transpose(x, (0, 3, 1, 2))  # B, C, H, W
-
-            # Implement unfold operation manually since MLX doesn't have unfold
-            patches = []
-            for i in range(0, h - 1, 2):
-                for j in range(0, w - 1, 2):
-                    patch = x[:, :, i : i + 2, j : j + 2]
-                    patches.append(patch)
-
-            patches = mx.stack(patches, axis=2)  # B, C, N_patches, 2, 2
-            batch_size, channels, n_patches, _, _ = patches.shape
-
-            # Reshape and concatenate
-            patches = mx.reshape(patches, (batch_size, channels, n_patches, -1))
-            patches = mx.transpose(patches, (0, 2, 1, 3))
-            patches = mx.reshape(patches, (batch_size, n_patches, channels * 4))
-            x = self.token_pooling_layer(patches)
-
-        elif self.config.projector_config.projector_type == "downsample_mlp_gelu":
+        if self.config.projector_config.projector_type == "downsample_mlp_gelu":
             bs, hw, input_dim = x.shape
             h = w = int(math.sqrt(hw))
 
@@ -129,7 +89,7 @@ class MlpProjector(nn.Module):
 
             x = mx.stack(patches, axis=1)  # B, N_patches, C*ds*ds
 
-        if self.config.projector_config.projector_type in ["indentity", "linear"]:
+        if self.config.projector_config.projector_type == "linear":
             x = self.layers(x)
         else:
             for layer in self.layers:
@@ -159,19 +119,25 @@ class Model(nn.Module):
 
         self.tile_tag = config.tile_tag
         self.global_view_pos = config.global_view_pos
-
         # 用于format image token sequence的特殊token
         embed_std = 1 / mx.sqrt(
             mx.array(config.projector_config.n_embed, dtype=mx.float32)
         )
-        # <|view_separator|>, <|\n|>
-        self.image_newline = mx.array(
-            mx.random.normal((config.projector_config.n_embed,)) * embed_std
-        )
-        # fix the typo: view_seperater
-        self.view_separator = mx.array(
-            mx.random.normal((config.projector_config.n_embed,)) * embed_std
-        )
+
+        if self.tile_tag == "2D":
+
+            # <|view_separator|>, <|\n|>
+            self.image_newline = mx.array(
+                mx.random.normal((config.projector_config.n_embed,)) * embed_std
+            )
+            # fix the typo: view_seperater
+            self.view_separator = mx.array(
+                mx.random.normal((config.projector_config.n_embed,)) * embed_std
+            )
+        else:
+            raise ValueError(
+                f"Only 2D tile_tag is supported currently, got: {self.tile_tag}"
+            )
 
     def get_input_embeddings(
         self,
@@ -193,7 +159,7 @@ class Model(nn.Module):
 
             idx = 0
 
-            for crop_shape in images_spatial_crop:
+            for crop_shape in images_spatial_crop.tolist():
                 images_in_this_batch = []
                 patches = pixel_values[0]
                 image_ori = pixel_values[1]
@@ -203,14 +169,14 @@ class Model(nn.Module):
                     crop_flag = 1
                     local_features_1 = self.sam_model(patches.transpose(0, 2, 3, 1))
 
-                    local_features_2, _ = self.vision_model(
+                    local_features_2 = self.vision_model(
                         patches.transpose(0, 2, 3, 1), patch_embeds=local_features_1
                     )
 
                     local_features = mx.concatenate(
                         (
                             local_features_2[:, 1:],
-                            mx.flatten(local_features_1, start_axis=1, end_axis=2),
+                            local_features_1.flatten(start_axis=1, end_axis=2),
                         ),
                         axis=-1,
                     )
@@ -218,13 +184,17 @@ class Model(nn.Module):
                     local_features = self.projector(local_features)
 
                     global_features_1 = self.sam_model(image_ori.transpose(0, 2, 3, 1))
-                    global_features_2, _ = self.vision_model(
+                    global_features_2 = self.vision_model(
                         image_ori.transpose(0, 2, 3, 1), global_features_1
+                    )
+                    global_features_1_flat = mx.reshape(
+                        global_features_1,
+                        (global_features_1.shape[0], -1, global_features_1.shape[-1]),
                     )
                     global_features = mx.concatenate(
                         (
                             global_features_2[:, 1:],
-                            mx.flatten(global_features_1, start_axis=1, end_axis=2),
+                            global_features_1_flat,
                         ),
                         axis=-1,
                     )
@@ -242,8 +212,8 @@ class Model(nn.Module):
                     h2 = w2 = int(hw2**0.5)
 
                     width_crop_num, height_crop_num = (
-                        crop_shape[0].tolist(),
-                        crop_shape[1].tolist(),
+                        crop_shape[0],
+                        crop_shape[1],
                     )
 
                     global_features = global_features.reshape(h, w, n_dim)
@@ -286,7 +256,7 @@ class Model(nn.Module):
 
                 else:
                     global_features_1 = self.sam_model(image_ori.transpose(0, 2, 3, 1))
-                    global_features_2, _ = self.vision_model(
+                    global_features_2 = self.vision_model(
                         image_ori.transpose(0, 2, 3, 1), global_features_1
                     )
                     global_features = mx.concatenate(
@@ -350,6 +320,7 @@ class Model(nn.Module):
 
         images_spatial_crop = kwargs.get("images_spatial_crop", None)
         images_seq_mask = kwargs.get("images_seq_mask", None)
+
         input_embeddings = self.get_input_embeddings(
             input_ids, pixel_values, images_spatial_crop, images_seq_mask
         )
