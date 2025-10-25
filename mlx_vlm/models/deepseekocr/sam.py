@@ -325,12 +325,9 @@ class SAMEncoder(nn.Module):
         if self.use_abs_pos:
             x = x + get_abs_pos_sam(self.pos_embed, x.shape[1])
 
-        patch_embed = x
-
         # Apply transformer blocks
         for blk in self.blocks:
             x = blk(x)
-        patch_block = x
 
         # Apply neck layers
         for n in self.neck:
