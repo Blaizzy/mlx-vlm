@@ -7,7 +7,7 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import interpolate
-from .config import MLPConfig, VisionConfig
+from .config import VisionConfig
 
 
 def check_array_shape(arr):
@@ -24,99 +24,6 @@ def check_array_shape(arr):
         return True
     else:
         return False
-
-
-class AttentionPoolLatent(nn.Module):
-    """Attention pooling w/ latent query"""
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int = None,
-        embed_dim: int = None,
-        num_heads: int = 8,
-        mlp_ratio: float = 4.0,
-        qkv_bias: bool = True,
-        qk_norm: bool = False,
-        latent_len: int = 1,
-        latent_dim: int = None,
-        pos_embed: str = "",
-        pool_type: str = "token",
-        norm_layer: Optional[nn.Module] = None,
-        drop: float = 0.0,
-    ):
-        super().__init__()
-
-        embed_dim = embed_dim or in_features
-        out_features = out_features or in_features
-        assert embed_dim % num_heads == 0
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim**-0.5
-        self.pool = pool_type
-
-        self.latent_dim = latent_dim or embed_dim
-        self.latent_len = latent_len
-        self.latent = mx.zeros((self.latent_len, embed_dim))[None, :]
-
-        self.q = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
-        self.kv = nn.Linear(embed_dim, embed_dim * 2, bias=qkv_bias)
-        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.proj = nn.Linear(embed_dim, embed_dim)
-        self.proj_drop = nn.Dropout(drop)
-
-        if pos_embed == "abs":
-            spatial_len = self.feat_size
-            self.pos_embed = mx.zeros((spatial_len, in_features))
-        else:
-            self.pos_embed = None
-
-        self.norm = nn.LayerNorm(out_features)
-        config = MLPConfig(
-            hidden_size=embed_dim, intermediate_size=int(embed_dim * mlp_ratio)
-        )
-        self.mlp = MLP(config)
-
-    def __call__(self, x: mx.array):
-        B, N, C = x.shape
-
-        if self.pos_embed is not None:
-            x = x + self.pos_embed.unsqueeze(0).to(x.dtype)
-
-        q_latent = mx.array(self.latent)
-
-        q = (
-            self.q(q_latent)
-            .reshape(B, self.latent_len, self.num_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-
-        kv = (
-            self.kv(x)
-            .reshape(B, N, 2, self.num_heads, self.head_dim)
-            .transpose(2, 0, 3, 1, 4)
-        )
-        k, v = mx.split(kv, 2, axis=0)
-
-        q, k = self.q_norm(q), self.k_norm(k)
-
-        x = mx.fast.scaled_dot_product_attention(
-            q, k[0], v[0], scale=(1.0 / sqrt(q.shape[-1])), mask=None
-        )
-
-        x = x.transpose(0, 2, 1, 3).reshape(B, self.latent_len, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-
-        x = x + self.mlp(self.norm(x))
-
-        # optional pool if latent seq_len > 1 and pooled output is desired
-        if self.pool == "token":
-            x = x[:, 0]
-        elif self.pool == "avg":
-            x = x.mean(1)
-        return x
 
 
 class Attention(nn.Module):
@@ -194,7 +101,7 @@ class EncoderLayer(nn.Module):
 
 
 class VisionEmbeddings(nn.Module):
-    def __init__(self, config: VisionConfig, norm_layer: bool = False):
+    def __init__(self, config: VisionConfig):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
@@ -239,8 +146,6 @@ class VisionEmbeddings(nn.Module):
             old_pos_embed = mx.transpose(old_pos_embed, (0, 3, 1, 2))
             old_pos_embed = old_pos_embed.astype(mx.float32)
 
-            # MLX doesn't have F.interpolate, so we'll implement bicubic interpolation
-            # using available operations or a simpler alternative
             new_pos_embed = interpolate(old_pos_embed, (tgt_size_2d, tgt_size_2d))
 
             new_pos_embed = new_pos_embed.astype(dtype)
@@ -259,18 +164,27 @@ class VisionEmbeddings(nn.Module):
     ) -> mx.array:
         batch_size, height, width, _ = x.shape
         target_dtype = self.position_embedding.weight.dtype
+
         if patch_embeds is not None:
             patch_embeddings = patch_embeds
         else:
             patch_embeddings = self.patch_embedding(x)
 
+        # Flatten patch embeddings properly
         patch_embeds = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
+
+        # Broadcast class embedding
         class_embeds = mx.broadcast_to(
             self.class_embedding, (batch_size, 1, self.embed_dim)
         ).astype(target_dtype)
+
+        # Concatenate class and patch embeddings
         embeddings = mx.concatenate([class_embeds, patch_embeds], axis=1)
+
+        # Create position IDs
         position_ids = mx.array(np.arange(self.num_positions)[None, :])
 
+        # Add positional embeddings
         embeddings = embeddings + self._get_abs_pos(
             self.position_embedding(position_ids), embeddings.shape[1]
         ).astype(target_dtype)
@@ -287,15 +201,10 @@ class NoTPTransformer(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
-        encoder_states = (x,) if output_hidden_states else None
         for l in self.layers:
             x = l(x, mask=None)
-            if output_hidden_states:
-                encoder_states = encoder_states + (x,)
-
-        return x, encoder_states
+        return x
 
 
 class VisionModel(nn.Module):
@@ -315,16 +224,10 @@ class VisionModel(nn.Module):
         self,
         x: mx.array,
         patch_embeds: mx.array = None,
-        output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
         x = self.embeddings(x, patch_embeds)
         x = self.pre_layrnorm(x)
-
-        x, encoder_states = self.transformer(
-            x, output_hidden_states=output_hidden_states
-        )
-
-        return x, encoder_states
+        return self.transformer(x)
 
     def sanitize(self, weights):
         sanitized_weights = {}
