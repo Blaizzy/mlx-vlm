@@ -1576,6 +1576,28 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
         )
 
+    def test_deepseekocr(self):
+        from mlx_vlm.models import deepseekocr
+
+        text_config = deepseekocr.TextConfig()
+        vision_config = deepseekocr.VisionConfig(model_type="vision")
+        projector_config = deepseekocr.ProjectorConfig(projector_type="linear")
+        config = deepseekocr.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            projector_config=projector_config,
+            model_type="deepseekocr",
+        )
+        model = deepseekocr.Model(config)
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        # TODO: Add test for vision model. Ensure I can pass input type and shapes.
+
 
 if __name__ == "__main__":
     unittest.main()
