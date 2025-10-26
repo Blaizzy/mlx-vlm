@@ -52,6 +52,7 @@ MODEL_CONFIG = {
     "phi3_v": MessageFormat.NUMBERED_IMAGE_TOKENS,
     "multi_modality": MessageFormat.IMAGE_TOKEN,
     "deepseek_vl_v2": MessageFormat.IMAGE_TOKEN_NEWLINE,
+    "deepseekocr": MessageFormat.IMAGE_TOKEN_NEWLINE,
     # Prompt-only models
     "florence2": MessageFormat.PROMPT_ONLY,
     "molmo": MessageFormat.PROMPT_ONLY,

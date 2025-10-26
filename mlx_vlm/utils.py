@@ -68,7 +68,7 @@ def get_model_and_args(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    model_type = config["model_type"]
+    model_type = config["model_type"].lower()
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
@@ -872,6 +872,8 @@ def prepare_inputs(
         for key, value in inputs.items():
             if key not in model_inputs and not isinstance(value, (str, list)):
                 model_inputs[key] = mx.array(value)
+            else:
+                model_inputs[key] = value
 
     return model_inputs
 
