@@ -67,9 +67,9 @@ class DeepseekV2YarnRotaryEmbedding(nn.Module):
         self.mscale = yarn_get_mscale(scaling_factor, mscale) / yarn_get_mscale(
             scaling_factor, mscale_all_dim
         )
-        freq_extra = 1.0 / (base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim))
-        freq_inter = 1.0 / (
-            scaling_factor * base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim)
+        freq_extra = base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim)
+        freq_inter = scaling_factor * base ** (
+            mx.arange(0, dim, 2, dtype=mx.float32) / dim
         )
         low, high = yarn_find_correction_range(
             beta_fast,
@@ -79,7 +79,9 @@ class DeepseekV2YarnRotaryEmbedding(nn.Module):
             original_max_position_embeddings,
         )
         freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2)
-        self._freqs = freq_inter * (1 - freq_mask) + freq_extra * freq_mask
+        self._freqs = (freq_inter * freq_extra) / (
+            freq_inter * freq_mask + freq_extra * (1 - freq_mask)
+        )
 
     def __call__(self, x, offset=0):
         if self.mscale != 1.0:
@@ -144,30 +146,37 @@ class DeepseekV2Attention(nn.Module):
             bias=config.attention_bias,
         )
 
-        mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
-        scaling_factor = self.config.rope_scaling.get("factor", 1)
-        if mscale_all_dim:
-            mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-            self.scale = self.scale * mscale * mscale
-
-            rope_kwargs = {
-                key: self.config.rope_scaling[key]
-                for key in [
-                    "original_max_position_embeddings",
-                    "beta_fast",
-                    "beta_slow",
-                    "mscale",
-                    "mscale_all_dim",
-                ]
-                if key in self.config.rope_scaling
-            }
-            self.rope = DeepseekV2YarnRotaryEmbedding(
-                dim=self.qk_rope_head_dim,
-                max_position_embeddings=self.max_position_embeddings,
-                scaling_factor=scaling_factor,
+        if self.config.rope_scaling is None:
+            self.rope = nn.RoPE(
+                self.qk_rope_head_dim,
+                traditional=self.config.rope_traditional,
                 base=self.rope_theta,
-                **rope_kwargs,
             )
+        else:
+            mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
+            scaling_factor = self.config.rope_scaling.get("factor", 1)
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+                self.scale = self.scale * mscale * mscale
+
+                rope_kwargs = {
+                    key: self.config.rope_scaling[key]
+                    for key in [
+                        "original_max_position_embeddings",
+                        "beta_fast",
+                        "beta_slow",
+                        "mscale",
+                        "mscale_all_dim",
+                    ]
+                    if key in self.config.rope_scaling
+                }
+                self.rope = DeepseekV2YarnRotaryEmbedding(
+                    dim=self.qk_rope_head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                    base=self.rope_theta,
+                    **rope_kwargs,
+                )
 
     def __call__(
         self,
@@ -315,72 +324,81 @@ class MoEGate(nn.Module):
         self.weight = mx.zeros((self.n_routed_experts, config.hidden_size))
 
     def __call__(self, x):
+        bsz, seq_len = x.shape[:2]
+        # Layer-specific forced gate takes precedence
+        layer_idx = getattr(self, "_layer_index", None)
+
         gates = x @ self.weight.T
 
         if self.scoring_func == "softmax":
-            scores = mx.softmax(gates, axis=-1, precise=True)
+            scores = mx.softmax(gates, axis=-1, precise=True)  # type: ignore[call-arg]
         elif self.scoring_func == "sigmoid":
             scores = mx.sigmoid(gates)
         else:
             raise ValueError(f"Unknown scoring function: {self.scoring_func}")
 
         if self.topk_method == "greedy":
-            bsz, seq_len = x.shape[:2]
-            scores = scores.reshape(bsz, seq_len, self.n_group, -1)
-            group_scores = scores.max(axis=-1)
-
-            # Get top-k groups
-            k = self.n_group - self.topk_group
-            group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-1)[..., :k]
-            batch_idx = mx.expand_dims(mx.arange(bsz), (1, 2))
-            seq_idx = mx.expand_dims(mx.arange(seq_len), (0, 2))
-
-            # Mask out top-k groups
-            scores[batch_idx, seq_idx, group_idx] = 0.0
-            scores = scores.reshape(bsz, seq_len, -1)
-
-            # Get top-k indices and weights
+            flat_scores = scores
             k = self.top_k
-            inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-            scores = mx.take_along_axis(scores, inds, axis=-1)
+            inds = mx.argpartition(flat_scores, kth=-k, axis=-1)[..., -k:]
+            scores_selected = mx.take_along_axis(flat_scores, inds, axis=-1)
 
         elif self.topk_method == "noaux_tc":
-            bsz, seq_len = x.shape[:2]
+            experts_per_group = self.n_routed_experts // self.n_group
+            topk_group = self.topk_group if self.topk_group else self.n_group
 
-            # Add bias correction
-            scores_for_choice = scores.reshape(bsz * seq_len, -1) + mx.expand_dims(
-                self.e_score_correction_bias, 0
+            scores_bt = scores.reshape(bsz, seq_len, self.n_routed_experts)
+            bias = self.e_score_correction_bias.astype(mx.float32)
+            bias = mx.reshape(bias, (1, 1, self.n_routed_experts))
+            corrected = scores_bt + bias
+            corrected_groups = corrected.reshape(
+                bsz, seq_len, self.n_group, experts_per_group
             )
 
-            # Calculate group scores using top-2 sum per group
-            scores_reshaped = scores_for_choice.reshape(bsz * seq_len, self.n_group, -1)
+            sorted_groups = mx.sort(corrected_groups, axis=-1)
+            if experts_per_group >= 2:
+                top_values = sorted_groups[..., -2:]
+            else:
+                top_values = sorted_groups
+            group_scores = mx.sum(top_values, axis=-1)
 
-            # Get top 2 scores per group
-            group_scores = mx.topk(scores_reshaped, 2, axis=-1).sum(axis=-1)
+            if topk_group < self.n_group:
+                kth_group = self.n_group - topk_group
+                group_idx = mx.argpartition(group_scores, kth=kth_group, axis=-1)[
+                    ..., -topk_group:
+                ]
+                group_axis = mx.reshape(
+                    mx.arange(self.n_group, dtype=mx.int32), (1, 1, self.n_group)
+                )
+                mask = mx.zeros(group_scores.shape, dtype=mx.bool_)
+                for slot in range(topk_group):
+                    idx = mx.expand_dims(group_idx[..., slot], axis=-1)
+                    mask = mx.logical_or(mask, mx.equal(idx, group_axis))
+            else:
+                mask = mx.ones(group_scores.shape, dtype=mx.bool_)
 
-            # Get top groups
-            k = self.n_group - self.topk_group
+            mask_expanded = mx.expand_dims(mask, axis=-1)
+            corrected_masked = mx.where(
+                mask_expanded,
+                corrected_groups,
+                mx.zeros_like(corrected_groups),
+            )
 
-            # Create mask for selected groups
-            group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-1)[..., :k]
-            batch_idx = mx.expand_dims(mx.arange(bsz), (1, 2))
+            corrected_flat = corrected_masked.reshape(bsz, seq_len, -1)
+            raw_flat = scores_bt
 
-            seq_idx = mx.expand_dims(mx.arange(seq_len), (0, 2))
-            scores[batch_idx, seq_idx, group_idx] = 0.0
+            total_experts = corrected_flat.shape[-1]
+            kth_value = max(total_experts - self.top_k, 0)
+            inds = mx.argpartition(corrected_flat, kth=kth_value, axis=-1)[
+                ..., -self.top_k :
+            ].astype(mx.int32)
+            scores_selected = mx.take_along_axis(raw_flat, inds, axis=-1)
 
-            # Get top-k indices and weights
-            k = self.top_k
-            inds = mx.argpartition(scores, kth=-k, axis=-1)[..., -k:]
-
-            # Gather original scores for the selected indices
-            scores_flat = scores.reshape(bsz * seq_len, -1)
-            batch_idx = mx.expand_dims(mx.arange(bsz * seq_len), 1)
-            scores = mx.take(scores_flat, inds + batch_idx * scores_flat.shape[1])
         else:
             raise ValueError(f"Unknown topk method: {self.topk_method}")
 
-        scores = scores * self.routed_scaling_factor
-        return inds, scores
+        scores_selected = scores_selected * self.routed_scaling_factor
+        return inds, scores_selected
 
 
 class DeepseekV2MoE(nn.Module):
