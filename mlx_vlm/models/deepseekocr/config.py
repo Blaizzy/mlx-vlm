@@ -32,7 +32,7 @@ class TextConfig(BaseModelConfig):
     max_position_embeddings: int = 2048
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
-    rope_traditional: bool = True
+    rope_traditional: bool = False
     rope_scaling: Dict = None
     attention_bias: bool = False
     scoring_func: str = "softmax"
