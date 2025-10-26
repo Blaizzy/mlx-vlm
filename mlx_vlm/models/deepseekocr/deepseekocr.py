@@ -164,8 +164,6 @@ class Model(nn.Module):
                 patches = pixel_values[0]
                 image_ori = pixel_values[1]
                 if mx.sum(patches).item() != 0:
-                    # P, C, H, W = patches.shape
-
                     crop_flag = 1
                     local_features_1 = self.sam_model(patches.transpose(0, 2, 3, 1))
 
