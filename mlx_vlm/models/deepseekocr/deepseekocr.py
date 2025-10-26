@@ -187,14 +187,11 @@ class Model(nn.Module):
                     global_features_2 = self.vision_model(
                         image_ori.transpose(0, 2, 3, 1), global_features_1
                     )
-                    global_features_1_flat = mx.reshape(
-                        global_features_1,
-                        (global_features_1.shape[0], -1, global_features_1.shape[-1]),
-                    )
+
                     global_features = mx.concatenate(
                         (
                             global_features_2[:, 1:],
-                            global_features_1_flat,
+                            global_features_1.flatten(start_axis=1, end_axis=2),
                         ),
                         axis=-1,
                     )
@@ -262,7 +259,7 @@ class Model(nn.Module):
                     global_features = mx.concatenate(
                         (
                             global_features_2[:, 1:],
-                            mx.flatten(global_features_1, start_axis=1, end_axis=2),
+                            global_features_1.flatten(start_axis=1, end_axis=2),
                         ),
                         axis=-1,
                     )
