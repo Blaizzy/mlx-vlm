@@ -872,10 +872,11 @@ def prepare_inputs(
 
         # Convert inputs to model_inputs with mx.array if present
         for key, value in inputs.items():
-            if key not in model_inputs and not isinstance(value, (str, list)):
-                model_inputs[key] = mx.array(value)
-            elif key not in model_inputs:
-                model_inputs[key] = value
+            if key not in model_inputs:
+                if isinstance(value, (str, list, mx.array)):
+                    model_inputs[key] = value
+                else:
+                    model_inputs[key] = mx.array(value)
 
     return model_inputs
 
