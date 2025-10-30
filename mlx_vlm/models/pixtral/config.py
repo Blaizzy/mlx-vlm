@@ -33,6 +33,7 @@ class TextConfig(BaseModelConfig):
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     max_position_embeddings: int = 4096
+    use_qk_norm: bool = True
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
