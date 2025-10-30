@@ -53,6 +53,7 @@ def skip_multimodal_module(path: str) -> bool:
     return (
         "vision_model" in path
         or "vision_tower" in path
+        or "sam_model" in path
         or "audio_model" in path
         or "audio_tower" in path
     )
@@ -868,12 +869,14 @@ def prepare_inputs(
         model_inputs["attention_mask"] = (
             mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
         )
+
         # Convert inputs to model_inputs with mx.array if present
         for key, value in inputs.items():
-            if key not in model_inputs and not isinstance(value, (str, list)):
-                model_inputs[key] = mx.array(value)
-            else:
-                model_inputs[key] = value
+            if key not in model_inputs:
+                if isinstance(value, (str, list, mx.array)):
+                    model_inputs[key] = value
+                else:
+                    model_inputs[key] = mx.array(value)
 
     return model_inputs
 
