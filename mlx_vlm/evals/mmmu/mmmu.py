@@ -50,9 +50,18 @@ MMMU_SUBJECTS = [
 ]
 
 
+def normalize_number(s):
+    """Normalize numeric strings for comparison."""
+    try:
+        return float(str(s).strip().replace(",", ""))
+    except:
+        return str(s).strip()
+
+
 def MMMU_eval(data: list, eval_file: str):
     """
     Evaluate MMMU results by subject.
+    Handles both multiple choice (A-F) and open-ended questions.
     """
 
     # Track by subject
@@ -62,7 +71,7 @@ def MMMU_eval(data: list, eval_file: str):
     total_correct = 0
     total_questions = 0
 
-    for line in tqdm(data, desc="Evaluating"):
+    for line in data:
         predict = str(line["prediction"])
         answer = str(line["answer"])
         subject = str(line.get("subject", "Unknown"))
@@ -76,46 +85,73 @@ def MMMU_eval(data: list, eval_file: str):
         subject_counters[subject] += 1
         total_questions += 1
 
-        # Normalize answer and prediction
-        answer = answer.lower().strip()
-        predict = predict.lower().strip()
+        # Normalize for comparison
+        predict_lower = predict.lower().strip()
+        answer_lower = answer.lower().strip()
 
-        # Check if prediction is correct
         is_correct = False
 
-        # Extract all possible answer patterns from prediction
-        # Look for patterns like "A", "Option A", "Answer: A", "(A)", "A.", "A)", etc.
-        patterns = [
-            r"\b([a-d])\b",  # Single letter with word boundaries
-            r"option\s*([a-d])",
-            r"answer[:\s]+([a-d])",
-            r"choice[:\s]+([a-d])",
-            r"\(([a-d])\)",
-            r"^([a-d])[.:\)]",  # At start with punctuation
-            r"select[:\s]+([a-d])",
-            r"correct[:\s]+([a-d])",
-        ]
+        # Check if this is a multiple choice question (answer is A-F or I)
+        if answer in ["A", "B", "C", "D", "E", "F", "I"]:
+            # Multiple choice extraction with prioritized patterns
+            patterns = [
+                (r"option\s+([a-f])\b", 10),  # High priority
+                (r"answer\s+is:?\s+([a-f])\b", 10),
+                (r"choice\s+is:?\s+([a-f])\b", 10),
+                (r"correct\s+answer\s+is:?\s+([a-f])\b", 10),
+                (r"correct\s+option\s+is:?\s+\(?([a-f])\)?", 10),
+                (r"\(([a-f])\)", 8),  # Medium priority
+                (r"^([a-f])[.:\)]\s", 8),
+                (r"\b([a-f])\b", 5),  # Low priority - isolated letters
+            ]
 
-        # Try each pattern
-        for pattern in patterns:
-            matches = re.findall(pattern, predict, re.IGNORECASE)
-            if matches:
-                # Take the first match (usually the most relevant)
-                extracted = matches[0].lower()
-                if answer == extracted:
-                    is_correct = True
-                    break
+            best_match = None
+            best_priority = -1
 
-        # If no pattern matched, try direct comparison with first character
-        if not is_correct and len(predict) > 0:
-            if answer == predict[0]:
+            # Try each pattern, keeping the highest priority match
+            for pattern, priority in patterns:
+                matches = re.findall(pattern, predict_lower, re.IGNORECASE)
+                if matches and priority > best_priority:
+                    best_match = matches[0].lower()
+                    best_priority = priority
+                    # Stop early if we found a high-confidence pattern
+                    if priority >= 10:
+                        break
+
+            # Check if match is correct
+            if best_match and best_match == answer_lower:
                 is_correct = True
+            # Fallback: check first character
+            elif (
+                not best_match
+                and len(predict_lower) > 0
+                and predict_lower[0] in "abcdef"
+            ):
+                if predict_lower[0] == answer_lower:
+                    is_correct = True
 
-        # Debug output for failed matches
-        if not is_correct and answer in ["a", "b", "c", "d"]:
-            logger.debug(
-                f"Failed match - Answer: {answer}, Prediction: {predict[:100]}"
-            )
+        else:
+            # Open-ended question - check if answer appears in prediction
+            # Exact substring match (case-insensitive)
+            if answer_lower in predict_lower:
+                is_correct = True
+            # For numeric answers, try numeric comparison
+            elif answer.replace(".", "").replace("-", "").replace(",", "").isdigit():
+                numbers = re.findall(r"-?\d+\.?\d*", predict)
+                answer_num = normalize_number(answer)
+                for num_str in numbers:
+                    try:
+                        if abs(normalize_number(num_str) - answer_num) < 0.01:
+                            is_correct = True
+                            break
+                    except:
+                        pass
+            # Word-level match for text answers
+            else:
+                answer_words = set(answer_lower.split())
+                predict_words = set(predict_lower.split())
+                if answer_words and answer_words.issubset(predict_words):
+                    is_correct = True
 
         if is_correct:
             total_correct += 1
