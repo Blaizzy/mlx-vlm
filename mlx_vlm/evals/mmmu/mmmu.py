@@ -156,6 +156,9 @@ def MMMU_eval(data: list, eval_file: str):
         if is_correct:
             total_correct += 1
             subject_scores[subject] += 1
+            line["score"] = 1
+        else:
+            line["score"] = 0
 
     # Calculate final scores
     results = {}
@@ -174,26 +177,35 @@ def MMMU_eval(data: list, eval_file: str):
             results[f"subject_{subject}_correct"] = subject_scores[subject]
             results[f"subject_{subject}_total"] = subject_counters[subject]
 
+    # Print scores
+    print("\nMMMU Evaluation Results:")
+    print("=" * 80)
+    print(
+        f"Overall Accuracy: {results['overall_accuracy']:.4f} ({total_correct}/{total_questions})"
+    )
+    print("=" * 80)
+    print("Subject Breakdown:")
+    for subject in sorted(subject_scores.keys()):
+        acc = results.get(f"subject_{subject}_accuracy", 0.0)
+        correct = results.get(f"subject_{subject}_correct", 0)
+        total = results.get(f"subject_{subject}_total", 0)
+        print(f"  {subject}: {acc:.4f} ({correct}/{total})")
+    print("=" * 80)
+
     # Save results
     score_pth = eval_file.replace(".csv", "_score.json")
     with open(score_pth, "w") as f:
         dump(results, f, indent=2)
 
+    with open(eval_file, "w", newline="", encoding="utf-8") as f:
+        if data:
+            writer = csv.DictWriter(f, fieldnames=data[0].keys())
+            writer.writeheader()
+            writer.writerows(data)
+
     logger.info(
         f"MMMU_eval successfully finished evaluating {eval_file}, results saved in {score_pth}"
     )
-    logger.info("=" * 80)
-    logger.info(
-        f"Overall Accuracy: {results['overall_accuracy']:.4f} ({total_correct}/{total_questions})"
-    )
-    logger.info("=" * 80)
-    logger.info("Subject Breakdown:")
-    for subject in sorted(subject_scores.keys()):
-        acc = results.get(f"subject_{subject}_accuracy", 0.0)
-        correct = results.get(f"subject_{subject}_correct", 0)
-        total = results.get(f"subject_{subject}_total", 0)
-        logger.info(f"  {subject}: {acc:.4f} ({correct}/{total})")
-    logger.info("=" * 80)
 
 
 def process_question(example):
@@ -356,6 +368,12 @@ def parse_arguments():
         action="store_true",
         help="List all 30 available subjects and exit",
     )
+    parser.add_argument(
+        "--prediction_file",
+        type=str,
+        default=None,
+        help="Path to the prediction file",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     return parser.parse_args()
 
@@ -364,6 +382,20 @@ def main():
     args = parse_arguments()
 
     random.seed(args.seed)
+
+    if args.prediction_file:
+        # Load predictions from file
+        logger.info(f"\033[32mLoading predictions from {args.prediction_file}\033[0m")
+        results = []
+        with open(args.prediction_file, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                results.append(row)
+
+        # Evaluate loaded predictions
+        MMMU_eval(results, args.prediction_file)
+        logger.info(f"\033[32mEvaluation complete\033[0m")
+        return
 
     # Handle --list-subjects flag
     if args.list_subjects:
