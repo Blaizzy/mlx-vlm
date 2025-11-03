@@ -18,73 +18,57 @@ logger = getLogger(__name__)
 def extract_answer(predict, answer):
     """
     Extracts the answer from the model's predictions.
-        predict: Model prediction text
-        answer: Ground truth answer (A, B, C, or D)
-
-    Returns:
-        bool: True if answer matches, False otherwise
+    predict: Model prediction text
+    answer: Ground truth answer (A, B, C, or D)
+    Returns: bool: True if answer matches, False otherwise
     """
-    answer_upper = answer.upper()
+    text = predict.lower().replace("\n", " ").strip()
     answer_lower = answer.lower()
-    pred_lower = predict.lower().strip().replace("\n", " ")
 
-    # STRATEGY 1: Strict positional matching (from original evaluation)
-    try:
-        # Check if first character matches
-        if len(pred_lower) > 0 and answer_lower == pred_lower[0]:
-            return True
-        # Check if starts with "(" and second character matches
-        if (
-            len(pred_lower) > 1
-            and pred_lower[0] == "("
-            and answer_lower == pred_lower[1]
-        ):
-            return True
-        # Check if starts with "option " and 8th character matches
-        if (
-            len(pred_lower) >= 8
-            and pred_lower[0:7] == "option "
-            and answer_lower == pred_lower[7]
-        ):
-            return True
-        # Check if starts with "the answer is " and 15th character matches
-        if (
-            len(pred_lower) >= 15
-            and pred_lower[0:14] == "the answer is "
-            and answer_lower == pred_lower[14]
-        ):
-            return True
-    except:
-        pass
-
-    # STRATEGY 2: Flexible pattern matching for common answer formats
-    patterns = [
-        # Direct answer markers
-        rf"\b{answer_upper}\s*:",  # "A:"
-        rf"(?:^|\.|\n)\s*{answer_upper}\.",  # "A." at sentence start
-        rf"\({answer_upper}\)",  # "(A)"
-        # Explicit answer statements
-        rf"answer\s+is\s+{answer_upper}\b",  # "answer is A"
-        rf"correct\s+(?:answer|option|choice)\s+is\s+{answer_upper}\b",
-        rf"the\s+answer\s+is\s+{answer_upper}\b",
-        # Option/choice references
-        rf"option\s+{answer_upper}\b",  # "option A"
-        rf"choice\s+{answer_upper}\b",  # "choice A"
-        # Conclusion markers
-        rf"(?:therefore|thus|hence)[,\s]+(?:the\s+)?(?:answer\s+is\s+)?{answer_upper}\b",
-        # Answer with separators
-        rf"\b{answer_upper}\s*[:\.\)]",  # "A:" or "A." or "A)"
-        # Answer after action verbs
-        rf"(?:select|choose)\s+{answer_upper}\b",
-        rf"it\s+is\s+{answer_upper}\b",
-        rf"would\s+be\s+{answer_upper}\b",
+    general_templates = [
+        r"^{0}\b",
+        r"^\({0}",
+        r"^option {0}\b",
+        r"\b{0}\s*[:\.\)]",
+        r"(?:^|\.|\s)\s*{0}\.",
+        r"\({0}\)",
+        r"option\s+{0}\b",
+        r"choice\s+{0}\b",
     ]
 
-    for pattern in patterns:
-        if re.search(pattern, predict, re.IGNORECASE | re.MULTILINE):
-            return True
+    concluding_templates = [
+        r"^the answer is {0}\b",
+        r"answer:\s*{0}\b",
+        r"answer\s+is\s+{0}\b",
+        r"correct\s+(?:answer|option|choice)\s+is:?\s+{0}\b",
+        r"the\s+answer\s+is\s+{0}\b",
+        r"is\s+{0}\s*:",
+        r"(?:therefore|thus|hence)[,\s]+(?:the\s+)?(?:answer\s+is\s+)?{0}\b",
+        r"(?:select|choose)\s+{0}\b",
+        r"it\s+is\s+{0}\b",
+        r"would\s+be\s+{0}\b",
+        r"\*\*(?:revised\s+)?answer\*\*:\s*{0}\b",
+        r"(?:correct\s+)?category\s+(?:for\s+this\s+image\s+)?is\s+\*\*{0}[:\s]",
+    ]
 
-    return False
+    possible_answers = ["a", "b", "c", "d", "e"]
+    matches = []
+
+    for ans in possible_answers:
+        for pri, template_list in [(2, concluding_templates), (1, general_templates)]:
+            for template in template_list:
+                pattern = template.format(ans)
+                for match in re.finditer(pattern, text):
+                    matches.append((match.end(), ans, pri))
+
+    if not matches:
+        return False
+
+    # Sort ascending by (-priority, -end_position) to prefer higher priority first, then latest position
+    matches.sort(key=lambda m: (-m[2], -m[0]))
+    latest_ans = matches[0][1]
+
+    return latest_ans == answer_lower
 
 
 def MMStar_eval(data: list, eval_file: str):
@@ -134,24 +118,28 @@ def MMStar_eval(data: list, eval_file: str):
         if extract_answer(predict, answers):
             MMStar_score_l2[category][l2_category] += 1
 
+            line["score"] = 1
+        else:
+            line["score"] = 0
+
     # Calculate scores
     MMStar_score = {}
     MMStar_score["final score"] = 0
     total_correct = 0
 
     for k, v in MMStar_score_l2.items():
-        MMStar_score[k] = 0
+        cat_total = sum(MMStar_counter[k].values())
+        cat_correct = 0
         for l2_k, l2_v in v.items():
             count = MMStar_counter[k][l2_k]
             if count > 0:
                 MMStar_score[f"{k}({l2_k})"] = float(l2_v) / float(count)
             else:
                 MMStar_score[f"{k}({l2_k})"] = 0.0
-            MMStar_score[k] += l2_v
+            cat_correct += l2_v
             total_correct += l2_v
-        MMStar_score["final score"] += MMStar_score[k]
-        if MMStar_score[k] > 0:
-            MMStar_score[k] = float(MMStar_score[k]) / 250.0
+        MMStar_score[k] = float(cat_correct) / cat_total if cat_total > 0 else 0.0
+        MMStar_score["final score"] += cat_correct
 
     if len(data) > 0:
         MMStar_score["final score"] = float(MMStar_score["final score"]) / float(
@@ -208,6 +196,12 @@ def MMStar_eval(data: list, eval_file: str):
     with open(score_pth, "w") as f:
         dump(MMStar_score, f, indent=2)
 
+    with open(eval_file, "w", newline="", encoding="utf-8") as f:
+        if data:
+            writer = csv.DictWriter(f, fieldnames=data[0].keys())
+            writer.writeheader()
+            writer.writerows(data)
+
     logger.info(
         f"MMStar_eval successfully finished evaluating {eval_file}, results saved in {score_pth}"
     )
@@ -245,7 +239,7 @@ def inference(
         resize_shape=resize_shape,
         verbose=verbose,
     )
-    return response.text
+    return response
 
 
 def parse_arguments():
@@ -280,12 +274,26 @@ def parse_arguments():
         help="Resize shape for the image",
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    parser.add_argument(
+        "--prediction_file", type=str, default=None, help="Path to the prediction file"
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_arguments()
     logger.info("\033[32mStarting MMStar Evaluation\033[0m")
+    if args.prediction_file:
+        logger.info(
+            f"\033[32mLoading predictions from {args.prediction_file} for evaluation\033[0m"
+        )
+        results = []
+        with open(args.prediction_file, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            results = [row for row in reader]
+        MMStar_eval(results, args.prediction_file)
+        logger.info(f"\033[32mEvaluation complete\033[0m")
+        return
     logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
     dataset = load_dataset(args.dataset, split=args.split)
     logger.info(f"\033[32mLoading model from {args.model}\033[0m")
