@@ -198,6 +198,8 @@ def normalize_answer(response: str, problem: dict) -> Optional[str]:
         boxed_match = re.search(r"\\boxed\{([^}]+)\}", response)
         if boxed_match:
             boxed_content = boxed_match.group(1)
+            # Remove commas from numbers
+            boxed_content = boxed_content.replace(",", "")
             # Try scientific notation first
             sci_numbers = re.findall(r"-?\d+\.?\d*[eE][+-]?\d+", boxed_content)
             if sci_numbers:
@@ -216,16 +218,18 @@ def normalize_answer(response: str, problem: dict) -> Optional[str]:
         # Try common answer patterns near the end
         end_section = response[-500:] if len(response) > 500 else response
         answer_patterns = [
-            r"(?:the\s+)?answer\s+is\s+(-?\d+\.?\d*[eE][+-]?\d+|-?\d+)",
-            r"answer:\s*(-?\d+\.?\d*[eE][+-]?\d+|-?\d+)",
-            r"(?:total|result|left|remaining)(?:\s+is|\s+are|:)\s*(-?\d+\.?\d*[eE][+-]?\d+|-?\d+)",
+            r"(?:the\s+)?answer\s+is\s+(-?[\d,]+\.?\d*[eE][+-]?\d+|-?[\d,]+)",
+            r"answer:\s*(-?[\d,]+\.?\d*[eE][+-]?\d+|-?[\d,]+)",
+            r"(?:total|result|left|remaining)(?:\s+is|\s+are|:)\s*(-?[\d,]+\.?\d*[eE][+-]?\d+|-?[\d,]+)",
         ]
 
         for pattern in answer_patterns:
             matches = list(re.finditer(pattern, end_section, re.IGNORECASE))
             if matches:
                 try:
-                    return str(int(float(matches[-1].group(1))))
+                    # Remove commas before converting
+                    num_str = matches[-1].group(1).replace(",", "")
+                    return str(int(float(num_str)))
                 except:
                     pass
 
@@ -237,12 +241,13 @@ def normalize_answer(response: str, problem: dict) -> Optional[str]:
             except:
                 pass
 
-        # Fall back to finding all numbers and taking the last one
-        numbers = re.findall(r"-?\d+", response)
+        # Fall back to finding all numbers (including comma-formatted) and taking the last one
+        # Match numbers with optional commas: 7,518 or 7518
+        numbers = re.findall(r"-?[\d,]+", response)
         if numbers:
             try:
-                # Try the last number first
-                return str(int(numbers[-1]))
+                # Remove commas and try the last number first
+                return str(int(numbers[-1].replace(",", "")))
             except:
                 pass
 
