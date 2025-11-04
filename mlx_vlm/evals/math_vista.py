@@ -10,10 +10,9 @@ from datasets import load_dataset
 from PIL import Image
 from tqdm import tqdm
 
-from mlx_vlm.generate import generate
+from mlx_vlm import generate, load
 
 from ..prompt_utils import apply_chat_template
-from ..utils import load, load_config, prepare_inputs
 
 
 def parse_args():
@@ -43,6 +42,11 @@ def parse_args():
         default="testmini",
         choices=["testmini", "test"],
         help="Dataset split to evaluate on",
+    )
+    parser.add_argument(
+        "--streaming",
+        action="store_false",
+        help="Use streaming dataset loading",
     )
     parser.add_argument(
         "--max-samples",
@@ -78,14 +82,13 @@ def parse_args():
 
 def process_question(sample: dict) -> str:
     """Format the question with choices if it's multiple choice."""
-    question = sample["question"]
+    question = sample["query"]
 
     if sample["question_type"] == "multi_choice" and sample["choices"]:
         choices_text = "\n".join(
             [f"({chr(65+i)}) {choice}" for i, choice in enumerate(sample["choices"])]
         )
         question = f"{question}\n{choices_text}"
-
     return question
 
 
@@ -100,23 +103,71 @@ def normalize_answer(response: str, problem: dict) -> Optional[str]:
     answer_type = problem["answer_type"]
     choices = problem.get("choices", [])
 
+    import re
+
     # For multiple choice, try to extract the letter
     if question_type == "multi_choice":
-        # Look for patterns like "(A)", "A)", "A.", "A", etc.
-        import re
+        # First, try to find boxed answers
+        boxed_match = re.search(r"\\boxed\{([^}]+)\}", response)
+        if boxed_match:
+            boxed_content = boxed_match.group(1)
+            # Check if it's a choice letter
+            letter_match = re.match(
+                r"^\(?([A-Z])\)?\.?$", boxed_content.strip().upper()
+            )
+            if letter_match:
+                letter = letter_match.group(1)
+                idx = ord(letter) - ord("A")
+                if 0 <= idx < len(choices):
+                    return choices[idx]
+            # Check if it's directly one of the choices
+            if boxed_content.strip() in choices:
+                return boxed_content.strip()
 
-        match = re.search(r"\(?([A-Z])\)?\.?", response.upper())
-        if match:
-            letter = match.group(1)
+        # Try to find Chinese answer pattern "故选：X" or "故选X"
+        chinese_match = re.search(r"故选[：:]\s*([A-Z])", response.upper())
+        if not chinese_match:
+            chinese_match = re.search(r"故选\s*([A-Z])", response.upper())
+        if chinese_match:
+            letter = chinese_match.group(1)
             idx = ord(letter) - ord("A")
             if 0 <= idx < len(choices):
                 return choices[idx]
+
+        # Try to find "the answer is X" or "answer: X" patterns near the end
+        answer_patterns = [
+            r"(?:the\s+)?answer\s+is\s+\(?([A-Z])\)?",
+            r"answer:\s*\(?([A-Z])\)?",
+            r"choose\s+\(?([A-Z])\)?",
+            r"option\s+\(?([A-Z])\)?",
+        ]
+
+        # Search from the end of the response (last 500 chars)
+        end_section = response[-500:] if len(response) > 500 else response
+        for pattern in answer_patterns:
+            matches = list(re.finditer(pattern, end_section, re.IGNORECASE))
+            if matches:
+                # Take the last match
+                letter = matches[-1].group(1).upper()
+                idx = ord(letter) - ord("A")
+                if 0 <= idx < len(choices):
+                    return choices[idx]
+
+        # Look for patterns like "(A)", "A)", "A.", "A" - prioritize from the end
+        matches = list(re.finditer(r"\(?([A-Z])\)?\.?", response.upper()))
+        if matches:
+            # Try the last few matches first
+            for match in reversed(matches[-5:]):
+                letter = match.group(1)
+                idx = ord(letter) - ord("A")
+                if 0 <= idx < len(choices):
+                    return choices[idx]
 
         # If the response is exactly one of the choices
         if response in choices:
             return response
 
-        # Try to find the most similar choice
+        # Try to find the most similar choice using edit distance
         def distance(s1, s2):
             if len(s1) < len(s2):
                 return distance(s2, s1)
@@ -143,24 +194,111 @@ def normalize_answer(response: str, problem: dict) -> Optional[str]:
 
     # For integer answers
     elif answer_type == "integer":
-        import re
+        # First try to find boxed answer
+        boxed_match = re.search(r"\\boxed\{([^}]+)\}", response)
+        if boxed_match:
+            boxed_content = boxed_match.group(1)
+            # Try scientific notation first
+            sci_numbers = re.findall(r"-?\d+\.?\d*[eE][+-]?\d+", boxed_content)
+            if sci_numbers:
+                try:
+                    return str(int(float(sci_numbers[0])))
+                except:
+                    pass
+            # Then regular numbers
+            numbers = re.findall(r"-?\d+", boxed_content)
+            if numbers:
+                try:
+                    return str(int(numbers[0]))
+                except:
+                    pass
 
+        # Try common answer patterns near the end
+        end_section = response[-500:] if len(response) > 500 else response
+        answer_patterns = [
+            r"(?:the\s+)?answer\s+is\s+(-?\d+\.?\d*[eE][+-]?\d+|-?\d+)",
+            r"answer:\s*(-?\d+\.?\d*[eE][+-]?\d+|-?\d+)",
+            r"(?:total|result|left|remaining)(?:\s+is|\s+are|:)\s*(-?\d+\.?\d*[eE][+-]?\d+|-?\d+)",
+        ]
+
+        for pattern in answer_patterns:
+            matches = list(re.finditer(pattern, end_section, re.IGNORECASE))
+            if matches:
+                try:
+                    return str(int(float(matches[-1].group(1))))
+                except:
+                    pass
+
+        # Look for scientific notation anywhere in response
+        sci_numbers = re.findall(r"-?\d+\.?\d*[eE][+-]?\d+", response)
+        if sci_numbers:
+            try:
+                return str(int(float(sci_numbers[-1])))
+            except:
+                pass
+
+        # Fall back to finding all numbers and taking the last one
         numbers = re.findall(r"-?\d+", response)
         if numbers:
             try:
-                return str(int(numbers[0]))
+                # Try the last number first
+                return str(int(numbers[-1]))
             except:
                 pass
 
     # For float answers
     elif answer_type == "float":
-        import re
+        precision = int(problem.get("precision", 2))
 
+        # First try to find boxed answer
+        boxed_match = re.search(r"\\boxed\{([^}]+)\}", response)
+        if boxed_match:
+            boxed_content = boxed_match.group(1)
+            # Try scientific notation first
+            sci_numbers = re.findall(r"-?\d+\.?\d*[eE][+-]?\d+", boxed_content)
+            if sci_numbers:
+                try:
+                    return str(round(float(sci_numbers[0]), precision))
+                except:
+                    pass
+            # Then regular numbers
+            numbers = re.findall(r"-?\d+\.?\d*", boxed_content)
+            if numbers:
+                try:
+                    return str(round(float(numbers[0]), precision))
+                except:
+                    pass
+
+        # Try common answer patterns near the end
+        end_section = response[-500:] if len(response) > 500 else response
+        answer_patterns = [
+            r"(?:the\s+)?answer\s+is\s+(-?\d+\.?\d*[eE][+-]?\d+|-?\d+\.?\d*)",
+            r"answer:\s*(-?\d+\.?\d*[eE][+-]?\d+|-?\d+\.?\d*)",
+            r"d\s*=\s*(-?\d+\.?\d*[eE][+-]?\d+|-?\d+\.?\d*)",  # For physics problems with d=
+        ]
+
+        for pattern in answer_patterns:
+            matches = list(re.finditer(pattern, end_section, re.IGNORECASE))
+            if matches:
+                try:
+                    return str(round(float(matches[-1].group(1)), precision))
+                except:
+                    pass
+
+        # Look for scientific notation anywhere in response
+        sci_numbers = re.findall(r"-?\d+\.?\d*[eE][+-]?\d+", response)
+        if sci_numbers:
+            try:
+                return str(round(float(sci_numbers[-1]), precision))
+            except:
+                pass
+
+        # Fall back to finding all numbers and taking the last one
         numbers = re.findall(r"-?\d+\.?\d*", response)
         if numbers:
             try:
-                precision = int(problem.get("precision", 2))
-                return str(round(float(numbers[0]), precision))
+                # Try the last number first
+                return str(round(float(numbers[-1]), precision))
             except:
                 pass
 
@@ -171,9 +309,46 @@ def evaluate_answer(prediction: Optional[str], ground_truth: str) -> bool:
     """Check if the prediction matches the ground truth."""
     if prediction is None:
         return False
-
     try:
-        return str(prediction).strip() == str(ground_truth).strip()
+        # First check exact match
+        if str(prediction).strip() == str(ground_truth).strip():
+            return True
+
+        # Handle numeric word representations
+        word_to_num = {
+            "zero": "0",
+            "one": "1",
+            "two": "2",
+            "three": "3",
+            "four": "4",
+            "five": "5",
+            "six": "6",
+            "seven": "7",
+            "eight": "8",
+            "nine": "9",
+            "ten": "10",
+            "eleven": "11",
+            "twelve": "12",
+            "thirteen": "13",
+            "fourteen": "14",
+            "fifteen": "15",
+            "sixteen": "16",
+            "seventeen": "17",
+            "eighteen": "18",
+            "nineteen": "19",
+            "twenty": "20",
+        }
+
+        pred_normalized = str(prediction).strip().lower()
+        gt_normalized = str(ground_truth).strip().lower()
+
+        # Convert words to numbers
+        if pred_normalized in word_to_num:
+            pred_normalized = word_to_num[pred_normalized]
+        if gt_normalized in word_to_num:
+            gt_normalized = word_to_num[gt_normalized]
+
+        return pred_normalized == gt_normalized
     except:
         return False
 
@@ -229,12 +404,12 @@ def main():
 
     # Load dataset
     logging.info(f"Loading dataset {args.dataset_name}, split {args.split}")
-    dataset = load_dataset(args.dataset_name, split=args.split)
+    dataset = load_dataset(
+        args.dataset_name, split=args.split, streaming=args.streaming
+    )
 
     if args.max_samples:
         dataset = dataset.select(range(min(args.max_samples, len(dataset))))
-
-    logging.info(f"Evaluating on {len(dataset)} samples")
 
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -286,22 +461,27 @@ def main():
             prediction = normalize_answer(response, sample)
 
             # Evaluate
-            is_correct = evaluate_answer(prediction, sample["answer"])
+            ground_truth = sample.get("answer", "")
+            if args.split == "testmini" and ground_truth:
+                is_correct = evaluate_answer(prediction, ground_truth)
+                if is_correct:
+                    correct += 1
+            else:
+                is_correct = None
 
-            if is_correct:
-                correct += 1
             total += 1
 
             # Store results
             results[pid] = {
                 "pid": pid,
                 "question": sample["question"],
+                "query": sample["query"],
                 "question_type": sample["question_type"],
                 "answer_type": sample["answer_type"],
                 "choices": sample.get("choices", []),
                 "unit": sample.get("unit", ""),
                 "precision": sample.get("precision", 0),
-                "ground_truth": sample["answer"],
+                "ground_truth": ground_truth,
                 "response": response,
                 "prediction": prediction,
                 "correct": is_correct,
@@ -313,15 +493,19 @@ def main():
                 logging.info(f"Question: {sample['question']}")
                 logging.info(f"Response: {response}")
                 logging.info(f"Prediction: {prediction}")
-                logging.info(f"Ground Truth: {sample['answer']}")
+                logging.info(f"Ground Truth: {ground_truth}")
                 logging.info(f"Correct: {is_correct}")
 
         except Exception as e:
             logging.error(f"Error processing sample {pid}: {e}")
             continue
 
-    # Calculate accuracy
-    accuracy = correct / total if total > 0 else 0
+    # Calculate accuracy if applicable
+    if args.split == "testmini":
+        accuracy = correct / total if total > 0 else 0
+    else:
+        accuracy = None
+        correct = None
 
     # Save results
     results_file = output_dir / f"results_{args.split}.json"
@@ -334,9 +518,10 @@ def main():
         "dataset": args.dataset_name,
         "split": args.split,
         "total_samples": total,
-        "correct": correct,
-        "accuracy": accuracy,
     }
+    if accuracy is not None:
+        summary["correct"] = correct
+        summary["accuracy"] = accuracy
 
     summary_file = output_dir / f"summary_{args.split}.json"
     with open(summary_file, "w") as f:
@@ -348,8 +533,11 @@ def main():
     print(f"Model: {args.model}")
     print(f"Split: {args.split}")
     print(f"Total Samples: {total}")
-    print(f"Correct: {correct}")
-    print(f"Accuracy: {accuracy*100:.2f}%")
+    if accuracy is not None:
+        print(f"Correct: {correct}")
+        print(f"Accuracy: {accuracy*100:.2f}%")
+    else:
+        print("Accuracy not computed for this split (no ground truth labels)")
     print(f"{'='*50}")
     print(f"\nResults saved to {results_file} and {summary_file}")
 
