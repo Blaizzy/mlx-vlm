@@ -30,7 +30,7 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        default="lmms-lab/OCRBench-v2",
+        default="echo840/OCRBench",
         help="Hugging Face dataset name",
     )
     parser.add_argument(
