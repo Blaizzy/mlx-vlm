@@ -1,7 +1,9 @@
 import argparse
+import csv
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -102,8 +104,6 @@ def normalize_answer(response: str, problem: dict) -> Optional[str]:
     question_type = problem["question_type"]
     answer_type = problem["answer_type"]
     choices = problem.get("choices", [])
-
-    import re
 
     # For multiple choice, try to extract the letter
     if question_type == "multi_choice":
@@ -421,6 +421,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     results = {}
+    category_scores = {}
     correct = 0
     total = 0
 
@@ -492,6 +493,14 @@ def main():
                 "correct": is_correct,
                 "metadata": sample.get("metadata", {}),
             }
+            # Track category-wise performance
+            category = sample.get("metadata", {}).get("category", "unknown")
+            if category not in category_scores:
+                category_scores[category] = {"correct": 0, "total": 0}
+
+            category_scores[category]["total"] += 1
+            if is_correct:
+                category_scores[category]["correct"] += 1
 
             if args.verbose:
                 logging.info(f"\nSample {pid}:")
@@ -513,9 +522,38 @@ def main():
         correct = None
 
     # Save results
-    results_file = output_dir / f"results_{args.split}.json"
-    with open(results_file, "w") as f:
-        json.dump(results, f, indent=2)
+    model_name = args.model.split("/")[-1]
+    results_file = output_dir / f"{model_name}_MathVista_{args.split}.csv"
+
+    # Convert results to list of dictionaries for CSV writing
+    fieldnames = [
+        "pid",
+        "question",
+        "query",
+        "question_type",
+        "answer_type",
+        "choices",
+        "unit",
+        "precision",
+        "ground_truth",
+        "response",
+        "prediction",
+        "correct",
+        "metadata",
+    ]
+
+    with open(results_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for result in results.values():
+            # Convert list and dict fields to strings for CSV
+            row = result.copy()
+            if isinstance(row.get("choices"), list):
+                row["choices"] = "; ".join(row["choices"])
+            if isinstance(row.get("metadata"), dict):
+                row["metadata"] = json.dumps(row["metadata"])
+            writer.writerow(row)
 
     # Save summary
     summary = {
@@ -523,18 +561,20 @@ def main():
         "dataset": args.dataset_name,
         "split": args.split,
         "total_samples": total,
+        "category_scores": category_scores,
     }
+
     if accuracy is not None:
         summary["correct"] = correct
         summary["accuracy"] = accuracy
 
-    summary_file = output_dir / f"summary_{args.split}.json"
+    summary_file = output_dir / f"{model_name}_MathVista_{args.split}.json"
     with open(summary_file, "w") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"\n{'='*50}")
-    print(f"MathVista Evaluation Results")
-    print(f"{'='*50}")
+    print(f"\n{'='*80}")
+    print("MathVista Evaluation Results")
+    print(f"{'='*80}")
     print(f"Model: {args.model}")
     print(f"Split: {args.split}")
     print(f"Total Samples: {total}")
@@ -543,7 +583,16 @@ def main():
         print(f"Accuracy: {accuracy*100:.2f}%")
     else:
         print("Accuracy not computed for this split (no ground truth labels)")
-    print(f"{'='*50}")
+
+    print("\n" + "-" * 80)
+    print(f"Subcategory Scores:")
+    print(f"{'-'*80}")
+    for category, scores in category_scores.items():
+        cat_total = scores["total"]
+        cat_correct = scores["correct"]
+        cat_accuracy = cat_correct / cat_total if cat_total > 0 else 0
+        print(f"  {category}: {cat_correct}/{cat_total} ({cat_accuracy*100:.2f}%)")
+    print(f"{'='*80}")
     print(f"\nResults saved to {results_file} and {summary_file}")
 
 

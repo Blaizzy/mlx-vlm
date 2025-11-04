@@ -326,7 +326,7 @@ def parse_arguments():
         "--streaming", action="store_false", help="Use streaming dataset loading"
     )
     parser.add_argument(
-        "--max_tokens",
+        "--max-tokens",
         type=int,
         default=3000,
         help="Maximum number of tokens to generate",
@@ -338,19 +338,19 @@ def parse_arguments():
         help="Temperature for sampling (0.0 for greedy)",
     )
     parser.add_argument(
-        "--top_p",
+        "--top-p",
         type=float,
         default=0.9,
         help="Top-p sampling parameter",
     )
     parser.add_argument(
-        "--repetition_penalty",
+        "--repetition-penalty",
         type=float,
         default=1.0,
         help="Repetition penalty parameter",
     )
     parser.add_argument(
-        "--resize_shape",
+        "--resize-shape",
         type=int,
         nargs=2,
         default=None,
@@ -358,7 +358,7 @@ def parse_arguments():
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument(
-        "--max_samples",
+        "--max-samples",
         type=int,
         default=None,
         help="Maximum number of samples to evaluate (for testing)",
@@ -369,10 +369,16 @@ def parse_arguments():
         help="List all 30 available subjects and exit",
     )
     parser.add_argument(
-        "--prediction_file",
+        "--prediction-file",
         type=str,
         default=None,
         help="Path to the prediction file",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="/results/mmmu",
+        help="Directory to save evaluation results",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     return parser.parse_args()
@@ -450,10 +456,8 @@ def main():
 
     # Create results directory
     model_name = args.model.split("/")[-1]
-    result_file = (
-        f"./results/{model_name}_MMMU_{subset_name}_{args.split}_predictions.csv"
-    )
-    os.makedirs("./results/", exist_ok=True)
+    result_file = f"{args.output_dir}/{model_name}_MMMU_{subset_name}_{args.split}_predictions.csv"
+    os.makedirs(args.output_dir, exist_ok=True)
 
     results = []
     for subject, dataset in tqdm(datasets.items(), desc="Processing subjects"):

@@ -250,7 +250,7 @@ def parse_arguments():
         default="mlx-community/Qwen2-VL-2B-Instruct-bf16",
         help="Model path",
     )
-    parser.add_argument("--adapter_path", type=str, default=None, help="Adapter path")
+    parser.add_argument("--adapter-path", type=str, default=None, help="Adapter path")
     parser.add_argument(
         "--dataset", type=str, default="Lin-Chen/MMStar", help="Dataset path"
     )
@@ -258,7 +258,7 @@ def parse_arguments():
         "--split", type=str, default="val", help="Split to use for evaluation"
     )
     parser.add_argument(
-        "--max_tokens",
+        "--max-tokens",
         type=int,
         default=3000,
         help="Maximum number of tokens to generate",
@@ -267,7 +267,7 @@ def parse_arguments():
         "--temperature", type=float, default=0.7, help="Temperature for sampling"
     )
     parser.add_argument(
-        "--resize_shape",
+        "--resize-shape",
         type=int,
         nargs=2,
         default=None,
@@ -275,7 +275,13 @@ def parse_arguments():
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument(
-        "--prediction_file", type=str, default=None, help="Path to the prediction file"
+        "--prediction-file", type=str, default=None, help="Path to the prediction file"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="/results/mmstar",
+        help="Directory to save evaluation results",
     )
     return parser.parse_args()
 
@@ -303,8 +309,8 @@ def main():
     config = model.config
     logger.info(f"\033[32mConfig: {config}\033[0m")
 
-    result_file = f'./results/{args.model.split("/")[-1]}_{args.dataset.split("/")[-1]}_{args.split}_predictions.csv'
-    os.makedirs("./results/", exist_ok=True)
+    result_file = f'{args.output_dir}/{args.model.split("/")[-1]}_{args.dataset.split("/")[-1]}_{args.split}_predictions.csv'
+    os.makedirs(args.output_dir, exist_ok=True)
 
     results = []
     for example in tqdm(dataset, desc="Running inference"):
