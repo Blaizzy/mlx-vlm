@@ -13,8 +13,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from mlx_vlm import generate, load
-
-from ..prompt_utils import apply_chat_template
+from mlx_vlm.prompt_utils import apply_chat_template
 
 
 def parse_args():
@@ -33,7 +32,7 @@ def parse_args():
         help="Optional path for the trained adapter weights and config",
     )
     parser.add_argument(
-        "--dataset-name",
+        "--dataset",
         type=str,
         default="AI4Math/MathVista",
         help="Hugging Face dataset name",
@@ -47,7 +46,7 @@ def parse_args():
     )
     parser.add_argument(
         "--streaming",
-        action="store_false",
+        action="store_true",
         help="Use streaming dataset loading",
     )
     parser.add_argument(
@@ -408,10 +407,8 @@ def main():
     )
 
     # Load dataset
-    logging.info(f"Loading dataset {args.dataset_name}, split {args.split}")
-    dataset = load_dataset(
-        args.dataset_name, split=args.split, streaming=args.streaming
-    )
+    logging.info(f"Loading dataset {args.dataset}, split {args.split}")
+    dataset = load_dataset(args.dataset, split=args.split, streaming=args.streaming)
 
     if args.max_samples:
         dataset = dataset.select(range(min(args.max_samples, len(dataset))))
@@ -558,7 +555,7 @@ def main():
     # Save summary
     summary = {
         "model": args.model,
-        "dataset": args.dataset_name,
+        "dataset": args.dataset,
         "split": args.split,
         "total_samples": total,
         "category_scores": category_scores,

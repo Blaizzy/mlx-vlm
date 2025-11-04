@@ -9,13 +9,12 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 from mlx_vlm import generate, load
-
-from ..prompt_utils import apply_chat_template
+from mlx_vlm.prompt_utils import apply_chat_template
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate models on OCRBench-v2 benchmark"
+        description="Evaluate models on OCRBench benchmark"
     )
     parser.add_argument(
         "--model",
@@ -61,7 +60,7 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="results/ocrbench_v2",
+        default="results/ocrbench",
         help="Directory to save results",
     )
     parser.add_argument(
@@ -139,7 +138,7 @@ def inference(
     return response
 
 
-def OCRBench_v2_val(results_list, args, model_name, dataset="OCRBench-v2"):
+def OCRBench_val(results_list, args, model_name, dataset="OCRBench"):
     correct = 0
     total = len(results_list)
     category_scores = {}
@@ -211,16 +210,17 @@ def OCRBench_v2_val(results_list, args, model_name, dataset="OCRBench-v2"):
     print(f"Correct: {correct}")
     print(f"Accuracy: {accuracy*100:.2f}%")
 
-    print("\n" + "-" * 80)
-    print(f"Subcategory Scores:")
-    print(f"{'-'*80}")
-    for category, scores in category_scores.items():
-        cat_total = scores["total"]
-        cat_correct = scores["correct"]
-        cat_accuracy = cat_correct / cat_total if cat_total > 0 else 0
-        print(f"  {category}: {cat_correct}/{cat_total} ({cat_accuracy*100:.2f}%)")
-    print(f"{'='*80}")
-    print(f"\nResults saved to {results_file} and {summary_file}")
+    if len(category_scores.items()) > 1:
+        print("\n" + "-" * 80)
+        print(f"Subcategory Scores:")
+        print(f"{'-'*80}")
+        for category, scores in category_scores.items():
+            cat_total = scores["total"]
+            cat_correct = scores["correct"]
+            cat_accuracy = cat_correct / cat_total if cat_total > 0 else 0
+            print(f"  {category}: {cat_correct}/{cat_total} ({cat_accuracy*100:.2f}%)")
+        print(f"{'='*80}")
+        print(f"\nResults saved to {results_file} and {summary_file}")
 
 
 def main():
@@ -243,7 +243,7 @@ def main():
         dataset = (
             "OCRBench-v2" if "OCRBench-v2" in args.predictions_file else "OCRBench"
         )
-        OCRBench_v2_val(loaded_results, args, model_name, dataset)
+        OCRBench_val(loaded_results, args, model_name, dataset)
         logging.info(f"\033[32mEvaluation complete\033[0m")
         return
 
@@ -319,7 +319,7 @@ def main():
     results_list = list(results.values())
     model_name = args.model.split("/")[-1]
     dataset = args.dataset.split("/")[-1]
-    OCRBench_v2_val(results_list, args, model_name, dataset)
+    OCRBench_val(results_list, args, model_name, dataset)
 
 
 if __name__ == "__main__":

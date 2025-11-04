@@ -258,6 +258,15 @@ def parse_arguments():
         "--split", type=str, default="val", help="Split to use for evaluation"
     )
     parser.add_argument(
+        "--streaming", action="store_true", help="Use streaming dataset loading"
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Maximum number of samples to evaluate (for debugging)",
+    )
+    parser.add_argument(
         "--max-tokens",
         type=int,
         default=3000,
@@ -280,7 +289,7 @@ def parse_arguments():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="/results/mmstar",
+        default="results/mmstar",
         help="Directory to save evaluation results",
     )
     return parser.parse_args()
@@ -301,7 +310,10 @@ def main():
         logger.info(f"\033[32mEvaluation complete\033[0m")
         return
     logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
-    dataset = load_dataset(args.dataset, split=args.split)
+    dataset = load_dataset(args.dataset, split=args.split, streaming=args.streaming)
+    if args.max_samples:
+        dataset = dataset.take(args.max_samples)
+
     logger.info(f"\033[32mLoading model from {args.model}\033[0m")
     model, processor = load(
         args.model, adapter_path=args.adapter_path, trust_remote_code=True
@@ -325,7 +337,8 @@ def main():
             args.temperature,
             args.resize_shape,
             args.verbose,
-        )
+        ).text
+
         results.append(
             {
                 "question": question,

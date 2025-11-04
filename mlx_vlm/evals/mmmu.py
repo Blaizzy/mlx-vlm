@@ -49,6 +49,12 @@ MMMU_SUBJECTS = [
     "Sociology",
 ]
 
+MMMU_PRO_SUBJECTS = [
+    "vision",
+    "standard (10 options)",
+    "standard (4 options)",
+]
+
 
 def normalize_number(s):
     """Normalize numeric strings for comparison."""
@@ -180,6 +186,9 @@ def MMMU_eval(data: list, eval_file: str):
     # Print scores
     print("\nMMMU Evaluation Results:")
     print("=" * 80)
+    print(f"Model: {eval_file.split('/')[-1].split('_MMMU_')[0]}")
+    print(f"Total Questions: {total_questions}")
+    print(f"Total Correct: {total_correct}")
     print(
         f"Overall Accuracy: {results['overall_accuracy']:.4f} ({total_correct}/{total_questions})"
     )
@@ -242,15 +251,22 @@ def get_images(example):
     images = []
 
     # MMMU dataset may have image_1, image_2, etc.
-    for i in range(1, 8):  # Check up to 7 images
-        img_key = f"image_{i}"
-        if img_key in example and example[img_key] is not None:
-            try:
-                img = example[img_key].convert("RGB")
-                images.append(img)
-            except:
-                pass
-
+    if "image" in example and example["image"] is not None:
+        try:
+            img = example["image"].convert("RGB")
+            images.append(img)
+        except Exception as e:
+            print(f"Warning: Could not process image - {e}")
+    else:
+        for i in range(0, 8):  # Check up to 7 images
+            img_key = f"image_{i}"
+            if img_key in example and example[img_key] is not None:
+                try:
+                    img = example[img_key].convert("RGB")
+                    images.append(img)
+                except Exception as e:
+                    print(f"Warning: Could not process image for key {img_key} - {e}")
+                    continue
     return images
 
 
@@ -293,6 +309,11 @@ def inference(
 def list_subjects():
     """Print all available MMMU subjects."""
     print("\n" + "=" * 80)
+    print("MMMU Pro Subjects (3 total)")
+    print("=" * 80)
+    for i, subject in enumerate(MMMU_PRO_SUBJECTS, 1):
+        print(f"{i:2d}. {subject}")
+    print("\n" + "=" * 80)
     print("MMMU Available Subjects (30 total)")
     print("=" * 80)
     for i, subject in enumerate(MMMU_SUBJECTS, 1):
@@ -323,7 +344,7 @@ def parse_arguments():
         help=f"Subset to use - one of 30 subjects: {', '.join(MMMU_SUBJECTS[:5])}... (see SUBJECTS.md for full list)",
     )
     parser.add_argument(
-        "--streaming", action="store_false", help="Use streaming dataset loading"
+        "--streaming", action="store_true", help="Use streaming dataset loading"
     )
     parser.add_argument(
         "--max-tokens",
@@ -377,7 +398,7 @@ def parse_arguments():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="/results/mmmu",
+        default="results/mmmu",
         help="Directory to save evaluation results",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -386,8 +407,12 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
-
     random.seed(args.seed)
+
+    if "pro" in args.dataset.lower():
+        subjects = MMMU_PRO_SUBJECTS
+    else:
+        subjects = MMMU_SUBJECTS
 
     if args.prediction_file:
         # Load predictions from file
@@ -411,15 +436,16 @@ def main():
     logger.info("\033[32mStarting MMMU Evaluation\033[0m")
 
     # Validate subset if provided
-    if args.subset and args.subset not in MMMU_SUBJECTS:
+    if args.subset and args.subset not in subjects:
         logger.error(f"\033[31mError: Invalid subset '{args.subset}'\033[0m")
-        logger.error(f"\033[31mValid subjects are: {', '.join(MMMU_SUBJECTS)}\033[0m")
+        logger.error(f"\033[31mValid subjects are: {', '.join(subjects)}\033[0m")
         logger.error(f"\033[31mSee SUBJECTS.md for more details\033[0m")
         return
 
     logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
 
     # Load dataset
+
     if args.subset:
         logger.info(f"\033[32mUsing subset: {args.subset}\033[0m")
         datasets = {
@@ -431,10 +457,19 @@ def main():
     else:
         logger.info(f"\033[32mEvaluating all 30 subjects\033[0m")
         datasets = {}
-        for subject in MMMU_SUBJECTS:
-            datasets[subject] = load_dataset(
-                args.dataset, name=subject, split=args.split, streaming=args.streaming
-            )
+
+        for subject in subjects:
+            try:
+                datasets[subject] = load_dataset(
+                    args.dataset,
+                    name=subject,
+                    split=args.split,
+                    streaming=args.streaming,
+                )
+            except Exception as e:
+                logger.error(f"\033[31mError loading dataset for {subject}: {e}\033[0m")
+                continue
+
         subset_name = "all"
 
     # Limit samples if specified
@@ -463,6 +498,7 @@ def main():
     for subject, dataset in tqdm(datasets.items(), desc="Processing subjects"):
         for idx, example in enumerate(tqdm(dataset, desc=f"Processing {subject}")):
             question = process_question(example)
+
             images = get_images(example)
 
             # Get prediction
@@ -486,7 +522,7 @@ def main():
                 "topic_difficulty": example.get("topic_difficulty", "Unknown"),
                 "question_type": example.get("question_type", "Unknown"),
                 "prediction": prediction,
-                "subject": subject,
+                "subject": example.get("subject", None) or subject,
             }
             results.append(result)
 
