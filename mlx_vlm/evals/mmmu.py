@@ -223,8 +223,6 @@ def process_question(example):
     MMMU questions may have options and images.
     """
     question = example.get("question", "")
-    # Remove <image n> tags from the question
-    question = re.sub(r"<image \d+>", "", question).strip()
 
     # Add options if they exist
     options = example.get("options", None)
@@ -236,9 +234,8 @@ def process_question(example):
             letter = chr(65 + i)  # A, B, C, D, ...
             question += f"\n{letter}. {option}"
 
-    explanation = example.get("explanation", None)
-    if explanation:
-        question += f"\n\nExplanation: {explanation}"
+    # Remove <image n> tags from the question
+    question = re.sub(r"<image \d+>", "", question).strip()
 
     return question
 
@@ -500,18 +497,21 @@ def main():
             question = process_question(example)
 
             images = get_images(example)
-
-            # Get prediction
-            prediction = inference(
-                model,
-                processor,
-                question,
-                images,
-                args.max_tokens,
-                args.temperature,
-                args.resize_shape,
-                args.verbose,
-            )
+            try:
+                # Get prediction
+                prediction = inference(
+                    model,
+                    processor,
+                    question,
+                    images,
+                    args.max_tokens,
+                    args.temperature,
+                    args.resize_shape,
+                    args.verbose,
+                )
+            except Exception as e:
+                print(f"Error during inference:", question, images, "error message:", e)
+                prediction = ""
 
             # Store result
             result = {
