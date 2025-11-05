@@ -1,19 +1,17 @@
 import argparse
 import csv
+import logging
 import os
 import random
 import re
 from json import dump
-from logging import getLogger
 
 import numpy as np
 from datasets import load_dataset
 from tqdm import tqdm
 
-from mlx_vlm import generate, load
-from mlx_vlm.prompt_utils import apply_chat_template
-
-logger = getLogger(__name__)
+from mlx_vlm import load
+from mlx_vlm.evals.utils import inference
 
 # All 30 MMMU subjects (confirmed from dataset)
 MMMU_SUBJECTS = [
@@ -212,7 +210,7 @@ def MMMU_eval(data: list, eval_file: str):
             writer.writeheader()
             writer.writerows(data)
 
-    logger.info(
+    logging.info(
         f"MMMU_eval successfully finished evaluating {eval_file}, results saved in {score_pth}"
     )
 
@@ -265,42 +263,6 @@ def get_images(example):
                     print(f"Warning: Could not process image for key {img_key} - {e}")
                     continue
     return images
-
-
-def inference(
-    model,
-    processor,
-    question,
-    image,
-    max_tokens=3000,
-    temperature=0.0,
-    resize_shape=None,
-    verbose=False,
-):
-    """Run inference on a single question."""
-    # Check if image is a list or a single image
-    if image is None:
-        num_images = 0
-    elif isinstance(image, list):
-        num_images = len(image)
-    else:
-        num_images = 1
-
-    prompt = apply_chat_template(
-        processor, model.config, question, num_images=num_images
-    )
-
-    response = generate(
-        model,
-        processor,
-        prompt,
-        image=image,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        resize_shape=resize_shape,
-        verbose=verbose,
-    )
-    return response.text
 
 
 def list_subjects():
@@ -406,6 +368,12 @@ def main():
     args = parse_arguments()
     random.seed(args.seed)
 
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+
     if "pro" in args.dataset.lower():
         subjects = MMMU_PRO_SUBJECTS
     else:
@@ -413,7 +381,7 @@ def main():
 
     if args.prediction_file:
         # Load predictions from file
-        logger.info(f"\033[32mLoading predictions from {args.prediction_file}\033[0m")
+        logging.info(f"\033[32mLoading predictions from {args.prediction_file}\033[0m")
         results = []
         with open(args.prediction_file, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -422,7 +390,7 @@ def main():
 
         # Evaluate loaded predictions
         MMMU_eval(results, args.prediction_file)
-        logger.info(f"\033[32mEvaluation complete\033[0m")
+        logging.info(f"\033[32mEvaluation complete\033[0m")
         return
 
     # Handle --list-subjects flag
@@ -430,21 +398,21 @@ def main():
         list_subjects()
         return
 
-    logger.info("\033[32mStarting MMMU Evaluation\033[0m")
+    logging.info("\033[32mStarting MMMU Evaluation\033[0m")
 
     # Validate subset if provided
     if args.subset and args.subset not in subjects:
-        logger.error(f"\033[31mError: Invalid subset '{args.subset}'\033[0m")
-        logger.error(f"\033[31mValid subjects are: {', '.join(subjects)}\033[0m")
-        logger.error(f"\033[31mSee SUBJECTS.md for more details\033[0m")
+        logging.error(f"\033[31mError: Invalid subset '{args.subset}'\033[0m")
+        logging.error(f"\033[31mValid subjects are: {', '.join(subjects)}\033[0m")
+        logging.error(f"\033[31mSee SUBJECTS.md for more details\033[0m")
         return
 
-    logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
+    logging.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
 
     # Load dataset
 
     if args.subset:
-        logger.info(f"\033[32mUsing subset: {args.subset}\033[0m")
+        logging.info(f"\033[32mUsing subset: {args.subset}\033[0m")
         datasets = {
             args.subset: load_dataset(
                 args.dataset, args.subset, split=args.split, streaming=args.streaming
@@ -452,7 +420,7 @@ def main():
         }
         subset_name = args.subset
     else:
-        logger.info(f"\033[32mEvaluating all 30 subjects\033[0m")
+        logging.info(f"\033[32mEvaluating all 30 subjects\033[0m")
         datasets = {}
 
         for subject in subjects:
@@ -464,7 +432,9 @@ def main():
                     streaming=args.streaming,
                 )
             except Exception as e:
-                logger.error(f"\033[31mError loading dataset for {subject}: {e}\033[0m")
+                logging.error(
+                    f"\033[31mError loading dataset for {subject}: {e}\033[0m"
+                )
                 continue
 
         subset_name = "all"
@@ -475,16 +445,16 @@ def main():
             k: v.select(range(min(args.max_samples, len(v))))
             for k, v in datasets.items()
         }
-        logger.info(f"\033[33mLimited to {len(datasets)} samples for testing\033[0m")
+        logging.info(f"\033[33mLimited to {len(datasets)} samples for testing\033[0m")
 
-    logger.info(f"\033[32mDataset subset size: {len(datasets.keys())}\033[0m")
-    logger.info(f"\033[32mLoading model from {args.model}\033[0m")
+    logging.info(f"\033[32mDataset subset size: {len(datasets.keys())}\033[0m")
+    logging.info(f"\033[32mLoading model from {args.model}\033[0m")
 
     model, processor = load(
         args.model, adapter_path=args.adapter_path, trust_remote_code=True
     )
     config = model.config
-    logger.info(f"\033[32mConfig: {config}\033[0m")
+    logging.info(f"\033[32mConfig: {config}\033[0m")
 
     # Create results directory
     model_name = args.model.split("/")[-1]
@@ -528,7 +498,7 @@ def main():
 
             # Show progress
             if (idx + 1) % 10 == 0 or idx < 5:
-                logger.info(
+                logging.info(
                     f"Sample {idx + 1}: Answer={result['answer']}, Prediction={prediction[:50]}..."
                 )
 
@@ -546,12 +516,12 @@ def main():
             writer.writeheader()
             writer.writerows(results)
 
-    logger.info(f"\033[32mSaved results to {result_file}\033[0m")
+    logging.info(f"\033[32mSaved results to {result_file}\033[0m")
 
     # Evaluate results
     MMMU_eval(results, result_file)
 
-    logger.info(f"\033[32mEvaluation complete\033[0m")
+    logging.info(f"\033[32mEvaluation complete\033[0m")
 
 
 if __name__ == "__main__":

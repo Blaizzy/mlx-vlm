@@ -7,78 +7,12 @@ import re
 from pathlib import Path
 from typing import Optional
 
-import mlx.core as mx
 from datasets import load_dataset
 from PIL import Image
 from tqdm import tqdm
 
 from mlx_vlm import generate, load
-from mlx_vlm.prompt_utils import apply_chat_template
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Evaluate models on MathVista benchmark"
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="The path to the MLX VLM model",
-    )
-    parser.add_argument(
-        "--adapter-path",
-        type=str,
-        help="Optional path for the trained adapter weights and config",
-    )
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default="AI4Math/MathVista",
-        help="Hugging Face dataset name",
-    )
-    parser.add_argument(
-        "--split",
-        type=str,
-        default="testmini",
-        choices=["testmini", "test"],
-        help="Dataset split to evaluate on",
-    )
-    parser.add_argument(
-        "--streaming",
-        action="store_true",
-        help="Use streaming dataset loading",
-    )
-    parser.add_argument(
-        "--max-samples",
-        type=int,
-        default=None,
-        help="Maximum number of samples to evaluate (for debugging)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="results/mathvista",
-        help="Directory to save results",
-    )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=512,
-        help="Maximum number of tokens to generate",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-        help="Temperature for generation",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print detailed output for debugging",
-    )
-    return parser.parse_args()
+from mlx_vlm.evals.utils import inference
 
 
 def process_question(sample: dict) -> str:
@@ -390,6 +324,71 @@ def inference(
         verbose=verbose,
     )
     return response
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Evaluate models on MathVista benchmark"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        required=True,
+        help="The path to the MLX VLM model",
+    )
+    parser.add_argument(
+        "--adapter-path",
+        type=str,
+        help="Optional path for the trained adapter weights and config",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="AI4Math/MathVista",
+        help="Hugging Face dataset name",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="testmini",
+        choices=["testmini", "test"],
+        help="Dataset split to evaluate on",
+    )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Use streaming dataset loading",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Maximum number of samples to evaluate (for debugging)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="results/mathvista",
+        help="Directory to save results",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=512,
+        help="Maximum number of tokens to generate",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Temperature for generation",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print detailed output for debugging",
+    )
+    return parser.parse_args()
 
 
 def main():

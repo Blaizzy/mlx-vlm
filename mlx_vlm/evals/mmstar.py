@@ -1,18 +1,16 @@
 import argparse
 import csv
+import logging
 import os
 import re
 from copy import deepcopy
 from json import dump
-from logging import getLogger
 
 from datasets import load_dataset
 from tqdm import tqdm
 
-from mlx_vlm import generate, load
-from mlx_vlm.prompt_utils import apply_chat_template
-
-logger = getLogger(__name__)
+from mlx_vlm import load
+from mlx_vlm.evals.utils import inference
 
 
 def extract_answer(predict, answer):
@@ -202,45 +200,6 @@ def MMStar_eval(data: list, eval_file: str):
             writer.writeheader()
             writer.writerows(data)
 
-    logger.info(
-        f"MMStar_eval successfully finished evaluating {eval_file}, results saved in {score_pth}"
-    )
-
-
-def inference(
-    model,
-    processor,
-    question,
-    image,
-    max_tokens=3000,
-    temperature=0.7,
-    resize_shape=None,
-    verbose=False,
-):
-    # Check if image is a list or a single image
-    if image is None:
-        num_images = 0
-    elif isinstance(image, list):
-        num_images = len(image)
-    else:
-        num_images = 1
-
-    prompt = apply_chat_template(
-        processor, model.config, question, num_images=num_images
-    )
-
-    response = generate(
-        model,
-        processor,
-        prompt,
-        image=image,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        resize_shape=resize_shape,
-        verbose=verbose,
-    )
-    return response
-
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="MMStar Evaluation")
@@ -297,9 +256,16 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
-    logger.info("\033[32mStarting MMStar Evaluation\033[0m")
+
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+
+    logging.info("\033[32mStarting MMStar Evaluation\033[0m")
     if args.prediction_file:
-        logger.info(
+        logging.info(
             f"\033[32mLoading predictions from {args.prediction_file} for evaluation\033[0m"
         )
         results = []
@@ -307,19 +273,19 @@ def main():
             reader = csv.DictReader(f)
             results = [row for row in reader]
         MMStar_eval(results, args.prediction_file)
-        logger.info(f"\033[32mEvaluation complete\033[0m")
+        logging.info(f"\033[32mEvaluation complete\033[0m")
         return
-    logger.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
+    logging.info(f"\033[32mLoading dataset from {args.dataset}\033[0m")
     dataset = load_dataset(args.dataset, split=args.split, streaming=args.streaming)
     if args.max_samples:
         dataset = dataset.take(args.max_samples)
 
-    logger.info(f"\033[32mLoading model from {args.model}\033[0m")
+    logging.info(f"\033[32mLoading model from {args.model}\033[0m")
     model, processor = load(
         args.model, adapter_path=args.adapter_path, trust_remote_code=True
     )
     config = model.config
-    logger.info(f"\033[32mConfig: {config}\033[0m")
+    logging.info(f"\033[32mConfig: {config}\033[0m")
 
     result_file = f'{args.output_dir}/{args.model.split("/")[-1]}_{args.dataset.split("/")[-1]}_{args.split}_predictions.csv'
     os.makedirs(args.output_dir, exist_ok=True)
@@ -364,8 +330,8 @@ def main():
 
     MMStar_eval(results, result_file)
 
-    logger.info(f"\033[32mSaving results to {result_file}\033[0m")
-    logger.info(f"\033[32mEvaluation complete\033[0m")
+    logging.info(f"\033[32mSaving results to {result_file}\033[0m")
+    logging.info(f"\033[32mEvaluation complete\033[0m")
 
 
 if __name__ == "__main__":

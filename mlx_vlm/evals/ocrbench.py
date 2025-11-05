@@ -8,79 +8,8 @@ from typing import Optional
 from datasets import load_dataset
 from tqdm import tqdm
 
-from mlx_vlm import generate, load
-from mlx_vlm.prompt_utils import apply_chat_template
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Evaluate models on OCRBench benchmark"
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="The path to the MLX VLM model",
-    )
-    parser.add_argument(
-        "--adapter-path",
-        type=str,
-        help="Optional path for the trained adapter weights and config",
-    )
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default="echo840/OCRBench",
-        help="Hugging Face dataset name",
-    )
-    parser.add_argument(
-        "--split",
-        type=str,
-        default="test",
-        choices=["test"],
-        help="Dataset split to evaluate on",
-    )
-    parser.add_argument(
-        "--streaming",
-        action="store_true",
-        help="Use streaming dataset loading",
-    )
-    parser.add_argument(
-        "--max-samples",
-        type=int,
-        default=None,
-        help="Maximum number of samples to evaluate (for debugging)",
-    )
-    parser.add_argument(
-        "--predictions-file",
-        type=str,
-        default=None,
-        help="File with predictions",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="results/ocrbench",
-        help="Directory to save results",
-    )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=512,
-        help="Maximum number of tokens to generate",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-        help="Temperature for generation",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print detailed output for debugging",
-    )
-    return parser.parse_args()
+from mlx_vlm import load
+from mlx_vlm.evals.utils import inference
 
 
 def process_question(sample: dict) -> str:
@@ -101,41 +30,6 @@ def evaluate_answer(prediction: Optional[str], ground_truth: list) -> bool:
         return False
     pred = prediction.strip().lower()
     return any(str(a).strip().lower() in pred for a in ground_truth)
-
-
-def inference(
-    model,
-    processor,
-    question,
-    image,
-    max_tokens=512,
-    temperature=0.0,
-    resize_shape=None,
-    verbose=False,
-):
-    # Check if image is a list or a single image
-    if image is None:
-        num_images = 0
-    elif isinstance(image, list):
-        num_images = len(image)
-    else:
-        num_images = 1
-
-    prompt = apply_chat_template(
-        processor, model.config, question, num_images=num_images
-    )
-
-    response = generate(
-        model,
-        processor,
-        prompt,
-        image=image,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        resize_shape=resize_shape,
-        verbose=verbose,
-    )
-    return response
 
 
 def OCRBench_val(results_list, args, model_name, dataset="OCRBench"):
@@ -221,6 +115,77 @@ def OCRBench_val(results_list, args, model_name, dataset="OCRBench"):
             print(f"  {category}: {cat_correct}/{cat_total} ({cat_accuracy*100:.2f}%)")
         print(f"{'='*80}")
         print(f"\nResults saved to {results_file} and {summary_file}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Evaluate models on OCRBench benchmark"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        required=True,
+        help="The path to the MLX VLM model",
+    )
+    parser.add_argument(
+        "--adapter-path",
+        type=str,
+        help="Optional path for the trained adapter weights and config",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="echo840/OCRBench",
+        help="Hugging Face dataset name",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="test",
+        choices=["test"],
+        help="Dataset split to evaluate on",
+    )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Use streaming dataset loading",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Maximum number of samples to evaluate (for debugging)",
+    )
+    parser.add_argument(
+        "--predictions-file",
+        type=str,
+        default=None,
+        help="File with predictions",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="results/ocrbench",
+        help="Directory to save results",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=512,
+        help="Maximum number of tokens to generate",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Temperature for generation",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print detailed output for debugging",
+    )
+    return parser.parse_args()
 
 
 def main():
