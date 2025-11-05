@@ -366,6 +366,7 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
+
     random.seed(args.seed)
 
     # Setup logging

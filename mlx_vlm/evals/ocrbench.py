@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import logging
+import random
 from pathlib import Path
 from typing import Optional
 
@@ -185,11 +186,14 @@ def parse_args():
         action="store_true",
         help="Print detailed output for debugging",
     )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    random.seed(args.seed)
 
     # Setup logging
     logging.basicConfig(

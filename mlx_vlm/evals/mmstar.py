@@ -2,6 +2,7 @@ import argparse
 import csv
 import logging
 import os
+import random
 import re
 from copy import deepcopy
 from json import dump
@@ -251,11 +252,15 @@ def parse_arguments():
         default="results/mmstar",
         help="Directory to save evaluation results",
     )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+
     return parser.parse_args()
 
 
 def main():
     args = parse_arguments()
+
+    random.seed(args.seed)
 
     # Setup logging
     logging.basicConfig(
