@@ -424,7 +424,7 @@ def main():
                 image=image,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
-            ).text
+            )
 
             response = output.strip()
 

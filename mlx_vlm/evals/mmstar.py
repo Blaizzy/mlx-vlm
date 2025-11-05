@@ -308,7 +308,7 @@ def main():
             args.temperature,
             args.resize_shape,
             args.verbose,
-        ).text
+        )
 
         results.append(
             {
