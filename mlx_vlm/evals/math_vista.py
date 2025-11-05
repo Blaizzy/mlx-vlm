@@ -11,7 +11,7 @@ from datasets import load_dataset
 from PIL import Image
 from tqdm import tqdm
 
-from mlx_vlm import generate, load
+from mlx_vlm import load
 from mlx_vlm.evals.utils import inference
 
 
