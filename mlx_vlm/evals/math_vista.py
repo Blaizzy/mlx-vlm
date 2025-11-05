@@ -291,41 +291,6 @@ def evaluate_answer(prediction: Optional[str], ground_truth: str) -> bool:
         return False
 
 
-def inference(
-    model,
-    processor,
-    question,
-    image,
-    max_tokens=3000,
-    temperature=0.7,
-    resize_shape=None,
-    verbose=False,
-):
-    # Check if image is a list or a single image
-    if image is None:
-        num_images = 0
-    elif isinstance(image, list):
-        num_images = len(image)
-    else:
-        num_images = 1
-
-    prompt = apply_chat_template(
-        processor, model.config, question, num_images=num_images
-    )
-
-    response = generate(
-        model,
-        processor,
-        prompt,
-        image=image,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        resize_shape=resize_shape,
-        verbose=verbose,
-    )
-    return response
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Evaluate models on MathVista benchmark"
