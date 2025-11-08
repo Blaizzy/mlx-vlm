@@ -147,10 +147,8 @@ class Attention(nn.Module):
             (1, seq_length, seq_length), mx.finfo(q.dtype).min, dtype=q.dtype
         )
 
-        for i in range(1, len(cu_seqlens)):
-            start = int(cu_seqlens[i - 1])
-            end = int(cu_seqlens[i])
-            attention_mask[..., start:end, start:end] = 0
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        attention_mask[..., -max_seqlen:] = 0
 
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
@@ -169,7 +167,7 @@ class MLP(nn.Module):
         super().__init__()
         self.linear_fc1 = nn.Linear(dim, hidden_dim, bias=True)
         self.linear_fc2 = nn.Linear(hidden_dim, dim, bias=True)
-        self.act_fn = nn.GELU(approx="fast")
+        self.act_fn = nn.GELU()
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
@@ -393,13 +391,10 @@ class VisionModel(nn.Module):
         batch_size = grid_thw.shape[0]
 
         # Calculate cu_seqlens for each item in the batch
-        cu_seqlens = []
-        for i in range(batch_size):
-            seq_len = grid_thw[i, 1] * grid_thw[i, 2]
-            cu_seqlens.append(mx.repeat(seq_len, grid_thw[i, 0]))
-
-        # Concatenate the cu_seqlens for all items in the batch
-        cu_seqlens = mx.concatenate(cu_seqlens)
+        seq_lens = grid_thw[:, 1] * grid_thw[:, 2]  # height * width for each item
+        cu_seqlens = mx.repeat(
+            seq_lens, grid_thw[:, 0].astype(mx.int32)
+        )  # repeat by num_frames
 
         cu_seqlens = mx.cumsum(cu_seqlens.astype(mx.int32), axis=0)
         cu_seqlens = mx.pad(cu_seqlens, (1, 0), mode="constant", constant_values=0)
