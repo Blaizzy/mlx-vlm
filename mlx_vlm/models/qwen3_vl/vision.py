@@ -391,7 +391,6 @@ class VisionModel(nn.Module):
         batch_size = grid_thw.shape[0]
 
         # Calculate cu_seqlens for each item in the batch
-        # Calculate sequence lengths for each item in the batch
         seq_lens = grid_thw[:, 1] * grid_thw[:, 2]  # height * width for each item
         cu_seqlens = mx.repeat(
             seq_lens, grid_thw[:, 0].astype(mx.int32)
