@@ -24,7 +24,9 @@ class Attention(nn.Module):
 
         # Allow overriding head_dim to support architectures where
         # n_heads * head_dim != hidden_size.
-        self.head_dim = head_dim = getattr(args, "head_dim", None) or (args.hidden_size // n_heads)
+        self.head_dim = head_dim = getattr(args, "head_dim", None) or (
+            args.hidden_size // n_heads
+        )
         self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)

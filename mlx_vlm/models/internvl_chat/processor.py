@@ -108,7 +108,7 @@ def dynamic_preprocess(
     if orig_width == 0 or orig_height == 0:
         # Handle potential zero dimensions
         return []
-    
+
     aspect_ratio = orig_width / orig_height
 
     # Calculate the possible target aspect ratios

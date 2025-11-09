@@ -22,11 +22,8 @@ class VisionConfig(BaseModelConfig):
 
     @classmethod
     def from_dict(cls, params):
-        # Normalize some fields that may arrive as lists (e.g., [H, W])
         def normalize_dim(v):
-            # Accept int, float, str, list/tuple
             if isinstance(v, (list, tuple)):
-                # If square dims, use that single value; else pick the first
                 if len(v) > 0:
                     try:
                         return int(v[0])
@@ -43,8 +40,8 @@ class VisionConfig(BaseModelConfig):
         if "patch_size" in p:
             p["patch_size"] = normalize_dim(p["patch_size"])
 
-        # Construct using standard dataclass-compatible filtering
         import inspect as _inspect
+
         return cls(
             **{k: v for k, v in p.items() if k in _inspect.signature(cls).parameters}
         )
