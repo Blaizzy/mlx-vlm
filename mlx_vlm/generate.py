@@ -404,6 +404,7 @@ def stream_generate(
             image_token_index=image_token_index,
             resize_shape=resize_shape,
             add_special_tokens=add_special_tokens,
+            **kwargs,
         )
         input_ids = inputs.get("input_ids", None)
         pixel_values = inputs.get("pixel_values", None)
