@@ -195,6 +195,12 @@ def configure_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--hf-path", type=str, help="Path to the Hugging Face model.")
     parser.add_argument(
+        "--revision",
+        type=str,
+        help="Hugging Face revision (branch), when converting a model from the Hub.",
+        default=None,
+    )
+    parser.add_argument(
         "--mlx-path", type=str, default="mlx_model", help="Path to save the MLX model."
     )
     parser.add_argument(
