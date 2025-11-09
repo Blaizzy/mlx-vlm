@@ -143,22 +143,20 @@ class Attention(nn.Module):
         q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
         k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
 
-        attention_mask = mx.full(
-            (1, seq_length, seq_length), mx.finfo(q.dtype).min, dtype=q.dtype
-        )
-
-        for i in range(1, len(cu_seqlens)):
-            start = int(cu_seqlens[i - 1])
-            end = int(cu_seqlens[i])
-            attention_mask[..., start:end, start:end] = 0
-
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        output = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.scale, mask=attention_mask
-        )
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        splits = [mx.split(tensor, lengths.tolist(), axis=2) for tensor in (q, k, v)]
+        attn_outputs = []
+        for q, k, v in zip(*splits):
+            output = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scale, mask=None
+            )
+            attn_outputs.append(output)
+
+        output = mx.concat(attn_outputs, axis=2)
         output = output.transpose(0, 2, 1, 3)
         output = output.reshape(seq_length, -1)
         return self.proj(output)
@@ -169,7 +167,7 @@ class MLP(nn.Module):
         super().__init__()
         self.linear_fc1 = nn.Linear(dim, hidden_dim, bias=True)
         self.linear_fc2 = nn.Linear(hidden_dim, dim, bias=True)
-        self.act_fn = nn.GELU(approx="fast")
+        self.act_fn = nn.GELU()
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
