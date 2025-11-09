@@ -720,12 +720,16 @@ def process_inputs(
         "images": images,
         "padding": True,
         "return_tensors": return_tensors,
-        **kwargs,
     }
 
     # Add special tokens if supported
     if "add_special_tokens" in inspect.signature(process_method).parameters:
         args["add_special_tokens"] = add_special_tokens
+
+    for param in inspect.signature(process_method).parameters.keys():
+        if param in kwargs.keys():
+            args[param] = kwargs.get(param, None)
+            break
 
     # Add audio if provided and supported
     if audio is not None:

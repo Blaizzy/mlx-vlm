@@ -268,7 +268,9 @@ class DeepseekVLV2Processor(ProcessorMixin):
         prompt: str = None,
         images: List[Image.Image] = None,
         inference_mode: bool = True,
-        **kwargs,
+        base_size: int = 1024,
+        image_size: int = 640,
+        cropping: bool = True,
     ):
 
         sft_format = prompt
@@ -281,9 +283,9 @@ class DeepseekVLV2Processor(ProcessorMixin):
         ) = self.tokenize_with_images(
             sft_format,
             images,
-            base_size=kwargs.get("base_size", 1024),
-            image_size=kwargs.get("image_size", 640),
-            cropping=kwargs.get("cropping", True),
+            base_size=base_size,
+            image_size=image_size,
+            cropping=cropping,
         )
 
         masked_tokenized_str = []
@@ -521,7 +523,11 @@ class DeepseekVLV2Processor(ProcessorMixin):
         text: str = None,
         images: List[Image.Image] = None,
         inference_mode: bool = True,
-        **kwargs,
+        image_size: int = 640,
+        base_size: int = 1024,
+        cropping: bool = True,
+        padding: bool = True,
+        return_tensors: Literal["np", "mx", "pt"] = "mx",
     ):
         """
 
@@ -529,7 +535,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
             text (str): the formatted prompt;
             images (List[ImageType]): the list of images;
             inference_mode (bool): if True, then remove the last eos token;
-            **kwargs:
 
         Returns:
             outputs (BaseProcessorOutput): the output of the processor,
@@ -543,7 +548,9 @@ class DeepseekVLV2Processor(ProcessorMixin):
             prompt=text,
             images=images,
             inference_mode=inference_mode,
-            **kwargs,
+            image_size=image_size,
+            base_size=base_size,
+            cropping=cropping,
         )
 
         return prepare
