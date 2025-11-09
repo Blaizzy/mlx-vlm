@@ -108,6 +108,7 @@ def dynamic_preprocess(
     if orig_width == 0 or orig_height == 0:
         # Handle potential zero dimensions
         return []
+
     aspect_ratio = orig_width / orig_height
 
     # Calculate the possible target aspect ratios
@@ -302,6 +303,13 @@ class InternVLChatProcessor(ProcessorMixin):
         **kwargs,
     ):
         processed_inputs = {}
+        if text is not None:
+            if isinstance(text, str):
+                text = [text]
+
+            if len(text) == 1 and images is not None and len(images) > 1:
+                raise ValueError("Multi-image inference is not supported.")
+
         if images is not None:
             image_features = self.image_processor.preprocess(
                 images, return_tensors=return_tensors, **kwargs
@@ -310,9 +318,6 @@ class InternVLChatProcessor(ProcessorMixin):
 
         if text is not None:
             queries = []
-
-            if isinstance(text, str):
-                text = [text]
 
             for idx in range(len(images)):
                 question = text[idx]
