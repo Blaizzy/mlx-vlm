@@ -526,7 +526,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
         """
 
         Args:
-            prompt (str): the formatted prompt;
+            text (str): the formatted prompt;
             images (List[ImageType]): the list of images;
             inference_mode (bool): if True, then remove the last eos token;
             **kwargs:
