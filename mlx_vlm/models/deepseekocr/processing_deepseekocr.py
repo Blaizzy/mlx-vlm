@@ -533,8 +533,8 @@ class DeepseekVLV2Processor(ProcessorMixin):
 
         Returns:
             outputs (BaseProcessorOutput): the output of the processor,
-                - input_ids (torch.LongTensor): [N + image tokens]
-                - images (torch.FloatTensor): [n_images, 3, H, W]
+                - input_ids (mx.array): [N + image tokens]
+                - images (mx.array): [n_images, 3, H, W]
                 - image_id (int): the id of the image token
                 - num_image_tokens (List[int]): the number of image tokens
         """
