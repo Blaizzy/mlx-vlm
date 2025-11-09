@@ -536,10 +536,20 @@ class LanguageModel(nn.Module):
         if pixel_values is not None:
             self.rope_deltas = None
 
+        cache_offset = 0
+        if cache and cache[0] is not None:
+            offset = cache[0].offset
+            if isinstance(offset, int):
+                cache_offset = offset
+            elif isinstance(offset, mx.array):
+                cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
+            else:
+                raise ValueError(f"Unexpected cache offset type: {type(offset)}")
+
         if position_ids is None and (mask is None or mask.ndim == 2):
             # Calculate RoPE index once per generation in the pre-fill stage only
             if (
-                (cache is not None and cache[0] is not None and cache[0].offset == 0)
+                (cache is not None and cache[0] is not None and (cache_offset == 0))
                 or self.rope_deltas is None
                 or cache is None
             ):
@@ -550,14 +560,23 @@ class LanguageModel(nn.Module):
             else:
                 # Use the prev pre-calculated rope-deltas to get the correct position ids
                 batch_size, seq_length = inputs.shape
-                delta = cache[-1].offset + self.rope_deltas if cache is not None else 0
-                delta = delta[None][None]
-                position_ids = mx.arange(seq_length).reshape(1, seq_length)
+                delta = mx.array(
+                    cache_offset + self.rope_deltas if cache is not None else 0
+                )
+                position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
-                if cache is not None:
-                    # Repeat delta for each batch
-                    delta = mx.repeat(delta, batch_size // delta.shape[0], axis=0)
-                position_ids = mx.add(position_ids, delta).reshape(position_ids.shape)
+
+                if cache_offset is not None:
+                    if delta.ndim == 0:
+                        delta = mx.expand_dims(delta, axis=0)
+
+                    if delta.shape[0] < batch_size:
+                        delta = mx.tile(delta, (batch_size, 1))
+                    else:
+                        # Slice delta to match batch
+                        delta = delta[:batch_size]
+
+                position_ids = mx.add(position_ids, delta)[None, ...]
                 position_ids = mx.broadcast_to(
                     position_ids, (3, batch_size, seq_length)
                 )

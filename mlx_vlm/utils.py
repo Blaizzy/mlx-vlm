@@ -54,6 +54,7 @@ def skip_multimodal_module(path: str) -> bool:
     return (
         "vision_model" in path
         or "vision_tower" in path
+        or "sam_model" in path
         or "audio_model" in path
         or "audio_tower" in path
     )
@@ -69,7 +70,7 @@ def get_model_and_args(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    model_type = config["model_type"]
+    model_type = config["model_type"].lower()
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
@@ -708,6 +709,7 @@ def process_inputs(
     audio=None,
     add_special_tokens=False,
     return_tensors="mlx",
+    **kwargs,
 ):
     # Get the process method from the processor
     process_method = getattr(processor, "process", processor)
@@ -718,6 +720,7 @@ def process_inputs(
         "images": images,
         "padding": True,
         "return_tensors": return_tensors,
+        **kwargs,
     }
 
     # Add special tokens if supported
@@ -735,7 +738,13 @@ def process_inputs(
 
 
 def process_inputs_with_fallback(
-    processor, prompts, images, audio, add_special_tokens=False, return_tensors="mlx"
+    processor,
+    prompts,
+    images,
+    audio,
+    add_special_tokens=False,
+    return_tensors="mlx",
+    **kwargs,
 ):
     # First attempt with specified return_tensors
     try:
@@ -746,6 +755,7 @@ def process_inputs_with_fallback(
             audio=audio,
             add_special_tokens=add_special_tokens,
             return_tensors=return_tensors,
+            **kwargs,
         )
     except Exception as e:
         # Fallback to PyTorch tensors if MLX fails
@@ -758,11 +768,12 @@ def process_inputs_with_fallback(
                     audio=audio,
                     add_special_tokens=add_special_tokens,
                     return_tensors="pt",
+                    **kwargs,
                 )
             except Exception as fallback_error:
                 raise ValueError(
                     f"Failed to process inputs with error: {fallback_error}"
-                )
+                ) from fallback_error
 
         raise ValueError(f"Failed to process inputs with error: {e}")
 
@@ -775,6 +786,7 @@ def prepare_inputs(
     image_token_index=None,
     resize_shape=None,
     add_special_tokens=False,
+    **kwargs,
 ):
 
     if not images and not audio:
@@ -860,6 +872,7 @@ def prepare_inputs(
             audio=audio,
             prompts=prompts,
             add_special_tokens=add_special_tokens,
+            **kwargs,
         )
 
         if "images" in inputs:
@@ -869,10 +882,14 @@ def prepare_inputs(
         model_inputs["attention_mask"] = (
             mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
         )
+
         # Convert inputs to model_inputs with mx.array if present
         for key, value in inputs.items():
-            if key not in model_inputs and not isinstance(value, (str, list)):
-                model_inputs[key] = mx.array(value)
+            if key not in model_inputs:
+                if isinstance(value, (str, list, mx.array)):
+                    model_inputs[key] = value
+                else:
+                    model_inputs[key] = mx.array(value)
 
     return model_inputs
 
