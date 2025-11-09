@@ -2,7 +2,13 @@ from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import ChunkedKVCache, KVCache, RotatingKVCache, _BaseCache
+from mlx_lm.models.cache import (
+    BatchKVCache,
+    BatchRotatingKVCache,
+    KVCache,
+    RotatingKVCache,
+    _BaseCache,
+)
 
 
 def make_prompt_cache(
