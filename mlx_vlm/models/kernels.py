@@ -91,7 +91,9 @@ def nearest_interpolate(x, size=None, scale_factor=None):
     return result
 
 
-def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
+def bicubic_interpolate(
+    x, size=None, scale_factor=None, align_corners=False, antialias=False
+):
     """
     Bicubic interpolation using MLX's built-in interpolate function.
 
@@ -100,6 +102,7 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
         size: Tuple of (out_h, out_w) or None
         scale_factor: Float or tuple of (scale_h, scale_w) or None
         align_corners: Whether to align corners
+        antialias: Whether to apply antialiasing
 
     Returns:
         Interpolated MLX tensor
@@ -120,9 +123,34 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
     else:
         raise ValueError("Either size or scale_factor must be specified")
 
-    # Create scale and align_corners parameters tensor
+    # Calculate antialiasing parameters
+    # PyTorch uses support = 2.0 for bicubic when antialiasing
+    support = 2.0
+    antialias_flag = 1.0 if (antialias and (scale_h < 1.0 or scale_w < 1.0)) else 0.0
+
+    # When downsampling with antialias, PyTorch expands the filter support
+    if antialias and scale_h < 1.0:
+        filter_scale_h = 1.0 / scale_h
+    else:
+        filter_scale_h = 1.0
+
+    if antialias and scale_w < 1.0:
+        filter_scale_w = 1.0 / scale_w
+    else:
+        filter_scale_w = 1.0
+
+    # Create parameters tensor
     params = mx.array(
-        [scale_h, scale_w, 1.0 if align_corners else 0.0], dtype=mx.float32
+        [
+            scale_h,
+            scale_w,
+            1.0 if align_corners else 0.0,
+            antialias_flag,
+            filter_scale_h,
+            filter_scale_w,
+            support,
+        ],
+        dtype=mx.float32,
     )
 
     # Create dimensions tensor
@@ -137,32 +165,38 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
         x_flat = x_flat.astype(mx.float32)
 
     header = """
-        // Improved cubic kernel function for better continuity
+        // Bicubic kernel function
         float cubic_kernel(float x) {
             float absx = fabs(x);
             float absx2 = absx * absx;
             float absx3 = absx2 * absx;
 
-            // Use a=-0.5 for smoother interpolation
             const float a = -0.5f;
 
             if (absx <= 1.0f) {
-                return (a+2.0f)*absx3 - (a+3.0f)*absx2 + 1.0f;
+                return (a + 2.0f) * absx3 - (a + 3.0f) * absx2 + 1.0f;
             } else if (absx < 2.0f) {
-                return a*absx3 - 5.0f*a*absx2 + 8.0f*a*absx - 4.0f*a;
+                return a * absx3 - 5.0f * a * absx2 + 8.0f * a * absx - 4.0f * a;
             }
             return 0.0f;
-        };
+        }
+
+        // Antialiased bicubic kernel - scales the support region for downsampling
+        float cubic_kernel_antialias(float x, float scale) {
+            // When downsampling, we need to integrate over a wider region
+            // This matches PyTorch's antialiasing behavior
+            return cubic_kernel(x / scale);
+        }
     """
 
-    # Metal kernel source code
+    # Metal kernel source code with antialiasing support
     source = """
         // Get thread position
         uint x_out = thread_position_in_grid.x;
         uint y_out = thread_position_in_grid.y;
         uint bc_idx = thread_position_in_grid.z;
 
-        // Extract dimensions from dims
+        // Extract dimensions
         int batch_size = dims[0];
         int channels = dims[1];
         int in_h = dims[2];
@@ -170,10 +204,14 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
         int out_h = dims[4];
         int out_w = dims[5];
 
-        // Extract scales and flags
+        // Extract parameters
         float scale_h = params[0];
         float scale_w = params[1];
-        bool align_corners = params[2] > 0.5;
+        bool align_corners = params[2] > 0.5f;
+        bool use_antialias = params[3] > 0.5f;
+        float filter_scale_h = params[4];
+        float filter_scale_w = params[5];
+        float support = params[6];
 
         // Check bounds
         if (x_out >= (uint)out_w || y_out >= (uint)out_h || bc_idx >= (uint)(batch_size * channels))
@@ -183,39 +221,50 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
         int c = bc_idx % channels;
         int b = bc_idx / channels;
 
-        // Calculate input coordinates based on output position
+        // Calculate input coordinates
         float x_in, y_in;
 
         if (align_corners && out_w > 1 && out_h > 1) {
             x_in = float(x_out) * (in_w - 1) / (out_w - 1);
             y_in = float(y_out) * (in_h - 1) / (out_h - 1);
         } else {
-            // Fix the alignment calculation to ensure consistent mapping across thread boundaries
+            // PyTorch's default coordinate mapping
             x_in = ((float(x_out) + 0.5f) / float(out_w)) * float(in_w) - 0.5f;
             y_in = ((float(y_out) + 0.5f) / float(out_h)) * float(in_h) - 0.5f;
         }
 
-        // Get integer and fractional parts
-        int x0 = int(floor(x_in));
-        int y0 = int(floor(y_in));
-        float x_frac = x_in - x0;
-        float y_frac = y_in - y0;
+        // Calculate the support region based on antialiasing
+        float support_h = use_antialias ? support * filter_scale_h : support;
+        float support_w = use_antialias ? support * filter_scale_w : support;
 
-        // Perform bicubic interpolation with improved boundary handling
+        // Calculate the range of input pixels to sample
+        int y_start = int(floor(y_in - support_h)) + 1;
+        int y_end = int(floor(y_in + support_h)) + 1;
+        int x_start = int(floor(x_in - support_w)) + 1;
+        int x_end = int(floor(x_in + support_w)) + 1;
+
+        // Clamp to valid range
+        y_start = max(0, y_start);
+        y_end = min(in_h, y_end);
+        x_start = max(0, x_start);
+        x_end = min(in_w, x_end);
+
+        // Perform bicubic interpolation with antialiasing
         float result = 0.0f;
-        float weight_sum = 0.0f;  // Track weight sum for normalization
+        float weight_sum = 0.0f;
 
-        for (int i = -1; i <= 2; i++) {
-            int y_pos = y0 + i;
-            // Clamp y coordinate to valid range
-            y_pos = max(0, min(y_pos, in_h - 1));
-            float wy = cubic_kernel(y_frac - i);
+        for (int y_pos = y_start; y_pos < y_end; y_pos++) {
+            float dy = float(y_pos) - y_in;
+            float wy = use_antialias ?
+                cubic_kernel_antialias(dy, filter_scale_h) :
+                cubic_kernel(dy);
 
-            for (int j = -1; j <= 2; j++) {
-                int x_pos = x0 + j;
-                // Clamp x coordinate to valid range
-                x_pos = max(0, min(x_pos, in_w - 1));
-                float wx = cubic_kernel(x_frac - j);
+            for (int x_pos = x_start; x_pos < x_end; x_pos++) {
+                float dx = float(x_pos) - x_in;
+                float wx = use_antialias ?
+                    cubic_kernel_antialias(dx, filter_scale_w) :
+                    cubic_kernel(dx);
+
                 float weight = wy * wx;
 
                 // Calculate input tensor offset
@@ -227,8 +276,8 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
             }
         }
 
-        // Normalize by weight sum to ensure consistent intensity
-        if (weight_sum > 0.0f) {
+        // Normalize by weight sum
+        if (weight_sum > 1e-8f) {
             result /= weight_sum;
         }
 
@@ -236,12 +285,12 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
         int output_offset = ((b * channels + c) * out_h + y_out) * out_w + x_out;
 
         // Assign the result to output
-        output[output_offset] = (float)result;
+        output[output_offset] = result;
     """
 
     # Create the kernel
     kernel = mx.fast.metal_kernel(
-        name="bicubic_interpolation",
+        name="bicubic_interpolation_antialias",
         input_names=["input", "dims", "params"],
         output_names=["output"],
         source=source,
@@ -255,7 +304,7 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
         grid=(out_w, out_h, batch_size * channels),
         threadgroup=threadgroup,
         output_shapes=[(batch_size * channels * out_h * out_w,)],
-        output_dtypes=[mx.float32],  # Always use float32 for kernel output
+        output_dtypes=[mx.float32],
     )
 
     # Reshape output back to 4D tensor and convert back to original dtype

@@ -3,6 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -13,7 +14,7 @@ from ..cache import KVCache
 from .config import ModelConfig, TextConfig
 
 
-class Qwen2RotaryEmbedding:
+class Qwen3VLRotaryEmbedding:
     def __init__(
         self, dim, max_position_embeddings=2048, base=10000, rope_scaling=None
     ):
@@ -113,21 +114,26 @@ class Attention(nn.Module):
         assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
-        self.head_dim = head_dim = args.hidden_size // n_heads
+        self.head_dim = head_dim = getattr(
+            args, "head_dim", args.hidden_size // args.num_attention_heads
+        )
         self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
+
+        self.q_norm = nn.RMSNorm(dims=head_dim, eps=args.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(dims=head_dim, eps=args.rms_norm_eps)
 
         self.rope_scaling = args.rope_scaling
 
-        self.rotary_emb = Qwen2RotaryEmbedding(
+        self.rotary_emb = Qwen3VLRotaryEmbedding(
             head_dim,
             max_position_embeddings=args.max_position_embeddings,
             base=args.rope_theta,
-            rope_scaling=args.rope_scaling,
+            rope_scaling=self.rope_scaling,
         )
 
     def __call__(
@@ -142,10 +148,12 @@ class Attention(nn.Module):
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
         # Prepare the queries, keys and values for the attention computation
-        queries = queries.reshape(B, L, self.n_heads, self.head_dim).transpose(
-            0, 2, 1, 3
-        )
-        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        queries = self.q_norm(
+            queries.reshape(B, L, self.n_heads, self.head_dim)
+        ).transpose(0, 2, 1, 3)
+        keys = self.k_norm(
+            keys.reshape(B, L, self.n_kv_heads, self.head_dim)
+        ).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(
             0, 2, 1, 3
         )
@@ -163,10 +171,9 @@ class Attention(nn.Module):
         cos, sin = self.rotary_emb(values, position_ids)
 
         if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., : keys.shape[-2]]
-        queries, keys = apply_multimodal_rotary_pos_emb(
-            queries, keys, cos, sin, unqueeze_dim=1
-        )
+            mask = mask[..., :kv_seq_len]
+
+        queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
@@ -189,18 +196,18 @@ class MLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Qwen2VLDecoderLayer(nn.Module):
-    def __init__(self, args: TextConfig):
+class Qwen3VLDecoderLayer(nn.Module):
+    def __init__(self, args: TextConfig, layer_idx: int):
         super().__init__()
-        self.num_attention_heads = args.num_attention_heads
         self.hidden_size = args.hidden_size
         self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size)
+
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
         self.args = args
+        self.mlp = MLP(args.hidden_size, args.intermediate_size)
 
     def __call__(
         self,
@@ -216,7 +223,7 @@ class Qwen2VLDecoderLayer(nn.Module):
         return out
 
 
-class Qwen2Model(nn.Module):
+class Qwen3VLModel(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
         self.args = args
@@ -225,7 +232,8 @@ class Qwen2Model(nn.Module):
         assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            Qwen2VLDecoderLayer(args=args) for _ in range(args.num_hidden_layers)
+            Qwen3VLDecoderLayer(args=args, layer_idx=layer_idx)
+            for layer_idx in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
@@ -236,6 +244,9 @@ class Qwen2Model(nn.Module):
         mask: Optional[mx.array] = None,
         cache=None,
         position_ids: Optional[mx.array] = None,
+        # args for deepstack
+        visual_pos_masks: Optional[mx.array] = None,
+        deepstack_visual_embeds: Optional[mx.array] = None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -248,19 +259,44 @@ class Qwen2Model(nn.Module):
         if mask is None:
             mask = create_attention_mask(h, cache)
 
-        for layer, c in zip(self.layers, cache):
+        for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
             h = layer(h, mask, c, position_ids)
+
+            # Add deepstack visual embeds
+            # add visual features to the hidden states of first several layers
+            if deepstack_visual_embeds is not None and layer_idx in range(
+                len(deepstack_visual_embeds)
+            ):
+                h = self._deepstack_process(
+                    h,
+                    visual_pos_masks,
+                    deepstack_visual_embeds[layer_idx],
+                )
 
         return self.norm(h)
 
+    def _deepstack_process(
+        self,
+        hidden_states: mx.array,
+        visual_pos_masks: mx.array,
+        visual_embeds: mx.array,
+    ):
+        visual_embeds = visual_embeds.astype(hidden_states.dtype)
+        # Convert boolean mask to indices using numpy
+        visual_indices = np.where(visual_pos_masks)[0].tolist()
+        local_this = hidden_states[:, visual_indices, :] + visual_embeds
+        hidden_states[:, visual_indices, :] = local_this
+        return hidden_states
+
 
 class LanguageModel(nn.Module):
-    def __init__(self, args: TextConfig, config: ModelConfig):
+    def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
         self.args = args
         self.config = config
         self.model_type = args.model_type
-        self.model = Qwen2Model(args)
+        self.model = Qwen3VLModel(args)
+        self.rope_deltas = None
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
@@ -448,6 +484,9 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        # args for deepstack
+        visual_pos_masks: Optional[mx.array] = None,
+        deepstack_visual_embeds: Optional[mx.array] = None,
         **kwargs,
     ):
 
@@ -455,8 +494,9 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
-        # Local variable for rope_deltas
-        rope_deltas = None
+        # reset rope_deltas when processing a new image/video
+        if pixel_values is not None:
+            self.rope_deltas = None
 
         cache_offset = 0
         if cache and cache[0] is not None:
@@ -478,7 +518,7 @@ class LanguageModel(nn.Module):
                 position_ids, rope_deltas = self.get_rope_index(
                     inputs, image_grid_thw, video_grid_thw, mask
                 )
-                rope_deltas = mx.stop_gradient(rope_deltas)
+                self.rope_deltas = rope_deltas
             else:
                 # Use the prev pre-calculated rope-deltas to get the correct position ids
                 batch_size, seq_length = inputs.shape
@@ -488,14 +528,12 @@ class LanguageModel(nn.Module):
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
 
-                if cache is not None:
+                if cache_offset is not None:
                     if delta.ndim == 0:
                         delta = mx.expand_dims(delta, axis=0)
 
                     if delta.shape[0] < batch_size:
-                        # Repeat delta to fill batch
-                        repeats = batch_size // delta.shape[0]
-                        delta = mx.repeat(delta, repeats, axis=0)
+                        delta = mx.tile(delta, (batch_size, 1))
                     else:
                         # Slice delta to match batch
                         delta = delta[:batch_size]
@@ -506,7 +544,12 @@ class LanguageModel(nn.Module):
                 )
 
         out = self.model(
-            inputs, cache=cache, inputs_embeds=inputs_embeds, position_ids=position_ids
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
         )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
