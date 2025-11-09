@@ -391,11 +391,13 @@ class VisionModel(nn.Module):
         batch_size = grid_thw.shape[0]
 
         # Calculate cu_seqlens for each item in the batch
-        # Calculate sequence lengths for each item in the batch
-        seq_lens = grid_thw[:, 1] * grid_thw[:, 2]  # height * width for each item
-        cu_seqlens = mx.repeat(
-            seq_lens, grid_thw[:, 0].astype(mx.int32)
-        )  # repeat by num_frames
+        cu_seqlens = []
+        for i in range(batch_size):
+            seq_len = grid_thw[i, 1] * grid_thw[i, 2]
+            cu_seqlens.append(mx.repeat(seq_len, grid_thw[i, 0]))
+
+        # Concatenate the cu_seqlens for all items in the batch
+        cu_seqlens = mx.concatenate(cu_seqlens)
 
         cu_seqlens = mx.cumsum(cu_seqlens.astype(mx.int32), axis=0)
         cu_seqlens = mx.pad(cu_seqlens, (1, 0), mode="constant", constant_values=0)
