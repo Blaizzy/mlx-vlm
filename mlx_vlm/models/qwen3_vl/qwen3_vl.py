@@ -60,7 +60,9 @@ class Model(nn.Module):
         split_sizes = (
             image_grid_thw.prod(-1) // self.vision_tower.spatial_merge_size**2
         ).tolist()
-        hidden_states = mx.split(hidden_states, split_sizes)
+        hidden_states = mx.split(
+            hidden_states, [split_sizes[0], sum(split_sizes[:2])], axis=0
+        )
 
         hidden_states = mx.concatenate(hidden_states, axis=0).astype(
             hidden_states[0].dtype
