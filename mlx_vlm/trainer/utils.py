@@ -5,6 +5,7 @@ import math
 import mlx.nn as nn
 import mlx.core as mx
 from mlx.utils import tree_flatten
+from typing import Union
 
 from .lora import LoRaLayer
 
@@ -20,7 +21,7 @@ class Colors:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
-supported_for_training = {"qwen2_vl", "qwen2_5_vl"}
+supported_for_training = {"qwen2_vl"}
 
 def grad_checkpoint(layer):
     """
@@ -219,3 +220,18 @@ def unfreeze_modules(model: nn.Module, module_names):
             "[warn] unfreeze_modules: no matching modules found for patterns:",
             ", ".join(module_names),
         )
+
+
+def save_adapter(model: nn.Module, adapter_file: Union[str, Path]):
+    """Save adapter weights and config."""
+    path = Path(adapter_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Save adapter config if available
+    if hasattr(model, 'config') and hasattr(model.config, "lora"):
+        with open(path.parent / "adapter_config.json", "w") as f:
+            json.dump(model.config.lora, f, indent=2)
+    
+    # Save weights
+    flattened_tree = tree_flatten(model.trainable_parameters())
+    mx.save_safetensors(str(adapter_file), dict(flattened_tree))

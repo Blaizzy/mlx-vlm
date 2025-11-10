@@ -139,16 +139,6 @@ def main(args):
     )
     
     # Train the model
-    if hasattr(model, 'language_model'):
-        if not hasattr(model.language_model, 'rope_deltas'):
-            model.language_model.rope_deltas = None
-            logger.info(f"{Colors.OKGREEN}Initialized rope_deltas for language_model{Colors.ENDC}")
-        
-        # Freeze rope_deltas to prevent gradient computation
-        if hasattr(model.language_model, 'rope_deltas'):
-            model.language_model.freeze(keys=["rope_deltas"])
-            logger.info(f"{Colors.OKGREEN}Froze rope_deltas (no gradients){Colors.ENDC}")
-
     logger.info(f"{Colors.HEADER}Training model{Colors.ENDC}")
 
     train(

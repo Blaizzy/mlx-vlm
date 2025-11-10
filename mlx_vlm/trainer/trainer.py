@@ -5,7 +5,6 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -14,7 +13,7 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten, tree_map
 from tqdm import tqdm
 
-from .utils import grad_checkpoint, Colors
+from .utils import grad_checkpoint, save_adapter, Colors
 
 @dataclass
 class TrainingArgs:
@@ -65,32 +64,38 @@ class TrainingArgs:
     )
 
 
-def default_loss(model, inputs, targets, lengths, train_on_completions=False, assistant_id=77091):
-    outputs = model(inputs)
-    logits = outputs.logits[:, :-1].astype(mx.float32)
-    targets = targets[:, 1:]
-    _, seq_len = targets.shape
-    steps = mx.arange(seq_len)[None, :]
-    base_mask = steps < lengths[:, None]
-    if train_on_completions:
-        eq = (inputs[:, :-1] == assistant_id)
-        idxs = mx.arange(seq_len)[None, :]
-        last_ass_idx = mx.where(eq, idxs, mx.full(idxs.shape, -1)).max(axis=1)
-        comp_mask = steps > last_ass_idx[:, None]
-        mask = base_mask & comp_mask
+def vision_language_loss_fn(model, batch, train_on_completions=False, assistant_id=77091):
+    input_ids = batch["input_ids"]
+    attention_mask = batch["attention_mask"]
+    pixel_values = batch.get("pixel_values", None)
+    
+    # Prepare inputs and labels
+    inputs = input_ids[:, :-1]
+    labels = input_ids[:, 1:]
+    
+    # Forward pass
+    if pixel_values is not None:
+        logits = model(inputs, pixel_values, attention_mask[:, :-1]).logits
     else:
-        mask = base_mask
+        logits = model(inputs, attention_mask=attention_mask[:, :-1]).logits
     
-    weight_mask = mask.astype(mx.float32)
-
-    length_mask = mx.arange(targets.shape[1])[None, :] < (lengths - 1)[:, None]
+    # Create masks
+    length_mask = mx.arange(labels.shape[1]) < (mx.sum(attention_mask, axis=1, keepdims=True) - 1)
     
-    ce = nn.losses.cross_entropy(logits, targets, weights=weight_mask) * length_mask
-    ntoks = length_mask.sum()
-    ce = ce.sum() / ntoks
-
-    mx.clear_cache()
-    return ce, ntoks
+    if train_on_completions:
+        assistant_mask = input_ids == assistant_id
+        assistant_positions = mx.argmax(assistant_mask.astype(mx.int32), axis=1)
+        pos_indices = mx.arange(labels.shape[1])[None, :]
+        weight_mask = pos_indices >= assistant_positions[:, None]
+        has_assistant = mx.any(assistant_mask, axis=1, keepdims=True)
+        weight_mask = mx.where(has_assistant, weight_mask, mx.ones_like(weight_mask))
+        mask = length_mask.astype(mx.float32) * weight_mask.astype(mx.float32)
+    else:
+        mask = None
+    
+    # Compute loss
+    ce = nn.losses.cross_entropy(logits.astype(mx.float32), labels, reduction='none')
+    return (ce * mask).sum() / mask.sum()
 
 
 def iterate_batches(dataset, batch_size, max_seq_length, train=False):
@@ -147,7 +152,7 @@ def evaluate(
     batch_size,
     num_batches,
     max_seq_length=2048,
-    loss_fn=default_loss,
+    loss_fn=vision_language_loss_fn,
     train_on_completions=False,
     assistant_id=77091,
 ):
@@ -165,7 +170,6 @@ def evaluate(
     )
     
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
-    
     for _, batch in tqdm(
         zip(
             index_iterator,
@@ -178,22 +182,23 @@ def evaluate(
         desc="Calculating loss...",
         total=min(len(dataset) // batch_size, num_batches) if num_batches != -1 else len(dataset) // batch_size,
     ):
-        inputs = batch["input_ids"][:, :-1]
-        targets = batch["input_ids"][:, 1:]
+        # Calculate number of tokens for averaging
         if "attention_mask" in batch:
             lengths = batch["attention_mask"].sum(axis=1)
         else:
-            lengths = mx.full((inputs.shape[0],), inputs.shape[1])
-        losses, toks = loss_fn_partial(model, inputs, targets, lengths)
-        all_losses += losses * toks
-        ntokens += toks
+            lengths = mx.full((batch["input_ids"].shape[0],), batch["input_ids"].shape[1])
+        
+        ntoks = lengths.sum()
+        losses = loss_fn_partial(model, batch)
+        
+        all_losses += losses * ntoks
+        ntokens += ntoks
         mx.eval(all_losses, ntokens)
     
     all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
     ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
 
     mx.clear_cache()
-    
     return (all_losses / mx.maximum(ntokens, 1)).item()
 
 
@@ -201,9 +206,9 @@ def train(
     model,
     optimizer,
     train_dataset,
-    val_dataset = None,
+    val_dataset=None,
     args: TrainingArgs = TrainingArgs(),
-    loss_fn=default_loss,
+    loss_fn=vision_language_loss_fn,
     train_on_completions=False,
     assistant_id=77091,
 ):
@@ -213,7 +218,6 @@ def train(
     # Set memory limit if using Metal
     if mx.metal.is_available():
         mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
-    
     print(f"{Colors.HEADER}Starting training..., iterations: {args.iters}{Colors.ENDC}")
 
     # Initialize distributed training
@@ -238,16 +242,21 @@ def train(
         assistant_id=assistant_id
     )
     
+    # Create value and grad function
+    loss_value_and_grad = nn.value_and_grad(model, loss_fn_partial)
+    
     # Compile the training step (like MLX-LM)
     state = [model.state, optimizer.state, mx.random.state]
     
-    @partial(mx.compile, inputs=state, outputs=state)
     def step(batch):
-        inputs = batch["input_ids"]
-        targets = batch["input_ids"]
-        lengths = batch["attention_mask"].sum(axis=1)
-
-        (lvalue, toks), grad = loss_value_and_grad(model, inputs, targets, lengths)
+        # Calculate number of tokens for metrics
+        if "attention_mask" in batch:
+            lengths = batch["attention_mask"].sum(axis=1)
+        else:
+            lengths = mx.full((batch["input_ids"].shape[0],), batch["input_ids"].shape[1])
+        
+        toks = lengths.sum()
+        lvalue, grad = loss_value_and_grad(model, batch)
 
         # Gradient clipping
         if args.grad_clip is not None:
@@ -263,9 +272,7 @@ def train(
         optimizer.update(model, grad)
 
         return lvalue, toks
-    
-    loss_value_and_grad = nn.value_and_grad(model, loss_fn_partial)
-    
+
     # Training metrics
     model.train()
     losses = 0
@@ -273,7 +280,7 @@ def train(
     steps = 0
     trained_tokens = 0
     train_time = 0
-    
+
     # Main training loop
     for it, batch in zip(
         range(1, args.iters + 1),
@@ -361,23 +368,8 @@ def train(
                 f"{args.adapter_file} and {checkpoint}.{Colors.ENDC}",
                 flush=True,
             )
-    
+
     # Save final weights
     if rank == 0:
         save_adapter(model, args.adapter_file)
         print(f"{Colors.OKGREEN}Saved final adapter weights to {args.adapter_file}.{Colors.ENDC}")
-
-
-def save_adapter(model: nn.Module, adapter_file: Union[str, Path]):
-    """Save adapter weights and config."""
-    path = Path(adapter_file)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Save adapter config if available
-    if hasattr(model, 'config') and hasattr(model.config, "lora"):
-        with open(path.parent / "adapter_config.json", "w") as f:
-            json.dump(model.config.lora, f, indent=2)
-    
-    # Save weights
-    flattened_tree = tree_flatten(model.trainable_parameters())
-    mx.save_safetensors(str(adapter_file), dict(flattened_tree))
