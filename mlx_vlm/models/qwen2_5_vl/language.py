@@ -261,7 +261,6 @@ class LanguageModel(nn.Module):
         self.config = config
         self.model_type = args.model_type
         self.model = Qwen2Model(args)
-        self.rope_deltas = None
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
@@ -456,9 +455,11 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        rope_deltas = kwargs.pop("rope_deltas", None)
+
         # reset rope_deltas when processing a new image/video
         if pixel_values is not None:
-            self.rope_deltas = None
+            rope_deltas = None
 
         cache_offset = 0
         if cache and cache[0] is not None:
@@ -474,18 +475,18 @@ class LanguageModel(nn.Module):
             # Calculate RoPE index once per generation in the pre-fill stage only
             if (
                 (cache is not None and cache[0] is not None and (cache_offset == 0))
-                or self.rope_deltas is None
+                or rope_deltas is None
                 or cache is None
             ):
                 position_ids, rope_deltas = self.get_rope_index(
                     inputs, image_grid_thw, video_grid_thw, mask
                 )
-                self.rope_deltas = rope_deltas
+                rope_deltas = rope_deltas
             else:
                 # Use the prev pre-calculated rope-deltas to get the correct position ids
                 batch_size, seq_length = inputs.shape
                 delta = mx.array(
-                    cache_offset + self.rope_deltas if cache is not None else 0
+                    cache_offset + rope_deltas if cache is not None else 0
                 )
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))

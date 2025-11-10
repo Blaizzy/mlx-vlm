@@ -158,8 +158,8 @@ class Model(nn.Module):
     def __call__(
         self,
         input_ids: mx.array,
-        pixel_values: mx.array,
-        mask: mx.array,
+        pixel_values: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
         cache=None,
         **kwargs,
     ):
