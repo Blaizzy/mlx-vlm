@@ -69,17 +69,14 @@ def vision_language_loss_fn(model, batch, train_on_completions=False, assistant_
     attention_mask = batch["attention_mask"]
     pixel_values = batch.get("pixel_values", None)
     
-    # Prepare inputs and labels
     inputs = input_ids[:, :-1]
     labels = input_ids[:, 1:]
     
-    # Forward pass
     if pixel_values is not None:
         logits = model(inputs, pixel_values, attention_mask[:, :-1]).logits
     else:
         logits = model(inputs, attention_mask=attention_mask[:, :-1]).logits
     
-    # Create masks
     length_mask = mx.arange(labels.shape[1]) < (mx.sum(attention_mask, axis=1, keepdims=True) - 1)
     
     if train_on_completions:
@@ -91,9 +88,8 @@ def vision_language_loss_fn(model, batch, train_on_completions=False, assistant_
         weight_mask = mx.where(has_assistant, weight_mask, mx.ones_like(weight_mask))
         mask = length_mask.astype(mx.float32) * weight_mask.astype(mx.float32)
     else:
-        mask = None
+        mask = length_mask
     
-    # Compute loss
     ce = nn.losses.cross_entropy(logits.astype(mx.float32), labels, reduction='none')
     return (ce * mask).sum() / mask.sum()
 

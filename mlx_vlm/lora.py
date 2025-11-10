@@ -1,5 +1,4 @@
 import argparse
-import json
 import logging
 
 import mlx.optimizers as optim
@@ -40,22 +39,54 @@ def main(args):
     else:
         dataset = load_dataset(args.dataset, split=args.split)
     
-    # Validate image columns
     if not ("images" in dataset.column_names or "image" in dataset.column_names):
         raise ValueError(f"{Colors.FAIL}Dataset must have either an 'images' or 'image' column{Colors.ENDC}")
     
-    # Validate message columns
     if "messages" not in dataset.column_names:
         if "question" in dataset.column_names and "answer" in dataset.column_names:
-            def transform_to_messages(examples):
-                messages_list = []
-                for q, a in zip(examples["question"], examples["answer"]):
-                    messages_list.append([
-                        {"role": "user", "content": q},
-                        {"role": "assistant", "content": a}
-                    ])
-                examples["messages"] = messages_list
-                return examples
+            image_col = "images" if "images" in dataset.column_names else "image"
+            if model_type in ["gemma3", "qwen3_vl"]:
+                def transform_to_messages(examples):
+                    messages_list = []
+                    images = examples[image_col]
+                    for idx, (q, a) in enumerate(zip(examples["question"], examples["answer"])):
+                        img = images[idx]
+                        
+                        messages_list.append([
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image", "image": img},
+                                    {"type": "text", "text": q}
+                                ]
+                            },
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "text", "text": a}
+                                ]
+                            }
+                        ])
+                    return {"messages": messages_list}
+            elif model_type == "random":
+                def transform_to_messages(examples):
+                    messages_list = []
+                    for q, a in zip(examples["question"], examples["answer"]):
+                        messages_list.append([
+                            {"role": "user", "content": q},
+                            {"role": "assistant", "content": a}
+                        ])
+                        return {"messages": messages_list}
+            else:
+                def transform_to_messages(examples):
+                    messages_list = []
+                    for q, a in zip(examples["question"], examples["answer"]):
+                        messages_list.append([
+                            {"role": "user", "content": q},
+                            {"role": "assistant", "content": a}
+                        ])
+                        return {"messages": messages_list}
+                    
             dataset = dataset.map(transform_to_messages, batched=True)
         else:
             raise ValueError(f"{Colors.FAIL}Dataset must have a 'messages' column or both 'question' and 'answer' columns{Colors.ENDC}")
