@@ -85,10 +85,6 @@ class Dataset:
         if image_token_index is None:
             raise ValueError("Config must contain either 'image_token_index' or 'image_token_id'")
         
-        # Ensure prompts contain image tokens when images exist
-        if images and self.config["model_type"] == "multi_modality":
-            prompts = [f"{image_token_index}{p}" if image_token_index not in str(p) else p for p in prompts]
-        
         if self.config["model_type"] in ["qwen3_vl", "qwen3_vl_moe"]:
             inputs = prepare_inputs(
                 processor=self.processor,

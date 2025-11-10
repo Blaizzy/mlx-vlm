@@ -84,6 +84,7 @@ def main(args):
                 def transform_to_messages(examples):
                     messages_list = []
                     for q, a in zip(examples["question"], examples["answer"]):
+                        q = f"<image>{q}" if "<image>" not in str(q) else q
                         messages_list.append([
                             {"role": "user", "content": q},
                             {"role": "assistant", "content": a}
