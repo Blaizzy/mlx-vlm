@@ -1,5 +1,3 @@
-# Copyright © 2025 Apple Inc.
-
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -90,9 +88,9 @@ class GLM4VRotaryEmbedding(nn.Module):
 
 def rotate_half_llm(x):
     """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return mx.flatten(mx.stack([-x2, x1], axis=-1), start_axis=-2, end_axis=-1)
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
@@ -119,6 +117,9 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
     sin = mx.concatenate(
         [m[i % 3] for i, m in enumerate(mx.split(sin, mrope_section, axis=-1))], axis=-1
     )[:, None, :, :]
+
+    cos = mx.repeat(cos[..., : cos.shape[-1] // 2], repeats=2, axis=-1)
+    sin = mx.repeat(sin[..., : sin.shape[-1] // 2], repeats=2, axis=-1)
 
     rotary_dim = cos.shape[-1]
     q_rot = q[..., :rotary_dim]
@@ -239,13 +240,21 @@ class Glm4vDecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         position_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
+        r = x
 
-        r = self.self_attn(self.input_layernorm(x), mask, cache, position_embeddings)
-        r = self.post_self_attn_layernorm(r)
-        h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        r = self.post_mlp_layernorm(r)
-        return h + r
+        # Self Attention
+        x = self.self_attn(self.input_layernorm(x), mask, cache, position_embeddings)
+
+        x = self.post_self_attn_layernorm(x)
+        x = r + x
+
+        # Fully Connected
+        r = x
+        x = self.post_attention_layernorm(x)
+        x = self.mlp(x)
+        x = self.post_mlp_layernorm(x)
+        x = r + x
+        return x
 
 
 class GLM4VModel(nn.Module):

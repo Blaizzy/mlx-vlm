@@ -1,11 +1,7 @@
-import glob
-import json
-from pathlib import Path
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from huggingface_hub import snapshot_download
 
 from .config import ModelConfig
 from .language import LanguageModel
@@ -37,6 +33,17 @@ class Model(nn.Module):
         # Get the ouptut hidden states from the vision model
         hidden_states = self.vision_tower(
             pixel_values, image_grid_thw, output_hidden_states=False
+        )
+
+        split_sizes = (
+            image_grid_thw.prod(-1) // self.vision_tower.spatial_merge_size**2
+        ).tolist()
+        hidden_states = mx.split(
+            hidden_states, [split_sizes[0], sum(split_sizes[:2])], axis=0
+        )
+
+        hidden_states = mx.concatenate(hidden_states, axis=0).astype(
+            hidden_states[0].dtype
         )
 
         # Insert special image tokens in the input_ids

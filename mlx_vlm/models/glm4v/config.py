@@ -9,6 +9,9 @@ class TextConfig(BaseModelConfig):
     model_type: str = "glm4v_text"
     vocab_size: int = 151552
     hidden_size: int = 4096
+    eos_token_id: List[int] = field(
+        default_factory=lambda: [151329, 151336, 151338, 151348]
+    )
     intermediate_size: int = 13696
     max_position_embeddings: int = 65536
     num_attention_heads: int = 32
@@ -68,4 +71,4 @@ class ModelConfig(BaseModelConfig):
 
     def __post_init__(self):
         if self.eos_token_id is None:
-            self.eos_token_id = [151329, 151336, 151338]
+            self.eos_token_id = self.text_config["eos_token_id"]

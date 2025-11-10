@@ -51,7 +51,7 @@ def apply_rotary_pos_emb_vision(tensor, freqs) -> mx.array:
     return output.astype(orig_dtype)
 
 
-class Glm4vMoeVisionRotaryEmbedding(nn.Module):
+class Glm4vVisionRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
         self.dim = dim
@@ -136,7 +136,7 @@ class Glm4vVisionEmbeddings(nn.Module):
         return embeddings
 
 
-class Glm4vMoeVisionPatchEmbed(nn.Module):
+class Glm4vVisionPatchEmbed(nn.Module):
     def __init__(self, config: VisionConfig) -> None:
         super().__init__()
         self.config = config
@@ -167,7 +167,7 @@ class Glm4vMoeVisionPatchEmbed(nn.Module):
         return hidden_states
 
 
-class Glm4vMoeVisionPatchMerger(nn.Module):
+class Glm4vVisionPatchMerger(nn.Module):
     def __init__(self, dim: int, context_dim: int, bias: bool = False) -> None:
         super().__init__()
 
@@ -183,7 +183,7 @@ class Glm4vMoeVisionPatchMerger(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Glm4vMoeVisionAttention(nn.Module):
+class Glm4vVisionAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int = 16) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -204,28 +204,29 @@ class Glm4vMoeVisionAttention(nn.Module):
         q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
         k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
 
-        attention_mask = mx.full(
-            (1, seq_length, seq_length), mx.finfo(q.dtype).min, dtype=q.dtype
-        )
-
-        for i in range(1, len(cu_seqlens)):
-            start = int(cu_seqlens[i - 1])
-            end = int(cu_seqlens[i])
-            attention_mask[..., start:end, start:end] = 0
-
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        output = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.scale, mask=attention_mask
-        )
-        output = output.transpose(0, 2, 1, 3)
-        output = output.reshape(seq_length, -1)
+        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        splits = [
+            mx.split(tensor, [lengths[0], sum(lengths[:2])], axis=2)
+            for tensor in (q, k, v)
+        ]
+
+        attn_outputs = []
+        for q, k, v in zip(*splits):
+            output = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scale, mask=None
+            )
+            attn_outputs.append(output)
+
+        output = mx.concatenate(attn_outputs, axis=2)
+        output = output.transpose(0, 2, 1, 3).reshape(seq_length, -1)
         return self.proj(output)
 
 
-class Glm4vMoeVisionMLP(nn.Module):
+class Glm4vVisionMLP(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
@@ -236,16 +237,16 @@ class Glm4vMoeVisionMLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Glm4vMoeVisionBlock(nn.Module):
+class Glm4vVisionBlock(nn.Module):
     def __init__(self, config: VisionConfig) -> None:
         super().__init__()
         self.norm1 = nn.RMSNorm(config.hidden_size, eps=1e-6)
         self.norm2 = nn.RMSNorm(config.hidden_size, eps=1e-6)
 
-        self.attn = Glm4vMoeVisionAttention(
+        self.attn = Glm4vVisionAttention(
             dim=config.hidden_size, num_heads=config.num_heads
         )
-        self.mlp = Glm4vMoeVisionMLP(
+        self.mlp = Glm4vVisionMLP(
             dim=config.hidden_size, hidden_dim=config.out_hidden_size
         )
 
@@ -270,7 +271,7 @@ class VisionModel(nn.Module):
         self.spatial_merge_size = config.spatial_merge_size
 
         self.embeddings = Glm4vVisionEmbeddings(config)
-        self.patch_embed = Glm4vMoeVisionPatchEmbed(
+        self.patch_embed = Glm4vVisionPatchEmbed(
             config=config,
         )
 
@@ -279,10 +280,10 @@ class VisionModel(nn.Module):
         self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
 
         head_dim = config.hidden_size // config.num_heads
-        self.rotary_pos_emb = Glm4vMoeVisionRotaryEmbedding(head_dim // 2)
+        self.rotary_pos_emb = Glm4vVisionRotaryEmbedding(head_dim // 2)
 
-        self.blocks = [Glm4vMoeVisionBlock(config) for _ in range(config.depth)]
-        self.merger = Glm4vMoeVisionPatchMerger(
+        self.blocks = [Glm4vVisionBlock(config) for _ in range(config.depth)]
+        self.merger = Glm4vVisionPatchMerger(
             dim=config.out_hidden_size, context_dim=config.intermediate_size
         )
 
