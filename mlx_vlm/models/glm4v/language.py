@@ -1,12 +1,8 @@
-import math
-from dataclasses import dataclass
-from functools import partial
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -92,9 +88,9 @@ class GLM4VRotaryEmbedding(nn.Module):
 
 def rotate_half_llm(x):
     """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return mx.flatten(mx.stack([-x2, x1], axis=-1), start_axis=-2, end_axis=-1)
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
@@ -122,6 +118,9 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
         [m[i % 3] for i, m in enumerate(mx.split(sin, mrope_section, axis=-1))], axis=-1
     )[:, None, :, :]
 
+    cos = mx.repeat(cos[..., : cos.shape[-1] // 2], repeats=2, axis=-1)
+    sin = mx.repeat(sin[..., : sin.shape[-1] // 2], repeats=2, axis=-1)
+
     rotary_dim = cos.shape[-1]
     q_rot = q[..., :rotary_dim]
     q_pass = q[..., rotary_dim:]
@@ -138,7 +137,7 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
     return q_embed, k_embed
 
 
-class Glm4vMoeAttention(nn.Module):
+class Glm4vAttention(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
 
@@ -146,7 +145,9 @@ class Glm4vMoeAttention(nn.Module):
         self.n_heads = n_heads = args.num_attention_heads
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
-        head_dim = args.head_dim
+        head_dim = getattr(
+            args, "head_dim", args.hidden_size // args.num_attention_heads
+        )
         self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=args.attention_bias)
@@ -193,7 +194,7 @@ class Glm4vMoeAttention(nn.Module):
         return self.o_proj(output)
 
 
-class Glm4vMoeMLP(nn.Module):
+class Glm4vMLP(nn.Module):
     def __init__(
         self, config: TextConfig, hidden_size: int = None, intermediate_size: int = None
     ):
@@ -204,119 +205,31 @@ class Glm4vMoeMLP(nn.Module):
             config.intermediate_size if intermediate_size is None else intermediate_size
         )
 
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.gate_up_proj = nn.Linear(
+            self.hidden_size, self.intermediate_size * 2, bias=False
+        )
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def __call__(self, x):
-        down_proj = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        x = self.gate_up_proj(x)
+        gate, x = mx.split(x, 2, axis=-1)
+        return self.down_proj(nn.silu(gate) * x)
 
 
-@mx.compile
-def group_expert_select(
-    gates,
-    e_score_correction_bias,
-    top_k,
-    n_group,
-    topk_group,
-    routed_scaling_factor,
-    norm_topk_prob,
-):
-
-    scores = mx.sigmoid(gates.astype(mx.float32))
-    orig_scores = scores
-    scores = scores + e_score_correction_bias
-    if n_group > 1:
-        k = top_k
-        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
-        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
-        k = n_group - topk_group
-        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
-        scores = mx.put_along_axis(
-            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
-        )
-        scores = mx.flatten(scores, -2, -1)
-
-    k = top_k
-    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
-    if top_k > 1 and norm_topk_prob:
-        denominator = scores.sum(axis=-1, keepdims=True)
-        scores = scores / denominator
-    scores = scores * routed_scaling_factor
-
-    return inds, scores
-
-
-class MoEGate(nn.Module):
+class Glm4vDecoderLayer(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
-        self.config = config
-        self.top_k = config.num_experts_per_tok
-        self.norm_topk_prob = config.norm_topk_prob
-        self.n_routed_experts = config.n_routed_experts
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.n_group = config.n_group
-        self.topk_group = config.topk_group
-        self.weight = mx.zeros((self.n_routed_experts, config.hidden_size))
-        self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
-        assert config.topk_method == "noaux_tc", "Unsupported topk method."
+        self.self_attn = Glm4vAttention(config)
+        self.mlp = Glm4vMLP(config)
 
-    def __call__(self, x):
-        return group_expert_select(
-            x @ self.weight.T,
-            self.e_score_correction_bias,
-            self.top_k,
-            self.n_group,
-            self.topk_group,
-            self.routed_scaling_factor,
-            self.norm_topk_prob,
-        )
-
-
-class MoE(nn.Module):
-    def __init__(self, config: TextConfig):
-        super().__init__()
-        self.config = config
-        self.num_experts_per_tok = config.num_experts_per_tok
-        self.switch_mlp = SwitchGLU(
-            config.hidden_size,
-            config.moe_intermediate_size,
-            config.n_routed_experts,
-        )
-
-        self.gate = MoEGate(config)
-        if config.n_shared_experts is not None:
-            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = Glm4vMoeMLP(
-                config=config, intermediate_size=intermediate_size
-            )
-
-    def __call__(self, x):
-        inds, scores = self.gate(x)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
-        if self.config.n_shared_experts is not None:
-            y = y + self.shared_experts(x)
-
-        return y
-
-
-class Glm4vMoeDecoderLayer(nn.Module):
-    def __init__(self, config: TextConfig, layer_idx: int):
-        super().__init__()
-        self.self_attn = Glm4vMoeAttention(config)
-        self.mlp = (
-            MoE(config)
-            if (
-                config.n_routed_experts is not None
-                and layer_idx >= config.first_k_dense_replace
-            )
-            else Glm4vMoeMLP(config)
-        )
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_self_attn_layernorm = nn.RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_mlp_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -327,11 +240,21 @@ class Glm4vMoeDecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         position_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
+        r = x
 
-        r = self.self_attn(self.input_layernorm(x), mask, cache, position_embeddings)
-        h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        return h + r
+        # Self Attention
+        x = self.self_attn(self.input_layernorm(x), mask, cache, position_embeddings)
+
+        x = self.post_self_attn_layernorm(x)
+        x = r + x
+
+        # Fully Connected
+        r = x
+        x = self.post_attention_layernorm(x)
+        x = self.mlp(x)
+        x = self.post_mlp_layernorm(x)
+        x = r + x
+        return x
 
 
 class GLM4VModel(nn.Module):
@@ -340,7 +263,7 @@ class GLM4VModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
-            Glm4vMoeDecoderLayer(config, idx) for idx in range(config.num_hidden_layers)
+            Glm4vDecoderLayer(config) for _ in range(config.num_hidden_layers)
         ]
         self.start_idx = 0
         self.end_idx = len(self.layers)
@@ -620,37 +543,11 @@ class LanguageModel(nn.Module):
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
-        mpt_layer = self.args.num_hidden_layers
-
-        # Stack experts
-        for l in range(self.args.num_hidden_layers):
-            prefix = f"language_model.model.layers.{l}"
-            for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
-                for k in ["weight", "scales", "biases"]:
-                    if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
-                        to_join = [
-                            weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")
-                            for e in range(self.args.n_routed_experts)
-                        ]
-                        weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
-
-        # Remove multi-token prediction layer
-        return {
-            k: v
-            for k, v in weights.items()
-            if not k.startswith(f"language_model.model.layers.{mpt_layer}")
-        }
+        return weights
 
     @property
     def layers(self):
         return self.model.layers
-
-    @property
-    def cast_predicate(self):
-        def predicate(k):
-            return "e_score_correction_bias" not in k
-
-        return predicate
 
     @property
     def n_kv_heads(self):
