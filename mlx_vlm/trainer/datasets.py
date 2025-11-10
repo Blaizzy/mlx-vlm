@@ -87,16 +87,25 @@ class Dataset:
         
         # Ensure prompts contain image tokens when images exist
         if images and self.config["model_type"] == "multi_modality":
-            prompts = [f"<image>{p}" if "<image>" not in str(p) else p for p in prompts]
+            prompts = [f"{image_token_index}{p}" if image_token_index not in str(p) else p for p in prompts]
         
-        inputs = prepare_inputs(
-            processor=self.processor,
-            images=images if images else None,
-            audio=None,
-            prompts=prompts,
-            image_token_index=image_token_index,
-            resize_shape=self.image_resize_shape,
-        )
+        if self.config["model_type"] in ["qwen3_vl", "qwen3_vl_moe"]:
+            inputs = prepare_inputs(
+                processor=self.processor,
+                audio=None,
+                prompts=prompts,
+                image_token_index=image_token_index,
+                resize_shape=self.image_resize_shape,
+            )
+        else:
+            inputs = prepare_inputs(
+                processor=self.processor,
+                images=images if images else None,
+                audio=None,
+                prompts=prompts,
+                image_token_index=image_token_index,
+                resize_shape=self.image_resize_shape,
+            )
         
         input_ids = inputs.get("input_ids")
         pixel_values = inputs.get("pixel_values")

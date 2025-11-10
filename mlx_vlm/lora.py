@@ -51,7 +51,6 @@ def main(args):
                     images = examples[image_col]
                     for idx, (q, a) in enumerate(zip(examples["question"], examples["answer"])):
                         img = images[idx]
-                        
                         messages_list.append([
                             {
                                 "role": "user",
