@@ -91,6 +91,7 @@ def main(args):
     
     elif args.full_finetune:
         logger.info(f"{Colors.UNDERLINE}Training with full weight finetuning{Colors.ENDC}")
+        unfreeze_modules(model, ["language_model"])
     else:
         logger.info(f"{Colors.UNDERLINE}Setting up LoRA{Colors.ENDC}")
         
