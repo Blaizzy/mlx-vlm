@@ -1,8 +1,8 @@
 import argparse
+import json
 import logging
 
 import mlx.optimizers as optim
-import mlx.core as mx
 from datasets import load_dataset
 
 from .trainer import Dataset, TrainingArgs, Colors, train, print_trainable_parameters
@@ -17,6 +17,7 @@ from .utils import load, load_image_processor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 def main(args):
     logger.info(f"{Colors.HEADER}Loading model from {args.model_path}{Colors.ENDC}")
@@ -119,6 +120,9 @@ def main(args):
     
     print_trainable_parameters(model)
     
+    logger.info(f"{Colors.HEADER}Setting up optimizer{Colors.ENDC}")
+    optimizer = optim.Adam(learning_rate=args.learning_rate)
+    
     # Create TrainingArgs
     training_args = TrainingArgs(
         batch_size=args.batch_size,
@@ -135,9 +139,17 @@ def main(args):
     )
     
     # Train the model
-    logger.info(f"{Colors.HEADER}Training model{Colors.ENDC}")
+    if hasattr(model, 'language_model'):
+        if not hasattr(model.language_model, 'rope_deltas'):
+            model.language_model.rope_deltas = None
+            logger.info(f"{Colors.OKGREEN}Initialized rope_deltas for language_model{Colors.ENDC}")
+        
+        # Freeze rope_deltas to prevent gradient computation
+        if hasattr(model.language_model, 'rope_deltas'):
+            model.language_model.freeze(keys=["rope_deltas"])
+            logger.info(f"{Colors.OKGREEN}Froze rope_deltas (no gradients){Colors.ENDC}")
 
-    optimizer = optim.Adam(learning_rate=args.learning_rate)
+    logger.info(f"{Colors.HEADER}Training model{Colors.ENDC}")
 
     train(
         model=model,

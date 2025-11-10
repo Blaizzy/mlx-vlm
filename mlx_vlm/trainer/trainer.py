@@ -122,12 +122,12 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
             attention_mask_batch = np.zeros((len(items), padded_len), dtype=np.int32)
 
             for i, item in enumerate(items):
-                arr = np.array(item["input_ids"]).reshape(-1)  # flatten input_ids
+                arr = np.array(item["input_ids"]).reshape(-1)
                 L = min(len(arr), padded_len)
                 input_ids_batch[i, :L] = arr[:L]
 
                 if "attention_mask" in item:
-                    mask = np.array(item["attention_mask"]).reshape(-1)  # flatten mask
+                    mask = np.array(item["attention_mask"]).reshape(-1)
                     attention_mask_batch[i, :L] = mask[:L]
                 else:
                     attention_mask_batch[i, :L] = 1
