@@ -266,30 +266,28 @@ class DeepseekVLV2Processor(ProcessorMixin):
     def process_one(
         self,
         prompt: str = None,
-        conversations: List[Dict[str, str]] = None,
         images: List[Image.Image] = None,
-        apply_sft_format: bool = False,
         inference_mode: bool = True,
-        system_prompt: str = "",
-        **kwargs,
+        base_size: int = 1024,
+        image_size: int = 640,
+        cropping: bool = True,
     ):
-        assert (
-            prompt is None or conversations is None
-        ), "prompt and conversations cannot be used at the same time."
 
-        if apply_sft_format:
-            sft_format = self.format_prompts(
-                prompts=prompt, sft_format=self.sft_format, system_prompt=system_prompt
-            )
-        else:
-            sft_format = prompt
+        sft_format = prompt
         (
             tokenized_str,
             images_list,
             images_seq_mask,
             images_spatial_crop,
             num_image_tokens,
-        ) = self.tokenize_with_images(sft_format, images, cropping=len(images) <= 2)
+        ) = self.tokenize_with_images(
+            sft_format,
+            images,
+            base_size=base_size,
+            image_size=image_size,
+            cropping=cropping,
+        )
+
         masked_tokenized_str = []
         for token_index in tokenized_str:
             if token_index != self.image_token_id:
@@ -362,7 +360,9 @@ class DeepseekVLV2Processor(ProcessorMixin):
         ratio = 1 - ((max(w, h) - min(w, h)) / (max(w, h)))
 
         """Tokenize text with <image> tags."""
-        assert conversation.count(self.image_token) == len(images)
+        assert conversation.count(self.image_token) == len(
+            images
+        ), f"The number of image tokens in the prompt does not match the number of images: {conversation.count(self.image_token)} != {len(images)}"
         text_splits = conversation.split(self.image_token)
 
         images_list, images_crop_list, images_seq_mask = [], [], []
@@ -400,14 +400,12 @@ class DeepseekVLV2Processor(ProcessorMixin):
                     valid_img_tokens += int(256 * ratio)
                 elif base_size == 1280:
                     valid_img_tokens += int(400 * ratio)
-                # elif base_size == 640:
-                #     valid_img_tokens += int(100 * ratio)
+                elif base_size == 640:
+                    valid_img_tokens += int(100 * ratio)
 
                 images_list.append(
                     self.image_transform(global_view).astype(mx.bfloat16)
                 )
-
-                # global_view_tensor = image_transform(global_view).to(torch.bfloat16)
 
                 width_crop_num, height_crop_num = crop_ratio
 
@@ -442,17 +440,14 @@ class DeepseekVLV2Processor(ProcessorMixin):
                     ) * (num_queries * height_crop_num)
                 tokenized_str += tokenized_image
                 images_seq_mask += [True] * len(tokenized_image)
-                # num_image_tokens.append(len(tokenized_image))
 
             else:
-                # best_width, best_height = self.image_size, self.image_size
-                # print(image.size, (best_width, best_height)) # check the select_best_resolutions func
 
                 """process the global view"""
                 if image_size <= 640:
                     print("directly resize")
                     image = image.resize((image_size, image_size))
-                # else:
+
                 global_view = ImageOps.pad(
                     image,
                     (image_size, image_size),
@@ -482,8 +477,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
                     [self.image_token_id] * num_queries + [self.image_token_id]
                 ) * num_queries
                 tokenized_image += [self.image_token_id]
-                # tokenized_image += ([self.image_token_id] * (num_queries * width_crop_num) + [self.image_token_id]) * (
-                #             num_queries * height_crop_num)
+
                 tokenized_str += tokenized_image
                 images_seq_mask += [True] * len(tokenized_image)
 
@@ -528,28 +522,24 @@ class DeepseekVLV2Processor(ProcessorMixin):
         *,
         text: str = None,
         images: List[Image.Image] = None,
-        apply_sft_format: bool = False,
         inference_mode: bool = True,
-        system_prompt: str = "",
-        **kwargs,
+        image_size: int = 640,
+        base_size: int = 1024,
+        cropping: bool = True,
+        padding: bool = True,
+        return_tensors: Literal["np", "mx", "pt"] = "mx",
     ):
         """
 
         Args:
-            prompt (str): the formatted prompt;
-            conversations (List[Dict]): conversations with a list of messages;
+            text (str): the formatted prompt;
             images (List[ImageType]): the list of images;
-            apply_sft_format (bool): if prompt is not None, then apply the SFT format to prompt;
-                if conversations is not None, then it will always apply the SFT format to conversations;
-            force_batchify (bool): force batchify the inputs;
             inference_mode (bool): if True, then remove the last eos token;
-            system_prompt (str): the system prompt;
-            **kwargs:
 
         Returns:
             outputs (BaseProcessorOutput): the output of the processor,
-                - input_ids (torch.LongTensor): [N + image tokens]
-                - images (torch.FloatTensor): [n_images, 3, H, W]
+                - input_ids (mx.array): [N + image tokens]
+                - images (mx.array): [n_images, 3, H, W]
                 - image_id (int): the id of the image token
                 - num_image_tokens (List[int]): the number of image tokens
         """
@@ -557,9 +547,10 @@ class DeepseekVLV2Processor(ProcessorMixin):
         prepare = self.process_one(
             prompt=text,
             images=images,
-            apply_sft_format=apply_sft_format,
             inference_mode=inference_mode,
-            system_prompt=system_prompt,
+            image_size=image_size,
+            base_size=base_size,
+            cropping=cropping,
         )
 
         return prepare

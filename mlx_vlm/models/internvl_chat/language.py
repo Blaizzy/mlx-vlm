@@ -22,7 +22,11 @@ class Attention(nn.Module):
         assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
-        self.head_dim = head_dim = args.hidden_size // n_heads
+        # Allow overriding head_dim to support architectures where
+        # n_heads * head_dim != hidden_size.
+        self.head_dim = head_dim = getattr(args, "head_dim", None) or (
+            args.hidden_size // n_heads
+        )
         self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)
