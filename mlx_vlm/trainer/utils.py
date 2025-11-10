@@ -21,7 +21,15 @@ class Colors:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
-supported_for_training = {"qwen2_vl", "qwen2_5_vl", "qwen3_vl", "multi_modality", "deepseek_vl_v2", "gemma3"}
+supported_for_training = {
+    "qwen2_vl",
+    "qwen2_5_vl",
+    "qwen3_vl",
+    "multi_modality",
+    "deepseek_vl_v2",
+    "gemma3",
+    "aya_vision"
+}
 
 def grad_checkpoint(layer):
     """

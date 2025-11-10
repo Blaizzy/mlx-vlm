@@ -45,13 +45,10 @@ def main(args):
     if "messages" not in dataset.column_names:
         if "question" in dataset.column_names and "answer" in dataset.column_names:
             image_col = "images" if "images" in dataset.column_names else "image"
-            if model_type in ["gemma3", "qwen3_vl"]:
+            if model_type in ["gemma3", "qwen3_vl", "qwen3_vl_moe", "aya_vision"]:
                 def transform_to_messages(examples):
-                    messages_list = []
-                    images = examples[image_col]
-                    for idx, (q, a) in enumerate(zip(examples["question"], examples["answer"])):
-                        img = images[idx]
-                        messages_list.append([
+                    messages_list = [
+                        [
                             {
                                 "role": "user",
                                 "content": [
@@ -65,17 +62,24 @@ def main(args):
                                     {"type": "text", "text": a}
                                 ]
                             }
-                        ])
+                        ]
+                        for img, q, a in zip(examples[image_col], examples["question"], examples["answer"])
+                    ]
                     return {"messages": messages_list}
-            elif model_type == "random":
+            elif model_type == "deepseek_vl_v2":
                 def transform_to_messages(examples):
-                    messages_list = []
-                    for q, a in zip(examples["question"], examples["answer"]):
-                        messages_list.append([
-                            {"role": "user", "content": q},
-                            {"role": "assistant", "content": a}
-                        ])
-                        return {"messages": messages_list}
+                    messages_list = [
+                        [
+                            {
+                                "role": "<|User|>",
+                                "content": f"<image>\n<|ref|>{q}<|/ref|>.",
+                                "images": [img],
+                            },
+                            {"role": "<|Assistant|>", "content": a},
+                        ]
+                        for img, q, a in zip(examples[image_col], examples["question"], examples["answer"])
+                    ]
+                    return {"messages": messages_list}
             else:
                 def transform_to_messages(examples):
                     messages_list = []
