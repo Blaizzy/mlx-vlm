@@ -52,15 +52,15 @@ class Dataset:
         from mlx_vlm.utils import prepare_inputs
         
         item = self.dataset[idx]
-        
         images = item.get("images", item.get("image", None))
         conversations = item.get("messages", item.get("conversations"))
+        
         if images in (None, "", []):
             images = []
         elif not isinstance(images, list):
             images = [images]
-        prompts = []
         
+        prompts = []
         if isinstance(conversations, list) and isinstance(conversations[0], list):
             for conversation in conversations:
                 if self.config["model_type"] == "pixtral":
@@ -69,12 +69,10 @@ class Dataset:
                         warnings.warn(
                             "Pixtral batch processing is not supported yet. Set batch size to 1."
                         )
-                
                 prompt = get_prompt(
                     self.config["model_type"], self.processor, conversation
                 )
                 prompts.append(prompt)
-        
         else:
             if self.config["model_type"] == "pixtral":
                 conversations = [json.loads(i) for i in conversations]
@@ -87,29 +85,29 @@ class Dataset:
         if image_token_index is None:
             raise ValueError("Config must contain either 'image_token_index' or 'image_token_id'")
         
-        # Use prepare_inputs to process everything together
+        # Ensure prompts contain image tokens when images exist
+        if images and self.config["model_type"] == "multi_modality":
+            prompts = [f"<image>{p}" if "<image>" not in str(p) else p for p in prompts]
+        
         inputs = prepare_inputs(
             processor=self.processor,
-            images=images,  # Pass images directly here
+            images=images if images else None,
             audio=None,
             prompts=prompts,
             image_token_index=image_token_index,
             resize_shape=self.image_resize_shape,
         )
         
-        # Extract what we need from inputs
         input_ids = inputs.get("input_ids")
         pixel_values = inputs.get("pixel_values")
         mask = inputs.get("attention_mask")
         
-        # Get any additional kwargs
         kwargs = {
             k: v
             for k, v in inputs.items()
             if k not in ["input_ids", "pixel_values", "attention_mask"]
         }
         
-        # Ensure mask exists
         if mask is None:
             mask = mx.ones_like(input_ids)
         

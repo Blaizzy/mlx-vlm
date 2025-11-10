@@ -146,6 +146,10 @@ class Model(nn.Module):
         return logits
 
     def sanitize(self, weights):
+        weights = {
+            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
+        }
+        
         sanitized_weights = {}
         for key, value in weights.items():
             if "model" in key:
