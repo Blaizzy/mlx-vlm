@@ -1,5 +1,5 @@
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from dataclasses import asdict, dataclass, field
+from typing import Dict, List, Optional
 
 from ..base import BaseModelConfig
 
@@ -71,4 +71,9 @@ class ModelConfig(BaseModelConfig):
 
     def __post_init__(self):
         if self.eos_token_id is None:
-            self.eos_token_id = self.text_config["eos_token_id"]
+            text_config = (
+                asdict(self.text_config)
+                if isinstance(self.text_config, TextConfig)
+                else self.text_config
+            )
+            self.eos_token_id = text_config["eos_token_id"]
