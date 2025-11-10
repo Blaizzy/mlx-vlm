@@ -50,9 +50,9 @@ class Dataset:
 
     def __getitem__(self, idx):
         from mlx_vlm.utils import prepare_inputs
-
+        
         item = self.dataset[idx]
-
+        
         images = item.get("images", item.get("image", None))
         conversations = item.get("messages", item.get("conversations"))
         if images in (None, "", []):
@@ -60,7 +60,7 @@ class Dataset:
         elif not isinstance(images, list):
             images = [images]
         prompts = []
-
+        
         if isinstance(conversations, list) and isinstance(conversations[0], list):
             for conversation in conversations:
                 if self.config["model_type"] == "pixtral":
@@ -69,12 +69,12 @@ class Dataset:
                         warnings.warn(
                             "Pixtral batch processing is not supported yet. Set batch size to 1."
                         )
-
+                
                 prompt = get_prompt(
                     self.config["model_type"], self.processor, conversation
                 )
                 prompts.append(prompt)
-
+        
         else:
             if self.config["model_type"] == "pixtral":
                 conversations = [json.loads(i) for i in conversations]
@@ -82,38 +82,37 @@ class Dataset:
                 self.config["model_type"], self.processor, conversations
             )
             prompts.append(prompt)
-
+        
         image_token_index = self.config.get("image_token_index") or self.config.get("image_token_id")
         if image_token_index is None:
             raise ValueError("Config must contain either 'image_token_index' or 'image_token_id'")
         
-        # Separate image processing from text processing
-        if self.image_processor is not None and images:
-            pixel_values = self.image_processor(images=images, return_tensors="np")["pixel_values"]
-            pixel_values = mx.array(pixel_values)
-        else:
-            pixel_values = None
-
+        # Use prepare_inputs to process everything together
         inputs = prepare_inputs(
             processor=self.processor,
-            images=images,
+            images=images,  # Pass images directly here
             audio=None,
             prompts=prompts,
             image_token_index=image_token_index,
             resize_shape=self.image_resize_shape,
         )
-        text_inputs = self.processor(text=prompts, return_tensors="np", padding=True)
-        input_ids = mx.array(text_inputs["input_ids"])
-        mask = mx.array(text_inputs.get("attention_mask", mx.ones_like(input_ids)))
+        
+        # Extract what we need from inputs
+        input_ids = inputs.get("input_ids")
+        pixel_values = inputs.get("pixel_values")
+        mask = inputs.get("attention_mask")
+        
+        # Get any additional kwargs
         kwargs = {
             k: v
             for k, v in inputs.items()
             if k not in ["input_ids", "pixel_values", "attention_mask"]
         }
-
+        
+        # Ensure mask exists
         if mask is None:
             mask = mx.ones_like(input_ids)
-
+        
         return {
             "pixel_values": pixel_values,
             "input_ids": input_ids,
