@@ -140,6 +140,7 @@ def main(args):
     
     # Train the model
     logger.info(f"{Colors.HEADER}Training model{Colors.ENDC}")
+
     train(
         model=model,
         optimizer=optimizer,

@@ -455,8 +455,7 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
-        # Local variable for rope_deltas
-        rope_deltas = None
+        rope_deltas = kwargs.pop("rope_deltas", None)
 
         cache_offset = 0
         if cache and cache[0] is not None:
@@ -472,7 +471,7 @@ class LanguageModel(nn.Module):
             # Calculate RoPE index once per generation in the pre-fill stage only
             if (
                 (cache is not None and cache[0] is not None and (cache_offset == 0))
-                or self.rope_deltas is None
+                or rope_deltas is None
                 or cache is None
             ):
                 position_ids, rope_deltas = self.get_rope_index(
@@ -483,7 +482,7 @@ class LanguageModel(nn.Module):
                 # Use the prev pre-calculated rope-deltas to get the correct position ids
                 batch_size, seq_length = inputs.shape
                 delta = mx.array(
-                    cache_offset + self.rope_deltas if cache is not None else 0
+                    cache_offset + rope_deltas if cache is not None else 0
                 )
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
