@@ -100,8 +100,9 @@ class Dataset:
             )
 
         inputs = prepare_inputs(
-            self.processor,
+            processor=self.processor,
             images=images,
+            audio=None,
             prompts=prompts,
             image_token_index=image_token_index,
             resize_shape=self.image_resize_shape,

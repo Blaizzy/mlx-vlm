@@ -20,6 +20,32 @@ class VisionConfig(BaseModelConfig):
     qk_normalization: bool = False
     norm_type: str = "layer_norm"
 
+    @classmethod
+    def from_dict(cls, params):
+        def normalize_dim(v):
+            if isinstance(v, (list, tuple)):
+                if len(v) > 0:
+                    try:
+                        return int(v[0])
+                    except Exception:
+                        return v[0]
+            try:
+                return int(v)
+            except Exception:
+                return v
+
+        p = dict(params)
+        if "image_size" in p:
+            p["image_size"] = normalize_dim(p["image_size"])
+        if "patch_size" in p:
+            p["patch_size"] = normalize_dim(p["patch_size"])
+
+        import inspect as _inspect
+
+        return cls(
+            **{k: v for k, v in p.items() if k in _inspect.signature(cls).parameters}
+        )
+
 
 @dataclass
 class TextConfig(BaseModelConfig):
@@ -33,6 +59,7 @@ class TextConfig(BaseModelConfig):
     max_window_layers: int
     hidden_act: str
     num_key_value_heads: Optional[int] = 8
+    head_dim: Optional[int] = None
     max_position_embeddings: Optional[int] = 40960
     rope_theta: float = 1000000.0
     rope_traditional: bool = False
