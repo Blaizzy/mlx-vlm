@@ -156,8 +156,7 @@ class Model(nn.Module):
 
             elif "model.vision_projection" in key:
                 key = key.replace("model.vision_projection", "multi_modal_projector")
-            else:
-                raise ValueError(f"Unsupported key: {key}")
+
             return key
 
         return {transform_key(k): v for k, v in weights.items()}
