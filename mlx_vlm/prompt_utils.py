@@ -35,6 +35,7 @@ MODEL_CONFIG = {
     "qwen3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
@@ -48,6 +49,7 @@ MODEL_CONFIG = {
     "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
+    "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
     "bunny-llama": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "phi3_v": MessageFormat.NUMBERED_IMAGE_TOKENS,
     "multi_modality": MessageFormat.IMAGE_TOKEN,

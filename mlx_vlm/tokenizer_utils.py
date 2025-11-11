@@ -209,13 +209,16 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
             self._unflushed += v
 
     def finalize(self):
-        current_text = bytearray(self._byte_decoder[c] for c in self._unflushed).decode(
-            "utf-8"
-        )
-        if self.text or not self.trim_space:
-            self.text += current_text
-        else:
-            self.text += _remove_space(current_text)
+        try:
+            current_text = bytearray(
+                self._byte_decoder[c] for c in self._unflushed
+            ).decode("utf-8", errors="ignore")
+            if self.text or not self.trim_space:
+                self.text += current_text
+            else:
+                self.text += _remove_space(current_text)
+        except (UnicodeDecodeError, KeyError):
+            print(f"Warning: could not decode bytes: {self._unflushed}")
         self._unflushed = ""
 
     @classmethod
