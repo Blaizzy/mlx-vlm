@@ -1,5 +1,6 @@
 from enum import Enum
 from functools import partial
+from pydantic import BaseModel
 from typing import Any, Dict, List, Optional, Union
 
 
@@ -459,13 +460,20 @@ def apply_chat_template(
                         **kwargs,
                     )
                 )
-            elif isinstance(p, dict):
-                role = p.get("role", "user")
+            elif isinstance(p, dict) or isinstance(p, BaseModel):
+                role = "user"
+                content = ""
+                if isinstance(p, dict):
+                    role = p.get("role", "user")
+                    content = p["content"],
+                else:
+                    role = p.role
+                    content = p.content
                 is_first = i == 0 or (i == 1 and role not in ["system", "assistant"])
                 messages.append(
                     get_message_json(
                         model_type,
-                        p["content"],
+                        content,
                         role,
                         skip_image_token=not is_first
                         or role in ["system", "assistant"],
