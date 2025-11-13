@@ -294,10 +294,10 @@ class Qwen3VLModel(nn.Module):
                 updated_batches.append(batch_hidden)
                 continue
 
-            # @JJJYmmm, since mlx_vlm doesn't support training, so just modify tensor in-place
-            batch_hidden[batch_indices] += visual_embeds
+            batch_result = mx.array(batch_hidden)  # avoid modifying in-place
+            batch_result = batch_result.at[batch_indices].add(visual_embeds)
 
-            updated_batches.append(batch_hidden)
+            updated_batches.append(batch_result)
 
         return mx.stack(updated_batches, axis=0)
 
