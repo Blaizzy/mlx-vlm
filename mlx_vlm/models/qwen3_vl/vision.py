@@ -149,7 +149,7 @@ class Attention(nn.Module):
 
         lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
         splits = [
-            mx.split(tensor, [lengths[0], sum(lengths[:2])], axis=2)
+            mx.split(tensor, lengths, axis=2)
             for tensor in (q, k, v)
         ]
 
