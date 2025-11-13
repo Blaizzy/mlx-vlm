@@ -319,7 +319,7 @@ class Qwen3VLMoEModel(nn.Module):
         visual_pos_masks: mx.array,
         visual_embeds: mx.array,
     ):
-        batch_size, seq_len, _ = hidden_states.shape
+        batch_size = hidden_states.shape[0]
 
         updated_batches = []
         for b in range(batch_size):
@@ -332,28 +332,10 @@ class Qwen3VLMoEModel(nn.Module):
                 updated_batches.append(batch_hidden)
                 continue
 
-            local_this = batch_hidden[batch_indices] + visual_embeds
+            # @JJJYmmm, since mlx_vlm doesn't support training, so just modify tensor in-place
+            batch_hidden[batch_indices] += visual_embeds
 
-            updated_parts = []
-            prev_idx = 0
-
-            # @JJJYmmm, maybe we can use a more efficient way to do this?
-            for i, idx in enumerate(batch_indices):
-                idx_int = int(idx)
-                if idx_int > prev_idx:
-                    updated_parts.append(batch_hidden[prev_idx:idx_int])
-                updated_parts.append(local_this[i : i + 1])
-                prev_idx = idx_int + 1
-
-            if prev_idx < seq_len:
-                updated_parts.append(batch_hidden[prev_idx:])
-
-            if len(updated_parts) > 0:
-                updated_batch = mx.concatenate(updated_parts, axis=0)
-            else:
-                updated_batch = batch_hidden
-
-            updated_batches.append(updated_batch)
+            updated_batches.append(batch_hidden)
 
         return mx.stack(updated_batches, axis=0)
 
