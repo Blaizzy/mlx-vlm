@@ -901,7 +901,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     choices = [
                         ChatStreamChoice(
                             finish_reason="stop",
-                            delta=ChatMessage(role="assistant", content=chunk.text),
+                            delta=ChatMessage(role="assistant", content=""),
                         )
                     ]
                     chunk_data = ChatStreamChunk(
