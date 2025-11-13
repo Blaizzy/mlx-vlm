@@ -12,9 +12,9 @@ import mlx.core as mx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from huggingface_hub import scan_cache_dir
 from pydantic import BaseModel, Field
 from typing_extensions import Required, TypeAlias, TypedDict
-from huggingface_hub import scan_cache_dir
 
 from .generate import (
     DEFAULT_MAX_TOKENS,
@@ -118,11 +118,13 @@ def unload_model_sync():
 
 # Models for /responses endpoint
 
+
 class ResponseInputTextParam(TypedDict, total=False):
     text: Required[str]
     type: Required[
         Literal["input_text", "text"]
     ]  # The type of the input item. Always `input_text`.
+
 
 class ResponseInputImageParam(TypedDict, total=False):
     detail: Literal["high", "low", "auto"] = Field(
@@ -141,9 +143,11 @@ class ResponseInputImageParam(TypedDict, total=False):
      NOTE : wouldn't this help the model if we passed the file_id as well to the vlm models
     """
 
+
 class InputAudio(TypedDict, total=False):
     data: Required[str]
     format: Required[str]
+
 
 class ResponseInputAudioParam(TypedDict, total=False):
     type: Required[
@@ -151,8 +155,10 @@ class ResponseInputAudioParam(TypedDict, total=False):
     ]  # The type of the input item. Always `input_audio`.
     input_audio: Required[InputAudio]
 
+
 class ImageUrl(TypedDict, total=False):
     url: Required[str]
+
 
 class ResponseImageUrlParam(TypedDict, total=False):
     type: Required[
@@ -160,8 +166,12 @@ class ResponseImageUrlParam(TypedDict, total=False):
     ]  # The type of the input item. Always`image_url`.
     image_url: Required[ImageUrl]
 
+
 ResponseInputContentParam: TypeAlias = Union[
-    ResponseInputTextParam, ResponseInputImageParam, ResponseImageUrlParam, ResponseInputAudioParam
+    ResponseInputTextParam,
+    ResponseInputImageParam,
+    ResponseImageUrlParam,
+    ResponseInputAudioParam,
 ]
 
 ResponseInputMessageContentListParam: TypeAlias = List[ResponseInputContentParam]
@@ -365,6 +375,7 @@ StreamEvent = Union[
 
 # Models for /chat/completion endpoint
 
+
 class VLMRequest(BaseModel):
     model: str = Field(
         DEFAULT_MODEL_PATH,
@@ -386,6 +397,7 @@ class VLMRequest(BaseModel):
         description="Resize shape for the image (height, width). Provide two integers.",
     )
 
+
 class GenerationRequest(VLMRequest):
     """
     Inherits from VLMRequest and adds additional fields for the generation request.
@@ -394,6 +406,7 @@ class GenerationRequest(VLMRequest):
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
+
 
 class UsageStats(OpenAIUsage):
     """
@@ -408,21 +421,26 @@ class UsageStats(OpenAIUsage):
         ..., description="Peak memory usage during the generation."
     )
 
+
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
+
 
 class ChatChoice(BaseModel):
     finish_reason: str
     message: ChatMessage
+
 
 class ChatResponse(BaseModel):
     model: str
     choices: List[ChatChoice]
     usage: Optional[UsageStats]
 
+
 class ChatStreamChoice(BaseModel):
     finish_reason: Optional[str] = None
     delta: ChatMessage
+
 
 class ChatStreamChunk(BaseModel):
     model: str
@@ -432,16 +450,20 @@ class ChatStreamChunk(BaseModel):
 
 # Models for /models endpoint
 
+
 class ModelInfo(BaseModel):
     id: str
     object: str
     created: int
 
+
 class ModelsResponse(BaseModel):
     object: Literal["list"]
     data: List[ModelInfo]
 
+
 # OpenAI compatile endpoints
+
 
 @app.post("/responses")
 async def responses_endpoint(request: Request):
@@ -777,7 +799,9 @@ async def responses_endpoint(request: Request):
         )
 
 
-@app.post("/chat/completions", response_model=None)  # Response model handled dynamically based on stream flag
+@app.post(
+    "/chat/completions", response_model=None
+)  # Response model handled dynamically based on stream flag
 async def chat_completions_endpoint(request: ChatRequest):
     """
     Generate text based on a prompt and optional images.
@@ -814,7 +838,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     images.append(content["image_url"])
                 if content["type"] == "image_url":
                     images.append(content["image_url"]["url"])
-                if content["type"]== "input_audio":
+                if content["type"] == "input_audio":
                     audio.append(content["input_audio"]["data"])
 
         formatted_prompt = apply_chat_template(
@@ -859,8 +883,14 @@ async def chat_completions_endpoint(request: ChatRequest):
                             "peak_memory": chunk.peak_memory,
                         }
 
-                        choices = [ChatStreamChoice(delta=ChatMessage(role="assistant", content=chunk.text))]
-                        chunk_data = ChatStreamChunk(model=request.model, usage=usage_stats, choices=choices)
+                        choices = [
+                            ChatStreamChoice(
+                                delta=ChatMessage(role="assistant", content=chunk.text)
+                            )
+                        ]
+                        chunk_data = ChatStreamChunk(
+                            model=request.model, usage=usage_stats, choices=choices
+                        )
 
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
                         await asyncio.sleep(
@@ -868,8 +898,15 @@ async def chat_completions_endpoint(request: ChatRequest):
                         )  # Small sleep to prevent blocking event loop entirely
 
                     # Signal stream end
-                    choices = [ChatStreamChoice(finish_reason="stop", delta=ChatMessage(role="assistant", content=chunk.text))]
-                    chunk_data = ChatStreamChunk(model=request.model, usage=usage_stats, choices=choices)
+                    choices = [
+                        ChatStreamChoice(
+                            finish_reason="stop",
+                            delta=ChatMessage(role="assistant", content=chunk.text),
+                        )
+                    ]
+                    chunk_data = ChatStreamChunk(
+                        model=request.model, usage=usage_stats, choices=choices
+                    )
                     yield f"data: {chunk_data.model_dump_json()}\n\n"
 
                 except Exception as e:
@@ -915,8 +952,15 @@ async def chat_completions_endpoint(request: ChatRequest):
                     peak_memory=gen_result.peak_memory,
                 )
 
-                choices = [ChatChoice(finish_reason="stop", message=ChatMessage(role="assistant", content=gen_result.text))]
-                result = ChatResponse(model=request.model, usage=usage_stats, choices=choices)
+                choices = [
+                    ChatChoice(
+                        finish_reason="stop",
+                        message=ChatMessage(role="assistant", content=gen_result.text),
+                    )
+                ]
+                result = ChatResponse(
+                    model=request.model, usage=usage_stats, choices=choices
+                )
 
                 return result
 
@@ -940,44 +984,40 @@ async def chat_completions_endpoint(request: ChatRequest):
             status_code=500, detail=f"An unexpected error occurred: {e}"
         )
 
+
 @app.get("/models", response_model=ModelsResponse)
 def models_endpoint():
-        """
-        Return list of locally downloaded MLX models.
-        """
+    """
+    Return list of locally downloaded MLX models.
+    """
 
-        files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
+    files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
 
-        def probably_mlx_lm(repo):
-            if repo.repo_type != "model":
-                return False
-            if "main" not in repo.refs:
-                return False
-            file_names = {f.file_path.name for f in repo.refs["main"].files}
-            return all(f in file_names for f in files)
+    def probably_mlx_lm(repo):
+        if repo.repo_type != "model":
+            return False
+        if "main" not in repo.refs:
+            return False
+        file_names = {f.file_path.name for f in repo.refs["main"].files}
+        return all(f in file_names for f in files)
 
-        # Scan the cache directory for downloaded mlx models
-        hf_cache_info = scan_cache_dir()
-        downloaded_models = [
-            repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
-        ]
+    # Scan the cache directory for downloaded mlx models
+    hf_cache_info = scan_cache_dir()
+    downloaded_models = [repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)]
 
-        # Create a list of available models
-        models = [
-            {
-                "id": repo.repo_id,
-                "object": "model",
-                "created": int(repo.last_modified)
-            }
-            for repo in downloaded_models
-        ]
+    # Create a list of available models
+    models = [
+        {"id": repo.repo_id, "object": "model", "created": int(repo.last_modified)}
+        for repo in downloaded_models
+    ]
 
-        response = {"object": "list", "data": models}
+    response = {"object": "list", "data": models}
 
-        return response
+    return response
 
 
 # MLX_VLM API endpoints
+
 
 @app.get("/health")
 async def health_check():

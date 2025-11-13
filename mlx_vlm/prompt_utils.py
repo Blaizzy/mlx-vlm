@@ -1,7 +1,8 @@
 from enum import Enum
 from functools import partial
-from pydantic import BaseModel
 from typing import Any, Dict, List, Optional, Union
+
+from pydantic import BaseModel
 
 
 class MessageFormat(Enum):
@@ -465,7 +466,7 @@ def apply_chat_template(
                 content = ""
                 if isinstance(p, dict):
                     role = p.get("role", "user")
-                    content = p["content"],
+                    content = p.get("content")
                 else:
                     role = p.role
                     content = p.content
