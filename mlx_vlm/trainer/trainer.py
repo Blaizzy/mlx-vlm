@@ -238,12 +238,10 @@ def train(
         assistant_id=assistant_id
     )
     
-    # Create value and grad function
-    loss_value_and_grad = nn.value_and_grad(model, loss_fn_partial)
-    
     # Compile the training step (like MLX-LM)
     state = [model.state, optimizer.state, mx.random.state]
     
+    @partial(mx.compile, inputs=state, outputs=state)
     def step(batch):
         # Calculate number of tokens for metrics
         if "attention_mask" in batch:
@@ -268,6 +266,9 @@ def train(
         optimizer.update(model, grad)
 
         return lvalue, toks
+    
+    # Create value and grad function
+    loss_value_and_grad = nn.value_and_grad(model, loss_fn_partial)
 
     # Training metrics
     model.train()
