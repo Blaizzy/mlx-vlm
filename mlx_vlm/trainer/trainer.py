@@ -74,6 +74,8 @@ def vision_language_loss_fn(model, batch, train_on_completions=False, assistant_
     
     if pixel_values is not None:
         logits = model(inputs, pixel_values, attention_mask[:, :-1]).logits
+        del pixel_values
+        mx.clear_cache()
     else:
         logits = model(inputs, attention_mask=attention_mask[:, :-1]).logits
     
