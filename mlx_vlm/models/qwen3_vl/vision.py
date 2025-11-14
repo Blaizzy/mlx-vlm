@@ -147,10 +147,8 @@ class Attention(nn.Module):
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
         splits = [
-            mx.split(tensor, [lengths[0], sum(lengths[:2])], axis=2)
-            for tensor in (q, k, v)
+            mx.split(tensor, cu_seqlens[1:-1].tolist(), axis=2) for tensor in (q, k, v)
         ]
 
         attn_outputs = []
