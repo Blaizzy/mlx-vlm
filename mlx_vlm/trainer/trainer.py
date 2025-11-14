@@ -230,8 +230,9 @@ def train(
     
     # Enable gradient checkpointing if requested
     if args.grad_checkpoint:
-        if hasattr(model, 'layers'):
-            grad_checkpoint(model.layers[0])
+        for module in model.children().values():
+            if hasattr(module, 'layers'):
+                grad_checkpoint(module.layers[0])
     
     # Create loss function with partial application
     loss_fn_partial = partial(
