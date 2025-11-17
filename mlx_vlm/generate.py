@@ -132,6 +132,12 @@ def parse_arguments():
         action="store_true",
         help="Force download the model from Hugging Face.",
     )
+    parser.add_argument(
+        "--revision",
+        type=str,
+        default="main",
+        help="The specific model version to use (branch, tag, commit).",
+    )
 
     return parser.parse_args()
 
@@ -579,7 +585,9 @@ def main():
     if isinstance(args.image, str):
         args.image = [args.image]
 
-    model, processor = load(args.model, args.adapter_path, trust_remote_code=True)
+    model, processor = load(
+        args.model, args.adapter_path, revision=args.revision, trust_remote_code=True
+    )
     config = model.config
 
     prompt = args.prompt
