@@ -13,7 +13,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import Required, TypeAlias, TypedDict
 
 from .generate import (
@@ -41,6 +41,12 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 # Loading/unloading utilities
 
 model_cache = {}
+
+
+class FlexibleBaseModel(BaseModel):
+    """Base model that ignores/accepts any unknown OpenAI SDK fields."""
+
+    model_config = ConfigDict(extra="allow")
 
 
 def load_model_resources(model_path: str, adapter_path: Optional[str]):
@@ -187,7 +193,7 @@ class ResponseOutputText(TypedDict, total=False):
 ResponseOutputMessageContentList: TypeAlias = List[ResponseOutputText]
 
 
-class ChatMessage(BaseModel):
+class ChatMessage(FlexibleBaseModel):
     role: Literal["user", "assistant", "system", "developer"] = Field(
         ...,
         description="Role of the message sender (e.g., 'system', 'user', 'assistant').",
@@ -197,7 +203,7 @@ class ChatMessage(BaseModel):
     ] = Field(..., description="Content of the message.")
 
 
-class OpenAIRequest(BaseModel):
+class OpenAIRequest(FlexibleBaseModel):
     """
     OpenAI-compatible request structure.
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
@@ -376,7 +382,7 @@ StreamEvent = Union[
 # Models for /chat/completion endpoint
 
 
-class VLMRequest(BaseModel):
+class VLMRequest(FlexibleBaseModel):
     model: str = Field(
         DEFAULT_MODEL_PATH,
         description="The path to the local model directory or Hugging Face repo.",
