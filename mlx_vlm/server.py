@@ -13,7 +13,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import Required, TypeAlias, TypedDict
 
 from .generate import (
@@ -202,6 +202,7 @@ class OpenAIRequest(BaseModel):
     OpenAI-compatible request structure.
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
     """
+    model_config = ConfigDict(extra="ignore")
 
     input: Union[str, List[ChatMessage]] = Field(
         ..., description="Input text or list of chat messages."
@@ -423,6 +424,8 @@ class UsageStats(OpenAIUsage):
 
 
 class ChatRequest(GenerationRequest):
+    model_config = ConfigDict(extra="ignore")
+    
     messages: List[ChatMessage]
 
 
