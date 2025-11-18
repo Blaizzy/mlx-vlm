@@ -167,6 +167,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     weights = {}
     for wf in weight_files:
         weights.update(mx.load(wf))
+    
+    import safetensors
+    with safetensors.safe_open(weight_files[0], framework="np") as f:
+        is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
 
     model_class, _ = get_model_and_args(config=config)
 
@@ -182,18 +186,28 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     model = model_class.Model(model_config)
 
-    # Sanitize weights
-    weights = sanitize_weights(model, weights)
-    weights = sanitize_weights(
-        model_class.VisionModel, weights, model_config.vision_config
-    )
-    weights = sanitize_weights(
-        model_class.LanguageModel, weights, model_config.text_config
-    )
-    if hasattr(model_class, "AudioModel"):
-        weights = sanitize_weights(
-            model_class.AudioModel, weights, model_config.audio_config
-        )
+    if not is_mlx_format:
+        # Sanitize weights
+        weights = sanitize_weights(model, weights)
+        
+        # For qwen3_omni_moe, only sanitize model.thinker
+        if hasattr(model, "thinker") and hasattr(model.thinker, "sanitize"):
+            weights = sanitize_weights(model.thinker, weights)
+            weights = sanitize_weights(model.thinker.vision_tower, weights)
+            weights = sanitize_weights(model.thinker.audio_tower, weights)
+            weights = sanitize_weights(model.code2wav, weights)
+        else:
+            # For other models, sanitize VisionModel, LanguageModel, AudioModel separately
+            weights = sanitize_weights(
+                model_class.VisionModel, weights, model_config.vision_config
+            )
+            weights = sanitize_weights(
+                model_class.LanguageModel, weights, model_config.text_config
+            )
+            if hasattr(model_class, "AudioModel"):
+                weights = sanitize_weights(
+                    model_class.AudioModel, weights, model_config.audio_config
+                )
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may or may not have vision quantized
