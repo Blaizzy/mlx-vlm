@@ -202,6 +202,7 @@ class OpenAIRequest(BaseModel):
     OpenAI-compatible request structure.
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
     """
+
     model_config = ConfigDict(extra="ignore")
 
     input: Union[str, List[ChatMessage]] = Field(
@@ -425,7 +426,7 @@ class UsageStats(OpenAIUsage):
 
 class ChatRequest(GenerationRequest):
     model_config = ConfigDict(extra="ignore")
-    
+
     messages: List[ChatMessage]
 
 

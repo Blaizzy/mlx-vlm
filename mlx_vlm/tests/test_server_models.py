@@ -1,14 +1,18 @@
 """
 Simple test to verify ConfigDict(extra="ignore") works correctly
 """
-from pydantic import BaseModel, ConfigDict, ValidationError, Field
+
 from typing import List, Literal, Union
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
 # Simulate the models from server.py
+
 
 class ChatMessage(BaseModel):
     role: Literal["user", "assistant", "system", "developer"]
     content: Union[str, List[dict]]
+
 
 class VLMRequest(BaseModel):
     model: str = Field("default-model", description="The model to use")
@@ -17,23 +21,27 @@ class VLMRequest(BaseModel):
     top_p: float = Field(1.0, description="Top-p sampling")
     seed: int = Field(0, description="Seed for random generation")
 
+
 class GenerationRequest(VLMRequest):
     stream: bool = Field(False, description="Whether to stream the response")
 
+
 class ChatRequest(GenerationRequest):
     model_config = ConfigDict(extra="ignore")
-    
+
     messages: List[ChatMessage]
+
 
 class OpenAIRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    
+
     input: Union[str, List[ChatMessage]]
     model: str
     max_output_tokens: int = 256
     temperature: float = 0.5
     top_p: float = 1.0
     stream: bool = False
+
 
 print("Testing Pydantic models with ConfigDict(extra='ignore')...")
 print("=" * 70)
@@ -42,10 +50,7 @@ print("=" * 70)
 print("\n1. Testing ChatRequest with basic fields...")
 try:
     request = ChatRequest(
-        model="test-model",
-        messages=[
-            ChatMessage(role="user", content="Hello")
-        ]
+        model="test-model", messages=[ChatMessage(role="user", content="Hello")]
     )
     assert request.model == "test-model"
     assert len(request.messages) == 1
@@ -59,9 +64,7 @@ print("\n2. Testing ChatRequest with extra fields (OpenAI SDK simulation)...")
 try:
     request_data = {
         "model": "test-model",
-        "messages": [
-            {"role": "user", "content": "Hello"}
-        ],
+        "messages": [{"role": "user", "content": "Hello"}],
         "max_tokens": 100,
         "temperature": 0.7,
         "stream": False,
@@ -80,15 +83,16 @@ try:
     assert request.temperature == 0.7
     assert request.stream == False
     # Extra fields should be ignored, not stored
-    assert not hasattr(request, 'frequency_penalty')
-    assert not hasattr(request, 'presence_penalty')
-    assert not hasattr(request, 'n')
+    assert not hasattr(request, "frequency_penalty")
+    assert not hasattr(request, "presence_penalty")
+    assert not hasattr(request, "n")
     print("   ✓ ChatRequest accepts and ignores extra fields")
     print(f"   ✓ Validated: model={request.model}, max_tokens={request.max_tokens}")
     print(f"   ✓ Extra fields correctly ignored (not stored in model)")
 except Exception as e:
     print(f"   ✗ Failed: {e}")
     import traceback
+
     traceback.print_exc()
     exit(1)
 
@@ -110,12 +114,13 @@ try:
     assert request.model == "test-model"
     assert request.input == "Hello world"
     assert request.max_output_tokens == 100
-    assert not hasattr(request, 'some_extra_field')
+    assert not hasattr(request, "some_extra_field")
     print("   ✓ OpenAIRequest accepts and ignores extra fields")
     print(f"   ✓ Validated: model={request.model}, input={request.input}")
 except Exception as e:
     print(f"   ✗ Failed: {e}")
     import traceback
+
     traceback.print_exc()
     exit(1)
 
@@ -137,10 +142,8 @@ print("\n5. Testing that validation rejects invalid field types...")
 try:
     request = ChatRequest(
         model="test-model",
-        messages=[
-            ChatMessage(role="user", content="Hello")
-        ],
-        temperature="not-a-number"  # Should be float
+        messages=[ChatMessage(role="user", content="Hello")],
+        temperature="not-a-number",  # Should be float
     )
     print("   ✗ Failed: Should have raised ValidationError for invalid type")
     exit(1)
@@ -155,8 +158,8 @@ try:
         role="user",
         content=[
             {"type": "input_text", "text": "What's in this image?"},
-            {"type": "input_image", "image_url": "http://example.com/image.jpg"}
-        ]
+            {"type": "input_image", "image_url": "http://example.com/image.jpg"},
+        ],
     )
     assert message.role == "user"
     assert isinstance(message.content, list)
@@ -173,8 +176,8 @@ try:
         model="test-model",
         input=[
             ChatMessage(role="system", content="You are helpful"),
-            ChatMessage(role="user", content="Hello")
-        ]
+            ChatMessage(role="user", content="Hello"),
+        ],
     )
     assert len(request.input) == 2
     print("   ✓ OpenAIRequest accepts list of ChatMessages")
