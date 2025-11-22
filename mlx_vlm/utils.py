@@ -167,8 +167,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     weights = {}
     for wf in weight_files:
         weights.update(mx.load(wf))
-    
+
     import safetensors
+
     with safetensors.safe_open(weight_files[0], framework="np") as f:
         is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
 
@@ -189,15 +190,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     if not is_mlx_format:
         # Sanitize weights
         weights = sanitize_weights(model, weights)
-        
-        # For qwen3_omni_moe, only sanitize model.thinker
+
         if hasattr(model, "thinker") and hasattr(model.thinker, "sanitize"):
             weights = sanitize_weights(model.thinker, weights)
             weights = sanitize_weights(model.thinker.vision_tower, weights)
             weights = sanitize_weights(model.thinker.audio_tower, weights)
+            weights = sanitize_weights(model.thinker.language_model, weights)
             weights = sanitize_weights(model.code2wav, weights)
+            weights = sanitize_weights(model.talker, weights)
         else:
-            # For other models, sanitize VisionModel, LanguageModel, AudioModel separately
             weights = sanitize_weights(
                 model_class.VisionModel, weights, model_config.vision_config
             )
@@ -830,6 +831,18 @@ def prepare_inputs(
         images = [process_image(img, resize_shape, image_processor) for img in images]
 
     # Process audio
+    audio_inputs = None
+    audio_feature_lengths = None
+    is_qwen3_omni_moe = False
+    processor_class_name = (
+        processor.__class__.__name__ if hasattr(processor, "__class__") else ""
+    )
+    if (
+        "qwen3" in processor_class_name.lower()
+        and "omni" in processor_class_name.lower()
+    ):
+        is_qwen3_omni_moe = True
+
     if audio:
         if not isinstance(audio, list):
             audio = [audio]
@@ -840,10 +853,38 @@ def prepare_inputs(
             )
             audio = audio[:1]
 
-        audio = [
-            load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
-            for audio_file in audio
-        ]
+        if is_qwen3_omni_moe:
+            audio_arrays = [
+                load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
+                for audio_file in audio
+            ]
+            audio_arrays = [
+                audio_array.astype(np.float32) for audio_array in audio_arrays
+            ]
+
+            feature_extractor = getattr(processor, "feature_extractor", None)
+            if feature_extractor is None:
+                raise ValueError("Processor missing feature_extractor for audio prep.")
+
+            audio_inputs = feature_extractor(
+                audio_arrays,
+                sampling_rate=feature_extractor.sampling_rate,
+                padding=True,
+                return_attention_mask=True,
+            )
+
+            audio_feature_lengths = np.sum(
+                audio_inputs["attention_mask"], axis=-1, dtype=np.int32
+            )
+        else:
+            feature_extractor = getattr(processor, "feature_extractor", None)
+            if feature_extractor is not None:
+                audio = [
+                    load_audio(audio_file, sr=feature_extractor.sampling_rate)
+                    for audio_file in audio
+                ]
+            else:
+                audio = [load_audio(audio_file, sr=16000) for audio_file in audio]
     else:
         audio = None
 
@@ -908,6 +949,15 @@ def prepare_inputs(
                     model_inputs[key] = value
                 else:
                     model_inputs[key] = mx.array(value)
+
+    if audio_inputs is not None:
+        model_inputs["input_features"] = mx.array(audio_inputs["input_features"])
+        model_inputs["feature_attention_mask"] = mx.array(
+            audio_inputs["attention_mask"]
+        ).astype(mx.int32)
+        model_inputs["audio_feature_lengths"] = mx.array(
+            audio_feature_lengths, dtype=mx.int32
+        )
 
     return model_inputs
 

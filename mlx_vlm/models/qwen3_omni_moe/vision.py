@@ -5,10 +5,10 @@ import mlx.nn as nn
 
 from .config import VisionConfig
 
+
 def check_array_shape(arr):
     shape = arr.shape
 
-    # Check if the shape has 4 or 5 dimensions
     if len(shape) not in [4, 5]:
         return False
 
@@ -17,7 +17,6 @@ def check_array_shape(arr):
     if t == 3:
         return True
 
-    # Check if out_channels is the largest, and kH and KW are the same
     if (out_channels >= kH) and (out_channels >= KW) and (kH == KW):
         return True
     else:
@@ -25,7 +24,6 @@ def check_array_shape(arr):
 
 
 def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return mx.concatenate([-x2, x1], axis=-1)
@@ -232,9 +230,8 @@ class VisionModel(nn.Module):
     def rot_pos_emb(self, grid_thw: mx.array) -> mx.array:
         merge_size = self.spatial_merge_size
 
-        # Get max grid size for frequency table
         max_hw = int(mx.max(grid_thw[:, 1:]).item())
-        freq_table = self.rotary_pos_emb(max_hw)  # Shape: (max_hw, dim // 2)
+        freq_table = self.rotary_pos_emb(max_hw)
 
         pos_ids = []
 
@@ -242,15 +239,12 @@ class VisionModel(nn.Module):
             num_frames, height, width = int(num_frames), int(height), int(width)
             merged_h, merged_w = height // merge_size, width // merge_size
 
-            # Create block indices
             block_rows = mx.arange(merged_h)
             block_cols = mx.arange(merged_w)
 
-            # Create intra-block indices
             intra_row = mx.arange(merge_size)
             intra_col = mx.arange(merge_size)
 
-            # Compute full-resolution positions
             row_idx = (
                 block_rows[:, None, None, None] * merge_size
                 + intra_row[None, None, :, None]
@@ -260,7 +254,6 @@ class VisionModel(nn.Module):
                 + intra_col[None, None, None, :]
             )
 
-            # Broadcast and flatten
             row_idx = mx.broadcast_to(
                 row_idx, (merged_h, merged_w, merge_size, merge_size)
             ).reshape(-1)
@@ -268,24 +261,18 @@ class VisionModel(nn.Module):
                 col_idx, (merged_h, merged_w, merge_size, merge_size)
             ).reshape(-1)
 
-            # Stack into coordinate pairs
             coords = mx.stack([row_idx, col_idx], axis=-1)
 
-            # Repeat for temporal dimension
             if num_frames > 1:
                 coords = mx.tile(coords, (num_frames, 1))
 
             pos_ids.append(coords)
 
-        # Concatenate all position IDs - shape: (total_tokens, 2)
         pos_ids = mx.concatenate(pos_ids, axis=0)
 
-        # Lookup embeddings: freq_table[h_pos] and freq_table[w_pos]
-        # pos_ids[:, 0] = height positions, pos_ids[:, 1] = width positions
-        h_embeddings = freq_table[pos_ids[:, 0]]  # (total_tokens, dim // 2)
-        w_embeddings = freq_table[pos_ids[:, 1]]  # (total_tokens, dim // 2)
+        h_embeddings = freq_table[pos_ids[:, 0]]
+        w_embeddings = freq_table[pos_ids[:, 1]]
 
-        # Concatenate height and width embeddings
         embeddings = mx.concatenate([h_embeddings, w_embeddings], axis=-1)
 
         return embeddings
@@ -386,16 +373,13 @@ class VisionModel(nn.Module):
         hidden_states = hidden_states.reshape(seq_len, -1)
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
 
-        # Assuming grid_thw has shape (batch_size, 3)
         batch_size = grid_thw.shape[0]
 
-        # Calculate cu_seqlens for each item in the batch
         cu_seqlens = []
         for i in range(batch_size):
             seq_len = grid_thw[i, 1] * grid_thw[i, 2]
             cu_seqlens.append(mx.repeat(seq_len, grid_thw[i, 0]))
 
-        # Concatenate the cu_seqlens for all items in the batch
         cu_seqlens = mx.concatenate(cu_seqlens)
 
         cu_seqlens = mx.cumsum(cu_seqlens.astype(mx.int32), axis=0)
@@ -422,13 +406,8 @@ class VisionModel(nn.Module):
         sanitized_weights = {}
         for k, v in weights.items():
             if "position_ids" in k:
-                # Remove unused position_ids
                 continue
             elif "patch_embed.proj.weight" in k:
-                # PyTorch conv2d weight tensors have shape:
-                #   [out_channels, in_channels, kH, KW]
-                # MLX conv2d expects the weight be of shape:
-                #   [out_channels, kH, KW, in_channels]
                 if check_array_shape(v):
                     sanitized_weights[k] = v
                 else:

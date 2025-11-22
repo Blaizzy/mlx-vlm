@@ -1,3 +1,4 @@
+from .audio import AudioModel
 from .config import (
     AudioConfig,
     Code2WavConfig,
@@ -8,10 +9,9 @@ from .config import (
     ThinkerConfig,
     VisionConfig,
 )
-from .qwen3_omni_moe import Model
 from .language import LanguageModel
+from .qwen3_omni_moe import Model
 from .vision import VisionModel
-from .audio import AudioModel
 
 __all__ = [
     "Model",
@@ -27,4 +27,3 @@ __all__ = [
     "CodePredictorConfig",
     "Code2WavConfig",
 ]
-

@@ -5,7 +5,6 @@ from typing import Dict, List, Optional, Union
 from ..base import BaseModelConfig
 
 
-# ========== Code2Wav Config ==========
 @dataclass
 class Code2WavConfig(BaseModelConfig):
     model_type: str = ""
@@ -43,7 +42,6 @@ class Code2WavConfig(BaseModelConfig):
         )
 
 
-# ========== Audio Config (for Thinker) ==========
 @dataclass
 class AudioConfig(BaseModelConfig):
     model_type: str = "qwen3_omni_moe_audio_encoder"
@@ -77,7 +75,6 @@ class AudioConfig(BaseModelConfig):
         )
 
 
-# ========== Vision Config (for Thinker) ==========
 @dataclass
 class VisionConfig(BaseModelConfig):
     model_type: str = "qwen3_omni_moe_vision_encoder"
@@ -97,7 +94,7 @@ class VisionConfig(BaseModelConfig):
     hidden_act: str = "gelu_pytorch_tanh"
     initializer_range: float = 0.02
     apply_vit_abs_pos_embed: bool = True
-    num_position_embeddings: int = 2304  # (image_size / patch_size) ** 2 = (768 / 16) ** 2 = 2304
+    num_position_embeddings: int = 2304
     deepstack_visual_indexes: List[int] = field(default_factory=lambda: [8, 16, 24])
 
     @classmethod
@@ -111,7 +108,6 @@ class VisionConfig(BaseModelConfig):
         )
 
 
-# ========== Text Config (shared by Thinker and Talker) ==========
 @dataclass
 class TextConfig(BaseModelConfig):
     model_type: str
@@ -161,7 +157,6 @@ class TextConfig(BaseModelConfig):
         )
 
 
-# ========== Code Predictor Config (for Talker) ==========
 @dataclass
 class CodePredictorConfig(BaseModelConfig):
     model_type: str = "qwen3_omni_moe_talker_code_predictor"
@@ -198,7 +193,6 @@ class CodePredictorConfig(BaseModelConfig):
         )
 
 
-# ========== Thinker Config ==========
 @dataclass
 class ThinkerConfig(BaseModelConfig):
     text_config: TextConfig
@@ -220,12 +214,11 @@ class ThinkerConfig(BaseModelConfig):
 
     @classmethod
     def from_dict(cls, params):
-        # Extract nested configs
-        params = dict(params)  # Create a copy to avoid modifying original
+        params = dict(params)
         text_config = TextConfig.from_dict(params.pop("text_config", {}))
         vision_config = VisionConfig.from_dict(params.pop("vision_config", {}))
         audio_config = AudioConfig.from_dict(params.pop("audio_config", {}))
-        
+
         return cls(
             text_config=text_config,
             vision_config=vision_config,
@@ -234,11 +227,10 @@ class ThinkerConfig(BaseModelConfig):
                 k: v
                 for k, v in params.items()
                 if k in inspect.signature(cls).parameters
-            }
+            },
         )
 
 
-# ========== Talker Config ==========
 @dataclass
 class TalkerConfig(BaseModelConfig):
     text_config: TextConfig
@@ -263,19 +255,18 @@ class TalkerConfig(BaseModelConfig):
     codec_pad_id: int = 2148
     codec_think_bos_id: int = 2156
     codec_think_eos_id: int = 2157
-    speaker_id: Dict[str, int] = field(default_factory=lambda: {
-        "chelsie": 2301,
-        "ethan": 2302,
-        "aiden": 2303
-    })
+    speaker_id: Dict[str, int] = field(
+        default_factory=lambda: {"chelsie": 2301, "ethan": 2302, "aiden": 2303}
+    )
 
     @classmethod
     def from_dict(cls, params):
-        # Extract nested configs
-        params = dict(params)  # Create a copy to avoid modifying original
+        params = dict(params)
         text_config = TextConfig.from_dict(params.pop("text_config", {}))
-        code_predictor_config = CodePredictorConfig.from_dict(params.pop("code_predictor_config", {}))
-        
+        code_predictor_config = CodePredictorConfig.from_dict(
+            params.pop("code_predictor_config", {})
+        )
+
         return cls(
             text_config=text_config,
             code_predictor_config=code_predictor_config,
@@ -283,11 +274,10 @@ class TalkerConfig(BaseModelConfig):
                 k: v
                 for k, v in params.items()
                 if k in inspect.signature(cls).parameters
-            }
+            },
         )
 
 
-# ========== Top-level Model Config ==========
 @dataclass
 class ModelConfig(BaseModelConfig):
     thinker_config: ThinkerConfig
@@ -307,12 +297,11 @@ class ModelConfig(BaseModelConfig):
 
     @classmethod
     def from_dict(cls, params):
-        # Extract nested configs
-        params = dict(params)  # Create a copy to avoid modifying original
+        params = dict(params)
         thinker_config = ThinkerConfig.from_dict(params.pop("thinker_config", {}))
         talker_config = TalkerConfig.from_dict(params.pop("talker_config", {}))
         code2wav_config = Code2WavConfig.from_dict(params.pop("code2wav_config", {}))
-        
+
         return cls(
             thinker_config=thinker_config,
             talker_config=talker_config,
@@ -321,6 +310,5 @@ class ModelConfig(BaseModelConfig):
                 k: v
                 for k, v in params.items()
                 if k in inspect.signature(cls).parameters
-            }
+            },
         )
-

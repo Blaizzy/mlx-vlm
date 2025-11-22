@@ -1,6 +1,5 @@
 import argparse
 import glob
-import os
 import shutil
 from pathlib import Path
 from typing import Callable, Optional, Union
@@ -9,11 +8,6 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map_with_path
 from mlx_lm.utils import dequantize_model, quantize_model
-
-# Check for CPU device override (for debugging)
-if os.getenv("MLX_DEFAULT_DEVICE", "").lower() == "cpu" or os.getenv("MLX_FORCE_CPU", "0") == "1":
-    mx.set_default_device(mx.cpu)
-    print("[INFO] Forced to use CPU device")
 
 from .utils import (
     MODEL_CONVERSION_DTYPES,
@@ -120,10 +114,6 @@ def convert(
     trust_remote_code: bool = True,
     quant_predicate: Optional[str] = None,
 ):
-    # Force CPU for debugging
-    mx.set_default_device(mx.cpu)
-    print("[INFO] Using CPU device")
-    
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
     model, config, processor = fetch_from_hub(

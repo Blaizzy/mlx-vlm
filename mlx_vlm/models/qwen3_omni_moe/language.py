@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Optional
 
 import mlx.core as mx
@@ -11,7 +12,16 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
-from .config import ThinkerConfig, TextConfig
+from .config import TextConfig, ThinkerConfig
+
+
+@dataclass
+class ModelOutput:
+    logits: mx.array
+    hidden_states: Optional[list] = None
+    cross_attention_states: Optional[mx.array] = None
+    encoder_outputs: Optional[list] = None
+    past_key_values: Optional[list] = None
 
 
 class Qwen3OmniMoeThinkerTextRotaryEmbedding:
@@ -26,31 +36,29 @@ class Qwen3OmniMoeThinkerTextRotaryEmbedding:
             self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
         )
         self.inv_freq = inv_freq
-        self.attention_scaling = 1.0  # type: default
+        self.attention_scaling = 1.0
 
+        rope_scaling = rope_scaling or {}
         self.mrope_section = rope_scaling.get("mrope_section", [24, 20, 20])
 
     def apply_interleaved_mrope(self, freqs, mrope_section):
-        """Apply interleaved MRoPE to 3D rotary embeddings.
-        Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
-        interleaved [THTHWHTHW...TT], preserving frequency continuity.
-        args:
-            x: (3, bs, seq_len, head_dim // 2)
-            mrope_section: (3,)
-        returns:
-            x_t: (bs, seq_len, head_dim // 2)
-        """
-        freqs_t = freqs[0]  # just overwrite the first dimension T
-        for dim, offset in enumerate((1, 2), start=1):  # H, W
-            length = mrope_section[dim] * 3
-            idx = slice(offset, length, 3)
-            freqs_t[..., idx] = freqs[dim, ..., idx]
+        D = freqs.shape[-1]
+        indices = mx.arange(D)
+
+        freqs_t = freqs[0]
+
+        limit1 = mrope_section[1] * 3
+        mask1 = (indices % 3 == 1) & (indices < limit1)
+        freqs_t = mx.where(mask1, freqs[1], freqs_t)
+
+        limit2 = mrope_section[2] * 3
+        mask2 = (indices % 3 == 2) & (indices < limit2)
+        freqs_t = mx.where(mask2, freqs[2], freqs_t)
+
         return freqs_t
 
     def __call__(self, x, position_ids):
 
-        # In contrast to other models, Qwen3VLMoe has different position ids for the grids
-        # So we expand the inv_freq to shape (3, ...)
         if position_ids.ndim == 2:
             position_ids = mx.broadcast_to(
                 position_ids[None, ...],
@@ -61,9 +69,7 @@ class Qwen3OmniMoeThinkerTextRotaryEmbedding:
             self.inv_freq[None, None, :, None].astype(mx.float32),
             (3, position_ids.shape[1], self.inv_freq.shape[0], 1),
         )
-        position_ids_expanded = position_ids[:, :, None, :].astype(
-            mx.float32
-        )  # shape (3, bs, 1, positions)
+        position_ids_expanded = position_ids[:, :, None, :].astype(mx.float32)
 
         freqs = inv_freq_expanded @ position_ids_expanded
         freqs = mx.swapaxes(freqs, 2, 3)
@@ -76,29 +82,15 @@ class Qwen3OmniMoeThinkerTextRotaryEmbedding:
 
 
 def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return mx.concatenate([-x2, x1], axis=-1)
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
-    """
-    Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors.
-    Args:
-        q (mx.array): The query tensor.
-        k (mx.array): The key tensor.
-        cos (mx.array): The cosine part of the rotary embedding.
-        sin (mx.array): The sine part of the rotary embedding.
-        unsqueeze_dim (int, optional): Dimension to unsqueeze. Defaults to 1.
-    Returns:
-        tuple(mx.array): The rotated query and key tensors.
-    """
-
     cos = mx.expand_dims(cos, axis=unqueeze_dim)
     sin = mx.expand_dims(sin, axis=unqueeze_dim)
 
-    # Apply rotary embedding
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
 
@@ -147,7 +139,6 @@ class Attention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        # Prepare the queries, keys and values for the attention computation
         queries = self.q_norm(
             queries.reshape(B, L, self.n_heads, self.head_dim)
         ).transpose(0, 2, 1, 3)
@@ -199,18 +190,32 @@ class MLP(nn.Module):
 class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
-        self.gate = nn.Linear(args.hidden_size, args.num_experts, bias=False)
-        self.experts = [
-            MLP(args.hidden_size, args.intermediate_size) for _ in range(args.num_experts)
-        ]
+        self.num_experts = args.num_experts
+        self.top_k = args.num_experts_per_tok
+        self.norm_topk_prob = args.norm_topk_prob
 
-        pass
+        self.gate = nn.Linear(args.hidden_size, args.num_experts, bias=False)
+        self.switch_mlp = SwitchGLU(
+            args.hidden_size, args.moe_intermediate_size, args.num_experts
+        )
 
     def __call__(
         self,
         x: mx.array,
-    ):
-        pass
+    ) -> mx.array:
+        gates = self.gate(x)
+        gates = mx.softmax(gates, axis=-1, precise=True)
+
+        k = self.top_k
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores /= mx.sum(scores, axis=-1, keepdims=True)
+
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2)
+
+        return y
 
 
 class Qwen3OmniMoEThinkerTextDecoderLayer(nn.Module):
@@ -267,9 +272,9 @@ class Qwen3VLMoEModel(nn.Module):
         mask: Optional[mx.array] = None,
         cache=None,
         position_ids: Optional[mx.array] = None,
-        # args for deepstack
         visual_pos_masks: Optional[mx.array] = None,
         deepstack_visual_embeds: Optional[mx.array] = None,
+        output_hidden_states: bool = False,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -282,11 +287,13 @@ class Qwen3VLMoEModel(nn.Module):
         if mask is None:
             mask = create_attention_mask(h, cache)
 
+        all_hidden_states = [] if output_hidden_states else None
+
         for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
+            if output_hidden_states:
+                all_hidden_states.append(h)
             h = layer(h, mask, c, position_ids)
 
-            # Add deepstack visual embeds
-            # add visual features to the hidden states of first several layers
             if deepstack_visual_embeds is not None and layer_idx in range(
                 len(deepstack_visual_embeds)
             ):
@@ -296,7 +303,15 @@ class Qwen3VLMoEModel(nn.Module):
                     deepstack_visual_embeds[layer_idx],
                 )
 
-        return self.norm(h)
+            if layer_idx % 4 == 0:
+                mx.eval(h)
+
+        if output_hidden_states:
+            all_hidden_states.append(h)
+
+        return (
+            (self.norm(h), all_hidden_states) if output_hidden_states else self.norm(h)
+        )
 
     def _deepstack_process(
         self,
@@ -304,8 +319,9 @@ class Qwen3VLMoEModel(nn.Module):
         visual_pos_masks: mx.array,
         visual_embeds: mx.array,
     ):
+        if visual_pos_masks.ndim == 3:
+            visual_pos_masks = visual_pos_masks[..., 0]
         visual_embeds = visual_embeds.astype(hidden_states.dtype)
-        # Convert boolean mask to indices using numpy
         visual_indices = np.where(visual_pos_masks)[0].tolist()
         local_this = hidden_states[:, visual_indices, :] + visual_embeds
         hidden_states[:, visual_indices, :] = local_this
@@ -331,7 +347,6 @@ class LanguageModel(nn.Module):
         video_grid_thw: Optional[mx.array] = None,
         attention_mask: Optional[mx.array] = None,
     ):
-        # Calculate RoPE index for image/video tokens
         batch_size, seq_length = input_ids.shape
         position_ids = mx.arange(seq_length, dtype=mx.int32)
         position_ids = mx.broadcast_to(position_ids[None, :], (batch_size, seq_length))
@@ -411,29 +426,23 @@ class LanguageModel(nn.Module):
                     index = mx.broadcast_to(index, (3, text_len))
                     index = index + st_idx
                     llm_pos_ids_list.append(index)
-                    t_index = mx.arange(llm_grid_t).reshape(
-                        llm_grid_t, 1
-                    )  # Equivalent to .view(-1, 1)
+                    t_index = mx.arange(llm_grid_t).reshape(llm_grid_t, 1)
                     t_index = mx.broadcast_to(
                         t_index, (llm_grid_t, llm_grid_h * llm_grid_w)
-                    )  # Equivalent to expand()
-                    t_index = t_index.flatten()  # Flattens to 1D
+                    )
+                    t_index = t_index.flatten()
 
-                    h_index = mx.arange(llm_grid_h).reshape(
-                        1, llm_grid_h, 1
-                    )  # Equivalent to .view(1, -1)
+                    h_index = mx.arange(llm_grid_h).reshape(1, llm_grid_h, 1)
                     h_index = mx.broadcast_to(
                         h_index, (llm_grid_t, llm_grid_h, llm_grid_w)
-                    )  # Equivalent to expand()
-                    h_index = h_index.flatten()  # Flattens to 1D
+                    )
+                    h_index = h_index.flatten()
 
-                    w_index = mx.arange(llm_grid_w).reshape(
-                        1, 1, llm_grid_w
-                    )  # Equivalent to .view(1, -1)
+                    w_index = mx.arange(llm_grid_w).reshape(1, 1, llm_grid_w)
                     w_index = mx.broadcast_to(
                         w_index, (llm_grid_t, llm_grid_h, llm_grid_w)
-                    )  # Equivalent to expand()
-                    w_index = w_index.flatten()  # Flattens to 1D
+                    )
+                    w_index = w_index.flatten()
 
                     llm_pos_ids_list.append(
                         mx.stack([t_index, h_index, w_index]) + text_len + st_idx
@@ -447,12 +456,8 @@ class LanguageModel(nn.Module):
                     )
                     text_len = len(input_tokens) - st
 
-                    t_index = mx.arange(text_len).reshape(
-                        1, text_len
-                    )  # Equivalent to .view(-1, 1)
-                    t_index = mx.broadcast_to(
-                        t_index, (3, text_len)
-                    )  # Equivalent to expand(3, -1)
+                    t_index = mx.arange(text_len).reshape(1, text_len)
+                    t_index = mx.broadcast_to(t_index, (3, text_len))
 
                     llm_pos_ids_list.append(t_index + st_idx)
 
@@ -507,7 +512,6 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
-        # args for deepstack
         visual_pos_masks: Optional[mx.array] = None,
         deepstack_visual_embeds: Optional[mx.array] = None,
         **kwargs,
@@ -517,7 +521,6 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
-        # reset rope_deltas when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None
 
@@ -532,7 +535,6 @@ class LanguageModel(nn.Module):
                 raise ValueError(f"Unexpected cache offset type: {type(offset)}")
 
         if position_ids is None and (mask is None or mask.ndim == 2):
-            # Calculate RoPE index once per generation in the pre-fill stage only
             if (
                 (cache is not None and cache[0] is not None and (cache_offset == 0))
                 or self._rope_deltas is None
@@ -543,7 +545,6 @@ class LanguageModel(nn.Module):
                 )
                 self._rope_deltas = rope_deltas
             else:
-                # Use the prev pre-calculated rope-deltas to get the correct position ids
                 batch_size, seq_length = inputs.shape
                 delta = mx.array(
                     cache_offset + self._rope_deltas if cache is not None else 0
@@ -558,13 +559,16 @@ class LanguageModel(nn.Module):
                     if delta.shape[0] < batch_size:
                         delta = mx.tile(delta, (batch_size, 1))
                     else:
-                        # Slice delta to match batch
                         delta = delta[:batch_size]
 
                 position_ids = mx.add(position_ids, delta)[None, ...]
                 position_ids = mx.broadcast_to(
                     position_ids, (3, batch_size, seq_length)
                 )
+
+        visual_pos_masks = kwargs.get("visual_pos_masks", None)
+        deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds", None)
+        output_hidden_states = kwargs.pop("output_hidden_states", False)
 
         out = self.model(
             inputs,
@@ -573,22 +577,38 @@ class LanguageModel(nn.Module):
             position_ids=position_ids,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
+            output_hidden_states=output_hidden_states,
         )
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
 
-    # def sanitize(self, weights):
-    #     for l in range(self.args.num_hidden_layers):
-    #         prefix = f"language_model.model.layers.{l}.mlp"
-    #         # Only sanitize MoE layer weights
-    #         if f"{prefix}.experts.up_proj" in weights:
-    #             for n in ["up_proj", "down_proj", "gate_proj"]:
-    #                 to_join = weights.pop(f"{prefix}.experts.{n}")
-    #                 weights[f"{prefix}.switch_mlp.{n}.weight"] = to_join
-    #     return weights
+        if output_hidden_states:
+            hidden_states, all_hidden_states = out
+            out = hidden_states
+
+        if self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(out)
+        else:
+            logits = self.lm_head(out)
+
+        return ModelOutput(
+            logits=logits,
+            hidden_states=all_hidden_states if output_hidden_states else None,
+        )
+
+    def sanitize(self, weights):
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"thinker.language_model.model.layers.{l}.mlp"
+            for n in ["gate_proj", "down_proj", "up_proj"]:
+                experts_weights = []
+                for e in range(self.args.num_experts):
+                    key = f"{prefix}.experts.{e}.{n}.weight"
+                    if key in weights:
+                        experts_weights.append(weights.pop(key))
+
+                if experts_weights:
+                    weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(
+                        experts_weights, axis=0
+                    )
+        return weights
 
     @property
     def quant_predicate(self):
