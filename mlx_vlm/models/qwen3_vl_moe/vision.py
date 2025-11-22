@@ -111,7 +111,7 @@ class PatchMerger(nn.Module):
             self.hidden_size if use_postshuffle_norm else config.hidden_size, eps=1e-6
         )
         self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
-        self.act_fn = nn.GELU()
+        self.act_fn = nn.GELU(approx="tanh")
         self.linear_fc2 = nn.Linear(self.hidden_size, config.out_hidden_size)
 
     def __call__(self, x: mx.array) -> mx.array:

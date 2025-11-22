@@ -168,7 +168,7 @@ class MLP(nn.Module):
         super().__init__()
         self.linear_fc1 = nn.Linear(dim, hidden_dim, bias=True)
         self.linear_fc2 = nn.Linear(hidden_dim, dim, bias=True)
-        self.act_fn = nn.GELU()
+        self.act_fn = nn.GELU(approx="tanh")
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
