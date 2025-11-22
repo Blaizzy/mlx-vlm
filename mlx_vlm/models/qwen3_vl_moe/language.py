@@ -26,7 +26,6 @@ class Qwen3VLMoERotaryEmbedding:
             self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
         )
         self.inv_freq = inv_freq
-        self.attention_scaling = 1.0  # type: default
 
         self.mrope_section = rope_scaling.get("mrope_section", [24, 20, 20])
 
@@ -69,8 +68,8 @@ class Qwen3VLMoERotaryEmbedding:
         freqs = mx.swapaxes(freqs, 2, 3)
         freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
         emb = mx.concatenate([freqs, freqs], axis=-1)
-        cos = mx.cos(emb) * self.attention_scaling
-        sin = mx.sin(emb) * self.attention_scaling
+        cos = mx.cos(emb)
+        sin = mx.sin(emb)
 
         return cos.astype(x.dtype), sin.astype(x.dtype)
 
