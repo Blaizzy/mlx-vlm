@@ -146,37 +146,64 @@ The server provides multiple endpoints for different use cases and supports dyna
 
 #### Available Endpoints
 
-- `/generate` - Main generation endpoint with support for images, audio, and text
-- `/chat` - Chat-style interaction endpoint
-- `/responses` - OpenAI-compatible endpoint
+- `/models` - List models available locally
+- `/chat/completion` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
+- `/responses` - OpenAI-compatible responses endpoint
 - `/health` - Check server status
 - `/unload` - Unload current model from memory
 
 #### Usage Examples
 
-##### Text Generation
+##### List available models
 
 ```sh
-curl -X POST "http://localhost:8000/generate" \
+curl "http://localhost:8080/models"
+```
+
+##### Text Input
+
+```sh
+curl -X POST "http://localhost:8080/chat/completion" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/Qwen2-VL-2B-Instruct-4bit",
-    "prompt": "Hello, how are you?",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello, how are you",
+      }
+    ],
     "stream": true,
     "max_tokens": 100
   }'
 ```
 
-##### Image Generation
+##### Image Input
 
 ```sh
-curl -X POST "http://localhost:8000/generate" \
+curl -X POST "http://localhost:8080/chat/completion" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/Qwen2.5-VL-32B-Instruct-8bit",
-    "image": ["/path/to/repo/examples/images/renewables_california.png"],
-    "prompt": "This is today'\''s chart for energy demand in California. Can you provide an analysis of the chart and comment on the implications for renewable energy in California?",
-    "system": "You are a helpful assistant.",
+    [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant."
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": This is today's chart for energy demand in California. Can you provide an analysis of the chart and comment on the implications for renewable energy in California?"
+          },
+          {
+            "type": "input_image",
+            "image_url": "/path/to/repo/examples/images/renewables_california.png"
+          }
+        ]
+      }
+    ],
     "stream": true,
     "max_tokens": 1000
   }'
@@ -184,12 +211,20 @@ curl -X POST "http://localhost:8000/generate" \
 
 ##### Audio Support (New)
 ```sh
-curl -X POST "http://localhost:8000/generate" \
+curl -X POST "http://localhost:8080/generate" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/gemma-3n-E2B-it-4bit",
-    "audio": ["/path/to/audio1.wav", "https://example.com/audio2.mp3"],
-    "prompt": "Describe what you hear in these audio files",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          { "type": "text", "text": "Describe what you hear in these audio files" },
+          {"type": "input_audio", "input_audio": "/path/to/audio1.wav"}
+          {"type": "input_audio", "input_audio": "https://example.com/audio2.mp3"}
+        ]
+      }
+    ],
     "stream": true,
     "max_tokens": 500
   }'
@@ -197,37 +232,26 @@ curl -X POST "http://localhost:8000/generate" \
 
 ##### Multi-Modal (Image + Audio)
 ```sh
-curl -X POST "http://localhost:8000/generate" \
+curl -X POST "http://localhost:8080/generate" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/gemma-3n-E2B-it-4bit",
-    "image": ["/path/to/image.jpg"],
-    "audio": ["/path/to/audio.wav"],
-    "prompt": "",
-    "max_tokens": 1000
-  }'
-```
-
-##### Chat Endpoint
-```sh
-curl -X POST "http://localhost:8000/chat" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "mlx-community/Qwen2-VL-2B-Instruct-4bit",
     "messages": [
       {
         "role": "user",
-        "content": "What is in this image?",
-        "images": ["/path/to/image.jpg"]
+        "content": [
+          {"type": "input_image", "image_url": "/path/to/image.jpg"},
+          {"type": "input_audio", "input_audio": "/path/to/audio.wav"}
+        ]
       }
     ],
     "max_tokens": 100
   }'
 ```
 
-##### OpenAI-Compatible Endpoint
+##### Responses Endpoint
 ```sh
-curl -X POST "http://localhost:8000/responses" \
+curl -X POST "http://localhost:8080/responses" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/Qwen2-VL-2B-Instruct-4bit",
@@ -236,7 +260,7 @@ curl -X POST "http://localhost:8000/responses" \
         "role": "user",
         "content": [
           {"type": "input_text", "text": "What is in this image?"},
-          {"type": "input_image", "image": "/path/to/image.jpg"}
+          {"type": "input_image", "image_url": "/path/to/image.jpg"}
         ]
       }
     ],
@@ -247,10 +271,6 @@ curl -X POST "http://localhost:8000/responses" \
 #### Request Parameters
 
 - `model`: Model identifier (required)
-- `prompt`: Text prompt for generation
-- `image`: List of image URLs or local paths (optional)
-- `audio`: List of audio URLs or local paths (optional, new)
-- `system`: System prompt (optional)
 - `messages`: Chat messages for chat/OpenAI endpoints
 - `max_tokens`: Maximum tokens to generate
 - `temperature`: Sampling temperature
