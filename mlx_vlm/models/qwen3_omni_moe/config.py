@@ -31,16 +31,6 @@ class Code2WavConfig(BaseModelConfig):
     upsample_rates: List[int] = field(default_factory=lambda: [8, 5, 4, 3])
     upsampling_ratios: List[int] = field(default_factory=lambda: [2, 2])
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
 
 @dataclass
 class AudioConfig(BaseModelConfig):
@@ -63,16 +53,6 @@ class AudioConfig(BaseModelConfig):
     n_window: int = 50
     n_window_infer: int = 800
     max_source_positions: int = 1500
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 @dataclass
@@ -97,20 +77,9 @@ class VisionConfig(BaseModelConfig):
     num_position_embeddings: int = 2304
     deepstack_visual_indexes: List[int] = field(default_factory=lambda: [8, 16, 24])
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
 
 @dataclass
 class TextConfig(BaseModelConfig):
-    model_type: str
     num_hidden_layers: int
     hidden_size: int
     intermediate_size: int
@@ -126,6 +95,7 @@ class TextConfig(BaseModelConfig):
     head_dim: int
     rope_theta: float
     max_position_embeddings: int
+    model_type: str = "qwen3_omni_moe_text_encoder"
     norm_topk_prob: bool = True
     rope_scaling: Optional[Dict[str, Union[float, str, bool, List[int]]]] = field(
         default_factory=lambda: {"type": "default"}
@@ -145,16 +115,6 @@ class TextConfig(BaseModelConfig):
     def __post_init__(self):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 @dataclass
@@ -181,16 +141,6 @@ class CodePredictorConfig(BaseModelConfig):
     rope_scaling: Optional[Dict[str, Union[float, str, bool, List[int]]]] = None
     use_sliding_window: bool = False
     sliding_window: Optional[int] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 @dataclass
