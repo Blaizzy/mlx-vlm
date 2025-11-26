@@ -57,6 +57,7 @@ def skip_multimodal_module(path: str) -> bool:
         or "sam_model" in path
         or "audio_model" in path
         or "audio_tower" in path
+        or "code_predictor" in path
     )
 
 

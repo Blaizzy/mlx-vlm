@@ -490,132 +490,26 @@ class Model(nn.Module):
         talker_input_embed = mx.concatenate(talker_input_embeds, axis=1)
         talker_input_id = mx.concatenate(talker_input_ids, axis=1)
 
-        from mlx_lm.models.cache import KVCache
-
-        from mlx_vlm.sample_utils import top_p_sampling
-
-        talker_sequences = [talker_input_id]
-
-        past_key_values = [
-            KVCache()
-            for _ in range(self.config.talker_config.text_config.num_hidden_layers)
-        ]
-
-        logits, hidden_states = self.talker(
-            input_ids=None,
+        talker_result = self.talker.generate(
             inputs_embeds=talker_input_embed,
-            past_key_values=past_key_values,
-            use_cache=True,
+            trailing_text_hidden=trailing_text_hidden,
+            tts_pad_embed=tts_pad_embed,
+            talker_input_ids=talker_input_id,
+            max_new_tokens=talker_max_new_tokens,
+            temperature=talker_temperature,
+            top_p=talker_top_p,
         )
 
-        talker_hidden_states_list = [hidden_states]
-
-        if talker_temperature == 0:
-            token = mx.argmax(logits[:, -1, :], axis=-1)
-        else:
-            token = top_p_sampling(logits[:, -1, :], talker_top_p, talker_temperature)
-
-        talker_sequences.append(token[:, None])
-
-        generation_step = 0
-
-        all_generated_codes = []
-
-        for _ in range(talker_max_new_tokens):
-            token_scalar = token.item()
-            if token_scalar == self.config.talker_config.codec_eos_token_id:
-                break
-
-            current_step_codes = [token[:, None]]
-
-            past_hidden = talker_hidden_states_list[-1][:, -1:]
-            last_id_hidden = self.talker.model.codec_embedding(token[:, None])
-
-            cp_input_embeds = mx.concatenate([past_hidden, last_id_hidden], axis=1)
-            cp_past_key_values = [
-                KVCache() for _ in range(len(self.talker.code_predictor.model.layers))
-            ]
-
-            cp_logits, cp_hidden, _ = self.talker.code_predictor(
-                inputs_embeds=cp_input_embeds,
-                past_key_values=cp_past_key_values,
-                use_cache=True,
-            )
-
-            if talker_temperature == 0:
-                cp_token = mx.argmax(cp_logits[:, -1, :], axis=-1)
-            else:
-                cp_token = top_p_sampling(cp_logits[:, -1, :], 0.8, talker_temperature)
-
-            current_step_codes.append(cp_token[:, None])
-
-            mid_residual_hiddens = []
-
-            for cp_step in range(1, self.config.talker_config.num_code_groups - 1):
-                cp_logits, cp_hidden, cp_input_embeds_out = self.talker.code_predictor(
-                    input_ids=cp_token[:, None],
-                    past_key_values=cp_past_key_values,
-                    use_cache=True,
-                    generation_steps=cp_step,
-                )
-                mid_residual_hiddens.append(cp_input_embeds_out)
-
-                if talker_temperature == 0:
-                    cp_token = mx.argmax(cp_logits[:, -1, :], axis=-1)
-                else:
-                    cp_token = top_p_sampling(
-                        cp_logits[:, -1, :], 0.8, talker_temperature
-                    )
-
-                current_step_codes.append(cp_token[:, None])
-
-            last_residual_hidden = self.talker.code_predictor.model.codec_embedding[-1](
-                cp_token[:, None]
-            )
-
-            all_generated_codes.append(mx.concatenate(current_step_codes, axis=1))
-
-            codec_hiddens = (
-                [last_id_hidden] + mid_residual_hiddens + [last_residual_hidden]
-            )
-            codec_hiddens_stacked = mx.concatenate(codec_hiddens, axis=1)
-            inputs_embeds = mx.sum(codec_hiddens_stacked, axis=1, keepdims=True)
-
-            if generation_step < trailing_text_hidden.shape[1]:
-                trailing = trailing_text_hidden[:, generation_step].reshape(1, 1, -1)
-                inputs_embeds = inputs_embeds + trailing
-            else:
-                inputs_embeds = inputs_embeds + tts_pad_embed
-
-            logits, hidden_states = self.talker(
-                input_ids=None,
-                inputs_embeds=inputs_embeds,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
-            talker_hidden_states_list.append(hidden_states)
-
-            if talker_temperature == 0:
-                token = mx.argmax(logits[:, -1, :], axis=-1)
-            else:
-                token = top_p_sampling(
-                    logits[:, -1, :], talker_top_p, talker_temperature
-                )
-
-            talker_sequences.append(token[:, None])
-            generation_step += 1
-
-        talker_result_sequences = mx.concatenate(talker_sequences, axis=1)
-
-        talker_generated_hidden = mx.concatenate(talker_hidden_states_list, axis=1)
-
-        generated_len = len(talker_sequences) - 1
-
-        if not all_generated_codes:
+        valid_codes = [
+            hid[-1] for hid in talker_result.hidden_states if hid[-1] is not None
+        ]
+        if not valid_codes:
             talker_wavs = mx.zeros((1, 1, 1000))
         else:
-            talker_codes = mx.stack(all_generated_codes, axis=2)
-            talker_wavs = self.code2wav(codes=talker_codes)
+            talker_codes = mx.stack(valid_codes, axis=1).transpose(0, 2, 1)
+            talker_wavs = self.code2wav.chunked_decode(
+                talker_codes, chunk_size=300, left_context_size=25
+            )
 
         thinker_result = type(
             "obj",
@@ -627,3 +521,186 @@ class Model(nn.Module):
         )()
 
         return thinker_result, talker_wavs.astype(mx.float32)
+
+    def generate_stream(
+        self,
+        input_ids: mx.array,
+        speaker: str = "Ethan",
+        thinker_max_new_tokens: int = 1024,
+        thinker_eos_token_id: int = 151645,
+        talker_max_new_tokens: int = 4096,
+        talker_top_p: float = 1.0,
+        talker_temperature: float = 0.9,
+        chunk_size: int = 300,
+        left_context_size: int = 25,
+        **kwargs,
+    ):
+        if not self.has_talker:
+            raise ValueError("Cannot stream audio without talker module")
+        if input_ids.shape[0] != 1:
+            raise NotImplementedError("Streaming does not support batched inference")
+
+        speaker_id = self.config.talker_config.speaker_id.get(speaker.lower())
+        if speaker_id is None:
+            raise NotImplementedError(f"Speaker {speaker} not implemented")
+
+        from mlx_vlm.generate import generate_step
+
+        thinker_kwargs = {
+            "max_tokens": thinker_max_new_tokens,
+            "eos_tokens": [thinker_eos_token_id],
+        }
+        for key, value in kwargs.items():
+            if key.startswith("thinker_"):
+                thinker_kwargs[key[len("thinker_") :]] = value
+            elif key in (
+                "input_features",
+                "feature_attention_mask",
+                "audio_feature_lengths",
+                "pixel_values",
+                "pixel_values_videos",
+                "image_grid_thw",
+                "video_grid_thw",
+            ):
+                thinker_kwargs[key] = value
+
+        generator = generate_step(
+            input_ids,
+            self.thinker,
+            thinker_kwargs.get("pixel_values"),
+            kwargs.get("mask"),
+            **{
+                k: v
+                for k, v in thinker_kwargs.items()
+                if k not in ("pixel_values", "mask")
+            },
+        )
+        sequences = [input_ids]
+        for token, _ in generator:
+            sequences.append(mx.array([[token]]))
+            if token == thinker_eos_token_id:
+                break
+
+        thinker_result_sequences = mx.concatenate(sequences, axis=1)
+        thinker_hidden_all, thinker_embed_all = self.extract_thinker_hidden_states(
+            thinker_result_sequences,
+            target_layer_idx=self.config.talker_config.accept_hidden_layer,
+            **kwargs,
+        )
+
+        im_start_indexes = mx.concatenate(
+            (
+                mx.array(
+                    np.where(np.array(input_ids[0] == self.config.im_start_token_id))[0]
+                ),
+                mx.array([thinker_result_sequences.shape[-1]], dtype=mx.int32),
+            ),
+            axis=0,
+        )
+        multimodal_mask = (
+            (thinker_result_sequences == self.config.thinker_config.audio_token_id)
+            | (thinker_result_sequences == self.config.thinker_config.image_token_id)
+            | (thinker_result_sequences == self.config.thinker_config.video_token_id)
+        )
+
+        talker_special_tokens = mx.array(
+            [
+                [
+                    self.config.tts_bos_token_id,
+                    self.config.tts_eos_token_id,
+                    self.config.tts_pad_token_id,
+                ]
+            ],
+            dtype=input_ids.dtype,
+        )
+        talker_special_embeds = self.thinker.language_model.model.embed_tokens(
+            talker_special_tokens
+        )
+        talker_special_embeds_proj = self.talker.text_projection(talker_special_embeds)
+        tts_bos_embed, tts_eos_embed, tts_pad_embed = (
+            talker_special_embeds_proj[:, 0:1],
+            talker_special_embeds_proj[:, 1:2],
+            talker_special_embeds_proj[:, 2:3],
+        )
+
+        talker_input_embeds, talker_input_ids = [], []
+        trailing_text_hidden = None
+
+        for i in range(len(im_start_indexes) - 1):
+            im_start_index, segment_end_index = int(im_start_indexes[i]), int(
+                im_start_indexes[i + 1]
+            )
+            role_token = int(input_ids[0, im_start_index + 1])
+
+            if role_token == self.config.system_token_id:
+                continue
+            elif role_token == self.config.user_token_id:
+                talker_input_embeds.append(
+                    self._get_talker_user_parts(
+                        im_start_index,
+                        segment_end_index,
+                        multimodal_mask,
+                        thinker_hidden_all,
+                        thinker_embed_all,
+                    )
+                )
+                talker_input_ids.append(
+                    thinker_result_sequences[:, im_start_index:segment_end_index]
+                )
+            elif (
+                role_token == self.config.assistant_token_id
+                and i == len(im_start_indexes) - 2
+            ):
+                talker_assistant_embeds, talker_assistant_ids, trailing_text_hidden = (
+                    self._get_talker_assistant_parts(
+                        im_start_index,
+                        segment_end_index,
+                        speaker_id,
+                        thinker_embed_all,
+                        tts_pad_embed,
+                        tts_bos_embed,
+                        tts_eos_embed,
+                    )
+                )
+                talker_input_embeds.append(talker_assistant_embeds)
+                talker_input_ids.append(talker_assistant_ids)
+
+        if not talker_input_embeds:
+            return
+
+        talker_input_embed = mx.concatenate(talker_input_embeds, axis=1)
+        talker_input_id = mx.concatenate(talker_input_ids, axis=1)
+
+        generated_tokens = thinker_result_sequences[0, input_ids.shape[1] :].tolist()
+        yield ("text", generated_tokens)
+
+        codes_list = []
+        decoded_len = 0
+
+        for residual_codes in self.talker.generate_stream(
+            inputs_embeds=talker_input_embed,
+            trailing_text_hidden=trailing_text_hidden,
+            tts_pad_embed=tts_pad_embed,
+            talker_input_ids=talker_input_id,
+            max_new_tokens=talker_max_new_tokens,
+            temperature=talker_temperature,
+            top_p=talker_top_p,
+        ):
+            codes_list.append(residual_codes)
+            if len(codes_list) >= chunk_size:
+                codes_buffer = mx.stack(codes_list, axis=1).transpose(0, 2, 1)
+                wav_chunk, decoded_len = self.code2wav.stream_decode(
+                    codes_buffer, chunk_size, left_context_size, decoded_len
+                )
+                if wav_chunk is not None:
+                    mx.eval(wav_chunk)
+                    yield ("audio", wav_chunk.astype(mx.float32))
+
+        if codes_list:
+            codes_buffer = mx.stack(codes_list, axis=1).transpose(0, 2, 1)
+            wav_chunk = self.code2wav.flush_decode(
+                codes_buffer, left_context_size, decoded_len
+            )
+            if wav_chunk is not None:
+                mx.eval(wav_chunk)
+                yield ("audio", wav_chunk.astype(mx.float32))
