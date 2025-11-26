@@ -29,21 +29,21 @@ class Qwen2RotaryEmbedding:
 
         self.mrope_section = rope_scaling.get("mrope_section", [24, 20, 20])
 
-    def apply_interleaved_mrope(self, freqs, mrope_section):
-        """Apply interleaved MRoPE to 3D rotary embeddings.
-        Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
-        interleaved [THTHWHTHW...TT], preserving frequency continuity.
+    def apply_mrope(self, freqs, mrope_section):
+        """Apply MRoPE to 3D rotary embeddings.
+        Reorganizes frequency layout to chunked [TTT...HHH...WWW]
         args:
-            x: (3, bs, seq_len, head_dim // 2)
+            freqs: (3, bs, seq_len, head_dim // 2)
             mrope_section: (3,)
         returns:
             x_t: (bs, seq_len, head_dim // 2)
         """
         freqs_t = freqs[0]  # just overwrite the first dimension T
-        for dim, offset in enumerate((1, 2), start=1):  # H, W
-            length = mrope_section[dim] * 3
-            idx = slice(offset, length, 3)
+        offset = mrope_section[0]
+        for dim, length in enumerate(mrope_section[1:], start=1):  # H, W
+            idx = slice(offset, offset + length)
             freqs_t[..., idx] = freqs[dim, ..., idx]
+            offset += length
         return freqs_t
 
     def __call__(self, x, position_ids):
@@ -66,7 +66,7 @@ class Qwen2RotaryEmbedding:
 
         freqs = inv_freq_expanded @ position_ids_expanded
         freqs = mx.swapaxes(freqs, 2, 3)
-        freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
+        freqs = self.apply_mrope(freqs, self.mrope_section)
         emb = mx.concatenate([freqs, freqs], axis=-1)
         cos = mx.cos(emb) * self.attention_scaling
         sin = mx.sin(emb) * self.attention_scaling

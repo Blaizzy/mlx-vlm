@@ -26,7 +26,6 @@ class Qwen3VLMoERotaryEmbedding:
             self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
         )
         self.inv_freq = inv_freq
-        self.attention_scaling = 1.0  # type: default
 
         self.mrope_section = rope_scaling.get("mrope_section", [24, 20, 20])
 
@@ -69,8 +68,8 @@ class Qwen3VLMoERotaryEmbedding:
         freqs = mx.swapaxes(freqs, 2, 3)
         freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
         emb = mx.concatenate([freqs, freqs], axis=-1)
-        cos = mx.cos(emb) * self.attention_scaling
-        sin = mx.sin(emb) * self.attention_scaling
+        cos = mx.cos(emb)
+        sin = mx.sin(emb)
 
         return cos.astype(x.dtype), sin.astype(x.dtype)
 
@@ -319,12 +318,25 @@ class Qwen3VLMoEModel(nn.Module):
         visual_pos_masks: mx.array,
         visual_embeds: mx.array,
     ):
-        visual_embeds = visual_embeds.astype(hidden_states.dtype)
-        # Convert boolean mask to indices using numpy
-        visual_indices = np.where(visual_pos_masks)[0].tolist()
-        local_this = hidden_states[:, visual_indices, :] + visual_embeds
-        hidden_states[:, visual_indices, :] = local_this
-        return hidden_states
+        batch_size = hidden_states.shape[0]
+
+        updated_batches = []
+        for b in range(batch_size):
+            batch_mask = visual_pos_masks[b]
+            batch_hidden = hidden_states[b]
+
+            batch_indices = mx.array(np.where(batch_mask)[0], dtype=mx.uint32)
+
+            if len(batch_indices) == 0:
+                updated_batches.append(batch_hidden)
+                continue
+
+            batch_result = mx.array(batch_hidden)  # avoid modifying in-place
+            batch_result = batch_result.at[batch_indices].add(visual_embeds)
+
+            updated_batches.append(batch_hidden)
+
+        return mx.stack(updated_batches, axis=0)
 
 
 class LanguageModel(nn.Module):

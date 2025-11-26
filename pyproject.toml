@@ -30,6 +30,7 @@ Repository = "https://github.com/Blaizzy/mlx-vlm"
 Issues = "https://github.com/Blaizzy/mlx-vlm/issues"
 
 [project.scripts]
+"mlx_vlm.chat_ui" = "mlx_vlm.chat_ui:main"
 "mlx_vlm.convert" = "mlx_vlm.convert:main"
 "mlx_vlm.generate" = "mlx_vlm.generate:main"
 "mlx_vlm.server" = "mlx_vlm.server:main"
