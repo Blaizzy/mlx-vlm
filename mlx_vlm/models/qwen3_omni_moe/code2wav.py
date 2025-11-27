@@ -102,8 +102,8 @@ class CausalTransConvNet(nn.Module):
         super().__init__()
         self.conv = nn.ConvTranspose1d(in_chn, out_chn, kernel_sz, stride=stride)
         pad = kernel_sz - stride
-        self.left_pad = math.ceil(pad)
-        self.right_pad = self.left_pad
+        self.left_pad = 0
+        self.right_pad = pad
 
     def __call__(self, hidden_state: mx.array) -> mx.array:
         hidden_state = hidden_state.transpose(0, 2, 1)
@@ -440,6 +440,80 @@ class Code2WavModel(nn.Module):
         for block in self.decoder:
             wav = block(wav)
         return mx.clip(wav, -1, 1)
+
+    def chunked_decode(self, codes, chunk_size=300, left_context_size=25):
+        total_upsample_factor = 1
+        for r in self.config.upsampling_ratios:
+            total_upsample_factor *= r
+        for r in self.config.upsample_rates:
+            total_upsample_factor *= r
+
+        B, Q, L = codes.shape
+        final_wav_list = []
+
+        for start in range(0, L, chunk_size):
+            end = min(start + chunk_size, L)
+            context_start = max(0, start - left_context_size)
+            chunk_codes = codes[:, :, context_start:end]
+            wav_chunk = self(codes=chunk_codes)
+            context_len_tokens = start - context_start
+            valid_start_sample = context_len_tokens * total_upsample_factor
+            current_chunk_valid_len_tokens = end - start
+            valid_len_samples = current_chunk_valid_len_tokens * total_upsample_factor
+            chunk_valid_wav = wav_chunk[
+                :, :, valid_start_sample : valid_start_sample + valid_len_samples
+            ]
+            final_wav_list.append(chunk_valid_wav)
+
+        return mx.concatenate(final_wav_list, axis=-1)
+
+    def stream_decode(
+        self, codes_buffer, chunk_size=300, left_context_size=25, decoded_len=0
+    ):
+        total_upsample_factor = 1
+        for r in self.config.upsampling_ratios:
+            total_upsample_factor *= r
+        for r in self.config.upsample_rates:
+            total_upsample_factor *= r
+
+        L = codes_buffer.shape[2]
+        start = decoded_len
+        context_start = max(0, start - left_context_size)
+        context_len = start - context_start
+        new_tokens = chunk_size - context_len
+        if L - start < new_tokens:
+            return None, decoded_len
+
+        end = start + new_tokens
+        chunk_codes = codes_buffer[:, :, context_start:end]
+        wav_chunk = self(codes=chunk_codes)
+        context_len_tokens = start - context_start
+        valid_start_sample = context_len_tokens * total_upsample_factor
+        current_chunk_valid_len_tokens = end - start
+        valid_len_samples = current_chunk_valid_len_tokens * total_upsample_factor
+        chunk_valid_wav = wav_chunk[
+            :, :, valid_start_sample : valid_start_sample + valid_len_samples
+        ]
+        return chunk_valid_wav, end
+
+    def flush_decode(self, codes_buffer, left_context_size=25, decoded_len=0):
+        total_upsample_factor = 1
+        for r in self.config.upsampling_ratios:
+            total_upsample_factor *= r
+        for r in self.config.upsample_rates:
+            total_upsample_factor *= r
+
+        L = codes_buffer.shape[2]
+        if decoded_len >= L:
+            return None
+
+        start = decoded_len
+        context_start = max(0, start - left_context_size)
+        chunk_codes = codes_buffer[:, :, context_start:]
+        wav_chunk = self(codes=chunk_codes)
+        context_len_tokens = start - context_start
+        valid_start_sample = context_len_tokens * total_upsample_factor
+        return wav_chunk[:, :, valid_start_sample:]
 
     def sanitize(self, weights):
         sanitized_weights = {}
