@@ -15,15 +15,6 @@ from ..cache import KVCache
 from .config import TextConfig, ThinkerConfig
 
 
-@dataclass
-class ModelOutput:
-    logits: mx.array
-    hidden_states: Optional[list] = None
-    cross_attention_states: Optional[mx.array] = None
-    encoder_outputs: Optional[list] = None
-    past_key_values: Optional[list] = None
-
-
 class Qwen3OmniMoeThinkerTextRotaryEmbedding:
     def __init__(
         self, dim, max_position_embeddings=2048, base=10000, rope_scaling=None
@@ -589,7 +580,7 @@ class LanguageModel(nn.Module):
         else:
             logits = self.lm_head(out)
 
-        return ModelOutput(
+        return LanguageModelOutput(
             logits=logits,
             hidden_states=all_hidden_states if output_hidden_states else None,
         )
