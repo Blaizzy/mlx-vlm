@@ -3,6 +3,7 @@ from typing import Any, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import (
+    ArraysCache,
     BatchKVCache,
     BatchRotatingKVCache,
     KVCache,
