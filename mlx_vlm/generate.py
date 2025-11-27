@@ -760,15 +760,31 @@ class BatchGenerator:
             else self.prompt_cache
         )
 
-        while inputs.shape[1] > 1 and kwargs.get("pixel_values", None) is None:
+        # Slice batch data in kwargs to match current batch size
+        batch_kwargs = {}
+        batch_indices = list(range(len(uids)))  # Indices for current batch
+
+        for key, value in kwargs.items():
+            if isinstance(value, mx.array) and len(value.shape) > 0:
+                if value.shape[0] > len(batch_indices):
+                    batch_kwargs[key] = value[batch_indices]
+                else:
+                    batch_kwargs[key] = value
+            elif isinstance(value, (list, tuple)) and len(value) > len(batch_indices):
+                batch_kwargs[key] = [value[i] for i in batch_indices]
+            else:
+                batch_kwargs[key] = value
+
+        while inputs.shape[1] > 1 and batch_kwargs.get("pixel_values", None) is None:
             n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
             self.model(inputs[:, :n_to_process], cache=prompt_cache)
             mx.eval([c.state for c in prompt_cache])
             inputs = inputs[:, n_to_process:]
             mx.clear_cache()
 
-        y, logprobs = self._step(inputs, prompt_cache, **kwargs)
+        y, logprobs = self._step(inputs, prompt_cache, **batch_kwargs)
         mx.async_eval(y, logprobs)
+        mx.clear_cache()
         return Batch(
             list(uids), y, logprobs, list(max_tokens), [0] * len(uids), prompt_cache
         )
@@ -778,6 +794,8 @@ class BatchGenerator:
         logits = output.logits[:, -1, :]
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         sampled = self.sampler(logprobs)
+
+        # TODO: Add KV cache quantization if specified
         return sampled, logprobs
 
     def stats(self):
@@ -864,6 +882,10 @@ class BatchGenerator:
                 self.active_batch = None
 
         self._stats.generation_tokens += len(responses)
+
+        if len(responses) > 0 and self._stats.generation_tokens % 100 == 0:
+            mx.clear_cache()
+
         return responses
 
     def next(self, **kwargs):
@@ -937,8 +959,6 @@ def batch_generate(
     gen = BatchGenerator(
         model.language_model,
         stop_tokens=[tokenizer.eos_token_ids],
-        prefill_batch_size=len(prompts),
-        completion_batch_size=len(prompts),
         **kwargs,
     )
     num_samples = len(prompts)
