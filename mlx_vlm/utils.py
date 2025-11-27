@@ -12,16 +12,10 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import requests
-import soundfile as sf
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
 from PIL import Image, ImageOps
-from transformers import (
-    AutoConfig,
-    AutoProcessor,
-    PreTrainedTokenizer,
-    PreTrainedTokenizerFast,
-)
+from transformers import AutoProcessor, PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from .models.base import BaseImageProcessor
 from .tokenizer_utils import load_tokenizer
@@ -682,6 +676,8 @@ def load_audio(
     """
     Helper function to load audio from either a URL or file.
     """
+    import soundfile as sf
+
     if file.startswith(("http://", "https://")):
         try:
             response = requests.get(file, stream=True, timeout=timeout)
