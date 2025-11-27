@@ -934,9 +934,12 @@ def batch_generate(
         for k, v in inputs.items()
         if k not in ["input_ids", "pixel_values", "attention_mask"]
     }
-
     gen = BatchGenerator(
-        model.language_model, stop_tokens=[tokenizer.eos_token_ids], **kwargs
+        model.language_model,
+        stop_tokens=[tokenizer.eos_token_ids],
+        prefill_batch_size=len(prompts),
+        completion_batch_size=len(prompts),
+        **kwargs,
     )
     num_samples = len(prompts)
     fin = 0
