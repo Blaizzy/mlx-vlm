@@ -943,10 +943,25 @@ def batch_generate(
     processor.detokenizer.reset()
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
-    # TODO: Handle interleaved cases where image/audios might be None or uneven with prompts
+    # TODO: Add audio support
+    # Count images per prompt
+    num_images_list = [0] * len(prompts)
+
+    if isinstance(images, str):
+        num_images_list = [1] + [0] * (len(prompts) - 1)
+    elif isinstance(images, list):
+        num_images_list = [1 if i < len(images) else 0 for i in range(len(prompts))]
+    else:
+        num_images_list = [0] * len(prompts)
+
     prompts = [
-        apply_chat_template(processor, model.config, p, num_images=1, num_audios=0)
-        for p in prompts
+        apply_chat_template(
+            processor,
+            model.config,
+            p,
+            num_images=num_images_list[i],
+        )
+        for i, p in enumerate(prompts)
     ]
 
     add_special_tokens = (
