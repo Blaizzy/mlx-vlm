@@ -768,21 +768,12 @@ class BatchGenerator:
         )
 
         # Slice batch data in kwargs to match current batch size
-        batch_kwargs = {}
-        batch_indices = list(range(len(uids)))  # Indices for current batch
-
+        batch_size = len(uids)
         for key, value in kwargs.items():
-            if isinstance(value, mx.array) and len(value.shape) > 0:
-                if value.shape[0] > len(batch_indices):
-                    batch_kwargs[key] = value[batch_indices]
-                else:
-                    batch_kwargs[key] = value
-            elif isinstance(value, (list, tuple)) and len(value) > len(batch_indices):
-                batch_kwargs[key] = [value[i] for i in batch_indices]
-            else:
-                batch_kwargs[key] = value
+            if isinstance(value, mx.array) and value.ndim > 0:
+                kwargs[key] = value[:batch_size]
 
-        inputs_embeds = batch_kwargs.get("inputs_embeds", None)
+        inputs_embeds = kwargs.pop("inputs_embeds", None)
 
         if inputs_embeds is not None:
             # Multimodal prefill
@@ -792,22 +783,26 @@ class BatchGenerator:
                     inputs[:, :n_to_process],
                     cache=prompt_cache,
                     inputs_embeds=inputs_embeds[:, :n_to_process],
-                    **{k: v for k, v in batch_kwargs.items() if k != "inputs_embeds"},
+                    n_to_process=n_to_process,
+                    **kwargs,
                 )
                 mx.eval([c.state for c in prompt_cache])
                 inputs_embeds = inputs_embeds[:, n_to_process:]
+                inputs = inputs[:, n_to_process:]
                 mx.clear_cache()
-            batch_kwargs["inputs_embeds"] = inputs_embeds
+
+            kwargs = {"inputs_embeds": inputs_embeds}
+
         else:
             # Text-only prefill
-            while inputs.shape[1] > 1:
+            while inputs.shape[1] > 1 and inputs_embeds is None:
                 n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
                 self.model(inputs[:, :n_to_process], cache=prompt_cache)
                 mx.eval([c.state for c in prompt_cache])
                 inputs = inputs[:, n_to_process:]
                 mx.clear_cache()
 
-        y, logprobs = self._step(inputs, prompt_cache, **batch_kwargs)
+        y, logprobs = self._step(inputs, prompt_cache, **kwargs)
         mx.async_eval(y, logprobs)
         mx.clear_cache()
         return Batch(
