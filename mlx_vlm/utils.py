@@ -705,6 +705,8 @@ def process_inputs(
     images=None,
     audio=None,
     add_special_tokens=False,
+    padding=True,
+    padding_side="left",
     return_tensors="mlx",
     **kwargs,
 ):
@@ -715,7 +717,8 @@ def process_inputs(
     args = {
         "text": prompts,
         "images": images,
-        "padding": True,
+        "padding": padding,
+        "padding_side": padding_side,
         "return_tensors": return_tensors,
     }
 
@@ -787,6 +790,9 @@ def prepare_inputs(
     image_token_index=None,
     resize_shape=None,
     add_special_tokens=False,
+    padding=True,
+    padding_side="left",
+    pad_to_uniform_size=False,
     **kwargs,
 ):
 
@@ -794,7 +800,12 @@ def prepare_inputs(
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
-        inputs = tokenizer(prompts, add_special_tokens=add_special_tokens)
+        inputs = tokenizer(
+            prompts,
+            add_special_tokens=add_special_tokens,
+            padding=padding,
+            padding_side=padding_side,
+        )
         input_ids = mx.array([inputs.input_ids])
         mask = mx.array([inputs.attention_mask])
         return {
@@ -812,8 +823,29 @@ def prepare_inputs(
         )
         images = [process_image(img, resize_shape, image_processor) for img in images]
 
+        # Pad all images to the size of the largest
+        if len(images) > 1 and pad_to_uniform_size:
+            max_width = max(img.width for img in images)
+            max_height = max(img.height for img in images)
+
+            padded_images = []
+            for img in images:
+                if img.width != max_width or img.height != max_height:
+                    # Create a new image with the max dimensions, filled with black
+                    padded_img = Image.new(
+                        "RGB", (max_width, max_height), (255, 255, 255)
+                    )
+                    # Center the original image
+                    x_offset = (max_width - img.width) // 2
+                    y_offset = (max_height - img.height) // 2
+                    padded_img.paste(img, (x_offset, y_offset))
+                    padded_images.append(padded_img)
+                else:
+                    padded_images.append(img)
+            images = padded_images
+
     # Process audio
-    if audio:
+    if audio is not None:
         if not isinstance(audio, list):
             audio = [audio]
 
@@ -827,8 +859,6 @@ def prepare_inputs(
             load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
             for audio_file in audio
         ]
-    else:
-        audio = None
 
     model_inputs = {}
 
@@ -838,7 +868,8 @@ def prepare_inputs(
         if not isinstance(prompts, list):
             prompts = [prompts]
 
-        processor.pad_token = processor.eos_token
+        if processor.pad_token is None:
+            processor.pad_token = processor.eos_token
         text_chunks = [
             [processor(chunk).input_ids for chunk in prompt.split("<image>")]
             for prompt in prompts
@@ -864,7 +895,7 @@ def prepare_inputs(
         ).astype(mx.int32)
 
     else:
-        if hasattr(processor, "tokenizer"):
+        if hasattr(processor, "tokenizer") and processor.tokenizer.pad_token is None:
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
         inputs = process_inputs_with_fallback(
