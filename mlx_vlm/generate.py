@@ -749,7 +749,7 @@ class BatchGenerator:
         uids, inputs, max_tokens = zip(*prompts)
         lengths = [len(p) for p in inputs]
         max_length = max(lengths)
-        batch_size = self.prefill_batch_size
+
         self._stats.prompt_tokens += sum(lengths)
         left_padding = [max_length - l for l in lengths]
         inputs = _left_pad_prompts(inputs, max_length=max_length)
@@ -775,12 +775,30 @@ class BatchGenerator:
             else:
                 batch_kwargs[key] = value
 
-        while inputs.shape[1] > 1 and batch_kwargs.get("pixel_values", None) is None:
-            n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
-            self.model(inputs[:, :n_to_process], cache=prompt_cache)
-            mx.eval([c.state for c in prompt_cache])
-            inputs = inputs[:, n_to_process:]
-            mx.clear_cache()
+        inputs_embeds = batch_kwargs.get("inputs_embeds", None)
+
+        if inputs_embeds is not None:
+            # Multimodal prefill
+            while inputs_embeds.shape[1] > 1:
+                n_to_process = min(self.prefill_step_size, inputs_embeds.shape[1] - 1)
+                self.model(
+                    inputs[:, :n_to_process],
+                    cache=prompt_cache,
+                    inputs_embeds=inputs_embeds[:, :n_to_process],
+                    **{k: v for k, v in batch_kwargs.items() if k != "inputs_embeds"},
+                )
+                mx.eval([c.state for c in prompt_cache])
+                inputs_embeds = inputs_embeds[:, n_to_process:]
+                mx.clear_cache()
+            batch_kwargs["inputs_embeds"] = inputs_embeds
+        else:
+            # Text-only prefill
+            while inputs.shape[1] > 1:
+                n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
+                self.model(inputs[:, :n_to_process], cache=prompt_cache)
+                mx.eval([c.state for c in prompt_cache])
+                inputs = inputs[:, n_to_process:]
+                mx.clear_cache()
 
         y, logprobs = self._step(inputs, prompt_cache, **batch_kwargs)
         mx.async_eval(y, logprobs)
