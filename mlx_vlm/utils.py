@@ -868,7 +868,8 @@ def prepare_inputs(
         if not isinstance(prompts, list):
             prompts = [prompts]
 
-        processor.pad_token = processor.eos_token
+        if processor.pad_token is None:
+            processor.pad_token = processor.eos_token
         text_chunks = [
             [processor(chunk).input_ids for chunk in prompt.split("<image>")]
             for prompt in prompts
@@ -894,7 +895,7 @@ def prepare_inputs(
         ).astype(mx.int32)
 
     else:
-        if hasattr(processor, "tokenizer"):
+        if hasattr(processor, "tokenizer") and processor.tokenizer.pad_token is None:
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
         inputs = process_inputs_with_fallback(
