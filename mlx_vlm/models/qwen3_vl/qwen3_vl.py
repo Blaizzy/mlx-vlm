@@ -65,15 +65,6 @@ class Model(nn.Module):
             pixel_values, grid_thw
         )
 
-        split_sizes = (
-            grid_thw.prod(-1) // self.vision_tower.spatial_merge_size**2
-        ).tolist()
-        hidden_states = mx.split(hidden_states, split_sizes)
-
-        hidden_states = mx.concatenate(hidden_states, axis=0).astype(
-            hidden_states[0].dtype
-        )
-
         visual_pos_masks = None
         deepstack_visual_embeds = None
 

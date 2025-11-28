@@ -70,7 +70,7 @@ class TestModels(unittest.TestCase):
                 )
 
             batch_size = kwargs.pop("batch_size", 1)
-            if model_type in ["qwen2_5_vl", "glm4v_moe"]:
+            if model_type in ["qwen2_5_vl", "glm4v_moe", "glm4v"]:
                 input_tensor = mx.random.uniform(shape=(image_size[0], image_size[1]))
             else:
                 shape = (
@@ -1202,6 +1202,70 @@ class TestModels(unittest.TestCase):
             ),  # image temporals shape (num_images, 3)
         )
 
+    def test_glm4v(self):
+        from mlx_vlm.models import glm4v
+
+        text_config = glm4v.TextConfig(
+            model_type="glm4v",
+        )
+
+        vision_config = glm4v.VisionConfig(
+            model_type="glm4v",
+            depth=32,
+            hidden_size=1280,
+            intermediate_size=3420,
+            out_hidden_size=1536,
+            num_heads=16,
+            patch_size=14,
+            window_size=112,
+            image_size=336,
+            in_channels=3,
+            rms_norm_eps=1e-05,
+            attention_bias=False,
+            attention_dropout=0.0,
+            hidden_act="silu",
+            initializer_range=0.02,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+        )
+
+        config = glm4v.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="glm4v",
+            vocab_size=257152,
+            ignore_index=-100,
+            image_token_index=151363,
+            image_token_id=151363,
+            video_token_index=151364,
+            video_token_id=151364,
+            vision_start_token_id=151339,
+            vision_end_token_id=151340,
+            hidden_size=2048,
+            pad_token_id=0,
+        )
+
+        model = glm4v.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.out_hidden_size,
+            config.vision_config.in_channels,
+            (140, 1176),
+            vision_feature_layer=-1,
+            grid_thw=mx.array(
+                [[1, 10, 14]], dtype=mx.int64
+            ),  # image temporals shape (num_images, 3)
+        )
+
     def test_lfm2_vl(self):
         from mlx_vlm.models import lfm2_vl
 
@@ -1575,6 +1639,28 @@ class TestModels(unittest.TestCase):
             config.vision_config.num_channels,
             (config.vision_config.image_size, config.vision_config.image_size),
         )
+
+    def test_deepseekocr(self):
+        from mlx_vlm.models import deepseekocr
+
+        text_config = deepseekocr.TextConfig()
+        vision_config = deepseekocr.VisionConfig(model_type="vision")
+        projector_config = deepseekocr.ProjectorConfig(projector_type="linear")
+        config = deepseekocr.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            projector_config=projector_config,
+            model_type="deepseekocr",
+        )
+        model = deepseekocr.Model(config)
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        # TODO: Add test for vision model. Ensure I can pass input type and shapes.
 
 
 if __name__ == "__main__":

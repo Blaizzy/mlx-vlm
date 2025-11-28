@@ -1,13 +1,8 @@
-import glob
-import inspect
-import json
-from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from huggingface_hub import snapshot_download
 
 from .config import ModelConfig
 from .language import LanguageModel
@@ -133,6 +128,30 @@ class Model(nn.Module):
                     key = key.replace("vision_tower", "vision_tower.vision_model")
                 if "ln_pre" in key:
                     key = key.replace("vision_tower", "vision_tower.vision_model")
+
+            elif "vision_encoder" in key and "vision_tower" not in key:
+                if "transformer" in key:
+                    key = key.replace(
+                        "model.vision_encoder", "vision_tower.vision_model"
+                    )
+                if "patch_conv" in key:
+                    key = key.replace(
+                        "model.vision_encoder", "vision_tower.vision_model"
+                    )
+                if "ln_pre" in key:
+                    key = key.replace(
+                        "model.vision_encoder", "vision_tower.vision_model"
+                    )
+
+            elif "model.language_model" in key and "language_model.model" not in key:
+                key = key.replace("model.language_model", "language_model.model")
+
+            elif "lm_head" in key and "language_model" not in key:
+                key = key.replace("lm_head", "language_model.lm_head")
+
+            elif "model.vision_projection" in key:
+                key = key.replace("model.vision_projection", "multi_modal_projector")
+
             return key
 
         return {transform_key(k): v for k, v in weights.items()}

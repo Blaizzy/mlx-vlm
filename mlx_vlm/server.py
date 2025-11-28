@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import codecs
 import gc
@@ -11,7 +12,8 @@ import mlx.core as mx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from huggingface_hub import scan_cache_dir
+from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import Required, TypeAlias, TypedDict
 
 from .generate import (
@@ -39,6 +41,12 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 # Loading/unloading utilities
 
 model_cache = {}
+
+
+class FlexibleBaseModel(BaseModel):
+    """Base model that ignores/accepts any unknown OpenAI SDK fields."""
+
+    model_config = ConfigDict(extra="allow")
 
 
 def load_model_resources(model_path: str, adapter_path: Optional[str]):
@@ -114,11 +122,13 @@ def unload_model_sync():
 
 # OpenAI API Models
 
+# Models for /responses endpoint
+
 
 class ResponseInputTextParam(TypedDict, total=False):
     text: Required[str]
     type: Required[
-        Literal["input_text"]
+        Literal["input_text", "text"]
     ]  # The type of the input item. Always `input_text`.
 
 
@@ -140,8 +150,34 @@ class ResponseInputImageParam(TypedDict, total=False):
     """
 
 
+class InputAudio(TypedDict, total=False):
+    data: Required[str]
+    format: Required[str]
+
+
+class ResponseInputAudioParam(TypedDict, total=False):
+    type: Required[
+        Literal["input_audio"]
+    ]  # The type of the input item. Always `input_audio`.
+    input_audio: Required[InputAudio]
+
+
+class ImageUrl(TypedDict, total=False):
+    url: Required[str]
+
+
+class ResponseImageUrlParam(TypedDict, total=False):
+    type: Required[
+        Literal["image_url"]
+    ]  # The type of the input item. Always`image_url`.
+    image_url: Required[ImageUrl]
+
+
 ResponseInputContentParam: TypeAlias = Union[
-    ResponseInputTextParam, ResponseInputImageParam
+    ResponseInputTextParam,
+    ResponseInputImageParam,
+    ResponseImageUrlParam,
+    ResponseInputAudioParam,
 ]
 
 ResponseInputMessageContentListParam: TypeAlias = List[ResponseInputContentParam]
@@ -157,7 +193,7 @@ class ResponseOutputText(TypedDict, total=False):
 ResponseOutputMessageContentList: TypeAlias = List[ResponseOutputText]
 
 
-class ChatMessage(BaseModel):
+class ChatMessage(FlexibleBaseModel):
     role: Literal["user", "assistant", "system", "developer"] = Field(
         ...,
         description="Role of the message sender (e.g., 'system', 'user', 'assistant').",
@@ -167,7 +203,7 @@ class ChatMessage(BaseModel):
     ] = Field(..., description="Content of the message.")
 
 
-class OpenAIRequest(BaseModel):
+class OpenAIRequest(FlexibleBaseModel):
     """
     OpenAI-compatible request structure.
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
@@ -343,10 +379,100 @@ StreamEvent = Union[
     ResponseCompletedEvent,
 ]
 
+# Models for /chat/completion endpoint
 
-# OpenAI endpoint
+
+class VLMRequest(FlexibleBaseModel):
+    model: str = Field(
+        DEFAULT_MODEL_PATH,
+        description="The path to the local model directory or Hugging Face repo.",
+    )
+    adapter_path: Optional[str] = Field(
+        None, description="The path to the adapter weights."
+    )
+    max_tokens: int = Field(
+        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
+    )
+    temperature: float = Field(
+        DEFAULT_TEMPERATURE, description="Temperature for sampling."
+    )
+    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
+    resize_shape: Optional[Tuple[int, int]] = Field(
+        None,
+        description="Resize shape for the image (height, width). Provide two integers.",
+    )
+
+
+class GenerationRequest(VLMRequest):
+    """
+    Inherits from VLMRequest and adds additional fields for the generation request.
+    """
+
+    stream: bool = Field(
+        False, description="Whether to stream the response chunk by chunk."
+    )
+
+
+class UsageStats(OpenAIUsage):
+    """
+    Inherits from OpenAIUsage and adds additional fields for usage statistics.
+    """
+
+    prompt_tps: float = Field(..., description="Tokens per second for the prompt.")
+    generation_tps: float = Field(
+        ..., description="Tokens per second for the generation."
+    )
+    peak_memory: float = Field(
+        ..., description="Peak memory usage during the generation."
+    )
+
+
+class ChatRequest(GenerationRequest):
+    messages: List[ChatMessage]
+
+
+class ChatChoice(BaseModel):
+    finish_reason: str
+    message: ChatMessage
+
+
+class ChatResponse(BaseModel):
+    model: str
+    choices: List[ChatChoice]
+    usage: Optional[UsageStats]
+
+
+class ChatStreamChoice(BaseModel):
+    finish_reason: Optional[str] = None
+    delta: ChatMessage
+
+
+class ChatStreamChunk(BaseModel):
+    model: str
+    choices: List[ChatStreamChoice]
+    usage: Optional[UsageStats]
+
+
+# Models for /models endpoint
+
+
+class ModelInfo(BaseModel):
+    id: str
+    object: str
+    created: int
+
+
+class ModelsResponse(BaseModel):
+    object: Literal["list"]
+    data: List[ModelInfo]
+
+
+# OpenAI compatile endpoints
+
+
 @app.post("/responses")
-async def openai_endpoint(request: Request):
+async def responses_endpoint(request: Request):
     """
     OpenAI-compatible endpoint for generating text based on a prompt and optional images.
 
@@ -679,262 +805,15 @@ async def openai_endpoint(request: Request):
         )
 
 
-# MLX_VLM Models
-class VLMRequest(BaseModel):
-    model: str = Field(
-        DEFAULT_MODEL_PATH,
-        description="The path to the local model directory or Hugging Face repo.",
-    )
-    adapter_path: Optional[str] = Field(
-        None, description="The path to the adapter weights."
-    )
-    image: List[str] = Field(
-        default_factory=list,
-        description="List of URLs or local paths of images to process.",
-    )
-    audio: List[str] = Field(
-        default_factory=list,
-        description="List of URLs or local paths of audio files to process.",
-    )
-    prompt: str = Field(
-        DEFAULT_PROMPT, description="Message to be processed by the model."
-    )
-    system: Optional[str] = Field(
-        None,
-        description="Optional system message for the model (used in chat structure).",
-    )
-    max_tokens: int = Field(
-        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
-    )
-    temperature: float = Field(
-        DEFAULT_TEMPERATURE, description="Temperature for sampling."
-    )
-    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
-    seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
-    resize_shape: Optional[Tuple[int, int]] = Field(
-        None,
-        description="Resize shape for the image (height, width). Provide two integers.",
-    )
-
-
-class GenerationRequest(VLMRequest):
-    """
-    Inherits from VLMRequest and adds additional fields for the generation request.
-    """
-
-    stream: bool = Field(
-        False, description="Whether to stream the response chunk by chunk."
-    )
-
-
-class ChatRequest(GenerationRequest):
-    """
-    Inherits from GenerationRequest and adds fields specific to chat interactions.
-    """
-
-    prompt: List[ChatMessage] = Field(
-        default_factory=list, description="List of chat messages for the conversation."
-    )
-
-
-class UsageStats(OpenAIUsage):
-    """
-    Inherits from OpenAIUsage and adds additional fields for usage statistics.
-    """
-
-    prompt_tps: float = Field(..., description="Tokens per second for the prompt.")
-    generation_tps: float = Field(
-        ..., description="Tokens per second for the generation."
-    )
-    peak_memory: float = Field(
-        ..., description="Peak memory usage during the generation."
-    )
-
-
-class GenerationResponse(BaseModel):
-    text: str
-    model: str
-    usage: Optional[UsageStats]
-
-
-class StreamChunk(BaseModel):
-    chunk: str
-    model: str
-    usage: Optional[UsageStats]
-
-
-# MLX_VLM API endpoints
-
-
 @app.post(
-    "/generate", response_model=None
+    "/chat/completions", response_model=None
 )  # Response model handled dynamically based on stream flag
-async def generate_endpoint(request: GenerationRequest):
-    """
-    Generate text based on a prompt and optional images.
-    Can operate in streaming or non-streaming mode.
-
-    NOTE: ideally, generate.py should be refactored to allow reusing the same code here
-    but for now, we just copy the logic from generate.py to avoid merging issues.
-    """
-    try:
-
-        # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(request.model, request.adapter_path)
-
-        kwargs = {}
-
-        if request.resize_shape is not None:
-            if len(request.resize_shape) not in [1, 2]:
-                raise HTTPException(
-                    status_code=400,
-                    detail="resize_shape must contain exactly two integers (height, width)",
-                )
-            kwargs["resize_shape"] = (
-                (request.resize_shape[0],) * 2
-                if len(request.resize_shape) == 1
-                else tuple(request.resize_shape)
-            )
-
-        # Prepare the prompt using the chat template logic
-        chat_messages = []
-        if request.system:
-            system_prompt = request.system
-            chat_messages.append({"role": "system", "content": system_prompt})
-        prompt = request.prompt
-        chat_messages.append({"role": "user", "content": prompt})
-
-        formatted_prompt = apply_chat_template(
-            processor,
-            config,
-            chat_messages,
-            num_images=len(request.image),
-            num_audios=len(request.audio),
-        )
-
-        if request.stream:
-            # Streaming response
-            async def stream_generator():
-                token_iterator = None
-                try:
-                    # Use stream_generate from utils
-                    token_iterator = stream_generate(
-                        model=model,
-                        processor=processor,
-                        prompt=formatted_prompt,
-                        image=request.image if request.image else None,
-                        audio=request.audio,
-                        temperature=request.temperature,
-                        max_tokens=request.max_tokens,
-                        top_p=request.top_p,
-                        **kwargs,
-                    )
-                    for chunk in token_iterator:
-                        if chunk is None or not hasattr(chunk, "text"):
-                            print("Warning: Received unexpected chunk format:", chunk)
-                            continue
-
-                        # Yield chunks in Server-Sent Events (SSE) format
-                        usage_stats = {
-                            "input_tokens": chunk.prompt_tokens,
-                            "output_tokens": chunk.generation_tokens,
-                            "total_tokens": chunk.prompt_tokens
-                            + chunk.generation_tokens,
-                            "prompt_tps": chunk.prompt_tps,
-                            "generation_tps": chunk.generation_tps,
-                            "peak_memory": chunk.peak_memory,
-                        }
-                        chunk_data = StreamChunk(
-                            chunk=chunk.text, model=request.model, usage=usage_stats
-                        )
-                        yield f"data: {chunk_data.model_dump_json()}\n\n"
-                        await asyncio.sleep(
-                            0.01
-                        )  # Small sleep to prevent blocking event loop entirely
-
-                    # Signal stream end (optional, depends on client handling)
-                    # yield f"data: {json.dumps({'end': True})}\n\n"
-
-                except Exception as e:
-                    print(f"Error during stream generation: {e}")
-                    traceback.print_exc()
-                    error_data = json.dumps({"error": str(e)})
-                    yield f"data: {error_data}\n\n"
-
-                finally:
-                    mx.clear_cache()
-                    gc.collect()
-                    print("Stream finished, cleared cache.")
-
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
-
-        else:
-            # Non-streaming response
-            try:
-                # Use generate from generate.py
-                gen_result = generate(
-                    model=model,
-                    processor=processor,
-                    prompt=formatted_prompt,
-                    image=request.image if request.image else None,
-                    audio=request.audio,
-                    temperature=request.temperature,
-                    max_tokens=request.max_tokens,
-                    top_p=request.top_p,
-                    verbose=False,  # stats are passed in the response
-                    **kwargs,
-                )
-                # Clean up resources
-                mx.clear_cache()
-                gc.collect()
-                print("Generation finished, cleared cache.")
-
-                usage_stats = UsageStats(
-                    input_tokens=gen_result.prompt_tokens,
-                    output_tokens=gen_result.generation_tokens,
-                    total_tokens=gen_result.total_tokens,
-                    prompt_tps=gen_result.prompt_tps,
-                    generation_tps=gen_result.generation_tps,
-                    peak_memory=gen_result.peak_memory,
-                )
-                result = GenerationResponse(
-                    text=gen_result.text, model=request.model, usage=usage_stats
-                )
-                return result
-
-            except Exception as e:
-                print(f"Error during generation: {e}")
-                traceback.print_exc()
-                mx.clear_cache()
-                gc.collect()
-                raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
-
-    except HTTPException as http_exc:
-        # Re-raise HTTP exceptions (like model loading failure)
-        raise http_exc
-    except Exception as e:
-        # Catch unexpected errors
-        print(f"Unexpected error in /generate endpoint: {e}")
-        traceback.print_exc()
-        mx.clear_cache()
-        gc.collect()
-        raise HTTPException(
-            status_code=500, detail=f"An unexpected error occurred: {e}"
-        )
-
-
-@app.post(
-    "/chat", response_model=None
-)  # Response model handled dynamically based on stream flag
-async def generate_endpoint(request: GenerationRequest):
+async def chat_completions_endpoint(request: ChatRequest):
     """
     Generate text based on a prompt and optional images.
     Prompt must be a list of chat messages, including system, user, and assistant messages.
     System message will be ignored if not already in the prompt.
     Can operate in streaming or non-streaming mode.
-
-    NOTE: ideally, generate.py should be refactored to allow reusing the same code here
-    but for now, we just copy the logic from generate.py to avoid merging issues.
     """
 
     try:
@@ -955,14 +834,25 @@ async def generate_endpoint(request: GenerationRequest):
                 else tuple(request.resize_shape)
             )
 
-        chat_messages = request.prompt
+        chat_messages = request.messages
+
+        images = []
+        audio = []
+        for content in chat_messages[-1].content:
+            if isinstance(content, dict):
+                if content["type"] == "input_image":
+                    images.append(content["image_url"])
+                if content["type"] == "image_url":
+                    images.append(content["image_url"]["url"])
+                if content["type"] == "input_audio":
+                    audio.append(content["input_audio"]["data"])
 
         formatted_prompt = apply_chat_template(
             processor,
             config,
             chat_messages,
-            num_images=len(request.image),
-            num_audios=len(request.audio),
+            num_images=len(images),
+            num_audios=len(audio),
         )
 
         if request.stream:
@@ -975,8 +865,8 @@ async def generate_endpoint(request: GenerationRequest):
                         model=model,
                         processor=processor,
                         prompt=formatted_prompt,
-                        image=request.image,
-                        audio=request.audio,
+                        image=images,
+                        audio=audio,
                         temperature=request.temperature,
                         max_tokens=request.max_tokens,
                         top_p=request.top_p,
@@ -998,16 +888,32 @@ async def generate_endpoint(request: GenerationRequest):
                             "generation_tps": chunk.generation_tps,
                             "peak_memory": chunk.peak_memory,
                         }
-                        chunk_data = StreamChunk(
-                            chunk=chunk.text, model=request.model, usage=usage_stats
+
+                        choices = [
+                            ChatStreamChoice(
+                                delta=ChatMessage(role="assistant", content=chunk.text)
+                            )
+                        ]
+                        chunk_data = ChatStreamChunk(
+                            model=request.model, usage=usage_stats, choices=choices
                         )
+
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
                         await asyncio.sleep(
                             0.01
                         )  # Small sleep to prevent blocking event loop entirely
 
-                    # Signal stream end (optional, depends on client handling)
-                    # yield f"data: {json.dumps({'end': True})}\n\n"
+                    # Signal stream end
+                    choices = [
+                        ChatStreamChoice(
+                            finish_reason="stop",
+                            delta=ChatMessage(role="assistant", content=""),
+                        )
+                    ]
+                    chunk_data = ChatStreamChunk(
+                        model=request.model, usage=usage_stats, choices=choices
+                    )
+                    yield f"data: {chunk_data.model_dump_json()}\n\n"
 
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
@@ -1030,8 +936,8 @@ async def generate_endpoint(request: GenerationRequest):
                     model=model,
                     processor=processor,
                     prompt=formatted_prompt,
-                    image=request.image,
-                    audio=request.audio,
+                    image=images,
+                    audio=audio,
                     temperature=request.temperature,
                     max_tokens=request.max_tokens,
                     top_p=request.top_p,
@@ -1051,9 +957,17 @@ async def generate_endpoint(request: GenerationRequest):
                     generation_tps=gen_result.generation_tps,
                     peak_memory=gen_result.peak_memory,
                 )
-                result = GenerationResponse(
-                    text=gen_result.text, model=request.model, usage=usage_stats
+
+                choices = [
+                    ChatChoice(
+                        finish_reason="stop",
+                        message=ChatMessage(role="assistant", content=gen_result.text),
+                    )
+                ]
+                result = ChatResponse(
+                    model=request.model, usage=usage_stats, choices=choices
                 )
+
                 return result
 
             except Exception as e:
@@ -1075,6 +989,40 @@ async def generate_endpoint(request: GenerationRequest):
         raise HTTPException(
             status_code=500, detail=f"An unexpected error occurred: {e}"
         )
+
+
+@app.get("/models", response_model=ModelsResponse)
+def models_endpoint():
+    """
+    Return list of locally downloaded MLX models.
+    """
+
+    files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
+
+    def probably_mlx_lm(repo):
+        if repo.repo_type != "model":
+            return False
+        if "main" not in repo.refs:
+            return False
+        file_names = {f.file_path.name for f in repo.refs["main"].files}
+        return all(f in file_names for f in files)
+
+    # Scan the cache directory for downloaded mlx models
+    hf_cache_info = scan_cache_dir()
+    downloaded_models = [repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)]
+
+    # Create a list of available models
+    models = [
+        {"id": repo.repo_id, "object": "model", "created": int(repo.last_modified)}
+        for repo in downloaded_models
+    ]
+
+    response = {"object": "list", "data": models}
+
+    return response
+
+
+# MLX_VLM API endpoints
 
 
 @app.get("/health")
@@ -1110,9 +1058,22 @@ async def unload_model_endpoint():
 
 
 def main():
-
+    parser = argparse.ArgumentParser(description="MLX VLM Http Server.")
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="Host for the HTTP server (default:0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Port for the HTTP server (default: 8080)",
+    )
+    args = parser.parse_args()
     uvicorn.run(
-        "mlx_vlm.server:app", host="0.0.0.0", port=8000, workers=1, reload=True
+        "mlx_vlm.server:app", host=args.host, port=args.port, workers=1, reload=True
     )  # reload=True for development to automatically restart on code changes.
 
 
