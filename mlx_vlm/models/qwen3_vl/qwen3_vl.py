@@ -126,11 +126,12 @@ class Model(nn.Module):
 
         inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
 
-        kwargs = {
-            "pixel_values": pixel_values,
-            **inputs_embeds,
-            **kwargs,
-        }
+        kwargs.update(
+            {
+                "pixel_values": pixel_values,
+                **inputs_embeds,
+            }
+        )
 
         logits = self.language_model(input_ids, mask=mask, cache=cache, **kwargs)
         return logits
