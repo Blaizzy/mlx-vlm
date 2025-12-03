@@ -770,6 +770,128 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
         )
 
+    def test_mistral3(self):
+        from mlx_vlm.models import mistral3
+
+        text_config = mistral3.TextConfig(
+            head_dim=128,
+            hidden_size=5120,
+            intermediate_size=32768,
+            max_position_embeddings=131072,
+            model_type="mistral",
+            num_attention_heads=32,
+            num_hidden_layers=40,
+            num_key_value_heads=8,
+            rms_norm_eps=1e-5,
+            rope_theta=1000000000.0,
+            vocab_size=131072,
+            rope_traditional=False,
+            rope_scaling=None,
+            tie_word_embeddings=False,
+            layer_types=["full_attention"] * 40,
+            use_qk_norm=False,
+        )
+
+        vision_config = mistral3.VisionConfig(
+            model_type="pixtral",
+            hidden_size=1024,
+            num_hidden_layers=24,
+            intermediate_size=4096,
+            num_attention_heads=16,
+            image_size=336,
+            patch_size=14,
+            projection_dim=768,
+            vocab_size=32000,
+            num_channels=3,
+            rms_norm_eps=1e-6,
+        )
+
+        config = mistral3.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="mistral3",
+        )
+
+        model = mistral3.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
+    def test_ministral3(self):
+        from mlx_vlm.models import mistral3
+
+        text_config = mistral3.TextConfig(
+            head_dim=128,
+            hidden_size=3072,
+            intermediate_size=9216,
+            max_position_embeddings=262144,
+            model_type="ministral3",
+            num_attention_heads=32,
+            num_hidden_layers=26,
+            rms_norm_eps=1e-05,
+            rope_parameters={
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "factor": 16.0,
+                "llama_4_scaling_beta": 0.1,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "original_max_position_embeddings": 16384,
+                "rope_theta": 1000000.0,
+                "rope_type": "yarn",
+                "type": "yarn",
+            },
+            rope_traditional=False,
+            rope_scaling=None,
+            tie_word_embeddings=True,
+            vocab_size=131072,
+        )
+
+        vision_config = mistral3.VisionConfig(
+            head_dim=64,
+            hidden_size=1024,
+            image_size=1540,
+            intermediate_size=4096,
+            model_type="pixtral",
+            num_attention_heads=16,
+            num_channels=3,
+            num_hidden_layers=24,
+            patch_size=14,
+            rope_theta=10000.0,
+        )
+
+        config = mistral3.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="pixtral",
+        )
+        model = mistral3.Model(config)
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
     def test_pixtral(self):
         from mlx_vlm.models import pixtral
 

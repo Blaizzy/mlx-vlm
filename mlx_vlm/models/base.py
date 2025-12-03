@@ -33,6 +33,9 @@ class BaseModelConfig:
             }
         )
 
+    def to_dict(self):
+        return {k: v for k, v in self.__dict__.items() if v is not None}
+
 
 class BaseImageProcessor(ImageProcessor):
     def __init__(
