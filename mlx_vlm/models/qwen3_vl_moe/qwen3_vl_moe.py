@@ -57,15 +57,6 @@ class Model(nn.Module):
             pixel_values, image_grid_thw
         )
 
-        split_sizes = (
-            image_grid_thw.prod(-1) // self.vision_tower.spatial_merge_size**2
-        ).tolist()
-        hidden_states = mx.split(hidden_states, split_sizes)
-
-        hidden_states = mx.concatenate(hidden_states, axis=0).astype(
-            hidden_states[0].dtype
-        )
-
         visual_pos_masks = None
         deepstack_visual_embeds = None
 
@@ -97,6 +88,7 @@ class Model(nn.Module):
 
         n_image_features = image_features.shape[0]
         n_image_mask_elements = special_image_mask.sum()
+
         if n_image_mask_elements != image_features.size:
             raise ValueError(
                 f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"

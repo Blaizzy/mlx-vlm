@@ -1,19 +1,12 @@
-import glob
-import inspect
-import json
-from dataclasses import dataclass
-from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import BaseModelConfig
-from ..pixtral import LanguageModel
-from ..pixtral import Model as PixtralModel
 from ..pixtral import VisionModel
 from .config import ModelConfig
+from .language import LanguageModel
 
 
 def _pair(x) -> Tuple[int, int]:
@@ -207,12 +200,15 @@ class Mistral3MultiModalProjector(nn.Module):
         return x
 
 
-class Model(PixtralModel):
+class Model(nn.Module):
     def __init__(self, config: ModelConfig):
-        super().__init__(config)
+        super().__init__()
         self.config = config
 
         self.multi_modal_projector = Mistral3MultiModalProjector(config)
+        self.vision_tower = VisionModel(config.vision_config)
+        self.language_model = LanguageModel(config.text_config)
+        self.vision_feature_layer = config.vision_feature_layer
 
     def get_input_embeddings(
         self,
@@ -254,6 +250,82 @@ class Model(PixtralModel):
             self.config.image_token_index, image_features, inputs_embeds, input_ids
         )
         return final_inputs_embeds
+
+    @staticmethod
+    def merge_input_ids_with_image_features(
+        image_token_index, image_features, inputs_embeds, input_ids
+    ):
+        num_images, num_image_patches, embed_dim = image_features.shape
+
+        # Positions of <image> tokens in input_ids, assuming batch size is 1
+        image_positions = np.where(input_ids == image_token_index)[1].tolist()
+
+        text_segments = []
+        start_idx = 0
+
+        for position in image_positions:
+            text_segments.append(inputs_embeds[:, start_idx:position])
+            start_idx = position + 1
+
+        # Split image features into separate embeddings for each image
+        image_embeddings = mx.split(image_features, num_image_patches, axis=1)
+        final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
+        final_embeddings += [inputs_embeds[:, start_idx:]]
+
+        # Create a final embedding of shape
+        # (1, num_image_patches*num_images + sequence_len, embed_dim)
+        return mx.concatenate(final_embeddings, axis=1)
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        pixel_values: mx.array,
+        mask: mx.array,
+        cache=None,
+        **kwargs,
+    ):
+        input_embddings = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
+        logits = self.language_model(
+            input_ids, cache=cache, inputs_embeds=input_embddings
+        )
+        return logits
+
+    def sanitize(self, weights):
+        def transform_key(key):
+            if "vision_tower" in key and "vision_model" not in key:
+                if "transformer" in key:
+                    key = key.replace("vision_tower", "vision_tower.vision_model")
+                if "patch_conv" in key:
+                    key = key.replace("vision_tower", "vision_tower.vision_model")
+                if "ln_pre" in key:
+                    key = key.replace("vision_tower", "vision_tower.vision_model")
+
+            elif "vision_encoder" in key and "vision_tower" not in key:
+                if "transformer" in key:
+                    key = key.replace(
+                        "model.vision_encoder", "vision_tower.vision_model"
+                    )
+                if "patch_conv" in key:
+                    key = key.replace(
+                        "model.vision_encoder", "vision_tower.vision_model"
+                    )
+                if "ln_pre" in key:
+                    key = key.replace(
+                        "model.vision_encoder", "vision_tower.vision_model"
+                    )
+
+            elif "model.language_model" in key and "language_model.model" not in key:
+                key = key.replace("model.language_model", "language_model.model")
+
+            elif "lm_head" in key and "language_model" not in key:
+                key = key.replace("lm_head", "language_model.lm_head")
+
+            elif "model.vision_projection" in key:
+                key = key.replace("model.vision_projection", "multi_modal_projector")
+
+            return key
+
+        return {transform_key(k): v for k, v in weights.items()}
 
     @property
     def layers(self):
