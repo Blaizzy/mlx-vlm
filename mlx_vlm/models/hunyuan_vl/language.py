@@ -359,6 +359,10 @@ class LanguageModel(nn.Module):
                 # +2: skip first image_token and account for xdrope positions
                 pos = int(image_start_indices[image_index]) + 2
                 t, h, w = image_grid_thw[image_index].tolist()
+
+                # Skip invalid grid values
+                if h == 0 or w == 0:
+                    continue
                 _, llm_grid_h, llm_grid_w = (
                     int(t),
                     int(h) // spatial_merge_size,
