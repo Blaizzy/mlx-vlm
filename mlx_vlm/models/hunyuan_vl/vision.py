@@ -3,23 +3,40 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..interpolate import resize_bilinear
 from .config import VisionConfig
 
 
-class VisionMLP(nn.Module):
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = mx.ones((hidden_size,))
+        self.eps = eps
 
+    def __call__(self, x: mx.array) -> mx.array:
+        dtype = x.dtype
+        x = x.astype(mx.float32)
+        variance = mx.mean(x * x, axis=-1, keepdims=True)
+        x = x * mx.rsqrt(variance + self.eps)
+        return (self.weight * x).astype(dtype)
+
+
+class VisionMLP(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
         self.dense_h_to_4h = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=True
+            self.hidden_size, self.intermediate_size, bias=True
         )
         self.dense_4h_to_h = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=True
+            self.intermediate_size, self.hidden_size, bias=True
         )
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.dense_4h_to_h(nn.gelu(self.dense_h_to_4h(x)))
+        x = self.dense_h_to_4h(x)
+        x = nn.gelu(x)
+        x = self.dense_4h_to_h(x)
+        return x
 
 
 class VisionAttention(nn.Module):
@@ -31,11 +48,18 @@ class VisionAttention(nn.Module):
         self.head_dim = self.hidden_size // self.num_heads
         self.scale = self.head_dim**-0.5
 
-        # All projections have bias in HunyuanOCR vision tower
-        self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
-        self.k_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
-        self.v_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
-        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.q_proj = nn.Linear(
+            config.hidden_size, self.num_heads * self.head_dim, bias=True
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, self.num_heads * self.head_dim, bias=True
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, self.num_heads * self.head_dim, bias=True
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, config.hidden_size, bias=True
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
         B, L, _ = x.shape
@@ -82,158 +106,122 @@ class VisionBlock(nn.Module):
         return out
 
 
-class VisionEmbeddings(nn.Module):
+class PatchEmbed(nn.Module):
 
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.config = config
+        self.embed_dim = config.hidden_size
         self.patch_size = config.patch_size
-        self.hidden_size = config.hidden_size
         self.num_channels = config.num_channels
+        self.spatial_merge_size = config.spatial_merge_size
+        self.interpolate_mode = config.interpolate_mode
 
         self.patch_embedding = nn.Conv2d(
             in_channels=config.num_channels,
-            out_channels=config.hidden_size,
-            kernel_size=config.patch_size,
-            stride=config.patch_size,
-            bias=config.add_patchemb_bias,
+            out_channels=self.embed_dim,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+            bias=True,
         )
 
-        # Learned position embedding - will be interpolated to match grid size
-        # Max grid size based on max_image_size / patch_size
-        # +1 for potential CLS token (HunyuanOCR has 16385 = 128*128 + 1)
-        max_grid = config.max_image_size // config.patch_size
-        self.position_edge = int((max_grid * max_grid + 1) ** 0.5)
-        self.position_embedding = nn.Embedding(
-            max_grid * max_grid + 1, config.hidden_size
-        )
-
-        self._patch_pos_embed = None
+        self.max_num_patches = (config.max_image_size // self.patch_size) ** 2
+        self.num_positions = self.max_num_patches + 1
+        self.position_edge = int(self.num_positions**0.5)
+        self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
 
     def __call__(self, pixel_values: mx.array, grid_thw: list) -> mx.array:
-
-        num_patches, hidden_dim = pixel_values.shape
-
+        num_patches = pixel_values.shape[0]
+        # Reshape: (num_patches, C*P*P) -> (num_patches, C, P, P) -> (num_patches, P, P, C) for MLX conv
         pixel_values = pixel_values.reshape(
             num_patches, self.num_channels, self.patch_size, self.patch_size
         )
+        pixel_values = pixel_values.transpose(0, 2, 3, 1)  # NCHW -> NHWC for MLX
 
-        pixel_values = pixel_values.transpose(0, 2, 3, 1)
-        patch_embeds = self.patch_embedding(pixel_values)
+        # Apply patch embedding
+        patch_embeds = self.patch_embedding(pixel_values)  # (N, 1, 1, embed_dim)
+        patch_embeds = patch_embeds.reshape(1, num_patches, self.embed_dim)
 
-        # Squeeze spatial dims and add batch dim: (1, num_patches, hidden_size)
-        patch_embeds = patch_embeds.squeeze(1).squeeze(1)[None, :, :]
+        # Get position embeddings and interpolate for each grid
+        pos_embed_weights = self.position_embedding.weight[1:, :]  # Skip cls token
+        base_pos_embed = pos_embed_weights.reshape(
+            1, self.position_edge, self.position_edge, self.embed_dim
+        )
 
-        # Get position embeddings with interpolation for each image
         patch_pos_embed_list = []
         for grid in grid_thw:
             t, h, w = grid
-            h, w = int(h), int(w)
-            pos_embed = self._get_position_embedding(h, w, patch_embeds.dtype)
+            h_float = float(h) + 0.1
+            w_float = float(w) + 0.1
+
+            # Interpolate position embeddings
+            # Note: MLX doesn't have direct interpolate, so we use a simple approach
+            scale_h = h_float / self.position_edge
+            scale_w = w_float / self.position_edge
+
+            # For simplicity, use nearest neighbor or bilinear interpolation
+            target_h = int(h)
+            target_w = int(w)
+
+            # Simple bilinear interpolation
+            pos_embed = self._interpolate_pos_embed(base_pos_embed, target_h, target_w)
+            pos_embed = pos_embed.reshape(1, -1, self.embed_dim)
             patch_pos_embed_list.append(pos_embed)
 
-        # Concatenate position embeddings for all images
         patch_pos_embed = mx.concatenate(patch_pos_embed_list, axis=1)
-
-        # Add position embeddings
         embeddings = patch_embeds + patch_pos_embed
 
         return embeddings
 
-    def _manual_bilinear(self, x: mx.array, size: Tuple[int, int]) -> mx.array:
-        """
-        Perform bilinear interpolation matching PyTorch's align_corners=False.
-        x: (B, H_in, W_in, C)
-        size: (H_out, W_out)
-        """
-        B, H_in, W_in, C = x.shape
-        H_out, W_out = size
+    def _interpolate_pos_embed(
+        self, pos_embed: mx.array, target_h: int, target_w: int
+    ) -> mx.array:
 
-        # Map to input coordinates
-        # x_in = (x_out + 0.5) * (src_size / dst_size) - 0.5
-        h_idx = mx.arange(H_out, dtype=mx.float32)
-        w_idx = mx.arange(W_out, dtype=mx.float32)
+        # pos_embed shape: (1, src_h, src_w, embed_dim)
+        src_h = pos_embed.shape[1]
+        src_w = pos_embed.shape[2]
+        embed_dim = pos_embed.shape[3]
 
-        # HunyuanOCR uses a specific hack in HF implementation:
-        # scale_factor = (size + 0.1) / src_size
-        # So src_size / dst_size becomes src_size / (size + 0.1)
-        h_scale = H_in / (H_out + 0.1)
-        w_scale = W_in / (W_out + 0.1)
+        if src_h == target_h and src_w == target_w:
+            return pos_embed
 
-        h_in = (h_idx + 0.5) * h_scale - 0.5
-        w_in = (w_idx + 0.5) * w_scale - 0.5
+        # Create interpolation grid
+        h_ratio = src_h / target_h
+        w_ratio = src_w / target_w
 
-        # Clamp to valid range
-        h_in = mx.clip(h_in, 0, H_in - 1)
-        w_in = mx.clip(w_in, 0, W_in - 1)
+        result = []
+        for i in range(target_h):
+            row = []
+            for j in range(target_w):
+                src_i = i * h_ratio
+                src_j = j * w_ratio
 
-        # Get integer parts and next neighbors
-        h0 = mx.floor(h_in).astype(mx.int32)
-        w0 = mx.floor(w_in).astype(mx.int32)
-        h1 = mx.minimum(h0 + 1, H_in - 1)
-        w1 = mx.minimum(w0 + 1, W_in - 1)
+                i0 = int(src_i)
+                j0 = int(src_j)
+                i1 = min(i0 + 1, src_h - 1)
+                j1 = min(j0 + 1, src_w - 1)
 
-        # Get fractional parts (weights)
-        h_lambda = (h_in - h0).astype(x.dtype)
-        w_lambda = (w_in - w0).astype(x.dtype)
+                di = src_i - i0
+                dj = src_j - j0
 
-        # Reshape weights for broadcasting: (1, H_out, 1, 1) and (1, 1, W_out, 1)
-        h_lambda = h_lambda.reshape(1, H_out, 1, 1)
-        w_lambda = w_lambda.reshape(1, 1, W_out, 1)
+                # Bilinear interpolation
+                val = (
+                    (1 - di) * (1 - dj) * pos_embed[0, i0, j0, :]
+                    + (1 - di) * dj * pos_embed[0, i0, j1, :]
+                    + di * (1 - dj) * pos_embed[0, i1, j0, :]
+                    + di * dj * pos_embed[0, i1, j1, :]
+                )
+                row.append(val)
+            result.append(mx.stack(row, axis=0))
 
-        # Gather values from input tensor
-        # We need to gather (B, H_out, W_out, C)
-        # x is (B, H_in, W_in, C)
-
-        # Gather along height: result is (B, H_out, W_in, C)
-        x_h0 = mx.take(x, h0, axis=1)
-        x_h1 = mx.take(x, h1, axis=1)
-
-        # Gather along width from the height-gathered tensors: result is (B, H_out, W_out, C)
-        q00 = mx.take(x_h0, w0, axis=2)
-        q01 = mx.take(x_h0, w1, axis=2)
-        q10 = mx.take(x_h1, w0, axis=2)
-        q11 = mx.take(x_h1, w1, axis=2)
-
-        # Bilinear interpolation
-        r0 = q00 * (1 - w_lambda) + q01 * w_lambda
-        r1 = q10 * (1 - w_lambda) + q11 * w_lambda
-        result = r0 * (1 - h_lambda) + r1 * h_lambda
-
-        return result
-
-    def _get_position_embedding(self, grid_h: int, grid_w: int, dtype) -> mx.array:
-        """Get position embedding with interpolation if necessary."""
-        # Get base position embeddings (skip first token which is CLS)
-        pos_ids = mx.arange(1, self.position_edge * self.position_edge + 1)
-        patch_pos_embed = self.position_embedding(pos_ids)
-
-        # Reshape to 2D grid: (position_edge, position_edge, hidden_size)
-        patch_pos_embed = patch_pos_embed.reshape(
-            self.position_edge, self.position_edge, self.hidden_size
-        )
-
-        # Interpolate to target grid size if needed
-        if grid_h != self.position_edge or grid_w != self.position_edge:
-            # Add batch dim for interpolation: (1, position_edge, position_edge, hidden_size)
-            patch_pos_embed = patch_pos_embed[None, :, :, :]
-
-            # Use manual bilinear interpolation to match HF/PyTorch exactly
-            patch_pos_embed = resize_bilinear(
-                patch_pos_embed.transpose(0, 3, 1, 2), (grid_h, grid_w), antialias=False
-            ).transpose(0, 2, 3, 1)
-        else:
-            patch_pos_embed = patch_pos_embed[None, :, :, :]
-
-        # Reshape to (1, num_patches, hidden_size)
-        patch_pos_embed = patch_pos_embed.reshape(1, -1, self.hidden_size)
-
-        return patch_pos_embed.astype(dtype)
+        return mx.stack(result, axis=0).reshape(1, target_h, target_w, embed_dim)
 
 
-class VisionPatchMerger(nn.Module):
-
-    def __init__(self, config: VisionConfig):
+class PatchMerger(nn.Module):
+    def __init__(
+        self,
+        config: VisionConfig,
+    ):
         super().__init__()
         self.config = config
         self.spatial_merge_size = config.spatial_merge_size
@@ -307,58 +295,48 @@ class VisionPatchMerger(nn.Module):
 
 
 class VisionModel(nn.Module):
-
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.config = config
-        self.model_type = config.model_type
-
-        self.embeddings = VisionEmbeddings(config)
-
+        self.embeddings = PatchEmbed(config)
         self.layers = [VisionBlock(config) for _ in range(config.num_hidden_layers)]
-
-        # Patch merger (perceive module)
-        self.perceive = VisionPatchMerger(config)
+        self.perceive = PatchMerger(
+            config=config,
+        )
 
     def __call__(
         self,
         pixel_values: mx.array,
-        image_grid_thw: Optional[mx.array] = None,
-        **kwargs,
+        grid_thw: list,
     ) -> mx.array:
+        """
+        Args:
+            pixel_values: Flattened pixel values of shape (total_patches, C*P*P)
+            grid_thw: List of [t, h, w] for each image
 
-        if image_grid_thw is not None:
-            if hasattr(image_grid_thw, "tolist"):
-                grid_thw = image_grid_thw.tolist()
-            else:
-                grid_thw = [list(g) for g in image_grid_thw]
-        else:
-            raise ValueError("image_grid_thw is required for HunyuanOCR vision model")
-
+        Returns:
+            Image features of shape (1, total_tokens, text_hidden_size)
+        """
         hidden_states = self.embeddings(pixel_values, grid_thw)
 
         for layer in self.layers:
             hidden_states = layer(hidden_states)
 
+        # Calculate cumulative sequence lengths
         cu_seqlens = [0]
         for t, h, w in grid_thw:
-            cu_seqlens.append(cu_seqlens[-1] + int(h) * int(w))
+            cu_seqlens.append(int(h * w))
+        cu_seqlens = mx.cumsum(mx.array(cu_seqlens, dtype=mx.int32))
 
+        # Split and process each image
         processed_items = []
-        for i, (t, h, w) in enumerate(grid_thw):
-            start_idx = cu_seqlens[i]
-            end_idx = cu_seqlens[i + 1]
+        for i, grid in enumerate(grid_thw):
+            t, h, w = grid
+            start_idx = int(cu_seqlens[i])
+            end_idx = int(cu_seqlens[i + 1])
             item = hidden_states[:, start_idx:end_idx, :]
             processed = self.perceive(item, int(h), int(w))
             processed_items.append(processed)
 
-        vision_features = mx.concatenate(processed_items, axis=1)
-
-        return vision_features
-
-    def get_num_tokens(self, grid_h: int, grid_w: int) -> int:
-
-        merge = self.config.spatial_merge_size
-        merged_h = grid_h // merge
-        merged_w = grid_w // merge
-        return merged_h * (merged_w + 1) + 2
+        hidden_states = mx.concatenate(processed_items, axis=1)
+        return hidden_states
