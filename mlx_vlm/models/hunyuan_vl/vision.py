@@ -176,45 +176,37 @@ class PatchEmbed(nn.Module):
     def _interpolate_pos_embed(
         self, pos_embed: mx.array, target_h: int, target_w: int
     ) -> mx.array:
-
-        # pos_embed shape: (1, src_h, src_w, embed_dim)
-        src_h = pos_embed.shape[1]
-        src_w = pos_embed.shape[2]
-        embed_dim = pos_embed.shape[3]
+        src_h, src_w = pos_embed.shape[1], pos_embed.shape[2]
 
         if src_h == target_h and src_w == target_w:
             return pos_embed
 
-        # Create interpolation grid
-        h_ratio = src_h / target_h
-        w_ratio = src_w / target_w
+        # Create coordinate grids
+        h_coords = mx.arange(target_h) * (src_h / target_h)
+        w_coords = mx.arange(target_w) * (src_w / target_w)
 
-        result = []
-        for i in range(target_h):
-            row = []
-            for j in range(target_w):
-                src_i = i * h_ratio
-                src_j = j * w_ratio
+        i0 = h_coords.astype(mx.int32)
+        j0 = w_coords.astype(mx.int32)
+        i1 = mx.minimum(i0 + 1, src_h - 1)
+        j1 = mx.minimum(j0 + 1, src_w - 1)
 
-                i0 = int(src_i)
-                j0 = int(src_j)
-                i1 = min(i0 + 1, src_h - 1)
-                j1 = min(j0 + 1, src_w - 1)
+        di = (h_coords - i0.astype(mx.float32))[:, None, None]
+        dj = (w_coords - j0.astype(mx.float32))[None, :, None]
 
-                di = src_i - i0
-                dj = src_j - j0
+        # Gather corners and interpolate
+        p00 = pos_embed[0, i0][:, j0]
+        p01 = pos_embed[0, i0][:, j1]
+        p10 = pos_embed[0, i1][:, j0]
+        p11 = pos_embed[0, i1][:, j1]
 
-                # Bilinear interpolation
-                val = (
-                    (1 - di) * (1 - dj) * pos_embed[0, i0, j0, :]
-                    + (1 - di) * dj * pos_embed[0, i0, j1, :]
-                    + di * (1 - dj) * pos_embed[0, i1, j0, :]
-                    + di * dj * pos_embed[0, i1, j1, :]
-                )
-                row.append(val)
-            result.append(mx.stack(row, axis=0))
+        result = (
+            (1 - di) * (1 - dj) * p00
+            + (1 - di) * dj * p01
+            + di * (1 - dj) * p10
+            + di * dj * p11
+        )
 
-        return mx.stack(result, axis=0).reshape(1, target_h, target_w, embed_dim)
+        return result[None]
 
 
 class PatchMerger(nn.Module):
