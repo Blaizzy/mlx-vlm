@@ -23,7 +23,7 @@ class Model(nn.Module):
         self.config = config
         self.model_type = config.model_type
         self.vision_tower = VisionModel(config.vision_config)
-        self.language_model = LanguageModel(config.text_config)
+        self.language_model = LanguageModel(config)
 
     def get_input_embeddings(
         self,
@@ -117,8 +117,7 @@ class Model(nn.Module):
         self,
         input_ids: mx.array,
         pixel_values: Optional[mx.array] = None,
-        attention_mask: Optional[mx.array] = None,
-        position_ids: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
         image_grid_thw: Optional[mx.array] = None,
         cache=None,
         **kwargs,
@@ -145,11 +144,11 @@ class Model(nn.Module):
 
         # Forward through language model
         return self.language_model(
-            input_ids=None,  # Use inputs_embeds instead
+            input_ids=input_ids,
             inputs_embeds=inputs_embeds,
-            mask=attention_mask,
+            mask=mask,
             cache=cache,
-            position_ids=position_ids,
+            image_grid_thw=image_grid_thw,
         )
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
@@ -192,8 +191,3 @@ class Model(nn.Module):
             sanitized[new_key] = value
 
         return sanitized
-
-
-# Re-export class names to keep import style consistent with other models.
-LanguageModel = LanguageModel
-VisionModel = VisionModel
