@@ -1,22 +1,13 @@
-"""Vision tower for HunyuanOCR (hunyuan_vl).
-
-Implements the HF HunyuanVL vision encoder with:
-- 27-layer ViT with LayerNorm (with bias)
-- Conv2d patch embedding with learned position embedding
-- Patch merger (perceive module) with image_begin/end/newline tokens
-- GELU MLP activation
-"""
-
 from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..interpolate import resize_bilinear
 from .config import VisionConfig
 
 
 class VisionMLP(nn.Module):
-    """Vision MLP with GELU activation (H -> 4H -> H)."""
 
     def __init__(self, config: VisionConfig):
         super().__init__()
@@ -32,7 +23,6 @@ class VisionMLP(nn.Module):
 
 
 class VisionAttention(nn.Module):
-    """Multi-head attention for vision encoder (with bias, no rope)."""
 
     def __init__(self, config: VisionConfig):
         super().__init__()
@@ -74,7 +64,6 @@ class VisionAttention(nn.Module):
 
 
 class VisionBlock(nn.Module):
-    """Vision transformer block with pre-norm (LayerNorm with bias)."""
 
     def __init__(self, config: VisionConfig):
         super().__init__()
@@ -94,13 +83,6 @@ class VisionBlock(nn.Module):
 
 
 class VisionEmbeddings(nn.Module):
-    """Patch embedding with learned position embedding.
-
-    Accepts flattened patches from the image processor in format:
-    (num_patches, C * patch_size * patch_size)
-
-    This matches the HuggingFace HunyuanOCR implementation.
-    """
 
     def __init__(self, config: VisionConfig):
         super().__init__()
@@ -109,9 +91,6 @@ class VisionEmbeddings(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_channels = config.num_channels
 
-        # Conv2d patch embedding with bias
-        # Input: (num_patches, patch_size, patch_size, C) in NHWC format
-        # Output: (num_patches, 1, 1, hidden_size)
         self.patch_embedding = nn.Conv2d(
             in_channels=config.num_channels,
             out_channels=config.hidden_size,
@@ -129,29 +108,17 @@ class VisionEmbeddings(nn.Module):
             max_grid * max_grid + 1, config.hidden_size
         )
 
-        # Cache for interpolated position embeddings
         self._patch_pos_embed = None
 
     def __call__(self, pixel_values: mx.array, grid_thw: list) -> mx.array:
-        """
-        Args:
-            pixel_values: Flattened patches (num_patches, C * patch_size * patch_size)
-            grid_thw: List of [t, h, w] for each image
 
-        Returns:
-            embeddings: (1, total_patches, hidden_size)
-        """
         num_patches, hidden_dim = pixel_values.shape
 
-        # Reshape flattened patches to (num_patches, C, patch_size, patch_size)
         pixel_values = pixel_values.reshape(
             num_patches, self.num_channels, self.patch_size, self.patch_size
         )
 
-        # Convert to NHWC for MLX Conv2d: (num_patches, patch_size, patch_size, C)
         pixel_values = pixel_values.transpose(0, 2, 3, 1)
-
-        # Apply patch embedding: (num_patches, 1, 1, hidden_size)
         patch_embeds = self.patch_embedding(pixel_values)
 
         # Squeeze spatial dims and add batch dim: (1, num_patches, hidden_size)
@@ -252,7 +219,9 @@ class VisionEmbeddings(nn.Module):
             patch_pos_embed = patch_pos_embed[None, :, :, :]
 
             # Use manual bilinear interpolation to match HF/PyTorch exactly
-            patch_pos_embed = self._manual_bilinear(patch_pos_embed, (grid_h, grid_w))
+            patch_pos_embed = resize_bilinear(
+                patch_pos_embed.transpose(0, 3, 1, 2), (grid_h, grid_w), antialias=False
+            ).transpose(0, 2, 3, 1)
         else:
             patch_pos_embed = patch_pos_embed[None, :, :, :]
 
@@ -263,20 +232,6 @@ class VisionEmbeddings(nn.Module):
 
 
 class VisionPatchMerger(nn.Module):
-    """Patch merger (perceive module) that merges spatial patches and adds special tokens.
-
-    Structure:
-        before_rms(1152) -> Conv2d(1152->2304, k=2) -> GELU -> Conv2d(2304->4608, k=1)
-        -> [insert image_newline(4608)] -> mlp(4608->1024) -> after_rms(1024)
-        -> [wrap with image_begin/end(1024)]
-
-    Output includes:
-    - image_begin token at start
-    - image_newline token after each row (inserted before mlp)
-    - image_end token at end
-
-    Token count formula: (H/merge) * (W/merge + 1) + 2
-    """
 
     def __init__(self, config: VisionConfig):
         super().__init__()
@@ -285,17 +240,12 @@ class VisionPatchMerger(nn.Module):
         self.hidden_size = config.hidden_size
         self.out_hidden_size = config.out_hidden_size
 
-        # Intermediate hidden size after conv layers
         merge_hidden = config.hidden_size * 2  # 2304
         final_hidden = config.hidden_size * 4  # 4608
 
-        # RMSNorm before (on ViT hidden) and after (on output hidden)
         self.before_rms = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.after_rms = nn.RMSNorm(config.out_hidden_size, eps=config.rms_norm_eps)
 
-        # Projection layers: Conv2d(merge_size) -> GELU -> Conv2d(1x1)
-        # proj.0: Conv2d with kernel=spatial_merge_size, stride=spatial_merge_size
-        # proj.2: Conv2d with kernel=1
         self.proj = [
             nn.Conv2d(
                 config.hidden_size,
@@ -308,47 +258,28 @@ class VisionPatchMerger(nn.Module):
             nn.Conv2d(merge_hidden, final_hidden, kernel_size=1, bias=True),
         ]
 
-        # Final linear projection to out_hidden_size
         self.mlp = nn.Linear(final_hidden, config.out_hidden_size, bias=True)
 
-        # Learnable special tokens
-        # image_newline is inserted BEFORE mlp, so it has final_hidden size (4608)
-        # image_begin/end/sep are inserted AFTER mlp, so they have out_hidden_size (1024)
         self.image_newline = mx.zeros((final_hidden,))
         self.image_begin = mx.zeros((config.out_hidden_size,))
         self.image_end = mx.zeros((config.out_hidden_size,))
         self.image_sep = mx.zeros((config.out_hidden_size,))
 
     def __call__(self, hidden_states: mx.array, grid_h: int, grid_w: int) -> mx.array:
-        """
-        Args:
-            hidden_states: (B, num_patches, hidden_size) from ViT
-            grid_h: Original patch grid height
-            grid_w: Original patch grid width
 
-        Returns:
-            merged: (B, num_tokens, out_hidden_size) with special tokens
-        """
         B = hidden_states.shape[0]
         final_hidden = self.config.hidden_size * 4  # 4608
 
-        # Apply before RMSNorm
         x = self.before_rms(hidden_states)
 
-        # Reshape to spatial: (B, grid_h, grid_w, hidden_size)
         x = x.reshape(B, grid_h, grid_w, self.hidden_size)
 
-        # Apply conv layers (MLX Conv2d expects NHWC)
         for layer in self.proj:
             x = layer(x)
 
-        # After merge: (B, merged_h, merged_w, final_hidden=4608)
         merged_h = grid_h // self.spatial_merge_size
         merged_w = grid_w // self.spatial_merge_size
 
-        # Insert image_newline BEFORE mlp (at final_hidden dimension)
-        # Reshape to (B, merged_h, merged_w, final_hidden)
-        # Add newline after each row
         rows_with_newline = []
         for row_idx in range(merged_h):
             row = x[:, row_idx, :, :]  # (B, merged_w, final_hidden)
@@ -357,13 +288,10 @@ class VisionPatchMerger(nn.Module):
             )
             rows_with_newline.append(mx.concatenate([row, newline], axis=1))
 
-        # Concatenate all rows: (B, merged_h * (merged_w + 1), final_hidden)
         x = mx.concatenate(rows_with_newline, axis=1)
 
-        # Apply MLP to project to out_hidden_size
         x = self.mlp(x)
 
-        # Add begin and end tokens (at out_hidden_size dimension)
         begin = mx.broadcast_to(
             self.image_begin[None, None, :], (B, 1, self.out_hidden_size)
         )
@@ -371,27 +299,22 @@ class VisionPatchMerger(nn.Module):
             self.image_end[None, None, :], (B, 1, self.out_hidden_size)
         )
 
-        # Concatenate: [begin] + rows_with_newlines + [end]
         x = mx.concatenate([begin, x, end], axis=1)
 
-        # Apply after RMSNorm to EVERYTHING
         x = self.after_rms(x)
 
         return x
 
 
 class VisionModel(nn.Module):
-    """HunyuanOCR Vision Encoder (27-layer ViT + Patch Merger)."""
 
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.config = config
         self.model_type = config.model_type
 
-        # Embeddings (patch + position)
         self.embeddings = VisionEmbeddings(config)
 
-        # Transformer layers
         self.layers = [VisionBlock(config) for _ in range(config.num_hidden_layers)]
 
         # Patch merger (perceive module)
@@ -403,16 +326,7 @@ class VisionModel(nn.Module):
         image_grid_thw: Optional[mx.array] = None,
         **kwargs,
     ) -> mx.array:
-        """
-        Args:
-            pixel_values: Flattened patches (num_patches, C * patch_size * patch_size)
-            image_grid_thw: (num_images, 3) array with [temporal, height, width] grid sizes
-                           For images, temporal=1
 
-        Returns:
-            vision_features: (1, num_tokens, out_hidden_size)
-        """
-        # Convert image_grid_thw to list format for processing
         if image_grid_thw is not None:
             if hasattr(image_grid_thw, "tolist"):
                 grid_thw = image_grid_thw.tolist()
@@ -421,22 +335,15 @@ class VisionModel(nn.Module):
         else:
             raise ValueError("image_grid_thw is required for HunyuanOCR vision model")
 
-        # Patch + position embedding
-        # Input: (num_patches, C * patch_size * patch_size)
-        # Output: (1, num_patches, hidden_size)
         hidden_states = self.embeddings(pixel_values, grid_thw)
 
-        # Transformer layers
         for layer in self.layers:
             hidden_states = layer(hidden_states)
 
-        # Process each image through patch merger
-        # Calculate cumulative sequence lengths for splitting
         cu_seqlens = [0]
         for t, h, w in grid_thw:
             cu_seqlens.append(cu_seqlens[-1] + int(h) * int(w))
 
-        # Split hidden states by image and process through perceive
         processed_items = []
         for i, (t, h, w) in enumerate(grid_thw):
             start_idx = cu_seqlens[i]
@@ -445,19 +352,12 @@ class VisionModel(nn.Module):
             processed = self.perceive(item, int(h), int(w))
             processed_items.append(processed)
 
-        # Concatenate all processed items
         vision_features = mx.concatenate(processed_items, axis=1)
 
         return vision_features
 
     def get_num_tokens(self, grid_h: int, grid_w: int) -> int:
-        """Calculate number of output tokens for given grid size.
 
-        Formula: (H/merge) * (W/merge + 1) + 2
-        - (H/merge) * (W/merge): merged patches
-        - (H/merge): newline tokens (one per row)
-        - 2: begin and end tokens
-        """
         merge = self.config.spatial_merge_size
         merged_h = grid_h // merge
         merged_w = grid_w // merge
