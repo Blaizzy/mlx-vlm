@@ -433,9 +433,6 @@ class LanguageModel(nn.Module):
             else:
                 cache_offset = int(offset)
 
-        # Generate XD-RoPE position IDs for prefill (first pass)
-        # FIX: Changed from "cache is not None and cache_offset == 0"
-        #      to "cache is None or cache_offset == 0"
         if position_ids is None and (cache is None or cache_offset == 0):
             if input_ids is not None:
                 position_ids = self.get_xdrope_input_positions(
@@ -443,9 +440,7 @@ class LanguageModel(nn.Module):
                     image_grid_thw=kwargs.get("image_grid_thw", None),
                     image_token_id=self.config.image_token_id,
                     spatial_merge_size=self.config.vision_config.spatial_merge_size,
-                )[
-                    None, ...
-                ]  # Add batch dimension: (xd_num, L) -> (1, xd_num, L)
+                )[None, ...]
 
         out = self.model(
             input_ids=input_ids,
