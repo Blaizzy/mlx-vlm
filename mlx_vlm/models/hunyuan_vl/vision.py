@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -61,7 +61,7 @@ class VisionAttention(nn.Module):
             self.num_heads * self.head_dim, config.hidden_size, bias=True
         )
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, chunk_size: int = 512) -> mx.array:
         B, L, _ = x.shape
 
         queries = self.q_proj(x)
@@ -77,14 +77,41 @@ class VisionAttention(nn.Module):
             0, 2, 1, 3
         )
 
-        # Scaled dot-product attention (no mask for vision)
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale
+        output = chunked_attention(
+            queries,
+            keys,
+            values,
+            scale=self.scale,
+            chunk_size=chunk_size,
         )
 
-        # Reshape and project
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
+
+
+@mx.compile
+def chunked_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    scale: float,
+    chunk_size: int,
+) -> mx.array:
+
+    L = queries.shape[2]
+
+    outputs = []
+    for i in range(0, L, chunk_size):
+        end_idx = min(i + chunk_size, L)
+        q_chunk = queries[:, :, i:end_idx, :]  # (B, n_heads, chunk, head_dim)
+
+        chunk_output = mx.fast.scaled_dot_product_attention(
+            q_chunk, keys, values, scale=scale
+        )
+
+        outputs.append(chunk_output)
+
+    return mx.concatenate(outputs, axis=2)  # (B, n_heads, L, head_dim)
 
 
 class VisionBlock(nn.Module):
