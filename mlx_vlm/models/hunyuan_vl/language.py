@@ -70,42 +70,48 @@ def apply_rotary_pos_emb_xdrope(
     """Applies XD Rotary Position Embedding."""
 
     x_dim = len(xdrope_section)
+    cos = (
+        cos[position_ids, ...]
+        .transpose(0, 2, 1, 3)
+        .reshape(output_size[0], output_size[2], x_dim, -1)
+    )
+    sin = (
+        sin[position_ids, ...]
+        .transpose(0, 2, 1, 3)
+        .reshape(output_size[0], output_size[2], x_dim, -1)
+    )
 
-    # Get cos/sin for positions: position_ids shape (B, x_dim, L)
-    # cos shape: (seq_len, head_dim) -> after indexing: (B, x_dim, L, head_dim)
-    cos = cos[position_ids, ...]
-    sin = sin[position_ids, ...]
+    xdrope_section = xdrope_section * 2
 
-    # Transpose to (B, L, x_dim, head_dim)
-    cos = cos.transpose(0, 2, 1, 3).reshape(output_size[0], output_size[2], x_dim, -1)
-    sin = sin.transpose(0, 2, 1, 3).reshape(output_size[0], output_size[2], x_dim, -1)
+    # for xd concat
+    assert sum(xdrope_section) == cos.shape[-1], "Illegal partition for xd rope"
 
-    xdrope_section_doubled = xdrope_section * 2
+    # Convert split sizes to split indices for MLX
+    split_indices = [
+        sum(xdrope_section[: i + 1]) for i in range(len(xdrope_section) - 1)
+    ]
+    cos_splits = mx.split(cos, split_indices, axis=-1)
+    sin_splits = mx.split(sin, split_indices, axis=-1)
 
-    # Split and concatenate for xd rope
-    cos_splits = []
-    sin_splits = []
-    start = 0
-    for i, size in enumerate(xdrope_section_doubled):
-        cos_splits.append(cos[:, :, i % x_dim, start : start + size])
-        sin_splits.append(sin[:, :, i % x_dim, start : start + size])
-        start += size
+    cos = mx.concatenate(
+        [m[:, :, i % x_dim, :] for i, m in enumerate(cos_splits)], axis=-1
+    )
+    sin = mx.concatenate(
+        [m[:, :, i % x_dim, :] for i, m in enumerate(sin_splits)], axis=-1
+    )
 
-    cos = mx.concatenate(cos_splits, axis=-1)
-    sin = mx.concatenate(sin_splits, axis=-1)
-
-    # Reshape for broadcasting: (B, 1, L, head_dim)
+    # for head repeat
     cos = cos.reshape(output_size[0], 1, output_size[2], -1)
     sin = sin.reshape(output_size[0], 1, output_size[2], -1)
 
-    orig_dtype = q.dtype
-    q = q.astype(mx.float32)
-    k = k.astype(mx.float32)
+    origin_dtype = q.dtype
+    q, k = q.astype(mx.float32), k.astype(mx.float32)
+    cos, sin = cos.astype(mx.float32), sin.astype(mx.float32)
 
     q_out = (q * cos) + (rotate_half(q) * sin)
     k_out = (k * cos) + (rotate_half(k) * sin)
 
-    return q_out.astype(orig_dtype), k_out.astype(orig_dtype)
+    return q_out.astype(origin_dtype), k_out.astype(origin_dtype)
 
 
 def apply_rotary_pos_emb(
