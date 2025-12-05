@@ -182,8 +182,10 @@ class PatchEmbed(nn.Module):
             return pos_embed
 
         # Create coordinate grids
-        h_coords = mx.arange(target_h) * (src_h / target_h)
-        w_coords = mx.arange(target_w) * (src_w / target_w)
+        h_scale = src_h / (target_h + 0.1)
+        w_scale = src_w / (target_w + 0.1)
+        h_coords = (mx.arange(target_h) + 0.5) * h_scale - 0.5
+        w_coords = (mx.arange(target_w) + 0.5) * w_scale - 0.5
 
         i0 = h_coords.astype(mx.int32)
         j0 = w_coords.astype(mx.int32)
