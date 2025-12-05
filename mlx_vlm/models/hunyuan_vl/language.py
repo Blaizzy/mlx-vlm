@@ -22,10 +22,11 @@ class HunyuanRotaryEmbedding:
         self.base = config.rope_theta
 
         # Handle xdrope/dynamic scaling
-        self.xdrope_section = None
-        if config.rope_scaling is not None:
-            self.xdrope_section = config.rope_scaling.get("xdrope_section")
-            alpha = config.rope_scaling.get("alpha")
+        self.xdrope_section = config.rope_scaling.get("xdrope_section")
+        self.rope_type = config.rope_scaling.get("type")
+        alpha = config.rope_scaling.get("alpha")
+
+        if config.rope_scaling is not None and self.rope_type in ["xdrope", "dynamic"]:
             if alpha:
                 self.base = self.base * (alpha ** (self.dim / (self.dim - 2)))
 
