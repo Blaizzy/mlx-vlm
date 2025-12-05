@@ -154,12 +154,6 @@ class PatchEmbed(nn.Module):
             h_float = float(h) + 0.1
             w_float = float(w) + 0.1
 
-            # Interpolate position embeddings
-            # Note: MLX doesn't have direct interpolate, so we use a simple approach
-            scale_h = h_float / self.position_edge
-            scale_w = w_float / self.position_edge
-
-            # For simplicity, use nearest neighbor or bilinear interpolation
             target_h = int(h)
             target_w = int(w)
 
@@ -262,15 +256,16 @@ class PatchMerger(nn.Module):
         merged_h = grid_h // self.spatial_merge_size
         merged_w = grid_w // self.spatial_merge_size
 
-        rows_with_newline = []
-        for row_idx in range(merged_h):
-            row = x[:, row_idx, :, :]  # (B, merged_w, final_hidden)
-            newline = mx.broadcast_to(
-                self.image_newline[None, None, :], (B, 1, final_hidden)
-            )
-            rows_with_newline.append(mx.concatenate([row, newline], axis=1))
+        x = x.reshape(B, merged_h, merged_w, final_hidden)
 
-        x = mx.concatenate(rows_with_newline, axis=1)
+        newlines = mx.broadcast_to(
+            self.image_newline[None, None, None, :], (B, merged_h, 1, final_hidden)
+        )
+
+        x = mx.concatenate(
+            [x, newlines], axis=2
+        )  # (B, merged_h, merged_w+1, final_hidden)
+        x = x.reshape(B, merged_h * (merged_w + 1), final_hidden)
 
         x = self.mlp(x)
 
