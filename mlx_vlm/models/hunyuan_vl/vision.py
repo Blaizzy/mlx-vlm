@@ -290,6 +290,9 @@ class VisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.config = config
+        self.model_type = config.model_type
+        if self.model_type != "hunyuan_vl":
+            raise ValueError(f"Unsupported model type: {self.model_type}")
         self.embeddings = PatchEmbed(config)
         self.layers = [VisionBlock(config) for _ in range(config.num_hidden_layers)]
         self.perceive = PatchMerger(
