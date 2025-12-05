@@ -70,7 +70,7 @@ class TestModels(unittest.TestCase):
                 )
 
             batch_size = kwargs.pop("batch_size", 1)
-            if model_type in ["qwen2_5_vl", "glm4v_moe", "glm4v"]:
+            if model_type in ["qwen2_5_vl", "glm4v_moe", "glm4v", "hunyuan_vl"]:
                 input_tensor = mx.random.uniform(shape=(image_size[0], image_size[1]))
             else:
                 shape = (
@@ -109,6 +109,12 @@ class TestModels(unittest.TestCase):
             else:
                 self.assertEqual(hidden_states.shape[-1], vision_hidden_size)
 
+            print(
+                "hidden_states.dtype",
+                hidden_states.dtype,
+                "vision_tower.embeddings.patch_embedding.weight.dtype",
+                vision_tower.embeddings.patch_embedding.weight.dtype,
+            )
             self.assertEqual(hidden_states.dtype, t)
 
     def test_llava_bunny(self):
@@ -1782,20 +1788,11 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
+        # TODO: Add test for vision model. Ensure I can pass input type and shapes.
+
     def test_hunyuan_vl(self):
-        """Test HunyuanOCR (hunyuan_vl) model components with REALISTIC config.
-
-        Uses actual production config values from hunyuanocr/config.json:
-        - Language: 24-layer decoder, 1024 hidden, GQA (16 heads / 8 KV heads)
-        - Vision: 27-layer ViT, 1152 hidden -> 1024 projection
-        - Special features: xdrope, QK norm, patch merger with special tokens
-
-        Note: Uses random weights (not real weights) for fast CI testing.
-        For real weight testing, see test_smoke_weights.py
-        """
         from mlx_vlm.models import hunyuan_vl
 
-        # Create text config
         text_config = hunyuan_vl.TextConfig(
             model_type="hunyuan_vl",
             vocab_size=120818,
@@ -1837,7 +1834,6 @@ class TestModels(unittest.TestCase):
             pad_id=120002,
         )
 
-        # Create vision config
         vision_config = hunyuan_vl.VisionConfig(
             model_type="hunyuan_vl",
             hidden_size=1152,
@@ -1860,7 +1856,6 @@ class TestModels(unittest.TestCase):
             hidden_act="gelu",
         )
 
-        # Create model config
         config = hunyuan_vl.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
@@ -1880,11 +1875,9 @@ class TestModels(unittest.TestCase):
 
         model = hunyuan_vl.Model(config)
 
-        # Verify model structure matches expected architecture
         self.assertEqual(len(model.language_model.model.layers), 24)
         self.assertEqual(len(model.vision_tower.layers), 27)
 
-        # Test language model
         self.language_test_runner(
             model.language_model,
             config.text_config.model_type,
@@ -1892,249 +1885,17 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
-        # Test vision model with proper input format
-        # Image size: 256x256 -> grid: 16x16 patches
-        image_size = 256
-        grid_h = image_size // config.vision_config.patch_size  # 16
-        grid_w = image_size // config.vision_config.patch_size  # 16
-
-        # Create input tensor (NHWC format for MLX)
-        pixel_values = mx.random.uniform(
-            shape=(
-                1,  # batch
-                image_size,
-                image_size,
-                config.vision_config.num_channels,
-            )
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.out_hidden_size,
+            config.vision_config.num_channels,
+            (1080, 768),
+            vision_feature_layer=-1,
+            grid_thw=mx.array(
+                [[1, 18, 60]], dtype=mx.int64
+            ),  # image temporals shape (num_images, 3)
         )
-
-        # Forward pass through vision tower
-        vision_features = model.vision_tower(pixel_values)
-
-        # Check output shape
-        # Token count formula: (H/merge) * (W/merge + 1) + 2
-        merge = config.vision_config.spatial_merge_size
-        merged_h = grid_h // merge  # 8
-        merged_w = grid_w // merge  # 8
-        expected_tokens = merged_h * (merged_w + 1) + 2  # 8 * 9 + 2 = 74
-
-        self.assertEqual(vision_features.shape[0], 1)  # batch
-        self.assertEqual(vision_features.shape[1], expected_tokens)
-        self.assertEqual(vision_features.shape[2], config.vision_config.out_hidden_size)
-
-        # Test with NCHW format (should also work)
-        pixel_values_nchw = mx.random.uniform(
-            shape=(
-                1,
-                config.vision_config.num_channels,
-                image_size,
-                image_size,
-            )
-        )
-        vision_features_nchw = model.vision_tower(pixel_values_nchw)
-        self.assertEqual(vision_features_nchw.shape, vision_features.shape)
-
-        # Test full model forward pass with image
-        num_image_tokens = expected_tokens
-        input_ids = mx.array(
-            [
-                [config.bos_token_id]
-                + [config.image_token_id] * num_image_tokens
-                + [100, 101, 102]
-            ]
-        )
-
-        output = model(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=mx.array([[1, grid_h, grid_w]]),
-        )
-
-        expected_seq_len = (
-            1 + num_image_tokens + 3
-        )  # bos + image tokens + 3 text tokens
-        self.assertEqual(output.logits.shape, (1, expected_seq_len, config.vocab_size))
-        self.assertFalse(
-            mx.any(mx.isnan(output.logits)).item(), "NaN detected in logits"
-        )
-
-    def test_hunyuan_vl_xdrope(self):
-        """Test xdrope (4D rotary positional encoding) specifically."""
-        from mlx_vlm.models.hunyuan_vl.language import HunyuanRotaryEmbedding
-
-        head_dim = 128
-        rope_scaling = {
-            "type": "xdrope",
-            "xdrope_section": [16, 16, 16, 16],
-        }
-
-        rotary_emb = HunyuanRotaryEmbedding(
-            dim=head_dim,
-            max_position_embeddings=32768,
-            base=10000.0,
-            rope_scaling=rope_scaling,
-        )
-
-        # Test with 2D position_ids (standard fallback)
-        batch_size = 2
-        seq_len = 10
-        position_ids_2d = mx.arange(seq_len)[None, :].astype(mx.int32)
-        position_ids_2d = mx.broadcast_to(position_ids_2d, (batch_size, seq_len))
-
-        x = mx.random.uniform(shape=(batch_size, seq_len, head_dim))
-        cos, sin = rotary_emb(x, position_ids_2d)
-
-        self.assertEqual(cos.shape, (batch_size, seq_len, head_dim))
-        self.assertEqual(sin.shape, (batch_size, seq_len, head_dim))
-
-        # Test with 4D position_ids (full xdrope)
-        position_ids_4d = mx.stack(
-            [
-                mx.arange(seq_len)[None, :],  # base
-                mx.arange(seq_len)[None, :],  # t
-                mx.zeros((1, seq_len)),  # h
-                mx.zeros((1, seq_len)),  # w
-            ],
-            axis=0,
-        ).astype(mx.int32)
-        position_ids_4d = mx.broadcast_to(position_ids_4d, (4, batch_size, seq_len))
-
-        cos_4d, sin_4d = rotary_emb(x, position_ids_4d)
-
-        self.assertEqual(cos_4d.shape, (batch_size, seq_len, head_dim))
-        self.assertEqual(sin_4d.shape, (batch_size, seq_len, head_dim))
-
-    def test_hunyuan_vl_qk_norm(self):
-        """Test QK normalization in attention."""
-        from mlx_vlm.models import hunyuan_vl
-
-        text_config = hunyuan_vl.TextConfig(
-            model_type="hunyuan_vl",
-            vocab_size=1000,
-            hidden_size=256,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=64,
-            intermediate_size=512,
-            use_qk_norm=True,
-            rms_norm_eps=1e-5,
-        )
-
-        from mlx_vlm.models.hunyuan_vl.language import Attention
-
-        attn = Attention(text_config)
-
-        # Verify QK norm layers exist
-        self.assertIsNotNone(attn.query_layernorm)
-        self.assertIsNotNone(attn.key_layernorm)
-
-        # Test forward pass
-        batch_size = 2
-        seq_len = 8
-        x = mx.random.uniform(shape=(batch_size, seq_len, text_config.hidden_size))
-
-        output = attn(x)
-
-        self.assertEqual(output.shape, (batch_size, seq_len, text_config.hidden_size))
-        # Check no NaNs
-        self.assertFalse(mx.any(mx.isnan(output)).item())
-
-    def test_hunyuan_vl_patch_merger(self):
-        """Test vision patch merger token count formula."""
-        from mlx_vlm.models import hunyuan_vl
-
-        vision_config = hunyuan_vl.VisionConfig(
-            model_type="hunyuan_vl",
-            hidden_size=1152,
-            out_hidden_size=1024,
-            num_hidden_layers=2,
-            num_attention_heads=16,
-            intermediate_size=4304,
-            patch_size=16,
-            num_channels=3,
-            spatial_merge_size=2,
-            max_image_size=512,
-        )
-
-        from mlx_vlm.models.hunyuan_vl.vision import VisionPatchMerger
-
-        merger = VisionPatchMerger(vision_config)
-
-        # Test various grid sizes
-        test_cases = [
-            (16, 16),  # 256x256 image
-            (32, 32),  # 512x512 image
-            (16, 32),  # 256x512 image (non-square)
-        ]
-
-        for grid_h, grid_w in test_cases:
-            batch_size = 1
-            num_patches = grid_h * grid_w
-            hidden_states = mx.random.uniform(
-                shape=(batch_size, num_patches, vision_config.hidden_size)
-            )
-
-            output = merger(hidden_states, grid_h, grid_w)
-
-            # Verify token count formula: (H/merge) * (W/merge + 1) + 2
-            merge = vision_config.spatial_merge_size
-            merged_h = grid_h // merge
-            merged_w = grid_w // merge
-            expected_tokens = merged_h * (merged_w + 1) + 2
-
-            self.assertEqual(
-                output.shape[1],
-                expected_tokens,
-                f"Token count mismatch for grid ({grid_h}, {grid_w})",
-            )
-            self.assertEqual(output.shape[2], vision_config.out_hidden_size)
-
-    def test_hunyuan_vl_tie_word_embeddings(self):
-        """Test that tie_word_embeddings works correctly."""
-        from mlx_vlm.models import hunyuan_vl
-
-        # Test with tied embeddings (default for HunyuanOCR)
-        text_config_tied = hunyuan_vl.TextConfig(
-            model_type="hunyuan_vl",
-            vocab_size=1000,
-            hidden_size=256,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=64,
-            intermediate_size=512,
-            tie_word_embeddings=True,
-        )
-
-        lm_tied = hunyuan_vl.LanguageModel(text_config_tied)
-
-        # Should NOT have lm_head attribute when tied
-        self.assertFalse(hasattr(lm_tied, "lm_head"))
-
-        # Test forward pass
-        input_ids = mx.array([[0, 1, 2, 3]])
-        output = lm_tied(input_ids)
-
-        self.assertEqual(output.logits.shape, (1, 4, text_config_tied.vocab_size))
-
-        # Test with untied embeddings
-        text_config_untied = hunyuan_vl.TextConfig(
-            model_type="hunyuan_vl",
-            vocab_size=1000,
-            hidden_size=256,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=64,
-            intermediate_size=512,
-            tie_word_embeddings=False,
-        )
-
-        lm_untied = hunyuan_vl.LanguageModel(text_config_untied)
-
-        # Should have lm_head attribute when not tied
-        self.assertTrue(hasattr(lm_untied, "lm_head"))
 
 
 if __name__ == "__main__":
