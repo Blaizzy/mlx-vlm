@@ -128,8 +128,6 @@ def apply_rotary_pos_emb(
 
 
 class Attention(nn.Module):
-    """Multi-head attention with GQA, xdrope, and QK normalization."""
-
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
