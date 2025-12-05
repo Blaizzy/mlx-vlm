@@ -7,20 +7,6 @@ from ..base import chunked_attention
 from .config import VisionConfig
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = mx.ones((hidden_size,))
-        self.eps = eps
-
-    def __call__(self, x: mx.array) -> mx.array:
-        dtype = x.dtype
-        x = x.astype(mx.float32)
-        variance = mx.mean(x * x, axis=-1, keepdims=True)
-        x = x * mx.rsqrt(variance + self.eps)
-        return (self.weight * x).astype(dtype)
-
-
 class VisionMLP(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
@@ -173,6 +159,7 @@ class PatchEmbed(nn.Module):
     def _interpolate_pos_embed(
         self, pos_embed: mx.array, target_h: int, target_w: int
     ) -> mx.array:
+        dtype = pos_embed.dtype
         src_h, src_w = pos_embed.shape[1], pos_embed.shape[2]
 
         if src_h == target_h and src_w == target_w:
@@ -205,7 +192,7 @@ class PatchEmbed(nn.Module):
             + di * dj * p11
         )
 
-        return result[None]
+        return result[None].astype(dtype)
 
 
 class PatchMerger(nn.Module):
