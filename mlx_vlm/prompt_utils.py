@@ -57,6 +57,7 @@ MODEL_CONFIG = {
     "multi_modality": MessageFormat.IMAGE_TOKEN,
     "deepseek_vl_v2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "deepseekocr": MessageFormat.IMAGE_TOKEN_NEWLINE,
+    "hunyuan_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Prompt-only models
     "florence2": MessageFormat.PROMPT_ONLY,
     "molmo": MessageFormat.PROMPT_ONLY,
