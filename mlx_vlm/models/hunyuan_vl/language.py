@@ -363,16 +363,10 @@ class LanguageModel(nn.Module):
             for image_index in range(len(image_start_indices)):
                 # +2: skip first image_token and account for xdrope positions
                 pos = int(image_start_indices[image_index]) + 2
-                t, h, w = image_grid_thw[image_index].tolist()
+                _, h, w = image_grid_thw.flatten().tolist()
 
-                # Skip invalid grid values
-                if h == 0 or w == 0:
-                    continue
-                _, llm_grid_h, llm_grid_w = (
-                    int(t),
-                    int(h) // spatial_merge_size,
-                    int(w) // spatial_merge_size,
-                )
+                llm_grid_h = h // spatial_merge_size
+                llm_grid_w = w // spatial_merge_size
 
                 token_num = (llm_grid_w + 1) * llm_grid_h
 
