@@ -1,14 +1,9 @@
-"""Main model glue for HunyuanOCR (hunyuan_vl).
-
-Wires together the vision tower and language model, handling:
-- Image feature extraction and placeholder replacement
-- Weight sanitization for HuggingFace -> MLX key mapping
-"""
-
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from mlx_vlm.models.base import check_array_shape
 
 from .config import ModelConfig
 from .language import LanguageModel
@@ -16,7 +11,6 @@ from .vision import VisionModel
 
 
 class Model(nn.Module):
-    """HunyuanOCR multimodal model combining vision encoder and language decoder."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -32,16 +26,7 @@ class Model(nn.Module):
         image_grid_thw: Optional[mx.array] = None,
         **kwargs,
     ) -> mx.array:
-        """Get input embeddings, replacing image placeholders with vision features.
 
-        Args:
-            input_ids: (B, L) token IDs with image_token_id as placeholders
-            pixel_values: (B, C, H, W) or (B, H, W, C) image tensor
-            image_grid_thw: (B, 3) tensor with [temporal, height, width] grid sizes
-
-        Returns:
-            inputs_embeds: (B, L, hidden_size) with vision features merged in
-        """
         # Get text embeddings
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
@@ -67,11 +52,8 @@ class Model(nn.Module):
                 f"Expected token count based on grid: {num_vision_tokens}"
             )
 
-        # Replace placeholders with vision features
-        B, L, D = inputs_embeds.shape
+        B, L, _ = inputs_embeds.shape
 
-        # Simple approach: build output by iterating through positions
-        # This is not the most efficient but works correctly
         output_parts = []
 
         for b in range(B):
@@ -102,7 +84,6 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        """Access language model layers for cache management."""
         return self.language_model.model.layers
 
     @property
@@ -122,19 +103,7 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        """Forward pass through the multimodal model.
 
-        Args:
-            input_ids: (B, L) token IDs
-            pixel_values: Optional (B, C, H, W) image tensor
-            attention_mask: Optional (B, L) attention mask
-            position_ids: Optional position IDs for xdrope
-            image_grid_thw: Optional (B, 3) grid size info
-            cache: Optional KV cache for generation
-
-        Returns:
-            LanguageModelOutput with logits
-        """
         # Get embeddings (with vision features merged if image provided)
         inputs_embeds = self.get_input_embeddings(
             input_ids=input_ids,
@@ -152,17 +121,7 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
-        """Remap HuggingFace weight keys to MLX model structure.
 
-        HF structure:
-            model.embed_tokens.weight -> language_model.model.embed_tokens.weight
-            model.layers.* -> language_model.model.layers.*
-            model.norm.weight -> language_model.model.norm.weight
-            vit.* -> vision_tower.*
-            vit.embeddings.* -> vision_tower.embeddings.*
-            vit.layers.* -> vision_tower.layers.*
-            vit.perceive.* -> vision_tower.perceive.*
-        """
         sanitized = {}
 
         for key, value in weights.items():
@@ -184,8 +143,7 @@ class Model(nn.Module):
                 or "proj.0.weight" in new_key
                 or "proj.2.weight" in new_key
             ):
-                if value.ndim == 4:
-                    # PyTorch format: [out_ch, in_ch, kH, kW] -> MLX: [out_ch, kH, kW, in_ch]
+                if not check_array_shape(value):
                     value = value.transpose(0, 2, 3, 1)
 
             sanitized[new_key] = value
