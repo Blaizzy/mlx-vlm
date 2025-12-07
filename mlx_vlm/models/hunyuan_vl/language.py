@@ -362,7 +362,7 @@ class LanguageModel(nn.Module):
         if image_grid_thw is not None and len(image_start_indices) > 0:
             for image_index in range(len(image_start_indices)):
                 # +2: skip first image_token and account for xdrope positions
-                pos = int(image_start_indices[image_index]) + 2
+                pos = int(image_start_indices[image_index]) + 1
                 _, h, w = image_grid_thw.flatten().tolist()
 
                 llm_grid_h = h // spatial_merge_size
@@ -395,17 +395,17 @@ class LanguageModel(nn.Module):
             llm_positions = mx.stack(
                 [
                     mx.array(p_index),
-                    mx.array(w_index),
-                    mx.array(h_index),
                     mx.array(t_index),
+                    mx.array(h_index),
+                    mx.array(w_index),
                 ]
             )
         elif xd_num == 3:
             llm_positions = mx.stack(
                 [
-                    mx.array(w_index),
-                    mx.array(h_index),
                     mx.array(t_index),
+                    mx.array(h_index),
+                    mx.array(w_index),
                 ]
             )
         else:
