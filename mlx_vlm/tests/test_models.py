@@ -109,12 +109,6 @@ class TestModels(unittest.TestCase):
             else:
                 self.assertEqual(hidden_states.shape[-1], vision_hidden_size)
 
-            print(
-                "hidden_states.dtype",
-                hidden_states.dtype,
-                "vision_tower.embeddings.patch_embedding.weight.dtype",
-                vision_tower.embeddings.patch_embedding.weight.dtype,
-            )
             self.assertEqual(hidden_states.dtype, t)
 
     def test_llava_bunny(self):
