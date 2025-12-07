@@ -34,6 +34,10 @@ class TextConfig(BaseModelConfig):
         if self.layer_types is None:
             self.layer_types = ["full_attention"] * self.num_hidden_layers
 
+        # Auto-detect QK norm for Qwen3-based models if not explicitly set
+        if self.use_qk_norm is None:
+            self.use_qk_norm = self.model_type in ("qwen3",)
+
 
 @dataclass
 class ModelConfig(BaseModelConfig):

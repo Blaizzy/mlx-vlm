@@ -41,6 +41,11 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
+        self.use_qk_norm = config.use_qk_norm
+        if self.use_qk_norm:
+            self.q_norm = nn.RMSNorm(head_dim, eps=config.rms_norm_eps)
+            self.k_norm = nn.RMSNorm(head_dim, eps=config.rms_norm_eps)
+
         self.rope = initialize_rope(
             self.head_dim,
             config.rope_parameters["rope_theta"],
@@ -61,8 +66,16 @@ class Attention(nn.Module):
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
         # Prepare the queries, keys and values for the attention computation
-        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, self.n_heads, -1)
+        keys = keys.reshape(B, L, self.n_kv_heads, -1)
+
+        # Apply QK normalization before transposing
+        if self.use_qk_norm:
+            queries = self.q_norm(queries)
+            keys = self.k_norm(keys)
+
+        queries = queries.transpose(0, 2, 1, 3)
+        keys = keys.transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         offset = 0
