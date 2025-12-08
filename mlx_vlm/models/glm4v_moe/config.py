@@ -25,10 +25,11 @@ class TextConfig(BaseModelConfig):
     num_hidden_layers: int
     num_key_value_heads: int
     rms_norm_eps: float
-    rope_theta: float
     use_qk_norm: bool
     attention_bias: bool
     partial_rotary_factor: float
+    rope_theta: float = None
+    rope_parameters: Dict = None
     rope_scaling: Dict = field(
         default_factory=lambda: {"type": "default", "mrope_section": [64, 32, 32]}
     )

@@ -30,7 +30,7 @@ def _compute_default_rope_parameters(
         base = rope_kwargs["base"]
         dim = rope_kwargs["dim"]
     elif config is not None:
-        base = config.rope_theta
+        base = config.rope_theta or config.rope_parameters["rope_theta"]
         partial_rotary_factor = (
             config.partial_rotary_factor
             if hasattr(config, "partial_rotary_factor")
@@ -154,7 +154,7 @@ class Glm4vMoeAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=args.attention_bias)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.rope_scaling = args.rope_scaling
+        self.rope_parameters = args.rope_parameters or args.rope_scaling
 
     def __call__(
         self,
@@ -177,7 +177,7 @@ class Glm4vMoeAttention(nn.Module):
         cos, sin = position_embeddings
 
         queries, keys = apply_multimodal_rotary_pos_emb(
-            queries, keys, cos, sin, self.rope_scaling["mrope_section"]
+            queries, keys, cos, sin, self.rope_parameters["mrope_section"]
         )
 
         if cache is not None:
