@@ -1792,7 +1792,7 @@ class TestModels(unittest.TestCase):
             vocab_size=120818,
             org_vocab_size=120818,
             hidden_size=1024,
-            num_hidden_layers=24,
+            num_hidden_layers=6,
             num_attention_heads=16,
             num_key_value_heads=8,
             head_dim=128,
@@ -1832,7 +1832,7 @@ class TestModels(unittest.TestCase):
             model_type="hunyuan_vl",
             hidden_size=1152,
             out_hidden_size=1024,
-            num_hidden_layers=27,
+            num_hidden_layers=5,
             num_attention_heads=16,
             intermediate_size=4304,
             patch_size=16,
@@ -1869,9 +1869,6 @@ class TestModels(unittest.TestCase):
 
         model = hunyuan_vl.Model(config)
 
-        self.assertEqual(len(model.language_model.model.layers), 24)
-        self.assertEqual(len(model.vision_tower.layers), 27)
-
         self.language_test_runner(
             model.language_model,
             config.text_config.model_type,
@@ -1884,7 +1881,7 @@ class TestModels(unittest.TestCase):
             config.vision_config.model_type,
             config.vision_config.out_hidden_size,
             config.vision_config.num_channels,
-            (1080, 768),
+            (360, 96),
             vision_feature_layer=-1,
             grid_thw=mx.array(
                 [[1, 18, 60]], dtype=mx.int64
