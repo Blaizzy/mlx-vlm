@@ -72,7 +72,11 @@ def chat(message, history, temperature, max_tokens):
                 elif isinstance(item[0], dict) and "text" in item[0]:
                     chat_history.append({"role": "user", "content": item[0]["text"]})
                 if item[1] is not None:
-                    content = item[1].split("\n\n---\n")[0] if isinstance(item[1], str) else item[1]
+                    content = (
+                        item[1].split("\n\n---\n")[0]
+                        if isinstance(item[1], str)
+                        else item[1]
+                    )
                     chat_history.append({"role": "assistant", "content": content})
 
         chat_history.append({"role": "user", "content": message["text"]})
@@ -132,7 +136,12 @@ with gr.Blocks(fill_height=True) as demo:
             minimum=0, maximum=1, step=0.1, value=0.1, label="Temperature", scale=1
         )
         max_tokens = gr.Slider(
-            minimum=128, maximum=4096, step=1, value=1024, label="Max new tokens", scale=1
+            minimum=128,
+            maximum=4096,
+            step=1,
+            value=1024,
+            label="Max new tokens",
+            scale=1,
         )
 
     gr.ChatInterface(
