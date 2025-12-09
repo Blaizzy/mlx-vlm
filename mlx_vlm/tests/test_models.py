@@ -1881,7 +1881,7 @@ class TestModels(unittest.TestCase):
             config.vision_config.model_type,
             config.vision_config.out_hidden_size,
             config.vision_config.num_channels,
-            (360, 96),
+            (1080, 768),
             vision_feature_layer=-1,
             grid_thw=mx.array(
                 [[1, 18, 60]], dtype=mx.int64
