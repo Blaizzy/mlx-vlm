@@ -1,4 +1,5 @@
 import argparse
+import threading
 
 import gradio as gr
 
@@ -27,18 +28,77 @@ config = load_config(args.model)
 model, processor = load(args.model, processor_kwargs={"trust_remote_code": True})
 image_processor = load_image_processor(args.model)
 # Use most of the viewport for conversation while leaving room for header/controls and avoid overshooting on short screens.
-chatbot_height = "clamp(380px, calc(100vh - 320px), 820px)"
+chatbot_height = "clamp(380px, calc(100vh - 400px), 820px)"
+
+# Global flag for stopping generation
+stop_generation = threading.Event()
 
 
-def chat(message, history, temperature, max_tokens):
-    image_file = ""
-    if "files" in message and len(message["files"]) > 0:
-        image_file = message["files"][-1]
+def extract_image_from_message(message):
+    """Extract image file path from various message formats."""
+    # Handle dict with "files" key (standard multimodal input)
+    if isinstance(message, dict):
+        if "files" in message and message["files"]:
+            img = message["files"][-1]
+            # File might be a dict with "path" key or a string path
+            if isinstance(img, dict) and "path" in img:
+                return img["path"]
+            elif isinstance(img, str):
+                return img
+        # Handle dict with "file" key (single file)
+        if "file" in message and message["file"]:
+            f = message["file"]
+            if isinstance(f, dict) and "path" in f:
+                return f["path"]
+            elif isinstance(f, str):
+                return f
+    # Handle string path directly
+    elif isinstance(message, str):
+        return message if message else ""
+    return ""
 
+
+def extract_text_from_message(message):
+    """Extract text content from various message formats."""
+    if isinstance(message, str):
+        return message
+    if isinstance(message, dict):
+        # Try "text" key first (standard multimodal input)
+        if "text" in message:
+            return message["text"] or ""
+        # Try "content" key (chat message format)
+        if "content" in message:
+            content = message["content"]
+            if isinstance(content, str):
+                return content
+            elif isinstance(content, list):
+                # Extract text from list of content items
+                text_parts = []
+                for c in content:
+                    if isinstance(c, str):
+                        text_parts.append(c)
+                    elif isinstance(c, dict) and c.get("type") == "text":
+                        text_parts.append(c.get("text", ""))
+                return " ".join(text_parts)
+    return ""
+
+
+def chat(
+    message, history, temperature, max_tokens, top_p, repetition_penalty, system_prompt
+):
+    global stop_generation
+    stop_generation.clear()
+
+    image_file = extract_image_from_message(message)
     num_images = 1 if image_file else 0
 
     if config["model_type"] != "paligemma":
         chat_history = []
+
+        # Add system prompt if provided
+        if system_prompt and system_prompt.strip():
+            chat_history.append({"role": "system", "content": system_prompt.strip()})
+
         for item in history:
             # Handle new Gradio dict format
             if isinstance(item, dict):
@@ -79,7 +139,9 @@ def chat(message, history, temperature, max_tokens):
                     )
                     chat_history.append({"role": "assistant", "content": content})
 
-        chat_history.append({"role": "user", "content": message["text"]})
+        chat_history.append(
+            {"role": "user", "content": extract_text_from_message(message)}
+        )
 
         messages = []
         for i, m in enumerate(chat_history):
@@ -99,18 +161,35 @@ def chat(message, history, temperature, max_tokens):
         messages = get_chat_template(processor, messages, add_generation_prompt=True)
 
     else:
-        messages = message["text"]
+        messages = extract_text_from_message(message)
 
     response = ""
     last_chunk = None
+
+    # Build generation kwargs
+    gen_kwargs = {
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+
+    # Only add optional params if they differ from defaults
+    if top_p < 1.0:
+        gen_kwargs["top_p"] = top_p
+    if repetition_penalty != 1.0:
+        gen_kwargs["repetition_penalty"] = repetition_penalty
+
     for chunk in stream_generate(
         model,
         processor,
         messages,
         image=image_file,
-        max_tokens=max_tokens,
-        temperature=temperature,
+        **gen_kwargs,
     ):
+        if stop_generation.is_set():
+            response += "\n\n*[Generation stopped]*"
+            yield response
+            return
+
         response += chunk.text
         last_chunk = chunk
         yield response
@@ -126,30 +205,113 @@ def chat(message, history, temperature, max_tokens):
         yield response + stats
 
 
-chatbot = gr.Chatbot(height=chatbot_height, scale=1, render=False)
+def stop_generating():
+    """Set the stop flag to interrupt generation."""
+    stop_generation.set()
+    return gr.update(interactive=False)
 
-with gr.Blocks(fill_height=True) as demo:
+
+def clear_chat():
+    """Clear the chat history."""
+    return [], None
+
+
+# Create custom theme with dark mode support
+theme = gr.themes.Soft(
+    primary_hue="blue",
+    secondary_hue="slate",
+).set(
+    body_background_fill="*neutral_50",
+    body_background_fill_dark="*neutral_950",
+    block_background_fill="*neutral_100",
+    block_background_fill_dark="*neutral_900",
+)
+
+with gr.Blocks(fill_height=True, title=f"MLX-VLM Chat — {args.model}") as demo:
     gr.Markdown(f"## MLX-VLM Chat UI — {args.model}")
 
+    # Main controls row
     with gr.Row():
-        temperature = gr.Slider(
-            minimum=0, maximum=1, step=0.1, value=0.1, label="Temperature", scale=1
-        )
-        max_tokens = gr.Slider(
-            minimum=128,
-            maximum=4096,
-            step=1,
-            value=1024,
-            label="Max new tokens",
-            scale=1,
-        )
+        with gr.Column(scale=4):
+            with gr.Accordion("⚙️ Generation Settings", open=False):
+                with gr.Row():
+                    temperature = gr.Slider(
+                        minimum=0,
+                        maximum=2,
+                        step=0.05,
+                        value=0.1,
+                        label="Temperature",
+                        info="Higher = more creative, lower = more focused",
+                    )
+                    max_tokens = gr.Slider(
+                        minimum=128,
+                        maximum=4096,
+                        step=64,
+                        value=1024,
+                        label="Max Tokens",
+                        info="Maximum length of response",
+                    )
+                with gr.Row():
+                    top_p = gr.Slider(
+                        minimum=0.1,
+                        maximum=1.0,
+                        step=0.05,
+                        value=1.0,
+                        label="Top-p (Nucleus Sampling)",
+                        info="1.0 = disabled, lower = more focused",
+                    )
+                    repetition_penalty = gr.Slider(
+                        minimum=1.0,
+                        maximum=2.0,
+                        step=0.05,
+                        value=1.0,
+                        label="Repetition Penalty",
+                        info="1.0 = disabled, higher = less repetition",
+                    )
+                with gr.Row():
+                    system_prompt = gr.Textbox(
+                        label="System Prompt (optional)",
+                        placeholder="You are a helpful assistant...",
+                        lines=2,
+                        max_lines=4,
+                    )
 
-    gr.ChatInterface(
+        with gr.Column(scale=1, min_width=200):
+            with gr.Row():
+                stop_btn = gr.Button("⏹️ Stop", variant="stop", size="sm")
+                clear_btn = gr.Button("🗑️ New Chat", variant="secondary", size="sm")
+
+    # Chatbot component
+    chatbot = gr.Chatbot(
+        height=chatbot_height,
+        scale=1,
+        buttons=["copy", "copy_all"],
+        placeholder="Upload an image and ask questions about it, or just chat!",
+    )
+
+    # Chat interface
+    chat_interface = gr.ChatInterface(
         fn=chat,
-        additional_inputs=[temperature, max_tokens],
+        additional_inputs=[
+            temperature,
+            max_tokens,
+            top_p,
+            repetition_penalty,
+            system_prompt,
+        ],
         multimodal=True,
         fill_height=True,
         chatbot=chatbot,
     )
 
-demo.launch(inbrowser=True)
+    # Connect buttons
+    stop_btn.click(fn=stop_generating, outputs=[stop_btn])
+    clear_btn.click(fn=clear_chat, outputs=[chatbot, chat_interface.textbox])
+
+
+def main():
+    demo.launch(inbrowser=True, theme=theme)
+
+
+if __name__ == "__main__":
+    main()
