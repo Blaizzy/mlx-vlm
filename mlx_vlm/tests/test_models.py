@@ -70,7 +70,7 @@ class TestModels(unittest.TestCase):
                 )
 
             batch_size = kwargs.pop("batch_size", 1)
-            if model_type in ["qwen2_5_vl", "glm4v_moe", "glm4v"]:
+            if model_type in ["qwen2_5_vl", "glm4v_moe", "glm4v", "hunyuan_vl"]:
                 input_tensor = mx.random.uniform(shape=(image_size[0], image_size[1]))
             else:
                 shape = (
@@ -1783,6 +1783,110 @@ class TestModels(unittest.TestCase):
         )
 
         # TODO: Add test for vision model. Ensure I can pass input type and shapes.
+
+    def test_hunyuan_vl(self):
+        from mlx_vlm.models import hunyuan_vl
+
+        text_config = hunyuan_vl.TextConfig(
+            model_type="hunyuan_vl",
+            vocab_size=120818,
+            org_vocab_size=120818,
+            hidden_size=1024,
+            num_hidden_layers=6,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=128,
+            attention_head_dim=128,
+            intermediate_size=3584,
+            hidden_act="silu",
+            attention_bias=False,
+            mlp_bias=False,
+            attention_dropout=0.0,
+            use_qk_norm=True,
+            rope_theta=10000.0,
+            rope_scaling={
+                "alpha": 1000.0,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 1.0,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "type": "xdrope",
+                "xdrope_section": [16, 16, 16, 16],
+            },
+            max_position_embeddings=32768,
+            rms_norm_eps=1e-5,
+            norm_type="rms",
+            tie_word_embeddings=True,
+            use_cache=True,
+            initializer_range=0.02,
+            routed_scaling_factor=1.0,
+            bos_token_id=120000,
+            eos_token_id=120020,
+            eod_token_id=120020,
+            pad_token_id=-1,
+            pad_id=120002,
+        )
+
+        vision_config = hunyuan_vl.VisionConfig(
+            model_type="hunyuan_vl",
+            hidden_size=1152,
+            out_hidden_size=1024,
+            num_hidden_layers=5,
+            num_attention_heads=16,
+            intermediate_size=4304,
+            patch_size=16,
+            num_channels=3,
+            spatial_merge_size=2,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            rms_norm_eps=1e-5,
+            interpolate_mode="bilinear",
+            cat_extra_token=1,
+            img_max_token_num=4096,
+            max_vit_seq_len=16384,
+            add_patchemb_bias=True,
+            max_image_size=2048,
+            hidden_act="gelu",
+        )
+
+        config = hunyuan_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="hunyuan_vl",
+            image_token_id=120120,
+            image_start_token_id=120118,
+            image_end_token_id=120119,
+            image_newline_token_id=120121,
+            bos_token_id=120000,
+            eos_token_id=120020,
+            pad_token_id=-1,
+            pad_id=120002,
+            vocab_size=120818,
+            org_vocab_size=120818,
+            tie_word_embeddings=True,
+        )
+
+        model = hunyuan_vl.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.out_hidden_size,
+            config.vision_config.num_channels,
+            (1080, 768),
+            vision_feature_layer=-1,
+            grid_thw=mx.array(
+                [[1, 18, 60]], dtype=mx.int64
+            ),  # image temporals shape (num_images, 3)
+        )
 
 
 if __name__ == "__main__":

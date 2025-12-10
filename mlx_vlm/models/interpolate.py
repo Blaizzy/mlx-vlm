@@ -181,6 +181,3 @@ def resize_bilinear(image, new_size, align_corners=False, antialias=True):
 
     else:
         raise ValueError("Unsupported image dimensions.")
-
-
-#
