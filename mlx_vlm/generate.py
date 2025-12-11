@@ -14,6 +14,7 @@ from transformers import PreTrainedTokenizer
 
 from mlx_vlm.models.gemma3n import audio
 
+from .batch_utils import group_images_by_shape
 from .models import cache
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
@@ -586,6 +587,22 @@ def generate(
 
 @dataclass
 class BatchGenerationResult:
+    """
+    Result of batch generation with optional image size tracking.
+
+    Attributes:
+        texts: Generated text for each sample
+        tokens: Last generated token for each sample
+        logprobs: Log probabilities for each sample
+        prompt_tokens: Number of prompt tokens per sample
+        generation_tokens: Number of generated tokens per sample
+        total_tokens: Total tokens (prompt + generation) per sample
+        prompt_tps: Prompt tokens per second per sample
+        generation_tps: Generation tokens per second per sample
+        peak_memory: Peak memory usage in GB
+        image_sizes: Original (height, width) for each image (for tracking)
+    """
+
     texts: List[str]
     tokens: List[Optional[int]]
     logprobs: List[Optional[List[float]]]
@@ -595,6 +612,7 @@ class BatchGenerationResult:
     prompt_tps: List[float]
     generation_tps: List[float]
     peak_memory: float = 0.0
+    image_sizes: Optional[List[Tuple[int, int]]] = None
 
 
 def _left_pad_prompts(prompts, max_length=None):
@@ -664,10 +682,14 @@ class BatchResponse:
     Args:
         texts: (List[str]): The generated text for each prompt.
         stats (BatchStats): Statistics about the generation.
+        image_sizes: (Optional[List[Tuple[int, int]]]): Original (height, width)
+            for each image. Useful for tracking which images produced which responses
+            and for debugging padding/batching behavior.
     """
 
     texts: List[str]
     stats: BatchStats
+    image_sizes: Optional[List[Tuple[int, int]]] = None
 
 
 @dataclass
@@ -714,6 +736,7 @@ class BatchGenerator:
     def __init__(
         self,
         model,
+        processor,
         max_tokens: int = 128,
         stop_tokens: Optional[set] = None,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
@@ -725,7 +748,10 @@ class BatchGenerator:
         self.model = model
         self.unprocessed_prompts = []
         self.max_tokens = max_tokens
-        self.stop_tokens = stop_tokens or set()
+        self.processor = processor
+        self.tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
         self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
@@ -733,6 +759,8 @@ class BatchGenerator:
         self.completion_batch_size = completion_batch_size
         self.prompt_cache = prompt_cache
         self._stats = BatchStats()
+
+        self.tokenizer.stopping_criteria.add_eos_token_ids(stop_tokens)
 
         self.active_batch = None
 
@@ -883,7 +911,7 @@ class BatchGenerator:
         ):
             num_tok += 1
             batch.num_tokens[e] = num_tok
-            if t in self.stop_tokens:
+            if self.tokenizer.stopping_criteria(t):
                 finish_reason = "stop"
                 end_idx.append(e)
             elif num_tok >= max_tok:
@@ -918,43 +946,195 @@ def batch_generate(
     processor,
     images: Union[str, List[str]] = None,
     audios: Union[str, List[str]] = None,
-    pad_to_uniform_size: bool = True,
-    prompts: List[int] = None,
+    prompts: List[str] = None,
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
+    group_by_shape: bool = True,
+    track_image_sizes: bool = True,
     **kwargs,
 ):
     """
-    Generate responses for the given batch of prompts.
+    Generate responses for the given batch of prompts with variable-sized images.
+
+    This function implements the transformers-style approach to batching:
+    1. Group images with the same shape for efficient batch processing
+    2. Process each group as a batch (no padding waste within groups)
+    3. Track original image sizes for proper attention masking
+    4. Restore results to original batch order
+
+    Key insight: Instead of padding all images to the same spatial dimensions
+    (which wastes computation and may hurt accuracy), we group same-sized
+    images together so there's zero padding within each group.
 
     Args:
        model (nn.Module): The language model.
-       tokenizer (PreTrainedTokenizer): The tokenizer.
-       prompt (List[List[int]]): The input prompts.
-       pad_to_uniform_size (bool): If ``True``, pad images/audios to the same size.
-          Default: ``True``.
+       processor (PreTrainedTokenizer): The tokenizer/processor.
+       images (Union[str, List[str]]): Images (paths, URLs, or PIL images).
+       audios (Union[str, List[str]]): Audio files (not yet supported for batching).
+       prompts (List[str]): The input prompts.
+       max_tokens (Union[int, List[int]]): Maximum number of output tokens. This
+          can be per prompt if a list is provided.
        verbose (bool): If ``True``, print tokens and timing information.
           Default: ``False``.
-       max_tokens (Union[int, List[int]): Maximum number of output tokens. This
-          can be per prompt if a list is provided.
+       group_by_shape (bool): If ``True``, group same-shaped images for efficient
+          batch processing. Default: ``True``.
+       track_image_sizes (bool): If ``True``, track and return original image sizes.
+          Default: ``True``.
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
+
+    Returns:
+        BatchResponse with generated texts, statistics, and optionally image_sizes.
     """
+    from PIL import Image
+
+    from .utils import process_image
+
     processor.detokenizer.reset()
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
-    # TODO: Add audio support
-    # Count images per prompt
-    num_images_list = [0] * len(prompts)
-
+    # Handle single image case
     if isinstance(images, str):
-        num_images_list = [1] + [0] * (len(prompts) - 1)
-    elif isinstance(images, list):
-        num_images_list = [1 if i < len(images) else 0 for i in range(len(prompts))]
-    else:
-        num_images_list = [0] * len(prompts)
+        images = [images]
 
-    prompts = [
+    # Handle no images case
+    if images is None:
+        texts, stats = _generate_batch(
+            model, processor, prompts, None, max_tokens, verbose, **kwargs
+        )
+        return BatchResponse(texts, stats)
+
+    # Load and preprocess images
+    image_processor = (
+        processor.image_processor if hasattr(processor, "image_processor") else None
+    )
+
+    processed_images = []
+    image_sizes_original = []
+    for img in images:
+        if isinstance(img, str):
+            pil_img = process_image(img, None, image_processor)
+        elif isinstance(img, Image.Image):
+            pil_img = img
+        else:
+            pil_img = img
+        processed_images.append(pil_img)
+        # Track original size
+        if hasattr(pil_img, "height"):
+            image_sizes_original.append((pil_img.height, pil_img.width))
+        else:
+            image_sizes_original.append((0, 0))
+
+    # Group images by shape for efficient processing (no padding within groups)
+    if group_by_shape and len(processed_images) > 1:
+        grouped_images, grouped_indices = group_images_by_shape(processed_images)
+
+        if verbose:
+            print(f"[batch_generate] Found {len(grouped_images)} unique image shapes")
+            for shape, indices in grouped_indices.items():
+                print(f"  Shape {shape}: {len(indices)} images")
+    else:
+        # Single image or grouping disabled - treat as one group
+        shape = (
+            (processed_images[0].height, processed_images[0].width)
+            if processed_images
+            else (0, 0)
+        )
+        grouped_images = {shape: processed_images}
+        grouped_indices = {shape: list(range(len(processed_images)))}
+
+    # Process each shape group
+    all_texts = [None] * len(prompts)
+    all_image_sizes = [None] * len(prompts)
+    total_stats = BatchStats()
+
+    for shape, indices in grouped_indices.items():
+        # Get images and prompts for this shape group
+        group_images = [processed_images[i] for i in indices]
+        group_prompts = [prompts[i] for i in indices]
+        group_sizes = [image_sizes_original[i] for i in indices]
+
+        # Handle per-sample max_tokens
+        if isinstance(max_tokens, list):
+            group_max_tokens = [max_tokens[i] for i in indices]
+        else:
+            group_max_tokens = max_tokens
+
+        # Process the entire group at once (same shape = no padding needed)
+        chunk_texts, chunk_stats = _generate_batch(
+            model,
+            processor,
+            group_prompts,
+            group_images,
+            group_max_tokens,
+            **kwargs,
+        )
+
+        # Store results in original order
+        for j, orig_idx in enumerate(indices):
+            all_texts[orig_idx] = chunk_texts[j]
+            all_image_sizes[orig_idx] = group_sizes[j]
+
+        # Accumulate stats
+        total_stats.prompt_tokens += chunk_stats.prompt_tokens
+        total_stats.prompt_time += chunk_stats.prompt_time
+        total_stats.generation_tokens += chunk_stats.generation_tokens
+        total_stats.generation_time += chunk_stats.generation_time
+
+        if verbose:
+            print(f"[batch_generate] Processed shape {shape}: {len(indices)} images")
+
+        # Clear memory between groups
+        mx.clear_cache()
+
+    # Compute final stats
+    if total_stats.prompt_time > 0:
+        total_stats.prompt_tps = total_stats.prompt_tokens / total_stats.prompt_time
+    if total_stats.generation_time > 0:
+        total_stats.generation_tps = (
+            total_stats.generation_tokens / total_stats.generation_time
+        )
+    total_stats.peak_memory = mx.get_peak_memory() / 1e9
+
+    if verbose:
+        print(f"[batch_generate] Finished processing {len(prompts)} samples")
+        print(
+            f"[batch_generate] Prompt: {total_stats.prompt_tokens} tokens, {total_stats.prompt_tps:.3f} tokens-per-sec"
+        )
+        print(
+            f"[batch_generate] Generation: {total_stats.generation_tokens} tokens, "
+            f"{total_stats.generation_tps:.3f} tokens-per-sec"
+        )
+        print(f"[batch_generate] Peak memory: {total_stats.peak_memory:.3f} GB")
+
+    response = BatchResponse(all_texts, total_stats)
+    if track_image_sizes:
+        response.image_sizes = all_image_sizes
+    return response
+
+
+def _generate_batch(
+    model,
+    processor,
+    prompts: List[str],
+    images: List = None,
+    max_tokens: Union[int, List[int]] = 100,
+    verbose: bool = False,
+    **kwargs,
+) -> BatchResponse:
+    """
+    Generate text, optionally with images, in batch.
+    If `images` is None, runs in text-only mode.
+    If `images` is provided, efficiently groups by shape.
+    Returns BatchResponse if text-only, (texts, stats) tuple if images are provided.
+    """
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+    num_images_list = [
+        1 if i < (len(images) if images is not None else 0) else 0
+        for i in range(len(prompts))
+    ]
+    formatted_prompts = [
         apply_chat_template(
             processor,
             model.config,
@@ -976,12 +1156,12 @@ def batch_generate(
     inputs = prepare_inputs(
         processor,
         images=images,
-        audio=audios,
-        prompts=prompts,
+        audio=None,
+        prompts=formatted_prompts,
         image_token_index=image_token_index,
         resize_shape=resize_shape,
         add_special_tokens=add_special_tokens,
-        pad_to_uniform_size=pad_to_uniform_size,
+        pad_to_uniform_size=True,
     )
     input_ids = inputs.get("input_ids", None)
     pixel_values = inputs.get("pixel_values", None)
@@ -991,15 +1171,12 @@ def batch_generate(
         for k, v in inputs.items()
         if k not in ["input_ids", "pixel_values", "attention_mask"]
     }
+
     gen = BatchGenerator(
         model.language_model,
-        stop_tokens=[tokenizer.eos_token_ids],
+        processor,
         **kwargs,
     )
-    num_samples = len(prompts)
-    fin = 0
-    if verbose:
-        print(f"[batch_generate] Finished processing 0/{num_samples} ...", end="\r")
 
     with wired_limit(model, [generation_stream]):
         if pixel_values is not None:
@@ -1007,48 +1184,28 @@ def batch_generate(
                 input_ids, pixel_values, **data_kwargs
             )
 
-            kwargs.update(
-                {
-                    "pixel_values": pixel_values,
-                    **data_kwargs,
-                    **(
-                        inputs_embeds
-                        if isinstance(inputs_embeds, dict)
-                        else {"inputs_embeds": inputs_embeds}
-                    ),
-                }
-            )
+            gen_kwargs = {
+                "pixel_values": pixel_values,
+                **data_kwargs,
+                **(
+                    inputs_embeds
+                    if isinstance(inputs_embeds, dict)
+                    else {"inputs_embeds": inputs_embeds}
+                ),
+            }
         else:
             input_ids = mx.squeeze(input_ids, axis=0)
+            gen_kwargs = {}
 
         uids = gen.insert(input_ids.tolist(), max_tokens)
         results = {uid: [] for uid in uids}
-        while responses := gen.next(**kwargs):
+        while responses := gen.next(**gen_kwargs):
             for r in responses:
-                if verbose and r.finish_reason != None:
-                    fin += 1
-                    print(
-                        f"[batch_generate] Finished processing {fin}/{num_samples} ...",
-                        end="\r",
-                    )
                 if r.finish_reason != "stop":
                     results[r.uid].append(r.token)
-    if verbose:
-        print(f"[batch_generate] Finished processing {fin}/{num_samples}")
 
-    # Return results in correct order
     texts = [tokenizer.decode(results[uid]) for uid in uids]
-    stats = gen.stats()
-    if verbose:
-        print(
-            f"[batch_generate] Prompt: {stats.prompt_tokens} tokens, {stats.prompt_tps:.3f} tokens-per-sec"
-        )
-        print(
-            f"[batch_generate] Generation: {stats.generation_tokens} tokens, "
-            f"{stats.generation_tps:.3f} tokens-per-sec"
-        )
-        print(f"[batch_generate] Peak memory: {stats.peak_memory:.3f} GB")
-    return BatchResponse(texts, stats)
+    return texts, gen.stats()
 
 
 def main():

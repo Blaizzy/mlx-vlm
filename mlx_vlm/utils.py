@@ -6,7 +6,7 @@ import logging
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -23,6 +23,12 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
+from .batch_utils import (
+    group_images_by_shape,
+    pad_pixel_values_for_batching,
+    sort_images_by_size,
+    unsort_results,
+)
 from .models.base import BaseImageProcessor
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
@@ -829,26 +835,52 @@ def prepare_inputs(
         )
         images = [process_image(img, resize_shape, image_processor) for img in images]
 
-        # Pad all images to the size of the largest
+        # For batching, we need uniform image sizes. Instead of padding to the
+        # largest image (which adds white borders that hurt accuracy), we resize
+        # all images to the model's expected input size.
         if len(images) > 1 and pad_to_uniform_size:
-            max_width = max(img.width for img in images)
-            max_height = max(img.height for img in images)
+            # Get target size from image processor if available
+            target_size = None
+            if image_processor is not None and hasattr(image_processor, "size"):
+                size = image_processor.size
+                if isinstance(size, tuple):
+                    target_size = size
+                elif isinstance(size, dict):
+                    target_size = (size.get("height", 384), size.get("width", 384))
+                elif isinstance(size, int):
+                    target_size = (size, size)
 
-            padded_images = []
-            for img in images:
-                if img.width != max_width or img.height != max_height:
-                    # Create a new image with the max dimensions, filled with black
-                    padded_img = Image.new(
-                        "RGB", (max_width, max_height), (255, 255, 255)
-                    )
-                    # Center the original image
-                    x_offset = (max_width - img.width) // 2
-                    y_offset = (max_height - img.height) // 2
-                    padded_img.paste(img, (x_offset, y_offset))
-                    padded_images.append(padded_img)
-                else:
-                    padded_images.append(img)
-            images = padded_images
+            if target_size is not None:
+                # Resize all images to the target size
+                resized_images = []
+                for img in images:
+                    if img.size != (
+                        target_size[1],
+                        target_size[0],
+                    ):  # PIL uses (width, height)
+                        img = img.resize(
+                            (target_size[1], target_size[0]), Image.Resampling.BICUBIC
+                        )
+                    resized_images.append(img)
+                images = resized_images
+            else:
+                # Fallback: pad to largest size (original behavior)
+                max_width = max(img.width for img in images)
+                max_height = max(img.height for img in images)
+
+                padded_images = []
+                for img in images:
+                    if img.width != max_width or img.height != max_height:
+                        padded_img = Image.new(
+                            "RGB", (max_width, max_height), (255, 255, 255)
+                        )
+                        x_offset = (max_width - img.width) // 2
+                        y_offset = (max_height - img.height) // 2
+                        padded_img.paste(img, (x_offset, y_offset))
+                        padded_images.append(padded_img)
+                    else:
+                        padded_images.append(img)
+                images = padded_images
 
     # Process audio
     if audio is not None:
@@ -930,6 +962,236 @@ def prepare_inputs(
                     model_inputs[key] = mx.array(value)
 
     return model_inputs
+
+
+def prepare_batched_inputs(
+    processor,
+    images: List,
+    prompts: List[str],
+    image_token_index: Optional[int] = None,
+    resize_shape: Optional[Tuple[int, int]] = None,
+    add_special_tokens: bool = False,
+    group_by_shape: bool = True,
+    **kwargs,
+) -> Dict[str, Any]:
+    """
+    Prepare batched inputs for VLM generation with variable-sized images.
+
+    This function implements the transformers-style approach:
+    1. Sort images by size to group similar dimensions
+    2. Group images with same shapes for efficient batch processing
+    3. Track original image sizes for proper attention masking
+    4. Handle text tokenization with proper padding
+
+    Args:
+        processor: HuggingFace processor with tokenizer and image_processor
+        images: List of images (PIL, paths, or URLs)
+        prompts: List of text prompts (one per image)
+        image_token_index: Token ID for image placeholder
+        resize_shape: Optional (height, width) to resize all images
+        add_special_tokens: Whether to add special tokens during tokenization
+        group_by_shape: If True, group same-shaped images for efficiency
+        max_batch_size: Maximum images to process in one batch
+        **kwargs: Additional arguments passed to processor
+
+    Returns:
+        Dict containing:
+            - input_ids: Tokenized and padded input IDs [batch_size, seq_len]
+            - pixel_values: Processed pixel values
+            - attention_mask: Text attention mask [batch_size, seq_len]
+            - image_sizes: Original (height, width) for each image
+            - image_attention_mask: Mask for padded image regions (if applicable)
+            - sorted_indices: Indices to restore original order
+    """
+    if not images or not prompts:
+        raise ValueError("Both images and prompts must be non-empty")
+
+    if len(images) != len(prompts):
+        raise ValueError(
+            f"Number of images ({len(images)}) must match prompts ({len(prompts)})"
+        )
+
+    batch_size = len(images)
+
+    # Get image processor
+    image_processor = (
+        processor.image_processor if hasattr(processor, "image_processor") else None
+    )
+
+    # Process images (load from URLs/paths if needed)
+    processed_images = []
+    for img in images:
+        if isinstance(img, str):
+            img = load_image(img)
+        elif not isinstance(img, Image.Image):
+            # Assume it's already processed
+            processed_images.append(img)
+            continue
+        processed_images.append(img)
+
+    # Track original sizes before any resizing
+    original_sizes = [
+        (img.height, img.width) if isinstance(img, Image.Image) else (0, 0)
+        for img in processed_images
+    ]
+
+    # Sort images by size for better batching (similar sizes together = less padding)
+    if group_by_shape and batch_size > 1:
+        sorted_images, sorted_indices = sort_images_by_size(processed_images)
+        sorted_prompts = [prompts[i] for i in sorted_indices]
+        sorted_sizes = [original_sizes[i] for i in sorted_indices]
+    else:
+        sorted_images = processed_images
+        sorted_prompts = prompts
+        sorted_sizes = original_sizes
+        sorted_indices = list(range(batch_size))
+
+    # Apply resize if specified
+    if resize_shape is not None and not isinstance(image_processor, BaseImageProcessor):
+        sorted_images = [resize_image(img, resize_shape) for img in sorted_images]
+
+    # Group images by shape for efficient processing
+    if group_by_shape and batch_size > 1:
+        grouped_images, grouped_indices = group_images_by_shape(sorted_images)
+
+        # Process each group
+        all_pixel_values = []
+        for shape, group_imgs in grouped_images.items():
+            group_indices = grouped_indices[shape]
+
+            # Process this group of same-sized images
+            if hasattr(processor, "image_processor") and isinstance(
+                processor.image_processor, BaseImageProcessor
+            ):
+                pv = processor.image_processor.preprocess(images=group_imgs)
+                pv = mx.array(np.stack(pv))
+            else:
+                # Use processor directly for each image in group
+                # Process as individual images and stack
+                group_pv = []
+                for img in group_imgs:
+                    try:
+                        result = processor.image_processor(
+                            images=[img], return_tensors="np"
+                        )
+                        pv = result.get("pixel_values", result.get("images"))
+                        group_pv.append(pv[0])  # Remove batch dim
+                    except Exception:
+                        # Fallback
+                        group_pv.append(np.array(img))
+                pv = mx.array(np.stack(group_pv))
+
+            # Store with indices for reordering
+            for i, idx in enumerate(group_indices):
+                all_pixel_values.append((idx, pv[i] if pv.ndim > 3 else pv))
+
+        # Sort by index to restore order
+        all_pixel_values.sort(key=lambda x: x[0])
+        pixel_values_list = [pv for _, pv in all_pixel_values]
+
+        # Pad pixel values to create uniform batch
+        pixel_values, _ = pad_pixel_values_for_batching(pixel_values_list)
+    else:
+        # Single image or no grouping - use standard processing
+        if hasattr(processor, "image_processor") and isinstance(
+            processor.image_processor, BaseImageProcessor
+        ):
+            pixel_values = processor.image_processor.preprocess(images=sorted_images)
+            pixel_values = mx.array(np.stack(pixel_values))
+        else:
+            result = process_inputs_with_fallback(
+                processor,
+                prompts=sorted_prompts,
+                images=sorted_images,
+                audio=None,
+                add_special_tokens=add_special_tokens,
+                return_tensors="mlx",
+                **kwargs,
+            )
+            pixel_values = result.get("pixel_values", result.get("images"))
+            if pixel_values is not None and not isinstance(pixel_values, mx.array):
+                pixel_values = mx.array(pixel_values)
+
+    # Tokenize prompts
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Use left padding for generation (recommended by transformers)
+    original_padding_side = getattr(tokenizer, "padding_side", "right")
+    tokenizer.padding_side = "left"
+
+    try:
+        # Tokenize with padding
+        if hasattr(processor, "image_processor") and isinstance(
+            processor.image_processor, BaseImageProcessor
+        ):
+            # Custom image processor - need to handle image tokens manually
+            text_chunks = [
+                [processor(chunk).input_ids for chunk in prompt.split("<image>")]
+                for prompt in sorted_prompts
+            ]
+
+            max_length = max(
+                sum(len(chunk) for chunk in chunks) + 1 for chunks in text_chunks
+            )
+
+            input_ids = []
+            attention_masks = []
+            for chunks in text_chunks:
+                ids = (
+                    chunks[0] + [image_token_index] + chunks[1]
+                    if len(chunks) > 1
+                    else chunks[0]
+                )
+                padding_length = max_length - len(ids)
+                # Left pad
+                padded_ids = [processor.tokenizer.pad_token_id] * padding_length + ids
+                mask = [0] * padding_length + [1] * len(ids)
+                input_ids.append(padded_ids)
+                attention_masks.append(mask)
+
+            input_ids = mx.array(input_ids)
+            attention_mask = mx.array(attention_masks)
+        else:
+            # Standard tokenization
+            tokenized = tokenizer(
+                sorted_prompts,
+                padding=True,
+                return_tensors="np",
+                add_special_tokens=add_special_tokens,
+            )
+            input_ids = mx.array(tokenized["input_ids"])
+            attention_mask = mx.array(tokenized["attention_mask"])
+    finally:
+        # Restore original padding side
+        tokenizer.padding_side = original_padding_side
+
+    # Build result
+    result = {
+        "input_ids": input_ids,
+        "pixel_values": pixel_values,
+        "attention_mask": attention_mask,
+        "image_sizes": sorted_sizes,
+        "sorted_indices": sorted_indices,
+    }
+
+    return result
+
+
+def restore_batch_order(results: List, sorted_indices: List[int]) -> List:
+    """
+    Restore results to original batch order after processing.
+
+    Args:
+        results: Results in sorted order
+        sorted_indices: Indices from prepare_batched_inputs
+
+    Returns:
+        Results in original batch order
+    """
+    return unsort_results(results, sorted_indices)
 
 
 class StoppingCriteria:
