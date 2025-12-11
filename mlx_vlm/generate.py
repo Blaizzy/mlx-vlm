@@ -1084,8 +1084,7 @@ def batch_generate(
         if verbose:
             print(f"[batch_generate] Processed shape {shape}: {len(indices)} images")
 
-        # Clear memory between groups
-        mx.clear_cache()
+    mx.clear_cache()
 
     # Compute final stats
     if total_stats.prompt_time > 0:
