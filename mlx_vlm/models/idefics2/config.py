@@ -7,29 +7,30 @@ from ..base import BaseModelConfig
 @dataclass
 class VisionConfig(BaseModelConfig):
     model_type: str
-    hidden_size: int
-    intermediate_size: int
-    num_hidden_layers: int
-    num_attention_heads: int
-    image_size: int
-    patch_size: int
-    layer_norm_eps: float = 1e-6
+    hidden_size: int = 4096
+    intermediate_size: int = 14336
+    num_hidden_layers: int = 32
+    num_attention_heads: int = 32
+    num_key_value_heads: int = 8
     num_channels: int = 3
+    image_size: int = 224
+    patch_size: int = 32
+    layer_norm_eps: float = 1e-6
 
 
 @dataclass
 class TextConfig(BaseModelConfig):
     model_type: str
-    hidden_size: int
-    num_hidden_layers: int
-    intermediate_size: int
-    num_attention_heads: int
-    rms_norm_eps: float
-    vocab_size: int
-    num_key_value_heads: int
+    hidden_size: int = 4096
+    intermediate_size: int = 14336
+    num_hidden_layers: int = 32
+    num_attention_heads: int = 32
+    num_key_value_heads: int = 8
+    rms_norm_eps: float = 1e-5
+    vocab_size: int = 32003
     rope_theta: float = 1000000.0
     rope_traditional: bool = False
-    max_position_embeddings: int = 4096
+    max_position_embeddings: int = 32768
     tie_word_embeddings: bool = False
 
     def __post_init__(self):
