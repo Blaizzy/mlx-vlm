@@ -1121,14 +1121,27 @@ def _generate_batch(
     max_tokens: Union[int, List[int]] = 100,
     verbose: bool = False,
     **kwargs,
-) -> BatchResponse:
+) -> Tuple[List[str], BatchStats]:
     """
     Generate text, optionally with images, in batch.
-    If `images` is None, runs in text-only mode.
-    If `images` is provided, efficiently groups by shape.
-    Returns BatchResponse if text-only, (texts, stats) tuple if images are provided.
+
+    All images in this batch should have the same shape (pre-grouped by caller).
+    This ensures no padding is needed within the batch for maximum accuracy.
+
+    Args:
+        model: The VLM model
+        processor: The processor with tokenizer and image processor
+        prompts: List of text prompts
+        images: List of images (should all be same shape)
+        max_tokens: Maximum tokens to generate
+        verbose: Print debug info
+        **kwargs: Additional arguments for BatchGenerator
+
+    Returns:
+        Tuple of (texts, stats)
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    batch_size = len(prompts)
 
     num_images_list = [
         1 if i < (len(images) if images is not None else 0) else 0
@@ -1172,9 +1185,12 @@ def _generate_batch(
         if k not in ["input_ids", "pixel_values", "attention_mask"]
     }
 
+    # Use batch_size for prefill and completion to ensure consistent processing
     gen = BatchGenerator(
         model.language_model,
         processor,
+        prefill_batch_size=batch_size,
+        completion_batch_size=batch_size,
         **kwargs,
     )
 
