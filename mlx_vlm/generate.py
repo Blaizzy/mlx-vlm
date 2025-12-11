@@ -14,11 +14,16 @@ from transformers import PreTrainedTokenizer
 
 from mlx_vlm.models.gemma3n import audio
 
-from .batch_utils import group_images_by_shape
 from .models import cache
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
-from .utils import StoppingCriteria, apply_repetition_penalty, load, prepare_inputs
+from .utils import (
+    StoppingCriteria,
+    apply_repetition_penalty,
+    group_images_by_shape,
+    load,
+    prepare_inputs,
+)
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
@@ -1121,24 +1126,7 @@ def _generate_batch(
     verbose: bool = False,
     **kwargs,
 ) -> Tuple[List[str], BatchStats]:
-    """
-    Generate text, optionally with images, in batch.
 
-    All images in this batch should have the same shape (pre-grouped by caller).
-    This ensures no padding is needed within the batch for maximum accuracy.
-
-    Args:
-        model: The VLM model
-        processor: The processor with tokenizer and image processor
-        prompts: List of text prompts
-        images: List of images (should all be same shape)
-        max_tokens: Maximum tokens to generate
-        verbose: Print debug info
-        **kwargs: Additional arguments for BatchGenerator
-
-    Returns:
-        Tuple of (texts, stats)
-    """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     batch_size = len(prompts)
 
