@@ -1036,8 +1036,6 @@ def batch_generate(
 
         if verbose:
             print(f"[batch_generate] Found {len(grouped_images)} unique image shapes")
-            for shape, indices in grouped_indices.items():
-                print(f"  Shape {shape}: {len(indices)} images")
     else:
         # Single image or grouping disabled - treat as one group
         shape = (
@@ -1085,9 +1083,6 @@ def batch_generate(
         total_stats.prompt_time += chunk_stats.prompt_time
         total_stats.generation_tokens += chunk_stats.generation_tokens
         total_stats.generation_time += chunk_stats.generation_time
-
-        if verbose:
-            print(f"[batch_generate] Processed shape {shape}: {len(indices)} images")
 
     mx.clear_cache()
 
