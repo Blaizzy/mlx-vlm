@@ -9,6 +9,21 @@ from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
 
+try:
+    from transformers import AutoImageProcessor, AutoProcessor
+
+    from .processing_hunyuan_vl import HunYuanVLImageProcessor, HunYuanVLProcessor
+
+    MODEL_TYPE = "hunyuan_vl"
+
+    AutoImageProcessor.register(
+        MODEL_TYPE, slow_image_processor_class=HunYuanVLImageProcessor
+    )
+    AutoProcessor.register(MODEL_TYPE, HunYuanVLProcessor)
+
+except Exception as e:
+    raise e
+
 
 class Model(nn.Module):
 

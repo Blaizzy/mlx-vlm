@@ -598,23 +598,6 @@ def split_image_into_patch_blocks(
 ImageProcessor = HunYuanVLImageProcessor
 
 
-# Register with AutoProcessor so load() can find our custom processor
-try:
-    from transformers import AutoImageProcessor, AutoProcessor
-
-    MODEL_TYPE = "hunyuan_vl"
-
-    AutoImageProcessor.register(
-        MODEL_TYPE, slow_image_processor_class=HunYuanVLImageProcessor
-    )
-    AutoProcessor.register(MODEL_TYPE, HunYuanVLProcessor)
-
-    logger.info(f"Registered custom processor classes for model type '{MODEL_TYPE}'.")
-except Exception as e:
-    # Registration may fail if transformers version doesn't support it
-    pass
-
-
 __all__ = [
     "HunYuanVLImageProcessor",
     "HunYuanVLProcessor",
