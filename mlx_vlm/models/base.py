@@ -1,11 +1,13 @@
 import inspect
 import math
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.base import create_attention_mask, scaled_dot_product_attention
+from mlx_lm.models.cache import RotatingKVCache
 from PIL import Image
 from transformers.image_processing_utils import BaseImageProcessor as ImageProcessor
 from transformers.image_processing_utils import get_size_dict
