@@ -154,7 +154,7 @@ class Model(nn.Module):
         if (
             self.sam_model is not None
             and (input_ids.shape[1] != 1 or self.training)
-            and mx.sum(pixel_values[0][1]).item() != 0
+            and mx.sum(pixel_values[1]).item() != 0
         ):
 
             idx = 0
