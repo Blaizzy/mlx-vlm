@@ -6,6 +6,7 @@ from mlx_lm.models.cache import (
     ArraysCache,
     BatchKVCache,
     BatchRotatingKVCache,
+    ChunkedKVCache,
     KVCache,
     RotatingKVCache,
     _BaseCache,

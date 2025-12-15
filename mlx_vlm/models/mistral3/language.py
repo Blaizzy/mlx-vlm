@@ -172,8 +172,11 @@ class Ministral3(nn.Module):
         else:
             h = self.embed_tokens(inputs)
 
+        if cache is None:
+            cache = [None] * len(self.layers)
+
         cache_offset = 0
-        if cache and cache[0] is not None:
+        if cache[0] is not None:
             offset = cache[0].offset
             if isinstance(offset, int):
                 cache_offset = offset
