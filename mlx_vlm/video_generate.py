@@ -5,7 +5,6 @@ import base64
 import logging
 import math
 import os
-import sys
 import time
 from io import BytesIO
 from typing import List

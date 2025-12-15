@@ -3,7 +3,6 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,

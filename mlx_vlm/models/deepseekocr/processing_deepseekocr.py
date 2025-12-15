@@ -4,16 +4,13 @@ From https://github.com/deepseek-ai/DeepSeek-VL2
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
 from PIL import Image, ImageOps
 from transformers import LlamaTokenizerFast
 from transformers.processing_utils import ProcessorMixin
-
-from .conversation import get_conv_template
 
 
 def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):

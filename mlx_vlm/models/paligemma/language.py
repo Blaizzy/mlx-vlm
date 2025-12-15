@@ -1,5 +1,4 @@
-import inspect
-from typing import Optional, Tuple
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn

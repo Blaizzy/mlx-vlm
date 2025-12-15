@@ -1,7 +1,4 @@
-import inspect
-import math
-from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -9,8 +6,7 @@ import numpy as np
 
 from ..base import LanguageModelOutput, create_attention_mask
 from ..cache import KVCache
-from .config import ModelConfig, TextConfig
-from .language import LanguageModel
+from .config import TextConfig
 from .su_rope import Phi3SuScaledRotaryEmbedding
 from .vision import VisionModel
 

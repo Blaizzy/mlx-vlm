@@ -7,13 +7,10 @@ from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Tuple
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
 from PIL import Image, ImageOps
 from transformers import LlamaTokenizerFast
 from transformers.processing_utils import ProcessorMixin
-
-from .conversation import get_conv_template
 
 
 def select_best_resolution(image_size, candidate_resolutions):

@@ -7,8 +7,6 @@ import numpy as np
 from PIL import Image
 from PIL.Image import Resampling
 
-from .config import SAMViTCfg
-
 
 class MLPBlock(nn.Module):
     def __init__(

@@ -1,15 +1,10 @@
-import copy
-import inspect
-from dataclasses import dataclass
 from functools import partial
 from math import sqrt
 from typing import Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
-from ..base import BaseModelConfig
 from .config import MLPConfig, VisionConfig
 
 

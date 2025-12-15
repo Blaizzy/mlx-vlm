@@ -1,19 +1,11 @@
-import glob
-import inspect
-import json
 import re
-from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from huggingface_hub import snapshot_download
-from transformers import AutoConfig
 
-from ..base import BaseModelConfig
-from .config import ModelConfig, PerceiverConfig
+from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
 

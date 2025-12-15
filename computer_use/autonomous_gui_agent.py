@@ -171,7 +171,6 @@ def hover(position):
 
 def answer(value):
     """Provide an answer"""
-    pass
 
 
 def enter():
@@ -288,7 +287,7 @@ def build_messages(system_prompt, query, past_actions=[]):
     return messages
 
 
-from PIL import Image, ImageDraw
+from PIL import ImageDraw
 
 
 def extract_thought_action(response):
