@@ -1,5 +1,6 @@
 """Tests for batch generation functionality in mlx_vlm.generate module."""
 
+import sys
 from dataclasses import dataclass
 from typing import Any, List, Optional
 from unittest.mock import MagicMock, patch
@@ -16,6 +17,8 @@ from mlx_vlm.generate import (
     GenerationResult,
     _left_pad_prompts,
 )
+
+generate_module = sys.modules["mlx_vlm.generate"]
 
 # ============================================================================
 # Fixtures and Mock Classes
@@ -494,7 +497,7 @@ class TestBatchGenerator:
 class TestBatchGenerate:
     """Tests for the batch_generate function."""
 
-    @patch("mlx_vlm.generate._generate_batch")
+    @patch.object(generate_module, "_generate_batch")
     def test_text_only_batch(self, mock_generate_batch, mock_model, mock_processor):
         """Test batch generation without images."""
         from mlx_vlm.generate import batch_generate
@@ -517,7 +520,7 @@ class TestBatchGenerate:
         assert response.texts == ["Response 1", "Response 2"]
         mock_generate_batch.assert_called_once()
 
-    @patch("mlx_vlm.generate._generate_batch")
+    @patch.object(generate_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_with_images_same_shape(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -556,7 +559,7 @@ class TestBatchGenerate:
         # Same shape images should be processed in one batch
         assert mock_generate_batch.call_count == 1
 
-    @patch("mlx_vlm.generate._generate_batch")
+    @patch.object(generate_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_with_images_different_shapes(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -608,7 +611,7 @@ class TestBatchGenerate:
         # All 3 responses should be present
         assert len(response.texts) == 3
 
-    @patch("mlx_vlm.generate._generate_batch")
+    @patch.object(generate_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_track_image_sizes(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -639,7 +642,7 @@ class TestBatchGenerate:
         assert response.image_sizes is not None
         assert response.image_sizes[0] == (512, 384)
 
-    @patch("mlx_vlm.generate._generate_batch")
+    @patch.object(generate_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_disable_track_image_sizes(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -669,7 +672,7 @@ class TestBatchGenerate:
 
         assert response.image_sizes is None
 
-    @patch("mlx_vlm.generate._generate_batch")
+    @patch.object(generate_module, "_generate_batch")
     def test_per_sample_max_tokens(
         self, mock_generate_batch, mock_model, mock_processor
     ):
@@ -695,7 +698,7 @@ class TestBatchGenerate:
         assert isinstance(response, BatchResponse)
         assert len(response.texts) == 2
 
-    @patch("mlx_vlm.generate._generate_batch")
+    @patch.object(generate_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_single_image_string(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -722,7 +725,7 @@ class TestBatchGenerate:
         assert isinstance(response, BatchResponse)
         mock_process_image.assert_called_once()
 
-    @patch("mlx_vlm.generate._generate_batch")
+    @patch.object(generate_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_verbose_output(
         self,
@@ -763,7 +766,7 @@ class TestBatchGenerate:
         captured = capsys.readouterr()
         assert "[batch_generate]" in captured.out
 
-    @patch("mlx_vlm.generate._generate_batch")
+    @patch.object(generate_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_disable_grouping(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
