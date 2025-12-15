@@ -3,6 +3,7 @@ import csv
 import json
 import logging
 import random
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -282,7 +283,10 @@ def main():
                 logging.info(f"Ground Truth: {sample.get('answers', [])}")
 
         except Exception as e:
-            logging.error(f"Error processing sample {pid}: {e}")
+            if args.verbose:
+                traceback.print_exc()
+            else:
+                logging.error(f"Error processing sample {pid}: {e}")
             continue
 
     results_list = list(results.values())

@@ -193,3 +193,28 @@ def interpolate(pos_embed, size, mode="cubic", align_corners=False):
     if input_dim == 3:
         return result.reshape(original_shape[0], *size)
     return result
+
+
+@mx.compile
+def chunked_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    scale: float,
+    chunk_size: int,
+) -> mx.array:
+
+    L = queries.shape[2]
+
+    outputs = []
+    for i in range(0, L, chunk_size):
+        end_idx = min(i + chunk_size, L)
+        q_chunk = queries[:, :, i:end_idx, :]  # (B, n_heads, chunk, head_dim)
+
+        chunk_output = mx.fast.scaled_dot_product_attention(
+            q_chunk, keys, values, scale=scale
+        )
+
+        outputs.append(chunk_output)
+
+    return mx.concatenate(outputs, axis=2)  # (B, n_heads, L, head_dim)
