@@ -1,7 +1,7 @@
-"""Image processor and processor classes for HunyuanOCR (hunyuan_vl).
+"""Image processor and processor classes for HunyuanVL.
 
-Based on the official HuggingFace transformers implementation at commit 82a06db.
-Handles image preprocessing and tokenization for the HunyuanOCR model.
+Based on the official HuggingFace transformers implementation.
+Handles image preprocessing and tokenization for the HunyuanVL model.
 """
 
 import math
@@ -10,7 +10,12 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 from PIL import Image
 from transformers import AutoTokenizer
-from transformers.image_processing_utils import BatchFeature, ImageProcessingMixin
+from transformers.feature_extraction_utils import BatchFeature
+from transformers.image_processing_utils import ImageProcessingMixin
+from transformers.processing_utils import ProcessorMixin
+from transformers.utils import logging
+
+logger = logging.get_logger(__name__)
 
 # CLIP normalization constants (same as HF)
 OPENAI_CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
@@ -65,7 +70,7 @@ def smart_resize(
 
 
 class HunYuanVLImageProcessor(ImageProcessingMixin):
-    """Image processor for HunyuanOCR model.
+    """Image processor for HunyuanVL model.
 
     Handles resizing, normalization, and patch extraction for images.
 
@@ -140,7 +145,7 @@ class HunYuanVLImageProcessor(ImageProcessingMixin):
                 min_pixels=self.min_pixels,
                 max_pixels=self.max_pixels,
             )
-            image = image.resize((resized_width, resized_height), Image.BICUBIC)
+            image = image.resize((resized_width, resized_height), Image.BILINEAR)
 
         # Convert to numpy array and normalize
         img_array = np.array(image).astype(np.float32) / 255.0
@@ -279,8 +284,8 @@ class HunYuanVLImageProcessor(ImageProcessingMixin):
         return cls(**kwargs)
 
 
-class HunYuanVLProcessor:
-    """Processor for HunyuanOCR that combines image processing and tokenization.
+class HunYuanVLProcessor(ProcessorMixin):
+    """Processor for HunyuanVL that combines image processing and tokenization.
 
     Handles:
     - Image preprocessing via HunYuanVLImageProcessor
@@ -288,7 +293,12 @@ class HunYuanVLProcessor:
     - 4D position_ids construction for xdrope
     """
 
-    # Special token IDs (from HunyuanOCR config)
+    attributes = ["image_processor", "tokenizer"]
+    valid_kwargs = ["chat_template"]
+    image_processor_class = "AutoImageProcessor"
+    tokenizer_class = "AutoTokenizer"
+
+    # Special token IDs (from HunyuanVL config)
     IMAGE_TOKEN_ID = 120120
     IM_START_TOKEN_ID = 120118
     IM_END_TOKEN_ID = 120119
@@ -296,97 +306,46 @@ class HunYuanVLProcessor:
 
     def __init__(
         self,
-        image_processor: Optional[HunYuanVLImageProcessor] = None,
+        image_processor=None,
         tokenizer=None,
+        chat_template=None,
         **kwargs,
     ):
         if image_processor is None:
             image_processor = HunYuanVLImageProcessor(**kwargs)
 
-        self.image_processor = image_processor
         self.tokenizer = tokenizer
+        self.image_processor = image_processor
 
-        # Set corrected chat template that includes generation prompt support
-        # The default tokenizer template is missing the add_generation_prompt logic
-
-        # Note: The tokenizer uses U+2581 (Lower One Eighth Block) for spaces in these special tokens.
-        # We must match this exactly for the tokenizer to recognize them as single tokens.
-        space = "\u2581"
-
-        begin_of_sentence = f"<｜hy_begin{space}of{space}sentence｜>"
-        place_holder_3 = f"<｜hy_place{space}holder{space}no{space}3｜>"
-        place_holder_100 = f"<｜hy_place{space}holder{space}no{space}100｜>"
-        place_holder_101 = f"<｜hy_place{space}holder{space}no{space}101｜>"
-        place_holder_102 = f"<｜hy_place{space}holder{space}no{space}102｜>"
-
-        self.chat_template = (
-            "{% if messages[0]['role'] == 'system' %}"
-            "{% set loop_messages = messages[1:] %}"
-            "{% if messages[0]['content'] is string %}"
-            "{% set system_message = messages[0]['content'] %}"
-            "{% else %}"
-            "{% set system_message = messages[0]['content']['text'] %}"
-            "{% endif %}"
-            f"{begin_of_sentence}{{{{ system_message }}}}{place_holder_3}"
-            "{% else %}"
-            "{% set loop_messages = messages %}"
-            f"{begin_of_sentence}"
-            "{% endif %}"
-            "{% for message in loop_messages %}"
-            "{% if message['role'] == 'user' %}"
-            "{% if message['content'] is string %}"
-            "{{ message['content'] }}"
-            "{% else %}"
-            "{% for content in message['content'] %}"
-            "{% if content['type'] == 'image' or 'image' in content or 'image_url' in content %}"
-            f"{place_holder_100}{place_holder_102}{place_holder_101}"
-            "{% elif 'text' in content %}"
-            "{{ content['text'] }}"
-            "{% endif %}"
-            "{% endfor %}"
-            "{% endif %}"
-            "<｜hy_User｜>"
-            "{% elif message['role'] == 'assistant' %}"
-            "{{ message['content'] }}"
-            "<｜hy_Assistant｜>"
-            "{% endif %}"
-            "{% endfor %}"
-            "{% if add_generation_prompt %}"
-            "<｜hy_Assistant｜>"
-            "{% endif %}"
-        )
-
-        # Get special tokens
+        # Get special token IDs
         self.image_token_id = self.IMAGE_TOKEN_ID
         self.im_start_token_id = self.IM_START_TOKEN_ID
         self.im_end_token_id = self.IM_END_TOKEN_ID
         self.pad_id = self.PAD_TOKEN_ID
 
-        # Get image token string from tokenizer
+        # Get token strings from tokenizer
         if tokenizer is not None:
-            # The actual image token in the vocabulary
-            self.image_token_str = tokenizer.convert_ids_to_tokens(self.image_token_id)
-            # Placeholder token is vocab_size - 1 (used internally by HF processor)
+            self.image_token = tokenizer.convert_ids_to_tokens(self.image_token_id)
+            self.im_start_token = tokenizer.convert_ids_to_tokens(
+                self.im_start_token_id
+            )
+            self.im_end_token = tokenizer.convert_ids_to_tokens(self.im_end_token_id)
             self.placeholder_token = tokenizer.convert_ids_to_tokens(
                 tokenizer.vocab_size - 1
             )
         else:
-            self.image_token_str = "<image>"
+            self.image_token = "<image>"
+            self.im_start_token = "<im_start>"
+            self.im_end_token = "<im_end>"
             self.placeholder_token = "<placeholder>"
 
-        # User-facing image token (what users put in their prompts)
-        self.image_token = "<image>"
-
-    def apply_chat_template(self, messages, **kwargs):
-        """Apply chat template using the tokenizer."""
-        return self.tokenizer.apply_chat_template(
-            messages, chat_template=self.chat_template, **kwargs
-        )
+        super().__init__(image_processor, tokenizer, chat_template=chat_template)
 
     def __call__(
         self,
-        images: Optional[Union[Image.Image, List[Image.Image]]] = None,
-        text: Optional[Union[str, List[str]]] = None,
+        images=None,
+        text: Union[str, List[str]] = None,
+        videos=None,
         **kwargs,
     ) -> BatchFeature:
         """Process images and text for the model.
@@ -394,6 +353,7 @@ class HunYuanVLProcessor:
         Args:
             images: Single image or list of images
             text: Single text or list of texts
+            videos: Video inputs (not currently supported)
             **kwargs: Additional arguments passed to tokenizer
 
         Returns:
@@ -405,13 +365,12 @@ class HunYuanVLProcessor:
                 - position_ids: 4D position IDs for xdrope
         """
         image_inputs = {}
+        videos_inputs = {}
 
-        # Process images if provided
         if images is not None:
             image_inputs = self.image_processor(images=images)
             image_grid_thw = image_inputs["image_grid_thw"]
 
-        # Handle text input
         if text is None:
             text = [""]
         elif not isinstance(text, list):
@@ -425,10 +384,7 @@ class HunYuanVLProcessor:
         if images is not None:
             index = 0
             for i in range(len(text)):
-                # Look for the actual image token string (e.g., <｜hy_place holder no 102｜>)
-                # This is what the chat template produces
-
-                while self.image_token_str in text[i]:
+                while self.image_token in text[i]:
                     grid_h, grid_w = image_grid_thw[index][-2:]
                     patch_h = grid_h // self.image_processor.merge_size
                     patch_w = grid_w // self.image_processor.merge_size
@@ -436,23 +392,18 @@ class HunYuanVLProcessor:
                     image_tokens_cumsum.append(
                         image_tokens_cumsum[-1] + num_image_tokens
                     )
-
-                    # Replace single image token with placeholder tokens (N times)
-                    # Then replace placeholders back to image tokens
-                    # This matches the HF processor behavior
                     text[i] = text[i].replace(
-                        self.image_token_str,
+                        self.image_token,
                         self.placeholder_token * num_image_tokens,
-                        1,  # Replace only first occurrence
+                        1,
                     )
                     index += 1
-                # Replace all placeholders back to image tokens
-                text[i] = text[i].replace(self.placeholder_token, self.image_token_str)
+                text[i] = text[i].replace(self.placeholder_token, self.image_token)
 
         # Pop return_tensors to handle it ourselves at the end
         return_tensors = kwargs.pop("return_tensors", None)
 
-        # Tokenize text - always get numpy/list output for processing
+        # Tokenize text
         text_inputs = self.tokenizer(text, add_special_tokens=False, **kwargs)
 
         # Get input_ids and convert to numpy array for processing
@@ -463,14 +414,8 @@ class HunYuanVLProcessor:
         elif isinstance(input_ids, list):
             input_ids = np.array(input_ids)
 
-        # Update text_inputs with numpy array
         text_inputs["input_ids"] = input_ids
-
         seq_len = input_ids.shape[-1]
-
-        if images is not None:
-            # Find image token positions
-            image_token_positions = np.where(input_ids[0] == self.image_token_id)[0]
 
         # Build 4D position_ids for xdrope
         # Shape: (1, 4, seq_len) where 4 = [base, w, h, t]
@@ -481,7 +426,7 @@ class HunYuanVLProcessor:
 
         if images is not None:
             # Find image token positions
-            image_token_positions = np.where(input_ids[0] == self.image_token_id)[0]
+            image_token_pos_indices = np.where(input_ids[0] == self.image_token_id)[0]
 
             for i in range(len(image_grid_thw)):
                 grid_h, grid_w = image_grid_thw[i][-2:]
@@ -489,7 +434,7 @@ class HunYuanVLProcessor:
                 patch_w = grid_w // self.image_processor.merge_size
 
                 # Start position for this image's tokens (skip begin token)
-                start_pos = image_token_positions[image_tokens_cumsum[i]].item() + 1
+                start_pos = image_token_pos_indices[image_tokens_cumsum[i]].item() + 1
                 replace_num = (patch_w + 1) * patch_h
 
                 # Set width positions: 0, 1, 2, ..., patch_w, 0, 1, 2, ..., patch_w, ...
@@ -509,7 +454,7 @@ class HunYuanVLProcessor:
                 position_ids_t[start_pos : start_pos + replace_num] = 0
 
         # Stack position_ids: (1, 4, seq_len)
-        # Order per plan: base, w, h, t (Corrected from base, t, h, w based on HF parity check)
+        # Order: base, w, h, t
         position_ids = np.stack(
             [position_ids, position_ids_w, position_ids_h, position_ids_t]
         )[np.newaxis, ...]
@@ -520,9 +465,11 @@ class HunYuanVLProcessor:
         attention_mask = (input_ids != self.pad_id).astype(np.int64)
         text_inputs["attention_mask"] = attention_mask
 
-        # Combine all inputs
+        # Get image positions
+        text_inputs["imgs_pos"] = [self.get_imgs_pos(input_ids[0])]
+
         return BatchFeature(
-            data={**text_inputs, **image_inputs},
+            data={**text_inputs, **image_inputs, **videos_inputs},
             tensor_type=return_tensors,
         )
 
@@ -534,17 +481,43 @@ class HunYuanVLProcessor:
         """Decode token IDs to text."""
         return self.tokenizer.decode(*args, **kwargs)
 
+    def apply_chat_template(self, *args, **kwargs):
+        """Apply chat template using the tokenizer."""
+        return self.tokenizer.apply_chat_template(*args, **kwargs)
+
+    def get_imgs_pos(self, doc_ids):
+        """Get image positions from document token IDs.
+
+        Args:
+            doc_ids: Token IDs array
+
+        Returns:
+            List of [start, end] positions for each image
+        """
+        doc_ids = np.array(doc_ids, dtype=np.int64)
+        img_begin_index = np.where(doc_ids == self.im_start_token_id)[0]
+        img_end_index = np.where(doc_ids == self.im_end_token_id)[0]
+        imgs_pos = np.concatenate(
+            (
+                np.reshape(img_begin_index + 1, (-1, 1)),
+                np.reshape(img_end_index, (-1, 1)),
+            ),
+            axis=-1,
+        ).tolist()
+        return imgs_pos
+
     @property
     def model_input_names(self):
         """Return combined input names from tokenizer and image processor."""
-        tokenizer_names = self.tokenizer.model_input_names if self.tokenizer else []
-        image_processor_names = self.image_processor.model_input_names
-        return list(dict.fromkeys(tokenizer_names + image_processor_names))
+        tokenizer_input_names = (
+            self.tokenizer.model_input_names if self.tokenizer else []
+        )
+        image_processor_input_names = self.image_processor.model_input_names
+        return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         """Load processor from pretrained model path."""
-        # Extract trust_remote_code to avoid passing it twice
         trust_remote_code = kwargs.pop("trust_remote_code", True)
 
         tokenizer = AutoTokenizer.from_pretrained(
@@ -556,17 +529,79 @@ class HunYuanVLProcessor:
         return cls(image_processor=image_processor, tokenizer=tokenizer, **kwargs)
 
 
+def split_image_into_patch_blocks(
+    pixel_values: np.ndarray,  # shape: [batch_size, 3, H, W]
+    patch_size: int = 16,
+    adaptor_patch_div: int = 4,
+) -> np.ndarray:
+    """Split the input image array into large patches and then smaller regions.
+
+    Split the input image tensor (supporting batch) into large patches of size `patch_size`,
+    and then further divide each large patch into smaller regions of size
+    (patch_size // adaptor_patch_div) x (patch_size // adaptor_patch_div).
+    Each small region is extracted as a tensor of shape [3, patch_size, patch_size].
+    The final output contains all such small region tensors.
+
+    Args:
+        pixel_values: Input image array of shape [batch_size, 3, H, W].
+        patch_size: Size of the large patch, e.g., 16.
+        adaptor_patch_div: Each large patch is divided into
+                          (patch_size // adaptor_patch_div) x (patch_size // adaptor_patch_div)
+                          smaller regions.
+
+    Returns:
+        patches: An array of shape [N, 3, patch_size, patch_size],
+                 where N = batch_size * (H // patch_size) * (W // patch_size) * (patch_size // adaptor_patch_div)^2.
+                 Each element in the batch corresponds to one small image region.
+    """
+    batch_size, channels, height, width = pixel_values.shape
+    assert channels == 3, "Pixel values must have 3 channels in dim=1"
+    assert (
+        height % patch_size == 0 and width % patch_size == 0
+    ), "H and W must be divisible by patch_size"
+
+    patch_height_num = height // patch_size
+    patch_width_num = width // patch_size
+
+    # Reshape to [B, 3, ph, ps, pw, ps]
+    img = pixel_values.reshape(
+        batch_size,
+        3,
+        patch_height_num,
+        patch_size,
+        patch_width_num,
+        patch_size,
+    )
+
+    # Further split each psxps patch into (ps//aps)x(ps//aps) small regions
+    img = img.reshape(
+        batch_size,
+        3,
+        patch_height_num,
+        patch_size // adaptor_patch_div,
+        adaptor_patch_div,
+        patch_width_num,
+        patch_size // adaptor_patch_div,
+        adaptor_patch_div,
+    )
+
+    # Permute to group the small regions: [B, ph, pw, ps//aps, ps//aps, 3, aps, aps]
+    img = img.transpose(0, 2, 5, 3, 6, 1, 4, 7)
+
+    # Reshape into [B * ph * pw * (ps//aps)^2, 3, patch_size, patch_size]
+    patches = img.reshape(-1, 3, patch_size, patch_size)
+
+    return patches
+
+
 # Alias for compatibility
 ImageProcessor = HunYuanVLImageProcessor
 
 
 # Register with AutoProcessor so load() can find our custom processor
 try:
-    import logging
-
     from transformers import AutoImageProcessor, AutoProcessor
 
-    logger = logging.getLogger(__name__)
     MODEL_TYPE = "hunyuan_vl"
 
     AutoImageProcessor.register(
@@ -585,4 +620,5 @@ __all__ = [
     "HunYuanVLProcessor",
     "ImageProcessor",
     "smart_resize",
+    "split_image_into_patch_blocks",
 ]
