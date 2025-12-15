@@ -5,7 +5,18 @@ import mlx.nn as nn
 
 from .config import ModelConfig
 from .language import LanguageModel
+from .processing import Glm4VProcessor
 from .vision import VisionModel
+
+# Register the processor for glm4v model type
+try:
+    print("Registering glm4v processor")
+    from transformers import AutoProcessor
+
+    MODEL_TYPE = "glm4v"
+    AutoProcessor.register(MODEL_TYPE, Glm4VProcessor)
+except Exception as e:
+    print(f"Error registering glm4v processor: {e}")
 
 
 class Model(nn.Module):

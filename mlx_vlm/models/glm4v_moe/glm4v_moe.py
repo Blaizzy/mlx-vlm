@@ -1,15 +1,22 @@
-import glob
-import json
-from pathlib import Path
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from huggingface_hub import snapshot_download
 
 from .config import ModelConfig, TextConfig, VisionConfig
 from .language import LanguageModel
+from .processing import Glm4VMoEProcessor
 from .vision import VisionModel
+
+# Register the processor for glm4v_moe model type
+try:
+    print("Registering glm4v_moe processor")
+    from transformers import AutoProcessor
+
+    MODEL_TYPE = "glm4v_moe"
+    AutoProcessor.register(MODEL_TYPE, Glm4VMoEProcessor)
+except Exception as e:
+    print(f"Error registering glm4v_moe processor: {e}")
 
 
 class Model(nn.Module):
