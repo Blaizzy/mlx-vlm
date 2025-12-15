@@ -17,3 +17,4 @@ repos:
             - --in-place
             - --remove-all-unused-imports
             - --ignore-init-module-imports
+            - --exclude=mlx_vlm/models/base.py, mlx_vlm/models/cache.py
