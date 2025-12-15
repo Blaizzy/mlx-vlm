@@ -7,12 +7,10 @@ Handles image preprocessing and tokenization for the HunyuanOCR model.
 import math
 from typing import Dict, List, Optional, Tuple, Union
 
-import mlx.core as mx
 import numpy as np
 from PIL import Image
 from transformers import AutoTokenizer
 from transformers.image_processing_utils import BatchFeature, ImageProcessingMixin
-from transformers.processing_utils import ProcessorMixin
 
 # CLIP normalization constants (same as HF)
 OPENAI_CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
