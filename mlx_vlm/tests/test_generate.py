@@ -1,8 +1,6 @@
 """Tests for batch generation functionality in mlx_vlm.generate module."""
 
 import sys
-from dataclasses import dataclass
-from typing import Any, List, Optional
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
