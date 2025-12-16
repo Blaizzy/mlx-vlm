@@ -1,5 +1,4 @@
 import math
-from math import sqrt
 from typing import Dict, Optional, Union
 
 import mlx.core as mx

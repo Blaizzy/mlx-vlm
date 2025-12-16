@@ -1,13 +1,7 @@
-import glob
-import inspect
-import json
 import math
-from pathlib import Path
-from typing import List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from huggingface_hub import snapshot_download
 from mlx.utils import tree_map
 
 from .config import ModelConfig

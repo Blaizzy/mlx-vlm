@@ -1,6 +1,5 @@
-import functools
 import sys
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import mlx.core as mx
 import mlx.nn as nn

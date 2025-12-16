@@ -16,12 +16,7 @@ import soundfile as sf
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
 from PIL import Image, ImageOps
-from transformers import (
-    AutoConfig,
-    AutoProcessor,
-    PreTrainedTokenizer,
-    PreTrainedTokenizerFast,
-)
+from transformers import AutoProcessor, PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from .models.base import BaseImageProcessor
 from .tokenizer_utils import load_tokenizer
@@ -1066,8 +1061,6 @@ def print_array_report(t: mx.array, label: Optional[str]) -> dict:
     Returns:
         Dictionary containing shape, dtype, value representation, and statistics
     """
-
-    from pprint import pprint
 
     # Get basic statistics
     mean_val = mx.mean(t)

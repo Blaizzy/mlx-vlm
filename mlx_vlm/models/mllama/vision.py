@@ -1,11 +1,8 @@
-import inspect
-from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import BaseModelConfig
 from .config import VisionConfig
 
 

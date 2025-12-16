@@ -1,25 +1,15 @@
-import glob
-import inspect
-import json
 import math
-from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from huggingface_hub import snapshot_download
-from PIL import Image
 from transformers import AutoProcessor
-from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
-from transformers.image_utils import to_numpy_array
 
-from ..base import BaseModelConfig, expand2square
-from .config import ModelConfig, ProjectorConfig, TextConfig, VisionConfig
-from .language import LanguageModel, TextConfig
+from .config import ModelConfig, ProjectorConfig
+from .language import LanguageModel
 from .processing_deepsek_vl_v2 import DeepseekVLV2Processor
-from .vision import VisionConfig, VisionModel
+from .vision import VisionModel
 
 AutoProcessor.register("deepseek_vl_v2", DeepseekVLV2Processor)
 

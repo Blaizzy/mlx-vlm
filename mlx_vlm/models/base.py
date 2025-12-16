@@ -1,8 +1,8 @@
 import inspect
 import math
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn

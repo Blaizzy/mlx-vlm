@@ -1,6 +1,6 @@
 from enum import Enum
 from functools import partial
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
 from pydantic import BaseModel
 

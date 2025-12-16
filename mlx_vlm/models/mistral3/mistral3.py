@@ -2,7 +2,6 @@ from typing import List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..pixtral import VisionModel
 from .config import ModelConfig

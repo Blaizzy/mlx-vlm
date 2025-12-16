@@ -12,8 +12,6 @@ from mlx.utils import tree_reduce
 from mlx_lm.generate import maybe_quantize_kv_cache
 from transformers import PreTrainedTokenizer
 
-from mlx_vlm.models.gemma3n import audio
-
 from .models import cache
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
