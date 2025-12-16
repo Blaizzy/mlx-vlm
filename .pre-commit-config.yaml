@@ -9,3 +9,12 @@ repos:
     -   id: isort
         args:
             - --profile=black
+-   repo: https://github.com/PyCQA/autoflake
+    rev: v2.2.1
+    hooks:
+    -   id: autoflake
+        args:
+            - --in-place
+            - --remove-all-unused-imports
+            - --ignore-init-module-imports
+            - --exclude=mlx_vlm/models/base.py,mlx_vlm/models/cache.py

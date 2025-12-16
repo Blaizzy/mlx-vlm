@@ -1,6 +1,6 @@
 import inspect
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Optional, Union
 
 from ..base import BaseModelConfig
 

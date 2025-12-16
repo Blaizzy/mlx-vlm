@@ -1,16 +1,9 @@
-import glob
-import inspect
-import json
-from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
-from huggingface_hub import snapshot_download
 
-from .config import ModelConfig, TextConfig, VisionConfig
+from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
 
@@ -26,7 +19,7 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        grid_thw: Optional[mx.array] = None,
+        image_grid_thw: Optional[mx.array] = None,
     ):
 
         if pixel_values is None:
@@ -40,7 +33,7 @@ class Model(nn.Module):
 
         # Get the ouptut hidden states from the vision model
         hidden_states = self.vision_tower(
-            pixel_values, grid_thw, output_hidden_states=False
+            pixel_values, image_grid_thw, output_hidden_states=False
         )
 
         # Insert special image tokens in the input_ids

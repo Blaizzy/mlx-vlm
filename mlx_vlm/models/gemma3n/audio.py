@@ -5,7 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import check_array_shape
-from .config import AudioConfig, ModelConfig
+from .config import AudioConfig
 from .language import Gemma3nRMSNorm
 
 

@@ -1,6 +1,4 @@
-import inspect
-import re
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -124,6 +122,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        **kwargs,
     ):
         # for passing merged input embeddings
         if inputs_embeds is None:
@@ -148,10 +147,6 @@ class LanguageModel(nn.Module):
         return {
             k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
         }
-
-    @property
-    def layers(self):
-        return self.model.layers
 
     @property
     def head_dim(self):

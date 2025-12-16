@@ -7,13 +7,10 @@ from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Tuple
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
 from PIL import Image, ImageOps
 from transformers import LlamaTokenizerFast
 from transformers.processing_utils import ProcessorMixin
-
-from .conversation import get_conv_template
 
 
 def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
@@ -528,22 +525,46 @@ class DeepseekVLV2Processor(ProcessorMixin):
         cropping: bool = True,
         padding: bool = True,
         return_tensors: Literal["np", "mx", "pt"] = "mx",
+        **kwargs,
     ):
         """
 
         Args:
-            text (str): the formatted prompt;
-            images (List[ImageType]): the list of images;
+            text (str or List[str]): the formatted prompt(s);
+            images (List[ImageType]): the list of images (one per prompt for batched inputs);
             inference_mode (bool): if True, then remove the last eos token;
 
         Returns:
             outputs (BaseProcessorOutput): the output of the processor,
-                - input_ids (mx.array): [N + image tokens]
+                - input_ids (mx.array): [batch_size, N + image tokens]
                 - images (mx.array): [n_images, 3, H, W]
                 - image_id (int): the id of the image token
                 - num_image_tokens (List[int]): the number of image tokens
         """
 
+        # Handle batched inputs (list of prompts with list of images)
+        if isinstance(text, list):
+            if images is None:
+                images = [None] * len(text)
+
+            batch_results = []
+            for i, prompt in enumerate(text):
+                # Each prompt has one image
+                img = [images[i]] if images[i] is not None else None
+                result = self.process_one(
+                    prompt=prompt,
+                    images=img,
+                    inference_mode=inference_mode,
+                    image_size=image_size,
+                    base_size=base_size,
+                    cropping=cropping,
+                )
+                batch_results.append(result)
+
+            # Collate batch results
+            return self._collate_batch(batch_results, padding=padding)
+
+        # Single input case
         prepare = self.process_one(
             prompt=text,
             images=images,
@@ -554,3 +575,75 @@ class DeepseekVLV2Processor(ProcessorMixin):
         )
 
         return prepare
+
+    def _collate_batch(self, batch_results: List[Dict], padding: bool = True) -> Dict:
+        """Collate multiple processed results into a batch."""
+        if not batch_results:
+            return {}
+
+        batch_size = len(batch_results)
+
+        # Get max sequence length for padding
+        max_seq_len = max(r["input_ids"].shape[1] for r in batch_results)
+
+        # Pad and stack input_ids
+        padded_input_ids = []
+        padded_images_seq_mask = []
+        for r in batch_results:
+            seq_len = r["input_ids"].shape[1]
+            pad_len = max_seq_len - seq_len
+
+            if pad_len > 0:
+                # Pad input_ids on the left
+                input_ids = mx.concatenate(
+                    [
+                        mx.full((1, pad_len), self.pad_id, dtype=r["input_ids"].dtype),
+                        r["input_ids"],
+                    ],
+                    axis=1,
+                )
+                # Pad images_seq_mask on the left with False
+                seq_mask = mx.concatenate(
+                    [mx.zeros((1, pad_len), dtype=mx.bool_), r["images_seq_mask"]],
+                    axis=1,
+                )
+            else:
+                input_ids = r["input_ids"]
+                seq_mask = r["images_seq_mask"]
+
+            padded_input_ids.append(input_ids)
+            padded_images_seq_mask.append(seq_mask)
+
+        # Stack into batch
+        input_ids = mx.concatenate(padded_input_ids, axis=0)
+        images_seq_mask = mx.concatenate(padded_images_seq_mask, axis=0)
+
+        # Combine images: [patches, global_images]
+        all_patches = []
+        all_global_images = []
+        all_spatial_crops = []
+
+        for r in batch_results:
+            patches, global_img = r["images"]
+            # Only add non-zero patches
+            if mx.sum(patches).item() != 0:
+                all_patches.append(patches)
+            all_global_images.append(global_img)
+            all_spatial_crops.append(r["images_spatial_crop"])
+
+        # Stack patches and global images
+        if all_patches:
+            combined_patches = mx.concatenate(all_patches, axis=0)
+        else:
+            combined_patches = mx.zeros((1, 3, 1024, 1024))
+
+        combined_global_images = mx.concatenate(all_global_images, axis=0)
+        combined_spatial_crops = mx.concatenate(all_spatial_crops, axis=0)
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": input_ids != self.pad_id,
+            "images": [combined_patches, combined_global_images],
+            "images_seq_mask": images_seq_mask,
+            "images_spatial_crop": combined_spatial_crops,
+        }

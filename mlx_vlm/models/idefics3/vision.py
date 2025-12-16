@@ -1,9 +1,7 @@
-import inspect
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from .config import VisionConfig
 
@@ -148,16 +146,71 @@ class VisionEmbeddings(nn.Module):
             stride=self.patch_size,
         )
 
-        self.num_patches = (self.image_size // self.patch_size) ** 2
+        self.num_patches_per_side = self.image_size // self.patch_size
+        self.num_patches = self.num_patches_per_side**2
         self.num_positions = self.num_patches
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
 
-    def __call__(self, x: mx.array) -> mx.array:
-        patch_embeddings = self.patch_embedding(x)
-        patch_embeddings = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
-        position_ids = mx.array(mx.arange(self.num_positions)[None, :])
-        embeddings = patch_embeddings
-        embeddings += self.position_embedding(position_ids)
+    def __call__(self, x: mx.array, patch_attention_mask: mx.array = None) -> mx.array:
+        batch_size, max_im_h, max_im_w, _ = x.shape
+        patch_embeds = self.patch_embedding(x)
+        embeddings = mx.flatten(patch_embeds, start_axis=1, end_axis=2)
+
+        seq_len = embeddings.shape[1]
+
+        if patch_attention_mask is None:
+            position_ids = mx.tile(mx.arange(seq_len), (batch_size, 1))
+        else:
+            boundaries = mx.arange(
+                1 / self.num_patches_per_side, 1.0, 1 / self.num_patches_per_side
+            )
+
+            # Flatten mask to match sequence length (handles both (B,H,W) and (B,H,W,1))
+            if patch_attention_mask.ndim == 4:
+                flat_mask = patch_attention_mask.squeeze(-1).reshape(batch_size, -1)[
+                    :, :seq_len
+                ]
+            else:
+                flat_mask = patch_attention_mask.reshape(batch_size, -1)[:, :seq_len]
+
+            # Compute valid patches per image (channels-last indexing)
+            nb_patches_h = mx.maximum(patch_attention_mask[:, :, 0].sum(axis=1), 1)
+            nb_patches_w = mx.maximum(patch_attention_mask[:, 0, :].sum(axis=1), 1)
+
+            position_ids = mx.zeros((batch_size, seq_len), dtype=mx.int32)
+
+            for batch_idx in range(batch_size):
+                nb_h = int(nb_patches_h[batch_idx])
+                nb_w = int(nb_patches_w[batch_idx])
+
+                # Compute fractional coordinates
+                fractional_h = mx.arange(nb_h, dtype=mx.float32) / nb_h
+                fractional_w = mx.arange(nb_w, dtype=mx.float32) / nb_w
+                fractional_h = mx.clip(fractional_h, a_min=0.0, a_max=1.0 - 1e-6)
+                fractional_w = mx.clip(fractional_w, a_min=0.0, a_max=1.0 - 1e-6)
+
+                # Bucket into position IDs
+                bucket_h = mx.sum(fractional_h[:, None] >= boundaries[None, :], axis=1)
+                bucket_w = mx.sum(fractional_w[:, None] >= boundaries[None, :], axis=1)
+
+                # Create 2D grid: iterate over height, then width (row-major)
+                pos_ids = (
+                    bucket_h[:, None] * self.num_patches_per_side + bucket_w[None, :]
+                ).reshape(-1)
+
+                valid_len = min(pos_ids.shape[0], seq_len)
+                position_ids[batch_idx, :valid_len] = pos_ids[:valid_len]
+
+            # Zero out position embeddings for padding
+            mask_expanded = flat_mask[:, :, None]  # (batch, seq_len, 1)
+
+        pos_embeddings = self.position_embedding(position_ids)
+
+        # Apply mask to zero out padding position embeddings
+        if patch_attention_mask is not None:
+            pos_embeddings = pos_embeddings * mask_expanded
+
+        embeddings = embeddings + pos_embeddings
         return embeddings
 
 
@@ -180,9 +233,10 @@ class VisionModel(nn.Module):
     def __call__(
         self,
         x: mx.array,
+        patch_attention_mask: Optional[mx.array] = None,
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
-        x = self.embeddings(x)
+        x = self.embeddings(x, patch_attention_mask)
         x = x.astype(self.embeddings.patch_embedding.weight.dtype)
         encoder_outputs = self.encoder(
             x=x, output_hidden_states=output_hidden_states, mask=None

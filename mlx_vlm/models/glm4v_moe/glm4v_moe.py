@@ -3,7 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .config import ModelConfig, TextConfig, VisionConfig
+from .config import ModelConfig
 from .language import LanguageModel
 from .processing import Glm46VMoEProcessor
 from .vision import VisionModel

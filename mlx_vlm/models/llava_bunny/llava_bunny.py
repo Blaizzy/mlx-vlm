@@ -1,18 +1,10 @@
-import glob
-import inspect
-import json
 import re
-from dataclasses import dataclass
 from functools import partial, reduce
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
-from huggingface_hub import snapshot_download
 from PIL import Image
-from transformers import AutoConfig
 from transformers.image_transforms import (
     convert_to_rgb,
     normalize,
