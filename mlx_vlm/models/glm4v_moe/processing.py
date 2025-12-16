@@ -11,7 +11,7 @@ from transformers.feature_extraction_utils import BatchFeature
 from transformers.processing_utils import ProcessorMixin
 
 
-class Glm4VMoEProcessor(ProcessorMixin):
+class Glm46VMoEProcessor(ProcessorMixin):
     """
     Processor for GLM-4V-MoE that wraps an image processor and tokenizer.
 
@@ -32,25 +32,28 @@ class Glm4VMoEProcessor(ProcessorMixin):
         chat_template=None,
         **kwargs,
     ):
-        # Get image/video tokens from tokenizer or use defaults
-        self.image_token = (
-            tokenizer.image_token if hasattr(tokenizer, "image_token") else "<|image|>"
-        )
-        self.video_token = (
-            tokenizer.video_token if hasattr(tokenizer, "video_token") else "<|video|>"
-        )
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
 
-        # Get token IDs
-        self.image_token_id = (
-            tokenizer.image_token_id
-            if getattr(tokenizer, "image_token_id", None)
-            else tokenizer.convert_tokens_to_ids(self.image_token)
-        )
-        self.video_token_id = (
-            tokenizer.video_token_id
-            if getattr(tokenizer, "video_token_id", None)
-            else tokenizer.convert_tokens_to_ids(self.video_token)
-        )
+        # Get image/video tokens from tokenizer or use defaults
+        self.image_token = "<|image|>"
+        self.video_token = "<|video|>"
+
+        if tokenizer is not None:
+            self.image_token = getattr(tokenizer, "image_token", "<|image|>")
+            self.video_token = getattr(tokenizer, "video_token", "<|video|>")
+
+            # Get token IDs
+            self.image_token_id = getattr(tokenizer, "image_token_id", None)
+            if self.image_token_id is None:
+                self.image_token_id = tokenizer.convert_tokens_to_ids(self.image_token)
+
+            self.video_token_id = getattr(tokenizer, "video_token_id", None)
+            if self.video_token_id is None:
+                self.video_token_id = tokenizer.convert_tokens_to_ids(self.video_token)
+        else:
+            self.image_token_id = None
+            self.video_token_id = None
 
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
 
@@ -83,9 +86,14 @@ class Glm4VMoEProcessor(ProcessorMixin):
         image_grid_thw = None
         video_grid_thw = None
 
+        # Pop tokenizer-specific kwargs that shouldn't go to image processor
+        padding = kwargs.pop("padding", False)
+        return_token_type_ids = kwargs.pop("return_token_type_ids", False)
+        return_tensors = kwargs.pop("return_tensors", None)
+
         # Process images
-        if images is not None:
-            image_inputs = self.image_processor(images=images, **kwargs)
+        if images is not None and self.image_processor is not None:
+            image_inputs = self.image_processor(images=images)
             image_grid_thw = image_inputs.get("image_grid_thw")
 
         # Process videos
@@ -155,14 +163,11 @@ class Glm4VMoEProcessor(ProcessorMixin):
                     text[i] = text[i].replace(self.video_token, video_structure, 1)
                     video_index += 1
 
-        # Pop return_tensors to handle at the end
-        return_tensors = kwargs.pop("return_tensors", None)
-
         # Tokenize text
         text_inputs = self.tokenizer(
             text,
-            padding=kwargs.pop("padding", False),
-            return_token_type_ids=kwargs.pop("return_token_type_ids", False),
+            padding=padding,
+            return_token_type_ids=return_token_type_ids,
             **kwargs,
         )
 
@@ -196,5 +201,29 @@ class Glm4VMoEProcessor(ProcessorMixin):
         )
         return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """Load processor from pretrained model path."""
+        from transformers import AutoTokenizer, Glm4vImageProcessor
 
-__all__ = ["Glm4VMoEProcessor"]
+        trust_remote_code = kwargs.pop("trust_remote_code", True)
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
+        )
+
+        image_processor = Glm4vImageProcessor.from_pretrained(
+            pretrained_model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
+        )
+
+        return cls(image_processor=image_processor, tokenizer=tokenizer, **kwargs)
+
+
+__all__ = ["Glm46VMoEProcessor"]
+
+# Alias for backwards compatibility
+Glm4VMoEProcessor = Glm46VMoEProcessor

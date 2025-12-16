@@ -5,16 +5,15 @@ import mlx.nn as nn
 
 from .config import ModelConfig, TextConfig, VisionConfig
 from .language import LanguageModel
-from .processing import Glm4VMoEProcessor
+from .processing import Glm46VMoEProcessor
 from .vision import VisionModel
 
-# Register the processor for glm4v_moe model type
+# Register the processor with the name expected by the model config
 try:
-    print("Registering glm4v_moe processor")
     from transformers import AutoProcessor
 
-    MODEL_TYPE = "glm4v_moe"
-    AutoProcessor.register(MODEL_TYPE, Glm4VMoEProcessor)
+    # Register for both possible processor class names
+    AutoProcessor.register("Glm46VMoEProcessor", Glm46VMoEProcessor)
 except Exception as e:
     print(f"Error registering glm4v_moe processor: {e}")
 
