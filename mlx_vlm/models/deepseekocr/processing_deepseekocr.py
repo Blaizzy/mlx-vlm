@@ -4,7 +4,7 @@ From https://github.com/deepseek-ai/DeepSeek-VL2
 
 import math
 from dataclasses import dataclass
-from typing import List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import mlx.core as mx
 import numpy as np
