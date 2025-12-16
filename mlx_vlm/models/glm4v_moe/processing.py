@@ -4,7 +4,7 @@ Handles image/video token expansion based on grid dimensions and merge size.
 Based on the HuggingFace transformers GLM-4.6V processor implementation.
 """
 
-from typing import List, Optional, Union
+from typing import List, Union
 
 import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
