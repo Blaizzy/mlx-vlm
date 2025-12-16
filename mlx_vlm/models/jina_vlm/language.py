@@ -212,6 +212,7 @@ class LanguageModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
+        self.model_type = config.model_type
         # This will be loaded under "language_model" prefix
         self.embedding = None  # Handled by sanitize
         self.layers = None  # Handled by sanitize

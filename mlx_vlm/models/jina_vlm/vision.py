@@ -120,6 +120,7 @@ class VisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.config = config
+        self.model_type = config.model_type
         self.hidden_size = config.hidden_size
         self.vit_layers = config.vit_layers
 
