@@ -122,6 +122,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        **kwargs,
     ):
         # for passing merged input embeddings
         if inputs_embeds is None:
