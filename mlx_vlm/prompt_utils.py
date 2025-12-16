@@ -27,6 +27,8 @@ class MessageFormat(Enum):
 # Model configuration mapping
 MODEL_CONFIG = {
     # List with image format models
+    "jina_vlm": MessageFormat.IMAGE_TOKEN_PIPE,
+    "jvlm": MessageFormat.IMAGE_TOKEN_PIPE,
     "idefics2": MessageFormat.LIST_WITH_IMAGE,
     "idefics3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "lfm2_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
