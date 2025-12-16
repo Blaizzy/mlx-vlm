@@ -1,17 +1,11 @@
 """Vision encoder for Jina VLM in MLX."""
 
-import math
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .config import VisionConfig
-
-
-def gelu_pytorch_tanh(x):
-    """GELU activation with PyTorch tanh approximation."""
-    return 0.5 * x * (1.0 + mx.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x * x * x)))
 
 
 class PatchEmbedding(nn.Module):
@@ -53,14 +47,15 @@ class VisionMLP(nn.Module):
         # Named to match weights: ffn.up, ffn.down
         self.up = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.use_bias)
         self.down = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.use_bias)
-        self.activation = config.activation
+        # Use built-in GELU with tanh approximation
+        if config.activation == "gelu_pytorch_tanh":
+            self.gelu = nn.GELU(approx="tanh")
+        else:
+            self.gelu = nn.GELU()
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.up(x)
-        if self.activation == "gelu_pytorch_tanh":
-            x = gelu_pytorch_tanh(x)
-        else:
-            x = nn.gelu(x)
+        x = self.gelu(x)
         x = self.down(x)
         return x
 

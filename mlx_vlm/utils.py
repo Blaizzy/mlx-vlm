@@ -363,13 +363,8 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
-    from transformers import AutoTokenizer
 
-    try:
-        processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
-    except (ValueError, KeyError, OSError):
-        # Fall back to AutoTokenizer for models with unknown/custom model types
-        processor = AutoTokenizer.from_pretrained(model_path, use_fast=True, **kwargs)
+    processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
@@ -904,11 +899,8 @@ def prepare_inputs(
 
         if processor.pad_token is None:
             processor.pad_token = processor.eos_token
-
-        # Detect image token pattern in prompts
-        image_token = "<|image|>" if "<|image|>" in prompts[0] else "<image>"
         text_chunks = [
-            [processor(chunk).input_ids for chunk in prompt.split(image_token)]
+            [processor(chunk).input_ids for chunk in prompt.split("<image>")]
             for prompt in prompts
         ]
 
@@ -924,71 +916,11 @@ def prepare_inputs(
             padding = [processor.pad_token_id] * (max_length - len(ids))
             input_ids.append(mx.array(ids + padding))
 
-        preprocess_result = processor.image_processor.preprocess(images=images)
-
-        # Handle dict output (e.g., jina_vlm) vs list output
-        if isinstance(preprocess_result, dict):
-            # For jina_vlm: expand image_tokens into the input sequence
-            if "image_tokens" in preprocess_result:
-                # Get image tokens from preprocess result
-                image_tokens_batch = preprocess_result["image_tokens"]
-                expanded_input_ids = []
-
-                for batch_idx, chunks in enumerate(text_chunks):
-                    # Get image tokens for this batch item (list of arrays)
-                    if isinstance(image_tokens_batch, list):
-                        img_tokens = image_tokens_batch[batch_idx].tolist()
-                    else:
-                        img_tokens = image_tokens_batch[batch_idx].tolist() if hasattr(image_tokens_batch, '__getitem__') else []
-
-                    # Build expanded sequence: prefix + image_tokens + suffix
-                    ids = list(chunks[0]) + img_tokens + list(chunks[1])
-                    expanded_input_ids.append(ids)
-
-                # Find max length and pad
-                max_length = max(len(ids) for ids in expanded_input_ids)
-                padded_ids = []
-                for ids in expanded_input_ids:
-                    padding = [processor.pad_token_id] * (max_length - len(ids))
-                    padded_ids.append(mx.array(ids + padding))
-
-                model_inputs["input_ids"] = mx.array(padded_ids)
-
-                # Update image_input_idx to account for prefix offset
-                if "image_input_idx" in preprocess_result:
-                    # Offset by the length of the prefix (chunks[0])
-                    prefix_len = len(text_chunks[0][0])
-                    image_input_idx_batch = preprocess_result["image_input_idx"]
-                    if isinstance(image_input_idx_batch, list):
-                        offset_idx = [idx + prefix_len for idx in image_input_idx_batch]
-                        model_inputs["image_input_idx"] = mx.array(np.stack(offset_idx))
-                    else:
-                        model_inputs["image_input_idx"] = mx.array(image_input_idx_batch) + prefix_len
-            else:
-                model_inputs["input_ids"] = mx.array(input_ids)
-
-            # For other arrays (pixel_values, image_masks, etc.)
-            for key, value in preprocess_result.items():
-                if key in model_inputs:
-                    continue  # Already handled
-                if isinstance(value, list):
-                    if len(value) > 0:
-                        if isinstance(value[0], np.ndarray):
-                            model_inputs[key] = mx.array(np.stack(value))
-                        else:
-                            model_inputs[key] = mx.array(value)
-                elif isinstance(value, np.ndarray):
-                    model_inputs[key] = mx.array(value)
-                else:
-                    model_inputs[key] = value
-        else:
-            # Standard list of pixel arrays
-            model_inputs["input_ids"] = mx.array(input_ids)
-            model_inputs["pixel_values"] = mx.array(np.stack(preprocess_result))
-
-        # Build attention mask based on final input_ids
+        model_inputs["input_ids"] = mx.array(input_ids)
+        pixel_values = processor.image_processor.preprocess(images=images)
+        model_inputs["pixel_values"] = mx.array(np.stack(pixel_values))
         model_inputs["attention_mask"] = mx.array(
-            [(mx.array(ids) != processor.pad_token_id).tolist() for ids in model_inputs["input_ids"]]
+            [(ids != processor.pad_token_id) for ids in input_ids]
         ).astype(mx.int32)
 
     else:

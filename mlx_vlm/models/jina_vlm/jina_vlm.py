@@ -5,10 +5,14 @@ from typing import Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from transformers import AutoProcessor
 
 from .config import ModelConfig, VisionConfig
 from .language import LanguageModel, RMSNorm
+from .processing_jinavlm import JinaVLMProcessor
 from .vision import VisionModel
+
+AutoProcessor.register("jvlm", JinaVLMProcessor)
 
 
 class CrossAttention(nn.Module):

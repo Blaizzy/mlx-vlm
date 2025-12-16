@@ -7,8 +7,6 @@ import mlx.core as mx
 import numpy as np
 from PIL import Image
 
-from ..base import BaseImageProcessor
-
 # CLIP normalization constants
 CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
 CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
@@ -71,8 +69,8 @@ def patchify(array: np.ndarray, patch_size: int, batched: bool = False) -> np.nd
         raise ValueError(f"Unsupported array shape: {array.shape}")
 
 
-class ImageProcessor(BaseImageProcessor):
-    """Image processor for Jina VLM."""
+class ImageProcessor:
+    """Image processor for Jina VLM (standalone, not a BaseImageProcessor)."""
 
     def __init__(
         self,
@@ -93,7 +91,6 @@ class ImageProcessor(BaseImageProcessor):
         end_token_id: int = DEFAULT_END_TOKEN_ID,
         column_token_id: int = DEFAULT_COLUMN_TOKEN_ID,
     ):
-        super().__init__()
         self.base_input_size = base_input_size
         self.patch_size = patch_size
         self.max_crops = max_crops
