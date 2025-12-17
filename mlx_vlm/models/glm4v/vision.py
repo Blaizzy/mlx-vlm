@@ -145,8 +145,9 @@ class Glm4vVisionPatchEmbed(nn.Module):
         self.in_channels = config.in_channels
         self.embed_dim = config.hidden_size
 
-        kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
-        self.proj = nn.Conv3d(
+        # Use 2D convolution for images
+        kernel_size = [self.patch_size, self.patch_size]
+        self.proj = nn.Conv2d(
             self.in_channels,
             self.embed_dim,
             kernel_size=kernel_size,
@@ -154,16 +155,18 @@ class Glm4vVisionPatchEmbed(nn.Module):
         )
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
-        hidden_states = hidden_states.reshape(
-            -1,
-            self.in_channels,
-            self.temporal_patch_size,
-            self.patch_size,
-            self.patch_size,
-        ).moveaxis(1, 4)
-
-        hidden_states = self.proj(hidden_states)
-        hidden_states = hidden_states.reshape(-1, self.embed_dim)
+        # Handle image data (4D tensor)
+        if hidden_states.ndim == 4:
+            batch_size, height, width, channels = hidden_states.shape
+            
+            # Apply 2D convolution directly (no transpose needed for MLX)
+            # MLX conv2d expects input shape: [batch_size, height, width, channels]
+            # and weight shape: [out_channels, kernel_height, kernel_width, in_channels]
+            hidden_states = self.proj(hidden_states)
+            
+            # Reshape to [num_patches, embed_dim]
+            hidden_states = hidden_states.reshape(batch_size, -1, self.embed_dim)
+            hidden_states = hidden_states.reshape(-1, self.embed_dim)
         return hidden_states
 
 
@@ -337,9 +340,23 @@ class VisionModel(nn.Module):
     def __call__(
         self,
         hidden_states: mx.array,
-        grid_thw: mx.array,
+        grid_thw: Optional[mx.array] = None,
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
+
+        # Calculate grid_thw if not provided
+        if grid_thw is None:
+            # For GLM4V, grid_thw should be [batch_size, 3] where each element is (t, h, w)
+            # Assume t=1 for images (not video)
+            batch_size = hidden_states.shape[0]
+            t = 1
+            
+            # Calculate grid dimensions based on the model configuration
+            # For GLM4V with image_size=336 and patch_size=14, we get (336/14) = 24 patches per dimension
+            # These should be divisible by spatial_merge_size (default 2)
+            h = w = self.config.image_size // self.patch_size
+            
+            grid_thw = mx.array([[t, h, w] for _ in range(batch_size)])
 
         hidden_states = self.patch_embed(hidden_states)
         hidden_states = self.post_conv_layernorm(hidden_states)
@@ -388,7 +405,18 @@ class VisionModel(nn.Module):
             if "position_ids" in k:
                 # Remove unused position_ids
                 continue
-            elif "patch_embed.proj.weight" in k or "downsample.weight" in k:
+            elif "patch_embed.proj.weight" in k:
+                # Convert 3D convolution weights to 2D by averaging over temporal dimension
+                if v.ndim == 5:
+                    # Average over temporal dimension (index 1)
+                    v_2d = v.mean(axis=1)
+                    # The shape after averaging is already correct for MLX conv2d: [out_channels, kH, KW, in_channels]
+                    sanitized_weights[k] = v_2d
+                elif v.ndim == 4:
+                    # v shape: [out_channels, in_channels, kH, KW]
+                    # MLX conv2d expects shape: [out_channels, kH, KW, in_channels]
+                    sanitized_weights[k] = v.transpose(0, 2, 3, 1)
+            elif "downsample.weight" in k:
                 # PyTorch conv2d weight tensors have shape:
                 #   [out_channels, in_channels, kH, KW]
                 # MLX conv2d expects the weight be of shape:
@@ -396,8 +424,6 @@ class VisionModel(nn.Module):
                 if check_array_shape(v):
                     sanitized_weights[k] = v
                 else:
-                    if v.ndim == 5:
-                        sanitized_weights[k] = v.transpose(0, 2, 3, 4, 1)
                     if v.ndim == 4:
                         sanitized_weights[k] = v.transpose(0, 2, 3, 1)
             else:
