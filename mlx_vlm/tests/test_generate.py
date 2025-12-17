@@ -927,6 +927,11 @@ class TestThinkingBudget:
             def language_model(self):
                 return self
 
+            def make_cache(self):
+                from mlx_vlm.models import cache
+
+                return [cache.KVCache() for _ in range(4)]
+
             def __call__(
                 self, input_ids, pixel_values=None, cache=None, mask=None, **kwargs
             ):
@@ -971,13 +976,15 @@ class TestThinkingBudget:
         ):
             tokens.append(token)
 
-        # Verify: should see <think>, then 5 regular tokens, then </think> forced
+        # Verify: should see <think>, then 5 thinking tokens, then </think> forced
         assert tokens[0] == THINK_START_ID  # First token is <think>
         assert THINK_END_ID in tokens  # </think> should be forced
 
         # Find where </think> appears
         think_end_idx = tokens.index(THINK_END_ID)
-        # Should be at index 6 (after <think> + 5 thinking tokens)
+        # Budget of 5 means: tokens at indices 1-5 are thinking tokens (5 total),
+        # then </think> is forced at index 6
+        # Token sequence: <think>, tok, tok, tok, tok, tok, </think>
         assert think_end_idx == 6
 
     def test_thinking_budget_with_natural_end(self):
@@ -1006,6 +1013,11 @@ class TestThinkingBudget:
             @property
             def language_model(self):
                 return self
+
+            def make_cache(self):
+                from mlx_vlm.models import cache
+
+                return [cache.KVCache() for _ in range(4)]
 
             def __call__(
                 self, input_ids, pixel_values=None, cache=None, mask=None, **kwargs

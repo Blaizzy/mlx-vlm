@@ -378,6 +378,17 @@ def generate_step(
     in_thinking = False
     thinking_token_count = 0
 
+    # Check if the first token (y from initial forward pass) is <think>
+    if (
+        thinking_budget is not None
+        and thinking_end_token_id is not None
+        and thinking_start_token_id is not None
+    ):
+        first_token_id = y.item()
+        if first_token_id == thinking_start_token_id:
+            in_thinking = True
+            thinking_token_count = 0
+
     n = 0
     while True:
         if n != max_tokens:
@@ -387,17 +398,14 @@ def generate_step(
             if thinking_budget is not None and thinking_end_token_id is not None:
                 token_id = next_y.item()
 
-                if thinking_start_token_id is not None and token_id == thinking_start_token_id and n == 0 and not in_thinking:
-                    in_thinking = True
-                    thinking_token_count = 0
-                elif in_thinking:
+                if in_thinking:
                     if token_id == thinking_end_token_id:
                         in_thinking = False
                     else:
                         thinking_token_count += 1
 
                         # Budget exceeded - force </think> token
-                        if thinking_token_count >= thinking_budget:
+                        if thinking_token_count > thinking_budget:
                             next_y = mx.array([thinking_end_token_id])
                             # TODO: Consider gradually boosting thinking_end_token
                             # probability as budget approaches instead of hard cutoff
