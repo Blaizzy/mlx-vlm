@@ -124,7 +124,7 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, kwargs)
+        inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
 
         kwargs = {
             "pixel_values": pixel_values,
