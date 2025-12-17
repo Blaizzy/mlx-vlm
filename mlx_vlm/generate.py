@@ -145,6 +145,24 @@ def parse_arguments():
         default="main",
         help="The specific model version to use (branch, tag, commit).",
     )
+    parser.add_argument(
+        "--thinking-budget",
+        type=int,
+        default=None,
+        help="Maximum tokens for model thinking/reasoning (in <think> blocks).",
+    )
+    parser.add_argument(
+        "--thinking-start-token",
+        type=str,
+        default="<think>",
+        help="Token string that marks the start of a thinking block.",
+    )
+    parser.add_argument(
+        "--thinking-end-token",
+        type=str,
+        default="</think>",
+        help="Token string that marks the end of a thinking block.",
+    )
 
     return parser.parse_args()
 
@@ -223,6 +241,9 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    thinking_budget: Optional[int] = None,
+    thinking_start_token_id: Optional[int] = None,
+    thinking_end_token_id: Optional[int] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -240,6 +261,13 @@ def generate_step(
         top_p (float, optional): Nulceus sampling, higher means model considers
           more less likely words.
         logit_bias (dictionary, optional): Additive logit bias.
+        thinking_budget (int, optional): Maximum number of tokens allowed in
+          thinking blocks (between thinking_start_token and thinking_end_token).
+          When exceeded, the thinking_end_token is force-inserted.
+        thinking_start_token_id (int, optional): Token ID that marks the start
+          of a thinking block. Required if thinking_budget is set.
+        thinking_end_token_id (int, optional): Token ID that marks the end of
+          a thinking block. Required if thinking_budget is set.
 
     Yields:
         Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
@@ -346,10 +374,35 @@ def generate_step(
     else:
         kwargs = {}
 
+    # Thinking budget state tracking
+    in_thinking = False
+    thinking_token_count = 0
+
     n = 0
     while True:
         if n != max_tokens:
             next_y, next_logprobs = _step(y, **kwargs)
+
+            # Thinking budget enforcement
+            if thinking_budget is not None and thinking_end_token_id is not None:
+                token_id = next_y.item()
+
+                if thinking_start_token_id is not None and token_id == thinking_start_token_id:
+                    in_thinking = True
+                    thinking_token_count = 0
+                elif in_thinking:
+                    if token_id == thinking_end_token_id:
+                        in_thinking = False
+                    else:
+                        thinking_token_count += 1
+
+                        # Budget exceeded - force </think> token
+                        if thinking_token_count >= thinking_budget:
+                            next_y = mx.array([thinking_end_token_id])
+                            # TODO: Consider gradually boosting thinking_end_token
+                            # probability as budget approaches instead of hard cutoff
+                            in_thinking = False
+
             mx.async_eval(next_y)
             if "decoder_input_ids" in kwargs:
                 kwargs["decoder_input_ids"] = next_y[None]
@@ -371,6 +424,9 @@ def stream_generate(
     prompt: str,
     image: Union[str, List[str]] = None,
     audio: Union[str, List[str]] = None,
+    thinking_budget: Optional[int] = None,
+    thinking_start_token: str = "<think>",
+    thinking_end_token: str = "</think>",
     **kwargs,
 ) -> Union[str, Generator[str, None, None]]:
     """
@@ -380,6 +436,12 @@ def stream_generate(
         prompt (mx.array): The input prompt.
         model (nn.Module): The model to use for generation.
         max_tokens (int): The ma
+        thinking_budget (int, optional): Maximum number of tokens allowed in
+          thinking blocks. When exceeded, the thinking_end_token is force-inserted.
+        thinking_start_token (str): Token string that marks the start of a
+          thinking block. Default: "<think>".
+        thinking_end_token (str): Token string that marks the end of a
+          thinking block. Default: "</think>".
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -387,6 +449,17 @@ def stream_generate(
         Generator[Tuple[mx.array, mx.array]]: A generator producing text.
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+    # Resolve thinking token IDs if budget is set
+    thinking_start_token_id = None
+    thinking_end_token_id = None
+    if thinking_budget is not None:
+        thinking_start_token_id = tokenizer.encode(
+            thinking_start_token, add_special_tokens=False
+        )[-1]
+        thinking_end_token_id = tokenizer.encode(
+            thinking_end_token, add_special_tokens=False
+        )[-1]
 
     # Skip special tokens
     skip_special_tokens = kwargs.pop("skip_special_tokens", False)
@@ -435,7 +508,16 @@ def stream_generate(
         detokenizer.reset()
         tic = time.perf_counter()
         for n, (token, logprobs) in enumerate(
-            generate_step(input_ids, model, pixel_values, mask, **kwargs)
+            generate_step(
+                input_ids,
+                model,
+                pixel_values,
+                mask,
+                thinking_budget=thinking_budget,
+                thinking_start_token_id=thinking_start_token_id,
+                thinking_end_token_id=thinking_end_token_id,
+                **kwargs,
+            )
         ):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
@@ -485,6 +567,9 @@ def generate(
     image: Union[str, List[str]] = None,
     audio: Union[str, List[str]] = None,
     verbose: bool = False,
+    thinking_budget: Optional[int] = None,
+    thinking_start_token: str = "<think>",
+    thinking_end_token: str = "</think>",
     **kwargs,
 ) -> GenerationResult:
     """
@@ -502,6 +587,12 @@ def generate(
            probability and displays it.
        repetition_penalty (float, optional): The penalty factor for repeating tokens.
        repetition_context_size (int, optional): The number of tokens to consider for repetition penalty.
+       thinking_budget (int, optional): Maximum number of tokens allowed in
+           thinking blocks. When exceeded, the thinking_end_token is force-inserted.
+       thinking_start_token (str): Token string that marks the start of a
+           thinking block. Default: "<think>".
+       thinking_end_token (str): Token string that marks the end of a
+           thinking block. Default: "</think>".
     """
 
     if verbose:
@@ -544,7 +635,17 @@ def generate(
     else:
         tokenizer.stopping_criteria.reset(model.config.eos_token_id)
 
-    for response in stream_generate(model, processor, prompt, image, audio, **kwargs):
+    for response in stream_generate(
+        model,
+        processor,
+        prompt,
+        image,
+        audio,
+        thinking_budget=thinking_budget,
+        thinking_start_token=thinking_start_token,
+        thinking_end_token=thinking_end_token,
+        **kwargs,
+    ):
         if verbose:
             print(response.text, end="", flush=True)
         text += response.text
@@ -1267,6 +1368,9 @@ def main():
                 args.audio,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
+                thinking_budget=args.thinking_budget,
+                thinking_start_token=args.thinking_start_token,
+                thinking_end_token=args.thinking_end_token,
                 **kwargs,
             ):
                 response += chunk.text
@@ -1290,6 +1394,9 @@ def main():
             kv_bits=args.kv_bits,
             kv_group_size=args.kv_group_size,
             quantized_kv_start=args.quantized_kv_start,
+            thinking_budget=args.thinking_budget,
+            thinking_start_token=args.thinking_start_token,
+            thinking_end_token=args.thinking_end_token,
             **kwargs,
         )
         if not args.verbose:
