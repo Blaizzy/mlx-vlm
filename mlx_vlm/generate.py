@@ -387,7 +387,7 @@ def generate_step(
             if thinking_budget is not None and thinking_end_token_id is not None:
                 token_id = next_y.item()
 
-                if thinking_start_token_id is not None and token_id == thinking_start_token_id:
+                if thinking_start_token_id is not None and token_id == thinking_start_token_id and n == 0 and not in_thinking:
                     in_thinking = True
                     thinking_token_count = 0
                 elif in_thinking:
