@@ -898,5 +898,324 @@ class TestEdgeCases:
         assert response.image_sizes is None
 
 
+# ============================================================================
+# Tests for Thinking Budget
+# ============================================================================
+
+
+class TestThinkingBudget:
+    """Tests for thinking budget enforcement in generate_step."""
+
+    def test_thinking_budget_enforcement(self):
+        """Test that thinking budget correctly limits tokens in think blocks."""
+        from mlx_vlm.generate import generate_step
+
+        # Token IDs for testing
+        THINK_START_ID = 100  # <think>
+        THINK_END_ID = 101  # </think>
+        REGULAR_ID = 50  # regular token
+
+        # Create a mock model that returns predictable tokens
+        class ThinkingMockModel:
+            def __init__(self):
+                self.call_count = 0
+                self.config = MockConfig()
+                # Sequence: <think>, regular, regular, ... (thinking never ends naturally)
+                self.token_sequence = [THINK_START_ID] + [REGULAR_ID] * 20
+
+            @property
+            def language_model(self):
+                return self
+
+            def make_cache(self):
+                from mlx_vlm.models import cache
+
+                return [cache.KVCache() for _ in range(4)]
+
+            def __call__(
+                self, input_ids, pixel_values=None, cache=None, mask=None, **kwargs
+            ):
+                # Return logits that favor the next token in sequence
+                batch_size = 1
+                seq_len = (
+                    input_ids.shape[-1] if input_ids.ndim > 1 else input_ids.shape[0]
+                )
+                logits = mx.zeros((batch_size, seq_len, 32000))
+
+                # Set high logit for the token we want to generate
+                if self.call_count < len(self.token_sequence):
+                    target_token = self.token_sequence[self.call_count]
+                else:
+                    target_token = REGULAR_ID
+                logits[:, -1, target_token] = 100.0
+                self.call_count += 1
+
+                return MagicMock(
+                    logits=logits,
+                    cross_attention_states=None,
+                    encoder_outputs=None,
+                )
+
+        model = ThinkingMockModel()
+        input_ids = mx.array([[1, 2, 3]])
+        pixel_values = None
+        mask = None
+
+        # Generate with thinking_budget=5
+        tokens = []
+        for token, logprobs in generate_step(
+            input_ids,
+            model,
+            pixel_values,
+            mask,
+            max_tokens=15,
+            temperature=0,
+            thinking_budget=5,
+            thinking_start_token_id=THINK_START_ID,
+            thinking_end_token_id=THINK_END_ID,
+        ):
+            tokens.append(token)
+
+        # Verify: should see <think>, then 5 thinking tokens, then </think> forced
+        assert tokens[0] == THINK_START_ID  # First token is <think>
+        assert THINK_END_ID in tokens  # </think> should be forced
+
+        # Find where </think> appears
+        think_end_idx = tokens.index(THINK_END_ID)
+        # Budget of 5 means: tokens at indices 1-5 are thinking tokens (5 total),
+        # then </think> is forced at index 6
+        # Token sequence: <think>, tok, tok, tok, tok, tok, </think>
+        assert think_end_idx == 6
+
+    def test_thinking_budget_with_natural_end(self):
+        """Test that natural </think> tokens are respected before budget is hit."""
+        from mlx_vlm.generate import generate_step
+
+        # Token IDs for testing
+        THINK_START_ID = 100  # <think>
+        THINK_END_ID = 101  # </think>
+        REGULAR_ID = 50  # regular token
+
+        class NaturalEndMockModel:
+            def __init__(self):
+                self.call_count = 0
+                self.config = MockConfig()
+                # Sequence: <think>, regular, regular, </think> (natural end at 3 tokens)
+                self.token_sequence = [
+                    THINK_START_ID,
+                    REGULAR_ID,
+                    REGULAR_ID,
+                    THINK_END_ID,
+                    REGULAR_ID,
+                    REGULAR_ID,
+                ]
+
+            @property
+            def language_model(self):
+                return self
+
+            def make_cache(self):
+                from mlx_vlm.models import cache
+
+                return [cache.KVCache() for _ in range(4)]
+
+            def __call__(
+                self, input_ids, pixel_values=None, cache=None, mask=None, **kwargs
+            ):
+                batch_size = 1
+                seq_len = (
+                    input_ids.shape[-1] if input_ids.ndim > 1 else input_ids.shape[0]
+                )
+                logits = mx.zeros((batch_size, seq_len, 32000))
+
+                if self.call_count < len(self.token_sequence):
+                    target_token = self.token_sequence[self.call_count]
+                else:
+                    target_token = REGULAR_ID
+                logits[:, -1, target_token] = 100.0
+                self.call_count += 1
+
+                return MagicMock(
+                    logits=logits,
+                    cross_attention_states=None,
+                    encoder_outputs=None,
+                )
+
+        model = NaturalEndMockModel()
+        input_ids = mx.array([[1, 2, 3]])
+
+        # Generate with thinking_budget=10 (higher than natural end)
+        tokens = []
+        for token, logprobs in generate_step(
+            input_ids,
+            model,
+            None,
+            None,
+            max_tokens=10,
+            temperature=0,
+            thinking_budget=10,
+            thinking_start_token_id=THINK_START_ID,
+            thinking_end_token_id=THINK_END_ID,
+        ):
+            tokens.append(token)
+
+        # Natural </think> should appear at index 3 (not forced at budget)
+        assert tokens[0] == THINK_START_ID
+        think_end_idx = tokens.index(THINK_END_ID)
+        assert think_end_idx == 3  # Natural end, not forced
+
+    def test_thinking_budget_implicit_mode(self):
+        """Test that thinking budget works with implicit thinking (no start token)."""
+        from mlx_vlm.generate import generate_step
+
+        # Token IDs for testing
+        THINK_END_ID = 101  # </think>
+        REGULAR_ID = 50  # regular token
+
+        class ImplicitThinkingMockModel:
+            def __init__(self):
+                self.call_count = 0
+                self.config = MockConfig()
+                # Sequence: regular tokens only (no <think> token, model starts thinking implicitly)
+                self.token_sequence = [REGULAR_ID] * 20
+
+            @property
+            def language_model(self):
+                return self
+
+            def make_cache(self):
+                from mlx_vlm.models import cache
+
+                return [cache.KVCache() for _ in range(4)]
+
+            def __call__(
+                self, input_ids, pixel_values=None, cache=None, mask=None, **kwargs
+            ):
+                batch_size = 1
+                seq_len = (
+                    input_ids.shape[-1] if input_ids.ndim > 1 else input_ids.shape[0]
+                )
+                logits = mx.zeros((batch_size, seq_len, 32000))
+
+                if self.call_count < len(self.token_sequence):
+                    target_token = self.token_sequence[self.call_count]
+                else:
+                    target_token = REGULAR_ID
+                logits[:, -1, target_token] = 100.0
+                self.call_count += 1
+
+                return MagicMock(
+                    logits=logits,
+                    cross_attention_states=None,
+                    encoder_outputs=None,
+                )
+
+        model = ImplicitThinkingMockModel()
+        input_ids = mx.array([[1, 2, 3]])
+
+        # Generate with thinking_budget=5 and NO thinking_start_token_id (implicit mode)
+        tokens = []
+        for token, logprobs in generate_step(
+            input_ids,
+            model,
+            None,
+            None,
+            max_tokens=15,
+            temperature=0,
+            thinking_budget=5,
+            thinking_start_token_id=None,  # Implicit thinking mode
+            thinking_end_token_id=THINK_END_ID,
+        ):
+            tokens.append(token)
+
+        # In implicit mode, thinking starts immediately
+        # The first token (index 0) is yielded before counting starts
+        # Budget of 5 means: tokens at indices 1-5 are counted (5 total),
+        # then </think> is forced at index 6
+        # Token sequence: tok(0), tok(1), tok(2), tok(3), tok(4), tok(5), </think>(6)
+        assert THINK_END_ID in tokens
+        think_end_idx = tokens.index(THINK_END_ID)
+        # Budget=5 allows 5 thinking tokens (indices 1-5), then forces </think> at index 6
+        assert think_end_idx == 6
+
+    def test_thinking_budget_warning_on_mismatch(self):
+        """Test that a warning is issued when start token doesn't match first generated token."""
+        import warnings
+
+        from mlx_vlm.generate import generate_step
+
+        THINK_START_ID = 100  # <think>
+        THINK_END_ID = 101  # </think>
+        REGULAR_ID = 50  # regular token
+
+        class MismatchMockModel:
+            def __init__(self):
+                self.call_count = 0
+                self.config = MockConfig()
+                # First token is NOT the thinking start token
+                self.token_sequence = [REGULAR_ID] * 10
+
+            @property
+            def language_model(self):
+                return self
+
+            def make_cache(self):
+                from mlx_vlm.models import cache
+
+                return [cache.KVCache() for _ in range(4)]
+
+            def __call__(
+                self, input_ids, pixel_values=None, cache=None, mask=None, **kwargs
+            ):
+                batch_size = 1
+                seq_len = (
+                    input_ids.shape[-1] if input_ids.ndim > 1 else input_ids.shape[0]
+                )
+                logits = mx.zeros((batch_size, seq_len, 32000))
+
+                if self.call_count < len(self.token_sequence):
+                    target_token = self.token_sequence[self.call_count]
+                else:
+                    target_token = REGULAR_ID
+                logits[:, -1, target_token] = 100.0
+                self.call_count += 1
+
+                return MagicMock(
+                    logits=logits,
+                    cross_attention_states=None,
+                    encoder_outputs=None,
+                )
+
+        model = MismatchMockModel()
+        input_ids = mx.array([[1, 2, 3]])
+
+        # Generate with thinking_budget and explicit start token that WON'T match
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            tokens = []
+            for token, logprobs in generate_step(
+                input_ids,
+                model,
+                None,
+                None,
+                max_tokens=5,
+                temperature=0,
+                thinking_budget=3,
+                thinking_start_token_id=THINK_START_ID,  # Expects <think> but won't get it
+                thinking_end_token_id=THINK_END_ID,
+            ):
+                tokens.append(token)
+
+            # Should have issued a warning
+            assert len(w) == 1
+            assert "thinking_budget is set but first generated token" in str(
+                w[0].message
+            )
+            assert "Budget enforcement will not be applied" in str(w[0].message)
+
+        # No </think> should be forced since budget enforcement wasn't applied
+        assert THINK_END_ID not in tokens
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
