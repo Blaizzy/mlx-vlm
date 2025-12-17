@@ -1,6 +1,6 @@
 """Language model decoder for Jina VLM in MLX."""
 
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -57,12 +57,16 @@ class Attention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.num_kv_groups = self.num_heads // self.num_kv_heads
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
 
         # Fused QKV projection - named to match weights
-        qkv_size = (config.num_attention_heads + 2 * config.num_key_value_heads) * config.head_dim
+        qkv_size = (
+            config.num_attention_heads + 2 * config.num_key_value_heads
+        ) * config.head_dim
         self.qkv = nn.Linear(config.hidden_size, qkv_size, bias=False)
-        self.out = nn.Linear(config.num_attention_heads * config.head_dim, config.hidden_size, bias=False)
+        self.out = nn.Linear(
+            config.num_attention_heads * config.head_dim, config.hidden_size, bias=False
+        )
 
         # QK normalization - named to match weights
         if config.use_qk_norm:
@@ -88,8 +92,8 @@ class Attention(nn.Module):
         kv_size = self.num_kv_heads * self.head_dim
 
         q = qkv[..., :q_size]
-        k = qkv[..., q_size:q_size + kv_size]
-        v = qkv[..., q_size + kv_size:]
+        k = qkv[..., q_size : q_size + kv_size]
+        v = qkv[..., q_size + kv_size :]
 
         q = q.reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = k.reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
@@ -107,7 +111,9 @@ class Attention(nn.Module):
             q = self.rope(q)
             k = self.rope(k)
 
-        output = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=mask)
+        output = scaled_dot_product_attention(
+            q, k, v, cache=cache, scale=self.scale, mask=mask
+        )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.out(output)
 
@@ -118,7 +124,9 @@ class MLP(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         # Fused gate and up projection - named to match weights
-        self.gate_up = nn.Linear(config.hidden_size, 2 * config.intermediate_size, bias=False)
+        self.gate_up = nn.Linear(
+            config.hidden_size, 2 * config.intermediate_size, bias=False
+        )
         self.down = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -182,7 +190,10 @@ class TextModel(nn.Module):
         else:
             self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
 
-        self.layers = [TransformerBlock(config, layer_idx=i) for i in range(config.num_hidden_layers)]
+        self.layers = [
+            TransformerBlock(config, layer_idx=i)
+            for i in range(config.num_hidden_layers)
+        ]
 
         # Named to match weights: language_model.ln_f
         self.ln_f = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -227,7 +238,10 @@ class LanguageModel(nn.Module):
         else:
             self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
 
-        self.layers = [TransformerBlock(config, layer_idx=i) for i in range(config.num_hidden_layers)]
+        self.layers = [
+            TransformerBlock(config, layer_idx=i)
+            for i in range(config.num_hidden_layers)
+        ]
         self.ln_f = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def __call__(
@@ -260,8 +274,5 @@ class LanguageModel(nn.Module):
 
     def _create_causal_mask(self, seq_len: int, offset: int = 0) -> mx.array:
         total_len = offset + seq_len
-        mask = mx.triu(
-            mx.full((seq_len, total_len), float("-inf")),
-            k=offset + 1
-        )
+        mask = mx.triu(mx.full((seq_len, total_len), float("-inf")), k=offset + 1)
         return mask[None, None, :, :]

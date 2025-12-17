@@ -1838,8 +1838,12 @@ class TestModels(unittest.TestCase):
         # Vision model expects patchified input from processor, skip standard test
         # Test basic forward pass with patchified input instead
         batch_size = 1
-        n_patches = (config.vision_config.image_size // config.vision_config.patch_size) ** 2
-        patch_dim = config.vision_config.patch_size ** 2 * config.vision_config.num_channels
+        n_patches = (
+            config.vision_config.image_size // config.vision_config.patch_size
+        ) ** 2
+        patch_dim = (
+            config.vision_config.patch_size**2 * config.vision_config.num_channels
+        )
         pixel_values = mx.random.uniform(shape=(batch_size, n_patches, patch_dim))
         output, hidden_states = model.vision_model(pixel_values)
         # Check output shape matches hidden size

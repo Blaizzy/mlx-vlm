@@ -5,7 +5,6 @@ from typing import Dict, List, Literal, Optional, Union
 import mlx.core as mx
 import numpy as np
 from PIL import Image
-from transformers import AutoTokenizer
 from transformers.processing_utils import ProcessorMixin
 
 from .image_processor import ImageProcessor
@@ -130,8 +129,12 @@ class JinaVLMProcessor(ProcessorMixin):
                 # Get image tokens for this image
                 img_tokens = image_tokens[current_image_idx]
                 # Offset image_input_idx by current position
-                if image_input_idx_list is not None and current_image_idx < len(image_input_idx_list):
-                    offset_idx = image_input_idx_list[current_image_idx] + len(input_ids)
+                if image_input_idx_list is not None and current_image_idx < len(
+                    image_input_idx_list
+                ):
+                    offset_idx = image_input_idx_list[current_image_idx] + len(
+                        input_ids
+                    )
                     updated_image_input_idx.append(offset_idx)
                 input_ids.extend(img_tokens.tolist())
                 current_image_idx += 1
@@ -226,14 +229,12 @@ class JinaVLMProcessor(ProcessorMixin):
             pad_len = max_len - seq_len
 
             if pad_len > 0:
-                input_ids = mx.concatenate([
-                    mx.full((1, pad_len), self.pad_token_id),
-                    r["input_ids"]
-                ], axis=1)
-                attention_mask = mx.concatenate([
-                    mx.zeros((1, pad_len)),
-                    r["attention_mask"]
-                ], axis=1)
+                input_ids = mx.concatenate(
+                    [mx.full((1, pad_len), self.pad_token_id), r["input_ids"]], axis=1
+                )
+                attention_mask = mx.concatenate(
+                    [mx.zeros((1, pad_len)), r["attention_mask"]], axis=1
+                )
             else:
                 input_ids = r["input_ids"]
                 attention_mask = r["attention_mask"]

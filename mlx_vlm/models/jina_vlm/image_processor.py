@@ -14,8 +14,8 @@ CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
 # Default special token IDs
 DEFAULT_PATCH_TOKEN_ID = 151665  # <im_patch>
 DEFAULT_START_TOKEN_ID = 151666  # <im_start>
-DEFAULT_END_TOKEN_ID = 151667    # <im_end>
-DEFAULT_COLUMN_TOKEN_ID = 151668 # <im_col>
+DEFAULT_END_TOKEN_ID = 151667  # <im_end>
+DEFAULT_COLUMN_TOKEN_ID = 151668  # <im_col>
 
 
 def smart_resize(
@@ -145,7 +145,7 @@ class ImageProcessor:
         candidate_resolutions = candidate_tilings * patch_size
 
         original_size = np.array([h, w], dtype=np.float32)
-        with np.errstate(divide='ignore'):
+        with np.errstate(divide="ignore"):
             required_scale = candidate_resolutions.astype(np.float32) / original_size
         required_scale = np.min(required_scale, axis=-1, keepdims=True)
 
@@ -167,9 +167,19 @@ class ImageProcessor:
         right_margin: int,
     ) -> int:
         if num_tiles > 1:
-            left_crop = (crop_window_patches + left_margin + pooling_size - 1) // pooling_size * pooling_size
-            middle_crop = (crop_window_patches + pooling_size - 1) // pooling_size * pooling_size
-            right_crop = (crop_window_patches + right_margin + pooling_size - 1) // pooling_size * pooling_size
+            left_crop = (
+                (crop_window_patches + left_margin + pooling_size - 1)
+                // pooling_size
+                * pooling_size
+            )
+            middle_crop = (
+                (crop_window_patches + pooling_size - 1) // pooling_size * pooling_size
+            )
+            right_crop = (
+                (crop_window_patches + right_margin + pooling_size - 1)
+                // pooling_size
+                * pooling_size
+            )
             return left_crop + (num_tiles - 2) * middle_crop + right_crop
         else:
             return (crop_patches + pooling_size - 1) // pooling_size * pooling_size
@@ -179,7 +189,7 @@ class ImageProcessor:
         image_tokens: np.ndarray,
         patch_order: Optional[np.ndarray],
     ) -> np.ndarray:
-        image_input_idx = (image_tokens == self.patch_token_id)
+        image_input_idx = image_tokens == self.patch_token_id
         image_input_idx = np.nonzero(image_input_idx)[0].astype(np.int32)
 
         if patch_order is not None:
@@ -193,7 +203,9 @@ class ImageProcessor:
                 )
 
             sorted_patch_ixs = np.zeros([image_input_idx.shape[0]], np.int32)
-            sorted_patch_ixs[patch_order[valid]] = np.arange(n_valid_patches, dtype=np.int32)
+            sorted_patch_ixs[patch_order[valid]] = np.arange(
+                n_valid_patches, dtype=np.int32
+            )
             sorted_patch_ixs_ex = np.full(np.shape(patch_order), -1)
             sorted_patch_ixs_ex[valid] = sorted_patch_ixs
 
@@ -203,7 +215,9 @@ class ImageProcessor:
 
         return np.reshape(image_input_idx, [-1, self.tokens_per_image])
 
-    def crop_image(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def crop_image(
+        self, image: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         left_margin, right_margin = self.overlap_margins
         total_margin_pixels = self.patch_size * (right_margin + left_margin)
         crop_patches = self.crop_patches
@@ -260,23 +274,26 @@ class ImageProcessor:
                             np.arange(on, on + pooled_h * pooled_w, dtype=np.int32),
                             (pooled_h, pooled_w),
                         ),
-                        [[crop_y0, after_padding_height], [crop_x0, after_padding_width]],
+                        [
+                            [crop_y0, after_padding_height],
+                            [crop_x0, after_padding_width],
+                        ],
                         constant_values=-1,
-                        mode='constant',
+                        mode="constant",
                     )
                 )
 
-                crop = src[y0:y0 + crop_size, x0:x0 + crop_size]
+                crop = src[y0 : y0 + crop_size, x0 : x0 + crop_size]
                 if crop.shape[0] < crop_size or crop.shape[1] < crop_size:
                     padded = np.zeros((crop_size, crop_size, 3), dtype=np.float32)
-                    padded[:crop.shape[0], :crop.shape[1]] = crop
+                    padded[: crop.shape[0], : crop.shape[1]] = crop
                     crop = padded
                 patches_arr.append(crop)
 
-                crop_mask = img_mask[y0:y0 + crop_size, x0:x0 + crop_size]
+                crop_mask = img_mask[y0 : y0 + crop_size, x0 : x0 + crop_size]
                 if crop_mask.shape[0] < crop_size or crop_mask.shape[1] < crop_size:
                     padded_mask = np.zeros((crop_size, crop_size), dtype=np.bool_)
-                    padded_mask[:crop_mask.shape[0], :crop_mask.shape[1]] = crop_mask
+                    padded_mask[: crop_mask.shape[0], : crop_mask.shape[1]] = crop_mask
                     crop_mask = padded_mask
                 mask_arr.append(crop_mask)
 
@@ -287,7 +304,9 @@ class ImageProcessor:
         img_masks = np.stack(mask_arr)
 
         patches = patchify(patches, self.patch_size, batched=True)
-        img_masks = patchify(img_masks.astype(np.float32), self.patch_size, batched=True)
+        img_masks = patchify(
+            img_masks.astype(np.float32), self.patch_size, batched=True
+        )
         if img_masks.ndim == 3:
             img_masks = img_masks.mean(axis=-1)
 
@@ -303,10 +322,20 @@ class ImageProcessor:
         patch_ordering[valid] = patch_ordering_rh[patch_ordering_rh >= 0]
 
         h = self._get_patches_from_tiling(
-            tiling[0], self.pooling_h, crop_patches, crop_window_patches, left_margin, right_margin
+            tiling[0],
+            self.pooling_h,
+            crop_patches,
+            crop_window_patches,
+            left_margin,
+            right_margin,
         )
         w = self._get_patches_from_tiling(
-            tiling[1], self.pooling_w, crop_patches, crop_window_patches, left_margin, right_margin
+            tiling[1],
+            self.pooling_w,
+            crop_patches,
+            crop_window_patches,
+            left_margin,
+            right_margin,
         )
 
         per_row = np.full((w // self.pooling_w,), self.patch_token_id, dtype=np.int32)
@@ -351,7 +380,8 @@ class ImageProcessor:
 
         h, w = image.shape[:2]
         new_h, new_w = smart_resize(
-            h, w,
+            h,
+            w,
             factor=self.patch_size,
             min_pixels=self.min_pixels,
             max_pixels=self.max_pixels,

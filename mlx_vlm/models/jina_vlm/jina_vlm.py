@@ -1,14 +1,13 @@
 """Main Jina VLM model for MLX."""
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 from transformers import AutoProcessor
 
 from .config import ModelConfig, VisionConfig
-from .language import LanguageModel, RMSNorm
+from .language import LanguageModel
 from .processing_jinavlm import JinaVLMProcessor
 from .vision import VisionModel
 
@@ -26,7 +25,7 @@ class CrossAttention(nn.Module):
 
         self.num_heads = n_heads
         self.head_dim = head_dim
-        self.scale = head_dim ** -0.5
+        self.scale = head_dim**-0.5
 
         # Named to match weights: pooling.q, pooling.kv, pooling.out
         self.q = nn.Linear(input_size, n_heads * head_dim, bias=True)
@@ -87,8 +86,12 @@ class VisionLanguageConnector(nn.Module):
         self.pooling_w = config.pooling_w
 
         self.crop_patches = config.image_size // config.patch_size
-        self.token_length_h = (self.crop_patches + config.pooling_h - 1) // config.pooling_h
-        self.token_length_w = (self.crop_patches + config.pooling_w - 1) // config.pooling_w
+        self.token_length_h = (
+            self.crop_patches + config.pooling_h - 1
+        ) // config.pooling_h
+        self.token_length_w = (
+            self.crop_patches + config.pooling_w - 1
+        ) // config.pooling_w
         self.tokens_per_image = self.token_length_h * self.token_length_w
 
         input_size = config.hidden_size * len(config.vit_layers)
@@ -102,9 +105,7 @@ class VisionLanguageConnector(nn.Module):
         self.projector = ConnectorMLP(config)
 
     def __call__(
-        self,
-        image_features: mx.array,
-        image_masks: Optional[mx.array] = None
+        self, image_features: mx.array, image_masks: Optional[mx.array] = None
     ) -> mx.array:
         B, n_crops = image_features.shape[:2]
         n_patch_h = n_patch_w = self.crop_patches
@@ -112,8 +113,7 @@ class VisionLanguageConnector(nn.Module):
         if image_masks is not None:
             all_pad = (image_masks == 0).astype(mx.float32)
             partial_pad = mx.logical_and(
-                image_masks < 1,
-                mx.logical_not(image_masks == 0)
+                image_masks < 1, mx.logical_not(image_masks == 0)
             ).astype(mx.float32)
 
             pad_embed_0 = self.pad_embed[0][None, None, None, :]
@@ -130,8 +130,7 @@ class VisionLanguageConnector(nn.Module):
             pad_h = self.pooling_h - pad_h if pad_h != 0 else 0
             pad_w = self.pooling_w - pad_w if pad_w != 0 else 0
             image_features = mx.pad(
-                image_features,
-                [(0, 0), (0, 0), (0, pad_h), (0, pad_w), (0, 0)]
+                image_features, [(0, 0), (0, 0), (0, pad_h), (0, pad_w), (0, 0)]
             )
 
         _, _, H, W, C = image_features.shape
@@ -188,7 +187,9 @@ class Model(nn.Module):
         dtype = self.vision_model.patch_embed.proj.weight.dtype
 
         images_flat = images.reshape(B * n_crops, n_patches, patch_dim).astype(dtype)
-        valid_mask = ~mx.all(images_flat.reshape(B * n_crops, -1) == -1, axis=-1, keepdims=True)
+        valid_mask = ~mx.all(
+            images_flat.reshape(B * n_crops, -1) == -1, axis=-1, keepdims=True
+        )
         valid_mask = valid_mask[:, :, None]
 
         image_features = self.vision_model.get_features(images_flat)
@@ -221,14 +222,22 @@ class Model(nn.Module):
         if pixel_values is not None and image_input_idx is not None:
             if pixel_values.ndim == 3:
                 pixel_values = mx.expand_dims(pixel_values, 0)
-                image_masks = mx.expand_dims(image_masks, 0) if image_masks is not None else None
-                image_input_idx = mx.expand_dims(image_input_idx, 0) if image_input_idx is not None else None
+                image_masks = (
+                    mx.expand_dims(image_masks, 0) if image_masks is not None else None
+                )
+                image_input_idx = (
+                    mx.expand_dims(image_input_idx, 0)
+                    if image_input_idx is not None
+                    else None
+                )
 
             image_features = self.get_image_features(pixel_values, image_masks)
 
             num_image, num_patch = image_features.shape[1:3]
 
-            image_features = image_features.reshape(batch_size, num_image * num_patch, -1)
+            image_features = image_features.reshape(
+                batch_size, num_image * num_patch, -1
+            )
             image_input_idx = image_input_idx.reshape(batch_size, num_image * num_patch)
 
             for b in range(batch_size):

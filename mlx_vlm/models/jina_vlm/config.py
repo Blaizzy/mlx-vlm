@@ -1,6 +1,5 @@
-import inspect
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Tuple
 
 from ..base import BaseModelConfig
 
@@ -8,6 +7,7 @@ from ..base import BaseModelConfig
 @dataclass
 class VisionConfig(BaseModelConfig):
     """Vision encoder configuration for Jina VLM."""
+
     model_type: str = "jina_vlm"
     hidden_size: int = 1152
     num_hidden_layers: int = 27
@@ -33,6 +33,7 @@ class VisionConfig(BaseModelConfig):
 @dataclass
 class TextConfig(BaseModelConfig):
     """Text decoder configuration for Jina VLM."""
+
     model_type: str = "jina_vlm"
     hidden_size: int = 2048
     num_hidden_layers: int = 28
@@ -52,6 +53,7 @@ class TextConfig(BaseModelConfig):
 @dataclass
 class ModelConfig(BaseModelConfig):
     """Full Jina VLM configuration."""
+
     text_config: TextConfig = field(default_factory=TextConfig)
     vision_config: VisionConfig = field(default_factory=VisionConfig)
     model_type: str = "jina_vlm"
@@ -84,7 +86,11 @@ class ModelConfig(BaseModelConfig):
             num_attention_heads=vision_attn.get("n_heads", 16),
             head_dim=vision_attn.get("head_dim", 72),
             patch_size=vision_cfg.get("patch_size", 14),
-            image_size=vision_cfg.get("input_size", [378, 378])[0] if isinstance(vision_cfg.get("input_size"), list) else 378,
+            image_size=(
+                vision_cfg.get("input_size", [378, 378])[0]
+                if isinstance(vision_cfg.get("input_size"), list)
+                else 378
+            ),
             num_channels=vision_cfg.get("n_channels", 3),
             intermediate_size=vision_ffn.get("size", 4304),
             use_bias=vision_attn.get("q_bias", True),
@@ -107,7 +113,9 @@ class ModelConfig(BaseModelConfig):
 
         text_config = TextConfig(
             hidden_size=text_cfg.get("hidden_size", 2048),
-            num_hidden_layers=text_cfg.get("n_layers", text_cfg.get("num_hidden_layers", 28)),
+            num_hidden_layers=text_cfg.get(
+                "n_layers", text_cfg.get("num_hidden_layers", 28)
+            ),
             num_attention_heads=text_attn.get("n_heads", 16),
             num_key_value_heads=text_attn.get("n_kv_heads", 8),
             head_dim=text_attn.get("head_dim", 128),

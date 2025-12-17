@@ -25,7 +25,7 @@ class PatchEmbedding(nn.Module):
         if x.ndim == 3:
             # Already patchified: (B, n_patches, patch_dim)
             B, n_patches, _ = x.shape
-            nH = nW = int(n_patches ** 0.5)
+            nH = nW = int(n_patches**0.5)
             x = self.proj(x)
         else:
             # Image format: (B, C, H, W)
@@ -45,8 +45,12 @@ class VisionMLP(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         # Named to match weights: ffn.up, ffn.down
-        self.up = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.use_bias)
-        self.down = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.use_bias)
+        self.up = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=config.use_bias
+        )
+        self.down = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=config.use_bias
+        )
         # Use built-in GELU with tanh approximation
         if config.activation == "gelu_pytorch_tanh":
             self.gelu = nn.GELU(approx="tanh")
@@ -67,18 +71,18 @@ class VisionAttention(nn.Module):
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
 
         # Fused QKV projection - named to match weights
         self.qkv = nn.Linear(
             config.hidden_size,
             3 * config.num_attention_heads * config.head_dim,
-            bias=config.use_bias
+            bias=config.use_bias,
         )
         self.out = nn.Linear(
             config.num_attention_heads * config.head_dim,
             config.hidden_size,
-            bias=config.use_bias
+            bias=config.use_bias,
         )
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -103,9 +107,13 @@ class VisionEncoderLayer(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         # Named to match weights: attn_norm, ffn_norm
-        self.attn_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps, bias=config.use_bias)
+        self.attn_norm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps, bias=config.use_bias
+        )
         self.attn = VisionAttention(config)
-        self.ffn_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps, bias=config.use_bias)
+        self.ffn_norm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps, bias=config.use_bias
+        )
         self.ffn = VisionMLP(config)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -137,11 +145,15 @@ class VisionModel(nn.Module):
         self.pos_embed = mx.zeros((num_patches, config.hidden_size))
 
         # Transformer blocks
-        self.layers = [VisionEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+        self.layers = [
+            VisionEncoderLayer(config) for _ in range(config.num_hidden_layers)
+        ]
 
         # Named to match weights: post_norm
         if config.post_layer_norm:
-            self.post_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps, bias=config.use_bias)
+            self.post_norm = nn.LayerNorm(
+                config.hidden_size, eps=config.layer_norm_eps, bias=config.use_bias
+            )
         else:
             self.post_norm = None
 
