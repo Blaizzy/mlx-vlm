@@ -172,6 +172,9 @@ def convert(
     for pattern in ["*.py", "*.json"]:
         files = glob.glob(str(model_path / pattern))
         for file in files:
+            # Skip the index file - save_weights() already generated the correct one
+            if Path(file).name == "model.safetensors.index.json":
+                continue
             shutil.copy(file, mlx_path)
 
     processor.save_pretrained(mlx_path)
