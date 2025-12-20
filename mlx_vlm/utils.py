@@ -29,6 +29,7 @@ MODEL_REMAPPING = {
     "bunny-llama": "llava_bunny",
     "lfm2-vl": "lfm2_vl",
     "cohere2_vision": "aya_vision",
+    "jvlm": "jina_vlm",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -49,6 +50,7 @@ def skip_multimodal_module(path: str) -> bool:
     return (
         "vision_model" in path
         or "vision_tower" in path
+        or "vl_connector" in path
         or "sam_model" in path
         or "audio_model" in path
         or "audio_tower" in path
