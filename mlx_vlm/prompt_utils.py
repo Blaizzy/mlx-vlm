@@ -27,6 +27,8 @@ class MessageFormat(Enum):
 # Model configuration mapping
 MODEL_CONFIG = {
     # List with image format models
+    "jina_vlm": MessageFormat.IMAGE_TOKEN_PIPE,
+    "jvlm": MessageFormat.IMAGE_TOKEN_PIPE,
     "idefics2": MessageFormat.LIST_WITH_IMAGE,
     "idefics3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "lfm2_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -49,6 +51,7 @@ MODEL_CONFIG = {
     "llava_next": MessageFormat.LIST_WITH_IMAGE,
     "mllama": MessageFormat.LIST_WITH_IMAGE,
     "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
+    "molmo2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
@@ -375,7 +378,7 @@ def get_chat_template(
     try:
         processor = (
             processor
-            if "chat_template" in processor.__dict__.keys()
+            if processor.__dict__.get("chat_template")
             else processor.tokenizer
         )
 

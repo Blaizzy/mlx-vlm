@@ -1520,6 +1520,70 @@ class TestModels(unittest.TestCase):
             (576, 588),
         )
 
+    def test_molmo2(self):
+        from mlx_vlm.models import molmo2
+
+        text_config = molmo2.TextConfig(
+            model_type="molmo2",
+            hidden_size=256,  # Reduced for testing
+            intermediate_size=512,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=64,
+            vocab_size=151936,
+            additional_vocab_size=128,
+            hidden_act="silu",
+            layer_norm_eps=1e-6,
+            rope_theta=5000000.0,
+            use_qk_norm=True,
+        )
+
+        vit_config = molmo2.config.VitConfig(
+            model_type="molmo2",
+            hidden_size=128,  # Reduced for testing
+            intermediate_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=64,
+            image_patch_size=14,
+            image_num_pos=729,  # 27x27
+            image_default_input_size=[378, 378],
+        )
+
+        adapter_config = molmo2.config.AdapterConfig(
+            model_type="molmo2",
+            hidden_size=128,  # Match vit_config
+            intermediate_size=256,
+            text_hidden_size=256,  # Match text_config
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=64,
+            vit_layers=[-1, -2],  # Use last two layers
+        )
+
+        vision_config = molmo2.VisionConfig(
+            vit_config=vit_config,
+            adapter_config=adapter_config,
+        )
+
+        config = molmo2.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="molmo2",
+        )
+        model = molmo2.Model(config)
+
+        # Test language model
+        # Note: vocab_size in logits is base vocab only, additional tokens are handled separately
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
     def test_florence2(self):
         from mlx_vlm.models import florence2
 
@@ -1783,6 +1847,72 @@ class TestModels(unittest.TestCase):
         )
 
         # TODO: Add test for vision model. Ensure I can pass input type and shapes.
+
+    def test_jina_vlm(self):
+        from mlx_vlm.models import jina_vlm
+
+        text_config = jina_vlm.TextConfig(
+            model_type="jina_vlm",
+            hidden_size=2048,
+            num_hidden_layers=4,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=128,
+            vocab_size=151936,
+            additional_vocab_size=128,
+            intermediate_size=6144,
+            rms_norm_eps=1e-6,
+            rope_theta=1000000.0,
+            use_qk_norm=True,
+        )
+
+        vision_config = jina_vlm.VisionConfig(
+            model_type="jina_vlm",
+            hidden_size=1152,
+            num_hidden_layers=4,
+            num_attention_heads=16,
+            head_dim=72,
+            patch_size=14,
+            image_size=378,
+            num_channels=3,
+            intermediate_size=4304,
+            vit_layers=(-2, -4),
+            output_size=2048,
+            pooling_h=2,
+            pooling_w=2,
+            connector_hidden_size=6144,
+        )
+
+        config = jina_vlm.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="jina_vlm",
+            vocab_size=151936,
+        )
+
+        model = jina_vlm.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        # Vision model expects patchified input from processor, skip standard test
+        # Test basic forward pass with patchified input instead
+        batch_size = 1
+        n_patches = (
+            config.vision_config.image_size // config.vision_config.patch_size
+        ) ** 2
+        patch_dim = (
+            config.vision_config.patch_size**2 * config.vision_config.num_channels
+        )
+        pixel_values = mx.random.uniform(shape=(batch_size, n_patches, patch_dim))
+        output, hidden_states = model.vision_model(pixel_values)
+        # Check output shape matches hidden size
+        self.assertEqual(output.shape[-1], config.vision_config.hidden_size)
+        self.assertEqual(len(hidden_states), config.vision_config.num_hidden_layers + 1)
 
     def test_hunyuan_vl(self):
         from mlx_vlm.models import hunyuan_vl
