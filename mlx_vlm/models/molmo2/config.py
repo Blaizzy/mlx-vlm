@@ -135,4 +135,3 @@ class ModelConfig(BaseModelConfig):
                 if k in inspect.signature(cls).parameters
             }
         )
-

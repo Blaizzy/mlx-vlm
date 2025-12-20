@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Union
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -53,7 +53,9 @@ class Model(nn.Module):
         n_crops, n_patches, pixels_per_patch = pixel_values.shape
 
         example_ids_for_image = mx.array(
-            np.repeat(np.arange(batch_size), np.array(counts).astype(np.int32).tolist()),
+            np.repeat(
+                np.arange(batch_size), np.array(counts).astype(np.int32).tolist()
+            ),
             dtype=mx.int32,
         )
 
@@ -106,11 +108,15 @@ class Model(nn.Module):
         patch_offset = 0
         for ex, c in enumerate(counts_list):
             num_pooled = int(pooled_per_example[ex].item())
-            cur = mx.array(image_token_pooling[pooled_offset : pooled_offset + num_pooled])
+            cur = mx.array(
+                image_token_pooling[pooled_offset : pooled_offset + num_pooled]
+            )
 
             per_img_patches = patches_per_image[image_idx : image_idx + c]
             index_offsets = [0] + np.cumsum(per_img_patches.tolist()).tolist()[:-1]
-            per_img_pooled = num_pooled_patches_per_image[image_idx : image_idx + c].tolist()
+            per_img_pooled = num_pooled_patches_per_image[
+                image_idx : image_idx + c
+            ].tolist()
 
             offset = 0
             for j in range(c):
@@ -148,7 +154,9 @@ class Model(nn.Module):
         num_videos = int(counts.sum().item())
 
         if video_grids.shape[0] != num_videos:
-            raise ValueError(f"Expected {num_videos} videos, got {video_grids.shape[0]}")
+            raise ValueError(
+                f"Expected {num_videos} videos, got {video_grids.shape[0]}"
+            )
 
         num_pooled_patches_per_video = (video_grids[:, 1] * video_grids[:, 2]).astype(
             video_token_pooling.dtype
@@ -222,7 +230,9 @@ class Model(nn.Module):
 
         if video_token_pooling is not None or video_grids is not None:
             if video_token_pooling is None or video_grids is None:
-                raise ValueError("video_token_pooling and video_grids are required for videos")
+                raise ValueError(
+                    "video_token_pooling and video_grids are required for videos"
+                )
             return self.build_batched_videos(
                 input_ids=input_ids,
                 pixel_values_videos=pixel_values,

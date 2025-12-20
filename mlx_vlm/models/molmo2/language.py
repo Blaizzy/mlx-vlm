@@ -3,7 +3,11 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput, create_attention_mask, scaled_dot_product_attention
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from ..cache import KVCache
 from .config import ModelConfig, TextConfig
 
@@ -138,7 +142,9 @@ class Molmo2Transformer(nn.Module):
         self.wte = Molmo2Embedding(
             config.vocab_size, config.additional_vocab_size, config.hidden_size
         )
-        self.blocks = [Molmo2DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        self.blocks = [
+            Molmo2DecoderLayer(config) for _ in range(config.num_hidden_layers)
+        ]
         self.ln_f = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
 
         self.emb_drop = nn.Dropout(config.embedding_dropout)
@@ -198,4 +204,3 @@ class LanguageModel(nn.Module):
     @property
     def layers(self):
         return self.model.blocks
-

@@ -122,7 +122,9 @@ class Molmo2VisionBlock(nn.Module):
         self.feed_forward = ViTMLP(
             config.hidden_size, config.intermediate_size, config.hidden_act
         )
-        self.attention_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.attention_norm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
         self.ffn_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -140,7 +142,9 @@ class Molmo2VisionTransformer(nn.Module):
         self.positional_embedding = mx.zeros((config.image_num_pos, config.hidden_size))
         patch_dim = config.image_patch_size * config.image_patch_size * 3
         self.patch_embedding = nn.Linear(patch_dim, config.hidden_size, bias=True)
-        self.transformer = [Molmo2VisionBlock(config) for _ in range(config.num_hidden_layers)]
+        self.transformer = [
+            Molmo2VisionBlock(config) for _ in range(config.num_hidden_layers)
+        ]
 
     def add_pos_emb(self, x: mx.array, patch_num: Tuple[int, int]) -> mx.array:
         pos_emb = self.positional_embedding
@@ -150,7 +154,9 @@ class Molmo2VisionTransformer(nn.Module):
         patch_h, patch_w = patch_num
         if pos_emb.shape[0] != patch_h or pos_emb.shape[1] != patch_w:
             pos_emb = mx.transpose(pos_emb[None, ...], (0, 3, 1, 2))
-            pos_emb = interpolate(pos_emb, (patch_h, patch_w), mode="cubic", align_corners=False)
+            pos_emb = interpolate(
+                pos_emb, (patch_h, patch_w), mode="cubic", align_corners=False
+            )
             pos_emb = mx.transpose(pos_emb, (0, 2, 3, 1))[0]
 
         pos_emb = mx.reshape(pos_emb, (-1, pos_emb.shape[-1]))
@@ -197,7 +203,9 @@ class VisionModel(nn.Module):
 
         self.vit_layers = []
         for layer in self.adapter_config.vit_layers:
-            self.vit_layers.append(layer if layer >= 0 else layer + self.vit_config.num_hidden_layers)
+            self.vit_layers.append(
+                layer if layer >= 0 else layer + self.vit_config.num_hidden_layers
+            )
 
         pool_dim = self.vit_config.hidden_size * len(self.vit_layers)
 

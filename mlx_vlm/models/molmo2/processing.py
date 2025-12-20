@@ -1,14 +1,14 @@
 """Image processor for Molmo2 - MLX-native implementation without torch dependency."""
 
 import logging
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
-
 from transformers import AutoImageProcessor, AutoProcessor
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import BaseImageProcessor, get_size_dict
+from transformers.image_transforms import convert_to_rgb
 from transformers.image_utils import (
     ImageInput,
     PILImageResampling,
@@ -16,7 +16,6 @@ from transformers.image_utils import (
     to_numpy_array,
     valid_images,
 )
-from transformers.image_transforms import convert_to_rgb
 from transformers.processing_utils import ProcessorMixin
 
 logger = logging.getLogger(__name__)
@@ -222,9 +221,7 @@ def build_overlapping_crops(
     return crop_arr, patch_idx_full, tiling
 
 
-def batch_pixels_to_patches(
-    crops: np.ndarray, patch_size: int
-) -> np.ndarray:
+def batch_pixels_to_patches(crops: np.ndarray, patch_size: int) -> np.ndarray:
     """Convert image crops to patches."""
     n_crops, h, w, c = crops.shape
     n_patches_h = h // patch_size
@@ -326,15 +323,20 @@ def image_to_patches_and_grids(
     all_crops = np.concatenate([resize_arr, crop_arr], axis=0)
 
     # Build pooling indices for low-res
-    resize_pooling_idx = arange_for_pooling(resize_idx, image_pooling_h, image_pooling_w)
+    resize_pooling_idx = arange_for_pooling(
+        resize_idx, image_pooling_h, image_pooling_w
+    )
     resized_h, resized_w = resize_pooling_idx.shape[:2]
-    resize_pooling_idx = resize_pooling_idx.reshape(-1, image_pooling_h * image_pooling_w)
+    resize_pooling_idx = resize_pooling_idx.reshape(
+        -1, image_pooling_h * image_pooling_w
+    )
 
     # LOW-RES crop is first, so offset HIGH-RES indices by the number of low-res patches
     # (matches HuggingFace: "Global image goes first, so the order of patches in previous crops gets increased")
     pooling_idx = np.where(
         pooling_idx >= 0,
-        pooling_idx + crop_patch_h * crop_patch_w,  # Offset by one crop (the low-res crop)
+        pooling_idx
+        + crop_patch_h * crop_patch_w,  # Offset by one crop (the low-res crop)
         -1,
     )
 
@@ -389,7 +391,9 @@ class Molmo2ImageProcessor(BaseImageProcessor):
         self.do_convert_rgb = do_convert_rgb
 
         self.max_crops = max_crops
-        self.overlap_margins = overlap_margins if overlap_margins is not None else [4, 4]
+        self.overlap_margins = (
+            overlap_margins if overlap_margins is not None else [4, 4]
+        )
         self.patch_size = patch_size
         self.pooling_size = pooling_size if pooling_size is not None else [2, 2]
 
@@ -420,7 +424,9 @@ class Molmo2ImageProcessor(BaseImageProcessor):
         resample = resample or self.resample
         image_mean = image_mean or self.image_mean
         image_std = image_std or self.image_std
-        do_convert_rgb = do_convert_rgb if do_convert_rgb is not None else self.do_convert_rgb
+        do_convert_rgb = (
+            do_convert_rgb if do_convert_rgb is not None else self.do_convert_rgb
+        )
 
         max_crops = max_crops or self.max_crops
         overlap_margins = overlap_margins or self.overlap_margins
@@ -452,17 +458,19 @@ class Molmo2ImageProcessor(BaseImageProcessor):
             batch_hi_pooled_dims = []
 
             for image in images:
-                image_grid, crops, pooled_idx, hi_pooled_dims = image_to_patches_and_grids(
-                    image,
-                    max_crops,
-                    overlap_margins,
-                    base_image_input_size,
-                    resample,
-                    image_mean,
-                    image_std,
-                    patch_size,
-                    image_pooling_w,
-                    image_pooling_h,
+                image_grid, crops, pooled_idx, hi_pooled_dims = (
+                    image_to_patches_and_grids(
+                        image,
+                        max_crops,
+                        overlap_margins,
+                        base_image_input_size,
+                        resample,
+                        image_mean,
+                        image_std,
+                        patch_size,
+                        image_pooling_w,
+                        image_pooling_h,
+                    )
                 )
                 batch_grids.append(image_grid)
                 batch_crops.append(crops)
