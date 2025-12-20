@@ -1,7 +1,7 @@
 mlx>=0.26.0
 datasets>=2.19.1
 tqdm>=4.66.2
-transformers>=4.57.0
+transformers>=5.0.0rc1
 Pillow>=10.3.0
 requests>=2.31.0
 mlx-lm>=0.23.0
