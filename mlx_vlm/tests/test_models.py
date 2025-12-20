@@ -1520,6 +1520,70 @@ class TestModels(unittest.TestCase):
             (576, 588),
         )
 
+    def test_molmo2(self):
+        from mlx_vlm.models import molmo2
+
+        text_config = molmo2.TextConfig(
+            model_type="molmo2",
+            hidden_size=256,  # Reduced for testing
+            intermediate_size=512,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=64,
+            vocab_size=151936,
+            additional_vocab_size=128,
+            hidden_act="silu",
+            layer_norm_eps=1e-6,
+            rope_theta=5000000.0,
+            use_qk_norm=True,
+        )
+
+        vit_config = molmo2.config.VitConfig(
+            model_type="molmo2",
+            hidden_size=128,  # Reduced for testing
+            intermediate_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=64,
+            image_patch_size=14,
+            image_num_pos=729,  # 27x27
+            image_default_input_size=[378, 378],
+        )
+
+        adapter_config = molmo2.config.AdapterConfig(
+            model_type="molmo2",
+            hidden_size=128,  # Match vit_config
+            intermediate_size=256,
+            text_hidden_size=256,  # Match text_config
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=64,
+            vit_layers=[-1, -2],  # Use last two layers
+        )
+
+        vision_config = molmo2.VisionConfig(
+            vit_config=vit_config,
+            adapter_config=adapter_config,
+        )
+
+        config = molmo2.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="molmo2",
+        )
+        model = molmo2.Model(config)
+
+        # Test language model
+        # Note: vocab_size in logits is base vocab only, additional tokens are handled separately
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
     def test_florence2(self):
         from mlx_vlm.models import florence2
 
