@@ -364,39 +364,7 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
 
-    # Try to use local processor for models that have one (avoids torch dependency)
-    processor = None
-    try:
-        config = load_config(model_path, trust_remote_code=False)
-        model_type = config.get("model_type", "").lower()
-        model_type = MODEL_REMAPPING.get(model_type, model_type)
-
-        # Check if model has a local Processor class
-        try:
-            model_module = importlib.import_module(f"mlx_vlm.models.{model_type}")
-            if hasattr(model_module, "Processor"):
-                # Load tokenizer separately
-                from transformers import AutoTokenizer
-
-                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
-
-                # Get ImageProcessor if available
-                image_processor = None
-                if hasattr(model_module, "ImageProcessor"):
-                    image_processor = model_module.ImageProcessor()
-
-                # Create processor with local classes
-                processor = model_module.Processor(
-                    image_processor=image_processor, tokenizer=tokenizer
-                )
-        except (ImportError, AttributeError):
-            pass  # Fall back to AutoProcessor
-    except Exception:
-        pass  # Fall back to AutoProcessor
-
-    # Fall back to AutoProcessor if local processor not available
-    if processor is None:
-        processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
+    processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
