@@ -3,7 +3,6 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -26,7 +25,6 @@ class Qwen3VLRotaryEmbedding:
             self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
         )
         self.inv_freq = inv_freq
-        self.attention_scaling = 1.0  # type: default
 
         self.mrope_section = rope_scaling.get("mrope_section", [24, 20, 20])
 
@@ -69,8 +67,8 @@ class Qwen3VLRotaryEmbedding:
         freqs = mx.swapaxes(freqs, 2, 3)
         freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
         emb = mx.concatenate([freqs, freqs], axis=-1)
-        cos = mx.cos(emb) * self.attention_scaling
-        sin = mx.sin(emb) * self.attention_scaling
+        cos = mx.cos(emb)
+        sin = mx.sin(emb)
 
         return cos.astype(x.dtype), sin.astype(x.dtype)
 
@@ -258,10 +256,8 @@ class Qwen3VLModel(nn.Module):
 
         if mask is None:
             mask = create_attention_mask(h, cache)
-
         for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
             h = layer(h, mask, c, position_ids)
-
             # Add deepstack visual embeds
             # add visual features to the hidden states of first several layers
             if deepstack_visual_embeds is not None and layer_idx in range(
@@ -281,12 +277,25 @@ class Qwen3VLModel(nn.Module):
         visual_pos_masks: mx.array,
         visual_embeds: mx.array,
     ):
-        visual_embeds = visual_embeds.astype(hidden_states.dtype)
-        # Convert boolean mask to indices using numpy
-        visual_indices = np.where(visual_pos_masks)[0].tolist()
-        local_this = hidden_states[:, visual_indices, :] + visual_embeds
-        hidden_states[:, visual_indices, :] = local_this
-        return hidden_states
+        batch_size = hidden_states.shape[0]
+
+        updated_batches = []
+        for b in range(batch_size):
+            batch_mask = visual_pos_masks[b]
+            batch_hidden = hidden_states[b]
+
+            batch_indices = mx.array(np.where(batch_mask)[0], dtype=mx.uint32)
+
+            if len(batch_indices) == 0:
+                updated_batches.append(batch_hidden)
+                continue
+
+            batch_result = mx.array(batch_hidden)  # avoid modifying in-place
+            batch_result = batch_result.at[batch_indices].add(visual_embeds)
+
+            updated_batches.append(batch_result)
+
+        return mx.stack(updated_batches, axis=0)
 
 
 class LanguageModel(nn.Module):
@@ -296,6 +305,7 @@ class LanguageModel(nn.Module):
         self.config = config
         self.model_type = args.model_type
         self.model = Qwen3VLModel(args)
+        self._rope_deltas = None
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
@@ -488,6 +498,10 @@ class LanguageModel(nn.Module):
         deepstack_visual_embeds: Optional[mx.array] = None,
         **kwargs,
     ):
+        # Slicing visual_pos_masks when prefilling
+        n_to_process = kwargs.get("n_to_process", None)
+        if n_to_process is not None:
+            visual_pos_masks = visual_pos_masks[:, n_to_process:]
 
         position_ids = kwargs.pop("position_ids", None)
         pixel_values = kwargs.pop("pixel_values", None)
@@ -497,7 +511,7 @@ class LanguageModel(nn.Module):
 
         # reset rope_deltas when processing a new image/video
         if pixel_values is not None:
-            rope_deltas = None
+            self._rope_deltas = None
 
         cache_offset = 0
         if cache and cache[0] is not None:
@@ -513,18 +527,18 @@ class LanguageModel(nn.Module):
             # Calculate RoPE index once per generation in the pre-fill stage only
             if (
                 (cache is not None and cache[0] is not None and (cache_offset == 0))
-                or rope_deltas is None
+                or self._rope_deltas is None
                 or cache is None
             ):
                 position_ids, rope_deltas = self.get_rope_index(
                     inputs, image_grid_thw, video_grid_thw, mask
                 )
-                rope_deltas = rope_deltas
+                self._rope_deltas = rope_deltas
             else:
                 # Use the prev pre-calculated rope-deltas to get the correct position ids
                 batch_size, seq_length = inputs.shape
                 delta = mx.array(
-                    cache_offset + rope_deltas if cache is not None else 0
+                    cache_offset + self._rope_deltas if cache is not None else 0
                 )
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))

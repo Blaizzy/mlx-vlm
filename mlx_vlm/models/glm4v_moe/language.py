@@ -1,9 +1,4 @@
-# Copyright © 2025 Apple Inc.
-
-import math
-from dataclasses import dataclass
-from functools import partial
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -32,7 +27,7 @@ def _compute_default_rope_parameters(
         base = rope_kwargs["base"]
         dim = rope_kwargs["dim"]
     elif config is not None:
-        base = config.rope_theta
+        base = config.rope_theta or config.rope_parameters["rope_theta"]
         partial_rotary_factor = (
             config.partial_rotary_factor
             if hasattr(config, "partial_rotary_factor")
@@ -156,7 +151,7 @@ class Glm4vMoeAttention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=args.attention_bias)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.rope_scaling = args.rope_scaling
+        self.rope_parameters = args.rope_parameters or args.rope_scaling
 
     def __call__(
         self,
@@ -179,7 +174,7 @@ class Glm4vMoeAttention(nn.Module):
         cos, sin = position_embeddings
 
         queries, keys = apply_multimodal_rotary_pos_emb(
-            queries, keys, cos, sin, self.rope_scaling["mrope_section"]
+            queries, keys, cos, sin, self.rope_parameters["mrope_section"]
         )
 
         if cache is not None:
@@ -393,7 +388,7 @@ class LanguageModel(nn.Module):
         self.model_type = args.model_type
         self.model = GLM4VModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-        self.rope_deltas = None
+        self._rope_deltas = None
 
     def get_rope_index(
         self,
@@ -587,29 +582,49 @@ class LanguageModel(nn.Module):
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         # reset rope_deltas when processing a new image/video
         if pixel_values is not None:
-            self.rope_deltas = None
+            self._rope_deltas = None
+
+        cache_offset = 0
+        if cache and cache[0] is not None:
+            offset = cache[0].offset
+            if isinstance(offset, int):
+                cache_offset = offset
+            elif isinstance(offset, mx.array):
+                cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
+            else:
+                raise ValueError(f"Unexpected cache offset type: {type(offset)}")
 
         if position_ids is None and (mask is None or mask.ndim == 2):
             # Calculate RoPE index once per generation in the pre-fill stage only
             if (
-                (cache is not None and cache[0] is not None and cache[0].offset == 0)
-                or self.rope_deltas is None
+                (cache is not None and cache[0] is not None and (cache_offset == 0))
+                or self._rope_deltas is None
                 or cache is None
             ):
                 position_ids, rope_deltas = self.get_rope_index(
                     inputs, image_grid_thw, video_grid_thw, mask
                 )
-                self.rope_deltas = rope_deltas
+                self._rope_deltas = rope_deltas
             else:
                 # Use the prev pre-calculated rope-deltas to get the correct position ids
                 batch_size, seq_length = inputs.shape
-                delta = cache[-1].offset + self.rope_deltas if cache is not None else 0
-                delta = delta[None, None, ...]
-                position_ids = mx.arange(seq_length).reshape(1, seq_length)
+                delta = mx.array(
+                    cache_offset + self._rope_deltas if cache is not None else 0
+                )
+                position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
-                if cache is not None:
-                    delta = mx.repeat(delta, batch_size // delta.shape[0], axis=0)
-                position_ids = mx.add(position_ids, delta).reshape(position_ids.shape)
+
+                if cache_offset is not None:
+                    if delta.ndim == 0:
+                        delta = mx.expand_dims(delta, axis=0)
+
+                    if delta.shape[0] < batch_size:
+                        delta = mx.tile(delta, (batch_size, 1))
+                    else:
+                        # Slice delta to match batch
+                        delta = delta[:batch_size]
+
+                position_ids = mx.add(position_ids, delta)[None, ...]
                 position_ids = mx.broadcast_to(
                     position_ids, (3, batch_size, seq_length)
                 )

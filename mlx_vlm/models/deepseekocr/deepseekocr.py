@@ -154,17 +154,33 @@ class Model(nn.Module):
         if (
             self.sam_model is not None
             and (input_ids.shape[1] != 1 or self.training)
-            and mx.sum(pixel_values[0][1]).item() != 0
+            and mx.sum(pixel_values[1]).item() != 0
         ):
 
             idx = 0
+            patch_idx = 0  # Track patch offset for batch processing
+            all_patches = pixel_values[0]
+            all_image_ori = pixel_values[1]
 
             for crop_shape in images_spatial_crop.tolist():
                 images_in_this_batch = []
-                patches = pixel_values[0]
-                image_ori = pixel_values[1]
-                if mx.sum(patches).item() != 0:
-                    crop_flag = 1
+                width_crop_num, height_crop_num = int(crop_shape[0]), int(crop_shape[1])
+
+                # Calculate number of patches for this image
+                has_crops = width_crop_num > 1 or height_crop_num > 1
+                num_patches = width_crop_num * height_crop_num if has_crops else 0
+
+                # Extract patches for current image
+                if has_crops and num_patches > 0:
+                    patches = all_patches[patch_idx : patch_idx + num_patches]
+                    patch_idx += num_patches
+                else:
+                    patches = None
+
+                # Extract global image for current image (one per batch item)
+                image_ori = all_image_ori[idx : idx + 1]
+
+                if patches is not None and mx.sum(patches).item() != 0:
                     local_features_1 = self.sam_model(patches.transpose(0, 2, 3, 1))
 
                     local_features_2 = self.vision_model(
@@ -195,21 +211,13 @@ class Model(nn.Module):
                     )
                     global_features = self.projector(global_features)
 
-                    print("=====================")
-                    print("BASE: ", global_features.shape)
-                    print("PATCHES: ", local_features.shape)
-                    print("=====================")
-
-                    _, hw, n_dim = global_features.shape
+                    # Remove batch dimension for single image processing
+                    global_features = global_features[0]  # (hw, n_dim)
+                    hw, n_dim = global_features.shape
                     h = w = int(hw**0.5)
 
-                    _2, hw2, n_dim2 = local_features.shape
+                    _, hw2, n_dim2 = local_features.shape
                     h2 = w2 = int(hw2**0.5)
-
-                    width_crop_num, height_crop_num = (
-                        crop_shape[0],
-                        crop_shape[1],
-                    )
 
                     global_features = global_features.reshape(h, w, n_dim)
 
@@ -262,11 +270,10 @@ class Model(nn.Module):
                         axis=-1,
                     )
                     global_features = self.projector(global_features)
-                    print("=====================")
-                    print("BASE: ", global_features.shape)
-                    print("NO PATCHES")
-                    print("=====================")
-                    _, hw, n_dim = global_features.shape
+
+                    # Remove batch dimension for single image processing
+                    global_features = global_features[0]  # (hw, n_dim)
+                    hw, n_dim = global_features.shape
                     h = w = int(hw**0.5)
 
                     global_features = global_features.reshape(h, w, n_dim)

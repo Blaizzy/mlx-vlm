@@ -1,4 +1,3 @@
-import inspect
 from typing import Any, Optional
 
 import mlx.core as mx

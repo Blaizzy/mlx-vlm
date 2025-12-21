@@ -1,10 +1,7 @@
 import mlx.core as mx
 import numpy as np
 
-from ..idefics3 import LanguageModel
 from ..idefics3 import Model as Idefics3Model
-from ..idefics3 import VisionModel
-from .config import ModelConfig, TextConfig, VisionConfig
 
 
 class Model(Idefics3Model):

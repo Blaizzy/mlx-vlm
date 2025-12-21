@@ -1,5 +1,4 @@
-import inspect
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -41,6 +40,11 @@ class Attention(nn.Module):
             base=config.rope_theta,
             scale=rope_scale,
         )
+        self.use_qk_norm = config.use_qk_norm
+
+        if self.use_qk_norm:
+            self.q_norm = nn.RMSNorm(dims=head_dim, eps=config.rms_norm_eps)
+            self.k_norm = nn.RMSNorm(dims=head_dim, eps=config.rms_norm_eps)
 
     def __call__(
         self,
@@ -56,6 +60,10 @@ class Attention(nn.Module):
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+
+        if self.use_qk_norm:
+            queries = self.q_norm(queries)
+            keys = self.k_norm(keys)
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -152,10 +160,6 @@ class LanguageModel(nn.Module):
         super().__init__()
         self.config = config
         self.model_type = config.model_type
-        if self.model_type != "mistral":
-            raise ValueError(
-                f"Model type {self.model_type} not supported. Currently only 'mistral' is supported"
-            )
         self.model = Mistral(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -165,6 +169,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        **kwargs,
     ):
         out = self.model(inputs, mask=mask, cache=cache, inputs_embeds=inputs_embeds)
         logits = self.lm_head(out)

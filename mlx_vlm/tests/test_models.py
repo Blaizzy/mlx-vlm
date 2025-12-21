@@ -70,7 +70,7 @@ class TestModels(unittest.TestCase):
                 )
 
             batch_size = kwargs.pop("batch_size", 1)
-            if model_type in ["qwen2_5_vl", "glm4v_moe"]:
+            if model_type in ["qwen2_5_vl", "glm4v_moe", "glm4v", "hunyuan_vl"]:
                 input_tensor = mx.random.uniform(shape=(image_size[0], image_size[1]))
             else:
                 shape = (
@@ -770,6 +770,128 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
         )
 
+    def test_mistral3(self):
+        from mlx_vlm.models import mistral3
+
+        text_config = mistral3.TextConfig(
+            head_dim=128,
+            hidden_size=5120,
+            intermediate_size=32768,
+            max_position_embeddings=131072,
+            model_type="mistral",
+            num_attention_heads=32,
+            num_hidden_layers=40,
+            num_key_value_heads=8,
+            rms_norm_eps=1e-5,
+            rope_theta=1000000000.0,
+            vocab_size=131072,
+            rope_traditional=False,
+            rope_scaling=None,
+            tie_word_embeddings=False,
+            layer_types=["full_attention"] * 40,
+            use_qk_norm=False,
+        )
+
+        vision_config = mistral3.VisionConfig(
+            model_type="pixtral",
+            hidden_size=1024,
+            num_hidden_layers=24,
+            intermediate_size=4096,
+            num_attention_heads=16,
+            image_size=336,
+            patch_size=14,
+            projection_dim=768,
+            vocab_size=32000,
+            num_channels=3,
+            rms_norm_eps=1e-6,
+        )
+
+        config = mistral3.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="mistral3",
+        )
+
+        model = mistral3.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
+    def test_ministral3(self):
+        from mlx_vlm.models import mistral3
+
+        text_config = mistral3.TextConfig(
+            head_dim=128,
+            hidden_size=3072,
+            intermediate_size=9216,
+            max_position_embeddings=262144,
+            model_type="ministral3",
+            num_attention_heads=32,
+            num_hidden_layers=26,
+            rms_norm_eps=1e-05,
+            rope_parameters={
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "factor": 16.0,
+                "llama_4_scaling_beta": 0.1,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "original_max_position_embeddings": 16384,
+                "rope_theta": 1000000.0,
+                "rope_type": "yarn",
+                "type": "yarn",
+            },
+            rope_traditional=False,
+            rope_scaling=None,
+            tie_word_embeddings=True,
+            vocab_size=131072,
+        )
+
+        vision_config = mistral3.VisionConfig(
+            head_dim=64,
+            hidden_size=1024,
+            image_size=1540,
+            intermediate_size=4096,
+            model_type="pixtral",
+            num_attention_heads=16,
+            num_channels=3,
+            num_hidden_layers=24,
+            patch_size=14,
+            rope_theta=10000.0,
+        )
+
+        config = mistral3.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="pixtral",
+        )
+        model = mistral3.Model(config)
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
     def test_pixtral(self):
         from mlx_vlm.models import pixtral
 
@@ -1202,6 +1324,70 @@ class TestModels(unittest.TestCase):
             ),  # image temporals shape (num_images, 3)
         )
 
+    def test_glm4v(self):
+        from mlx_vlm.models import glm4v
+
+        text_config = glm4v.TextConfig(
+            model_type="glm4v",
+        )
+
+        vision_config = glm4v.VisionConfig(
+            model_type="glm4v",
+            depth=32,
+            hidden_size=1280,
+            intermediate_size=3420,
+            out_hidden_size=1536,
+            num_heads=16,
+            patch_size=14,
+            window_size=112,
+            image_size=336,
+            in_channels=3,
+            rms_norm_eps=1e-05,
+            attention_bias=False,
+            attention_dropout=0.0,
+            hidden_act="silu",
+            initializer_range=0.02,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+        )
+
+        config = glm4v.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="glm4v",
+            vocab_size=257152,
+            ignore_index=-100,
+            image_token_index=151363,
+            image_token_id=151363,
+            video_token_index=151364,
+            video_token_id=151364,
+            vision_start_token_id=151339,
+            vision_end_token_id=151340,
+            hidden_size=2048,
+            pad_token_id=0,
+        )
+
+        model = glm4v.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.out_hidden_size,
+            config.vision_config.in_channels,
+            (140, 1176),
+            vision_feature_layer=-1,
+            grid_thw=mx.array(
+                [[1, 10, 14]], dtype=mx.int64
+            ),  # image temporals shape (num_images, 3)
+        )
+
     def test_lfm2_vl(self):
         from mlx_vlm.models import lfm2_vl
 
@@ -1332,6 +1518,70 @@ class TestModels(unittest.TestCase):
             config.vision_config.d_model,
             config.vision_config.num_channels,
             (576, 588),
+        )
+
+    def test_molmo2(self):
+        from mlx_vlm.models import molmo2
+
+        text_config = molmo2.TextConfig(
+            model_type="molmo2",
+            hidden_size=256,  # Reduced for testing
+            intermediate_size=512,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=64,
+            vocab_size=151936,
+            additional_vocab_size=128,
+            hidden_act="silu",
+            layer_norm_eps=1e-6,
+            rope_theta=5000000.0,
+            use_qk_norm=True,
+        )
+
+        vit_config = molmo2.config.VitConfig(
+            model_type="molmo2",
+            hidden_size=128,  # Reduced for testing
+            intermediate_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=64,
+            image_patch_size=14,
+            image_num_pos=729,  # 27x27
+            image_default_input_size=[378, 378],
+        )
+
+        adapter_config = molmo2.config.AdapterConfig(
+            model_type="molmo2",
+            hidden_size=128,  # Match vit_config
+            intermediate_size=256,
+            text_hidden_size=256,  # Match text_config
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=64,
+            vit_layers=[-1, -2],  # Use last two layers
+        )
+
+        vision_config = molmo2.VisionConfig(
+            vit_config=vit_config,
+            adapter_config=adapter_config,
+        )
+
+        config = molmo2.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="molmo2",
+        )
+        model = molmo2.Model(config)
+
+        # Test language model
+        # Note: vocab_size in logits is base vocab only, additional tokens are handled separately
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
         )
 
     def test_florence2(self):
@@ -1597,6 +1847,176 @@ class TestModels(unittest.TestCase):
         )
 
         # TODO: Add test for vision model. Ensure I can pass input type and shapes.
+
+    def test_jina_vlm(self):
+        from mlx_vlm.models import jina_vlm
+
+        text_config = jina_vlm.TextConfig(
+            model_type="jina_vlm",
+            hidden_size=2048,
+            num_hidden_layers=4,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=128,
+            vocab_size=151936,
+            additional_vocab_size=128,
+            intermediate_size=6144,
+            rms_norm_eps=1e-6,
+            rope_theta=1000000.0,
+            use_qk_norm=True,
+        )
+
+        vision_config = jina_vlm.VisionConfig(
+            model_type="jina_vlm",
+            hidden_size=1152,
+            num_hidden_layers=4,
+            num_attention_heads=16,
+            head_dim=72,
+            patch_size=14,
+            image_size=378,
+            num_channels=3,
+            intermediate_size=4304,
+            vit_layers=(-2, -4),
+            output_size=2048,
+            pooling_h=2,
+            pooling_w=2,
+            connector_hidden_size=6144,
+        )
+
+        config = jina_vlm.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="jina_vlm",
+            vocab_size=151936,
+        )
+
+        model = jina_vlm.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        # Vision model expects patchified input from processor, skip standard test
+        # Test basic forward pass with patchified input instead
+        batch_size = 1
+        n_patches = (
+            config.vision_config.image_size // config.vision_config.patch_size
+        ) ** 2
+        patch_dim = (
+            config.vision_config.patch_size**2 * config.vision_config.num_channels
+        )
+        pixel_values = mx.random.uniform(shape=(batch_size, n_patches, patch_dim))
+        output, hidden_states = model.vision_model(pixel_values)
+        # Check output shape matches hidden size
+        self.assertEqual(output.shape[-1], config.vision_config.hidden_size)
+        self.assertEqual(len(hidden_states), config.vision_config.num_hidden_layers + 1)
+
+    def test_hunyuan_vl(self):
+        from mlx_vlm.models import hunyuan_vl
+
+        text_config = hunyuan_vl.TextConfig(
+            model_type="hunyuan_vl",
+            vocab_size=120818,
+            org_vocab_size=120818,
+            hidden_size=1024,
+            num_hidden_layers=6,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=128,
+            attention_head_dim=128,
+            intermediate_size=3584,
+            hidden_act="silu",
+            attention_bias=False,
+            mlp_bias=False,
+            attention_dropout=0.0,
+            use_qk_norm=True,
+            rope_theta=10000.0,
+            rope_scaling={
+                "alpha": 1000.0,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 1.0,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "type": "xdrope",
+                "xdrope_section": [16, 16, 16, 16],
+            },
+            max_position_embeddings=32768,
+            rms_norm_eps=1e-5,
+            norm_type="rms",
+            tie_word_embeddings=True,
+            use_cache=True,
+            initializer_range=0.02,
+            routed_scaling_factor=1.0,
+            bos_token_id=120000,
+            eos_token_id=120020,
+            eod_token_id=120020,
+            pad_token_id=-1,
+            pad_id=120002,
+        )
+
+        vision_config = hunyuan_vl.VisionConfig(
+            model_type="hunyuan_vl",
+            hidden_size=1152,
+            out_hidden_size=1024,
+            num_hidden_layers=5,
+            num_attention_heads=16,
+            intermediate_size=4304,
+            patch_size=16,
+            num_channels=3,
+            spatial_merge_size=2,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            rms_norm_eps=1e-5,
+            interpolate_mode="bilinear",
+            cat_extra_token=1,
+            img_max_token_num=4096,
+            max_vit_seq_len=16384,
+            add_patchemb_bias=True,
+            max_image_size=2048,
+            hidden_act="gelu",
+        )
+
+        config = hunyuan_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="hunyuan_vl",
+            image_token_id=120120,
+            image_start_token_id=120118,
+            image_end_token_id=120119,
+            image_newline_token_id=120121,
+            bos_token_id=120000,
+            eos_token_id=120020,
+            pad_token_id=-1,
+            pad_id=120002,
+            vocab_size=120818,
+            org_vocab_size=120818,
+            tie_word_embeddings=True,
+        )
+
+        model = hunyuan_vl.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.out_hidden_size,
+            config.vision_config.num_channels,
+            (1080, 768),
+            vision_feature_layer=-1,
+            grid_thw=mx.array(
+                [[1, 18, 60]], dtype=mx.int64
+            ),  # image temporals shape (num_images, 3)
+        )
 
 
 if __name__ == "__main__":

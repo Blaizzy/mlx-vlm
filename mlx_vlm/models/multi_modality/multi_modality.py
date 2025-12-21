@@ -1,19 +1,14 @@
-import glob
-import inspect
-import json
-from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from huggingface_hub import snapshot_download
 from PIL import Image
 from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import to_numpy_array
 
 from ..base import BaseImageProcessor, expand2square
-from .config import ModelConfig, ProjectorConfig, TextConfig, VisionConfig
+from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
 

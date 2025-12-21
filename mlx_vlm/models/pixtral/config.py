@@ -1,4 +1,3 @@
-import inspect
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
@@ -11,11 +10,16 @@ class ModelConfig(BaseModelConfig):
     vision_config: "VisionConfig" = field(default_factory=lambda: VisionConfig())
     model_type: str = "pixtral"
     ignore_index: int = -100
-    image_token_index: int = 10
+    image_token_index: int = None
+    image_token_id: int = None
     vision_feature_select_strategy: str = "full"
     vision_feature_layer: int = -1
     vocab_size: int = 32000
     eos_token_id: Optional[List[int]] = None
+
+    def __post_init__(self):
+        if self.image_token_index is None:
+            self.image_token_index = self.image_token_id
 
 
 @dataclass
@@ -33,6 +37,7 @@ class TextConfig(BaseModelConfig):
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     max_position_embeddings: int = 4096
+    use_qk_norm: bool = False
 
     def __post_init__(self):
         if self.num_key_value_heads is None:

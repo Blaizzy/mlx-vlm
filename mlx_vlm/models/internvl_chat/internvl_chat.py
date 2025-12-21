@@ -1,14 +1,10 @@
-import glob
-import inspect
-import json
-from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import BaseModelConfig, pixel_shuffle
+from ..base import pixel_shuffle
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel

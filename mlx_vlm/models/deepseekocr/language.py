@@ -1,14 +1,11 @@
-import inspect
 import math
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
-    BaseModelConfig,
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
@@ -512,6 +509,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        **kwargs,
     ):
         out = self.model(inputs, mask=mask, inputs_embeds=inputs_embeds, cache=cache)
         out = self.lm_head(out)

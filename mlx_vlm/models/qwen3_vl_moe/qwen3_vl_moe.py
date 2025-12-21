@@ -41,10 +41,18 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        image_grid_thw: Optional[mx.array] = None,
+        **kwargs,
     ):
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids), None, None
+            return {
+                "inputs_embeds": self.language_model.model.embed_tokens(input_ids),
+                "visual_pos_masks": None,
+                "deepstack_visual_embeds": None,
+            }
 
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
         pixel_values = pixel_values.astype(dtype)
@@ -54,16 +62,7 @@ class Model(nn.Module):
 
         # Get the ouptut hidden states from the vision model
         hidden_states, deepstack_image_embeds = self.vision_tower(
-            pixel_values, image_grid_thw
-        )
-
-        split_sizes = (
-            image_grid_thw.prod(-1) // self.vision_tower.spatial_merge_size**2
-        ).tolist()
-        hidden_states = mx.split(hidden_states, split_sizes)
-
-        hidden_states = mx.concatenate(hidden_states, axis=0).astype(
-            hidden_states[0].dtype
+            pixel_values, grid_thw
         )
 
         visual_pos_masks = None
@@ -82,7 +81,11 @@ class Model(nn.Module):
         visual_pos_masks = image_mask
         deepstack_visual_embeds = deepstack_image_embeds
 
-        return inputs_embeds, visual_pos_masks, deepstack_visual_embeds
+        return {
+            "inputs_embeds": inputs_embeds,
+            "visual_pos_masks": visual_pos_masks,
+            "deepstack_visual_embeds": deepstack_visual_embeds,
+        }
 
     @staticmethod
     def merge_input_ids_with_image_features(
@@ -97,6 +100,7 @@ class Model(nn.Module):
 
         n_image_features = image_features.shape[0]
         n_image_mask_elements = special_image_mask.sum()
+
         if n_image_mask_elements != image_features.size:
             raise ValueError(
                 f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
@@ -120,26 +124,15 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        image_grid_thw = kwargs.pop("image_grid_thw", None)
-        video_grid_thw = kwargs.pop("video_grid_thw", None)
-        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
-
-        inputs_embeds, visual_pos_masks, deepstack_visual_embeds = (
-            self.get_input_embeddings(input_ids, pixel_values, grid_thw)
-        )
+        inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
 
         kwargs = {
             "pixel_values": pixel_values,
-            "image_grid_thw": image_grid_thw,
-            "video_grid_thw": video_grid_thw,
-            "visual_pos_masks": visual_pos_masks,
-            "deepstack_visual_embeds": deepstack_visual_embeds,
+            **inputs_embeds,
             **kwargs,
         }
 
-        logits = self.language_model(
-            input_ids, inputs_embeds, mask=mask, cache=cache, **kwargs
-        )
+        logits = self.language_model(input_ids, mask=mask, cache=cache, **kwargs)
 
         return logits
 
