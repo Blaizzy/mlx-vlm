@@ -341,7 +341,7 @@ def train(
 
             if rank == 0:
                 print(
-                    f"Iter {it}: Train loss {Colors.OKGREEN}{train_loss:.3f}{Colors.ENDC}, "
+                    f"Iter {it}: Train loss {Colors.OKGREEN}{train_loss:.8f}{Colors.ENDC}, "
                     f"Learning Rate {learning_rate:.3e}, "
                     f"It/sec {it_sec:.3f}, "
                     f"Tokens/sec {tokens_sec:.3f}, "
