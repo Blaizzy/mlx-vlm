@@ -425,9 +425,7 @@ def generate_step(
                                 -float("inf"),
                                 dtype=next_logprobs.dtype,
                             )
-                            next_logprobs = next_logprobs.at[
-                                thinking_end_token_id
-                            ].set(0.0)
+                            next_logprobs[thinking_end_token_id] = 0.0
                             in_thinking = False
 
             mx.async_eval(next_y)
@@ -844,8 +842,10 @@ class Batch:
         self.uids = [self.uids[k] for k in keep_idx]
         self.max_tokens = [self.max_tokens[k] for k in keep_idx]
         self.num_tokens = [self.num_tokens[k] for k in keep_idx]
-        self.in_thinking = [self.in_thinking[k] for k in keep_idx]
-        self.thinking_token_count = [self.thinking_token_count[k] for k in keep_idx]
+        if self.in_thinking is not None:
+            self.in_thinking = [self.in_thinking[k] for k in keep_idx]
+        if self.thinking_token_count is not None:
+            self.thinking_token_count = [self.thinking_token_count[k] for k in keep_idx]
         keep_idx = mx.array(keep_idx, mx.int32)
         self.y = self.y[keep_idx]
         self.logprobs = self.logprobs[keep_idx]
@@ -858,8 +858,10 @@ class Batch:
         self.logprobs = mx.concatenate([self.logprobs, other.logprobs])
         self.num_tokens.extend(other.num_tokens)
         self.max_tokens.extend(other.max_tokens)
-        self.in_thinking.extend(other.in_thinking)
-        self.thinking_token_count.extend(other.thinking_token_count)
+        if self.in_thinking is not None and other.in_thinking is not None:
+            self.in_thinking.extend(other.in_thinking)
+        if self.thinking_token_count is not None and other.thinking_token_count is not None:
+            self.thinking_token_count.extend(other.thinking_token_count)
         for c, o in zip(self.cache, other.cache):
             c.extend(o)
 
@@ -1080,6 +1082,9 @@ class BatchGenerator:
                 if batch.in_thinking[e]:
                     if t == self.thinking_end_token_id:
                         batch.in_thinking[e] = False
+                    elif t == self.thinking_start_token_id:
+                        # Don't count the start token itself
+                        pass
                     else:
                         batch.thinking_token_count[e] += 1
                         # Budget exceeded - force thinking end token
@@ -1093,16 +1098,16 @@ class BatchGenerator:
             if tokens_modified:
                 batch.y = mx.array(y)
                 # Update logprobs for forced tokens
+                logprobs_list = list(logprobs)
                 for idx in modified_indices:
                     forced_logprobs = mx.full(
-                        logprobs[idx].shape,
+                        logprobs_list[idx].shape,
                         -float("inf"),
                         dtype=logprobs.dtype,
                     )
-                    forced_logprobs = forced_logprobs.at[
-                        self.thinking_end_token_id
-                    ].set(0.0)
-                    logprobs = logprobs.at[idx].set(forced_logprobs)
+                    forced_logprobs[self.thinking_end_token_id] = 0.0
+                    logprobs_list[idx] = forced_logprobs
+                logprobs = mx.stack(logprobs_list)
 
         toc = time.perf_counter()
         if prompt_processing:
