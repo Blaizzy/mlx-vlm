@@ -488,6 +488,91 @@ class TestBatchGenerator:
 
 
 # ============================================================================
+# Tests for BatchGenerator thinking budget
+# ============================================================================
+
+
+class TestBatchGeneratorThinking:
+    """Tests for thinking budget enforcement in BatchGenerator."""
+
+    def test_batch_generator_thinking_budget_enforcement(self, mock_processor):
+        """Test that thinking budget correctly limits tokens in BatchGenerator."""
+        # Token IDs for testing
+        THINK_START_ID = 100  # <think>
+        THINK_END_ID = 101  # </think>
+        REGULAR_ID = 50  # regular token
+
+        # Create a mock model that returns predictable tokens
+        class ThinkingMockModel:
+            def __init__(self):
+                self.call_count = 0
+                self.config = MockConfig()
+                # Sequence: <think>, regular, regular, ... (thinking never ends naturally)
+                self.token_sequence = [THINK_START_ID] + [REGULAR_ID] * 20
+                self.layers = [MagicMock() for _ in range(4)]
+
+            def make_cache(self):
+                from mlx_vlm.models import cache
+
+                return [cache.KVCache() for _ in range(4)]
+
+            def __call__(self, input_ids, cache=None, **kwargs):
+                # Return logits that favor the next token in sequence
+                batch_size = input_ids.shape[0] if input_ids.ndim > 1 else 1
+                seq_len = (
+                    input_ids.shape[-1] if input_ids.ndim > 1 else input_ids.shape[0]
+                )
+                logits = mx.zeros((batch_size, seq_len, 32000))
+
+                # Set high logit for the token we want to generate
+                if self.call_count < len(self.token_sequence):
+                    target_token = self.token_sequence[self.call_count]
+                else:
+                    target_token = REGULAR_ID
+                logits[:, -1, target_token] = 100.0
+                self.call_count += 1
+
+                return MagicMock(logits=logits)
+
+        model = ThinkingMockModel()
+
+        # Create BatchGenerator with thinking budget
+        gen = BatchGenerator(
+            model=model,
+            processor=mock_processor,
+            max_tokens=15,
+            thinking_budget=5,
+            thinking_start_token_id=THINK_START_ID,
+            thinking_end_token_id=THINK_END_ID,
+        )
+
+        # Insert a single prompt and generate (single token to skip prefill loop)
+        gen.insert([[1]], max_tokens=15)
+        tokens = []
+        while responses := gen.next():
+            for r in responses:
+                if r.finish_reason is None:
+                    tokens.append(r.token)
+                else:
+                    tokens.append(r.token)
+                    break
+            else:
+                continue
+            break
+
+        # Verify: should see <think>, then 5 thinking tokens, then </think> forced
+        assert tokens[0] == THINK_START_ID  # First token is <think>
+        assert THINK_END_ID in tokens  # </think> should be forced
+
+        # Find where </think> appears
+        think_end_idx = tokens.index(THINK_END_ID)
+        # Budget of 5 means: tokens at indices 1-5 are thinking tokens (5 total),
+        # then </think> is forced at index 6
+        # Token sequence: <think>, tok, tok, tok, tok, tok, </think>
+        assert think_end_idx == 6
+
+
+# ============================================================================
 # Tests for batch_generate function
 # ============================================================================
 
