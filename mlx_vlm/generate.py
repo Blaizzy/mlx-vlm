@@ -419,6 +419,15 @@ def generate_step(
                             next_y = mx.array([thinking_end_token_id])
                             # TODO: Consider gradually boosting thinking_end_token
                             # probability as budget approaches instead of hard cutoff
+                            # Update logprobs to reflect forced token selection
+                            next_logprobs = mx.full(
+                                next_logprobs.shape,
+                                -float("inf"),
+                                dtype=next_logprobs.dtype,
+                            )
+                            next_logprobs = next_logprobs.at[
+                                thinking_end_token_id
+                            ].set(0.0)
                             in_thinking = False
 
             mx.async_eval(next_y)
@@ -825,6 +834,8 @@ class Batch:
     max_tokens: List[int]
     num_tokens: List[int]
     cache: List[Any]
+    in_thinking: Optional[List[bool]] = None
+    thinking_token_count: Optional[List[int]] = None
 
     def __len__(self):
         return len(self.uids)
@@ -833,6 +844,8 @@ class Batch:
         self.uids = [self.uids[k] for k in keep_idx]
         self.max_tokens = [self.max_tokens[k] for k in keep_idx]
         self.num_tokens = [self.num_tokens[k] for k in keep_idx]
+        self.in_thinking = [self.in_thinking[k] for k in keep_idx]
+        self.thinking_token_count = [self.thinking_token_count[k] for k in keep_idx]
         keep_idx = mx.array(keep_idx, mx.int32)
         self.y = self.y[keep_idx]
         self.logprobs = self.logprobs[keep_idx]
@@ -845,6 +858,8 @@ class Batch:
         self.logprobs = mx.concatenate([self.logprobs, other.logprobs])
         self.num_tokens.extend(other.num_tokens)
         self.max_tokens.extend(other.max_tokens)
+        self.in_thinking.extend(other.in_thinking)
+        self.thinking_token_count.extend(other.thinking_token_count)
         for c, o in zip(self.cache, other.cache):
             c.extend(o)
 
@@ -869,6 +884,9 @@ class BatchGenerator:
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
         prompt_cache=None,
+        thinking_budget: Optional[int] = None,
+        thinking_start_token_id: Optional[int] = None,
+        thinking_end_token_id: Optional[int] = None,
     ):
         self.model = model
         self.unprocessed_prompts = []
@@ -884,6 +902,11 @@ class BatchGenerator:
         self.completion_batch_size = completion_batch_size
         self.prompt_cache = prompt_cache
         self._stats = BatchStats()
+
+        # Thinking budget parameters
+        self.thinking_budget = thinking_budget
+        self.thinking_start_token_id = thinking_start_token_id
+        self.thinking_end_token_id = thinking_end_token_id
 
         self.tokenizer.stopping_criteria.add_eos_token_ids(stop_tokens)
 
@@ -958,8 +981,30 @@ class BatchGenerator:
         y, logprobs = self._step(inputs, prompt_cache, **kwargs)
         mx.async_eval(y, logprobs)
         mx.clear_cache()
+
+        # Initialize thinking state if budget is set
+        in_thinking = None
+        thinking_token_count = None
+        if self.thinking_budget is not None and self.thinking_end_token_id is not None:
+            batch_size = len(uids)
+            # If no start token specified, assume thinking starts immediately
+            if self.thinking_start_token_id is None:
+                in_thinking = [True] * batch_size
+            else:
+                # Check first token of each sample to see if it's the thinking start token
+                first_tokens = y.tolist()
+                in_thinking = [t == self.thinking_start_token_id for t in first_tokens]
+            thinking_token_count = [0] * batch_size
+
         return Batch(
-            list(uids), y, logprobs, list(max_tokens), [0] * len(uids), prompt_cache
+            list(uids),
+            y,
+            logprobs,
+            list(max_tokens),
+            [0] * len(uids),
+            prompt_cache,
+            in_thinking,
+            thinking_token_count,
         )
 
     def _step(self, input_tokens: mx.array, prompt_cache: List[Any], **kwargs):
@@ -1022,6 +1067,43 @@ class BatchGenerator:
         mx.async_eval(batch.y, batch.logprobs)
 
         y = y.tolist()
+
+        # Apply thinking budget enforcement
+        tokens_modified = False
+        modified_indices: List[int] = []
+        if (
+            self.thinking_budget is not None
+            and self.thinking_end_token_id is not None
+            and batch.in_thinking is not None
+        ):
+            for e, t in enumerate(y):
+                if batch.in_thinking[e]:
+                    if t == self.thinking_end_token_id:
+                        batch.in_thinking[e] = False
+                    else:
+                        batch.thinking_token_count[e] += 1
+                        # Budget exceeded - force thinking end token
+                        if batch.thinking_token_count[e] > self.thinking_budget:
+                            y[e] = self.thinking_end_token_id
+                            batch.in_thinking[e] = False
+                            tokens_modified = True
+                            modified_indices.append(e)
+
+            # Update batch.y and logprobs if any tokens were modified
+            if tokens_modified:
+                batch.y = mx.array(y)
+                # Update logprobs for forced tokens
+                for idx in modified_indices:
+                    forced_logprobs = mx.full(
+                        logprobs[idx].shape,
+                        -float("inf"),
+                        dtype=logprobs.dtype,
+                    )
+                    forced_logprobs = forced_logprobs.at[
+                        self.thinking_end_token_id
+                    ].set(0.0)
+                    logprobs = logprobs.at[idx].set(forced_logprobs)
+
         toc = time.perf_counter()
         if prompt_processing:
             self._stats.prompt_time += toc - tic
@@ -1076,6 +1158,9 @@ def batch_generate(
     verbose: bool = False,
     group_by_shape: bool = True,
     track_image_sizes: bool = True,
+    thinking_budget: Optional[int] = None,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: str = "</think>",
     **kwargs,
 ):
     """
@@ -1105,6 +1190,13 @@ def batch_generate(
           batch processing. Default: ``True``.
        track_image_sizes (bool): If ``True``, track and return original image sizes.
           Default: ``True``.
+       thinking_budget (int, optional): Maximum number of tokens allowed in
+          thinking blocks. When exceeded, the thinking_end_token is force-inserted.
+       thinking_start_token (str, optional): Token string that marks the start of a
+          thinking block. If None (default), assumes thinking starts immediately
+          when thinking_budget is set.
+       thinking_end_token (str): Token string that marks the end of a
+          thinking block. Default: "</think>".
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
 
@@ -1118,6 +1210,18 @@ def batch_generate(
     processor.detokenizer.reset()
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
+    # Resolve thinking token IDs if budget is set
+    thinking_start_token_id = None
+    thinking_end_token_id = None
+    if thinking_budget is not None:
+        if thinking_start_token is not None:
+            thinking_start_token_id = tokenizer.encode(
+                thinking_start_token, add_special_tokens=False
+            )[-1]
+        thinking_end_token_id = tokenizer.encode(
+            thinking_end_token, add_special_tokens=False
+        )[-1]
+
     # Handle single image case
     if isinstance(images, str):
         images = [images]
@@ -1125,7 +1229,16 @@ def batch_generate(
     # Handle no images case
     if images is None:
         texts, stats = _generate_batch(
-            model, processor, prompts, None, max_tokens, verbose, **kwargs
+            model,
+            processor,
+            prompts,
+            None,
+            max_tokens,
+            verbose,
+            thinking_budget=thinking_budget,
+            thinking_start_token_id=thinking_start_token_id,
+            thinking_end_token_id=thinking_end_token_id,
+            **kwargs,
         )
         return BatchResponse(texts, stats)
 
@@ -1190,6 +1303,9 @@ def batch_generate(
             group_prompts,
             group_images,
             group_max_tokens,
+            thinking_budget=thinking_budget,
+            thinking_start_token_id=thinking_start_token_id,
+            thinking_end_token_id=thinking_end_token_id,
             **kwargs,
         )
 
@@ -1239,6 +1355,9 @@ def _generate_batch(
     images: List = None,
     max_tokens: Union[int, List[int]] = 100,
     verbose: bool = False,
+    thinking_budget: Optional[int] = None,
+    thinking_start_token_id: Optional[int] = None,
+    thinking_end_token_id: Optional[int] = None,
     **kwargs,
 ) -> Tuple[List[str], BatchStats]:
 
@@ -1293,6 +1412,9 @@ def _generate_batch(
         processor,
         prefill_batch_size=batch_size,
         completion_batch_size=batch_size,
+        thinking_budget=thinking_budget,
+        thinking_start_token_id=thinking_start_token_id,
+        thinking_end_token_id=thinking_end_token_id,
         **kwargs,
     )
 
