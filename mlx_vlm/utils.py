@@ -912,39 +912,6 @@ def prepare_inputs(
             )
             audio = audio[:1]
 
-        if is_qwen3_omni_moe:
-            audio_arrays = [
-                load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
-                for audio_file in audio
-            ]
-            audio_arrays = [
-                audio_array.astype(np.float32) for audio_array in audio_arrays
-            ]
-
-            feature_extractor = getattr(processor, "feature_extractor", None)
-            if feature_extractor is None:
-                raise ValueError("Processor missing feature_extractor for audio prep.")
-
-            audio_inputs = feature_extractor(
-                audio_arrays,
-                sampling_rate=feature_extractor.sampling_rate,
-                padding=True,
-                return_attention_mask=True,
-            )
-
-            audio_feature_lengths = np.sum(
-                audio_inputs["attention_mask"], axis=-1, dtype=np.int32
-            )
-        else:
-            feature_extractor = getattr(processor, "feature_extractor", None)
-            if feature_extractor is not None:
-                audio = [
-                    load_audio(audio_file, sr=feature_extractor.sampling_rate)
-                    for audio_file in audio
-                ]
-            else:
-                audio = [load_audio(audio_file, sr=16000) for audio_file in audio]
-    else:
         audio = [
             load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
             for audio_file in audio
