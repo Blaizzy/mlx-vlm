@@ -1,12 +1,9 @@
-import inspect
-from dataclasses import dataclass
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import BaseModelConfig
 from .config import VisionConfig
 
 

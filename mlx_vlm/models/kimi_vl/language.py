@@ -1,8 +1,6 @@
-import inspect
 import math
-import re
 from functools import partial
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -13,7 +11,6 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import KVCache
 from .config import TextConfig
 
 

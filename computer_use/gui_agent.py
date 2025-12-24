@@ -83,7 +83,6 @@ def hover(position):
 
 def answer(value):
     """Provide an answer"""
-    pass
 
 
 def enter():

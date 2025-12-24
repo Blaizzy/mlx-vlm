@@ -14,7 +14,6 @@ import soundfile as sf
 from PIL import ImageGrab
 from pynput.mouse import Controller as MouseController
 from rich import print
-from rich.prompt import Prompt
 from utils import draw_point, update_navigation_history
 
 from mlx_vlm import load
@@ -172,7 +171,6 @@ def hover(position):
 
 def answer(value):
     """Provide an answer"""
-    pass
 
 
 def enter():
@@ -289,7 +287,7 @@ def build_messages(system_prompt, query, past_actions=[]):
     return messages
 
 
-from PIL import Image, ImageDraw
+from PIL import ImageDraw
 
 
 def extract_thought_action(response):
@@ -589,7 +587,6 @@ def main():
     )
 
     import mlx_whisper
-    import numpy as np
     import speech_recognition as sr
 
     r = sr.Recognizer()

@@ -4,7 +4,7 @@ import contextlib
 import functools
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -15,7 +15,13 @@ from transformers import PreTrainedTokenizer
 from .models import cache
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
-from .utils import StoppingCriteria, apply_repetition_penalty, load, prepare_inputs
+from .utils import (
+    StoppingCriteria,
+    apply_repetition_penalty,
+    group_images_by_shape,
+    load,
+    prepare_inputs,
+)
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
@@ -68,6 +74,7 @@ def parse_arguments():
     parser.add_argument(
         "--prompt",
         type=str,
+        nargs="+",
         default=DEFAULT_PROMPT,
         help="Message to be processed by the model.",
     )
@@ -271,6 +278,7 @@ def generate_step(
         )
 
     y = input_ids
+
     # Create the KV cache for generation
     if prompt_cache is None:
         prompt_cache = cache.make_prompt_cache(
@@ -578,6 +586,622 @@ def generate(
         generation_tps=last_response.generation_tps,
         peak_memory=last_response.peak_memory,
     )
+
+
+@dataclass
+class BatchGenerationResult:
+    """
+    Result of batch generation with optional image size tracking.
+
+    Attributes:
+        texts: Generated text for each sample
+        tokens: Last generated token for each sample
+        logprobs: Log probabilities for each sample
+        prompt_tokens: Number of prompt tokens per sample
+        generation_tokens: Number of generated tokens per sample
+        total_tokens: Total tokens (prompt + generation) per sample
+        prompt_tps: Prompt tokens per second per sample
+        generation_tps: Generation tokens per second per sample
+        peak_memory: Peak memory usage in GB
+        image_sizes: Original (height, width) for each image (for tracking)
+    """
+
+    texts: List[str]
+    tokens: List[Optional[int]]
+    logprobs: List[Optional[List[float]]]
+    prompt_tokens: List[int]
+    generation_tokens: List[int]
+    total_tokens: List[int]
+    prompt_tps: List[float]
+    generation_tps: List[float]
+    peak_memory: float = 0.0
+    image_sizes: Optional[List[Tuple[int, int]]] = None
+
+
+def _left_pad_prompts(prompts, max_length=None):
+    if max_length is None:
+        max_length = max(len(p) for p in prompts)
+
+    return mx.array([[0] * (max_length - len(p)) + p for p in prompts])
+
+
+def _make_cache(model, left_padding):
+    """
+    Convert a list of regular caches into their corresponding
+    batch-aware caches.
+    """
+
+    def to_batch_cache(c):
+        if isinstance(c, cache.KVCache):
+            return cache.BatchKVCache(left_padding)
+        elif isinstance(c, cache.ArraysCache):
+            c.left_padding = mx.array(left_padding)
+            return c
+        elif isinstance(c, cache.RotatingKVCache):
+            if c.keep > 0:
+                raise ValueError("RotatingKVCache with keep tokens is not supported.")
+            return cache.BatchRotatingKVCache(c.max_size, left_padding)
+        elif isinstance(c, cache.CacheList):
+            return cache.BatchCacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
+        else:
+            raise ValueError(f"{type(c)} does not yet support batching")
+
+    if hasattr(model, "make_cache"):
+        model_cache = model.make_cache()
+        return [to_batch_cache(c) for c in model_cache]
+    else:
+        return [cache.BatchKVCache(left_padding) for _ in model.layers]
+
+
+@dataclass
+class BatchStats:
+    """
+    An data object to hold generation stats.
+
+    Args:
+        prompt_tokens (int): The number of prompt tokens processed.
+        prompt_tps (float): The prompt processing tokens-per-second.
+        prompt_time (float): The time in seconds spent in prompt processing.
+        generation_tokens (int): The number of generated tokens.
+        generation_tps (float): The tokens-per-second for generation.
+        generation_time (float): The time in seconds spent in generation .
+        peak_memory (float): The peak memory used so far in GB.
+    """
+
+    prompt_tokens: int = 0
+    prompt_tps: float = 0
+    prompt_time: float = 0
+    generation_tokens: int = 0
+    generation_tps: float = 0
+    generation_time: float = 0
+    peak_memory: float = 0
+
+
+@dataclass
+class BatchResponse:
+    """
+    An data object to hold a batch generation response.
+
+    Args:
+        texts: (List[str]): The generated text for each prompt.
+        stats (BatchStats): Statistics about the generation.
+        image_sizes: (Optional[List[Tuple[int, int]]]): Original (height, width)
+            for each image. Useful for tracking which images produced which responses
+            and for debugging padding/batching behavior.
+    """
+
+    texts: List[str]
+    stats: BatchStats
+    image_sizes: Optional[List[Tuple[int, int]]] = None
+
+
+@dataclass
+class Batch:
+    uids: List[int]
+    y: mx.array
+    logprobs: mx.array
+    max_tokens: List[int]
+    num_tokens: List[int]
+    cache: List[Any]
+
+    def __len__(self):
+        return len(self.uids)
+
+    def filter(self, keep_idx: List[int]):
+        self.uids = [self.uids[k] for k in keep_idx]
+        self.max_tokens = [self.max_tokens[k] for k in keep_idx]
+        self.num_tokens = [self.num_tokens[k] for k in keep_idx]
+        keep_idx = mx.array(keep_idx, mx.int32)
+        self.y = self.y[keep_idx]
+        self.logprobs = self.logprobs[keep_idx]
+        for c in self.cache:
+            c.filter(keep_idx)
+
+    def extend(self, other):
+        self.uids.extend(other.uids)
+        self.y = mx.concatenate([self.y, other.y])
+        self.logprobs = mx.concatenate([self.logprobs, other.logprobs])
+        self.num_tokens.extend(other.num_tokens)
+        self.max_tokens.extend(other.max_tokens)
+        for c, o in zip(self.cache, other.cache):
+            c.extend(o)
+
+
+class BatchGenerator:
+
+    @dataclass
+    class Response:
+        uid: int
+        token: int
+        logprobs: mx.array
+        finish_reason: Optional[str]
+
+    def __init__(
+        self,
+        model,
+        processor,
+        max_tokens: int = 128,
+        stop_tokens: Optional[set] = None,
+        sampler: Optional[Callable[[mx.array], mx.array]] = None,
+        completion_batch_size: int = 32,
+        prefill_batch_size: int = 8,
+        prefill_step_size: int = 2048,
+        prompt_cache=None,
+    ):
+        self.model = model
+        self.unprocessed_prompts = []
+        self.max_tokens = max_tokens
+        self.processor = processor
+        self.tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+        self.uid_count = 0
+        self.prefill_step_size = prefill_step_size
+        self.prefill_batch_size = prefill_batch_size
+        self.completion_batch_size = completion_batch_size
+        self.prompt_cache = prompt_cache
+        self._stats = BatchStats()
+
+        self.tokenizer.stopping_criteria.add_eos_token_ids(stop_tokens)
+
+        self.active_batch = None
+
+    def insert(self, prompts, max_tokens: Union[List[int], int, None] = None):
+        uids = []
+
+        if max_tokens is None or isinstance(max_tokens, int):
+            max_tokens = [max_tokens or self.max_tokens] * len(prompts)
+
+        for p, m in zip(prompts, max_tokens):
+            self.unprocessed_prompts.append((self.uid_count, p, m))
+            uids.append(self.uid_count)
+            self.uid_count += 1
+        # Sort in ascending order of length
+        self.unprocessed_prompts = sorted(
+            self.unprocessed_prompts, key=lambda x: len(x[1])
+        )
+        return uids
+
+    def _process_prompts(self, prompts, **kwargs) -> Batch:
+        uids, inputs, max_tokens = zip(*prompts)
+        lengths = [len(p) for p in inputs]
+        max_length = max(lengths)
+
+        self._stats.prompt_tokens += sum(lengths)
+        left_padding = [max_length - l for l in lengths]
+        inputs = _left_pad_prompts(inputs, max_length=max_length)
+
+        prompt_cache = (
+            _make_cache(self.model, left_padding)
+            if self.prompt_cache is None
+            else self.prompt_cache
+        )
+
+        # Slice batch data in kwargs to match current batch size
+        batch_size = len(uids)
+        for key, value in kwargs.items():
+            if isinstance(value, mx.array) and value.ndim > 0:
+                kwargs[key] = value[:batch_size]
+
+        inputs_embeds = kwargs.pop("inputs_embeds", None)
+
+        if inputs_embeds is not None:
+            # Multimodal prefill
+            while inputs_embeds.shape[1] > 1:
+                n_to_process = min(self.prefill_step_size, inputs_embeds.shape[1] - 1)
+                self.model(
+                    inputs[:, :n_to_process],
+                    cache=prompt_cache,
+                    inputs_embeds=inputs_embeds[:, :n_to_process],
+                    n_to_process=n_to_process,
+                    **kwargs,
+                )
+                mx.eval([c.state for c in prompt_cache])
+                inputs_embeds = inputs_embeds[:, n_to_process:]
+                inputs = inputs[:, n_to_process:]
+                mx.clear_cache()
+
+            kwargs = {"inputs_embeds": inputs_embeds}
+
+        else:
+            # Text-only prefill
+            while inputs.shape[1] > 1 and inputs_embeds is None:
+                n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
+                self.model(inputs[:, :n_to_process], cache=prompt_cache)
+                mx.eval([c.state for c in prompt_cache])
+                inputs = inputs[:, n_to_process:]
+                mx.clear_cache()
+
+        y, logprobs = self._step(inputs, prompt_cache, **kwargs)
+        mx.async_eval(y, logprobs)
+        mx.clear_cache()
+        return Batch(
+            list(uids), y, logprobs, list(max_tokens), [0] * len(uids), prompt_cache
+        )
+
+    def _step(self, input_tokens: mx.array, prompt_cache: List[Any], **kwargs):
+        output = self.model(input_tokens, cache=prompt_cache, **kwargs)
+        logits = output.logits[:, -1, :]
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        sampled = self.sampler(logprobs)
+
+        # TODO: Add KV cache quantization if specified
+        return sampled, logprobs
+
+    def stats(self):
+        self._stats.prompt_tps = self._stats.prompt_tokens / self._stats.prompt_time
+        self._stats.generation_tps = (
+            self._stats.generation_tokens / self._stats.generation_time
+        )
+        self._stats.peak_memory = mx.get_peak_memory() / 1e9
+        return self._stats
+
+    def _next(self, **kwargs):
+        tic = time.perf_counter()
+
+        prompt_processing = False
+        batch = self.active_batch
+        num_active = len(batch) if batch else 0
+        num_to_add = self.completion_batch_size - num_active
+        while num_to_add >= self.prefill_batch_size:
+            prompts = self.unprocessed_prompts[: self.prefill_batch_size]
+            # Finish processing the last examples of the last batch
+            if len(prompts) == 0 and num_active > 0:
+                break
+            # No more prompts and no more completions, all done
+            elif len(prompts) == 0:
+                self.active_batch = None
+                return []
+            # Process prompts
+            if batch is not None and not prompt_processing:
+                # Finish any active completion tokens
+                mx.eval(batch.y, batch.logprobs)
+                self._stats.generation_time += time.perf_counter() - tic
+                tic = time.perf_counter()
+
+            batch = self._process_prompts(prompts, **kwargs)
+            self.unprocessed_prompts = self.unprocessed_prompts[
+                self.prefill_batch_size :
+            ]
+            prompt_processing = True
+            # If there was no active batch, set it
+            if self.active_batch is None:
+                self.active_batch = batch
+            else:
+                self.active_batch.extend(batch)
+
+            num_active = len(self.active_batch)
+            num_to_add -= len(batch)
+
+        batch = self.active_batch
+        y, logprobs = batch.y, batch.logprobs
+        batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
+        mx.async_eval(batch.y, batch.logprobs)
+
+        y = y.tolist()
+        toc = time.perf_counter()
+        if prompt_processing:
+            self._stats.prompt_time += toc - tic
+        else:
+            self._stats.generation_time += toc - tic
+        keep_idx = []
+        end_idx = []
+        responses = []
+
+        for e, (t, uid, num_tok, max_tok) in enumerate(
+            zip(y, batch.uids, batch.num_tokens, batch.max_tokens)
+        ):
+            num_tok += 1
+            batch.num_tokens[e] = num_tok
+            if self.tokenizer.stopping_criteria(t):
+                finish_reason = "stop"
+                end_idx.append(e)
+            elif num_tok >= max_tok:
+                finish_reason = "length"
+                end_idx.append(e)
+            else:
+                finish_reason = None
+                keep_idx.append(e)
+            responses.append(self.Response(uid, t, logprobs[e], finish_reason))
+
+        # Remove any finished completions
+        if len(end_idx):
+            if len(keep_idx) > 0:
+                batch.filter(keep_idx)
+            else:
+                self.active_batch = None
+
+        self._stats.generation_tokens += len(responses)
+
+        if len(responses) > 0 and self._stats.generation_tokens % 100 == 0:
+            mx.clear_cache()
+
+        return responses
+
+    def next(self, **kwargs):
+        with mx.stream(generation_stream):
+            return self._next(**kwargs)
+
+
+def batch_generate(
+    model,
+    processor,
+    images: Union[str, List[str]] = None,
+    audios: Union[str, List[str]] = None,
+    prompts: List[str] = None,
+    max_tokens: Union[int, List[int]] = 128,
+    verbose: bool = False,
+    group_by_shape: bool = True,
+    track_image_sizes: bool = True,
+    **kwargs,
+):
+    """
+    Generate responses for the given batch of prompts with variable-sized images.
+
+    This function implements the transformers-style approach to batching:
+    1. Group images with the same shape for efficient batch processing
+    2. Process each group as a batch (no padding waste within groups)
+    3. Track original image sizes for proper attention masking
+    4. Restore results to original batch order
+
+    Key insight: Instead of padding all images to the same spatial dimensions
+    (which wastes computation and may hurt accuracy), we group same-sized
+    images together so there's zero padding within each group.
+
+    Args:
+       model (nn.Module): The language model.
+       processor (PreTrainedTokenizer): The tokenizer/processor.
+       images (Union[str, List[str]]): Images (paths, URLs, or PIL images).
+       audios (Union[str, List[str]]): Audio files (not yet supported for batching).
+       prompts (List[str]): The input prompts.
+       max_tokens (Union[int, List[int]]): Maximum number of output tokens. This
+          can be per prompt if a list is provided.
+       verbose (bool): If ``True``, print tokens and timing information.
+          Default: ``False``.
+       group_by_shape (bool): If ``True``, group same-shaped images for efficient
+          batch processing. Default: ``True``.
+       track_image_sizes (bool): If ``True``, track and return original image sizes.
+          Default: ``True``.
+       kwargs: The remaining options get passed to :obj:`BatchGenerator`.
+          See :obj:`BatchGenerator` for more details.
+
+    Returns:
+        BatchResponse with generated texts, statistics, and optionally image_sizes.
+    """
+    from PIL import Image
+
+    from .utils import process_image
+
+    processor.detokenizer.reset()
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+    # Handle single image case
+    if isinstance(images, str):
+        images = [images]
+
+    # Handle no images case
+    if images is None:
+        texts, stats = _generate_batch(
+            model, processor, prompts, None, max_tokens, verbose, **kwargs
+        )
+        return BatchResponse(texts, stats)
+
+    # Load and preprocess images
+    image_processor = (
+        processor.image_processor if hasattr(processor, "image_processor") else None
+    )
+
+    processed_images = []
+    image_sizes_original = []
+    for img in images:
+        if isinstance(img, str):
+            pil_img = process_image(img, None, image_processor)
+        elif isinstance(img, Image.Image):
+            pil_img = img
+        else:
+            pil_img = img
+        processed_images.append(pil_img)
+        # Track original size
+        if hasattr(pil_img, "height"):
+            image_sizes_original.append((pil_img.height, pil_img.width))
+        else:
+            image_sizes_original.append((0, 0))
+
+    # Group images by shape for efficient processing (no padding within groups)
+    if group_by_shape and len(processed_images) > 1:
+        grouped_images, grouped_indices = group_images_by_shape(processed_images)
+
+        if verbose:
+            print(f"[batch_generate] Found {len(grouped_images)} unique image shapes")
+    else:
+        # Single image or grouping disabled - treat as one group
+        shape = (
+            (processed_images[0].height, processed_images[0].width)
+            if processed_images
+            else (0, 0)
+        )
+        grouped_images = {shape: processed_images}
+        grouped_indices = {shape: list(range(len(processed_images)))}
+
+    # Process each shape group
+    all_texts = [None] * len(prompts)
+    all_image_sizes = [None] * len(prompts)
+    total_stats = BatchStats()
+
+    for shape, indices in grouped_indices.items():
+        # Get images and prompts for this shape group
+        group_images = [processed_images[i] for i in indices]
+        group_prompts = [prompts[i] for i in indices]
+        group_sizes = [image_sizes_original[i] for i in indices]
+
+        # Handle per-sample max_tokens
+        if isinstance(max_tokens, list):
+            group_max_tokens = [max_tokens[i] for i in indices]
+        else:
+            group_max_tokens = max_tokens
+
+        # Process the entire group at once (same shape = no padding needed)
+        chunk_texts, chunk_stats = _generate_batch(
+            model,
+            processor,
+            group_prompts,
+            group_images,
+            group_max_tokens,
+            **kwargs,
+        )
+
+        # Store results in original order
+        for j, orig_idx in enumerate(indices):
+            all_texts[orig_idx] = chunk_texts[j]
+            all_image_sizes[orig_idx] = group_sizes[j]
+
+        # Accumulate stats
+        total_stats.prompt_tokens += chunk_stats.prompt_tokens
+        total_stats.prompt_time += chunk_stats.prompt_time
+        total_stats.generation_tokens += chunk_stats.generation_tokens
+        total_stats.generation_time += chunk_stats.generation_time
+
+    mx.clear_cache()
+
+    # Compute final stats
+    if total_stats.prompt_time > 0:
+        total_stats.prompt_tps = total_stats.prompt_tokens / total_stats.prompt_time
+    if total_stats.generation_time > 0:
+        total_stats.generation_tps = (
+            total_stats.generation_tokens / total_stats.generation_time
+        )
+    total_stats.peak_memory = mx.get_peak_memory() / 1e9
+
+    if verbose:
+        print(f"[batch_generate] Finished processing {len(prompts)} samples")
+        print(
+            f"[batch_generate] Prompt: {total_stats.prompt_tokens} tokens, {total_stats.prompt_tps:.3f} tokens-per-sec"
+        )
+        print(
+            f"[batch_generate] Generation: {total_stats.generation_tokens} tokens, "
+            f"{total_stats.generation_tps:.3f} tokens-per-sec"
+        )
+        print(f"[batch_generate] Peak memory: {total_stats.peak_memory:.3f} GB")
+
+    response = BatchResponse(all_texts, total_stats)
+    if track_image_sizes:
+        response.image_sizes = all_image_sizes
+    return response
+
+
+def _generate_batch(
+    model,
+    processor,
+    prompts: List[str],
+    images: List = None,
+    max_tokens: Union[int, List[int]] = 100,
+    verbose: bool = False,
+    **kwargs,
+) -> Tuple[List[str], BatchStats]:
+
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    batch_size = len(prompts)
+
+    num_images_list = [
+        1 if i < (len(images) if images is not None else 0) else 0
+        for i in range(len(prompts))
+    ]
+    formatted_prompts = [
+        apply_chat_template(
+            processor,
+            model.config,
+            p,
+            num_images=num_images_list[i],
+        )
+        for i, p in enumerate(prompts)
+    ]
+
+    add_special_tokens = (
+        not hasattr(processor, "chat_template")
+        if model.config.model_type in ["gemma3", "gemma3n"]
+        else True
+    )
+
+    resize_shape = kwargs.pop("resize_shape", None)
+    image_token_index = getattr(model.config, "image_token_index", None)
+
+    inputs = prepare_inputs(
+        processor,
+        images=images,
+        audio=None,
+        prompts=formatted_prompts,
+        image_token_index=image_token_index,
+        resize_shape=resize_shape,
+        add_special_tokens=add_special_tokens,
+        pad_to_uniform_size=False,  # Since images are pre-grouped by shape, they're already uniform size
+    )
+    input_ids = inputs.get("input_ids", None)
+    pixel_values = inputs.get("pixel_values", None)
+
+    data_kwargs = {
+        k: v
+        for k, v in inputs.items()
+        if k not in ["input_ids", "pixel_values", "attention_mask"]
+    }
+
+    # Use batch_size for prefill and completion to ensure consistent processing
+    gen = BatchGenerator(
+        model.language_model,
+        processor,
+        prefill_batch_size=batch_size,
+        completion_batch_size=batch_size,
+        **kwargs,
+    )
+
+    with wired_limit(model, [generation_stream]):
+        if pixel_values is not None:
+            inputs_embeds = model.get_input_embeddings(
+                input_ids, pixel_values, **data_kwargs
+            )
+
+            gen_kwargs = {
+                "pixel_values": pixel_values,
+                **data_kwargs,
+                **(
+                    inputs_embeds
+                    if isinstance(inputs_embeds, dict)
+                    else {"inputs_embeds": inputs_embeds}
+                ),
+            }
+        else:
+            input_ids = mx.squeeze(input_ids, axis=0)
+            gen_kwargs = {}
+
+        uids = gen.insert(input_ids.tolist(), max_tokens)
+        results = {uid: [] for uid in uids}
+        while responses := gen.next(**gen_kwargs):
+            for r in responses:
+                if r.finish_reason != "stop":
+                    results[r.uid].append(r.token)
+
+    texts = [tokenizer.decode(results[uid]) for uid in uids]
+    return texts, gen.stats()
 
 
 def main():

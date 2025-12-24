@@ -2,7 +2,6 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from .config import ModelConfig
 from .language import LanguageModel
@@ -80,26 +79,71 @@ class Model(nn.Module):
     def merge_input_ids_with_image_features(
         image_token_index, image_features, inputs_embeds, input_ids
     ):
-        num_images, num_image_patches, embed_dim = image_features.shape
+        """Merge image features into input embeddings at image token positions.
 
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids == image_token_index)[1].tolist()
+        Args:
+            image_token_index: Token ID for image placeholder
+            image_features: Vision features from the projector [1, num_features, hidden_dim]
+            inputs_embeds: Input embeddings [batch_size, seq_len, hidden_dim]
+            input_ids: Input token IDs [batch_size, seq_len]
 
-        text_segments = []
-        start_idx = 0
+        Returns:
+            Updated input embeddings with image features inserted
+        """
+        # Remove the extra batch dimension from image_features if present
+        if image_features.ndim == 3 and image_features.shape[0] == 1:
+            image_features = image_features.squeeze(0)  # [num_features, hidden_dim]
 
-        for position in image_positions:
-            text_segments.append(inputs_embeds[:, start_idx:position])
-            start_idx = position + 1
+        # Positions of <image> tokens in input_ids
+        image_positions = input_ids == image_token_index
 
-        # Split image features into separate embeddings for each image
-        image_embeddings = mx.split(image_features, num_image_patches, axis=1)
-        final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
-        final_embeddings += [inputs_embeds[:, start_idx:]]
+        # Get dimensions
+        batch_size, seq_len = input_ids.shape
 
-        # Create a final embedding of shape
-        # (1, num_image_patches*num_images + sequence_len, embed_dim)
-        return mx.concatenate(final_embeddings, axis=1)
+        # Process each batch item
+        batch_outputs = []
+        feature_start_idx = 0
+
+        for batch_idx in range(batch_size):
+            # Get mask for this batch
+            image_mask = image_positions[batch_idx]
+            num_positions = mx.sum(image_mask).item()
+
+            if num_positions > 0:
+                # Extract features for this batch
+                batch_features = image_features[
+                    feature_start_idx : feature_start_idx + num_positions
+                ]
+
+                # Validate we have the right number of features
+                if batch_features.shape[0] != num_positions:
+                    raise ValueError(
+                        f"Number of image token positions ({num_positions}) does not match "
+                        f"number of image features ({batch_features.shape[0]}) for batch {batch_idx}"
+                    )
+
+                # Create indices for gathering
+                cumsum = mx.cumsum(image_mask.astype(mx.int32))
+                feature_indices = mx.where(image_mask, cumsum - 1, 0)
+
+                # Gather features
+                gathered_features = batch_features[feature_indices]
+
+                # Combine with original embeddings
+                image_mask_expanded = mx.expand_dims(image_mask, axis=-1)
+                batch_output = mx.where(
+                    image_mask_expanded, gathered_features, inputs_embeds[batch_idx]
+                )
+
+                feature_start_idx += num_positions
+            else:
+                # No image tokens in this batch item
+                batch_output = inputs_embeds[batch_idx]
+
+            batch_outputs.append(batch_output)
+
+        # Stack all batch outputs
+        return mx.stack(batch_outputs, axis=0)
 
     @property
     def layers(self):

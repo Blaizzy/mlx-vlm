@@ -1,8 +1,7 @@
-from typing import Any, Optional
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_lm.models.qwen2 import Qwen2Model
 
 from ..base import LanguageModelOutput

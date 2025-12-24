@@ -1,6 +1,4 @@
-import json
-from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union
 
 import mlx.core as mx
 import numpy as np
@@ -10,7 +8,6 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
     BatchFeature,
-    PreTrainedTokenizerBase,
     ProcessorMixin,
 )
 from transformers.image_utils import ImageFeatureExtractionMixin

@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import codecs
 import gc
 import json
 import traceback
@@ -19,7 +18,6 @@ from typing_extensions import Required, TypeAlias, TypedDict
 from .generate import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL_PATH,
-    DEFAULT_PROMPT,
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,

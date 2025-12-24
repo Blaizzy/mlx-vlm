@@ -1,13 +1,8 @@
-import glob
-import inspect
-import json
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from huggingface_hub import snapshot_download
 
 from .config import ModelConfig
 from .language import LanguageModel

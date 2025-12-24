@@ -2,7 +2,6 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..base import (
     LanguageModelOutput,
@@ -490,14 +489,12 @@ class LanguageModel(nn.Module):
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
 
-                if cache is not None:
+                if cache_offset is not None:
                     if delta.ndim == 0:
                         delta = mx.expand_dims(delta, axis=0)
 
                     if delta.shape[0] < batch_size:
-                        # Repeat delta to fill batch
-                        repeats = batch_size // delta.shape[0]
-                        delta = mx.repeat(delta, repeats, axis=0)
+                        delta = mx.tile(delta, (batch_size, 1))
                     else:
                         # Slice delta to match batch
                         delta = delta[:batch_size]
