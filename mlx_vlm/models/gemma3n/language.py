@@ -4,7 +4,6 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import _BaseCache
 
 from ..base import (
     LanguageModelOutput,

@@ -31,7 +31,7 @@ To determine the model layer names, we suggest either:
 - Look at the names of the weights by inspecting `model.safetensors.index.json`
   in the Hugging Face repo.
 
-Additionally, add a test for the new modle type to the [model
+Additionally, add a test for the new model type to the [model
 tests](https://github.com/Blaizzy/mlx-vlm/tree/main/src/tests/test_models.py).
 
 From the `src/` directory, you can run the tests with:

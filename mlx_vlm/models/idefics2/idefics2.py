@@ -1,21 +1,34 @@
-import glob
-import inspect
-import json
 import re
-from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from huggingface_hub import snapshot_download
-from transformers import AutoConfig
 
-from ..base import BaseModelConfig
-from .config import ModelConfig, PerceiverConfig
+from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
+
+
+def masked_scatter(
+    final_embedding: mx.array,
+    image_mask_expanded: mx.array,
+    scaled_image_features: mx.array,
+):
+    # Reshape the tensors to 1D
+    final_embedding_shape = final_embedding.shape
+    scaled_image_features_flattened = mx.flatten(scaled_image_features)
+    final_embedding_flattened = mx.flatten(final_embedding)
+    image_mask_expanded_flattened = mx.flatten(image_mask_expanded)
+
+    # Scatter the scaled image features into the special image token positions
+    image_positions = mx.array(np.where(image_mask_expanded_flattened)[0], mx.uint32)
+    final_embedding_flattened[image_positions] = scaled_image_features_flattened
+
+    # Reshape back to the original shape
+    final_embedding = mx.reshape(final_embedding_flattened, final_embedding_shape)
+
+    return final_embedding
 
 
 class Idefics2PerceiverAttention(nn.Module):
@@ -170,18 +183,69 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        pixel_attention_mask: Optional[mx.array] = None,
+        **kwargs,
     ):
+        pixel_attention_mask = kwargs.get("pixel_attention_mask", None)
+
         if pixel_values is None:
             return self.language_model.embed_tokens(input_ids)
 
         inputs_embeds = self.language_model.embed_tokens(input_ids)
 
-        pooler_output, embeddings, hidden_state = self.vision_model(
-            pixel_values[0].transpose(0, 2, 3, 1), output_hidden_states=True
+        batch_size, num_images, num_channels, height, width = pixel_values.shape
+        pixel_values = pixel_values.reshape(
+            batch_size * num_images, num_channels, height, width
         )
+
+        # Remove padding images - padding image are full 0.
+        nb_values_per_image = np.prod(pixel_values.shape[1:])
+        real_images_mask = (pixel_values == 0.0).sum(
+            axis=(-1, -2, -3)
+        ) != nb_values_per_image
+        real_images_inds = np.where(real_images_mask)[0].tolist()
+        pixel_values = pixel_values[real_images_inds, ...]
+
+        if pixel_attention_mask is None:
+            pixel_attention_mask = mx.ones(
+                (pixel_values.size(0), pixel_values.size(2), pixel_values.size(3)),
+                dtype=mx.bool,
+            )
+        else:
+            # Remove padding images from the mask
+            pixel_attention_mask = pixel_attention_mask.reshape(
+                batch_size * num_images, height, width
+            )
+            pixel_attention_mask = pixel_attention_mask[real_images_inds]
+
+        patch_size = self.config.vision_config.patch_size
+        batch_size, height, width = pixel_attention_mask.shape
+
+        # Calculate number of patches
+        patches_h = height // patch_size
+        patches_w = width // patch_size
+
+        # Reshape to extract patches
+        reshaped = pixel_attention_mask[
+            :, : patches_h * patch_size, : patches_w * patch_size
+        ]
+        reshaped = reshaped.reshape(
+            batch_size, patches_h, patch_size, patches_w, patch_size
+        )
+        reshaped = reshaped.transpose(
+            0, 1, 3, 2, 4
+        )  # (batch, patches_h, patches_w, patch_size, patch_size)
+
+        # Sum over patch dimensions and check if any pixels are active
+        patch_attention_mask = reshaped.sum(axis=(-1, -2)) > 0
+
+        pooler_output, *_ = self.vision_model(
+            pixel_values.transpose(0, 2, 3, 1),
+            patch_attention_mask=patch_attention_mask,
+            output_hidden_states=True,
+        )
+
         image_features = pooler_output.astype(pixel_values.dtype)
-        image_features = self.connector(image_features, mask=None)
+        image_features = self.connector(image_features)
 
         final_inputs_embeds = self._prepare_inputs_for_multimodal(
             image_features, inputs_embeds, input_ids
@@ -189,20 +253,21 @@ class Model(nn.Module):
         return final_inputs_embeds
 
     def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
-        image_token_index = self.config.image_token_index
+        special_image_mask = input_ids == self.config.image_token_index
+        n_image_tokens = special_image_mask.sum()
+        special_image_mask = special_image_mask[..., None]
+        special_image_mask = mx.broadcast_to(special_image_mask, inputs_embeds.shape)
 
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids == image_token_index)[1].tolist()
-        num_images, _, vision_hidden_size = image_features.shape
+        n_image_features = image_features.shape[0]
+        n_image_mask_elements = special_image_mask.sum()
+        if n_image_mask_elements != image_features.size:
+            raise ValueError(
+                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+            )
 
-        reshaped_image_hidden_states = image_features.reshape(-1, vision_hidden_size)
-
-        # cast to the dtype of the input_embeds to support quantized models
-        reshaped_image_hidden_states = reshaped_image_hidden_states.astype(
-            inputs_embeds.dtype
+        inputs_embeds = masked_scatter(
+            inputs_embeds, special_image_mask, image_features
         )
-
-        inputs_embeds[:, image_positions, :] = reshaped_image_hidden_states
 
         return inputs_embeds
 
@@ -218,7 +283,7 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
+        input_embeddings = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
         logits = self.language_model(
             inputs=input_ids, cache=cache, inputs_embeds=input_embeddings
         )

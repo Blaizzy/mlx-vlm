@@ -3,14 +3,18 @@ import csv
 import json
 import logging
 import random
+import traceback
 from pathlib import Path
 from typing import Optional
 
+import mlx.core as mx
 from datasets import load_dataset
 from tqdm import tqdm
 
 from mlx_vlm import load
 from mlx_vlm.evals.utils import inference
+from mlx_vlm.generate import batch_generate
+from mlx_vlm.sample_utils import top_p_sampling
 
 
 def process_question(sample: dict) -> str:
@@ -187,7 +191,120 @@ def parse_args():
         help="Print detailed output for debugging",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size for generation (1 = sequential, >1 = batch generation)",
+    )
     return parser.parse_args()
+
+
+def create_sampler(temperature: float, top_p: float = 1.0):
+    """Create a sampler function for batch generation.
+
+    For accuracy consistency across batch sizes, we use deterministic sampling
+    (temperature=0) by default. This ensures the same outputs regardless of batch size.
+    """
+
+    def sampler(logits: mx.array) -> mx.array:
+        if temperature == 0:
+            return mx.argmax(logits, axis=-1)
+        else:
+            if top_p > 0 and top_p < 1.0:
+                return top_p_sampling(logits, top_p, temperature)
+            else:
+                return mx.random.categorical(logits * (1 / temperature))
+
+    return sampler
+
+
+def process_batch(
+    model,
+    processor,
+    batch_samples,
+    args,
+):
+    """Process a batch of samples using batch_generate.
+
+    batch_generate now handles image size sorting internally to minimize
+    padding effects and maintain accuracy.
+    """
+    prompts = []
+    images = []
+    sample_metadata = []
+
+    for sample in batch_samples:
+        pid = sample.get("id", str(sample.get("_idx", 0)))
+
+        # Load and process image
+        if "image" in sample and sample["image"]:
+            image = sample["image"].convert("RGB")
+        else:
+            logging.warning(f"No image for sample {pid}, skipping")
+            continue
+
+        images.append(image)
+
+        # Create prompt
+        prompt = process_question(sample)
+        prompts.append(prompt)
+
+        # Store metadata for results
+        sample_metadata.append(
+            {
+                "id": pid,
+                "question": sample["question"],
+                "dataset": sample.get("dataset", ""),
+                "type": sample.get("type", ""),
+                "ground_truth": (
+                    sample.get("answers", [])
+                    if hasattr(sample, "answers")
+                    else sample.get("answer", [])
+                ),
+            }
+        )
+
+    if not prompts:
+        return []
+
+    # Create sampler for deterministic output (temperature=0 by default)
+    sampler = create_sampler(args.temperature)
+
+    # Use batch_generate for processing
+    # batch_generate now handles image size sorting internally to avoid padding issues
+    batch_response = batch_generate(
+        model,
+        processor,
+        images=images,
+        prompts=prompts,
+        max_tokens=args.max_tokens,
+        sampler=sampler,
+        verbose=args.verbose,
+    )
+
+    # Process results
+    results = []
+    for text, metadata in zip(batch_response.texts, sample_metadata):
+        response = text.strip()
+        prediction = normalize_answer(response, {"question": metadata["question"]})
+
+        result = {
+            **metadata,
+            "response": response,
+            "prediction": prediction,
+            "correct": False,
+        }
+        results.append(result)
+
+        if args.verbose:
+            logging.info(f"\nSample {metadata['id']}:")
+            logging.info(f"Question: {metadata['question']}")
+            logging.info(f"Response: {response}")
+            logging.info(f"Prediction: {prediction}")
+            logging.info(f"Ground Truth: {metadata['ground_truth']}")
+
+    return results
 
 
 def main():
@@ -228,62 +345,103 @@ def main():
     if args.max_samples:
         dataset = dataset.take(args.max_samples)
 
+    # Convert to list for batching if streaming
+    if args.streaming:
+        dataset = list(dataset)
+
     results = {}
-    for idx, sample in enumerate(tqdm(dataset, desc="Evaluating")):
-        pid = sample.get("id", str(idx))
+    batch_size = args.batch_size
 
-        try:
-            # Load and process image
-            if "image" in sample and sample["image"]:
-                image = sample["image"].convert("RGB")
-            else:
-                logging.warning(f"No image for sample {pid}, skipping")
+    if batch_size > 1:
+        # Batch generation mode
+        logging.info(f"Using batch generation with batch_size={batch_size}")
+
+        # Collect samples into batches
+        batch = []
+        all_samples = list(dataset) if hasattr(dataset, "__iter__") else dataset
+
+        # Add index to samples for tracking
+        for idx, sample in enumerate(all_samples):
+            sample["_idx"] = idx
+
+        for idx, sample in enumerate(
+            tqdm(all_samples, desc=f"Evaluating (batch_size={batch_size})")
+        ):
+            batch.append(sample)
+
+            # Process batch when full or at the end
+            if len(batch) >= batch_size or idx == len(all_samples) - 1:
+                try:
+                    batch_results = process_batch(model, processor, batch, args)
+                    for result in batch_results:
+                        results[result["id"]] = result
+                except Exception as e:
+                    logging.error(f"Error processing batch: {e}")
+                    traceback.print_exc()
+
+                batch = []
+
+                # Clear memory after each batch
+                mx.clear_cache()
+
+    else:
+        # Sequential generation mode (original behavior)
+        for idx, sample in enumerate(tqdm(dataset, desc="Evaluating")):
+            pid = sample.get("id", str(idx))
+
+            try:
+                # Load and process image
+                if "image" in sample and sample["image"]:
+                    image = sample["image"].convert("RGB")
+                else:
+                    logging.warning(f"No image for sample {pid}, skipping")
+                    continue
+
+                # Create prompt
+                prompt = process_question(sample)
+
+                # Generate response
+                output = inference(
+                    model,
+                    processor,
+                    prompt,
+                    image=image,
+                    max_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                )
+
+                response = output.strip()
+
+                # Normalize answer
+                prediction = normalize_answer(response, sample)
+
+                # Store results (evaluation happens later)
+                results[pid] = {
+                    "id": pid,
+                    "question": sample["question"],
+                    "dataset": sample.get("dataset", ""),
+                    "type": sample.get("type", ""),
+                    "ground_truth": (
+                        sample.get("answers", [])
+                        if hasattr(sample, "answers")
+                        else sample.get("answer", [])
+                    ),
+                    "response": response,
+                    "prediction": prediction,
+                    "correct": False,
+                }
+
+                if args.verbose:
+                    logging.info(f"\nSample {pid}:")
+                    logging.info(f"Question: {sample['question']}")
+                    logging.info(f"Response: {response}")
+                    logging.info(f"Prediction: {prediction}")
+                    logging.info(f"Ground Truth: {sample.get('answers', [])}")
+
+            except Exception as e:
+                traceback.print_exc()
+                logging.error(f"Error processing sample {pid}: {e}")
                 continue
-
-            # Create prompt
-            prompt = process_question(sample)
-
-            # Generate response
-            output = inference(
-                model,
-                processor,
-                prompt,
-                image=image,
-                max_tokens=args.max_tokens,
-                temperature=args.temperature,
-            )
-
-            response = output.strip()
-
-            # Normalize answer
-            prediction = normalize_answer(response, sample)
-
-            # Store results (evaluation happens later)
-            results[pid] = {
-                "id": pid,
-                "question": sample["question"],
-                "dataset": sample.get("dataset", ""),
-                "type": sample.get("type", ""),
-                "ground_truth": (
-                    sample.get("answers", [])
-                    if hasattr(sample, "answers")
-                    else sample.get("answer", [])
-                ),
-                "response": response,
-                "prediction": prediction,
-                "correct": False,
-            }
-
-            if args.verbose:
-                logging.info(f"\nSample {pid}:")
-                logging.info(f"Question: {sample['question']}")
-                logging.info(f"Response: {response}")
-                logging.info(f"Prediction: {prediction}")
-                logging.info(f"Ground Truth: {sample.get('answers', [])}")
-
-        except Exception as e:
-            logging.error(f"Error processing sample {pid}: {e}")
-            continue
 
     results_list = list(results.values())
     model_name = args.model.split("/")[-1]

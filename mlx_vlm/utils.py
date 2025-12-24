@@ -6,7 +6,7 @@ import logging
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -16,12 +16,7 @@ import soundfile as sf
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
 from PIL import Image, ImageOps
-from transformers import (
-    AutoConfig,
-    AutoProcessor,
-    PreTrainedTokenizer,
-    PreTrainedTokenizerFast,
-)
+from transformers import AutoProcessor, PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from .models.base import BaseImageProcessor
 from .tokenizer_utils import load_tokenizer
@@ -34,6 +29,7 @@ MODEL_REMAPPING = {
     "bunny-llama": "llava_bunny",
     "lfm2-vl": "lfm2_vl",
     "cohere2_vision": "aya_vision",
+    "jvlm": "jina_vlm",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -54,6 +50,7 @@ def skip_multimodal_module(path: str) -> bool:
     return (
         "vision_model" in path
         or "vision_tower" in path
+        or "vl_connector" in path
         or "sam_model" in path
         or "audio_model" in path
         or "audio_tower" in path
@@ -142,7 +139,13 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     config = load_config(model_path, **kwargs)
     quantization = config.get("quantization", None)
 
-    weight_files = glob.glob(str(model_path / "*.safetensors"))
+    # Find all .safetensors files in the model_path, excluding consolidated model weights
+    weight_files = [
+        wf
+        for wf in glob.glob(str(model_path / "*.safetensors"))
+        if not wf.endswith("consolidated.safetensors")
+    ]
+
     if not weight_files:
         logging.error(f"No safetensors found in {model_path}")
         message = f"""
@@ -377,7 +380,7 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
 
-    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
+    processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
@@ -721,6 +724,8 @@ def process_inputs(
     images=None,
     audio=None,
     add_special_tokens=False,
+    padding=True,
+    padding_side="left",
     return_tensors="mlx",
     **kwargs,
 ):
@@ -731,7 +736,8 @@ def process_inputs(
     args = {
         "text": prompts,
         "images": images,
-        "padding": True,
+        "padding": padding,
+        "padding_side": padding_side,
         "return_tensors": return_tensors,
     }
 
@@ -803,6 +809,9 @@ def prepare_inputs(
     image_token_index=None,
     resize_shape=None,
     add_special_tokens=False,
+    padding=True,
+    padding_side="left",
+    pad_to_uniform_size=False,
     **kwargs,
 ):
 
@@ -810,7 +819,12 @@ def prepare_inputs(
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
-        inputs = tokenizer(prompts, add_special_tokens=add_special_tokens)
+        inputs = tokenizer(
+            prompts,
+            add_special_tokens=add_special_tokens,
+            padding=padding,
+            padding_side=padding_side,
+        )
         input_ids = mx.array([inputs.input_ids])
         mask = mx.array([inputs.attention_mask])
         return {
@@ -828,6 +842,53 @@ def prepare_inputs(
         )
         images = [process_image(img, resize_shape, image_processor) for img in images]
 
+        # For batching, we need uniform image sizes. Instead of padding to the
+        # largest image (which adds white borders that hurt accuracy), we resize
+        # all images to the model's expected input size.
+        if len(images) > 1 and pad_to_uniform_size:
+            # Get target size from image processor if available
+            target_size = None
+            if image_processor is not None and hasattr(image_processor, "size"):
+                size = image_processor.size
+                if isinstance(size, tuple):
+                    target_size = size
+                elif isinstance(size, dict):
+                    target_size = (size.get("height", 384), size.get("width", 384))
+                elif isinstance(size, int):
+                    target_size = (size, size)
+
+            if target_size is not None:
+                # Resize all images to the target size
+                resized_images = []
+                for img in images:
+                    if img.size != (
+                        target_size[1],
+                        target_size[0],
+                    ):  # PIL uses (width, height)
+                        img = img.resize(
+                            (target_size[1], target_size[0]), Image.Resampling.BICUBIC
+                        )
+                    resized_images.append(img)
+                images = resized_images
+            else:
+                # Fallback: pad to largest size (original behavior)
+                max_width = max(img.width for img in images)
+                max_height = max(img.height for img in images)
+
+                padded_images = []
+                for img in images:
+                    if img.width != max_width or img.height != max_height:
+                        padded_img = Image.new(
+                            "RGB", (max_width, max_height), (255, 255, 255)
+                        )
+                        x_offset = (max_width - img.width) // 2
+                        y_offset = (max_height - img.height) // 2
+                        padded_img.paste(img, (x_offset, y_offset))
+                        padded_images.append(padded_img)
+                    else:
+                        padded_images.append(img)
+                images = padded_images
+
     # Process audio
     audio_inputs = None
     audio_feature_lengths = None
@@ -841,7 +902,7 @@ def prepare_inputs(
     ):
         is_qwen3_omni_moe = True
 
-    if audio:
+    if audio is not None:
         if not isinstance(audio, list):
             audio = [audio]
 
@@ -884,7 +945,10 @@ def prepare_inputs(
             else:
                 audio = [load_audio(audio_file, sr=16000) for audio_file in audio]
     else:
-        audio = None
+        audio = [
+            load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
+            for audio_file in audio
+        ]
 
     model_inputs = {}
 
@@ -894,7 +958,8 @@ def prepare_inputs(
         if not isinstance(prompts, list):
             prompts = [prompts]
 
-        processor.pad_token = processor.eos_token
+        if processor.pad_token is None:
+            processor.pad_token = processor.eos_token
         text_chunks = [
             [processor(chunk).input_ids for chunk in prompt.split("<image>")]
             for prompt in prompts
@@ -920,7 +985,7 @@ def prepare_inputs(
         ).astype(mx.int32)
 
     else:
-        if hasattr(processor, "tokenizer"):
+        if hasattr(processor, "tokenizer") and processor.tokenizer.pad_token is None:
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
         inputs = process_inputs_with_fallback(
@@ -958,6 +1023,58 @@ def prepare_inputs(
         )
 
     return model_inputs
+
+
+def group_images_by_shape(
+    images: List[Image.Image],
+    disable_grouping: bool = False,
+) -> Tuple[Dict[Tuple[int, int], List[Image.Image]], Dict[Tuple[int, int], List[int]]]:
+    """
+    Group images by their dimensions for efficient batch processing.
+
+    Images with the same dimensions can be stacked and processed together,
+    which is much faster than processing individually (especially on GPU).
+
+    Args:
+        images: List of PIL images to group
+        disable_grouping: If True, each image gets its own group (useful for debugging)
+
+    Returns:
+        grouped_images: Dict mapping shape -> list of images with that shape
+        grouped_indices: Dict mapping shape -> list of original indices
+
+    Example:
+        >>> images = [img_400x300, img_800x600, img_400x300_2]
+        >>> grouped, indices = group_images_by_shape(images)
+        >>> grouped
+        {(300, 400): [img_400x300, img_400x300_2], (600, 800): [img_800x600]}
+        >>> indices
+        {(300, 400): [0, 2], (600, 800): [1]}
+    """
+    if disable_grouping:
+        # Each image in its own group
+        grouped_images = {}
+        grouped_indices = {}
+        for i, img in enumerate(images):
+            shape = (img.height, img.width)
+            # Make each shape unique by adding index
+            unique_shape = (img.height, img.width, i)
+            grouped_images[unique_shape] = [img]
+            grouped_indices[unique_shape] = [i]
+        return grouped_images, grouped_indices
+
+    grouped_images: Dict[Tuple[int, int], List[Image.Image]] = {}
+    grouped_indices: Dict[Tuple[int, int], List[int]] = {}
+
+    for i, img in enumerate(images):
+        shape = (img.height, img.width)
+        if shape not in grouped_images:
+            grouped_images[shape] = []
+            grouped_indices[shape] = []
+        grouped_images[shape].append(img)
+        grouped_indices[shape].append(i)
+
+    return grouped_images, grouped_indices
 
 
 class StoppingCriteria:
@@ -1016,8 +1133,6 @@ def print_array_report(t: mx.array, label: Optional[str]) -> dict:
     Returns:
         Dictionary containing shape, dtype, value representation, and statistics
     """
-
-    from pprint import pprint
 
     # Get basic statistics
     mean_val = mx.mean(t)

@@ -3,7 +3,6 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -499,6 +498,10 @@ class LanguageModel(nn.Module):
         deepstack_visual_embeds: Optional[mx.array] = None,
         **kwargs,
     ):
+        # Slicing visual_pos_masks when prefilling
+        n_to_process = kwargs.get("n_to_process", None)
+        if n_to_process is not None:
+            visual_pos_masks = visual_pos_masks[:, n_to_process:]
 
         position_ids = kwargs.pop("position_ids", None)
         pixel_values = kwargs.pop("pixel_values", None)

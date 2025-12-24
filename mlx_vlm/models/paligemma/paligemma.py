@@ -1,12 +1,7 @@
-import glob
-import inspect
-import json
-from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from huggingface_hub import snapshot_download
 
 from .config import ModelConfig
 from .language import LanguageModel

@@ -1,5 +1,3 @@
-import inspect
-import math
 from typing import Optional, Tuple
 
 import mlx.core as mx
