@@ -14,12 +14,7 @@ from mlx_vlm.sample_utils import top_p_sampling
 
 from ..base import create_attention_mask, scaled_dot_product_attention
 from ..cache import KVCache
-from .language import (
-    MLP,
-    Attention,
-    Qwen3OmniMoeThinkerTextRotaryEmbedding,
-    Qwen3OmniMoeThinkerTextSparseMoeBlock,
-)
+from .language import Attention, Qwen3OmniMoeThinkerTextRotaryEmbedding
 
 
 class CodePredictorRotaryEmbedding:

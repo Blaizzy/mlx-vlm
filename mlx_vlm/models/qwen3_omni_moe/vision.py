@@ -413,7 +413,6 @@ class VisionModel(nn.Module):
                     sanitized_weights[k] = v
                 else:
                     sanitized_weights[k] = v.transpose(0, 2, 3, 4, 1)
-                    pass
             else:
                 sanitized_weights[k] = v
 
