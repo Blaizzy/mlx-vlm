@@ -943,12 +943,10 @@ def prepare_inputs(
                     for audio_file in audio
                 ]
             else:
-                audio = [load_audio(audio_file, sr=16000) for audio_file in audio]
-    else:
-        audio = [
-            load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
-            for audio_file in audio
-        ]
+                audio = [
+                    load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
+                    for audio_file in audio
+                ]
 
     model_inputs = {}
 
