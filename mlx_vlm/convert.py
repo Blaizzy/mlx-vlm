@@ -7,13 +7,12 @@ from typing import Callable, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map_with_path
-from mlx_lm.utils import dequantize_model
+from mlx_lm.utils import dequantize_model, quantize_model
 
 from .utils import (
     MODEL_CONVERSION_DTYPES,
     fetch_from_hub,
     get_model_path,
-    quantize_model,
     save_config,
     save_weights,
     skip_multimodal_module,

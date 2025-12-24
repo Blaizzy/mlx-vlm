@@ -15,7 +15,6 @@ import requests
 import soundfile as sf
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
-from mlx_lm.utils import quantize_model as lm_quantize_model
 from PIL import Image, ImageOps
 from transformers import AutoProcessor, PreTrainedTokenizer, PreTrainedTokenizerFast
 
@@ -341,88 +340,6 @@ def update_module_configs(model_config, model_class, config, modules):
                 model_config, config_attr, config_class.from_dict(config[config_attr])
             )
     return model_config
-
-
-def quantize_model(
-    model: nn.Module,
-    config: dict,
-    q_group_size: int,
-    q_bits: int,
-    *,
-    mode: str = "affine",
-    skip_vision: bool = False,
-    quant_predicate: Optional[
-        Callable[[str, nn.Module], Union[bool, Dict[str, Any]]]
-    ] = None,
-) -> Tuple[nn.Module, dict]:
-    """Quantize a multimodal model while optionally skipping vision/audio towers."""
-
-    def _feature_dim(module: nn.Module) -> Optional[int]:
-        weight = getattr(module, "weight", None)
-        shape = getattr(weight, "shape", None)
-        if shape is None or len(shape) == 0:
-            return None
-        try:
-            return int(shape[-1])
-        except (TypeError, ValueError):
-            return None
-
-    def predicate(path: str, module: nn.Module) -> Union[bool, Dict[str, Any]]:
-        if skip_vision and skip_multimodal_module(path):
-            return False
-        if not hasattr(module, "to_quantized"):
-            return False
-
-        feature_dim = _feature_dim(module)
-
-        def is_divisible(group_size: Optional[int]) -> bool:
-            if group_size in (None, 0):
-                return True
-            if feature_dim is None:
-                return False
-            return feature_dim % int(group_size) == 0
-
-        if quant_predicate is not None:
-            result = quant_predicate(path, module)
-            if isinstance(result, dict):
-                group_size_override = result.get("group_size", q_group_size)
-                if not is_divisible(group_size_override):
-                    return False
-                return result
-            if isinstance(result, bool):
-                if not result:
-                    return False
-                if not is_divisible(q_group_size):
-                    return False
-                return True
-            return result
-
-        if not is_divisible(q_group_size):
-            return False
-        return True
-
-    if mode == "mxfp4":
-        if q_group_size != 32 or q_bits != 4:
-            print(
-                "[INFO] MXFP4 requires group_size=32 and bits=4; overriding provided values."
-            )
-        q_group_size = 32
-        q_bits = 4
-
-    quantized_model, quantized_config = lm_quantize_model(
-        model,
-        config,
-        q_group_size,
-        q_bits,
-        mode=mode,
-        quant_predicate=predicate,
-    )
-
-    if skip_vision:
-        quantized_config.setdefault("vision_config", {})
-        quantized_config["vision_config"]["skip_vision"] = True
-
-    return quantized_model, quantized_config
 
 
 def load(
@@ -879,28 +796,30 @@ def process_inputs(
 ):
     # Get the process method from the processor
     process_method = getattr(processor, "process", processor)
+    parameters = inspect.signature(process_method).parameters
 
     # Prepare arguments
     args = {
         "text": prompts,
         "images": images,
         "padding": padding,
-        "padding_side": padding_side,
         "return_tensors": return_tensors,
     }
+    if "padding_side" in parameters:
+        args["padding_side"] = padding_side
 
     # Add special tokens if supported
-    if "add_special_tokens" in inspect.signature(process_method).parameters:
+    if "add_special_tokens" in parameters:
         args["add_special_tokens"] = add_special_tokens
 
-    for param in inspect.signature(process_method).parameters.keys():
+    for param in parameters.keys():
         if param in kwargs.keys():
             args[param] = kwargs.get(param, None)
             break
 
     # Add audio if provided and supported
     if audio is not None:
-        if "audio" in inspect.signature(process_method).parameters:
+        if "audio" in parameters:
             args["audio"] = audio
         else:
             raise ValueError(f"Processor {processor} does not support audio parameter")

@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx_lm.utils import quantize_model
 
 from mlx_vlm.utils import (
     StoppingCriteria,
@@ -11,7 +12,6 @@ from mlx_vlm.utils import (
     load,
     prepare_inputs,
     process_inputs_with_fallback,
-    quantize_model,
     sanitize_weights,
     update_module_configs,
 )
@@ -195,7 +195,11 @@ def test_quantize_module():
     module = DummyModule((10, 64))
     config = {}
     _, updated_config = quantize_model(
-        module, config, q_group_size=64, q_bits=4, skip_vision=False
+        module,
+        config,
+        group_size=64,
+        bits=4,
+        mode="affine",
     )
 
     # Check quantization parameters
@@ -221,8 +225,8 @@ def test_quantize_module():
     _, updated_config = quantize_model(
         module,
         config,
-        q_group_size=32,
-        q_bits=4,
+        group_size=32,
+        bits=4,
         mode="mxfp4",
     )
     assert updated_config["quantization"] == {
@@ -234,8 +238,17 @@ def test_quantize_module():
     # Test skip_vision=True
     module = DummyModule((10, 64))
     config = {}
+
+    def skip_vision_predicate(path: str, _module: nn.Module):
+        return "vision_model" not in path
+
     _, updated_config = quantize_model(
-        module, config, q_group_size=64, q_bits=4, skip_vision=True
+        module,
+        config,
+        group_size=64,
+        bits=4,
+        mode="affine",
+        quant_predicate=skip_vision_predicate,
     )
 
     # Vision module should not be quantized
@@ -243,7 +256,11 @@ def test_quantize_module():
     assert not hasattr(module.vision_model, "scales")
 
     # Check config is updated correctly
-    assert updated_config["vision_config"]["skip_vision"] is True
+    assert updated_config["quantization"] == {
+        "group_size": 64,
+        "bits": 4,
+        "mode": "affine",
+    }
 
 
 def test_prepare_inputs():
@@ -257,7 +274,7 @@ def test_prepare_inputs():
         processor, prompts="test", images=None, image_token_index=None
     )
     assert "input_ids" in inputs
-    assert mx.array_equal(inputs["input_ids"], mx.array([1, 2, 3]))
+    assert mx.array_equal(inputs["input_ids"], mx.array([[1, 2, 3]]))
 
     # Test image-only input with image token
     image = mx.zeros((3, 224, 224))
