@@ -144,8 +144,10 @@ class Attention(nn.Module):
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        splits = [mx.split(tensor, lengths.tolist(), axis=2) for tensor in (q, k, v)]
+        splits = [
+            mx.split(tensor, cu_seqlens[1:-1].tolist(), axis=2) for tensor in (q, k, v)
+        ]
+
         attn_outputs = []
         for q, k, v in zip(*splits):
             output = mx.fast.scaled_dot_product_attention(
@@ -153,9 +155,8 @@ class Attention(nn.Module):
             )
             attn_outputs.append(output)
 
-        output = mx.concat(attn_outputs, axis=2)
-        output = output.transpose(0, 2, 1, 3)
-        output = output.reshape(seq_length, -1)
+        output = mx.concatenate(attn_outputs, axis=2)
+        output = output.transpose(0, 2, 1, 3).reshape(seq_length, -1)
         return self.proj(output)
 
 
