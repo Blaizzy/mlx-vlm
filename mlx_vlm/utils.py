@@ -819,6 +819,9 @@ def prepare_inputs(
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
+        # Ensure pad_token exists when padding text-only inputs
+        if padding and tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
         inputs = tokenizer(
             prompts,
             add_special_tokens=add_special_tokens,
