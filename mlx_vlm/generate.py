@@ -1254,9 +1254,7 @@ def main():
             chat.append({"role": "system", "content": args.system})
         while user := input("User:"):
             chat.append({"role": "user", "content": user})
-            prompt = apply_chat_template(
-                processor, config, chat, num_images=len(args.image)
-            )
+            prompt = apply_chat_template(processor, config, chat, num_images=num_images)
             response = ""
             print("Assistant:", end="")
             for chunk in stream_generate(
