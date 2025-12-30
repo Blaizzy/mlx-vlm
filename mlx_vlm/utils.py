@@ -349,7 +349,7 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
     try:
         with open(model_path / "config.json", encoding="utf-8") as f:
             config = json.load(f)
-        
+
         generation_config_file = model_path / "generation_config.json"
         if generation_config_file.exists():
             generation_config = {}
@@ -363,7 +363,7 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
                 config["eos_token_id"] = eos_token_id
 
         return config
-        
+
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"Config not found at {model_path}") from exc
 
