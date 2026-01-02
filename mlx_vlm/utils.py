@@ -241,6 +241,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             class_predicate=get_class_predicate,
         )
 
+    if hasattr(model, "sanitize"):
+        weights = model.sanitize(weights)
+
     model.load_weights(list(weights.items()))
     if not lazy:
         mx.eval(model.parameters())
