@@ -107,6 +107,7 @@ def convert(
     quantize: bool = False,
     q_group_size: int = 64,
     q_bits: int = 4,
+    q_mode: str = "affine",
     dtype: Optional[str] = None,
     upload_repo: str = None,
     revision: Optional[str] = None,
@@ -155,8 +156,19 @@ def convert(
     if quantize:
         print("[INFO] Quantizing")
         config.setdefault("vision_config", {})
+        if q_mode == "mxfp4" and (q_group_size != 32 or q_bits != 4):
+            print(
+                "[INFO] MXFP4 quantization forces group_size=32 and bits=4; overriding user-specified values."
+            )
+            q_group_size = 32
+            q_bits = 4
         model, config = quantize_model(
-            model, config, q_group_size, q_bits, quant_predicate=quant_predicate
+            model,
+            config,
+            q_group_size,
+            q_bits,
+            mode=q_mode,
+            quant_predicate=quant_predicate,
         )
 
     if dequantize:
@@ -214,6 +226,13 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--q-bits", help="Bits per weight for quantization.", type=int, default=4
+    )
+    parser.add_argument(
+        "--q-mode",
+        help="The quantization mode.",
+        type=str,
+        choices=["affine", "mxfp4"],
+        default="affine",
     )
     parser.add_argument(
         "--dtype",
