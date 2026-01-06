@@ -17,15 +17,13 @@ class LanguageModel(nn.Module):
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    # TODO: mask is going away in mlx-lm, see https://github.com/ml-explore/mlx-lm/pull/430
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, None, cache, inputs_embeds)
+        out = self.model(inputs, cache, inputs_embeds)
         out = self.model.embed_tokens.as_linear(out)
         return LanguageModelOutput(out)
 
