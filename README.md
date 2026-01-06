@@ -22,6 +22,22 @@ The easiest way to get started is to install the `mlx-vlm` package using pip:
 pip install -U mlx-vlm
 ```
 
+### Optional dependencies
+
+Install the extras that match the features you plan to use:
+
+| Extra | Install command | Purpose |
+| --- | --- | --- |
+| `ui` | `pip install -U "mlx-vlm[ui]"` | Required for the Gradio-based chat UI (`mlx_vlm.chat_ui`). |
+| `trainer` | `pip install -U "mlx-vlm[trainer]"` | Adds dataset + progress tooling used by the LoRA/QLoRA trainer. |
+| `server` | `pip install -U "mlx-vlm[server]"` | Installs FastAPI, Uvicorn, and Requests for running `mlx_vlm.server`. |
+| `audio` | `pip install -U "mlx-vlm[audio]"` | Enables audio file ingestion via `soundfile` for audio + multimodal prompts. |
+| `torch` | `pip install -U "mlx-vlm[torch]"` | Pulls in PyTorch + Torch vision. |
+| `cuda` | `pip install -U "mlx-vlm[cuda]"` | Includes the `mlx-cuda` wheel for CUDA-enabled environments. |
+| `cpu` | `pip install -U "mlx-vlm[cpu]"` | Installs the `mlx-cpu` backend when you need a CPU-only build. |
+
+You can combine extras, for example `pip install -U "mlx-vlm[server,audio]"`, to install only what your workflow requires.
+
 ## Usage
 
 ### Command Line Interface (CLI)
