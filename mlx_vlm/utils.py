@@ -238,6 +238,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
+            mode=quantization.get("mode", "affine"),
             class_predicate=get_class_predicate,
         )
 
@@ -746,28 +747,30 @@ def process_inputs(
 ):
     # Get the process method from the processor
     process_method = getattr(processor, "process", processor)
+    parameters = inspect.signature(process_method).parameters
 
     # Prepare arguments
     args = {
         "text": prompts,
         "images": images,
         "padding": padding,
-        "padding_side": padding_side,
         "return_tensors": return_tensors,
     }
+    if "padding_side" in parameters:
+        args["padding_side"] = padding_side
 
     # Add special tokens if supported
-    if "add_special_tokens" in inspect.signature(process_method).parameters:
+    if "add_special_tokens" in parameters:
         args["add_special_tokens"] = add_special_tokens
 
-    for param in inspect.signature(process_method).parameters.keys():
+    for param in parameters.keys():
         if param in kwargs.keys():
             args[param] = kwargs.get(param, None)
             break
 
     # Add audio if provided and supported
     if audio is not None:
-        if "audio" in inspect.signature(process_method).parameters:
+        if "audio" in parameters:
             args["audio"] = audio
         else:
             raise ValueError(f"Processor {processor} does not support audio parameter")
