@@ -156,12 +156,6 @@ def convert(
     if quantize:
         print("[INFO] Quantizing")
         config.setdefault("vision_config", {})
-        if q_mode == "mxfp4" and (q_group_size != 32 or q_bits != 4):
-            print(
-                "[INFO] MXFP4 quantization forces group_size=32 and bits=4; overriding user-specified values."
-            )
-            q_group_size = 32
-            q_bits = 4
         model, config = quantize_model(
             model,
             config,
