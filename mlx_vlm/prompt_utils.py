@@ -31,6 +31,7 @@ MODEL_CONFIG = {
     "jvlm": MessageFormat.IMAGE_TOKEN_PIPE,
     "idefics2": MessageFormat.LIST_WITH_IMAGE,
     "idefics3": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "lfm2-vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "lfm2_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "aya_vision": MessageFormat.LIST_WITH_IMAGE,
     "cohere2_vision": MessageFormat.LIST_WITH_IMAGE,
