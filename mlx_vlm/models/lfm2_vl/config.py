@@ -91,3 +91,4 @@ class ModelConfig(BaseModelConfig):
     projector_hidden_act: str = "gelu"
     projector_hidden_size: int = 2560
     eos_token_id: int = 7
+    projector_use_layernorm: bool = True
