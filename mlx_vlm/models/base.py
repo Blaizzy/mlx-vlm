@@ -17,6 +17,7 @@ from transformers.image_utils import ChannelDimension, PILImageResampling
 @dataclass
 class LanguageModelOutput:
     logits: mx.array
+    hidden_states: Optional[List[mx.array]] = None
     cross_attention_states: Optional[List[mx.array]] = None
     encoder_outputs: Optional[List[mx.array]] = None
 
