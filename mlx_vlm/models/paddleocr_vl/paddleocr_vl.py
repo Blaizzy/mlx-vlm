@@ -23,7 +23,7 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        grid_thw: Optional[mx.array] = None,
+        image_grid_thw: Optional[mx.array] = None,
     ):
         if pixel_values is None:
             return self.language_model.model.embed_tokens(input_ids)
@@ -35,7 +35,9 @@ class Model(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
-        hidden_states = self.visual(pixel_values, grid_thw, output_hidden_states=False)
+        hidden_states = self.visual(
+            pixel_values, image_grid_thw, output_hidden_states=False
+        )
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self.merge_input_ids_with_image_features(
@@ -124,13 +126,14 @@ class Model(nn.Module):
         input_ids: mx.array,
         pixel_values: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
-        image_grid_thw: Optional[mx.array] = None,
         cache=None,
         **kwargs,
     ):
-        input_embddings = self.get_input_embeddings(
-            input_ids, pixel_values, image_grid_thw
-        )
+        image_grid_thw = kwargs.pop("image_grid_thw", None)
+        video_grid_thw = kwargs.pop("video_grid_thw", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+
+        input_embddings = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
         kwargs = {
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
