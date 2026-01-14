@@ -47,6 +47,11 @@ class VisionDataset(Dataset):
         if not isinstance(images, list):
             images = [images] if images else []
         
+        # Handle audio
+        audio = item.get("audio", item.get("audios", []))
+        if not isinstance(audio, list):
+            audio = [audio] if audio else []
+        
         # Get conversations
         conversations = item["messages"]
         
@@ -59,14 +64,15 @@ class VisionDataset(Dataset):
         if not image_token_index:
             raise ValueError("Config must contain 'image_token_index' or 'image_token_id'")
         
-        # For models using structured content format, images are embedded in the conversation
+        # For models using structured content format, images/audio are embedded in the conversation
         # and processed by apply_chat_template, so we pass None to prepare_inputs
         model_type = self.config.get("model_type")
-        use_embedded_images = model_type in ["qwen3_vl", "qwen3_vl_moe", "gemma3"]
+        use_embedded_images = model_type in ["qwen3_vl", "qwen3_vl_moe", "qwen3_omni_moe", "gemma3"]
         
         inputs = prepare_inputs(
             processor=self.processor,
             images=None if use_embedded_images else (images if images else None),
+            audio=audio if audio else None,
             prompts=[prompt],
             image_token_index=image_token_index,
             resize_shape=self.image_resize_shape,
@@ -107,6 +113,7 @@ def transform_dataset_to_messages(dataset, model_type):
     has_messages = "messages" in dataset.column_names
     has_qa = "question" in dataset.column_names and "answer" in dataset.column_names
     has_images = "images" in dataset.column_names or "image" in dataset.column_names
+    has_audio = "audio" in dataset.column_names or "audios" in dataset.column_names
     
     if has_messages:
         return dataset
@@ -118,26 +125,40 @@ def transform_dataset_to_messages(dataset, model_type):
         raise ValueError("Dataset must have either 'images' or 'image' column")
     
     image_col = "images" if "images" in dataset.column_names else "image"
+    audio_col = "audios" if "audios" in dataset.column_names else "audio" if has_audio else None
     
     # Define transform functions based on model type
+    def qwen3_omni_moe_transform(img, q, a, aud=None):
+        content = []
+        if img:
+            content.append({"type": "image", "image": img})
+        if aud:
+            content.append({"type": "audio", "audio": aud})
+        content.append({"type": "text", "text": q})
+        return [
+            {"role": "user", "content": content},
+            {"role": "assistant", "content": [{"type": "text", "text": a}]}
+        ]
+    
     transform_funcs = {
-        "gemma3": lambda img, q, a: [
+        "gemma3": lambda img, q, a, aud=None: [
             {"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": q}]},
             {"role": "assistant", "content": [{"type": "text", "text": a}]}
         ],
-        "qwen3_vl": lambda img, q, a: [
+        "qwen3_vl": lambda img, q, a, aud=None: [
             {"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": q}]},
             {"role": "assistant", "content": [{"type": "text", "text": a}]}
         ],
-        "qwen3_vl_moe": lambda img, q, a: [
+        "qwen3_vl_moe": lambda img, q, a, aud=None: [
             {"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": q}]},
             {"role": "assistant", "content": [{"type": "text", "text": a}]}
         ],
-        "deepseek_vl_v2": lambda img, q, a: [
+        "qwen3_omni_moe": qwen3_omni_moe_transform,
+        "deepseek_vl_v2": lambda img, q, a, aud=None: [
             {"role": "<|User|>", "content": f"<image>\n<|ref|>{q}<|/ref|>.", "images": [img]},
             {"role": "<|Assistant|>", "content": a}
         ],
-        "default": lambda img, q, a: [
+        "default": lambda img, q, a, aud=None: [
             {"role": "user", "content": f"<image>{q}" if "<image>" not in str(q) else q},
             {"role": "assistant", "content": a}
         ]
@@ -150,9 +171,10 @@ def transform_dataset_to_messages(dataset, model_type):
         messages_list = []
         for i in range(len(examples[image_col])):
             img = examples[image_col][i] if has_images else None
+            aud = examples[audio_col][i] if has_audio and audio_col else None
             q = examples["question"][i]
             a = examples["answer"][i]
-            messages_list.append(transform_func(img, q, a))
+            messages_list.append(transform_func(img, q, a, aud))
         return {"messages": messages_list}
     
     return dataset.map(transform_batch, batched=True)
