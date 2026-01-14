@@ -124,10 +124,6 @@ def convert(
     def base_quant_predicate(path, module):
         if skip_multimodal_module(path):
             return False
-        if not hasattr(module, "to_quantized"):
-            return False
-        if module.weight.shape[1] % q_group_size != 0:
-            return False
         return True
 
     if isinstance(quant_predicate, str):
@@ -262,6 +258,12 @@ def configure_parser() -> argparse.ArgumentParser:
         "-d",
         "--dequantize",
         help="Dequantize a quantized model.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        help="Trust remote code.",
         action="store_true",
         default=False,
     )
