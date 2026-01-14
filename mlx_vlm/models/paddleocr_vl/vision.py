@@ -83,17 +83,22 @@ class PaddleOCRVisionEmbeddings(nn.Module):
         num_patches = (image_size // patch_size) ** 2
         self.position_embedding = nn.Embedding(num_patches, self.embed_dim)
 
-    def interpolate_pos_encoding(
-        self, hidden_states: mx.array, height: int, width: int
-    ) -> mx.array:
+    def interpolate_pos_encoding(self, height: int, width: int) -> mx.array:
+        # Get the number of positions and embedding dimension
         num_positions = self.position_embedding.weight.shape[0]
-        patch_pos_embed = mx.expand_dims(self.position_embedding.weight, 0)
-        dim = hidden_states.shape[-1]
 
+        # Get all position embeddings (this will dequantize if quantized)
+        position_ids = mx.arange(num_positions)
+        patch_pos_embed = self.position_embedding(position_ids)
+        dim = patch_pos_embed.shape[-1]
+
+        # Reshape to 2D grid
         sqrt_num_positions = int(num_positions**0.5)
         patch_pos_embed = patch_pos_embed.reshape(
             1, sqrt_num_positions, sqrt_num_positions, dim
         )
+
+        # Interpolate to target size
         patch_pos_embed = bilinear_interpolate(
             patch_pos_embed[0],
             height,
@@ -122,7 +127,7 @@ class PaddleOCRVisionEmbeddings(nn.Module):
             t, h, w = image_grid.tolist()
             end = start + t * h * w
             image_embeddings = embeddings[start:end, :]
-            position_embedding = self.interpolate_pos_encoding(image_embeddings, h, w)
+            position_embedding = self.interpolate_pos_encoding(h, w)
             image_embeddings = image_embeddings + position_embedding
             tmp_embeddings.append(image_embeddings)
             start = end
