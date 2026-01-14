@@ -1,10 +1,10 @@
-mlx>=0.26.0
+mlx>=0.30.0
 datasets>=2.19.1
 tqdm>=4.66.2
-transformers>=4.57.0
+mlx-lm>=0.30.2
+transformers>=5.0.0rc1
 Pillow>=10.3.0
 requests>=2.31.0
-mlx-lm>=0.23.0
 fastapi>=0.95.1
 soundfile>=0.13.1
 opencv-python>=4.12.0.88

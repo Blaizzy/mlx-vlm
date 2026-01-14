@@ -124,10 +124,6 @@ def convert(
     def base_quant_predicate(path, module):
         if skip_multimodal_module(path):
             return False
-        if not hasattr(module, "to_quantized"):
-            return False
-        if module.weight.shape[1] % q_group_size != 0:
-            return False
         return True
 
     if isinstance(quant_predicate, str):
@@ -201,8 +197,12 @@ def configure_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert Hugging Face model to MLX format"
     )
-
-    parser.add_argument("--hf-path", type=str, help="Path to the Hugging Face model.")
+    parser.add_argument(
+        "--hf-path",
+        "--model",
+        type=str,
+        help="Path to the model. This can be a local path or a Hugging Face Hub model identifier.",
+    )
     parser.add_argument(
         "--revision",
         type=str,
@@ -216,16 +216,22 @@ def configure_parser() -> argparse.ArgumentParser:
         "-q", "--quantize", help="Generate a quantized model.", action="store_true"
     )
     parser.add_argument(
-        "--q-group-size", help="Group size for quantization.", type=int, default=64
+        "--q-group-size",
+        help="Group size for quantization.",
+        type=int,
+        default=None,
     )
     parser.add_argument(
-        "--q-bits", help="Bits per weight for quantization.", type=int, default=4
+        "--q-bits",
+        help="Bits per weight for quantization.",
+        type=int,
+        default=None,
     )
     parser.add_argument(
         "--q-mode",
         help="The quantization mode.",
         type=str,
-        choices=["affine", "mxfp4"],
+        choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
         default="affine",
     )
     parser.add_argument(
@@ -252,6 +258,12 @@ def configure_parser() -> argparse.ArgumentParser:
         "-d",
         "--dequantize",
         help="Dequantize a quantized model.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        help="Trust remote code.",
         action="store_true",
         default=False,
     )
