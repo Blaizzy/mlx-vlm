@@ -59,9 +59,14 @@ class VisionDataset(Dataset):
         if not image_token_index:
             raise ValueError("Config must contain 'image_token_index' or 'image_token_id'")
         
+        # For models using structured content format, images are embedded in the conversation
+        # and processed by apply_chat_template, so we pass None to prepare_inputs
+        model_type = self.config.get("model_type")
+        use_embedded_images = model_type in ["qwen3_vl", "qwen3_vl_moe", "gemma3"]
+        
         inputs = prepare_inputs(
             processor=self.processor,
-            images=images if images else None,
+            images=None if use_embedded_images else (images if images else None),
             prompts=[prompt],
             image_token_index=image_token_index,
             resize_shape=self.image_resize_shape,
@@ -121,6 +126,10 @@ def transform_dataset_to_messages(dataset, model_type):
             {"role": "assistant", "content": [{"type": "text", "text": a}]}
         ],
         "qwen3_vl": lambda img, q, a: [
+            {"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": q}]},
+            {"role": "assistant", "content": [{"type": "text", "text": a}]}
+        ],
+        "qwen3_vl_moe": lambda img, q, a: [
             {"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": q}]},
             {"role": "assistant", "content": [{"type": "text", "text": a}]}
         ],
