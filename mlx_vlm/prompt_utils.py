@@ -34,6 +34,7 @@ MODEL_CONFIG = {
     "lfm2_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "aya_vision": MessageFormat.LIST_WITH_IMAGE,
     "cohere2_vision": MessageFormat.LIST_WITH_IMAGE,
+    "paddleocr_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen2_vl": MessageFormat.LIST_WITH_IMAGE,
     "qwen2_5_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
