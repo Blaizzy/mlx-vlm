@@ -139,7 +139,21 @@ print(output)
 
 Start the server:
 ```sh
-mlx_vlm.server
+mlx_vlm.server --port 8080
+
+# With trust remote code enabled (required for some models)
+mlx_vlm.server --trust-remote-code
+```
+
+#### Server Options
+
+- `--host`: Host address (default: `0.0.0.0`)
+- `--port`: Port number (default: `8080`)
+- `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
+
+You can also set trust remote code via environment variable:
+```sh
+MLX_TRUST_REMOTE_CODE=true mlx_vlm.server
 ```
 
 The server provides multiple endpoints for different use cases and supports dynamic model loading/unloading with caching (one model at a time).
