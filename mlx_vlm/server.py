@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import gc
 import json
+import os
 import traceback
 import uuid
 from datetime import datetime
@@ -57,7 +58,12 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         if adapter_path:
             print(f"Loading adapter from: {adapter_path}")
         # Use the load function from utils.py which handles path resolution and loading
-        model, processor = load(model_path, adapter_path, trust_remote_code=True)
+        trust_remote_code = (
+            os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
+        )
+        model, processor = load(
+            model_path, adapter_path, trust_remote_code=trust_remote_code
+        )
         config = model.config
         print("Model and processor loaded successfully.")
         return model, processor, config
@@ -836,19 +842,34 @@ async def chat_completions_endpoint(request: ChatRequest):
 
         images = []
         audio = []
-        for content in chat_messages[-1].content:
-            if isinstance(content, dict):
-                if content["type"] == "input_image":
-                    images.append(content["image_url"])
-                if content["type"] == "image_url":
-                    images.append(content["image_url"]["url"])
-                if content["type"] == "input_audio":
-                    audio.append(content["input_audio"]["data"])
+        processed_messages = []
+        for message in request.messages:
+            if isinstance(message.content, str):
+                processed_messages.append(
+                    {"role": message.role, "content": message.content}
+                )
+            elif isinstance(message.content, list):
+                text_content = ""
+                for item in message.content:
+                    if isinstance(item, dict):
+                        # Only extract images/audio from user messages
+                        if message.role == "user":
+                            if item["type"] == "input_image":
+                                images.append(item["image_url"])
+                            elif item["type"] == "image_url":
+                                images.append(item["image_url"]["url"])
+                            elif item["type"] == "input_audio":
+                                audio.append(item["input_audio"]["data"])
+                        if item["type"] in ("text", "input_text"):
+                            text_content = item.get("text", "")
+                processed_messages.append(
+                    {"role": message.role, "content": text_content}
+                )
 
         formatted_prompt = apply_chat_template(
             processor,
             config,
-            chat_messages,
+            processed_messages,
             num_images=len(images),
             num_audios=len(audio),
         )
@@ -1069,7 +1090,14 @@ def main():
         default=8080,
         help="Port for the HTTP server (default: 8080)",
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust remote code when loading models from Hugging Face Hub.",
+    )
     args = parser.parse_args()
+    if args.trust_remote_code:
+        os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
     uvicorn.run(
         "mlx_vlm.server:app", host=args.host, port=args.port, workers=1, reload=True
     )  # reload=True for development to automatically restart on code changes.
