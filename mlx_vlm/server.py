@@ -842,19 +842,34 @@ async def chat_completions_endpoint(request: ChatRequest):
 
         images = []
         audio = []
-        for content in chat_messages[-1].content:
-            if isinstance(content, dict):
-                if content["type"] == "input_image":
-                    images.append(content["image_url"])
-                if content["type"] == "image_url":
-                    images.append(content["image_url"]["url"])
-                if content["type"] == "input_audio":
-                    audio.append(content["input_audio"]["data"])
+        processed_messages = []
+        for message in request.messages:
+            if isinstance(message.content, str):
+                processed_messages.append(
+                    {"role": message.role, "content": message.content}
+                )
+            elif isinstance(message.content, list):
+                text_content = ""
+                for item in message.content:
+                    if isinstance(item, dict):
+                        # Only extract images/audio from user messages
+                        if message.role == "user":
+                            if item["type"] == "input_image":
+                                images.append(item["image_url"])
+                            elif item["type"] == "image_url":
+                                images.append(item["image_url"]["url"])
+                            elif item["type"] == "input_audio":
+                                audio.append(item["input_audio"]["data"])
+                        if item["type"] in ("text", "input_text"):
+                            text_content = item.get("text", "")
+                processed_messages.append(
+                    {"role": message.role, "content": text_content}
+                )
 
         formatted_prompt = apply_chat_template(
             processor,
             config,
-            chat_messages,
+            processed_messages,
             num_images=len(images),
             num_audios=len(audio),
         )
