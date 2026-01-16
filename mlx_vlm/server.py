@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import gc
 import json
+import os
 import traceback
 import uuid
 from datetime import datetime
@@ -57,7 +58,12 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         if adapter_path:
             print(f"Loading adapter from: {adapter_path}")
         # Use the load function from utils.py which handles path resolution and loading
-        model, processor = load(model_path, adapter_path, trust_remote_code=True)
+        trust_remote_code = (
+            os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
+        )
+        model, processor = load(
+            model_path, adapter_path, trust_remote_code=trust_remote_code
+        )
         config = model.config
         print("Model and processor loaded successfully.")
         return model, processor, config
@@ -1069,7 +1075,14 @@ def main():
         default=8080,
         help="Port for the HTTP server (default: 8080)",
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust remote code when loading models from Hugging Face Hub.",
+    )
     args = parser.parse_args()
+    if args.trust_remote_code:
+        os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
     uvicorn.run(
         "mlx_vlm.server:app", host=args.host, port=args.port, workers=1, reload=True
     )  # reload=True for development to automatically restart on code changes.
