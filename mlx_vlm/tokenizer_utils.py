@@ -118,6 +118,10 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
 
     It adds tokens to the text if the next token starts with the special SPM
     underscore which results in linear complexity.
+
+    Handles UTF-8 byte tokens (like <0xE5><0xA4><0xA2>) by accumulating them
+    and decoding as UTF-8 bytes, which is necessary for multi-byte characters
+    like Chinese that may not be in the vocabulary.
     """
 
     def __init__(self, tokenizer, trim_space=True):
@@ -125,27 +129,50 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
 
         # Extract the tokens in a list from id to text
         self.tokenmap = [None] * len(tokenizer.vocab)
+        self.is_byte_token = [False] * len(tokenizer.vocab)
+        self.byte_value = [0] * len(tokenizer.vocab)
+
         for value, tokenid in tokenizer.vocab.items():
             self.tokenmap[tokenid] = value
-
-        # Replace bytes with their value
-        for i in range(len(self.tokenmap)):
-            if self.tokenmap[i].startswith("<0x"):
-                self.tokenmap[i] = chr(int(self.tokenmap[i][3:5], 16))
+            # Mark byte tokens and store their byte value
+            if value.startswith("<0x") and len(value) >= 6 and value[5] == ">":
+                self.is_byte_token[tokenid] = True
+                self.byte_value[tokenid] = int(value[3:5], 16)
 
         self.reset()
 
     def reset(self):
         self.offset = 0
         self._unflushed = ""
+        self._byte_buffer = bytearray()
         self.text = ""
         self.tokens = []
+
+    def _flush_bytes(self):
+        """Decode accumulated bytes as UTF-8 and append to unflushed text."""
+        if self._byte_buffer:
+            try:
+                decoded = self._byte_buffer.decode("utf-8")
+                self._unflushed += decoded
+            except UnicodeDecodeError:
+                # If decoding fails, use replacement character
+                self._unflushed += self._byte_buffer.decode("utf-8", errors="replace")
+            self._byte_buffer = bytearray()
 
     def add_token(self, token, skip_special_token_ids: List[int] = []):
         if token in skip_special_token_ids:
             return
+
+        if self.is_byte_token[token]:
+            # Accumulate byte tokens
+            self._byte_buffer.append(self.byte_value[token])
+            return
+
+        # Flush any accumulated bytes before processing regular token
+        self._flush_bytes()
+
         v = self.tokenmap[token]
-        if v[0] == "\u2581":
+        if v and v[0] == "\u2581":
             if self.text or not self.trim_space:
                 self.text += self._unflushed.replace("\u2581", " ")
             else:
@@ -155,6 +182,9 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
             self._unflushed += v
 
     def finalize(self):
+        # Flush any remaining bytes
+        self._flush_bytes()
+
         if self.text or not self.trim_space:
             self.text += self._unflushed.replace("\u2581", " ")
         else:
@@ -304,14 +334,7 @@ def _is_spm_decoder_no_space(decoder):
 
 
 def _is_bpe_decoder(decoder):
-    _target_description = {
-        "type": "ByteLevel",
-        "add_prefix_space": False,
-        "trim_offsets": False,
-        "use_regex": False,
-    }
-
-    return _match(_target_description, decoder)
+    return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
 def _has_bytelevel_pretokenizer(pre_tokenizer):
