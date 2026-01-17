@@ -1,8 +1,9 @@
 import mlx.core as mx
-from mlx_vlm import load, stream_generate, generate
-from mlx_vlm.video_generate import process_vision_info
-from outlines.processors import JSONLogitsProcessor
 from outlines.models.transformers import TransformerTokenizer
+from outlines.processors import JSONLogitsProcessor
+
+from mlx_vlm import generate, load, stream_generate
+from mlx_vlm.video_generate import process_vision_info
 
 # need install outlines with version 1.1.1, uv pip install outlines==1.1.1
 
@@ -14,23 +15,15 @@ model, processor = load("mlx-community/Qwen3-VL-2B-Thinking-8bit")
 # Define JSON schema for structured output
 json_schema = {
     "properties": {
-        "username": {
-            "type": "string",
-            "description": "The username of the account"
-        },
-        "password": {
-            "type": "string",
-            "description": "The password of the account"
-        }
+        "username": {"type": "string", "description": "The username of the account"},
+        "password": {"type": "string", "description": "The password of the account"},
     }
 }
 
 # Setup outlines processor for JSON schema enforcement
 outlines_tokenizer = TransformerTokenizer(processor.tokenizer)
 json_logits_processor = JSONLogitsProcessor(
-    schema=json_schema,
-    tokenizer=outlines_tokenizer,
-    tensor_library_name="mlx"
+    schema=json_schema, tokenizer=outlines_tokenizer, tensor_library_name="mlx"
 )
 
 # Prepare messages
@@ -40,13 +33,10 @@ messages = [
         "content": [
             {
                 "type": "text",
-                "text": "Extract the wifi internet service provider information (including username and password) from the image"
+                "text": "Extract the wifi internet service provider information (including username and password) from the image",
             },
-            {
-                "type": "image",
-                "image": image_path
-            }
-        ]
+            {"type": "image", "image": image_path},
+        ],
     }
 ]
 
@@ -65,7 +55,7 @@ try:
         images=image_inputs,
         videos=video_inputs,
         padding=True,
-        return_tensors="mlx"
+        return_tensors="mlx",
     )
     # MLX arrays are already in the correct format
 except (TypeError, AttributeError, ValueError):
@@ -75,11 +65,13 @@ except (TypeError, AttributeError, ValueError):
         images=image_inputs,
         videos=video_inputs,
         padding=True,
-        return_tensors="pt"
+        return_tensors="pt",
     )
     # Convert PyTorch tensors to MLX arrays efficiently
-    inputs = {k: mx.array(v) if not isinstance(v, (str, list, mx.array)) else v 
-              for k, v in inputs.items()}
+    inputs = {
+        k: mx.array(v) if not isinstance(v, (str, list, mx.array)) else v
+        for k, v in inputs.items()
+    }
 
 # Add JSON logits processor to inputs
 inputs["json_logits_processor"] = json_logits_processor
@@ -88,24 +80,14 @@ inputs["json_logits_processor"] = json_logits_processor
 print("=" * 50)
 print("Testing generate()")
 print("=" * 50)
-response = generate(
-    model,
-    processor,
-    prompt=input_prompt,
-    **inputs
-)
+response = generate(model, processor, prompt=input_prompt, **inputs)
 print("RESPONSE:", response)
 
 # Test with streaming generate
 print("\n" + "=" * 50)
 print("Testing stream_generate()")
 print("=" * 50)
-response_generator = stream_generate(
-    model,
-    processor,
-    prompt=input_prompt,
-    **inputs
-)
+response_generator = stream_generate(model, processor, prompt=input_prompt, **inputs)
 
 # Use list for efficient string building
 chunks = []
