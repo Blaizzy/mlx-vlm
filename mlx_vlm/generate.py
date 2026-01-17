@@ -223,6 +223,7 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    json_logits_processor: Optional[Callable[[mx.array], mx.array]] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -291,7 +292,10 @@ def generate_step(
     if repetition_context_size:
         repetition_context = repetition_context[-repetition_context_size:]
 
+    tokens_list = []
+
     def _step(y, **kwargs):
+
         with mx.stream(generation_stream):
             nonlocal repetition_context
             if "decoder_input_ids" in kwargs:
@@ -307,6 +311,10 @@ def generate_step(
                 )
 
             logits = outputs.logits[:, -1, :]
+
+            if json_logits_processor:
+                tokens_list.append(y.item())
+                logits = json_logits_processor(mx.array(tokens_list), logits)
 
             if repetition_penalty:
                 logits = apply_repetition_penalty(
@@ -328,6 +336,12 @@ def generate_step(
 
     logits = outputs.logits[:, -1, :]
     quantize_cache_fn(prompt_cache)
+
+    if json_logits_processor is not None:
+        final_input_token = input_ids[0][-1].item()
+        tokens_list.append(final_input_token)
+        logits = json_logits_processor(mx.array(tokens_list), logits)
+
     y, logprobs = sample(logits)
     mx.async_eval(y)
 
