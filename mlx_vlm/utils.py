@@ -83,7 +83,7 @@ def get_model_and_args(config: dict):
 
 
 def get_model_path(
-    path_or_hf_repo: str, revision: Optional[str] = None, **kwargs
+    path_or_hf_repo: str, revision: Optional[str] = None, force_download: bool = False
 ) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
@@ -111,7 +111,7 @@ def get_model_path(
                     "*.txt",
                     "*.jinja",
                 ],
-                **kwargs,
+                force_download=force_download,
             )
         )
     return model_path
@@ -309,7 +309,10 @@ def load(
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
-    model_path = get_model_path(path_or_hf_repo, revision=revision, **kwargs)
+    force_download = kwargs.get("force_download", False)
+    model_path = get_model_path(
+        path_or_hf_repo, force_download=force_download, revision=revision
+    )
     model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
         model = apply_lora_layers(model, adapter_path)
@@ -342,7 +345,7 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
         FileNotFoundError: If config.json is not found at the path
     """
     if isinstance(model_path, str):
-        model_path = get_model_path(model_path, **kwargs)
+        model_path = get_model_path(model_path)
 
     try:
         with open(model_path / "config.json", encoding="utf-8") as f:
@@ -368,7 +371,7 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
 
 def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImageProcessor:
     if isinstance(model_path, str):
-        model_path = get_model_path(model_path, **kwargs)
+        model_path = get_model_path(model_path)
 
     if not kwargs:
         config = load_config(model_path, trust_remote_code=True)
