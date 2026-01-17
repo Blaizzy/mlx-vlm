@@ -48,30 +48,18 @@ input_prompt = processor.tokenizer.apply_chat_template(
     add_generation_prompt=True,
 )
 
-# Process inputs - try MLX first, fallback to PyTorch if needed
-try:
-    inputs = processor(
-        text=[input_prompt],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="mlx",
-    )
-    # MLX arrays are already in the correct format
-except (TypeError, AttributeError, ValueError):
-    # Fallback to PyTorch and convert to MLX
-    inputs = processor(
-        text=[input_prompt],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-    )
-    # Convert PyTorch tensors to MLX arrays efficiently
-    inputs = {
-        k: mx.array(v) if not isinstance(v, (str, list, mx.array)) else v
-        for k, v in inputs.items()
-    }
+inputs = processor(
+    text=[input_prompt],
+    images=image_inputs,
+    videos=video_inputs,
+    padding=True,
+    return_tensors="pt",
+)
+# Convert PyTorch tensors to MLX arrays efficiently
+inputs = {
+    k: mx.array(v) if not isinstance(v, (str, list, mx.array)) else v
+    for k, v in inputs.items()
+}
 
 # Add JSON logits processor to inputs
 inputs["json_logits_processor"] = json_logits_processor
