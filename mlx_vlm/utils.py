@@ -769,7 +769,7 @@ def process_inputs(
             break
 
     # Add audio if provided and supported
-    if audio is not None:
+    if audio is not None and len(audio) > 0:
         if "audio" in parameters:
             args["audio"] = audio
         else:
@@ -923,7 +923,7 @@ def prepare_inputs(
     ):
         is_qwen3_omni_moe = True
 
-    if audio is not None:
+    if audio is not None and len(audio) > 0:
         if not isinstance(audio, list):
             audio = [audio]
 
