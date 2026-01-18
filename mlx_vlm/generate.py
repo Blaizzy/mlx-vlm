@@ -223,7 +223,7 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
-    json_logits_processor: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -279,6 +279,7 @@ def generate_step(
         )
 
     y = input_ids
+    tokens = None  # Track tokens for logits processors
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -292,10 +293,8 @@ def generate_step(
     if repetition_context_size:
         repetition_context = repetition_context[-repetition_context_size:]
 
-    tokens_list = []
-
     def _step(y, **kwargs):
-
+        nonlocal tokens
         with mx.stream(generation_stream):
             nonlocal repetition_context
             if "decoder_input_ids" in kwargs:
@@ -312,9 +311,12 @@ def generate_step(
 
             logits = outputs.logits[:, -1, :]
 
-            if json_logits_processor:
-                tokens_list.append(y.item())
-                logits = json_logits_processor(mx.array(tokens_list), logits)
+            # Apply logits processors before repetition penalty
+            if logits_processors:
+                # Efficiently update tokens by concatenating only the new token
+                tokens = mx.concat([tokens, y])
+                for processor in logits_processors:
+                    logits = processor(tokens, logits)
 
             if repetition_penalty:
                 logits = apply_repetition_penalty(
@@ -337,12 +339,25 @@ def generate_step(
     logits = outputs.logits[:, -1, :]
     quantize_cache_fn(prompt_cache)
 
-    if json_logits_processor is not None:
-        final_input_token = input_ids[0][-1].item()
-        tokens_list.append(final_input_token)
-        logits = json_logits_processor(mx.array(tokens_list), logits)
+    # For logits processors, sample a candidate token first, then let processors modify logits
+    if logits_processors:
+        # Sample candidate token from original logits
+        if temperature == 0:
+            candidate_token = mx.argmax(logits, axis=-1)
+        else:
+            if top_p > 0 and top_p < 1.0:
+                candidate_token = top_p_sampling(logits, top_p, temperature)
+            else:
+                candidate_token = mx.random.categorical(logits * (1 / temperature))
 
+        # Pass candidate token to processors
+        tokens = candidate_token
+        for processor in logits_processors:
+            logits = processor(tokens, logits)
+
+    # Final sampling with processed logits
     y, logprobs = sample(logits)
+
     mx.async_eval(y)
 
     if outputs.cross_attention_states is not None:
