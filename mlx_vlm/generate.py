@@ -339,19 +339,10 @@ def generate_step(
     logits = outputs.logits[:, -1, :]
     quantize_cache_fn(prompt_cache)
 
-    # For logits processors, sample a candidate token first, then let processors modify logits
     if logits_processors:
-        # Sample candidate token from original logits
-        if temperature == 0:
-            candidate_token = mx.argmax(logits, axis=-1)
-        else:
-            if top_p > 0 and top_p < 1.0:
-                candidate_token = top_p_sampling(logits, top_p, temperature)
-            else:
-                candidate_token = mx.random.categorical(logits * (1 / temperature))
-
-        # Pass candidate token to processors
-        tokens = candidate_token
+        # get the last token from input_ids
+        final_input_token = input_ids[0][-1].item()
+        tokens = mx.array([final_input_token])
         for processor in logits_processors:
             logits = processor(tokens, logits)
 
