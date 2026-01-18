@@ -1,6 +1,15 @@
+import sys
+
 import mlx.core as mx
-from outlines.models.transformers import TransformerTokenizer
-from outlines.processors import JSONLogitsProcessor
+
+try:
+    from outlines.models.transformers import TransformerTokenizer
+    from outlines.processors import JSONLogitsProcessor
+except ImportError:
+    print(
+        "Outlines is not installed, please install it with `pip install outlines==1.1.1`"
+    )
+    sys.exit(1)
 
 from mlx_vlm import generate, load, stream_generate
 from mlx_vlm.video_generate import process_vision_info
@@ -25,6 +34,8 @@ outlines_tokenizer = TransformerTokenizer(processor.tokenizer)
 json_logits_processor = JSONLogitsProcessor(
     schema=json_schema, tokenizer=outlines_tokenizer, tensor_library_name="mlx"
 )
+
+logits_processors = [json_logits_processor]
 
 # Prepare messages
 messages = [
@@ -61,21 +72,22 @@ inputs = {
     for k, v in inputs.items()
 }
 
-# Add JSON logits processor to inputs
-inputs["json_logits_processor"] = json_logits_processor
-
 # Test with generate
 print("=" * 50)
 print("Testing generate()")
 print("=" * 50)
-response = generate(model, processor, prompt=input_prompt, **inputs)
+response = generate(
+    model, processor, prompt=input_prompt, logits_processors=logits_processors, **inputs
+)
 print("RESPONSE:", response)
 
 # Test with streaming generate
 print("\n" + "=" * 50)
 print("Testing stream_generate()")
 print("=" * 50)
-response_generator = stream_generate(model, processor, prompt=input_prompt, **inputs)
+response_generator = stream_generate(
+    model, processor, prompt=input_prompt, logits_processors=logits_processors, **inputs
+)
 
 # Use list for efficient string building
 chunks = []
