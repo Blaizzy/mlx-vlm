@@ -9,7 +9,6 @@ from mlx_vlm.tokenizer_utils import (
     SPMStreamingDetokenizer,
     StreamingDetokenizer,
     TokenizerWrapper,
-    _has_bytelevel_pretokenizer,
     _is_bpe_decoder,
     _is_spm_decoder,
     _is_spm_decoder_no_space,
@@ -199,38 +198,6 @@ class TestIsBpeDecoder:
     def test_non_dict(self):
         assert _is_bpe_decoder("ByteLevel") is False
         assert _is_bpe_decoder(None) is False
-
-
-class TestHasByteLevelPretokenizer:
-    """Tests for _has_bytelevel_pretokenizer function."""
-
-    def test_direct_bytelevel(self):
-        pre_tokenizer = {"type": "ByteLevel"}
-        assert _has_bytelevel_pretokenizer(pre_tokenizer) is True
-
-    def test_sequence_with_bytelevel(self):
-        pre_tokenizer = {
-            "type": "Sequence",
-            "pretokenizers": [
-                {"type": "Split"},
-                {"type": "ByteLevel"},
-            ],
-        }
-        assert _has_bytelevel_pretokenizer(pre_tokenizer) is True
-
-    def test_sequence_without_bytelevel(self):
-        pre_tokenizer = {
-            "type": "Sequence",
-            "pretokenizers": [
-                {"type": "Split"},
-                {"type": "Whitespace"},
-            ],
-        }
-        assert _has_bytelevel_pretokenizer(pre_tokenizer) is False
-
-    def test_non_dict(self):
-        assert _has_bytelevel_pretokenizer(None) is False
-        assert _has_bytelevel_pretokenizer("ByteLevel") is False
 
 
 # ============================================================================
