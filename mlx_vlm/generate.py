@@ -145,6 +145,24 @@ def parse_arguments():
         default="main",
         help="The specific model version to use (branch, tag, commit).",
     )
+    parser.add_argument(
+        "--thinking-budget",
+        type=int,
+        default=None,
+        help="Maximum tokens for model thinking/reasoning (in <think> blocks).",
+    )
+    parser.add_argument(
+        "--thinking-start-token",
+        type=str,
+        default=None,
+        help="Token string that marks the start of a thinking block. If None, assume thinking starts immediately.",
+    )
+    parser.add_argument(
+        "--thinking-end-token",
+        type=str,
+        default="</think>",
+        help="Token string that marks the end of a thinking block.",
+    )
 
     return parser.parse_args()
 
@@ -223,6 +241,9 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    thinking_budget: Optional[int] = None,
+    thinking_start_token_id: Optional[int] = None,
+    thinking_end_token_id: Optional[int] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -240,6 +261,13 @@ def generate_step(
         top_p (float, optional): Nulceus sampling, higher means model considers
           more less likely words.
         logit_bias (dictionary, optional): Additive logit bias.
+        thinking_budget (int, optional): Maximum number of tokens allowed in
+          thinking blocks (between thinking_start_token and thinking_end_token).
+          When exceeded, the thinking_end_token is force-inserted.
+        thinking_start_token_id (int, optional): Token ID that marks the start
+          of a thinking block. Required if thinking_budget is set.
+        thinking_end_token_id (int, optional): Token ID that marks the end of
+          a thinking block. Required if thinking_budget is set.
 
     Yields:
         Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
@@ -346,10 +374,60 @@ def generate_step(
     else:
         kwargs = {}
 
+    # Thinking budget state tracking
+    in_thinking = False
+    thinking_token_count = 0
+
+    # Determine initial thinking state
+    if thinking_budget is not None and thinking_end_token_id is not None:
+        if thinking_start_token_id is None:
+            # No start token specified - assume we start thinking immediately
+            in_thinking = True
+        else:
+            # Check if the first token is the thinking start token
+            first_token_id = y.item()
+            if first_token_id == thinking_start_token_id:
+                in_thinking = True
+            else:
+                # Warn user that expected start token was not found
+                import warnings
+
+                warnings.warn(
+                    f"thinking_budget is set but first generated token ({first_token_id}) "
+                    f"does not match thinking_start_token_id ({thinking_start_token_id}). "
+                    "Budget enforcement will not be applied. "
+                    "Set thinking_start_token=None to assume implicit thinking mode."
+                )
+
     n = 0
     while True:
         if n != max_tokens:
             next_y, next_logprobs = _step(y, **kwargs)
+
+            # Thinking budget enforcement
+            if thinking_budget is not None and thinking_end_token_id is not None:
+                token_id = next_y.item()
+
+                if in_thinking:
+                    if token_id == thinking_end_token_id:
+                        in_thinking = False
+                    else:
+                        thinking_token_count += 1
+
+                        # Budget exceeded - force </think> token
+                        if thinking_token_count > thinking_budget:
+                            next_y = mx.array([thinking_end_token_id])
+                            # TODO: Consider gradually boosting thinking_end_token
+                            # probability as budget approaches instead of hard cutoff
+                            # Update logprobs to reflect forced token selection
+                            next_logprobs = mx.full(
+                                next_logprobs.shape,
+                                -float("inf"),
+                                dtype=next_logprobs.dtype,
+                            )
+                            next_logprobs[thinking_end_token_id] = 0.0
+                            in_thinking = False
+
             mx.async_eval(next_y)
             if "decoder_input_ids" in kwargs:
                 kwargs["decoder_input_ids"] = next_y[None]
@@ -371,6 +449,9 @@ def stream_generate(
     prompt: str,
     image: Union[str, List[str]] = None,
     audio: Union[str, List[str]] = None,
+    thinking_budget: Optional[int] = None,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: str = "</think>",
     **kwargs,
 ) -> Union[str, Generator[str, None, None]]:
     """
@@ -380,6 +461,13 @@ def stream_generate(
         prompt (mx.array): The input prompt.
         model (nn.Module): The model to use for generation.
         max_tokens (int): The ma
+        thinking_budget (int, optional): Maximum number of tokens allowed in
+          thinking blocks. When exceeded, the thinking_end_token is force-inserted.
+        thinking_start_token (str, optional): Token string that marks the start of a
+          thinking block. If None (default), assumes thinking starts immediately
+          when thinking_budget is set.
+        thinking_end_token (str): Token string that marks the end of a
+          thinking block. Default: "</think>".
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -387,6 +475,18 @@ def stream_generate(
         Generator[Tuple[mx.array, mx.array]]: A generator producing text.
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+    # Resolve thinking token IDs if budget is set
+    thinking_start_token_id = None
+    thinking_end_token_id = None
+    if thinking_budget is not None:
+        if thinking_start_token is not None:
+            thinking_start_token_id = tokenizer.encode(
+                thinking_start_token, add_special_tokens=False
+            )[-1]
+        thinking_end_token_id = tokenizer.encode(
+            thinking_end_token, add_special_tokens=False
+        )[-1]
 
     # Skip special tokens
     skip_special_tokens = kwargs.pop("skip_special_tokens", False)
@@ -435,7 +535,16 @@ def stream_generate(
         detokenizer.reset()
         tic = time.perf_counter()
         for n, (token, logprobs) in enumerate(
-            generate_step(input_ids, model, pixel_values, mask, **kwargs)
+            generate_step(
+                input_ids,
+                model,
+                pixel_values,
+                mask,
+                thinking_budget=thinking_budget,
+                thinking_start_token_id=thinking_start_token_id,
+                thinking_end_token_id=thinking_end_token_id,
+                **kwargs,
+            )
         ):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
@@ -485,6 +594,9 @@ def generate(
     image: Union[str, List[str]] = None,
     audio: Union[str, List[str]] = None,
     verbose: bool = False,
+    thinking_budget: Optional[int] = None,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: str = "</think>",
     **kwargs,
 ) -> GenerationResult:
     """
@@ -502,6 +614,13 @@ def generate(
            probability and displays it.
        repetition_penalty (float, optional): The penalty factor for repeating tokens.
        repetition_context_size (int, optional): The number of tokens to consider for repetition penalty.
+       thinking_budget (int, optional): Maximum number of tokens allowed in
+           thinking blocks. When exceeded, the thinking_end_token is force-inserted.
+       thinking_start_token (str, optional): Token string that marks the start of a
+           thinking block. If None (default), assumes thinking starts immediately
+           when thinking_budget is set.
+       thinking_end_token (str): Token string that marks the end of a
+           thinking block. Default: "</think>".
     """
 
     if verbose:
@@ -544,7 +663,17 @@ def generate(
     else:
         tokenizer.stopping_criteria.reset(model.config.eos_token_id)
 
-    for response in stream_generate(model, processor, prompt, image, audio, **kwargs):
+    for response in stream_generate(
+        model,
+        processor,
+        prompt,
+        image,
+        audio,
+        thinking_budget=thinking_budget,
+        thinking_start_token=thinking_start_token,
+        thinking_end_token=thinking_end_token,
+        **kwargs,
+    ):
         if verbose:
             print(response.text, end="", flush=True)
         text += response.text
@@ -703,6 +832,8 @@ class Batch:
     max_tokens: List[int]
     num_tokens: List[int]
     cache: List[Any]
+    in_thinking: Optional[List[bool]] = None
+    thinking_token_count: Optional[List[int]] = None
 
     def __len__(self):
         return len(self.uids)
@@ -711,6 +842,10 @@ class Batch:
         self.uids = [self.uids[k] for k in keep_idx]
         self.max_tokens = [self.max_tokens[k] for k in keep_idx]
         self.num_tokens = [self.num_tokens[k] for k in keep_idx]
+        if self.in_thinking is not None:
+            self.in_thinking = [self.in_thinking[k] for k in keep_idx]
+        if self.thinking_token_count is not None:
+            self.thinking_token_count = [self.thinking_token_count[k] for k in keep_idx]
         keep_idx = mx.array(keep_idx, mx.int32)
         self.y = self.y[keep_idx]
         self.logprobs = self.logprobs[keep_idx]
@@ -723,6 +858,10 @@ class Batch:
         self.logprobs = mx.concatenate([self.logprobs, other.logprobs])
         self.num_tokens.extend(other.num_tokens)
         self.max_tokens.extend(other.max_tokens)
+        if self.in_thinking is not None and other.in_thinking is not None:
+            self.in_thinking.extend(other.in_thinking)
+        if self.thinking_token_count is not None and other.thinking_token_count is not None:
+            self.thinking_token_count.extend(other.thinking_token_count)
         for c, o in zip(self.cache, other.cache):
             c.extend(o)
 
@@ -747,6 +886,9 @@ class BatchGenerator:
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
         prompt_cache=None,
+        thinking_budget: Optional[int] = None,
+        thinking_start_token_id: Optional[int] = None,
+        thinking_end_token_id: Optional[int] = None,
     ):
         self.model = model
         self.unprocessed_prompts = []
@@ -762,6 +904,11 @@ class BatchGenerator:
         self.completion_batch_size = completion_batch_size
         self.prompt_cache = prompt_cache
         self._stats = BatchStats()
+
+        # Thinking budget parameters
+        self.thinking_budget = thinking_budget
+        self.thinking_start_token_id = thinking_start_token_id
+        self.thinking_end_token_id = thinking_end_token_id
 
         self.tokenizer.stopping_criteria.add_eos_token_ids(stop_tokens)
 
@@ -836,8 +983,30 @@ class BatchGenerator:
         y, logprobs = self._step(inputs, prompt_cache, **kwargs)
         mx.async_eval(y, logprobs)
         mx.clear_cache()
+
+        # Initialize thinking state if budget is set
+        in_thinking = None
+        thinking_token_count = None
+        if self.thinking_budget is not None and self.thinking_end_token_id is not None:
+            batch_size = len(uids)
+            # If no start token specified, assume thinking starts immediately
+            if self.thinking_start_token_id is None:
+                in_thinking = [True] * batch_size
+            else:
+                # Check first token of each sample to see if it's the thinking start token
+                first_tokens = y.tolist()
+                in_thinking = [t == self.thinking_start_token_id for t in first_tokens]
+            thinking_token_count = [0] * batch_size
+
         return Batch(
-            list(uids), y, logprobs, list(max_tokens), [0] * len(uids), prompt_cache
+            list(uids),
+            y,
+            logprobs,
+            list(max_tokens),
+            [0] * len(uids),
+            prompt_cache,
+            in_thinking,
+            thinking_token_count,
         )
 
     def _step(self, input_tokens: mx.array, prompt_cache: List[Any], **kwargs):
@@ -900,6 +1069,46 @@ class BatchGenerator:
         mx.async_eval(batch.y, batch.logprobs)
 
         y = y.tolist()
+
+        # Apply thinking budget enforcement
+        tokens_modified = False
+        modified_indices: List[int] = []
+        if (
+            self.thinking_budget is not None
+            and self.thinking_end_token_id is not None
+            and batch.in_thinking is not None
+        ):
+            for e, t in enumerate(y):
+                if batch.in_thinking[e]:
+                    if t == self.thinking_end_token_id:
+                        batch.in_thinking[e] = False
+                    elif t == self.thinking_start_token_id:
+                        # Don't count the start token itself
+                        pass
+                    else:
+                        batch.thinking_token_count[e] += 1
+                        # Budget exceeded - force thinking end token
+                        if batch.thinking_token_count[e] > self.thinking_budget:
+                            y[e] = self.thinking_end_token_id
+                            batch.in_thinking[e] = False
+                            tokens_modified = True
+                            modified_indices.append(e)
+
+            # Update batch.y and logprobs if any tokens were modified
+            if tokens_modified:
+                batch.y = mx.array(y)
+                # Update logprobs for forced tokens
+                logprobs_list = list(logprobs)
+                for idx in modified_indices:
+                    forced_logprobs = mx.full(
+                        logprobs_list[idx].shape,
+                        -float("inf"),
+                        dtype=logprobs.dtype,
+                    )
+                    forced_logprobs[self.thinking_end_token_id] = 0.0
+                    logprobs_list[idx] = forced_logprobs
+                logprobs = mx.stack(logprobs_list)
+
         toc = time.perf_counter()
         if prompt_processing:
             self._stats.prompt_time += toc - tic
@@ -954,6 +1163,9 @@ def batch_generate(
     verbose: bool = False,
     group_by_shape: bool = True,
     track_image_sizes: bool = True,
+    thinking_budget: Optional[int] = None,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: str = "</think>",
     **kwargs,
 ):
     """
@@ -983,6 +1195,13 @@ def batch_generate(
           batch processing. Default: ``True``.
        track_image_sizes (bool): If ``True``, track and return original image sizes.
           Default: ``True``.
+       thinking_budget (int, optional): Maximum number of tokens allowed in
+          thinking blocks. When exceeded, the thinking_end_token is force-inserted.
+       thinking_start_token (str, optional): Token string that marks the start of a
+          thinking block. If None (default), assumes thinking starts immediately
+          when thinking_budget is set.
+       thinking_end_token (str): Token string that marks the end of a
+          thinking block. Default: "</think>".
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
 
@@ -996,6 +1215,18 @@ def batch_generate(
     processor.detokenizer.reset()
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
+    # Resolve thinking token IDs if budget is set
+    thinking_start_token_id = None
+    thinking_end_token_id = None
+    if thinking_budget is not None:
+        if thinking_start_token is not None:
+            thinking_start_token_id = tokenizer.encode(
+                thinking_start_token, add_special_tokens=False
+            )[-1]
+        thinking_end_token_id = tokenizer.encode(
+            thinking_end_token, add_special_tokens=False
+        )[-1]
+
     # Handle single image case
     if isinstance(images, str):
         images = [images]
@@ -1003,7 +1234,16 @@ def batch_generate(
     # Handle no images case
     if images is None:
         texts, stats = _generate_batch(
-            model, processor, prompts, None, max_tokens, verbose, **kwargs
+            model,
+            processor,
+            prompts,
+            None,
+            max_tokens,
+            verbose,
+            thinking_budget=thinking_budget,
+            thinking_start_token_id=thinking_start_token_id,
+            thinking_end_token_id=thinking_end_token_id,
+            **kwargs,
         )
         return BatchResponse(texts, stats)
 
@@ -1068,6 +1308,9 @@ def batch_generate(
             group_prompts,
             group_images,
             group_max_tokens,
+            thinking_budget=thinking_budget,
+            thinking_start_token_id=thinking_start_token_id,
+            thinking_end_token_id=thinking_end_token_id,
             **kwargs,
         )
 
@@ -1117,6 +1360,9 @@ def _generate_batch(
     images: List = None,
     max_tokens: Union[int, List[int]] = 100,
     verbose: bool = False,
+    thinking_budget: Optional[int] = None,
+    thinking_start_token_id: Optional[int] = None,
+    thinking_end_token_id: Optional[int] = None,
     **kwargs,
 ) -> Tuple[List[str], BatchStats]:
 
@@ -1171,6 +1417,9 @@ def _generate_batch(
         processor,
         prefill_batch_size=batch_size,
         completion_batch_size=batch_size,
+        thinking_budget=thinking_budget,
+        thinking_start_token_id=thinking_start_token_id,
+        thinking_end_token_id=thinking_end_token_id,
         **kwargs,
     )
 
@@ -1265,6 +1514,9 @@ def main():
                 args.audio,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
+                thinking_budget=args.thinking_budget,
+                thinking_start_token=args.thinking_start_token,
+                thinking_end_token=args.thinking_end_token,
                 **kwargs,
             ):
                 response += chunk.text
@@ -1288,6 +1540,9 @@ def main():
             kv_bits=args.kv_bits,
             kv_group_size=args.kv_group_size,
             quantized_kv_start=args.quantized_kv_start,
+            thinking_budget=args.thinking_budget,
+            thinking_start_token=args.thinking_start_token,
+            thinking_end_token=args.thinking_end_token,
             **kwargs,
         )
         if not args.verbose:
