@@ -337,27 +337,6 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
-def _has_bytelevel_pretokenizer(pre_tokenizer):
-    """Check if the pre-tokenizer uses ByteLevel encoding.
-
-    This is important because of the TokenizersBackend in HuggingFace v5 or higher,
-    """
-    if not isinstance(pre_tokenizer, dict):
-        return False
-
-    # Direct ByteLevel pre-tokenizer
-    if pre_tokenizer.get("type") == "ByteLevel":
-        return True
-
-    # Sequence of pre-tokenizers - check if any is ByteLevel
-    if pre_tokenizer.get("type") == "Sequence":
-        for pt in pre_tokenizer.get("pretokenizers", []):
-            if isinstance(pt, dict) and pt.get("type") == "ByteLevel":
-                return True
-
-    return False
-
-
 def load_tokenizer(model_path, return_tokenizer=True, tokenizer_config_extra={}):
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
@@ -375,10 +354,7 @@ def load_tokenizer(model_path, return_tokenizer=True, tokenizer_config_extra={})
             except JSONDecodeError as e:
                 raise JSONDecodeError("Failed to parse tokenizer.json", e.doc, e.pos)
 
-        pre_tokenizer = tokenizer_content.get("pre_tokenizer")
-        if _has_bytelevel_pretokenizer(pre_tokenizer):
-            detokenizer_class = BPEStreamingDetokenizer
-        elif "decoder" in tokenizer_content:
+        if "decoder" in tokenizer_content:
             if _is_spm_decoder(tokenizer_content["decoder"]):
                 detokenizer_class = SPMStreamingDetokenizer
             elif _is_spm_decoder_no_space(tokenizer_content["decoder"]):
