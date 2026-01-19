@@ -265,17 +265,40 @@ class LanguageModel(nn.Module):
         return self.config.num_key_value_heads
 
     def make_cache(self):
+        import os
+
+        # Allow override via environment variable for extended context support.
+        # Gemma 3's default sliding_window=1024 limits effective context on
+        # Apple Silicon due to Metal GPU timeout at higher token counts.
+        #
+        # Options:
+        #   - Default (1024): ~10K token context, most memory efficient
+        #   - GEMMA3_SLIDING_WINDOW=8192: ~40K token context
+        #   - GEMMA3_SLIDING_WINDOW=0: ~50K token context (full KVCache)
+        #
+        # See: https://github.com/Blaizzy/mlx-vlm/pull/667
+        sliding_window_override = os.environ.get("GEMMA3_SLIDING_WINDOW")
+        if sliding_window_override is not None:
+            sliding_window = int(sliding_window_override)
+        else:
+            sliding_window = self.config.sliding_window
+
         caches = []
         for i in range(self.config.num_hidden_layers):
             if (
                 i % self.config.sliding_window_pattern
                 == self.config.sliding_window_pattern - 1
             ):
+                # Global attention layer - always uses full KVCache
+                caches.append(KVCache())
+            elif sliding_window == 0:
+                # Override: use full KVCache for all layers (maximum context)
                 caches.append(KVCache())
             else:
+                # Local attention layer - uses RotatingKVCache with sliding window
                 caches.append(
                     RotatingKVCache(
-                        max_size=self.config.sliding_window,
+                        max_size=sliding_window,
                         keep=0,
                     )
                 )
