@@ -165,6 +165,10 @@ class Model(nn.Module):
     def layers(self):
         return self.language_model.model.layers
 
+    def make_cache(self):
+        """Delegate cache creation to language model (has GEMMA3_SLIDING_WINDOW patch)."""
+        return self.language_model.make_cache()
+
     def __call__(
         self,
         input_ids: mx.array,

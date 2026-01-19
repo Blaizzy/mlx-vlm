@@ -203,8 +203,10 @@ class Gemma3Model(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            # Fix: Pass single cache object (not list slice) and window_size parameter
-            # for proper sliding window attention. Aligned with mlx_lm/models/gemma3_text.py
+            # FIX: Pass single cache object (not list slice) and window_size parameter
+            # See mlx_lm/models/gemma3_text.py for reference implementation
+            # Bug: was passing cache[j-1:j] (list slice) instead of cache[j-1] (single object)
+            # Bug: was missing window_size parameter for sliding window mask
             global_mask = create_attention_mask(
                 h, cache[self.config.sliding_window_pattern - 1]
             )
@@ -273,6 +275,8 @@ class LanguageModel(nn.Module):
 
     def make_cache(self):
         import os
+        import logging
+        logger = logging.getLogger(__name__)
 
         # Allow override via environment variable for extended context support.
         # Gemma 3's default sliding_window=1024 limits effective context on
@@ -287,8 +291,10 @@ class LanguageModel(nn.Module):
         sliding_window_override = os.environ.get("GEMMA3_SLIDING_WINDOW")
         if sliding_window_override is not None:
             sliding_window = int(sliding_window_override)
+            logger.info(f"[Gemma3 make_cache] Using GEMMA3_SLIDING_WINDOW={sliding_window}")
         else:
             sliding_window = self.config.sliding_window
+            logger.info(f"[Gemma3 make_cache] Using default sliding_window={sliding_window}")
 
         caches = []
         for i in range(self.config.num_hidden_layers):
