@@ -203,9 +203,16 @@ class Gemma3Model(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            j = self.config.sliding_window_pattern
-            full_mask = create_attention_mask(h, cache[j - 1 : j])
-            sliding_window_mask = create_attention_mask(h, cache)
+            # Fix: Pass single cache object (not list slice) and window_size parameter
+            # for proper sliding window attention. Aligned with mlx_lm/models/gemma3_text.py
+            global_mask = create_attention_mask(
+                h, cache[self.config.sliding_window_pattern - 1]
+            )
+            sliding_window_mask = create_attention_mask(
+                h,
+                cache[0],
+                window_size=self.config.sliding_window,
+            )
 
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             is_global = (
@@ -215,7 +222,7 @@ class Gemma3Model(nn.Module):
 
             local_mask = mask
             if mask is None and is_global:
-                local_mask = full_mask
+                local_mask = global_mask
             elif mask is None:
                 local_mask = sliding_window_mask
 
