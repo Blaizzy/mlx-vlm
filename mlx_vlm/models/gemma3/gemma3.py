@@ -88,7 +88,7 @@ class Model(nn.Module):
         mask: Optional[mx.array] = None,
     ):
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids), None
+            return self.language_model.model.embed_tokens(input_ids), None, None
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
@@ -99,7 +99,7 @@ class Model(nn.Module):
 
         image_features = self.multi_modal_projector(hidden_state)
 
-        final_inputs_embeds, final_attention_mask_4d = (
+        final_inputs_embeds, final_attention_mask_4d, image_mask = (
             self.prepare_inputs_for_multimodal(
                 self.config.hidden_size,
                 self.config.pad_token_id,
@@ -110,7 +110,7 @@ class Model(nn.Module):
                 mask,
             )
         )
-        return final_inputs_embeds, final_attention_mask_4d
+        return final_inputs_embeds, final_attention_mask_4d, image_mask
 
     @staticmethod
     def prepare_inputs_for_multimodal(
@@ -159,7 +159,8 @@ class Model(nn.Module):
         final_attention_mask_4d = final_attention_mask_4d
         final_attention_mask_4d = mx.expand_dims(final_attention_mask_4d, 1)
         final_embedding = mx.array(final_embedding)
-        return final_embedding.astype(inputs_embeds.dtype), final_attention_mask_4d
+        # Return image_mask for bidirectional attention in language model
+        return final_embedding.astype(inputs_embeds.dtype), final_attention_mask_4d, image_mask
 
     @property
     def layers(self):
@@ -177,11 +178,18 @@ class Model(nn.Module):
         cache: Optional[mx.array] = None,
         **kwargs,
     ):
-        input_embeddings, _ = self.get_input_embeddings(input_ids, pixel_values, mask)
+        input_embeddings, _, _ = self.get_input_embeddings(input_ids, pixel_values, mask)
+
+        # Compute image_mask from input_ids for bidirectional attention
+        # image_token_index marks positions where image features were inserted
+        image_mask = None
+        if pixel_values is not None:
+            image_mask = (input_ids == self.config.image_token_index)
 
         logits = self.language_model(
             inputs=input_ids,
             cache=cache,
             inputs_embeds=input_embeddings,
+            image_mask=image_mask,  # Pass image mask for bidirectional attention
         )
         return logits

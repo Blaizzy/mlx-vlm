@@ -171,6 +171,53 @@ class TransformerBlock(nn.Module):
         return out
 
 
+def create_bidirectional_image_mask(causal_mask: mx.array, image_mask: mx.array) -> mx.array:
+    """
+    Modify causal mask to allow bidirectional attention for image tokens.
+
+    For Gemma 3, image tokens should have full bidirectional attention (can attend
+    to all other image tokens), while text tokens maintain causal attention.
+
+    Args:
+        causal_mask: The standard causal attention mask [batch, 1, seq_len, seq_len]
+        image_mask: Boolean mask indicating image positions [batch, seq_len]
+
+    Returns:
+        Modified mask with bidirectional attention for image tokens
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    if image_mask is None:
+        logger.info("[BIDIR MASK] No image_mask provided")
+        return causal_mask
+
+    # If causal_mask is "causal" string, we need to create the actual mask
+    if not isinstance(causal_mask, mx.array):
+        logger.info(f"[BIDIR MASK] causal_mask is not array: {type(causal_mask)}")
+        return causal_mask
+
+    batch_size, seq_len = image_mask.shape
+    num_image_tokens = mx.sum(image_mask).item()
+    logger.info(f"[BIDIR MASK] Creating bidirectional mask: {num_image_tokens} image tokens out of {seq_len}")
+
+    # Create bidirectional mask for image tokens
+    # image_mask: [batch, seq_len] -> expand to [batch, 1, seq_len, 1] and [batch, 1, 1, seq_len]
+    image_mask_q = mx.expand_dims(mx.expand_dims(image_mask, 1), -1)  # [batch, 1, seq_len, 1]
+    image_mask_k = mx.expand_dims(mx.expand_dims(image_mask, 1), 2)   # [batch, 1, 1, seq_len]
+
+    # Bidirectional: both query and key are image tokens
+    bidirectional_mask = image_mask_q & image_mask_k  # [batch, 1, seq_len, seq_len]
+
+    # Combine: use causal mask OR bidirectional for image-to-image attention
+    # causal_mask is True where attention is allowed
+    combined_mask = causal_mask | bidirectional_mask
+
+    logger.info(f"[BIDIR MASK] Combined mask shape: {combined_mask.shape}")
+
+    return combined_mask
+
+
 class Gemma3Model(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -191,7 +238,11 @@ class Gemma3Model(nn.Module):
         inputs_embeds: mx.array = None,
         mask: mx.array = None,
         cache=None,
+        image_mask: mx.array = None,  # For bidirectional image attention (computed from inputs if not provided)
     ):
+        import logging
+        logger = logging.getLogger(__name__)
+
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
         else:
@@ -202,19 +253,30 @@ class Gemma3Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
+        # image_mask should be passed from gemma3.py Model.__call__ which has access to image_token_index
+        if image_mask is not None:
+            num_images = mx.sum(image_mask).item()
+            if num_images > 0:
+                logger.info(f"[Gemma3Model] Received image_mask: {num_images} image tokens out of {inputs.shape[1]}")
+
         if mask is None:
             # FIX: Pass single cache object (not list slice) and window_size parameter
             # See mlx_lm/models/gemma3_text.py for reference implementation
-            # Bug: was passing cache[j-1:j] (list slice) instead of cache[j-1] (single object)
-            # Bug: was missing window_size parameter for sliding window mask
             global_mask = create_attention_mask(
-                h, cache[self.config.sliding_window_pattern - 1]
+                h, cache[self.config.sliding_window_pattern - 1], return_array=True
             )
             sliding_window_mask = create_attention_mask(
                 h,
                 cache[0],
                 window_size=self.config.sliding_window,
+                return_array=True,
             )
+
+            # Apply bidirectional attention for image tokens
+            if image_mask is not None and mx.sum(image_mask).item() > 0:
+                logger.info(f"[Gemma3Model] Applying bidirectional mask for image tokens")
+                global_mask = create_bidirectional_image_mask(global_mask, image_mask)
+                sliding_window_mask = create_bidirectional_image_mask(sliding_window_mask, image_mask)
 
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             is_global = (
@@ -247,8 +309,9 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        image_mask: Optional[mx.array] = None,  # NEW: for bidirectional image attention
     ):
-        out = self.model(inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache)
+        out = self.model(inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache, image_mask=image_mask)
         out = self.lm_head(out)
         return LanguageModelOutput(logits=out)
 
