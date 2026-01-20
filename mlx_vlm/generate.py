@@ -223,6 +223,7 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    skip_prompt_processing: bool = False,  # For prefix caching: skip full forward pass
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -324,14 +325,33 @@ def generate_step(
             quantize_cache_fn(prompt_cache)
             return y, logprobs.squeeze(0)
 
-    outputs = model(input_ids, pixel_values, cache=prompt_cache, mask=mask, **kwargs)
+    # PREFIX CACHING: Skip full forward pass if cache is pre-populated
+    if skip_prompt_processing and prompt_cache is not None:
+        # Cache hit - skip prompt processing, just get logits for last token
+        # The cache already contains KV states for all prompt tokens
+        last_token = input_ids[:, -1:]
+        # Filter kwargs - language_model doesn't accept all kwargs the full model does
+        excluded_kwargs = {'temp', 'temperature', 'top_p', 'max_tokens', 'token_type_ids',
+                          'pixel_values', 'image_sizes', 'attention_mask', 'position_ids'}
+        lm_kwargs = {k: v for k, v in kwargs.items() if k not in excluded_kwargs}
+        outputs = model.language_model(
+            last_token,
+            cache=prompt_cache,
+            **lm_kwargs,
+        )
+        logits = outputs.logits[:, -1, :]
+        quantize_cache_fn(prompt_cache)
+        y, logprobs = sample(logits)
+        mx.async_eval(y)
+    else:
+        # Normal path - full forward pass with vision processing
+        outputs = model(input_ids, pixel_values, cache=prompt_cache, mask=mask, **kwargs)
+        logits = outputs.logits[:, -1, :]
+        quantize_cache_fn(prompt_cache)
+        y, logprobs = sample(logits)
+        mx.async_eval(y)
 
-    logits = outputs.logits[:, -1, :]
-    quantize_cache_fn(prompt_cache)
-    y, logprobs = sample(logits)
-    mx.async_eval(y)
-
-    if outputs.cross_attention_states is not None:
+    if not skip_prompt_processing and outputs.cross_attention_states is not None:
         kwargs = {
             k: v
             for k, v in zip(

@@ -144,15 +144,22 @@ class SlidingWindowCache(_BaseCache):
     @property
     def state(self):
         if self.keys is None:
-            return None, None
-        return self.keys, self.values
+            return None, None, 0
+        # Include offset in state for correct prefix caching
+        return self.keys, self.values, self.offset
 
     @state.setter
     def state(self, v):
-        if v is not None and len(v) == 2:
-            self.keys, self.values = v
-            if self.keys is not None:
-                self.offset = self.max_size
+        if v is not None:
+            if len(v) == 3:
+                # New format: (keys, values, offset) - preserves offset correctly
+                self.keys, self.values, self.offset = v
+            elif len(v) == 2:
+                # Legacy format: (keys, values) - reset offset to 0 for clean repopulation
+                self.keys, self.values = v
+                if self.keys is not None:
+                    # Reset to 0 instead of max_size to allow clean re-generation
+                    self.offset = 0
 
     def get_max_cache_shape(self):
         return self.max_size
@@ -211,15 +218,22 @@ class StaticKVCache(_BaseCache):
     @property
     def state(self):
         if self.keys is None:
-            return None, None
-        return self.keys, self.values
+            return None, None, 0
+        # Include offset in state for correct prefix caching
+        return self.keys, self.values, self.offset
 
     @state.setter
     def state(self, v):
-        if v is not None and len(v) == 2:
-            self.keys, self.values = v
-            if self.keys is not None:
-                self.offset = self.max_size
+        if v is not None:
+            if len(v) == 3:
+                # New format: (keys, values, offset) - preserves offset correctly
+                self.keys, self.values, self.offset = v
+            elif len(v) == 2:
+                # Legacy format: (keys, values) - reset offset to 0 for clean repopulation
+                self.keys, self.values = v
+                if self.keys is not None:
+                    # Reset to 0 instead of max_size to allow clean re-generation
+                    self.offset = 0
 
     @property
     def meta_state(self):
