@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -48,11 +49,10 @@ class Model(nn.Module):
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
-            return {
-                "inputs_embeds": self.language_model.model.embed_tokens(input_ids),
-                "visual_pos_masks": None,
-                "deepstack_visual_embeds": None,
-            }
+
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
         pixel_values = pixel_values.astype(dtype)
@@ -80,12 +80,11 @@ class Model(nn.Module):
         image_mask = image_mask[..., 0]
         visual_pos_masks = image_mask
         deepstack_visual_embeds = deepstack_image_embeds
-
-        return {
-            "inputs_embeds": inputs_embeds,
-            "visual_pos_masks": visual_pos_masks,
-            "deepstack_visual_embeds": deepstack_visual_embeds,
-        }
+        return InputEmbeddingsFeatures(
+            inputs_embeds=inputs_embeds,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+        )
 
     @staticmethod
     def merge_input_ids_with_image_features(
@@ -129,7 +128,7 @@ class Model(nn.Module):
         kwargs.update(
             {
                 "pixel_values": pixel_values,
-                **inputs_embeds,
+                **inputs_embeds.to_dict(),
             }
         )
 

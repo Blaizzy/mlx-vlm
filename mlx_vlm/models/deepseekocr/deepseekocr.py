@@ -6,6 +6,7 @@ import mlx.nn as nn
 import numpy as np
 from transformers import AutoProcessor
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig, ProjectorConfig, SAMViTConfig
 from .language import LanguageModel
 from .processing_deepseekocr import DeepseekVLV2Processor
@@ -305,7 +306,7 @@ class Model(nn.Module):
 
                 idx += 1
 
-        return input_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=input_embeds)
 
     @property
     def layers(self):

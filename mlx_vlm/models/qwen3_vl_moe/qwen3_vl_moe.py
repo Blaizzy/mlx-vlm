@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -81,11 +82,11 @@ class Model(nn.Module):
         visual_pos_masks = image_mask
         deepstack_visual_embeds = deepstack_image_embeds
 
-        return {
-            "inputs_embeds": inputs_embeds,
-            "visual_pos_masks": visual_pos_masks,
-            "deepstack_visual_embeds": deepstack_visual_embeds,
-        }
+        return InputEmbeddingsFeatures(
+            inputs_embeds=inputs_embeds,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+        )
 
     @staticmethod
     def merge_input_ids_with_image_features(
@@ -128,7 +129,7 @@ class Model(nn.Module):
 
         kwargs = {
             "pixel_values": pixel_values,
-            **inputs_embeds,
+            **inputs_embeds.to_dict(),
             **kwargs,
         }
 

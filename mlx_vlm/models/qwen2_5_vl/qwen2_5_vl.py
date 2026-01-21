@@ -3,6 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -19,10 +20,15 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        image_grid_thw: Optional[mx.array] = None,
+        **kwargs,
     ):
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids)
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
         pixel_values = pixel_values.astype(dtype)
@@ -32,7 +38,7 @@ class Model(nn.Module):
 
         # Get the ouptut hidden states from the vision model
         hidden_states = self.vision_tower(
-            pixel_values, image_grid_thw, output_hidden_states=False
+            pixel_values, grid_thw, output_hidden_states=False
         )
 
         # Insert special image tokens in the input_ids
@@ -43,7 +49,7 @@ class Model(nn.Module):
             inputs_embeds,
             input_ids,
         )
-        return final_inputs_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
     @staticmethod
     def merge_input_ids_with_image_features(
@@ -131,16 +137,13 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        image_grid_thw = kwargs.pop("image_grid_thw", None)
-        video_grid_thw = kwargs.pop("video_grid_thw", None)
-        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
-        inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
+        inputs_embeds = self.get_input_embeddings(
+            input_ids, pixel_values, **kwargs
+        ).inputs_embeds
 
         kwargs = {
             "pixel_values": pixel_values,
-            "image_grid_thw": image_grid_thw,
-            "video_grid_thw": video_grid_thw,
             **kwargs,
         }
 

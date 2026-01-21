@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -254,20 +255,12 @@ class Model(nn.Module):
     def layers(self):
         return self.language_model.model.layers
 
-    def __call__(
+    def get_input_embeddings(
         self,
-        input_ids=None,
-        pixel_values=None,
-        cache=None,
-        decoder_input_ids=None,
-        decoder_attention_mask=None,
-        labels=None,
+        input_ids: Optional[mx.array] = None,
+        pixel_values: Optional[mx.array] = None,
         **kwargs,
     ):
-        """Forward pass."""
-        attention_mask = None
-        decoder_inputs_embeds = None
-
         # Process image if provided
         if pixel_values is not None:
             image_features = self._encode_image(pixel_values)
@@ -284,6 +277,27 @@ class Model(nn.Module):
         else:
             inputs_embeds = None
             attention_mask = None
+        return InputEmbeddingsFeatures(
+            inputs_embeds=inputs_embeds, attention_mask=attention_mask
+        )
+
+    def __call__(
+        self,
+        input_ids=None,
+        pixel_values=None,
+        cache=None,
+        decoder_input_ids=None,
+        decoder_attention_mask=None,
+        labels=None,
+        **kwargs,
+    ):
+        """Forward pass."""
+        attention_mask = None
+        decoder_inputs_embeds = None
+
+        input_embeddings = self.get_input_embeddings(input_ids, pixel_values, kwargs)
+        inputs_embeds = input_embeddings.inputs_embeds
+        attention_mask = input_embeddings.attention_mask
 
         # Handle decoder input IDs
         if labels is not None and decoder_input_ids is None:

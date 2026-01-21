@@ -5,6 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import CallableModuleList, VisionModel
@@ -53,7 +54,7 @@ class Model(nn.Module):
         final_inputs_embeds = self.prepare_inputs_for_multimodal(
             image_features, input_ids, mask
         )
-        return final_inputs_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
     # Source: https://github.com/apple/ml-fastvlm/blob/592b4add3c1c8a518e77d95dc6248e76c1dd591f/llava/model/llava_arch.py#L146
     def prepare_inputs_for_multimodal(self, image_features, input_ids, mask):

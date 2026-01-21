@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -125,7 +126,7 @@ class Model(nn.Module):
         final_inputs_embeds = self._merge_input_ids_with_image_features(
             image_features, inputs_embeds, input_ids
         )
-        return final_inputs_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
     def _merge_input_ids_with_image_features(
         self, image_features, inputs_embeds, input_ids
