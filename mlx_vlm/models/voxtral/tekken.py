@@ -88,9 +88,7 @@ class TekkenTokenizerWrapper:
         self._tokenizer = tokenizer
         self._raw_tokenizer = tokenizer.instruct_tokenizer.tokenizer
         self.eos_token_ids = (
-            [eos_token_ids]
-            if isinstance(eos_token_ids, int)
-            else (eos_token_ids or [])
+            [eos_token_ids] if isinstance(eos_token_ids, int) else (eos_token_ids or [])
         )
         self.all_special_ids = []
         self.stopping_criteria = StoppingCriteria(self.eos_token_ids, self)
