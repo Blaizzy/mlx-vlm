@@ -1,5 +1,5 @@
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Union
 
 from ..base import BaseModelConfig
@@ -42,6 +42,14 @@ class TextConfig(BaseModelConfig):
     eos_token_id: int = (2,)
     use_bias: bool = (False,)
     head_dim: int = (128,)
+    rope_parameters: Dict = None
+    rope_scaling: Dict = field(
+        default_factory=lambda: {
+            "rope_type": "default",
+            "type": "default",
+            "mrope_section": [16, 24, 24],
+        }
+    )
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
