@@ -146,6 +146,11 @@ def parse_arguments():
         default="main",
         help="The specific model version to use (branch, tag, commit).",
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust remote code when loading the model.",
+    )
 
     return parser.parse_args()
 
@@ -1292,7 +1297,10 @@ def main():
         args.image = [args.image]
 
     model, processor = load(
-        args.model, args.adapter_path, revision=args.revision, trust_remote_code=True
+        args.model,
+        args.adapter_path,
+        revision=args.revision,
+        trust_remote_code=args.trust_remote_code,
     )
     config = model.config
 
