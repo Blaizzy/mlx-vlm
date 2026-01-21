@@ -1,8 +1,8 @@
 import argparse
 import glob
 import shutil
-from textwrap import dedent
 from pathlib import Path
+from textwrap import dedent
 from typing import Callable, Optional, Union
 
 import mlx.core as mx
@@ -201,10 +201,7 @@ def _ensure_readme(
     if readme_path.exists():
         if is_voxtral and note not in readme_path.read_text(encoding="utf-8"):
             readme_path.write_text(
-                readme_path.read_text(encoding="utf-8").rstrip()
-                + "\n\n"
-                + note
-                + "\n",
+                readme_path.read_text(encoding="utf-8").rstrip() + "\n\n" + note + "\n",
                 encoding="utf-8",
             )
         return
@@ -213,10 +210,7 @@ def _ensure_readme(
         shutil.copy(source_readme, readme_path)
         if is_voxtral and note not in readme_path.read_text(encoding="utf-8"):
             readme_path.write_text(
-                readme_path.read_text(encoding="utf-8").rstrip()
-                + "\n\n"
-                + note
-                + "\n",
+                readme_path.read_text(encoding="utf-8").rstrip() + "\n\n" + note + "\n",
                 encoding="utf-8",
             )
         return
