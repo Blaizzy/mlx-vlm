@@ -1,6 +1,7 @@
 import argparse
 import glob
 import shutil
+from textwrap import dedent
 from pathlib import Path
 from typing import Callable, Optional, Union
 
@@ -182,9 +183,60 @@ def convert(
     processor.save_pretrained(mlx_path)
 
     save_config(config, config_path=mlx_path / "config.json")
+    _ensure_readme(model_path, mlx_path, hf_path, config)
 
     if upload_repo is not None:
         upload_to_hub(mlx_path, upload_repo, hf_path)
+
+
+def _ensure_readme(
+    model_path: Path, mlx_path: Path, hf_path: str, config: dict
+) -> None:
+    readme_path = mlx_path / "README.md"
+    is_voxtral = config.get("model_type") == "voxtral"
+    note = (
+        "Voxtral models require the optional Tekken tokenizer via `mistral-common` "
+        "(install with `pip install mlx-vlm[tekken]`)."
+    )
+    if readme_path.exists():
+        if is_voxtral and note not in readme_path.read_text(encoding="utf-8"):
+            readme_path.write_text(
+                readme_path.read_text(encoding="utf-8").rstrip()
+                + "\n\n"
+                + note
+                + "\n",
+                encoding="utf-8",
+            )
+        return
+    source_readme = model_path / "README.md"
+    if source_readme.exists():
+        shutil.copy(source_readme, readme_path)
+        if is_voxtral and note not in readme_path.read_text(encoding="utf-8"):
+            readme_path.write_text(
+                readme_path.read_text(encoding="utf-8").rstrip()
+                + "\n\n"
+                + note
+                + "\n",
+                encoding="utf-8",
+            )
+        return
+    title = Path(hf_path).name if Path(hf_path).name else hf_path
+    readme_path.write_text(
+        dedent(
+            f"""\
+            ---
+            library_name: mlx
+            tags:
+              - mlx
+            ---
+            # {title}
+
+            This model was converted to MLX format using mlx-vlm.
+            {note if is_voxtral else ""}
+            """
+        ),
+        encoding="utf-8",
+    )
 
 
 def configure_parser() -> argparse.ArgumentParser:
