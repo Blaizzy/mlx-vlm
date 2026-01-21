@@ -44,7 +44,9 @@ class Model(nn.Module):
         mask: Optional[mx.array] = None,
     ):
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids)
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         _, image_features, _ = self.vision_tower(pixel_values.transpose(0, 2, 3, 1))
         B, H, W, C = image_features.shape
@@ -163,9 +165,11 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        input_embeddings = self.get_input_embeddings(input_ids, pixel_values, mask)
+        inputs_embeds = self.get_input_embeddings(
+            input_ids, pixel_values, mask
+        ).inputs_embeds
         logits = self.language_model(
-            input_ids, mask=mask, cache=cache, inputs_embeds=input_embeddings
+            input_ids, mask=mask, cache=cache, inputs_embeds=inputs_embeds
         )
         return logits
 

@@ -93,7 +93,9 @@ class Model(nn.Module):
         **kwargs,
     ):
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids)
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
@@ -159,9 +161,11 @@ class Model(nn.Module):
         **kwargs,
     ):
 
-        input_embddings = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
+        inputs_embeds = self.get_input_embeddings(
+            input_ids, pixel_values, **kwargs
+        ).inputs_embeds
         logits = self.language_model(
-            input_ids, cache=cache, inputs_embeds=input_embddings
+            input_ids, cache=cache, inputs_embeds=inputs_embeds
         )
         return logits
 

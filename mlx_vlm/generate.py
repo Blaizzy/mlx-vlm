@@ -363,7 +363,6 @@ def generate_step(
         "attention_mask_4d": embedding_output.attention_mask_4d,
         "visual_pos_masks": embedding_output.visual_pos_masks,
         "deepstack_visual_embeds": embedding_output.deepstack_visual_embeds,
-        "per_layer_inputs": embedding_output.per_layer_inputs,
     }
     kwargs.update({k: v for k, v in optional_fields.items() if v is not None})
 

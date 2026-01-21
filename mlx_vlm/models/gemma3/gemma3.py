@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel, RMSNorm
 from .vision import VisionModel
@@ -88,7 +89,9 @@ class Model(nn.Module):
         mask: Optional[mx.array] = None,
     ):
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids), None
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
@@ -110,7 +113,9 @@ class Model(nn.Module):
                 mask,
             )
         )
-        return final_inputs_embeds, final_attention_mask_4d
+        return InputEmbeddingsFeatures(
+            inputs_embeds=final_inputs_embeds, attention_mask_4d=final_attention_mask_4d
+        )
 
     @staticmethod
     def prepare_inputs_for_multimodal(
@@ -173,11 +178,14 @@ class Model(nn.Module):
         cache: Optional[mx.array] = None,
         **kwargs,
     ):
-        input_embeddings, _ = self.get_input_embeddings(input_ids, pixel_values, mask)
+        multimodal_embeddings = self.get_input_embeddings(input_ids, pixel_values, mask)
+        inputs_embeds = multimodal_embeddings.inputs_embeds
+        attention_mask = multimodal_embeddings.attention_mask_4d
 
         logits = self.language_model(
             inputs=input_ids,
             cache=cache,
-            inputs_embeds=input_embeddings,
+            inputs_embeds=inputs_embeds,
+            mask=attention_mask,
         )
         return logits

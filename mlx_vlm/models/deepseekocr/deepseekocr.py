@@ -324,12 +324,12 @@ class Model(nn.Module):
         images_spatial_crop = kwargs.get("images_spatial_crop", None)
         images_seq_mask = kwargs.get("images_seq_mask", None)
 
-        input_embeddings = self.get_input_embeddings(
+        inputs_embeds = self.get_input_embeddings(
             input_ids, pixel_values, images_spatial_crop, images_seq_mask
-        )
+        ).inputs_embeds
 
         logits = self.language_model(
-            input_ids, cache=cache, inputs_embeds=input_embeddings
+            input_ids, cache=cache, inputs_embeds=inputs_embeds
         )
         return logits
 
