@@ -2,6 +2,7 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from ..base import (
     LanguageModelOutput,
@@ -13,9 +14,7 @@ from .config import ModelConfig, TextConfig
 
 
 class PaddleOCRRotaryEmbedding:
-    def __init__(
-        self, dim, max_position_embeddings=8192, base=500000, rope_scaling=None
-    ):
+    def __init__(self, dim, max_position_embeddings=8192, base=500000):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
@@ -26,35 +25,7 @@ class PaddleOCRRotaryEmbedding:
         self.inv_freq = inv_freq
         self.attention_scaling = 1.0
 
-        self.mrope_section = rope_scaling.get("mrope_section", [16, 24, 24])
-
-    def apply_mrope(self, freqs, mrope_section):
-        """Apply MRoPE to 3D rotary embeddings.
-        Reorganizes frequency layout to chunked [TTT...HHH...WWW]
-        args:
-            freqs: (3, bs, seq_len, head_dim // 2)
-            mrope_section: (3,)
-        returns:
-            x_t: (bs, seq_len, head_dim // 2)
-        """
-        freqs_t = freqs[0]  # just overwrite the first dimension T
-        offset = mrope_section[0]
-        for dim, length in enumerate(mrope_section[1:], start=1):  # H, W
-            idx = slice(offset, offset + length)
-            freqs_t[..., idx] = freqs[dim, ..., idx]
-            offset += length
-        return freqs_t
-
     def __call__(self, x, position_ids):
-
-        # In contrast to other models, Qwen3VL has different position ids for the grids
-        # So we expand the inv_freq to shape (3, ...)
-        if position_ids.ndim == 2:
-            position_ids = mx.broadcast_to(
-                position_ids[None, ...],
-                (3, position_ids.shape[0], position_ids.shape[1]),
-            )
-
         inv_freq_expanded = mx.broadcast_to(
             self.inv_freq[None, None, :, None].astype(mx.float32),
             (3, position_ids.shape[1], self.inv_freq.shape[0], 1),
@@ -65,7 +36,6 @@ class PaddleOCRRotaryEmbedding:
 
         freqs = inv_freq_expanded @ position_ids_expanded
         freqs = mx.swapaxes(freqs, 2, 3)
-        freqs = self.apply_mrope(freqs, self.mrope_section)
         emb = mx.concatenate([freqs, freqs], axis=-1)
         cos = mx.cos(emb) * self.attention_scaling
         sin = mx.sin(emb) * self.attention_scaling
@@ -80,7 +50,7 @@ def rotate_half(x):
     return mx.concatenate([-x2, x1], axis=-1)
 
 
-def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
+def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
     """
     Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors.
     Args:
@@ -88,17 +58,33 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
         k (mx.array): The key tensor.
         cos (mx.array): The cosine part of the rotary embedding.
         sin (mx.array): The sine part of the rotary embedding.
-        unsqueeze_dim (int, optional): Dimension to unsqueeze. Defaults to 1.
+        mrope_section (List[int]): Multimodal rope section for channel dimension of temporal, height and width.
     Returns:
         tuple(mx.array): The rotated query and key tensors.
     """
+    mrope_section = np.cumsum(mrope_section * 2)[:-1].tolist()
 
-    cos = mx.expand_dims(cos, axis=unqueeze_dim)
-    sin = mx.expand_dims(sin, axis=unqueeze_dim)
+    cos = mx.concatenate(
+        [m[i % 3] for i, m in enumerate(mx.split(cos, mrope_section, axis=-1))], axis=-1
+    )[
+        :, None, :, :
+    ]  # unsqueeze dim 1
+    sin = mx.concatenate(
+        [m[i % 3] for i, m in enumerate(mx.split(sin, mrope_section, axis=-1))], axis=-1
+    )[:, None, :, :]
 
-    # Apply rotary embedding
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    rotary_dim = cos.shape[-1]
+    q_rot = q[..., :rotary_dim]
+    q_pass = q[..., rotary_dim:]
+
+    k_rot = k[..., :rotary_dim]
+    k_pass = k[..., rotary_dim:]
+
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+
+    q_embed = mx.concatenate([q_embed, q_pass], axis=-1)
+    k_embed = mx.concatenate([k_embed, k_pass], axis=-1)
 
     return q_embed, k_embed
 
@@ -122,21 +108,14 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=args.use_bias)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=args.use_bias)
 
-        self.rope_scaling = args.rope_scaling
-
-        self.rotary_emb = PaddleOCRRotaryEmbedding(
-            head_dim,
-            max_position_embeddings=args.max_position_embeddings,
-            base=args.rope_theta,
-            rope_scaling=args.rope_scaling,
-        )
+        self.rope_parameters = args.rope_parameters or args.rope_scaling
 
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
-        position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -151,26 +130,17 @@ class Attention(nn.Module):
             0, 2, 1, 3
         )
 
-        kv_seq_len = keys.shape[-2]
+        cos, sin = position_embeddings
 
-        if position_ids is None:
-            kv_seq_len += cache.offset + 1
-            position_ids = mx.arange(cache.offset, cache.offset + L)
-            position_ids = mx.expand_dims(position_ids, axis=0)
-            position_ids = mx.tile(position_ids, (3, 1, 1))
-        else:
-            kv_seq_len += cache.offset + 1 if cache is not None else 0
-
-        cos, sin = self.rotary_emb(values, position_ids)
-
-        if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., : keys.shape[-2]]
         queries, keys = apply_multimodal_rotary_pos_emb(
-            queries, keys, cos, sin, unqueeze_dim=1
+            queries, keys, cos, sin, self.rope_parameters["mrope_section"]
         )
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
+
+        if mask is not None and isinstance(mask, mx.array):
+            mask = mask[..., : keys.shape[-2]]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache, scale=self.scale, mask=mask
@@ -208,9 +178,9 @@ class PaddleOCRDecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
-        position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
+        r = self.self_attn(self.input_layernorm(x), mask, cache, position_embeddings)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         out = h + r
@@ -229,6 +199,11 @@ class PaddleOCRModel(nn.Module):
             PaddleOCRDecoderLayer(args=args) for _ in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.rotary_emb = PaddleOCRRotaryEmbedding(
+            args.head_dim,
+            max_position_embeddings=args.max_position_embeddings,
+            base=args.rope_theta,
+        )
 
     def __call__(
         self,
@@ -243,6 +218,13 @@ class PaddleOCRModel(nn.Module):
         else:
             h = inputs_embeds
 
+        if position_ids is None:
+            position_ids = mx.arange(cache[0].offset, cache[0].offset + h.shape[-2])
+            position_ids = mx.expand_dims(position_ids, axis=0)
+            position_ids = mx.tile(position_ids, (3, 1, 1))
+
+        position_embeddings = self.rotary_emb(h, position_ids)
+
         if cache is None:
             cache = [None] * len(self.layers)
 
@@ -250,7 +232,7 @@ class PaddleOCRModel(nn.Module):
             mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c, position_ids)
+            h = layer(h, mask, c, position_embeddings)
 
         return self.norm(h)
 
