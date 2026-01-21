@@ -464,6 +464,9 @@ class Gemma3Model(nn.Module):
         **kwargs,
     ):
         per_layer_inputs = kwargs.pop("per_layer_inputs", None)
+        n_to_process = kwargs.pop("n_to_process", None)
+        if per_layer_inputs is not None and n_to_process is not None:
+            per_layer_inputs = per_layer_inputs[:, :n_to_process]
 
         if inputs_embeds is None:
             h = self.embed_tokens(inputs) * (self.hidden_size**0.5)
