@@ -323,7 +323,14 @@ def load(
     # Get the eos_token_id from the model config
     eos_token_id = getattr(model.config, "eos_token_id", None)
 
-    processor = load_processor(model_path, True, eos_token_ids=eos_token_id, **kwargs)
+    if getattr(model.config, "model_type", None) == "voxtral":
+        from .models.voxtral.tekken import build_tekken_processor
+
+        processor = build_tekken_processor(model_path, eos_token_ids=eos_token_id)
+    else:
+        processor = load_processor(
+            model_path, True, eos_token_ids=eos_token_id, **kwargs
+        )
 
     if image_processor is not None:
         processor.image_processor = image_processor
@@ -426,14 +433,21 @@ def load_processor(
 def fetch_from_hub(
     model_path: Path, lazy: bool = False, **kwargs
 ) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
-    model = load_model(model_path, lazy, **kwargs)
     config = load_config(model_path, **kwargs)
-    processor = load_processor(
-        model_path,
-        add_detokenizer=False,
-        eos_token_ids=config.get("eos_token_id", None),
-        **kwargs,
-    )
+    model = load_model(model_path, lazy, **kwargs)
+    if config.get("model_type") == "voxtral":
+        from .models.voxtral.tekken import build_tekken_processor
+
+        processor = build_tekken_processor(
+            model_path, eos_token_ids=config.get("eos_token_id", None)
+        )
+    else:
+        processor = load_processor(
+            model_path,
+            add_detokenizer=False,
+            eos_token_ids=config.get("eos_token_id", None),
+            **kwargs,
+        )
     return model, config, processor
 
 

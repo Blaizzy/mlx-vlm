@@ -34,6 +34,25 @@ DEFAULT_SEED = 0
 DEFAULT_QUANTIZED_KV_START = 5000
 
 
+def _voxtral_messages(prompt):
+    if isinstance(prompt, list):
+        if all(isinstance(p, dict) for p in prompt):
+            return prompt
+        if all(isinstance(p, str) for p in prompt):
+            return [{"role": "user", "content": p} for p in prompt]
+    if isinstance(prompt, dict):
+        return [prompt]
+    return [{"role": "user", "content": prompt}]
+
+
+def _encode_voxtral_prompt(processor, prompt):
+    from .models.voxtral.tekken import encode_instruct
+
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    messages = _voxtral_messages(prompt)
+    return encode_instruct(messages, tokenizer)
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Generate text from an image using a model."
@@ -429,6 +448,10 @@ def stream_generate(
         input_ids = kwargs.pop("input_ids")
         pixel_values = kwargs.pop("pixel_values", None)
         mask = kwargs.pop("mask", None)
+    elif model.config.model_type == "voxtral":
+        input_ids = mx.array([_encode_voxtral_prompt(processor, prompt)])
+        pixel_values = None
+        mask = None
     else:
         inputs = prepare_inputs(
             processor,
@@ -1143,6 +1166,24 @@ def _generate_batch(
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     batch_size = len(prompts)
 
+    if model.config.model_type == "voxtral":
+        encoded_prompts = [_encode_voxtral_prompt(processor, p) for p in prompts]
+        gen = BatchGenerator(
+            model.language_model,
+            processor,
+            prefill_batch_size=batch_size,
+            completion_batch_size=batch_size,
+            **kwargs,
+        )
+        uids = gen.insert(encoded_prompts, max_tokens)
+        results = {uid: [] for uid in uids}
+        while responses := gen.next():
+            for r in responses:
+                if r.finish_reason != "stop":
+                    results[r.uid].append(r.token)
+        texts = [tokenizer.decode(results[uid]) for uid in uids]
+        return texts, gen.stats()
+
     num_images_list = [
         1 if i < (len(images) if images is not None else 0) else 0
         for i in range(len(prompts))
@@ -1240,9 +1281,10 @@ def main():
     num_audios = (
         1 if args.audio is not None else 0
     )  # TODO: Support multiple audio files
-    prompt = apply_chat_template(
-        processor, config, prompt, num_images=num_images, num_audios=num_audios
-    )
+    if config.model_type != "voxtral":
+        prompt = apply_chat_template(
+            processor, config, prompt, num_images=num_images, num_audios=num_audios
+        )
 
     kwargs = {}
 
@@ -1274,7 +1316,12 @@ def main():
             chat.append({"role": "system", "content": args.system})
         while user := input("User:"):
             chat.append({"role": "user", "content": user})
-            prompt = apply_chat_template(processor, config, chat, num_images=num_images)
+            if config.model_type != "voxtral":
+                prompt = apply_chat_template(
+                    processor, config, chat, num_images=num_images
+                )
+            else:
+                prompt = chat
             response = ""
             print("Assistant:", end="")
             for chunk in stream_generate(

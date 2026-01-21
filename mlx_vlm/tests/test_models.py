@@ -2018,6 +2018,36 @@ class TestModels(unittest.TestCase):
             ),  # image temporals shape (num_images, 3)
         )
 
+    def test_voxtral_language(self):
+        from mlx_vlm.models import voxtral
+
+        text_config = voxtral.TextConfig(
+            model_type="llama",
+            hidden_size=32,
+            head_dim=8,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            rope_theta=10000.0,
+            rope_traditional=False,
+            rope_scaling=None,
+            max_position_embeddings=2048,
+            use_qk_norm=False,
+        )
+
+        config = voxtral.ModelConfig(text_config=text_config, vocab_size=128)
+        model = voxtral.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
