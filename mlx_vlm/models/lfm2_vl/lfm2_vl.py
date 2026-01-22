@@ -188,12 +188,12 @@ class Model(nn.Module):
     ):
         spatial_shapes = kwargs.get("spatial_shapes", None)
         pixel_attention_mask = kwargs.get("pixel_attention_mask", None)
-        input_embeddings = self.get_input_embeddings(
+        input_embeddings_features = self.get_input_embeddings(
             input_ids, pixel_values, spatial_shapes, pixel_attention_mask
         )
 
         logits = self.language_model(
-            input_ids, mask=None, cache=cache, inputs_embeds=input_embeddings
+            input_ids, mask=None, cache=cache, inputs_embeds=input_embeddings_features
         )
         return logits
 

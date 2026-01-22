@@ -295,11 +295,11 @@ class Model(nn.Module):
         attention_mask = None
         decoder_inputs_embeds = None
 
-        multimodal_embeddings = self.get_input_embeddings(
+        input_embeddings_features = self.get_input_embeddings(
             input_ids, pixel_values, **kwargs
         )
-        inputs_embeds = multimodal_embeddings.inputs_embeds
-        attention_mask = multimodal_embeddings.attention_mask_4d
+        inputs_embeds = input_embeddings_features.inputs_embeds
+        attention_mask = input_embeddings_features.attention_mask_4d
         # Handle decoder input IDs
         if labels is not None and decoder_input_ids is None:
             decoder_input_ids = shift_tokens_right(

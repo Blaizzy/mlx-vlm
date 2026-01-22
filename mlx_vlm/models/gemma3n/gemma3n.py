@@ -293,7 +293,7 @@ class Model(nn.Module):
         **kwargs,
     ):
         # Audio features
-        multimodal_embeddings = self.get_input_embeddings(
+        input_embeddings_features = self.get_input_embeddings(
             input_ids=input_ids,
             pixel_values=pixel_values,
             **kwargs,
@@ -302,8 +302,8 @@ class Model(nn.Module):
         logits = self.language_model(
             input_ids=None,
             cache=cache,
-            inputs_embeds=multimodal_embeddings.inputs_embeds,
-            per_layer_inputs=multimodal_embeddings.per_layer_inputs,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
+            per_layer_inputs=input_embeddings_features.per_layer_inputs,
         )
         return logits
 

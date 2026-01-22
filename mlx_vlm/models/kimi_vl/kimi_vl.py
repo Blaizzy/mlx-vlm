@@ -94,11 +94,11 @@ class Model(nn.Module):
         image_grid_thw = kwargs.pop("image_grid_hws", None)
         video_grid_thw = kwargs.pop("video_grid_hws", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
-        input_embeddings = self.get_input_embeddings(
+        input_embeddings_features = self.get_input_embeddings(
             input_ids, pixel_values, grid_thw=grid_thw
         )
         logits = self.language_model(
-            inputs=input_ids, cache=cache, inputs_embeds=input_embeddings
+            inputs=input_ids, cache=cache, inputs_embeds=input_embeddings_features
         )
         return logits
 

@@ -123,12 +123,14 @@ class Model(nn.Module):
         **kwargs,
     ):
 
-        inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
+        input_embeddings_features = self.get_input_embeddings(
+            input_ids, pixel_values, **kwargs
+        )
 
         kwargs.update(
             {
                 "pixel_values": pixel_values,
-                **inputs_embeds.to_dict(),
+                **input_embeddings_features.to_dict(),
             }
         )
 

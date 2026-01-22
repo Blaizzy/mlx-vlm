@@ -119,7 +119,7 @@ class Model(nn.Module):
     ):
 
         # Get embeddings (with vision features merged if image provided)
-        inputs_embeds = self.get_input_embeddings(
+        input_embeddings_features = self.get_input_embeddings(
             input_ids=input_ids,
             pixel_values=pixel_values,
             **kwargs,
@@ -128,7 +128,7 @@ class Model(nn.Module):
         # Forward through language model
         return self.language_model(
             input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
             mask=mask,
             cache=cache,
             image_grid_thw=image_grid_thw,

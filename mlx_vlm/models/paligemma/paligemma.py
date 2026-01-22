@@ -124,9 +124,11 @@ class Model(nn.Module):
         cache: Optional[mx.array] = None,
         **kwargs,
     ):
-        multimodal_embeddings = self.get_input_embeddings(input_ids, pixel_values, mask)
-        input_embeddings = multimodal_embeddings.inputs_embeds
-        final_attention_mask_4d = multimodal_embeddings.attention_mask_4d
+        input_embeddings_features = self.get_input_embeddings(
+            input_ids, pixel_values, mask
+        )
+        input_embeddings = input_embeddings_features.inputs_embeds
+        final_attention_mask_4d = input_embeddings_features.attention_mask_4d
 
         logits = self.language_model(
             inputs=input_ids,

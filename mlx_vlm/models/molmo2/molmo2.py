@@ -304,13 +304,13 @@ class Model(nn.Module):
         if input_ids.ndim == 1:
             input_ids = input_ids[None, :]
 
-        inputs_embeds = self.get_input_embeddings(
+        input_embeddings_features = self.get_input_embeddings(
             input_ids=input_ids, pixel_values=pixel_values, **kwargs
-        ).inputs_embeds
+        )
 
         return self.language_model(
             input_ids,
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
             mask=mask,
             cache=cache,
         )

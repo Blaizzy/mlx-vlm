@@ -183,9 +183,10 @@ class Model(nn.Module):
         **kwargs,
     ):
         if inputs_embeds is None:
-            inputs_embeds = self.get_input_embeddings(
+            input_embeddings_features = self.get_input_embeddings(
                 inputs, pixel_values, **kwargs
-            ).inputs_embeds
+            )
+            inputs_embeds = input_embeddings_features.inputs_embeds
 
         out = self.model(inputs, inputs_embeds, mask=mask, cache=cache)
         logits = self.lm_head(out)
