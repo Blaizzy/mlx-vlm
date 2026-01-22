@@ -20,7 +20,7 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        kwargs: Optional[dict] = None,
+        **kwargs,
     ):
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)

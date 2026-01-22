@@ -7,11 +7,7 @@ from typing import Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import create_attention_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import RotatingKVCache
 from PIL import Image
-from transformers.image_processing_utils import BaseImageProcessor as ImageProcessor
-from transformers.image_processing_utils import get_size_dict
-from transformers.image_utils import ChannelDimension, PILImageResampling
 
 
 @dataclass
@@ -56,17 +52,30 @@ class BaseModelConfig:
         return {k: v for k, v in self.__dict__.items() if v is not None}
 
 
-class BaseImageProcessor(ImageProcessor):
+class BaseImageProcessor:
+    """
+    Base image processor class. Subclasses should implement preprocess().
+    Transformers imports are deferred to __init__ for faster module loading.
+    """
+
     def __init__(
         self,
         image_mean=(0.5, 0.5, 0.5),
         image_std=(0.5, 0.5, 0.5),
         size=(384, 384),
         crop_size: Dict[str, int] = None,
-        resample=PILImageResampling.BICUBIC,
+        resample=None,
         rescale_factor=1 / 255,
-        data_format=ChannelDimension.FIRST,
+        data_format=None,
     ):
+        from transformers.image_processing_utils import get_size_dict
+        from transformers.image_utils import ChannelDimension, PILImageResampling
+
+        if resample is None:
+            resample = PILImageResampling.BICUBIC
+        if data_format is None:
+            data_format = ChannelDimension.FIRST
+
         crop_size = (
             crop_size if crop_size is not None else {"height": 384, "width": 384}
         )
