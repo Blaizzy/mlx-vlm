@@ -150,7 +150,7 @@ class Model(nn.Module):
         input_embeds = self.language_model.model.embed_tokens(input_ids)
 
         if pixel_values is None:
-            return input_embeds
+            return InputEmbeddingsFeatures(inputs_embeds=input_embeds)
 
         if (
             self.sam_model is not None

@@ -1,4 +1,5 @@
 import math
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -261,22 +262,23 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
         **kwargs,
     ):
+
+        if input_ids is not None:
+            inputs_embeds = self.language_model.model.shared(input_ids)
+        else:
+            inputs_embeds = None
+
+        attention_mask = None
+
         # Process image if provided
         if pixel_values is not None:
             image_features = self._encode_image(pixel_values)
-
-            # Get input embeddings if needed
-            inputs_embeds = None
-            if input_ids is not None:
-                inputs_embeds = self.language_model.model.shared(input_ids)
 
             # Merge image features with text embeddings
             inputs_embeds, attention_mask = self._merge_input_ids_with_image_features(
                 image_features, inputs_embeds
             )
-        else:
-            inputs_embeds = None
-            attention_mask = None
+
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds, attention_mask_4d=attention_mask
         )
