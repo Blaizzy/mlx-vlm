@@ -2048,6 +2048,53 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
+    def test_voxtral_audio_fusion(self):
+        from mlx_vlm.models import voxtral
+
+        text_config = voxtral.TextConfig(
+            model_type="llama",
+            hidden_size=16,
+            head_dim=4,
+            num_hidden_layers=2,
+            intermediate_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            rope_theta=10000.0,
+            rope_traditional=False,
+            rope_scaling=None,
+            max_position_embeddings=128,
+            use_qk_norm=False,
+        )
+
+        audio_config = voxtral.AudioConfig(
+            hidden_size=8,
+            head_dim=4,
+            num_hidden_layers=1,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            num_mel_bins=4,
+            max_source_positions=4,
+            activation_function="gelu",
+        )
+
+        config = voxtral.ModelConfig(
+            text_config=text_config,
+            audio_config=audio_config,
+            vocab_size=64,
+            audio_token_id=5,
+            projector_hidden_act="gelu",
+        )
+        model = voxtral.Model(config)
+
+        input_features = mx.zeros((1, audio_config.num_mel_bins, audio_config.max_source_positions * 2))
+        input_ids = mx.array([[config.audio_token_id, 1, 2]], dtype=mx.int32)
+
+        output = model(input_ids, input_features=input_features)
+        self.assertEqual(output.logits.shape, (1, 3, text_config.vocab_size))
+
 
 if __name__ == "__main__":
     unittest.main()

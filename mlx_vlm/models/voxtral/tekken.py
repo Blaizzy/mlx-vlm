@@ -97,7 +97,14 @@ class TekkenTokenizerWrapper:
         return list(self._raw_tokenizer.encode(text, bos=False, eos=False))
 
     def decode(self, token_ids: Iterable[int]):
-        return self._tokenizer.decode(list(token_ids))
+        try:
+            from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy
+
+            return self._tokenizer.decode(
+                list(token_ids), special_token_policy=SpecialTokenPolicy.KEEP
+            )
+        except Exception:
+            return self._tokenizer.decode(list(token_ids))
 
     def encode_messages(self, messages):
         if hasattr(self._tokenizer, "encode_messages"):
@@ -108,6 +115,11 @@ class TekkenTokenizerWrapper:
         if hasattr(self._tokenizer, "encode_chat_completion"):
             return self._tokenizer.encode_chat_completion(messages)
         raise AttributeError("encode_chat_completion is not available on the tokenizer")
+
+    def get_special_token_id(self, token: str) -> int:
+        if hasattr(self._raw_tokenizer, "get_special_token"):
+            return self._raw_tokenizer.get_special_token(token)
+        raise AttributeError("get_special_token is not available on the tokenizer")
 
     def __call__(
         self,
@@ -168,4 +180,11 @@ def build_tekken_processor(
     wrapper = TekkenTokenizerWrapper(tokenizer, eos_token_ids)
     model_path = _resolve_model_dir(model_dir_or_repo)
     tekken_path = model_path / "tekken.json"
-    return TekkenProcessor(wrapper, tekken_path=tekken_path)
+    processor = TekkenProcessor(wrapper, tekken_path=tekken_path)
+    try:
+        from .audio import VoxtralFeatureExtractor
+
+        processor.feature_extractor = VoxtralFeatureExtractor.from_pretrained(model_path)
+    except FileNotFoundError:
+        pass
+    return processor
