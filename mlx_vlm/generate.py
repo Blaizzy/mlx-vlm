@@ -223,6 +223,7 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -278,6 +279,7 @@ def generate_step(
         )
 
     y = input_ids
+    tokens = None  # Track tokens for logits processors
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -292,6 +294,7 @@ def generate_step(
         repetition_context = repetition_context[-repetition_context_size:]
 
     def _step(y, **kwargs):
+        nonlocal tokens
         with mx.stream(generation_stream):
             nonlocal repetition_context
             if "decoder_input_ids" in kwargs:
@@ -307,6 +310,13 @@ def generate_step(
                 )
 
             logits = outputs.logits[:, -1, :]
+
+            # Apply logits processors before repetition penalty
+            if logits_processors:
+                # Efficiently update tokens by concatenating only the new token
+                tokens = mx.concat([tokens, y])
+                for processor in logits_processors:
+                    logits = processor(tokens, logits)
 
             if repetition_penalty:
                 logits = apply_repetition_penalty(
@@ -328,7 +338,17 @@ def generate_step(
 
     logits = outputs.logits[:, -1, :]
     quantize_cache_fn(prompt_cache)
+
+    if logits_processors:
+        # get the last token from input_ids
+        final_input_token = input_ids[0][-1].item()
+        tokens = mx.array([final_input_token])
+        for processor in logits_processors:
+            logits = processor(tokens, logits)
+
+    # Final sampling with processed logits
     y, logprobs = sample(logits)
+
     mx.async_eval(y)
 
     if outputs.cross_attention_states is not None:
