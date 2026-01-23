@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -114,14 +115,15 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        spatial_shapes: Optional[mx.array] = None,
-        pixel_attention_mask: Optional[mx.array] = None,
+        **kwargs,
     ):
+        spatial_shapes = kwargs.get("spatial_shapes", None)
+        pixel_attention_mask = kwargs.get("pixel_attention_mask", None)
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         if pixel_values is None:
-            return inputs_embeds
+            return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
         # Get the ouptut hidden states from the vision model
         *_, hidden_states = self.vision_tower(
@@ -150,7 +152,7 @@ class Model(nn.Module):
         final_inputs_embeds = self.merge_input_ids_with_image_features(
             image_features, inputs_embeds, input_ids, self.config.image_token_index
         )
-        return final_inputs_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
     @staticmethod
     def merge_input_ids_with_image_features(
