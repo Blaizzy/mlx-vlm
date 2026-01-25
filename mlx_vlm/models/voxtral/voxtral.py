@@ -86,6 +86,12 @@ class Model(nn.Module):
                 suffix = key[len("model.") :]
                 if suffix.startswith(("embed_tokens", "layers", "norm")):
                     return "language_model.model." + suffix
+            if key.startswith("model.audio_tower."):
+                return key.replace("model.audio_tower.", "audio_tower.")
+            if key.startswith("model.multi_modal_projector."):
+                return key.replace(
+                    "model.multi_modal_projector.", "multi_modal_projector."
+                )
             return key
 
         remapped = {transform_key(k): v for k, v in weights.items()}
