@@ -24,7 +24,9 @@ def _expected_mel_frames(config: AudioConfig) -> int:
 def _audio_tokens_per_chunk(config: AudioConfig) -> int:
     group_size = config.intermediate_size // config.hidden_size
     if group_size <= 0 or config.intermediate_size % config.hidden_size != 0:
-        raise ValueError("audio_config.intermediate_size must be a multiple of hidden_size")
+        raise ValueError(
+            "audio_config.intermediate_size must be a multiple of hidden_size"
+        )
     input_len = _expected_mel_frames(config)
     conv2_out = _conv1d_out_length(
         _conv1d_out_length(input_len, 3, 1, 1),
@@ -74,7 +76,9 @@ class VoxtralFeatureExtractor:
     def from_pretrained(cls, model_path: Path) -> "VoxtralFeatureExtractor":
         config_path = Path(model_path) / "preprocessor_config.json"
         if not config_path.exists():
-            raise FileNotFoundError(f"preprocessor_config.json not found at {config_path}")
+            raise FileNotFoundError(
+                f"preprocessor_config.json not found at {config_path}"
+            )
         config = json.loads(config_path.read_text())
         return cls(**config)
 
@@ -110,7 +114,9 @@ class VoxtralFeatureExtractor:
             chunk = audio[start : start + chunk_samples]
             if len(chunk) < chunk_samples:
                 chunk = np.pad(
-                    chunk, (0, chunk_samples - len(chunk)), constant_values=self.padding_value
+                    chunk,
+                    (0, chunk_samples - len(chunk)),
+                    constant_values=self.padding_value,
                 )
             chunks.append(chunk.astype(np.float32))
         return chunks
@@ -133,9 +139,7 @@ class VoxtralFeatureExtractor:
             self.n_samples if pad_to_multiple_of is None else pad_to_multiple_of
         )
         max_source_positions = (
-            self.nb_max_frames
-            if max_source_positions is None
-            else max_source_positions
+            self.nb_max_frames if max_source_positions is None else max_source_positions
         )
 
         features = []
@@ -171,7 +175,9 @@ class VoxtralAttention(nn.Module):
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
 
-    def __call__(self, hidden_states: mx.array, attention_mask: Optional[mx.array] = None):
+    def __call__(
+        self, hidden_states: mx.array, attention_mask: Optional[mx.array] = None
+    ):
         bsz, seq_len, _ = hidden_states.shape
         q = self.q_proj(hidden_states) * self.scaling
         k = self.k_proj(hidden_states)
@@ -204,7 +210,9 @@ class VoxtralEncoderLayer(nn.Module):
         else:
             raise ValueError(f"Unsupported activation: {config.activation_function}")
 
-    def __call__(self, hidden_states: mx.array, attention_mask: Optional[mx.array] = None):
+    def __call__(
+        self, hidden_states: mx.array, attention_mask: Optional[mx.array] = None
+    ):
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(hidden_states, attention_mask=attention_mask)
@@ -225,15 +233,25 @@ class AudioModel(nn.Module):
         self.dropout = config.dropout
         self.num_mel_bins = config.num_mel_bins
         self.max_source_positions = config.max_source_positions
-        self.embed_scale = math.sqrt(config.hidden_size) if config.scale_embedding else 1.0
+        self.embed_scale = (
+            math.sqrt(config.hidden_size) if config.scale_embedding else 1.0
+        )
 
         self.conv1 = nn.Conv1d(self.num_mel_bins, config.hidden_size, 3, padding=1)
-        self.conv2 = nn.Conv1d(config.hidden_size, config.hidden_size, 3, stride=2, padding=1)
-        self.embed_positions = nn.Embedding(self.max_source_positions, config.hidden_size)
-        self.layers = [VoxtralEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+        self.conv2 = nn.Conv1d(
+            config.hidden_size, config.hidden_size, 3, stride=2, padding=1
+        )
+        self.embed_positions = nn.Embedding(
+            self.max_source_positions, config.hidden_size
+        )
+        self.layers = [
+            VoxtralEncoderLayer(config) for _ in range(config.num_hidden_layers)
+        ]
         self.layer_norm = nn.LayerNorm(config.hidden_size)
 
-    def __call__(self, input_features: mx.array, attention_mask: Optional[mx.array] = None):
+    def __call__(
+        self, input_features: mx.array, attention_mask: Optional[mx.array] = None
+    ):
         expected_len = _expected_mel_frames(self.config)
         if input_features.shape[-1] != expected_len:
             raise ValueError(
@@ -241,7 +259,9 @@ class AudioModel(nn.Module):
             )
 
         # MLX conv1d expects (B, L, C) while Whisper features are (B, C, L).
-        input_features = input_features.astype(self.conv1.weight.dtype).transpose(0, 2, 1)
+        input_features = input_features.astype(self.conv1.weight.dtype).transpose(
+            0, 2, 1
+        )
         hidden_states = nn.gelu(self.conv1(input_features))
         hidden_states = nn.gelu(self.conv2(hidden_states))
 

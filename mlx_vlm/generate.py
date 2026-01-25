@@ -70,7 +70,9 @@ def _prepare_voxtral_inputs(model, processor, prompt, audio):
 
         feature_extractor = getattr(processor, "feature_extractor", None)
         if feature_extractor is None:
-            raise ValueError("Voxtral processor is missing feature_extractor for audio.")
+            raise ValueError(
+                "Voxtral processor is missing feature_extractor for audio."
+            )
 
         audio_arrays = [
             load_audio(audio_file, sr=feature_extractor.sampling_rate)
@@ -90,7 +92,9 @@ def _prepare_voxtral_inputs(model, processor, prompt, audio):
         if model.config.audio_token_id is None:
             raise ValueError("audio_token_id is required when passing audio inputs.")
         tokens_per_chunk = _audio_tokens_per_chunk(model.config.audio_config)
-        tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
         if hasattr(tokenizer, "get_special_token_id"):
             try:
                 begin_audio_id = tokenizer.get_special_token_id("[BEGIN_AUDIO]")

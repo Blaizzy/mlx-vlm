@@ -2089,7 +2089,9 @@ class TestModels(unittest.TestCase):
         )
         model = voxtral.Model(config)
 
-        input_features = mx.zeros((1, audio_config.num_mel_bins, audio_config.max_source_positions * 2))
+        input_features = mx.zeros(
+            (1, audio_config.num_mel_bins, audio_config.max_source_positions * 2)
+        )
         input_ids = mx.array([[config.audio_token_id, 1, 2]], dtype=mx.int32)
 
         output = model(input_ids, input_features=input_features)

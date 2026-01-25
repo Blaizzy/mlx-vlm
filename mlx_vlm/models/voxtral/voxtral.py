@@ -98,11 +98,15 @@ class Model(nn.Module):
         return {
             k: v
             for k, v in remapped.items()
-            if k.startswith(("language_model.", "audio_tower.", "multi_modal_projector."))
+            if k.startswith(
+                ("language_model.", "audio_tower.", "multi_modal_projector.")
+            )
         }
 
 
-def masked_scatter(inputs_embeds: mx.array, mask: mx.array, source: mx.array) -> mx.array:
+def masked_scatter(
+    inputs_embeds: mx.array, mask: mx.array, source: mx.array
+) -> mx.array:
     mask = mask.astype(mx.bool_)
     if mask.shape != inputs_embeds.shape:
         mask = mx.broadcast_to(mask, inputs_embeds.shape)
@@ -125,15 +129,15 @@ class VoxtralMultiModalProjector(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.linear_1 = nn.Linear(
-            config.audio_config.intermediate_size, config.text_config.hidden_size, bias=False
+            config.audio_config.intermediate_size,
+            config.text_config.hidden_size,
+            bias=False,
         )
         projector_act = config.projector_hidden_act or "gelu"
         if projector_act == "gelu":
             self.act = nn.gelu
         else:
-            raise ValueError(
-                f"Unsupported projector_hidden_act: {projector_act}"
-            )
+            raise ValueError(f"Unsupported projector_hidden_act: {projector_act}")
         self.linear_2 = nn.Linear(
             config.text_config.hidden_size, config.text_config.hidden_size, bias=False
         )

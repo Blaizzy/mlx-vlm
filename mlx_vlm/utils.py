@@ -59,7 +59,9 @@ def skip_multimodal_module(path: str) -> bool:
 
 
 def get_class_predicate(
-    skip_vision: bool, weights: Optional[dict] = None, quantization: Optional[dict] = None
+    skip_vision: bool,
+    weights: Optional[dict] = None,
+    quantization: Optional[dict] = None,
 ):
     """
     Build a predicate for quantization/rehydration decisions.
@@ -248,7 +250,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
         class_predicate = get_class_predicate(
-            skip_vision=skip_vision, weights=weights, quantization=config["quantization"]
+            skip_vision=skip_vision,
+            weights=weights,
+            quantization=config["quantization"],
         )
 
         nn.quantize(

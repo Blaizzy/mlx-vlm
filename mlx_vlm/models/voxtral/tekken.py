@@ -184,7 +184,9 @@ def build_tekken_processor(
     try:
         from .audio import VoxtralFeatureExtractor
 
-        processor.feature_extractor = VoxtralFeatureExtractor.from_pretrained(model_path)
+        processor.feature_extractor = VoxtralFeatureExtractor.from_pretrained(
+            model_path
+        )
     except FileNotFoundError:
         pass
     return processor
