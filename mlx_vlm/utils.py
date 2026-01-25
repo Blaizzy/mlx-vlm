@@ -58,6 +58,35 @@ def skip_multimodal_module(path: str) -> bool:
     )
 
 
+def get_class_predicate(
+    skip_vision: bool, weights: Optional[dict] = None, quantization: Optional[dict] = None
+):
+    """
+    Build a predicate for quantization/rehydration decisions.
+
+    Args:
+        skip_vision: Whether to skip multimodal (vision/audio) modules.
+        weights: Optional weights dict; if provided, only layers with existing
+            scales are considered quantized.
+        quantization: Optional per-layer quantization overrides.
+    """
+
+    def _predicate(path: str, module: nn.Module) -> Union[bool, dict]:
+        if skip_vision and skip_multimodal_module(path):
+            return False
+        if quantization and path in quantization:
+            return quantization[path]
+        if not hasattr(module, "to_quantized"):
+            return False
+        if hasattr(module, "weight") and module.weight.size % 64 != 0:
+            return False
+        if weights is None:
+            return True
+        return f"{path}.scales" in weights
+
+    return _predicate
+
+
 def get_model_and_args(config: dict):
     """
     Retrieve the model object based on the configuration.
@@ -218,28 +247,16 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # Handle legacy models which may or may not have vision quantized
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
-
-        def get_class_predicate(p, m):
-            # Always skip vision and audio models
-            if skip_multimodal_module(p) and skip_vision:
-                return False
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
-            # Skip layers not divisible by 64
-            if hasattr(m, "weight") and m.weight.size % 64 != 0:
-                return False
-            # Handle legacy models which may not have everything quantized
-            return f"{p}.scales" in weights
+        class_predicate = get_class_predicate(
+            skip_vision=skip_vision, weights=weights, quantization=config["quantization"]
+        )
 
         nn.quantize(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
             mode=quantization.get("mode", "affine"),
-            class_predicate=get_class_predicate,
+            class_predicate=class_predicate,
         )
 
     model.load_weights(list(weights.items()))
