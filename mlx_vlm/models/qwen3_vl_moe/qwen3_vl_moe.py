@@ -46,6 +46,7 @@ class Model(nn.Module):
     ):
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
+        mask = kwargs.get("mask", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
@@ -81,6 +82,14 @@ class Model(nn.Module):
         image_mask = image_mask[..., 0]
         visual_pos_masks = image_mask
         deepstack_visual_embeds = deepstack_image_embeds
+
+        # Pre-calculate position_ids for chunked prefill
+        if image_grid_thw is not None or video_grid_thw is not None:
+            position_ids, rope_deltas = self.language_model.get_rope_index(
+                input_ids, image_grid_thw, video_grid_thw, mask
+            )
+            self.language_model._position_ids = position_ids
+            self.language_model._rope_deltas = rope_deltas
 
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds,
