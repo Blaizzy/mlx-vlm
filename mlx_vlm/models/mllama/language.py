@@ -279,15 +279,12 @@ class MllamaTextModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
     ) -> mx.array:
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time"
-            )
+        # Prioritize inputs_embeds if provided
+        if inputs_embeds is not None:
+            batch_size, seq_length, _ = inputs_embeds.shape
         elif input_ids is not None:
             batch_size, seq_length = input_ids.shape
             inputs_embeds = self.embed_tokens(input_ids)
-        elif inputs_embeds is not None:
-            batch_size, seq_length, _ = inputs_embeds.shape
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
@@ -334,17 +331,18 @@ class LanguageModel(nn.Module):
 
     def __call__(
         self,
-        input_ids: Optional[mx.array] = None,
+        inputs: Optional[mx.array] = None,
+        inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
+        cache: Optional[KVCache] = None,
         cross_attention_states: Optional[mx.array] = None,
         cross_attention_mask: Optional[mx.array] = None,
         full_text_row_masked_out_mask: Optional[mx.array] = None,
-        inputs_embeds: Optional[mx.array] = None,
-        cache: Optional[KVCache] = None,
+        **kwargs,
     ) -> Tuple[mx.array, Optional[mx.array]]:
 
         hidden_states = self.model(
-            input_ids=input_ids,
+            input_ids=inputs,
             mask=mask,
             cross_attention_states=cross_attention_states,
             cross_attention_mask=cross_attention_mask,

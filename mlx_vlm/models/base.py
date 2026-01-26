@@ -25,6 +25,9 @@ class InputEmbeddingsFeatures:
     visual_pos_masks: Optional[mx.array] = None
     deepstack_visual_embeds: Optional[mx.array] = None
     per_layer_inputs: Optional[mx.array] = None
+    cross_attention_states: Optional[mx.array] = None
+    cross_attention_mask: Optional[mx.array] = None
+    full_text_row_masked_out_mask: Optional[mx.array] = None
 
     def to_dict(self):
         return {
@@ -33,6 +36,9 @@ class InputEmbeddingsFeatures:
             "visual_pos_masks": self.visual_pos_masks,
             "deepstack_visual_embeds": self.deepstack_visual_embeds,
             "per_layer_inputs": self.per_layer_inputs,
+            "cross_attention_states": self.cross_attention_states,
+            "cross_attention_mask": self.cross_attention_mask,
+            "full_text_row_masked_out_mask": self.full_text_row_masked_out_mask,
         }
 
 

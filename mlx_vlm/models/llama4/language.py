@@ -281,6 +281,7 @@ class LanguageModel(nn.Module):
         input_embeds: mx.array = None,
         mask: mx.array = None,
         cache=None,
+        **kwargs,
     ):
         out = self.model(
             input_ids=input_ids,
