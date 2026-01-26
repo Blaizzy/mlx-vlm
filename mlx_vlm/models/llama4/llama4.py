@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import Llama4MultiModalProjector, VisionModel
@@ -57,7 +58,9 @@ class Model(nn.Module):
         **kwargs,
     ):
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids)
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
@@ -77,7 +80,7 @@ class Model(nn.Module):
         final_inputs_embeds = self._prepare_inputs_for_multimodal(
             projected_vision_flat, inputs_embeds, input_ids
         )
-        return final_inputs_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
     def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
         image_token_index = self.config.image_token_index
