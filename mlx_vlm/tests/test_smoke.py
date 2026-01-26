@@ -174,7 +174,7 @@ def main():
         "prompt": args.prompt,
         "language_only_prompt": args.language_only_prompt,
         "kwargs": {
-            "temp": args.temperature,
+            "temperature": args.temperature,
             "max_tokens": args.max_tokens,
             "resize_shape": (
                 (args.resize_shape, args.resize_shape) if args.resize_shape else None
