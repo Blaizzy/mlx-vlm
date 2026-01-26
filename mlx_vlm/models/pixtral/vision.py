@@ -121,9 +121,7 @@ class Attention(nn.Module):
         queries, keys = apply_rotary_pos_emb(queries, keys, cos, sin, unsqueeze_dim=0)
 
         output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values,
-            scale=self.scale,
-            mask=mask
+            queries, keys, values, scale=self.scale, mask=mask
         )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
