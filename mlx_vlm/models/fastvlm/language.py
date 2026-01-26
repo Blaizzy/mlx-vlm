@@ -25,7 +25,7 @@ class LanguageModel(nn.Module):
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, None, cache, inputs_embeds)
+        out = self.model(inputs, cache=cache, input_embeddings=inputs_embeds)
         out = self.model.embed_tokens.as_linear(out)
         return LanguageModelOutput(out)
 

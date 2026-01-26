@@ -120,13 +120,9 @@ class Attention(nn.Module):
         cos, sin = position_embeddings
         queries, keys = apply_rotary_pos_emb(queries, keys, cos, sin, unsqueeze_dim=0)
 
-        attn_weights = mx.matmul(queries, keys.transpose(0, 1, 3, 2)) * self.scale
-
-        if mask is not None:
-            attn_weights = attn_weights + mask
-
-        attn_weights = mx.softmax(attn_weights, axis=-1)
-        output = mx.matmul(attn_weights, values)
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=self.scale, mask=mask
+        )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
