@@ -318,6 +318,7 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
         images_spatial_crop: Optional[mx.array] = None,
         image_seq_mask: Optional[mx.array] = None,
+        **kwargs,
     ):
         if pixel_values is None:
             return InputEmbeddingsFeatures(

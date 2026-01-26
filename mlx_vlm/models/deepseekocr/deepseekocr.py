@@ -146,6 +146,7 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
         images_spatial_crop: Optional[mx.array] = None,
         images_seq_mask: Optional[mx.array] = None,
+        **kwargs,
     ):
         input_embeds = self.language_model.model.embed_tokens(input_ids)
 

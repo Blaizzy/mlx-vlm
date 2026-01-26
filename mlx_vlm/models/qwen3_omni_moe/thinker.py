@@ -136,6 +136,7 @@ class Thinker(nn.Module):
         input_features: Optional[mx.array] = None,
         feature_attention_mask: Optional[mx.array] = None,
         audio_feature_lengths: Optional[mx.array] = None,
+        **kwargs,
     ):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         visual_pos_masks = None
