@@ -359,12 +359,14 @@ def generate_step(
     )
 
     inputs_embeds = embedding_output.inputs_embeds
-    optional_fields = {
-        "attention_mask_4d": embedding_output.attention_mask_4d,
-        "visual_pos_masks": embedding_output.visual_pos_masks,
-        "deepstack_visual_embeds": embedding_output.deepstack_visual_embeds,
-    }
-    kwargs.update({k: v for k, v in optional_fields.items() if v is not None})
+
+    kwargs.update(
+        {
+            k: v
+            for k, v in embedding_output.to_dict().items()
+            if k != "inputs_embeds" and v is not None
+        }
+    )
 
     if inputs_embeds.shape[1] > prefill_step_size:
         # Chunked prefill with embeddings
