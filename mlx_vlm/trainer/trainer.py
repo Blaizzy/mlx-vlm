@@ -288,9 +288,9 @@ def train(
         assistant_id=assistant_id
     )
     
-    state = [model.state, optimizer.state]
+    state = [model.state, optimizer.state, mx.random.state]
     
-    def step(batch):
+    def step(batch, prev_grad, do_update):
         # Calculate number of tokens for metrics
         if "attention_mask" in batch:
             lengths = batch["attention_mask"].sum(axis=1)
@@ -307,9 +307,17 @@ def train(
                 grad
             )
 
-        optimizer.update(model, grad)
+        if prev_grad is not None:
+            grad = tree_map(lambda x, y: x + y, grad, prev_grad)
 
-        return lvalue, toks
+        if do_update:
+            grad = average_gradients(grad)
+            if grad_accum_steps > 1:
+                grad = tree_map(lambda x: x / grad_accum_steps, grad)
+            optimizer.update(model, grad)
+            grad = None
+
+        return lvalue, toks, grad
     
     # Create value and grad function
     loss_value_and_grad = nn.value_and_grad(model, loss_fn_partial)
@@ -321,6 +329,7 @@ def train(
     steps = 0
     trained_tokens = 0
     train_time = 0
+    grad_accum = None
 
     # Main training loop
     for it, batch in zip(
@@ -361,12 +370,16 @@ def train(
             tic = time.perf_counter()
 
         # Training step
-        lvalue, toks = step(batch)
+        lvalue, toks, grad_accum = step(
+            batch,
+            grad_accum,
+            it % grad_accum_steps == 0,
+        )
         mx.clear_cache()
         losses += lvalue
         n_tokens += toks
         steps += 1
-        mx.eval(state, losses, n_tokens)
+        mx.eval(state, losses, n_tokens, grad_accum)
         train_time += time.perf_counter() - tic
 
         # Report training metrics
