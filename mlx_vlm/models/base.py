@@ -97,6 +97,38 @@ class BaseImageProcessor:
         self.data_format = data_format
         self.crop_size = crop_size
 
+    def rescale(
+        self,
+        image,
+        scale: float,
+        input_data_format: str = "channels_first",
+    ):
+        """Rescale an image by a scale factor."""
+        return image * scale
+
+    def normalize(
+        self,
+        image,
+        mean,
+        std,
+        input_data_format: str = "channels_first",
+    ):
+        """Normalize an image with mean and std."""
+        import numpy as np
+
+        mean = np.array(mean, dtype=image.dtype)
+        std = np.array(std, dtype=image.dtype)
+
+        if input_data_format == "channels_first":
+            # Image shape: [C, H, W]
+            mean = mean[:, None, None]
+            std = std[:, None, None]
+        else:
+            # Image shape: [H, W, C]
+            pass  # mean and std are already in correct shape
+
+        return (image - mean) / std
+
     @abstractmethod
     def preprocess(self, images):
         pass
