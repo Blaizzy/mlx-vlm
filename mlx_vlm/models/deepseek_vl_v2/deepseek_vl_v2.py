@@ -317,7 +317,7 @@ class Model(nn.Module):
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
         images_spatial_crop: Optional[mx.array] = None,
-        image_seq_mask: Optional[mx.array] = None,
+        images_seq_mask: Optional[mx.array] = None,
         **kwargs,
     ):
         if pixel_values is None:
@@ -366,7 +366,7 @@ class Model(nn.Module):
             input_embeds,
             image_features,
             images_spatial_crop,
-            image_seq_mask,
+            images_seq_mask,
             h,
             w,
             n_dim,
