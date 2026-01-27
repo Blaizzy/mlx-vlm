@@ -6,7 +6,7 @@ The KimiVLProcessor from the HuggingFace model repository tries to import
 function may not exist in all versions of transformers.
 
 The KimiVLImageProcessor also requires torch and torchvision, which we replace with
-a numpy-based implementation.
+an MLX-based implementation.
 
 The tokenizer also requires `bytes_to_unicode` from `transformers.models.gpt2.tokenization_gpt2`,
 which was removed in transformers 5.0.
@@ -14,7 +14,7 @@ which was removed in transformers 5.0.
 This patch:
 1. Adds the missing `_validate_images_text_input_order` function to transformers.processing_utils
 2. Adds the missing `bytes_to_unicode` function to transformers.models.gpt2.tokenization_gpt2
-3. Provides a numpy-based KimiVLImageProcessor that doesn't require torch/torchvision
+3. Provides an MLX-based KimiVLImageProcessor that doesn't require torch/torchvision
 4. Provides a complete KimiVLProcessor that works without PyTorch
 5. Allows the KimiVLProcessor to be loaded successfully without PyTorch dependencies
 """
@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import mlx.core as mx
-import numpy as np
 from PIL import Image
 
 from .config import ModelConfig
@@ -217,10 +216,11 @@ class KimiVLImageProcessor(BaseImageProcessor):
     def to_mlx(self, image: Image.Image) -> mx.array:
         """Convert PIL image to MLX array in CHW format, normalized to [0, 1]."""
         image = image.convert("RGB")
-        # Convert to numpy first, then to MLX
-        arr = np.array(image, dtype=np.float32) / 255.0
+        w, h = image.size
+        # Convert PIL image to MLX array directly via bytes
+        arr = mx.array(list(image.getdata()), dtype=mx.float32).reshape(h, w, 3) / 255.0
         # Convert from HWC to CHW format
-        arr = mx.array(arr).transpose(2, 0, 1)
+        arr = arr.transpose(2, 0, 1)
         return arr
 
     def normalize(self, image: mx.array) -> mx.array:
@@ -274,22 +274,27 @@ class KimiVLImageProcessor(BaseImageProcessor):
 
         if not valid_images(images):
             raise ValueError(
-                "Invalid image type. Must be of type PIL.Image.Image, numpy.ndarray, "
-                "torch.Tensor, tf.Tensor or jax.ndarray."
+                "Invalid image type. Must be of type PIL.Image.Image or mx.array."
             )
 
         pixel_values_list = []
         image_grid_hws = []
 
         for image in images:
-            # Convert numpy arrays to PIL Images if needed
-            if isinstance(image, np.ndarray):
-                if image.ndim == 3 and image.shape[0] in [1, 3, 4]:
+            # Convert MLX arrays to PIL Images if needed
+            if isinstance(image, mx.array):
+                # Ensure we're working with the array values
+                arr = image
+                if arr.ndim == 3 and arr.shape[0] in [1, 3, 4]:
                     # CHW format, convert to HWC
-                    image = image.transpose(1, 2, 0)
-                if image.dtype in [np.float32, np.float64]:
-                    image = (image * 255).astype(np.uint8)
-                image = Image.fromarray(image)
+                    arr = arr.transpose(1, 2, 0)
+                # Convert to uint8 for PIL
+                if arr.dtype in [mx.float32, mx.float16, mx.bfloat16]:
+                    arr = (arr * 255).astype(mx.uint8)
+                # Convert to PIL via list (MLX -> list -> PIL)
+                h, w, _ = arr.shape
+                flat_data = arr.reshape(-1).tolist()
+                image = Image.frombytes("RGB", (w, h), bytes(flat_data))
 
             patches, image_grid_hw = self._preprocess(image)
             pixel_values_list.append(patches)
@@ -298,10 +303,10 @@ class KimiVLImageProcessor(BaseImageProcessor):
         pixel_values = mx.concatenate(pixel_values_list, axis=0)
         image_grid_hws = mx.array(image_grid_hws)
 
-        # Convert to numpy for BatchFeature compatibility
+        # Return MLX arrays directly
         data = {
-            "pixel_values": np.array(pixel_values),
-            "image_grid_hws": np.array(image_grid_hws),
+            "pixel_values": pixel_values,
+            "image_grid_hws": image_grid_hws,
         }
 
         return BatchFeature(data=data, tensor_type=return_tensors)
@@ -318,7 +323,7 @@ class KimiVLImageProcessor(BaseImageProcessor):
 
 class KimiVLProcessor(ProcessorMixin):
     """
-    NumPy-based processor for KimiVL that doesn't require torch/torchvision.
+    MLX-based processor for KimiVL that doesn't require torch/torchvision.
 
     Constructs a KimiVL processor which wraps a KimiVL image processor and a tokenizer
     into a single processor.
@@ -366,16 +371,12 @@ class KimiVLProcessor(ProcessorMixin):
         # Check if images and text inputs are reversed for BC
         images, text = _validate_images_text_input_order(images, text)
 
-        # Extract return_tensors from kwargs
-        return_tensors = kwargs.pop("return_tensors", None)
+        # Extract return_tensors from kwargs (unused, we always return MLX arrays)
+        kwargs.pop("return_tensors", None)
 
-        # Convert "mlx" to "np" since transformers doesn't know about MLX
-        # MLX can work with numpy arrays directly
-        internal_return_tensors = "np" if return_tensors == "mlx" else return_tensors
-
-        # Process images (always use numpy for internal processing)
+        # Process images
         if images is not None:
-            image_inputs = self.image_processor(images, return_tensors="np")
+            image_inputs = self.image_processor(images)
             image_grid_hws = image_inputs["image_grid_hws"]
         else:
             image_inputs = {}
@@ -398,9 +399,9 @@ class KimiVLProcessor(ProcessorMixin):
             index = 0
             for i in range(len(text)):
                 while self.image_token in text[i]:
-                    num_placeholders = int(
-                        np.prod(image_grid_hws[index]) // merge_length
-                    )
+                    # Use mx.prod for MLX arrays
+                    grid_hw = image_grid_hws[index]
+                    num_placeholders = int(mx.prod(grid_hw).item()) // merge_length
                     text[i] = text[i].replace(
                         self.image_token,
                         "<|placeholder|>" * num_placeholders,
@@ -432,10 +433,10 @@ class KimiVLProcessor(ProcessorMixin):
                 padded_input_ids.append(padded_ids)
                 attention_masks.append(mask)
 
-            # Convert to numpy arrays
+            # Convert to MLX arrays
             text_inputs = {
-                "input_ids": np.array(padded_input_ids),
-                "attention_mask": np.array(attention_masks),
+                "input_ids": mx.array(padded_input_ids),
+                "attention_mask": mx.array(attention_masks),
             }
         else:
             text_inputs = {}
@@ -460,15 +461,34 @@ class KimiVLProcessor(ProcessorMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         """Load the processor from a pretrained model path."""
+        import importlib.util
 
         kwargs.pop("trust_remote_code", None)
 
-        # Load tokenizer (always needs trust_remote_code=True for tiktoken)
-        tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path,
-            trust_remote_code=True,
-            **kwargs,
-        )
+        # Check if it's a local path
+        model_path = Path(pretrained_model_name_or_path)
+        is_local = model_path.exists() and model_path.is_dir()
+
+        # Load tokenizer - use direct module loading for local paths
+        # because AutoTokenizer has issues with local paths in transformers 5.0
+        if is_local and (model_path / "tokenization_moonshot.py").exists():
+            # Load the tokenization module directly
+            spec = importlib.util.spec_from_file_location(
+                "tokenization_moonshot", model_path / "tokenization_moonshot.py"
+            )
+            tokenization_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(tokenization_module)
+            TikTokenTokenizer = tokenization_module.TikTokenTokenizer
+            tokenizer = TikTokenTokenizer.from_pretrained(
+                str(model_path), local_files_only=True
+            )
+        else:
+            # Fall back to AutoTokenizer for remote models
+            tokenizer = AutoTokenizer.from_pretrained(
+                pretrained_model_name_or_path,
+                trust_remote_code=True,
+                **kwargs,
+            )
 
         # Load image processor config and create our processor
         try:
@@ -506,3 +526,39 @@ class KimiVLProcessor(ProcessorMixin):
             tokenizer=tokenizer,
             chat_template=chat_template,
         )
+
+
+from transformers import AutoProcessor
+
+_original_auto_processor_from_pretrained = AutoProcessor.from_pretrained
+
+
+@classmethod
+def _patched_auto_processor_from_pretrained(
+    cls, pretrained_model_name_or_path, **kwargs
+):
+    """Patched from_pretrained that returns KimiVLProcessor for kimi_vl models."""
+    import json
+
+    model_path = Path(pretrained_model_name_or_path)
+
+    # Check if this is a kimi_vl model
+    is_kimi_vl = False
+    try:
+        config_path = model_path / "config.json"
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            is_kimi_vl = config.get("model_type", "").lower() == "kimi_vl"
+    except Exception:
+        pass
+
+    if is_kimi_vl:
+        return KimiVLProcessor.from_pretrained(pretrained_model_name_or_path, **kwargs)
+
+    return _original_auto_processor_from_pretrained.__func__(
+        cls, pretrained_model_name_or_path, **kwargs
+    )
+
+
+AutoProcessor.from_pretrained = _patched_auto_processor_from_pretrained
