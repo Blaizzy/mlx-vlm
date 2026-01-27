@@ -624,9 +624,11 @@ class MolmoProcessor(ProcessorMixin):
                 "{% if add_generation_prompt %}Assistant: {% endif %}"
             )
 
-        from jinja2 import Template
+        from jinja2 import Environment
 
-        template = Template(chat_template)
+        # Use Environment with loopcontrols extension to support {% continue %} and {% break %}
+        env = Environment(extensions=["jinja2.ext.loopcontrols"])
+        template = env.from_string(chat_template)
         rendered = template.render(
             messages=conversation,
             add_generation_prompt=add_generation_prompt,
@@ -745,7 +747,8 @@ def _patched_auto_processor_from_pretrained(
         with open(config_path, "r") as f:
             config = json.load(f)
         model_type = config.get("model_type", "").lower()
-        is_molmo = "molmo" in model_type
+
+        is_molmo = model_type == "molmo"
     except Exception:
         pass
 
