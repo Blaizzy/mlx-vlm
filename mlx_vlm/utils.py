@@ -734,6 +734,11 @@ def load_audio(
     return np.array(audio).mean(axis=1)
 
 
+def normalize_audio_features(features: mx.array) -> mx.array:
+    """Normalize mel spectrogram features for lossy audio formats (e.g., MP3)."""
+    return (features - mx.mean(features)) / (mx.std(features) + 1e-6)
+
+
 def process_inputs(
     processor,
     prompts,
@@ -923,9 +928,16 @@ def prepare_inputs(
     ):
         is_qwen3_omni_moe = True
 
+    is_lossy_audio = False
     if audio is not None and len(audio) > 0:
         if not isinstance(audio, list):
             audio = [audio]
+
+        # Check if any audio file is a lossy format (MP3, AAC, OGG, etc.)
+        lossy_extensions = {".mp3", ".m4a"}
+        is_lossy_audio = any(
+            str(f).lower().endswith(tuple(lossy_extensions)) for f in audio
+        )
 
         if len(audio) > 1:
             print(
@@ -1040,6 +1052,15 @@ def prepare_inputs(
         model_inputs["audio_feature_lengths"] = mx.array(
             audio_feature_lengths, dtype=mx.int32
         )
+
+    if is_lossy_audio and "input_features" in model_inputs:
+        f = model_inputs["input_features"]
+        if isinstance(f, list):
+            model_inputs["input_features"] = [
+                normalize_audio_features(mx.array(x)) for x in f
+            ]
+        else:
+            model_inputs["input_features"] = normalize_audio_features(f)
 
     return model_inputs
 
