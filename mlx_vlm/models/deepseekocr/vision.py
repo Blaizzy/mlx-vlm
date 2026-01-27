@@ -233,10 +233,12 @@ class Qwen2Decoder2Encoder(nn.Module):
         super().__init__()
         self.config = config
 
-        # 256 learnable queries (fixed output size)
-        # Named query_768 to match HuggingFace weight naming
-        # Shape: (256, dim) - batch dimension added during forward pass
-        self.query_768 = mx.random.normal((256, config.dim)) * 0.02
+        # Learnable queries for cross-attention
+        # query_1024: (256, dim) - for 1024x1024 images (SAM outputs 16x16=256 features)
+        # query_768: (144, dim) - for 768x768 images (SAM outputs 12x12=144 features)
+        # Initialized with zeros, will be loaded from weights
+        self.query_1024 = mx.zeros((256, config.dim))
+        self.query_768 = mx.zeros((144, config.dim))
 
         # Transformer layers
         self.layers = [
@@ -261,13 +263,27 @@ class Qwen2Decoder2Encoder(nn.Module):
         sam_features_flat = sam_features.reshape(batch_size, -1, self.config.dim)
         num_image_tokens = sam_features_flat.shape[1]
 
-        # Expand queries for batch: (256, C) -> (B, 256, C)
+        # Select appropriate query based on number of image tokens
+        # 256 tokens -> use query_1024 (for 1024x1024 images, SAM outputs 16x16)
+        # 144 tokens -> use query_768 (for 768x768 images, SAM outputs 12x12)
+        if num_image_tokens == 256:
+            query_embed = self.query_1024
+            num_queries = 256
+        elif num_image_tokens == 144:
+            query_embed = self.query_768
+            num_queries = 144
+        else:
+            # Default to query_1024 for unexpected sizes
+            query_embed = self.query_1024
+            num_queries = 256
+
+        # Expand queries for batch: (num_queries, C) -> (B, num_queries, C)
         queries = mx.broadcast_to(
-            self.query_768[None, :, :], (batch_size, 256, self.config.dim)
+            query_embed[None, :, :], (batch_size, num_queries, self.config.dim)
         )
 
         # Concatenate: image tokens + query tokens
-        # Shape: (B, num_image_tokens + 256, C)
+        # Shape: (B, num_image_tokens + num_queries, C)
         hidden_states = mx.concatenate([sam_features_flat, queries], axis=1)
         seq_len = hidden_states.shape[1]
 
@@ -275,7 +291,6 @@ class Qwen2Decoder2Encoder(nn.Module):
         # - Image tokens can attend to all image tokens (bidirectional)
         # - Query tokens use causal attention (each query attends to all image tokens + previous queries)
         # Shape: (1, seq_len, seq_len) - will be broadcast across batch and heads
-        # Use the same dtype as hidden_states for compatibility
         mask_dtype = hidden_states.dtype
 
         # Create causal mask for query tokens only
@@ -285,8 +300,8 @@ class Qwen2Decoder2Encoder(nn.Module):
 
         # Apply causal masking only for query-to-query attention
         query_start = num_image_tokens
-        for i in range(256):
-            for j in range(i + 1, 256):
+        for i in range(num_queries):
+            for j in range(i + 1, num_queries):
                 mask = mask.at[query_start + i, query_start + j].add(-1e9)
 
         # Reshape for attention: (1, 1, seq_len, seq_len)
@@ -308,8 +323,8 @@ class Qwen2Decoder2Encoder(nn.Module):
         # Apply final layer norm
         hidden_states = self.norm(hidden_states)
 
-        # Return only the query tokens (last 256 tokens)
-        return hidden_states[:, -256:, :]
+        # Return only the query tokens (last num_queries tokens)
+        return hidden_states[:, -num_queries:, :]
 
 
 class VisionModel(nn.Module):

@@ -54,16 +54,12 @@ class Model(nn.Module):
         self.tile_tag = config.tile_tag
         self.global_view_pos = config.global_view_pos
 
-        # Only view_separator is used in DeepSeek-OCR-2 (no image_newline)
-        embed_std = 1 / mx.sqrt(
-            mx.array(config.projector_config.n_embed, dtype=mx.float32)
-        )
-
+        # view_separator is loaded from model weights (mapped from view_seperator)
+        # Initialize with zeros - will be overwritten when weights are loaded
         if self.tile_tag == "2D":
             # <|view_separator|> - marks end of image features
-            self.view_separator = mx.array(
-                mx.random.normal((config.projector_config.n_embed,)) * embed_std
-            )
+            # Note: This must be defined as an mx.array for weight loading to work
+            self.view_separator = mx.zeros((config.projector_config.n_embed,))
         else:
             raise ValueError(
                 f"Only 2D tile_tag is supported currently, got: {self.tile_tag}"
@@ -186,7 +182,20 @@ class Model(nn.Module):
                 )
 
             # Handle query weights (learnable queries for Qwen2 encoder)
-            # HuggingFace has query_768.weight but we use plain array query_768
+            # For 1024x1024 images, SAM outputs 16x16=256 features, so use query_1024
+            # query_1024: (256, 896) - used for 1024x1024 images
+            # query_768: (144, 896) - used for 768x768 images
+            if "model.qwen2_model.query_1024.weight" in key:
+                key = key.replace(
+                    "model.qwen2_model.query_1024.weight",
+                    "vision_model.qwen2_encoder.query_1024",
+                )
+            elif "model.qwen2_model.query_1024" in key:
+                key = key.replace(
+                    "model.qwen2_model.query_1024",
+                    "vision_model.qwen2_encoder.query_1024",
+                )
+            # Also handle query_768 for smaller images (not currently used but keep for future)
             if "model.qwen2_model.query_768.weight" in key:
                 key = key.replace(
                     "model.qwen2_model.query_768.weight",
@@ -195,17 +204,6 @@ class Model(nn.Module):
             elif "model.qwen2_model.query_768" in key:
                 key = key.replace(
                     "model.qwen2_model.query_768",
-                    "vision_model.qwen2_encoder.query_768",
-                )
-            # Also handle query_1024 variant if present
-            if "qwen2_model.query_1024.weight" in key:
-                key = key.replace(
-                    "model.qwen2_model.query_1024.weight",
-                    "vision_model.qwen2_encoder.query_768",
-                )
-            elif "qwen2_model.query_1024" in key:
-                key = key.replace(
-                    "model.qwen2_model.query_1024",
                     "vision_model.qwen2_encoder.query_768",
                 )
 
