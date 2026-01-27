@@ -7,6 +7,9 @@ from mlx_lm.models.rope_utils import SuScaledRoPE
 
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput, create_attention_mask
 from ..cache import KVCache
+
+# Import processor to register it with AutoProcessor
+from . import processing_phi3_v  # noqa: F401
 from .config import ModelConfig, TextConfig
 from .vision import VisionModel
 
