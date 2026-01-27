@@ -205,7 +205,8 @@ class Model(nn.Module):
         inputs_embeds = self.model.embed_tokens(inputs)
 
         # Find positions where inputs < 0 (image token positions)
-        p = np.argwhere(inputs < 0).tolist()
+        inputs_np = np.array(inputs)
+        p = np.argwhere(inputs_np < 0).tolist()
 
         if pixel_values is not None:
             inputs_embeds = self.model.vision_embed_tokens(
