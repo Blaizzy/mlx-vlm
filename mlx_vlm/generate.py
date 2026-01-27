@@ -20,6 +20,7 @@ from .utils import (
     apply_repetition_penalty,
     group_images_by_shape,
     load,
+    load_audio,
     prepare_inputs,
 )
 
@@ -32,6 +33,82 @@ DEFAULT_TEMPERATURE = 0.5
 DEFAULT_TOP_P = 1.0
 DEFAULT_SEED = 0
 DEFAULT_QUANTIZED_KV_START = 5000
+
+
+def _voxtral_messages(prompt):
+    if isinstance(prompt, list):
+        if all(isinstance(p, dict) for p in prompt):
+            return prompt
+        if all(isinstance(p, str) for p in prompt):
+            return [{"role": "user", "content": p} for p in prompt]
+    if isinstance(prompt, dict):
+        return [prompt]
+    return [{"role": "user", "content": prompt}]
+
+
+def _encode_voxtral_prompt(processor, prompt):
+    from .models.voxtral.tekken import encode_instruct
+
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    messages = _voxtral_messages(prompt)
+    return encode_instruct(messages, tokenizer)
+
+
+def _prepare_voxtral_inputs(model, processor, prompt, audio):
+    input_features = None
+    audio_token_ids = []
+    begin_audio_id = None
+
+    if audio is not None:
+        if not isinstance(audio, list):
+            audio = [audio]
+        if len(audio) > 1:
+            print(
+                "\033[33mWarning\033[0m: Single prompt with multiple audio files is not supported yet. Using the first audio file.\n"
+            )
+            audio = audio[:1]
+
+        feature_extractor = getattr(processor, "feature_extractor", None)
+        if feature_extractor is None:
+            raise ValueError(
+                "Voxtral processor is missing feature_extractor for audio."
+            )
+
+        audio_arrays = [
+            load_audio(audio_file, sr=feature_extractor.sampling_rate)
+            for audio_file in audio
+        ]
+        audio_inputs = feature_extractor(
+            audio_arrays,
+            sampling_rate=feature_extractor.sampling_rate,
+            padding=True,
+            pad_to_multiple_of=feature_extractor.n_samples,
+            max_source_positions=feature_extractor.nb_max_frames,
+        )
+        input_features = mx.array(audio_inputs["input_features"])
+
+        from .models.voxtral.audio import _audio_tokens_per_chunk
+
+        if model.config.audio_token_id is None:
+            raise ValueError("audio_token_id is required when passing audio inputs.")
+        tokens_per_chunk = _audio_tokens_per_chunk(model.config.audio_config)
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        if hasattr(tokenizer, "get_special_token_id"):
+            try:
+                begin_audio_id = tokenizer.get_special_token_id("[BEGIN_AUDIO]")
+            except Exception:
+                begin_audio_id = None
+        audio_token_ids = [model.config.audio_token_id] * (
+            input_features.shape[0] * tokens_per_chunk
+        )
+        if begin_audio_id is not None:
+            audio_token_ids = [begin_audio_id] + audio_token_ids
+
+    prompt_ids = _encode_voxtral_prompt(processor, prompt)
+    input_ids = audio_token_ids + prompt_ids if audio_token_ids else prompt_ids
+    return mx.array([input_ids]), input_features
 
 
 def parse_arguments():
@@ -429,6 +506,14 @@ def stream_generate(
         input_ids = kwargs.pop("input_ids")
         pixel_values = kwargs.pop("pixel_values", None)
         mask = kwargs.pop("mask", None)
+    elif model.config.model_type == "voxtral":
+        input_ids, input_features = _prepare_voxtral_inputs(
+            model, processor, prompt, audio
+        )
+        pixel_values = None
+        mask = None
+        if input_features is not None:
+            kwargs["input_features"] = input_features
     else:
         inputs = prepare_inputs(
             processor,
@@ -1143,6 +1228,24 @@ def _generate_batch(
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     batch_size = len(prompts)
 
+    if model.config.model_type == "voxtral":
+        encoded_prompts = [_encode_voxtral_prompt(processor, p) for p in prompts]
+        gen = BatchGenerator(
+            model.language_model,
+            processor,
+            prefill_batch_size=batch_size,
+            completion_batch_size=batch_size,
+            **kwargs,
+        )
+        uids = gen.insert(encoded_prompts, max_tokens)
+        results = {uid: [] for uid in uids}
+        while responses := gen.next():
+            for r in responses:
+                if r.finish_reason != "stop":
+                    results[r.uid].append(r.token)
+        texts = [tokenizer.decode(results[uid]) for uid in uids]
+        return texts, gen.stats()
+
     num_images_list = [
         1 if i < (len(images) if images is not None else 0) else 0
         for i in range(len(prompts))
@@ -1240,9 +1343,10 @@ def main():
     num_audios = (
         1 if args.audio is not None else 0
     )  # TODO: Support multiple audio files
-    prompt = apply_chat_template(
-        processor, config, prompt, num_images=num_images, num_audios=num_audios
-    )
+    if config.model_type != "voxtral":
+        prompt = apply_chat_template(
+            processor, config, prompt, num_images=num_images, num_audios=num_audios
+        )
 
     kwargs = {}
 
@@ -1274,7 +1378,12 @@ def main():
             chat.append({"role": "system", "content": args.system})
         while user := input("User:"):
             chat.append({"role": "user", "content": user})
-            prompt = apply_chat_template(processor, config, chat, num_images=num_images)
+            if config.model_type != "voxtral":
+                prompt = apply_chat_template(
+                    processor, config, chat, num_images=num_images
+                )
+            else:
+                prompt = chat
             response = ""
             print("Assistant:", end="")
             for chunk in stream_generate(
