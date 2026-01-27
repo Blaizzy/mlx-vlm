@@ -3,16 +3,19 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx_lm.models.rope_utils import SuScaledRoPE
 
-from ..base import LanguageModelOutput, create_attention_mask
+from ..base import InputEmbeddingsFeatures, LanguageModelOutput, create_attention_mask
 from ..cache import KVCache
-from .config import TextConfig
-from .su_rope import Phi3SuScaledRotaryEmbedding
+
+# Import processor to register it with AutoProcessor
+from . import processing_phi3_v  # noqa: F401
+from .config import ModelConfig, TextConfig
 from .vision import VisionModel
 
 
 class Attention(nn.Module):
-    def __init__(self, config: TextConfig):
+    def __init__(self, config: ModelConfig):
         super().__init__()
 
         dim = config.hidden_size
@@ -27,23 +30,31 @@ class Attention(nn.Module):
         self.qkv_proj = nn.Linear(dim, op_size, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        rope_scale = 1.0
-        if config.rope_scaling and config.rope_scaling["type"] == "su":
-            self.rope = Phi3SuScaledRotaryEmbedding(
-                head_dim,
-                traditional=False,
+        rope_dim = int(head_dim * config.partial_rotary_factor)
+
+        # Check for Su-scaled RoPE by type or presence of short/long factors
+        rope_type = config.rope_scaling.get("type") if config.rope_scaling else None
+        has_su_factors = (
+            config.rope_scaling
+            and "short_factor" in config.rope_scaling
+            and "long_factor" in config.rope_scaling
+        )
+
+        if rope_type == "su" or has_su_factors:
+            self.rope = SuScaledRoPE(
+                rope_dim,
                 base=config.rope_theta,
-                scale=rope_scale,
                 max_position_embeddings=config.max_position_embeddings,
                 original_max_position_embeddings=config.original_max_position_embeddings,
                 short_factor=config.rope_scaling["short_factor"],
                 long_factor=config.rope_scaling["long_factor"],
             )
         else:
-            if config.rope_scaling and config.rope_scaling["type"] == "linear":
+            rope_scale = 1.0
+            if config.rope_scaling and rope_type == "linear":
                 rope_scale = 1 / config.rope_scaling["factor"]
             self.rope = nn.RoPE(
-                head_dim,
+                rope_dim,
                 traditional=config.rope_traditional,
                 base=config.rope_theta,
                 scale=rope_scale,
@@ -55,7 +66,7 @@ class Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
     ) -> mx.array:
-        B, L, D = x.shape
+        B, L, _ = x.shape
 
         qkv = self.qkv_proj(x)
         query_pos = self.n_heads * self.head_dim
@@ -121,7 +132,7 @@ class TransformerBlock(nn.Module):
 
 
 class Phi3V(nn.Module):
-    def __init__(self, config: TextConfig):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
@@ -136,26 +147,20 @@ class Phi3V(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        pixel_values=None,
-        image_sizes=None,
+        inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
     ):
-        h = self.embed_tokens(inputs)
-        p = np.argwhere(inputs < 0).tolist()
-
-        if pixel_values is not None:
-            h = self.vision_embed_tokens(pixel_values, h, image_sizes, p)
+        if inputs_embeds is None:
+            h = self.embed_tokens(inputs)
+        else:
+            h = inputs_embeds
 
         if cache is None:
             cache = [None] * len(self.layers)
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
-        else:
-            seq_len = h.shape[-2]
-            causal_mask = mx.tril(mx.ones((seq_len, seq_len), dtype=mx.bool_))
-            mask = (mask & causal_mask) > 0
+            mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -164,7 +169,7 @@ class Phi3V(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, config: TextConfig):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.model_type = config.model_type
         self.model = Phi3V(config)
@@ -174,17 +179,44 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
+        inputs_embeds: Optional[mx.array] = None,
         pixel_values=None,
         mask=None,
         cache=None,
-        image_sizes=None,
         **kwargs,
     ):
-        out = self.model(inputs, pixel_values, image_sizes, mask=mask, cache=cache)
+        if inputs_embeds is None:
+            input_embeddings_features = self.get_input_embeddings(
+                inputs, pixel_values, **kwargs
+            )
+            inputs_embeds = input_embeddings_features.inputs_embeds
+
+        out = self.model(inputs, inputs_embeds, mask=mask, cache=cache)
         logits = self.lm_head(out)
-        if self.lm_head.weight.dtype in [mx.float16, mx.bfloat16, mx.float32]:
-            logits = logits.astype(self.lm_head.weight.dtype)
+
         return LanguageModelOutput(logits=logits)
+
+    def get_input_embeddings(
+        self,
+        inputs: mx.array,
+        pixel_values: Optional[mx.array] = None,
+        **kwargs,
+    ):
+        image_sizes = kwargs.get("image_sizes", None) if kwargs else None
+
+        # Get text embeddings
+        inputs_embeds = self.model.embed_tokens(inputs)
+
+        # Find positions where inputs < 0 (image token positions)
+        inputs_list = inputs.tolist()
+        p = np.argwhere(np.array(inputs_list) < 0).tolist()
+
+        if pixel_values is not None:
+            inputs_embeds = self.model.vision_embed_tokens(
+                pixel_values, inputs_embeds, image_sizes, p
+            )
+
+        return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
     @property
     def layers(self):

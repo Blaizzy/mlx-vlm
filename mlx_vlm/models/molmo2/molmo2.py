@@ -4,7 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import LanguageModelOutput
+from ..base import InputEmbeddingsFeatures, LanguageModelOutput
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -257,19 +257,30 @@ class Model(nn.Module):
             image_num_crops=image_num_crops,
         )
 
-    def build_input_embeddings(
+    def get_input_embeddings(
         self,
         input_ids: mx.array,
-        images: Optional[mx.array] = None,
-        token_pooling: Optional[mx.array] = None,
+        pixel_values: Optional[mx.array] = None,
+        **kwargs,
     ) -> mx.array:
         input_ids = input_ids * (input_ids != -1).astype(input_ids.dtype)
         x = self.language_model.model.wte(input_ids)
 
-        if images is not None:
+        if pixel_values is not None:
+
+            pixel_values, token_pooling = self.merge_visual_inputs(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                image_token_pooling=kwargs.get("image_token_pooling", None),
+                image_grids=kwargs.get("image_grids", None),
+                image_num_crops=kwargs.get("image_num_crops", None),
+                video_token_pooling=kwargs.get("video_token_pooling", None),
+                video_grids=kwargs.get("video_grids", None),
+            )
+
             dtype = self.vision_tower.image_vit.patch_embedding.weight.dtype
-            images = images.astype(dtype)
-            image_features = self.vision_tower(images, token_pooling)
+            pixel_values = pixel_values.astype(dtype)
+            image_features = self.vision_tower(pixel_values, token_pooling)
             is_image_patch = mx.reshape(input_ids, (-1,)) == self.config.image_patch_id
             if int(is_image_patch.sum().item()) != image_features.shape[0]:
                 raise ValueError(
@@ -280,7 +291,7 @@ class Model(nn.Module):
             flat_x[positions] = flat_x[positions] + image_features
             x = flat_x.reshape(x.shape)
 
-        return x
+        return InputEmbeddingsFeatures(inputs_embeds=x)
 
     def __call__(
         self,
@@ -293,27 +304,13 @@ class Model(nn.Module):
         if input_ids.ndim == 1:
             input_ids = input_ids[None, :]
 
-        images, token_pooling = self.merge_visual_inputs(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            image_token_pooling=kwargs.get("image_token_pooling", None),
-            image_grids=kwargs.get("image_grids", None),
-            image_num_crops=kwargs.get("image_num_crops", None),
-            video_token_pooling=kwargs.get("video_token_pooling", None),
-            video_grids=kwargs.get("video_grids", None),
+        input_embeddings_features = self.get_input_embeddings(
+            input_ids=input_ids, pixel_values=pixel_values, **kwargs
         )
-
-        inputs_embeds = None
-        if pixel_values is not None:
-            inputs_embeds = self.build_input_embeddings(
-                input_ids=input_ids,
-                images=images,
-                token_pooling=token_pooling,
-            )
 
         return self.language_model(
             input_ids,
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
             mask=mask,
             cache=cache,
         )

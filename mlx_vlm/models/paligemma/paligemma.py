@@ -3,6 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -37,9 +38,12 @@ class Model(nn.Module):
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
+        **kwargs,
     ):
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids), None
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
@@ -56,7 +60,9 @@ class Model(nn.Module):
                 image_features, inputs_embeds, input_ids, mask
             )
         )
-        return final_inputs_embeds, final_attention_mask_4d
+        return InputEmbeddingsFeatures(
+            inputs_embeds=final_inputs_embeds, attention_mask_4d=final_attention_mask_4d
+        )
 
     def _prepare_inputs_for_multimodal(
         self, image_features, inputs_embeds, input_ids, attention_mask
@@ -119,9 +125,11 @@ class Model(nn.Module):
         cache: Optional[mx.array] = None,
         **kwargs,
     ):
-        input_embeddings, final_attention_mask_4d = self.get_input_embeddings(
+        input_embeddings_features = self.get_input_embeddings(
             input_ids, pixel_values, mask
         )
+        input_embeddings = input_embeddings_features.inputs_embeds
+        final_attention_mask_4d = input_embeddings_features.attention_mask_4d
 
         logits = self.language_model(
             inputs=input_ids,

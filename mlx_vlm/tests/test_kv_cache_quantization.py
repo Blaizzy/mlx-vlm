@@ -9,6 +9,29 @@ import pytest
 from mlx_vlm.generate import generate_step
 
 
+class MockInputEmbeddingsFeatures:
+    """Mock input embeddings features object."""
+
+    def __init__(self, inputs_embeds):
+        self.inputs_embeds = inputs_embeds
+        self.attention_mask_4d = None
+        self.cross_attention_states = None
+        self.cross_attention_mask = None
+        self.full_text_row_masked_out_mask = None
+        self.decoder_inputs_embeds = None
+
+    def to_dict(self):
+        """Return dictionary of attributes for kwargs expansion."""
+        return {
+            "inputs_embeds": self.inputs_embeds,
+            "attention_mask_4d": self.attention_mask_4d,
+            "cross_attention_states": self.cross_attention_states,
+            "cross_attention_mask": self.cross_attention_mask,
+            "full_text_row_masked_out_mask": self.full_text_row_masked_out_mask,
+            "decoder_inputs_embeds": self.decoder_inputs_embeds,
+        }
+
+
 class MockOutput:
     """Mock output object for model calls."""
 
@@ -39,6 +62,13 @@ class MockModel(nn.Module):
     def _language_model_call(self, *args, **kwargs):
         """Mock call for language_model."""
         return MockOutput()
+
+    def get_input_embeddings(self, input_ids, pixel_values=None, **kwargs):
+        """Mock get_input_embeddings method."""
+        # Return mock embeddings with shape (batch, seq_len, hidden_dim)
+        batch_size, seq_len = input_ids.shape
+        inputs_embeds = mx.random.normal((batch_size, seq_len, 768))
+        return MockInputEmbeddingsFeatures(inputs_embeds)
 
     def __call__(self, *args, **kwargs):
         return self.return_value

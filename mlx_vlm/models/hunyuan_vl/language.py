@@ -117,9 +117,17 @@ def apply_rotary_pos_emb_xdrope(
 def apply_rotary_pos_emb(
     q: mx.array, k: mx.array, cos: mx.array, sin: mx.array, unsqueeze_dim: int = 1
 ) -> Tuple[mx.array, mx.array]:
-    """Standard rotary position embedding."""
-    cos = mx.expand_dims(cos, axis=unsqueeze_dim)
-    sin = mx.expand_dims(sin, axis=unsqueeze_dim)
+    """Standard rotary position embedding.
+
+    Args:
+        q: Queries with shape (batch, n_heads, seq_len, head_dim)
+        k: Keys with shape (batch, n_heads, seq_len, head_dim)
+        cos: Cosine values with shape (seq_len, head_dim)
+        sin: Sine values with shape (seq_len, head_dim)
+    """
+    # Expand cos/sin to (1, 1, seq_len, head_dim) for broadcasting
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
 
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
@@ -332,6 +340,7 @@ class LanguageModel(nn.Module):
         self.config = config
         self.model_type = self.args.model_type
         self.model = HunyuanModel(self.args)
+        self._position_ids = None
 
         if not self.args.tie_word_embeddings:
             self.lm_head = nn.Linear(
@@ -416,14 +425,14 @@ class LanguageModel(nn.Module):
 
     def __call__(
         self,
-        input_ids: Optional[mx.array] = None,
+        inputs: Optional[mx.array] = None,
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
         **kwargs,
     ) -> LanguageModelOutput:
 
-        position_ids = kwargs.pop("position_ids", None)
+        kwargs_position_ids = kwargs.pop("position_ids", None)
 
         # Compute cache offset
         cache_offset = 0
@@ -436,17 +445,44 @@ class LanguageModel(nn.Module):
             else:
                 cache_offset = int(offset)
 
-        if position_ids is None and (cache is None or cache_offset == 0):
-            if input_ids is not None:
+        # Determine sequence length from inputs or inputs_embeds
+        if inputs_embeds is not None:
+            seq_length = inputs_embeds.shape[1]
+        elif inputs is not None:
+            seq_length = inputs.shape[1]
+        else:
+            seq_length = 0
+
+        position_ids = None
+        if cache is None or cache_offset == 0:
+            # Prefill phase - need xdrope position_ids
+            if self._position_ids is not None:
+                # Use stored position_ids (sliced for chunked prefill)
+                position_ids = self._position_ids[
+                    :, :, cache_offset : cache_offset + seq_length
+                ]
+            elif kwargs_position_ids is not None:
+                # Use position_ids from kwargs (e.g., from processor)
+                if not isinstance(kwargs_position_ids, mx.array):
+                    kwargs_position_ids = mx.array(kwargs_position_ids)
+                # Store for potential future chunks and slice for current chunk
+                self._position_ids = kwargs_position_ids
+                position_ids = self._position_ids[
+                    :, :, cache_offset : cache_offset + seq_length
+                ]
+            elif inputs is not None:
+                # Compute position_ids on the fly (for non-chunked prefill)
                 position_ids = self.get_xdrope_input_positions(
-                    input_tokens=input_ids[0].tolist(),
+                    input_tokens=inputs[0].tolist(),
                     image_grid_thw=kwargs.get("image_grid_thw", None),
                     image_token_id=self.config.image_token_id,
                     spatial_merge_size=self.config.vision_config.spatial_merge_size,
                 )[None, ...]
+                # Store for potential future chunks
+                self._position_ids = position_ids
 
         out = self.model(
-            input_ids=input_ids,
+            input_ids=inputs,
             inputs_embeds=inputs_embeds,
             mask=mask,
             cache=cache,

@@ -7,11 +7,7 @@ from typing import Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import create_attention_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import RotatingKVCache
 from PIL import Image
-from transformers.image_processing_utils import BaseImageProcessor as ImageProcessor
-from transformers.image_processing_utils import get_size_dict
-from transformers.image_utils import ChannelDimension, PILImageResampling
 
 
 @dataclass
@@ -20,6 +16,34 @@ class LanguageModelOutput:
     hidden_states: Optional[List[mx.array]] = None
     cross_attention_states: Optional[List[mx.array]] = None
     encoder_outputs: Optional[List[mx.array]] = None
+
+
+@dataclass
+class InputEmbeddingsFeatures:
+    inputs_embeds: mx.array
+    attention_mask_4d: Optional[mx.array] = None
+    visual_pos_masks: Optional[mx.array] = None
+    deepstack_visual_embeds: Optional[mx.array] = None
+    per_layer_inputs: Optional[mx.array] = None
+    cross_attention_states: Optional[mx.array] = None
+    cross_attention_mask: Optional[mx.array] = None
+    full_text_row_masked_out_mask: Optional[mx.array] = None
+    decoder_inputs_embeds: Optional[mx.array] = None
+    attention_mask: Optional[mx.array] = None  # For encoder-decoder models
+
+    def to_dict(self):
+        return {
+            "inputs_embeds": self.inputs_embeds,
+            "attention_mask_4d": self.attention_mask_4d,
+            "visual_pos_masks": self.visual_pos_masks,
+            "deepstack_visual_embeds": self.deepstack_visual_embeds,
+            "per_layer_inputs": self.per_layer_inputs,
+            "cross_attention_states": self.cross_attention_states,
+            "cross_attention_mask": self.cross_attention_mask,
+            "full_text_row_masked_out_mask": self.full_text_row_masked_out_mask,
+            "decoder_inputs_embeds": self.decoder_inputs_embeds,
+            "attention_mask": self.attention_mask,
+        }
 
 
 @dataclass
@@ -38,17 +62,30 @@ class BaseModelConfig:
         return {k: v for k, v in self.__dict__.items() if v is not None}
 
 
-class BaseImageProcessor(ImageProcessor):
+class BaseImageProcessor:
+    """
+    Base image processor class. Subclasses should implement preprocess().
+    Transformers imports are deferred to __init__ for faster module loading.
+    """
+
     def __init__(
         self,
         image_mean=(0.5, 0.5, 0.5),
         image_std=(0.5, 0.5, 0.5),
         size=(384, 384),
         crop_size: Dict[str, int] = None,
-        resample=PILImageResampling.BICUBIC,
+        resample=None,
         rescale_factor=1 / 255,
-        data_format=ChannelDimension.FIRST,
+        data_format=None,
     ):
+        from transformers.image_processing_utils import get_size_dict
+        from transformers.image_utils import ChannelDimension, PILImageResampling
+
+        if resample is None:
+            resample = PILImageResampling.BICUBIC
+        if data_format is None:
+            data_format = ChannelDimension.FIRST
+
         crop_size = (
             crop_size if crop_size is not None else {"height": 384, "width": 384}
         )
@@ -63,6 +100,38 @@ class BaseImageProcessor(ImageProcessor):
         self.rescale_factor = rescale_factor
         self.data_format = data_format
         self.crop_size = crop_size
+
+    def rescale(
+        self,
+        image,
+        scale: float,
+        input_data_format: str = "channels_first",
+    ):
+        """Rescale an image by a scale factor."""
+        return image * scale
+
+    def normalize(
+        self,
+        image,
+        mean,
+        std,
+        input_data_format: str = "channels_first",
+    ):
+        """Normalize an image with mean and std."""
+        import numpy as np
+
+        mean = np.array(mean, dtype=image.dtype)
+        std = np.array(std, dtype=image.dtype)
+
+        if input_data_format == "channels_first":
+            # Image shape: [C, H, W]
+            mean = mean[:, None, None]
+            std = std[:, None, None]
+        else:
+            # Image shape: [H, W, C]
+            pass  # mean and std are already in correct shape
+
+        return (image - mean) / std
 
     @abstractmethod
     def preprocess(self, images):

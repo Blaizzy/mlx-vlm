@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import InputEmbeddingsFeatures
 from ..cache import KVCache
 from .config import ModelConfig
 from .language import LanguageModel
@@ -25,11 +26,76 @@ class Model(nn.Module):
     def layers(self):
         return self.language_model.model.layers
 
+    def get_input_embeddings(
+        self,
+        input_ids: Optional[mx.array] = None,
+        pixel_values: Optional[mx.array] = None,
+        **kwargs,
+    ):
+        aspect_ratio_ids = kwargs.get("aspect_ratio_ids", None)
+        aspect_ratio_mask = kwargs.get("aspect_ratio_mask", None)
+        cross_attention_mask = kwargs.get("cross_attention_mask", None)
+
+        # Get text embeddings
+        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+
+        cross_attention_states = None
+        full_text_row_masked_out_mask = None
+
+        # Process vision input if provided
+        if pixel_values is not None:
+            if aspect_ratio_ids is None:
+                raise ValueError(
+                    "`aspect_ratio_ids` must be provided if `pixel_values` is provided"
+                )
+
+            vision_outputs = self.vision_tower(
+                pixel_values=pixel_values,
+                aspect_ratio_ids=aspect_ratio_ids,
+                aspect_ratio_mask=aspect_ratio_mask,
+            )
+            cross_attention_states = vision_outputs[0]
+
+            cross_attention_states = self.multi_modal_projector(
+                cross_attention_states
+            ).reshape(
+                -1,
+                cross_attention_states.shape[-2],
+                self.config.text_config.hidden_size,
+            )
+
+        # Prepare cross attention mask
+        if cross_attention_mask is not None:
+            cross_attention_mask, full_text_row_masked_out_mask = (
+                self._prepare_cross_attention_mask(
+                    cross_attention_mask,
+                    num_vision_tokens=(
+                        self.config.vision_config.image_size
+                        // self.config.vision_config.patch_size
+                    )
+                    ** 2
+                    + 1,
+                )
+            )
+
+            cache_position = mx.arange(input_ids.shape[1], dtype=mx.int32)
+            cross_attention_mask = cross_attention_mask[:, :, cache_position]
+            full_text_row_masked_out_mask = full_text_row_masked_out_mask[
+                :, :, cache_position
+            ]
+
+        return InputEmbeddingsFeatures(
+            inputs_embeds=inputs_embeds,
+            cross_attention_states=cross_attention_states,
+            cross_attention_mask=cross_attention_mask,
+            full_text_row_masked_out_mask=full_text_row_masked_out_mask,
+        )
+
     def __call__(
         self,
         input_ids: mx.array,
-        pixel_values: mx.array,
-        mask: mx.array,
+        pixel_values: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
         **kwargs,
     ) -> Tuple[mx.array, Optional[mx.array]]:
@@ -90,7 +156,7 @@ class Model(nn.Module):
 
         # Process language input
         outputs = self.language_model(
-            input_ids=input_ids,
+            inputs=input_ids,
             mask=mask,
             cross_attention_states=cross_attention_states,
             cross_attention_mask=cross_attention_mask,
