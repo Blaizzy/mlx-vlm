@@ -1,22 +1,10 @@
 """
-Compatibility patch for KimiVLProcessor.
+MLX-based KimiVL Processor.
 
-The KimiVLProcessor from the HuggingFace model repository tries to import
-`_validate_images_text_input_order` from `transformers.processing_utils`, but this
-function may not exist in all versions of transformers.
-
-The KimiVLImageProcessor also requires torch and torchvision, which we replace with
-an MLX-based implementation.
-
-The tokenizer also requires `bytes_to_unicode` from `transformers.models.gpt2.tokenization_gpt2`,
-which was removed in transformers 5.0.
-
-This patch:
-1. Adds the missing `_validate_images_text_input_order` function to transformers.processing_utils
-2. Adds the missing `bytes_to_unicode` function to transformers.models.gpt2.tokenization_gpt2
-3. Provides an MLX-based KimiVLImageProcessor that doesn't require torch/torchvision
-4. Provides a complete KimiVLProcessor that works without PyTorch
-5. Allows the KimiVLProcessor to be loaded successfully without PyTorch dependencies
+This module provides an MLX-native processor for KimiVL models that:
+1. Uses a pre-converted fast tokenizer (no tiktoken dependency)
+2. Provides an MLX-based image processor (no torch/torchvision dependency)
+3. Patches missing functions for transformers 5.0 compatibility
 """
 
 import json
@@ -26,48 +14,8 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import mlx.core as mx
-from PIL import Image
-
-from .config import ModelConfig
-
-
-def bytes_to_unicode():
-    """
-    Returns list of utf-8 byte and a mapping to unicode strings.
-    We specifically avoid mapping to whitespace/control characters the bpe code barfs on.
-
-    The reversible bpe codes work on unicode strings.
-    This means you need a large # of unicode characters in your vocab if you want to avoid UNKs.
-    When you're at something like a 10B token dataset you end up needing around 5K for decent coverage.
-    This is a significant percentage of your normal, say, 32K bpe vocab.
-    To avoid that, we want lookup tables between utf-8 bytes and unicode strings.
-    """
-    bs = (
-        list(range(ord("!"), ord("~") + 1))
-        + list(range(ord("¡"), ord("¬") + 1))
-        + list(range(ord("®"), ord("ÿ") + 1))
-    )
-    cs = bs[:]
-    n = 0
-    for b in range(2**8):
-        if b not in bs:
-            bs.append(b)
-            cs.append(2**8 + n)
-            n += 1
-    cs = [chr(n) for n in cs]
-    return dict(zip(bs, cs))
-
-
-# Patch transformers.models.gpt2.tokenization_gpt2 to add bytes_to_unicode
-try:
-    import transformers.models.gpt2.tokenization_gpt2 as gpt2_tokenization
-
-    if not hasattr(gpt2_tokenization, "bytes_to_unicode"):
-        gpt2_tokenization.bytes_to_unicode = bytes_to_unicode
-except ImportError:
-    pass
-
 import transformers.processing_utils as processing_utils
+from PIL import Image
 from transformers import AutoTokenizer
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import BaseImageProcessor
@@ -75,6 +23,8 @@ from transformers.image_utils import ImageInput, make_list_of_images, valid_imag
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.utils import TensorType
+
+from .config import ModelConfig
 
 
 def _validate_images_text_input_order(images, text):
@@ -461,34 +411,15 @@ class KimiVLProcessor(ProcessorMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         """Load the processor from a pretrained model path."""
-        import importlib.util
-
         kwargs.pop("trust_remote_code", None)
 
-        # Check if it's a local path
         model_path = Path(pretrained_model_name_or_path)
-        is_local = model_path.exists() and model_path.is_dir()
 
-        # Load tokenizer - use direct module loading for local paths
-        # because AutoTokenizer has issues with local paths in transformers 5.0
-        if is_local and (model_path / "tokenization_moonshot.py").exists():
-            # Load the tokenization module directly
-            spec = importlib.util.spec_from_file_location(
-                "tokenization_moonshot", model_path / "tokenization_moonshot.py"
-            )
-            tokenization_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(tokenization_module)
-            TikTokenTokenizer = tokenization_module.TikTokenTokenizer
-            tokenizer = TikTokenTokenizer.from_pretrained(
-                str(model_path), local_files_only=True
-            )
-        else:
-            # Fall back to AutoTokenizer for remote models
-            tokenizer = AutoTokenizer.from_pretrained(
-                pretrained_model_name_or_path,
-                trust_remote_code=True,
-                **kwargs,
-            )
+        # Load tokenizer using AutoTokenizer (uses pre-converted tokenizer.json, no tiktoken needed)
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(model_path) if model_path.exists() else pretrained_model_name_or_path,
+            local_files_only=model_path.exists() and model_path.is_dir(),
+        )
 
         # Load image processor config and create our processor
         try:
