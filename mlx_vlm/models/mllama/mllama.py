@@ -156,7 +156,7 @@ class Model(nn.Module):
 
         # Process language input
         outputs = self.language_model(
-            input_ids=input_ids,
+            inputs=input_ids,
             mask=mask,
             cross_attention_states=cross_attention_states,
             cross_attention_mask=cross_attention_mask,
