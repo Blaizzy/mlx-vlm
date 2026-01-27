@@ -1,0 +1,508 @@
+"""
+Compatibility patch for KimiVLProcessor.
+
+The KimiVLProcessor from the HuggingFace model repository tries to import
+`_validate_images_text_input_order` from `transformers.processing_utils`, but this
+function may not exist in all versions of transformers.
+
+The KimiVLImageProcessor also requires torch and torchvision, which we replace with
+a numpy-based implementation.
+
+The tokenizer also requires `bytes_to_unicode` from `transformers.models.gpt2.tokenization_gpt2`,
+which was removed in transformers 5.0.
+
+This patch:
+1. Adds the missing `_validate_images_text_input_order` function to transformers.processing_utils
+2. Adds the missing `bytes_to_unicode` function to transformers.models.gpt2.tokenization_gpt2
+3. Provides a numpy-based KimiVLImageProcessor that doesn't require torch/torchvision
+4. Provides a complete KimiVLProcessor that works without PyTorch
+5. Allows the KimiVLProcessor to be loaded successfully without PyTorch dependencies
+"""
+
+import json
+import math
+import warnings
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
+
+import mlx.core as mx
+import numpy as np
+from PIL import Image
+
+from .config import ModelConfig
+
+
+def bytes_to_unicode():
+    """
+    Returns list of utf-8 byte and a mapping to unicode strings.
+    We specifically avoid mapping to whitespace/control characters the bpe code barfs on.
+
+    The reversible bpe codes work on unicode strings.
+    This means you need a large # of unicode characters in your vocab if you want to avoid UNKs.
+    When you're at something like a 10B token dataset you end up needing around 5K for decent coverage.
+    This is a significant percentage of your normal, say, 32K bpe vocab.
+    To avoid that, we want lookup tables between utf-8 bytes and unicode strings.
+    """
+    bs = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
+    )
+    cs = bs[:]
+    n = 0
+    for b in range(2**8):
+        if b not in bs:
+            bs.append(b)
+            cs.append(2**8 + n)
+            n += 1
+    cs = [chr(n) for n in cs]
+    return dict(zip(bs, cs))
+
+
+# Patch transformers.models.gpt2.tokenization_gpt2 to add bytes_to_unicode
+try:
+    import transformers.models.gpt2.tokenization_gpt2 as gpt2_tokenization
+
+    if not hasattr(gpt2_tokenization, "bytes_to_unicode"):
+        gpt2_tokenization.bytes_to_unicode = bytes_to_unicode
+except ImportError:
+    pass
+
+import transformers.processing_utils as processing_utils
+from transformers import AutoTokenizer
+from transformers.feature_extraction_utils import BatchFeature
+from transformers.image_processing_utils import BaseImageProcessor
+from transformers.image_utils import ImageInput, make_list_of_images, valid_images
+from transformers.processing_utils import ProcessorMixin
+from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
+from transformers.utils import TensorType
+
+
+def _validate_images_text_input_order(images, text):
+    """
+    Validate and potentially swap the order of images and text arguments.
+
+    This function checks if the arguments are in the correct order (images first, text second)
+    for backward compatibility. If text is passed as the first argument and images as the second,
+    it swaps them and issues a deprecation warning.
+
+    Args:
+        images: The images argument (should be image-like objects or None)
+        text: The text argument (should be strings or None)
+
+    Returns:
+        Tuple of (images, text) in the correct order
+    """
+    # Check if arguments are swapped (text passed as images, images passed as text)
+    if images is not None and text is not None:
+        # If 'images' looks like text and 'text' looks like images, swap them
+        images_is_text = isinstance(images, str) or (
+            isinstance(images, (list, tuple))
+            and len(images) > 0
+            and isinstance(images[0], str)
+        )
+        text_is_image = not isinstance(text, str) and not (
+            isinstance(text, (list, tuple))
+            and len(text) > 0
+            and isinstance(text[0], str)
+        )
+
+        if images_is_text and text_is_image:
+            warnings.warn(
+                "You passed text as the first argument and images as the second. "
+                "This is deprecated and will be removed in a future version. "
+                "Please pass images first and text second.",
+                FutureWarning,
+            )
+            return text, images
+
+    return images, text
+
+
+# Add the function to transformers.processing_utils if it doesn't exist
+if not hasattr(processing_utils, "_validate_images_text_input_order"):
+    processing_utils._validate_images_text_input_order = (
+        _validate_images_text_input_order
+    )
+
+# Also add Unpack if it doesn't exist (for older Python versions)
+if not hasattr(processing_utils, "Unpack"):
+    try:
+        from typing import Unpack
+
+        processing_utils.Unpack = Unpack
+    except ImportError:
+        from typing_extensions import Unpack
+
+        processing_utils.Unpack = Unpack
+
+
+# CLIP-style normalization constants
+OPENAI_DATASET_MEAN = (0.48145466, 0.4578275, 0.40821073)
+OPENAI_DATASET_STD = (0.26862954, 0.26130258, 0.27577711)
+
+
+class KimiVLImageProcessor(BaseImageProcessor):
+
+    model_input_names = ["pixel_values", "image_grid_hws"]
+
+    def __init__(
+        self,
+        patch_size: int = 14,
+        pad_input: bool = False,
+        image_mean: Tuple[float, float, float] = OPENAI_DATASET_MEAN,
+        image_std: Tuple[float, float, float] = OPENAI_DATASET_STD,
+        in_token_limit: int = 4096,
+        merge_kernel_size: List[int] = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.in_token_limit = in_token_limit
+        self.patch_size = patch_size
+        self.pad_input = pad_input
+        self.image_mean = image_mean
+        self.image_std = image_std
+        self.merge_kernel_size = (
+            merge_kernel_size if merge_kernel_size is not None else [2, 2]
+        )
+
+    def rescale(
+        self, image: Image.Image, merge_kernel_size: List[int] = None
+    ) -> Image.Image:
+        """Rescale image to fit within token limits and pad/crop to patch boundaries."""
+        if merge_kernel_size is None:
+            merge_kernel_size = self.merge_kernel_size
+
+        w, h = image.size
+        patch_size = self.patch_size
+
+        # Rescale if exceeds token limit
+        if (w // patch_size) * (h // patch_size) > self.in_token_limit:
+            scale = math.sqrt(
+                self.in_token_limit / ((w // patch_size) * (h // patch_size))
+            )
+            new_w, new_h = int(w * scale), int(h * scale)
+            image = image.resize((new_w, new_h), Image.Resampling.BICUBIC)
+
+        if self.pad_input:
+            new_w, new_h = image.size
+            pad_size_h = merge_kernel_size[0] * patch_size
+            pad_size_w = merge_kernel_size[1] * patch_size
+
+            pad_h = (pad_size_h - new_h % pad_size_h) % pad_size_h
+            pad_w = (pad_size_w - new_w % pad_size_w) % pad_size_w
+
+            if pad_h > 0 or pad_w > 0:
+                # Pad image (bottom and right padding)
+                new_image = Image.new(
+                    image.mode, (new_w + pad_w, new_h + pad_h), (0, 0, 0)
+                )
+                new_image.paste(image, (0, 0))
+                image = new_image
+        else:
+            new_w, new_h = image.size
+            new_w = new_w - new_w % patch_size
+            new_h = new_h - new_h % patch_size
+            # Center crop
+            left = (image.size[0] - new_w) // 2
+            top = (image.size[1] - new_h) // 2
+            image = image.crop((left, top, left + new_w, top + new_h))
+
+        w, h = image.size
+        if w // patch_size >= 512 or h // patch_size >= 512:
+            raise ValueError("Exceed pos emb")
+
+        return image
+
+    def to_mlx(self, image: Image.Image) -> mx.array:
+        """Convert PIL image to MLX array in CHW format, normalized to [0, 1]."""
+        image = image.convert("RGB")
+        # Convert to numpy first, then to MLX
+        arr = np.array(image, dtype=np.float32) / 255.0
+        # Convert from HWC to CHW format
+        arr = mx.array(arr).transpose(2, 0, 1)
+        return arr
+
+    def normalize(self, image: mx.array) -> mx.array:
+        """Normalize image with CLIP-style mean and std."""
+        mean = mx.array(self.image_mean, dtype=mx.float32).reshape(3, 1, 1)
+        std = mx.array(self.image_std, dtype=mx.float32).reshape(3, 1, 1)
+        return (image - mean) / std
+
+    def patchify(self, image: mx.array) -> Tuple[mx.array, Tuple[int, int]]:
+        """Convert image to patches."""
+        patch_size = self.patch_size
+        C, H, W = image.shape
+
+        # Reshape to (C, H//p, p, W//p, p) then to (num_patches, C, p, p)
+        patches = image.reshape(
+            C, H // patch_size, patch_size, W // patch_size, patch_size
+        )
+        # Permute to (H//p, W//p, C, p, p)
+        patches = patches.transpose(1, 3, 0, 2, 4)
+        # Flatten to (num_patches, C, p, p)
+        patches = patches.reshape(-1, C, patch_size, patch_size)
+
+        grid_hw = (H // patch_size, W // patch_size)
+        return patches, grid_hw
+
+    def _preprocess(self, image: ImageInput) -> Tuple[mx.array, Tuple[int, int]]:
+        """
+        Preprocess image and patchify it.
+
+        Args:
+            image: Image to preprocess.
+
+        Returns:
+            patches: mx.array
+            grid_hw: Tuple[int, int]
+        """
+        image = self.rescale(image, self.merge_kernel_size)
+        image = self.to_mlx(image)
+        image = self.normalize(image)
+        patches, grid_hw = self.patchify(image)
+        return patches, grid_hw
+
+    def preprocess(
+        self,
+        images: ImageInput,
+        return_tensors: Optional[Union[str, TensorType]] = None,
+        **kwargs,
+    ) -> BatchFeature:
+        """Process images and return BatchFeature."""
+        images = make_list_of_images(images)
+
+        if not valid_images(images):
+            raise ValueError(
+                "Invalid image type. Must be of type PIL.Image.Image, numpy.ndarray, "
+                "torch.Tensor, tf.Tensor or jax.ndarray."
+            )
+
+        pixel_values_list = []
+        image_grid_hws = []
+
+        for image in images:
+            # Convert numpy arrays to PIL Images if needed
+            if isinstance(image, np.ndarray):
+                if image.ndim == 3 and image.shape[0] in [1, 3, 4]:
+                    # CHW format, convert to HWC
+                    image = image.transpose(1, 2, 0)
+                if image.dtype in [np.float32, np.float64]:
+                    image = (image * 255).astype(np.uint8)
+                image = Image.fromarray(image)
+
+            patches, image_grid_hw = self._preprocess(image)
+            pixel_values_list.append(patches)
+            image_grid_hws.append(image_grid_hw)
+
+        pixel_values = mx.concatenate(pixel_values_list, axis=0)
+        image_grid_hws = mx.array(image_grid_hws)
+
+        # Convert to numpy for BatchFeature compatibility
+        data = {
+            "pixel_values": np.array(pixel_values),
+            "image_grid_hws": np.array(image_grid_hws),
+        }
+
+        return BatchFeature(data=data, tensor_type=return_tensors)
+
+    def __call__(
+        self,
+        images: ImageInput,
+        return_tensors: Optional[Union[str, TensorType]] = None,
+        **kwargs,
+    ) -> BatchFeature:
+        """Make the image processor callable."""
+        return self.preprocess(images, return_tensors=return_tensors, **kwargs)
+
+
+class KimiVLProcessor(ProcessorMixin):
+    """
+    NumPy-based processor for KimiVL that doesn't require torch/torchvision.
+
+    Constructs a KimiVL processor which wraps a KimiVL image processor and a tokenizer
+    into a single processor.
+    """
+
+    attributes = ["image_processor", "tokenizer"]
+    valid_kwargs = ["chat_template"]
+    image_processor_class = "KimiVLImageProcessor"
+    tokenizer_class = "AutoTokenizer"
+
+    def __init__(
+        self,
+        image_processor=None,
+        tokenizer=None,
+        chat_template=None,
+        **kwargs,
+    ):
+        self.image_token = "<|media_pad|>"
+        if image_processor is None:
+            image_processor = KimiVLImageProcessor()
+        super().__init__(image_processor, tokenizer, chat_template=chat_template)
+
+    def __call__(
+        self,
+        images: ImageInput = None,
+        text: Union[
+            TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]
+        ] = None,
+        **kwargs,
+    ) -> BatchFeature:
+        """
+        Main method to prepare for the model one or several sequences(s) and image(s).
+
+        Args:
+            images: The image or batch of images to be prepared.
+            text: The sequence or batch of sequences to be encoded.
+            return_tensors: If set, will return tensors of a particular framework.
+
+        Returns:
+            BatchFeature with input_ids, attention_mask, and pixel_values.
+        """
+        if images is None and text is None:
+            raise ValueError("You have to specify at least one of `images` or `text`.")
+
+        # Check if images and text inputs are reversed for BC
+        images, text = _validate_images_text_input_order(images, text)
+
+        # Extract return_tensors from kwargs
+        return_tensors = kwargs.pop("return_tensors", None)
+
+        # Convert "mlx" to "np" since transformers doesn't know about MLX
+        # MLX can work with numpy arrays directly
+        internal_return_tensors = "np" if return_tensors == "mlx" else return_tensors
+
+        # Process images (always use numpy for internal processing)
+        if images is not None:
+            image_inputs = self.image_processor(images, return_tensors="np")
+            image_grid_hws = image_inputs["image_grid_hws"]
+        else:
+            image_inputs = {}
+            image_grid_hws = None
+
+        # Process text
+        if isinstance(text, str):
+            text = [text]
+        elif text is not None and not isinstance(text, list):
+            raise ValueError(
+                "Invalid input text. Please provide a string, or a list of strings"
+            )
+
+        # Replace image tokens with the correct number of placeholder tokens
+        if image_grid_hws is not None and text is not None:
+            merge_length = (
+                self.image_processor.merge_kernel_size[0]
+                * self.image_processor.merge_kernel_size[1]
+            )
+            index = 0
+            for i in range(len(text)):
+                while self.image_token in text[i]:
+                    num_placeholders = int(
+                        np.prod(image_grid_hws[index]) // merge_length
+                    )
+                    text[i] = text[i].replace(
+                        self.image_token,
+                        "<|placeholder|>" * num_placeholders,
+                        1,
+                    )
+                    index += 1
+                text[i] = text[i].replace("<|placeholder|>", self.image_token)
+
+        # Tokenize text
+        # Note: The TikToken tokenizer doesn't work properly with transformers' standard
+        # __call__ method due to issues with the pad function. We use encode() directly.
+        if text is not None:
+            # Encode each text and build the result manually
+            all_input_ids = []
+            for t in text:
+                ids = self.tokenizer.encode(t)
+                all_input_ids.append(ids)
+
+            # Pad sequences to the same length if needed
+            max_len = max(len(ids) for ids in all_input_ids)
+            pad_token_id = self.tokenizer.pad_token_id or 0
+
+            padded_input_ids = []
+            attention_masks = []
+            for ids in all_input_ids:
+                padding_length = max_len - len(ids)
+                padded_ids = ids + [pad_token_id] * padding_length
+                mask = [1] * len(ids) + [0] * padding_length
+                padded_input_ids.append(padded_ids)
+                attention_masks.append(mask)
+
+            # Convert to numpy arrays
+            text_inputs = {
+                "input_ids": np.array(padded_input_ids),
+                "attention_mask": np.array(attention_masks),
+            }
+        else:
+            text_inputs = {}
+
+        return BatchFeature(data={**text_inputs, **image_inputs})
+
+    def batch_decode(self, *args, **kwargs):
+        """Forward to tokenizer's batch_decode."""
+        return self.tokenizer.batch_decode(*args, **kwargs)
+
+    def decode(self, *args, **kwargs):
+        """Forward to tokenizer's decode."""
+        return self.tokenizer.decode(*args, **kwargs)
+
+    @property
+    def model_input_names(self):
+        """Get the model input names from tokenizer and image processor."""
+        tokenizer_input_names = self.tokenizer.model_input_names
+        image_processor_input_names = self.image_processor.model_input_names
+        return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """Load the processor from a pretrained model path."""
+
+        kwargs.pop("trust_remote_code", None)
+
+        # Load tokenizer (always needs trust_remote_code=True for tiktoken)
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path,
+            trust_remote_code=True,
+            **kwargs,
+        )
+
+        # Load image processor config and create our processor
+        try:
+            config_dict = {}
+            with open(
+                Path(pretrained_model_name_or_path) / "config.json",
+                "r",
+                encoding="utf-8",
+            ) as f:
+                config_dict = json.load(f)
+            config = ModelConfig.from_dict(config_dict)
+            image_processor_config = {}
+            if hasattr(config, "vision_config"):
+                vision_config = config.vision_config
+                if hasattr(vision_config, "patch_size"):
+                    image_processor_config["patch_size"] = vision_config.patch_size
+                if hasattr(vision_config, "in_token_limit"):
+                    image_processor_config["in_token_limit"] = (
+                        vision_config.in_token_limit
+                    )
+                if hasattr(vision_config, "merge_kernel_size"):
+                    image_processor_config["merge_kernel_size"] = (
+                        vision_config.merge_kernel_size
+                    )
+        except Exception:
+            image_processor_config = {}
+
+        image_processor = KimiVLImageProcessor(**image_processor_config)
+
+        # Get chat template if available
+        chat_template = getattr(tokenizer, "chat_template", None)
+
+        return cls(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+        )
