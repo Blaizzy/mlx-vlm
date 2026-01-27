@@ -413,7 +413,7 @@ class LanguageModel(nn.Module):
 
     def __call__(
         self,
-        input_ids=None,
+        inputs=None,
         inputs_embeds=None,
         decoder_input_ids=None,
         decoder_inputs_embeds=None,
@@ -421,9 +421,10 @@ class LanguageModel(nn.Module):
         decoder_attention_mask=None,
         encoder_outputs=None,
         cache=None,
+        **kwargs,
     ):
         decoder_outputs, encoder_outputs = self.model(
-            input_ids,
+            inputs,
             inputs_embeds,
             decoder_input_ids,
             decoder_inputs_embeds,

@@ -6,6 +6,9 @@ import mlx.nn as nn
 from mlx.utils import tree_map
 
 from ..base import InputEmbeddingsFeatures
+
+# Import to apply Florence2Processor compatibility patch
+from . import processing_florence2  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -321,7 +324,7 @@ class Model(nn.Module):
 
         # Forward through language model
         outputs = self.language_model(
-            input_ids=input_ids,
+            inputs=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
