@@ -414,11 +414,11 @@ class KimiVLProcessor(ProcessorMixin):
         kwargs.pop("trust_remote_code", None)
 
         model_path = Path(pretrained_model_name_or_path)
-
-        # Load tokenizer using AutoTokenizer (uses pre-converted tokenizer.json, no tiktoken needed)
+        is_local = model_path.exists() and model_path.is_dir()
         tokenizer = AutoTokenizer.from_pretrained(
-            str(model_path) if model_path.exists() else pretrained_model_name_or_path,
-            local_files_only=model_path.exists() and model_path.is_dir(),
+            str(model_path) if is_local else pretrained_model_name_or_path,
+            trust_remote_code=True,
+            local_files_only=is_local,
         )
 
         # Load image processor config and create our processor
