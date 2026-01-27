@@ -70,6 +70,13 @@ class MockModel(nn.Module):
         inputs_embeds = mx.random.normal((batch_size, seq_len, 768))
         return MockInputEmbeddingsFeatures(inputs_embeds)
 
+    def get_input_embeddings(self, input_ids, pixel_values=None, **kwargs):
+        """Mock get_input_embeddings method."""
+        # Return mock embeddings with shape (batch, seq_len, hidden_dim)
+        batch_size, seq_len = input_ids.shape
+        inputs_embeds = mx.random.normal((batch_size, seq_len, 768))
+        return MockInputEmbeddingsFeatures(inputs_embeds)
+
     def __call__(self, *args, **kwargs):
         return self.return_value
 
