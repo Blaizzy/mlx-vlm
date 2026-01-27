@@ -100,7 +100,7 @@ def test_model_loading(model_path, trust_remote_code=False):
         console.print("[bold green]Loading model...")
         start_time = time.time()
         model, processor = load(model_path, trust_remote_code=trust_remote_code)
-        config = model.config
+        config = model.config.to_dict()
         end_time = time.time()
         console.print(
             f"[bold green]✓[/] Model loaded successfully in {end_time - start_time:.2f} seconds"
@@ -212,13 +212,7 @@ def main():
 
             # Test language-only generation
             error |= test_generation(
-                model,
-                processor,
-                config,
-                model_path,
-                test_inputs,
-                vision_language=False,
-                trust_remote_code=args.trust_remote_code,
+                model, processor, config, model_path, test_inputs, vision_language=False
             )
             print("\n")
 
