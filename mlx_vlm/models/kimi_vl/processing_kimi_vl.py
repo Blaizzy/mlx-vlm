@@ -401,6 +401,43 @@ class KimiVLProcessor(ProcessorMixin):
         """Forward to tokenizer's decode."""
         return self.tokenizer.decode(*args, **kwargs)
 
+    def apply_chat_template(
+        self,
+        conversation,
+        chat_template=None,
+        add_generation_prompt=False,
+        tokenize=False,
+        **kwargs,
+    ):
+        """Apply chat template to the conversation."""
+        # Use provided template, processor's template, or tokenizer's template
+        if chat_template is None:
+            chat_template = self.chat_template
+        if chat_template is None:
+            chat_template = getattr(self.tokenizer, "chat_template", None)
+        if chat_template is None:
+            raise ValueError(
+                "No chat template found. Please provide a chat_template argument "
+                "or ensure the tokenizer has a chat_template attribute."
+            )
+
+        # Use jinja2 to render the template
+        try:
+            from jinja2 import Template
+        except ImportError:
+            raise ImportError("jinja2 is required for apply_chat_template")
+
+        template = Template(chat_template)
+        rendered = template.render(
+            messages=conversation,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
+
+        if tokenize:
+            return self.tokenizer.encode(rendered)
+        return rendered
+
     @property
     def model_input_names(self):
         """Get the model input names from tokenizer and image processor."""
@@ -411,6 +448,8 @@ class KimiVLProcessor(ProcessorMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         """Load the processor from a pretrained model path."""
+        from huggingface_hub import hf_hub_download
+
         kwargs.pop("trust_remote_code", None)
 
         model_path = Path(pretrained_model_name_or_path)
@@ -422,16 +461,17 @@ class KimiVLProcessor(ProcessorMixin):
         )
 
         # Load image processor config and create our processor
+        image_processor_config = {}
         try:
-            config_dict = {}
-            with open(
-                Path(pretrained_model_name_or_path) / "config.json",
-                "r",
-                encoding="utf-8",
-            ) as f:
+            if is_local:
+                config_path = model_path / "config.json"
+            else:
+                config_path = Path(
+                    hf_hub_download(pretrained_model_name_or_path, "config.json")
+                )
+            with open(config_path, "r", encoding="utf-8") as f:
                 config_dict = json.load(f)
             config = ModelConfig.from_dict(config_dict)
-            image_processor_config = {}
             if hasattr(config, "vision_config"):
                 vision_config = config.vision_config
                 if hasattr(vision_config, "patch_size"):
@@ -445,12 +485,28 @@ class KimiVLProcessor(ProcessorMixin):
                         vision_config.merge_kernel_size
                     )
         except Exception:
-            image_processor_config = {}
+            pass
 
         image_processor = KimiVLImageProcessor(**image_processor_config)
 
-        # Get chat template if available
+        # Load chat template from jinja file if not already set on tokenizer
         chat_template = getattr(tokenizer, "chat_template", None)
+        if chat_template is None:
+            try:
+                if is_local:
+                    jinja_path = model_path / "chat_template.jinja"
+                else:
+                    jinja_path = Path(
+                        hf_hub_download(
+                            pretrained_model_name_or_path, "chat_template.jinja"
+                        )
+                    )
+                if jinja_path.exists():
+                    chat_template = jinja_path.read_text(encoding="utf-8")
+                    # Set chat_template on tokenizer so apply_chat_template works
+                    tokenizer.chat_template = chat_template
+            except Exception:
+                pass
 
         return cls(
             image_processor=image_processor,
@@ -469,18 +525,23 @@ def _patched_auto_processor_from_pretrained(
     cls, pretrained_model_name_or_path, **kwargs
 ):
     """Patched from_pretrained that returns KimiVLProcessor for kimi_vl models."""
-    import json
+    from huggingface_hub import hf_hub_download
 
     model_path = Path(pretrained_model_name_or_path)
+    is_local = model_path.exists() and model_path.is_dir()
 
     # Check if this is a kimi_vl model
     is_kimi_vl = False
     try:
-        config_path = model_path / "config.json"
-        if config_path.exists():
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-            is_kimi_vl = config.get("model_type", "").lower() == "kimi_vl"
+        if is_local:
+            config_path = model_path / "config.json"
+        else:
+            config_path = Path(
+                hf_hub_download(pretrained_model_name_or_path, "config.json")
+            )
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        is_kimi_vl = config.get("model_type", "").lower() == "kimi_vl"
     except Exception:
         pass
 
