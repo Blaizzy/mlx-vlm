@@ -346,7 +346,9 @@ class Model(nn.Module):
         total_tiles = mx.concatenate(total_tiles, axis=0)
 
         if total_tiles.shape[0] == 0:
-            return self.language_model.model.embed_tokens(input_ids)
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         # Get the input embeddings from the language model
         input_embeds = self.language_model.model.embed_tokens(input_ids)

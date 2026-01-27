@@ -94,7 +94,7 @@ def test_model_loading(model_path):
     try:
         console.print("[bold green]Loading model...")
         start_time = time.time()
-        model, processor = load(model_path, trust_remote_code=True)
+        model, processor = load(model_path)
         config = load_config(model_path, trust_remote_code=True)
         end_time = time.time()
         console.print(
