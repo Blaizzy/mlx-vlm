@@ -33,7 +33,6 @@ from transformers import __version__ as transformers_version
 
 from mlx_vlm import generate, load
 from mlx_vlm.prompt_utils import apply_chat_template
-from mlx_vlm.utils import load_config
 from mlx_vlm.version import __version__
 
 # Initialize console
@@ -69,6 +68,12 @@ def parse_args():
     parser.add_argument(
         "--max-tokens", type=int, default=100, help="Maximum tokens to generate"
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        default=False,
+        help="Trust remote code",
+    )
     parser.add_argument("--resize-shape", type=int, default=None, help="Resize shape")
     return parser.parse_args()
 
@@ -90,12 +95,12 @@ def get_device_info():
         return None
 
 
-def test_model_loading(model_path):
+def test_model_loading(model_path, trust_remote_code=False):
     try:
         console.print("[bold green]Loading model...")
         start_time = time.time()
-        model, processor = load(model_path)
-        config = load_config(model_path, trust_remote_code=True)
+        model, processor = load(model_path, trust_remote_code=trust_remote_code)
+        config = model.config
         end_time = time.time()
         console.print(
             f"[bold green]✓[/] Model loaded successfully in {end_time - start_time:.2f} seconds"
@@ -188,7 +193,9 @@ def main():
         console.print(Panel(f"Testing {model_path}", style="bold blue"))
 
         # Run tests
-        model, processor, config, error = test_model_loading(model_path)
+        model, processor, config, error = test_model_loading(
+            model_path, args.trust_remote_code
+        )
 
         if not error and model:
             print("\n")
@@ -205,7 +212,13 @@ def main():
 
             # Test language-only generation
             error |= test_generation(
-                model, processor, config, model_path, test_inputs, vision_language=False
+                model,
+                processor,
+                config,
+                model_path,
+                test_inputs,
+                vision_language=False,
+                trust_remote_code=args.trust_remote_code,
             )
             print("\n")
 
