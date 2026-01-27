@@ -289,23 +289,63 @@ class Qwen2Decoder2Encoder(nn.Module):
 
         # Create mixed attention mask:
         # - Image tokens can attend to all image tokens (bidirectional)
-        # - Query tokens use causal attention (each query attends to all image tokens + previous queries)
-        # Shape: (1, seq_len, seq_len) - will be broadcast across batch and heads
+        # - Image tokens CANNOT attend to query tokens (blocked)
+        # - Query tokens can attend to all image tokens
+        # - Query tokens use causal attention within queries (can attend to self + previous)
+        # Shape: (1, 1, seq_len, seq_len) - will be broadcast across batch and heads
         mask_dtype = hidden_states.dtype
 
-        # Create causal mask for query tokens only
-        # Image tokens (0 to num_image_tokens-1) can attend to all image tokens
-        # Query tokens (num_image_tokens to seq_len-1) use causal attention within queries
-        mask = mx.zeros((seq_len, seq_len), dtype=mask_dtype)
+        # Start with all positions blocked (large negative value)
+        mask = mx.full((seq_len, seq_len), -1e9, dtype=mx.float32)
 
-        # Apply causal masking only for query-to-query attention
-        query_start = num_image_tokens
-        for i in range(num_queries):
-            for j in range(i + 1, num_queries):
-                mask = mask.at[query_start + i, query_start + j].add(-1e9)
+        # 1. Image tokens can attend to all image tokens (bidirectional)
+        # mask[0:num_image_tokens, 0:num_image_tokens] = 0
+        image_to_image = mx.zeros(
+            (num_image_tokens, num_image_tokens), dtype=mx.float32
+        )
+        mask = mx.concatenate(
+            [
+                mx.concatenate(
+                    [image_to_image, mask[:num_image_tokens, num_image_tokens:]], axis=1
+                ),
+                mask[num_image_tokens:, :],
+            ],
+            axis=0,
+        )
 
-        # Reshape for attention: (1, 1, seq_len, seq_len)
-        attention_mask = mask[None, None, :, :]
+        # 2. Query tokens can attend to all image tokens
+        # mask[num_image_tokens:, 0:num_image_tokens] = 0
+        query_to_image = mx.zeros((num_queries, num_image_tokens), dtype=mx.float32)
+        mask = mx.concatenate(
+            [
+                mask[:num_image_tokens, :],
+                mx.concatenate(
+                    [query_to_image, mask[num_image_tokens:, num_image_tokens:]], axis=1
+                ),
+            ],
+            axis=0,
+        )
+
+        # 3. Query tokens use causal attention (can attend to self + previous queries)
+        # Create lower triangular mask for query-query region
+        query_causal = mx.tril(mx.zeros((num_queries, num_queries), dtype=mx.float32))
+        query_causal = query_causal + mx.triu(
+            mx.full((num_queries, num_queries), -1e9, dtype=mx.float32), k=1
+        )
+
+        # Update query-query region in mask
+        mask = mx.concatenate(
+            [
+                mask[:, :num_image_tokens],
+                mx.concatenate(
+                    [mask[:num_image_tokens, num_image_tokens:], query_causal], axis=0
+                ),
+            ],
+            axis=1,
+        )
+
+        # Cast to input dtype and reshape for attention: (1, 1, seq_len, seq_len)
+        attention_mask = mask.astype(mask_dtype)[None, None, :, :]
 
         # Create position IDs
         position_ids = mx.broadcast_to(
