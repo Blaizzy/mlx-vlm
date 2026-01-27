@@ -341,7 +341,7 @@ class Model(nn.Module):
                     1 + num_width_tiles * num_height_tiles
                 ).tolist()
 
-            total_tiles.append(pixel_values[idx, : batch_num_tiles[idx]])
+            total_tiles.append(pixel_values[idx][: batch_num_tiles[idx]])
 
         total_tiles = mx.concatenate(total_tiles, axis=0)
 
