@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.nn.utils import average_gradients
-from mlx.utils import tree_flatten, tree_map
+from mlx.utils import tree_map
 from tqdm import tqdm
 
 from .utils import grad_checkpoint, save_adapter, Colors
@@ -62,38 +62,75 @@ class TrainingArgs:
         default=1e-6,
         metadata={"help": "Minimum learning rate after decay."},
     )
+    full_finetune: bool = field(
+        default=False,
+        metadata={"help": "Fine-tune the full model instead of adapters."},
+    )
+    gradient_accumulation_steps: int = field(
+        default=1,
+        metadata={"help": "Number of steps to accumulate gradients before updating."},
+    )
 
 
 def vision_language_loss_fn(model, batch, train_on_completions=False, assistant_id=77091):
+    pixel_values = batch["pixel_values"]
     input_ids = batch["input_ids"]
     attention_mask = batch["attention_mask"]
-    pixel_values = batch.get("pixel_values", None)
-    
-    inputs = input_ids[:, :-1]
-    labels = input_ids[:, 1:]
-    
-    if pixel_values is not None:
-        logits = model(inputs, pixel_values, attention_mask[:, :-1]).logits
-        del pixel_values
-        mx.clear_cache()
-    else:
-        logits = model(inputs, attention_mask=attention_mask[:, :-1]).logits
-    
-    length_mask = mx.arange(labels.shape[1]) < (mx.sum(attention_mask, axis=1, keepdims=True) - 1)
-    
+
+    batch_size, seq_length = input_ids.shape
+
     if train_on_completions:
-        assistant_mask = input_ids == assistant_id
-        assistant_positions = mx.argmax(assistant_mask.astype(mx.int32), axis=1)
-        pos_indices = mx.arange(labels.shape[1])[None, :]
-        weight_mask = pos_indices >= assistant_positions[:, None]
-        has_assistant = mx.any(assistant_mask, axis=1, keepdims=True)
-        weight_mask = mx.where(has_assistant, weight_mask, mx.ones_like(weight_mask))
-        mask = length_mask.astype(mx.float32) * weight_mask.astype(mx.float32)
+        weight_mask = mx.ones_like(attention_mask)
+
+        assistant_response_index = np.where(input_ids == assistant_id)[1]
+        range_matrix = mx.repeat(
+            mx.expand_dims(mx.arange(seq_length), 0), batch_size, axis=0
+        )
+        assistant_mask = range_matrix <= mx.array(assistant_response_index).reshape(
+            -1, 1
+        )
+        weight_mask = mx.where(
+            assistant_mask, mx.zeros_like(weight_mask), weight_mask
+        )[:, 1:]
     else:
-        mask = length_mask
+        weight_mask = None
+
+    input_ids = input_ids[:, :-1]
+    attention_mask = attention_mask[:, :-1]
+
+    lengths = mx.sum(attention_mask, axis=1)
+
+    labels = batch["input_ids"][:, 1:]
+
+    kwargs = {
+        k: v
+        for k, v in batch.items()
+        if k not in ["input_ids", "pixel_values", "attention_mask"]
+    }
+
+    outputs = model(input_ids, pixel_values, attention_mask, **kwargs)
+    logits = outputs.logits.astype(mx.float32)
+
+    def align_logits_with_labels(logits, labels):
+        if logits.shape[1] < labels.shape[1]:
+            pad_length = labels.shape[1] - logits.shape[1]
+            pad_width = ((0, 0), (0, pad_length), (0, 0))
+            return mx.pad(logits, pad_width, mode="constant", constant_values=-100)
+        elif logits.shape[1] > labels.shape[1]:
+            return logits[:, -labels.shape[1] :, :]
+        return logits
+
+    logits = align_logits_with_labels(logits, labels)
     
-    ce = nn.losses.cross_entropy(logits.astype(mx.float32), labels, reduction='none')
-    return (ce * mask).sum() / mask.sum()
+    seq_len = input_ids.shape[1]
+    lengths = mx.minimum(lengths, seq_len)
+    length_mask = mx.arange(seq_len)[None, :] < lengths[:, None]
+    
+    ce = (nn.losses.cross_entropy(logits, labels, weights=weight_mask,)* length_mask)
+    ntoks = length_mask.sum()
+    ce = ce.sum() / ntoks
+
+    return (ce * length_mask).sum() / length_mask.sum()
 
 
 def iterate_batches(dataset, batch_size, max_seq_length, train=False):
@@ -135,13 +172,19 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                 else:
                     attention_mask_batch[i, :L] = 1
 
+            pixel_values_batch = None
+            if "pixel_values" in items[0] and items[0]["pixel_values"] is not None:
+                pixel_values_batch = mx.stack(
+                    [item["pixel_values"] for item in items]
+                )
+            
             yield {
                 "input_ids": mx.array(input_ids_batch),
                 "attention_mask": mx.array(attention_mask_batch),
+                "pixel_values": pixel_values_batch
             }
         if not train:
             break
-        mx.clear_cache()
 
 
 def evaluate(
@@ -234,6 +277,10 @@ def train(
             if hasattr(module, 'layers'):
                 grad_checkpoint(module.layers[0])
     
+    grad_accum_steps = args.gradient_accumulation_steps
+    if grad_accum_steps < 1 and args:
+        raise ValueError("gradient_accumulation_steps must be at least 1")
+    
     # Create loss function with partial application
     loss_fn_partial = partial(
         loss_fn,
@@ -241,10 +288,8 @@ def train(
         assistant_id=assistant_id
     )
     
-    # Compile the training step (like MLX-LM)
-    state = [model.state, optimizer.state, mx.random.state]
+    state = [model.state, optimizer.state]
     
-    @partial(mx.compile, inputs=state, outputs=state)
     def step(batch):
         # Calculate number of tokens for metrics
         if "attention_mask" in batch:
@@ -262,10 +307,6 @@ def train(
                 grad
             )
 
-        # Average gradients for distributed training
-        grad = average_gradients(grad)
-
-        # Update model
         optimizer.update(model, grad)
 
         return lvalue, toks
@@ -302,7 +343,7 @@ def train(
                 batch_size=args.batch_size,
                 num_batches=args.val_batches,
                 max_seq_length=args.max_seq_length,
-                loss_fn=loss_fn,
+                loss_fn=loss_fn_partial,
                 train_on_completions=train_on_completions,
                 assistant_id=assistant_id,
             )

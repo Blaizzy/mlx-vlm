@@ -30,7 +30,9 @@ supported_for_training = {
     "multi_modality",
     "deepseek_vl_v2",
     "gemma3",
-    "aya_vision"
+    "aya_vision",
+    "smolvlm",
+    "idefics3"
 }
 
 def grad_checkpoint(layer):
