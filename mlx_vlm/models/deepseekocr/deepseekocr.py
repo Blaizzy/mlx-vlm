@@ -1,4 +1,3 @@
-import math
 from typing import Optional
 
 import mlx.core as mx
@@ -7,7 +6,7 @@ import numpy as np
 from transformers import AutoProcessor
 
 from ..base import InputEmbeddingsFeatures
-from .config import ModelConfig, ProjectorConfig, SAMViTConfig
+from .config import ModelConfig, SAMViTConfig
 from .language import LanguageModel
 from .processing_deepseekocr import DeepseekVLV2Processor
 from .sam import SAMEncoder
@@ -17,85 +16,21 @@ AutoProcessor.register("deepseekocr", DeepseekVLV2Processor)
 
 
 class MlpProjector(nn.Module):
-    def __init__(self, config: ProjectorConfig):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
 
         if config.projector_config.projector_type == "linear":
-            modules = nn.Linear(
+            self.layers = nn.Linear(
                 config.projector_config.input_dim, config.projector_config.n_embed
-            )
-
-        elif config.projector_config.projector_type == "downsample_mlp_gelu":
-            mlp_depth = config.projector_config.depth
-            mlp_ratio = config.projector_config.mlp_ratio
-            modules = [
-                nn.Linear(
-                    config.projector_config.input_dim
-                    * config.projector_config.downsample_ratio
-                    * config.projector_config.downsample_ratio,
-                    config.projector_config.n_embed * mlp_ratio,
-                )
-            ]
-            for _ in range(1, mlp_depth - 1):
-                modules.append(nn.GELU())
-                modules.append(
-                    nn.Linear(
-                        config.projector_config.n_embed * mlp_ratio,
-                        config.projector_config.n_embed * mlp_ratio,
-                    )
-                )
-            modules.append(nn.GELU())
-            modules.append(
-                nn.Linear(
-                    config.projector_config.n_embed * mlp_ratio,
-                    config.projector_config.n_embed,
-                )
             )
         else:
             raise ValueError(
                 f"Unknown projector type: {config.projector_config.projector_type}"
             )
 
-        self.layers = modules
-
     def __call__(self, x):
-        if self.config.projector_config.projector_type == "downsample_mlp_gelu":
-            bs, hw, input_dim = x.shape
-            h = w = int(math.sqrt(hw))
-
-            # Compute padding
-            pad = (
-                0
-                if h % self.config.projector_config.downsample_ratio == 0
-                else self.config.projector_config.downsample_ratio
-                - h % self.config.projector_config.downsample_ratio
-            )
-
-            x = mx.reshape(x, (bs, h, w, input_dim))
-            if pad > 0:
-                x = mx.pad(x, [(0, 0), (0, pad), (0, pad), (0, 0)], constant_values=0)
-
-            x = mx.transpose(x, (0, 3, 1, 2))  # B, C, H, W
-
-            # Manual implementation of unfold for downsampling
-            h_pad, w_pad = x.shape[2], x.shape[3]
-            ds = self.config.projector_config.downsample_ratio
-            patches = []
-
-            for i in range(0, h_pad - ds + 1, ds):
-                for j in range(0, w_pad - ds + 1, ds):
-                    patch = x[:, :, i : i + ds, j : j + ds]
-                    patches.append(mx.reshape(patch, (bs, -1)))
-
-            x = mx.stack(patches, axis=1)  # B, N_patches, C*ds*ds
-
-        if self.config.projector_config.projector_type == "linear":
-            x = self.layers(x)
-        else:
-            for layer in self.layers:
-                x = layer(x)
-        return x
+        return self.layers(x)
 
 
 class Model(nn.Module):
@@ -115,23 +50,17 @@ class Model(nn.Module):
         )
         self.language_model = LanguageModel(config.text_config)
         self.projector = MlpProjector(config)
-        self.vision_feature_layer = config.select_layer
-        self.vision_feature_select_strategy = config.vision_feature_select_strategy
 
         self.tile_tag = config.tile_tag
         self.global_view_pos = config.global_view_pos
-        # 用于format image token sequence的特殊token
+
+        # Only view_separator is used in DeepSeek-OCR-2 (no image_newline)
         embed_std = 1 / mx.sqrt(
             mx.array(config.projector_config.n_embed, dtype=mx.float32)
         )
 
         if self.tile_tag == "2D":
-
-            # <|view_separator|>, <|\n|>
-            self.image_newline = mx.array(
-                mx.random.normal((config.projector_config.n_embed,)) * embed_std
-            )
-            # fix the typo: view_seperater
+            # <|view_separator|> - marks end of image features
             self.view_separator = mx.array(
                 mx.random.normal((config.projector_config.n_embed,)) * embed_std
             )
@@ -153,159 +82,61 @@ class Model(nn.Module):
         if pixel_values is None:
             return InputEmbeddingsFeatures(inputs_embeds=input_embeds)
 
-        if (
-            self.sam_model is not None
-            and (input_ids.shape[1] != 1 or self.training)
-            and mx.sum(pixel_values[1]).item() != 0
-        ):
+        # pixel_values is a list: [patches, global_images]
+        # For DeepSeek-OCR-2 with Qwen2 encoder, we only use global_images
+        if isinstance(pixel_values, list):
+            _, global_images = pixel_values
+        else:
+            global_images = pixel_values
 
-            idx = 0
-            patch_idx = 0  # Track patch offset for batch processing
-            all_patches = pixel_values[0]
-            all_image_ori = pixel_values[1]
+        # Check if we have valid pixel values
+        if mx.sum(global_images).item() == 0:
+            return InputEmbeddingsFeatures(inputs_embeds=input_embeds)
 
-            for crop_shape in images_spatial_crop.tolist():
-                images_in_this_batch = []
-                width_crop_num, height_crop_num = int(crop_shape[0]), int(crop_shape[1])
+        # Process images through SAM -> Qwen2 -> Projector pipeline
+        batch_size = input_ids.shape[0]
 
-                # Calculate number of patches for this image
-                has_crops = width_crop_num > 1 or height_crop_num > 1
-                num_patches = width_crop_num * height_crop_num if has_crops else 0
+        for idx in range(batch_size):
+            # Get the image for this batch item
+            # global_images is (N, C, H, W) where N is number of images
+            image = global_images[idx : idx + 1]  # Keep batch dimension
 
-                # Extract patches for current image
-                if has_crops and num_patches > 0:
-                    patches = all_patches[patch_idx : patch_idx + num_patches]
-                    patch_idx += num_patches
-                else:
-                    patches = None
+            # Transpose to (B, H, W, C) for MLX conv2d
+            image_hwc = image.transpose(0, 2, 3, 1)
 
-                # Extract global image for current image (one per batch item)
-                image_ori = all_image_ori[idx : idx + 1]
+            # SAM encoder: (B, H, W, C) -> (B, H', W', 896)
+            sam_features = self.sam_model(image_hwc)
 
-                if patches is not None and mx.sum(patches).item() != 0:
-                    local_features_1 = self.sam_model(patches.transpose(0, 2, 3, 1))
+            # Qwen2 encoder: (B, H', W', 896) -> (B, 256, 896)
+            vision_features = self.vision_model(image_hwc, sam_features)
 
-                    local_features_2 = self.vision_model(
-                        patches.transpose(0, 2, 3, 1), patch_embeds=local_features_1
-                    )
+            # Linear projector: (B, 256, 896) -> (B, 256, 1280)
+            vision_features = self.projector(vision_features)
 
-                    local_features = mx.concatenate(
-                        (
-                            local_features_2[:, 1:],
-                            local_features_1.flatten(start_axis=1, end_axis=2),
-                        ),
-                        axis=-1,
-                    )
+            # Remove batch dimension: (256, 1280)
+            vision_features = vision_features[0]
 
-                    local_features = self.projector(local_features)
+            # Add view_separator: (257, 1280)
+            vision_features = mx.concatenate(
+                [vision_features, self.view_separator[None, :]], axis=0
+            )
 
-                    global_features_1 = self.sam_model(image_ori.transpose(0, 2, 3, 1))
-                    global_features_2 = self.vision_model(
-                        image_ori.transpose(0, 2, 3, 1), global_features_1
-                    )
-
-                    global_features = mx.concatenate(
-                        (
-                            global_features_2[:, 1:],
-                            global_features_1.flatten(start_axis=1, end_axis=2),
-                        ),
-                        axis=-1,
-                    )
-                    global_features = self.projector(global_features)
-
-                    # Remove batch dimension for single image processing
-                    global_features = global_features[0]  # (hw, n_dim)
-                    hw, n_dim = global_features.shape
-                    h = w = int(hw**0.5)
-
-                    _, hw2, n_dim2 = local_features.shape
-                    h2 = w2 = int(hw2**0.5)
-
-                    global_features = global_features.reshape(h, w, n_dim)
-
-                    global_features = mx.concatenate(
-                        [
-                            global_features,
-                            mx.broadcast_to(
-                                self.image_newline[None, None, :], (h, 1, n_dim)
-                            ),
-                        ],
-                        axis=1,
-                    )
-
-                    global_features = global_features.reshape(-1, n_dim)
-
-                    local_features = (
-                        local_features.reshape(
-                            height_crop_num, width_crop_num, h2, w2, n_dim2
+            # Find positions where images should be placed
+            if images_seq_mask is not None:
+                image_indices = np.where(images_seq_mask[idx])[0].tolist()
+                # Assign image features to those positions
+                if len(image_indices) > 0:
+                    # Truncate or pad vision_features to match number of image tokens
+                    num_positions = len(image_indices)
+                    if vision_features.shape[0] >= num_positions:
+                        input_embeds[idx, image_indices] = vision_features[
+                            :num_positions
+                        ]
+                    else:
+                        # Pad with zeros if needed
+                        input_embeds[idx, image_indices[: vision_features.shape[0]]] = (
+                            vision_features
                         )
-                        .transpose(0, 2, 1, 3, 4)
-                        .reshape(height_crop_num * h2, width_crop_num * w2, n_dim2)
-                    )
-                    local_features = mx.concatenate(
-                        [
-                            local_features,
-                            mx.broadcast_to(
-                                self.image_newline[None, None, :],
-                                (height_crop_num * h2, 1, n_dim2),
-                            ),
-                        ],
-                        axis=1,
-                    )
-                    local_features = local_features.reshape(-1, n_dim2)
-
-                    global_local_features = mx.concatenate(
-                        [local_features, global_features, self.view_separator[None, :]],
-                        axis=0,
-                    )
-
-                else:
-                    global_features_1 = self.sam_model(image_ori.transpose(0, 2, 3, 1))
-                    global_features_2 = self.vision_model(
-                        image_ori.transpose(0, 2, 3, 1), global_features_1
-                    )
-                    global_features = mx.concatenate(
-                        (
-                            global_features_2[:, 1:],
-                            global_features_1.flatten(start_axis=1, end_axis=2),
-                        ),
-                        axis=-1,
-                    )
-                    global_features = self.projector(global_features)
-
-                    # Remove batch dimension for single image processing
-                    global_features = global_features[0]  # (hw, n_dim)
-                    hw, n_dim = global_features.shape
-                    h = w = int(hw**0.5)
-
-                    global_features = global_features.reshape(h, w, n_dim)
-
-                    global_features = mx.concatenate(
-                        [
-                            global_features,
-                            mx.broadcast_to(
-                                self.image_newline[None, None, :], (h, 1, n_dim)
-                            ),
-                        ],
-                        axis=1,
-                    )
-
-                    global_features = global_features.reshape(-1, n_dim)
-
-                    global_local_features = mx.concatenate(
-                        [global_features, self.view_separator[None, :]], axis=0
-                    )
-
-                images_in_this_batch.append(global_local_features)
-
-                if images_in_this_batch:
-                    images_in_this_batch = mx.concatenate(images_in_this_batch, axis=0)
-                    # Find positions where images should be placed
-                    image_indices = np.where(images_seq_mask[idx])[0].tolist()
-                    # Directly assign the image features to those positions
-                    input_embeds[idx, image_indices] = images_in_this_batch
-
-                idx += 1
 
         return InputEmbeddingsFeatures(inputs_embeds=input_embeds)
 
@@ -321,7 +152,6 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-
         images_spatial_crop = kwargs.get("images_spatial_crop", None)
         images_seq_mask = kwargs.get("images_seq_mask", None)
 
@@ -339,15 +169,68 @@ class Model(nn.Module):
     @staticmethod
     def sanitize(weights):
         def transform_key(key):
-            if "model.layers" in key and "language_model" not in key:
+            # Handle Qwen2 encoder weights from HuggingFace format
+            # HuggingFace: model.qwen2_model.model.model.layers.X...
+            # MLX: vision_model.qwen2_encoder.layers.X...
+            if "qwen2_model.model.model.layers" in key:
+                key = key.replace(
+                    "model.qwen2_model.model.model.layers",
+                    "vision_model.qwen2_encoder.layers",
+                )
+
+            # Handle Qwen2 encoder norm
+            if "qwen2_model.model.model.norm" in key:
+                key = key.replace(
+                    "model.qwen2_model.model.model.norm",
+                    "vision_model.qwen2_encoder.norm",
+                )
+
+            # Handle query weights (learnable queries for Qwen2 encoder)
+            # HuggingFace has query_768.weight but we use plain array query_768
+            if "model.qwen2_model.query_768.weight" in key:
+                key = key.replace(
+                    "model.qwen2_model.query_768.weight",
+                    "vision_model.qwen2_encoder.query_768",
+                )
+            elif "model.qwen2_model.query_768" in key:
+                key = key.replace(
+                    "model.qwen2_model.query_768",
+                    "vision_model.qwen2_encoder.query_768",
+                )
+            # Also handle query_1024 variant if present
+            if "qwen2_model.query_1024.weight" in key:
+                key = key.replace(
+                    "model.qwen2_model.query_1024.weight",
+                    "vision_model.qwen2_encoder.query_768",
+                )
+            elif "qwen2_model.query_1024" in key:
+                key = key.replace(
+                    "model.qwen2_model.query_1024",
+                    "vision_model.qwen2_encoder.query_768",
+                )
+
+            # Language model layers
+            if (
+                "model.layers" in key
+                and "language_model" not in key
+                and "qwen2" not in key
+            ):
                 key = key.replace("model.layers", "language_model.model.layers")
 
-            if "model.embed_tokens" in key and "language_model" not in key:
+            if (
+                "model.embed_tokens" in key
+                and "language_model" not in key
+                and "qwen2" not in key
+            ):
                 key = key.replace(
                     "model.embed_tokens", "language_model.model.embed_tokens"
                 )
 
-            if "model.norm" in key and "language_model" not in key:
+            if (
+                "model.norm" in key
+                and "language_model" not in key
+                and "qwen2" not in key
+            ):
                 key = key.replace("model.norm", "language_model.model.norm")
 
             if "model.vision_model" in key:
@@ -359,11 +242,9 @@ class Model(nn.Module):
             if "model.projector" in key:
                 key = key.replace("model.projector", "projector")
 
+            # Note: HuggingFace has typo "view_seperator" (e instead of a)
             if "model.view_seperator" in key:
                 key = key.replace("model.view_seperator", "view_separator")
-
-            if "model.image_newline" in key:
-                key = key.replace("model.image_newline", "image_newline")
 
             if "lm_head.weight" in key and "language_model" not in key:
                 key = key.replace("lm_head.weight", "language_model.lm_head.weight")

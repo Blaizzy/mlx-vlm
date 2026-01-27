@@ -312,9 +312,7 @@ class SAMEncoder(nn.Module):
 
         # Additional downsampling layers
         self.net_2 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1, bias=False)
-        self.net_3 = nn.Conv2d(
-            512, 1024, kernel_size=3, stride=2, padding=1, bias=False
-        )
+        self.net_3 = nn.Conv2d(512, 896, kernel_size=3, stride=2, padding=1, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
         # Patch embedding

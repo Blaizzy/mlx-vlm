@@ -47,20 +47,63 @@ class TextConfig(BaseModelConfig):
 
 
 @dataclass
+class Qwen2EncoderConfig(BaseModelConfig):
+    """Configuration for the Qwen2 decoder-as-encoder in the vision model."""
+
+    dim: int = 896
+    layers: int = 24
+    heads: int = 14
+    kv_heads: int = 2
+    intermediate_size: int = 4864
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 1000000.0
+
+
+@dataclass
 class VisionConfig(BaseModelConfig):
     model_type: str
     layers: int = 24
     width: int = 1152
-    hidden_size: int = 1024
+    hidden_size: int = 896
     intermediate_size: int = 4096
     num_attention_heads: int = 16
-    image_size: int = 224
+    image_size: int = 1024
     patch_size: int = 14
     num_channels: int = 3
     layer_norm_eps: float = 1e-6
     mlp_ratio: float = 3.7362
     cls: str = None
     params: dict = None
+
+    @classmethod
+    def from_dict(cls, params):
+        # Parse width configuration for SAM and Qwen2
+        width = params.get("width", {})
+        qwen2_config = width.get("qwen2-0-5b", {})
+        sam_config = width.get("sam_vit_b", {})
+
+        # Build qwen2 params for VisionModel
+        qwen2_params = {
+            "dim": qwen2_config.get("dim", 896),
+            "layers": 24,  # Default for Qwen2 encoder
+            "heads": 14,
+            "kv_heads": 2,
+            "intermediate_size": 4864,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+        }
+
+        # Update params to include qwen2 config
+        if params.get("params") is None:
+            params["params"] = {}
+        params["params"]["qwen2"] = qwen2_params
+        params["params"]["sam"] = sam_config
+
+        # Set hidden_size from qwen2 dim
+        if "hidden_size" not in params:
+            params["hidden_size"] = qwen2_config.get("dim", 896)
+
+        return super().from_dict(params)
 
 
 @dataclass

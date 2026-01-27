@@ -2,7 +2,6 @@
 From https://github.com/deepseek-ai/DeepSeek-VL2
 """
 
-import math
 from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Tuple
 
@@ -344,145 +343,53 @@ class DeepseekVLV2Processor(ProcessorMixin):
         image_size: int = 640,
         cropping: bool = True,
     ):
+        """Tokenize text with <image> tags.
 
-        patch_size = 16
-        downsample_ratio = 4
-        valid_img_tokens = 0
-        ratio = 1
+        For DeepSeek-OCR-2 with Qwen2 encoder, each image always produces
+        exactly 257 tokens: 256 from Qwen2 encoder + 1 view_separator.
+        """
+        # Fixed number of tokens per image for Qwen2 encoder architecture
+        NUM_IMAGE_TOKENS = 257  # 256 from Qwen2 queries + 1 view_separator
 
-        image_draw = images[0].copy()
-
-        w, h = image_draw.size
-
-        ratio = 1 - ((max(w, h) - min(w, h)) / (max(w, h)))
-
-        """Tokenize text with <image> tags."""
         assert conversation.count(self.image_token) == len(
             images
         ), f"The number of image tokens in the prompt does not match the number of images: {conversation.count(self.image_token)} != {len(images)}"
+
         text_splits = conversation.split(self.image_token)
 
-        images_list, images_crop_list, images_seq_mask = [], [], []
+        images_list = []
+        images_seq_mask = []
         tokenized_str = []
         images_spatial_crop = []
-        for text_sep, image in zip(text_splits, images):
 
+        for text_sep, image in zip(text_splits, images):
+            # Tokenize the text before this image
             tokenized_sep = self.encode(text_sep, bos=False, eos=False)
             tokenized_str += tokenized_sep
             images_seq_mask += [False] * len(tokenized_sep)
 
-            if cropping:
+            # Process image: pad to base_size x base_size
+            global_view = ImageOps.pad(
+                image,
+                (base_size, base_size),
+                color=tuple(int(x * 255) for x in self.image_transform.mean),
+            )
+            images_list.append(self.image_transform(global_view).astype(mx.bfloat16))
 
-                if image.size[0] <= 640 and image.size[1] <= 640:
-                    crop_ratio = [1, 1]
+            # No cropping for Qwen2 encoder - single image processing
+            images_spatial_crop.append([1, 1])
 
-                else:
-                    if cropping:
-                        # best_width, best_height = select_best_resolution(image.size, self.candidate_resolutions)
-                        images_crop_raw, crop_ratio = dynamic_preprocess(image)
+            # Add fixed number of image tokens (257 = 256 + 1 view_separator)
+            tokenized_image = [self.image_token_id] * NUM_IMAGE_TOKENS
+            tokenized_str += tokenized_image
+            images_seq_mask += [True] * len(tokenized_image)
 
-                    else:
-                        # best_width, best_height = self.image_size, self.image_size
-                        crop_ratio = [1, 1]
-
-                """process the global view"""
-                # image = image.resize((base_size, base_size))
-                global_view = ImageOps.pad(
-                    image,
-                    (base_size, base_size),
-                    color=tuple(int(x * 255) for x in self.image_transform.mean),
-                )
-
-                if base_size == 1024:
-                    valid_img_tokens += int(256 * ratio)
-                elif base_size == 1280:
-                    valid_img_tokens += int(400 * ratio)
-                elif base_size == 640:
-                    valid_img_tokens += int(100 * ratio)
-
-                images_list.append(
-                    self.image_transform(global_view).astype(mx.bfloat16)
-                )
-
-                width_crop_num, height_crop_num = crop_ratio
-
-                images_spatial_crop.append([width_crop_num, height_crop_num])
-
-                if width_crop_num > 1 or height_crop_num > 1:
-                    """process the local views"""
-
-                    for i in range(len(images_crop_raw)):
-                        images_crop_list.append(
-                            self.image_transform(images_crop_raw[i]).astype(mx.bfloat16)
-                        )
-
-                if image_size == 640:
-                    valid_img_tokens += len(images_crop_list) * 100
-
-                num_queries = math.ceil((image_size // patch_size) / downsample_ratio)
-                num_queries_base = math.ceil(
-                    (base_size // patch_size) / downsample_ratio
-                )
-
-                """add image tokens"""
-
-                tokenized_image = (
-                    [self.image_token_id] * num_queries_base + [self.image_token_id]
-                ) * num_queries_base
-                tokenized_image += [self.image_token_id]
-                if width_crop_num > 1 or height_crop_num > 1:
-                    tokenized_image += (
-                        [self.image_token_id] * (num_queries * width_crop_num)
-                        + [self.image_token_id]
-                    ) * (num_queries * height_crop_num)
-                tokenized_str += tokenized_image
-                images_seq_mask += [True] * len(tokenized_image)
-
-            else:
-
-                """process the global view"""
-                if image_size <= 640:
-                    print("directly resize")
-                    image = image.resize((image_size, image_size))
-
-                global_view = ImageOps.pad(
-                    image,
-                    (image_size, image_size),
-                    color=tuple(int(x * 255) for x in self.image_transform.mean),
-                )
-                images_list.append(
-                    self.image_transform(global_view).astype(mx.bfloat16)
-                )
-
-                if base_size == 1024:
-                    valid_img_tokens += int(256 * ratio)
-                elif base_size == 1280:
-                    valid_img_tokens += int(400 * ratio)
-                elif base_size == 640:
-                    valid_img_tokens += int(100 * 1)
-                elif base_size == 512:
-                    valid_img_tokens += int(64 * 1)
-
-                width_crop_num, height_crop_num = 1, 1
-
-                images_spatial_crop.append([width_crop_num, height_crop_num])
-
-                """add image tokens"""
-                num_queries = math.ceil((image_size // patch_size) / downsample_ratio)
-
-                tokenized_image = (
-                    [self.image_token_id] * num_queries + [self.image_token_id]
-                ) * num_queries
-                tokenized_image += [self.image_token_id]
-
-                tokenized_str += tokenized_image
-                images_seq_mask += [True] * len(tokenized_image)
-
+        # Tokenize the text after the last image
         tokenized_sep = self.encode(text_splits[-1], bos=False, eos=False)
         tokenized_str += tokenized_sep
         images_seq_mask += [False] * len(tokenized_sep)
 
-        """add the bos tokens"""
+        # Add the bos token
         bos_id = 0
         tokenized_str = [bos_id] + tokenized_str
         images_seq_mask = [False] + images_seq_mask
@@ -490,28 +397,25 @@ class DeepseekVLV2Processor(ProcessorMixin):
         images_seq_mask = mx.array(images_seq_mask)
 
         if len(images_list) == 0:
-            images_ori = mx.zeros((1, 3, image_size, image_size))
+            images_ori = mx.zeros((1, 3, base_size, base_size))
             images_spatial_crop = mx.zeros((1, 2))
-            images_crop = mx.zeros((1, 3, base_size, base_size))
-
         else:
             images_ori = mx.stack(images_list, axis=0)
             images_spatial_crop = mx.array(images_spatial_crop)
-            if images_crop_list:
-                images_crop = mx.stack(images_crop_list, axis=0)
-            else:
-                images_crop = mx.zeros((1, 3, base_size, base_size))
+
+        # No crop images for Qwen2 encoder architecture
+        images_crop = mx.zeros((1, 3, base_size, base_size))
 
         assert len(tokenized_str) == len(
             images_seq_mask
-        ), f"tokenize_with_images func: tokenized_str's length {len(tokenized_str)} is not equal to imags_seq_mask's length {len(images_seq_mask)}"
+        ), f"tokenize_with_images func: tokenized_str's length {len(tokenized_str)} is not equal to images_seq_mask's length {len(images_seq_mask)}"
 
         return (
             tokenized_str,
             [images_crop, images_ori],
             images_seq_mask,
             images_spatial_crop,
-            valid_img_tokens,
+            NUM_IMAGE_TOKENS,
         )
 
     def __call__(

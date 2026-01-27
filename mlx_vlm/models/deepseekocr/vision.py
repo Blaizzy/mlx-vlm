@@ -1,12 +1,9 @@
-import math
-from typing import Dict, Optional, Union
+from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
-from ..base import interpolate
-from .config import VisionConfig
+from .config import Qwen2EncoderConfig, VisionConfig
 
 
 def check_array_shape(arr):
@@ -25,208 +22,332 @@ def check_array_shape(arr):
         return False
 
 
-class Attention(nn.Module):
+class Qwen2RMSNorm(nn.Module):
+    """RMSNorm for Qwen2 encoder."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = mx.ones((hidden_size,))
+        self.variance_epsilon = eps
+
+    def __call__(self, hidden_states: mx.array) -> mx.array:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.astype(mx.float32)
+        variance = mx.mean(hidden_states**2, axis=-1, keepdims=True)
+        hidden_states = hidden_states * mx.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.astype(input_dtype)
+
+
+class Qwen2RotaryEmbedding(nn.Module):
+    """Rotary position embeddings for Qwen2."""
+
     def __init__(
-        self,
-        dims: int,
-        num_heads: int,
-        qkv_bias: bool = True,
+        self, dim: int, max_position_embeddings: int = 2048, base: float = 1000000.0
     ):
         super().__init__()
-
-        if (dims % num_heads) != 0:
-            raise ValueError(
-                "The input feature dimensions should be divisible by the "
-                f"number of heads ({dims} % {num_heads}) != 0"
-            )
-
-        self.num_heads = num_heads = num_heads
-        head_dim = dims // num_heads
-        self.scale = head_dim**-0.5
-
-        self.qkv_proj = nn.Linear(dims, dims * 3, bias=qkv_bias)
-        self.out_proj = nn.Linear(dims, dims, bias=True)
-
-    def __call__(self, x, mask=None):
-        qkv = self.qkv_proj(x)
-        queries, keys, values = mx.split(qkv, 3, axis=-1)
-
-        num_heads = self.num_heads
-        B, L, D = queries.shape
-        _, S, _ = keys.shape
-        queries = queries.reshape(B, L, num_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
-
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
-        )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-
-        return self.out_proj(output)
-
-
-class MLP(nn.Module):
-    def __init__(self, config: Union[VisionConfig, Dict], bias: bool = True):
-        super().__init__()
-        self.activation_fn = nn.GELU()
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=bias)
-        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=bias)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        x = self.activation_fn(self.fc1(x))
-        x = self.fc2(x)
-        return x
-
-
-class EncoderLayer(nn.Module):
-    def __init__(self, config: VisionConfig):
-        super().__init__()
-        self.embed_dim = config.hidden_size
-        self.self_attn = Attention(
-            config.hidden_size, config.num_attention_heads, qkv_bias=True
-        )
-        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        self.mlp = MLP(config)
-        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-
-    def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
-        y = self.layer_norm1(x)
-        y = self.self_attn(y, mask)
-        x = x + y
-        y = self.layer_norm2(x)
-        y = self.mlp(y)
-        return x + y
-
-
-class VisionEmbeddings(nn.Module):
-    def __init__(self, config: VisionConfig):
-        super().__init__()
-        self.config = config
-        self.embed_dim = config.hidden_size
-        self.image_size = 224
-        self.patch_size = config.patch_size
-
-        self.class_embedding = mx.random.normal((self.embed_dim,))
-
-        self.patch_embedding = nn.Conv2d(
-            in_channels=config.num_channels,
-            out_channels=self.embed_dim,
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
-            bias=False,
-        )
-
-        self.num_patches = (self.image_size // self.patch_size) ** 2
-        self.num_positions = self.num_patches + 1
-        self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
-
-    def _get_abs_pos(self, abs_pos, tgt_size):
-        """
-        Resize absolute positional embeddings
-
-        Args:
-            abs_pos: Tensor of shape (L, C) - absolute position embeddings
-            tgt_size: int - target size M
-
-        Returns:
-            Tensor of shape (M, C) - resized position embeddings
-        """
-        dim = abs_pos.shape[-1]
-        abs_pos_new = mx.squeeze(abs_pos, axis=0)
-        cls_token, old_pos_embed = abs_pos_new[:1], abs_pos_new[1:]
-        src_size = int(math.sqrt(abs_pos_new.shape[0] - 1))
-        tgt_size_2d = int(math.sqrt(tgt_size))
-        dtype = abs_pos.dtype
-
-        if src_size != tgt_size_2d:
-            # Reshape to (1, src_size, src_size, dim) then transpose to (1, dim, src_size, src_size)
-            old_pos_embed = mx.reshape(old_pos_embed, (1, src_size, src_size, dim))
-            old_pos_embed = mx.transpose(old_pos_embed, (0, 3, 1, 2))
-            old_pos_embed = old_pos_embed.astype(mx.float32)
-
-            new_pos_embed = interpolate(old_pos_embed, (tgt_size_2d, tgt_size_2d))
-
-            new_pos_embed = new_pos_embed.astype(dtype)
-            new_pos_embed = mx.transpose(new_pos_embed, (0, 2, 3, 1))
-            new_pos_embed = mx.reshape(new_pos_embed, (tgt_size_2d * tgt_size_2d, dim))
-            vision_pos_embed = mx.concatenate([cls_token, new_pos_embed], axis=0)
-            vision_pos_embed = mx.reshape(
-                vision_pos_embed, (1, tgt_size_2d * tgt_size_2d + 1, dim)
-            )
-            return vision_pos_embed
-        else:
-            return abs_pos
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        # Note: inv_freq is computed on-the-fly, not stored as a parameter
 
     def __call__(
-        self, x: mx.array, patch_embeds: Optional[mx.array] = None
-    ) -> mx.array:
-        batch_size, height, width, _ = x.shape
-        target_dtype = self.position_embedding.weight.dtype
+        self, x: mx.array, position_ids: mx.array
+    ) -> Tuple[mx.array, mx.array]:
+        # Compute inv_freq on the fly (not stored as parameter)
+        inv_freq = 1.0 / (
+            self.base ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
+        )
 
-        if patch_embeds is not None:
-            patch_embeddings = patch_embeds
-        else:
-            patch_embeddings = self.patch_embedding(x)
+        # position_ids: [batch_size, seq_len]
+        # inv_freq: [head_dim // 2]
+        # We want freqs of shape [batch_size, seq_len, head_dim // 2]
 
-        # Flatten patch embeddings properly
-        patch_embeds = mx.flatten(patch_embeddings, start_axis=1, end_axis=2)
+        # Outer product: position_ids[:, :, None] * inv_freq[None, None, :]
+        position_ids_float = position_ids[:, :, None].astype(mx.float32)  # [B, S, 1]
+        inv_freq_expanded = inv_freq[None, None, :]  # [1, 1, D//2]
+        freqs = position_ids_float * inv_freq_expanded  # [B, S, D//2]
 
-        # Broadcast class embedding
-        class_embeds = mx.broadcast_to(
-            self.class_embedding, (batch_size, 1, self.embed_dim)
-        ).astype(target_dtype)
-
-        # Concatenate class and patch embeddings
-        embeddings = mx.concatenate([class_embeds, patch_embeds], axis=1)
-
-        # Create position IDs
-        position_ids = mx.array(np.arange(self.num_positions)[None, :])
-
-        # Add positional embeddings
-        embeddings = embeddings + self._get_abs_pos(
-            self.position_embedding(position_ids), embeddings.shape[1]
-        ).astype(target_dtype)
-
-        return embeddings
+        emb = mx.concatenate([freqs, freqs], axis=-1)  # [B, S, D]
+        cos = mx.cos(emb)
+        sin = mx.sin(emb)
+        return cos.astype(x.dtype), sin.astype(x.dtype)
 
 
-class NoTPTransformer(nn.Module):
-    def __init__(self, config: VisionConfig):
+def rotate_half(x: mx.array) -> mx.array:
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return mx.concatenate([-x2, x1], axis=-1)
+
+
+def apply_rotary_pos_emb(
+    q: mx.array, k: mx.array, cos: mx.array, sin: mx.array
+) -> Tuple[mx.array, mx.array]:
+    """Apply rotary position embedding to query and key tensors."""
+    cos = cos[:, None, :, :]
+    sin = sin[:, None, :, :]
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+class Qwen2MLP(nn.Module):
+    """MLP for Qwen2 encoder."""
+
+    def __init__(self, config: Qwen2EncoderConfig):
         super().__init__()
-        self.num_layers = config.layers
-        self.layers = [EncoderLayer(config) for _ in range(config.layers)]
+        self.hidden_size = config.dim
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class Qwen2Attention(nn.Module):
+    """Multi-head attention for Qwen2 encoder with GQA support."""
+
+    def __init__(self, config: Qwen2EncoderConfig, layer_idx: int = 0):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+
+        self.hidden_size = config.dim
+        self.num_heads = config.heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.kv_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=True
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        )
+
+        self.rotary_emb = Qwen2RotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=2048,
+            base=config.rope_theta,
+        )
+        self.scale = self.head_dim**-0.5
 
     def __call__(
         self,
-        x: mx.array,
+        hidden_states: mx.array,
+        attention_mask: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
-        for l in self.layers:
-            x = l(x, mask=None)
-        return x
+        bsz, q_len, _ = hidden_states.shape
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.reshape(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
+        key_states = key_states.reshape(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
+        value_states = value_states.reshape(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
+
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin
+        )
+
+        # Repeat KV heads for GQA
+        if self.num_key_value_groups > 1:
+            key_states = mx.repeat(key_states, self.num_key_value_groups, axis=1)
+            value_states = mx.repeat(value_states, self.num_key_value_groups, axis=1)
+
+        attn_output = mx.fast.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            scale=self.scale,
+            mask=attention_mask,
+        )
+
+        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(bsz, q_len, -1)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output
+
+
+class Qwen2DecoderLayer(nn.Module):
+    """Transformer layer for Qwen2 encoder."""
+
+    def __init__(self, config: Qwen2EncoderConfig, layer_idx: int = 0):
+        super().__init__()
+        self.hidden_size = config.dim
+        self.self_attn = Qwen2Attention(config, layer_idx)
+        self.mlp = Qwen2MLP(config)
+        self.input_layernorm = Qwen2RMSNorm(config.dim, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen2RMSNorm(
+            config.dim, eps=config.rms_norm_eps
+        )
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        attention_mask: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
+    ) -> mx.array:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
+
+
+class Qwen2Decoder2Encoder(nn.Module):
+    """Qwen2-based decoder used as encoder for vision features.
+
+    Takes SAM features and processes them through Qwen2 transformer layers
+    using learnable queries to produce fixed-size output.
+    """
+
+    def __init__(self, config: Qwen2EncoderConfig):
+        super().__init__()
+        self.config = config
+
+        # 256 learnable queries (fixed output size)
+        # Named query_768 to match HuggingFace weight naming
+        # Shape: (256, dim) - batch dimension added during forward pass
+        self.query_768 = mx.random.normal((256, config.dim)) * 0.02
+
+        # Transformer layers
+        self.layers = [
+            Qwen2DecoderLayer(config, layer_idx=i) for i in range(config.layers)
+        ]
+
+        # Final layer norm
+        self.norm = Qwen2RMSNorm(config.dim, eps=config.rms_norm_eps)
+
+    def __call__(self, sam_features: mx.array) -> mx.array:
+        """Process SAM features through Qwen2 encoder.
+
+        Args:
+            sam_features: SAM encoder output of shape (B, H, W, C) where C=896
+
+        Returns:
+            Encoded features of shape (B, 256, C)
+        """
+        batch_size = sam_features.shape[0]
+
+        # Flatten spatial dimensions: (B, H, W, C) -> (B, H*W, C)
+        sam_features_flat = sam_features.reshape(batch_size, -1, self.config.dim)
+        num_image_tokens = sam_features_flat.shape[1]
+
+        # Expand queries for batch: (256, C) -> (B, 256, C)
+        queries = mx.broadcast_to(
+            self.query_768[None, :, :], (batch_size, 256, self.config.dim)
+        )
+
+        # Concatenate: image tokens + query tokens
+        # Shape: (B, num_image_tokens + 256, C)
+        hidden_states = mx.concatenate([sam_features_flat, queries], axis=1)
+        seq_len = hidden_states.shape[1]
+
+        # Create mixed attention mask:
+        # - Image tokens can attend to all image tokens (bidirectional)
+        # - Query tokens use causal attention (each query attends to all image tokens + previous queries)
+        # Shape: (1, seq_len, seq_len) - will be broadcast across batch and heads
+        # Use the same dtype as hidden_states for compatibility
+        mask_dtype = hidden_states.dtype
+
+        # Create causal mask for query tokens only
+        # Image tokens (0 to num_image_tokens-1) can attend to all image tokens
+        # Query tokens (num_image_tokens to seq_len-1) use causal attention within queries
+        mask = mx.zeros((seq_len, seq_len), dtype=mask_dtype)
+
+        # Apply causal masking only for query-to-query attention
+        query_start = num_image_tokens
+        for i in range(256):
+            for j in range(i + 1, 256):
+                mask = mask.at[query_start + i, query_start + j].add(-1e9)
+
+        # Reshape for attention: (1, 1, seq_len, seq_len)
+        attention_mask = mask[None, None, :, :]
+
+        # Create position IDs
+        position_ids = mx.broadcast_to(
+            mx.arange(seq_len)[None, :], (batch_size, seq_len)
+        )
+
+        # Process through transformer layers
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+            )
+
+        # Apply final layer norm
+        hidden_states = self.norm(hidden_states)
+
+        # Return only the query tokens (last 256 tokens)
+        return hidden_states[:, -256:, :]
 
 
 class VisionModel(nn.Module):
+    """Vision model for DeepSeek-OCR-2 using Qwen2 encoder."""
+
     def __init__(self, config: VisionConfig):
         super().__init__()
-
         self.model_type = config.model_type
         self.config = config
+
         if self.model_type != "vision":
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
-        self.embeddings = VisionEmbeddings(config)
-        self.pre_layrnorm = nn.LayerNorm(config.hidden_size)
-        self.transformer = NoTPTransformer(config)
+        # Get Qwen2 config from params
+        qwen2_params = config.params.get("qwen2", {})
+        qwen2_config = Qwen2EncoderConfig(
+            dim=qwen2_params.get("dim", 896),
+            layers=qwen2_params.get("layers", 24),
+            heads=qwen2_params.get("heads", 14),
+            kv_heads=qwen2_params.get("kv_heads", 2),
+            intermediate_size=qwen2_params.get("intermediate_size", 4864),
+            rms_norm_eps=qwen2_params.get("rms_norm_eps", 1e-6),
+            rope_theta=qwen2_params.get("rope_theta", 1000000.0),
+        )
 
-    def __call__(
-        self,
-        x: mx.array,
-        patch_embeds: mx.array = None,
-    ) -> mx.array:
-        x = self.embeddings(x, patch_embeds)
-        x = self.pre_layrnorm(x)
-        return self.transformer(x)
+        self.qwen2_encoder = Qwen2Decoder2Encoder(qwen2_config)
+
+    def __call__(self, x: mx.array, sam_features: mx.array) -> mx.array:
+        """Process vision input through Qwen2 encoder.
+
+        Args:
+            x: Original image tensor (not used, kept for API compatibility)
+            sam_features: SAM encoder output of shape (B, H, W, C)
+
+        Returns:
+            Encoded features of shape (B, 256, C)
+        """
+        return self.qwen2_encoder(sam_features)
 
     def sanitize(self, weights):
         sanitized_weights = {}

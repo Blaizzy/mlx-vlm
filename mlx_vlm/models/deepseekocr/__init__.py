@@ -1,2 +1,10 @@
-from .config import MLPConfig, ModelConfig, ProjectorConfig, TextConfig, VisionConfig
-from .deepseekocr import DeepseekVLV2Processor, LanguageModel, Model, VisionModel
+from .config import (
+    MLPConfig,
+    ModelConfig,
+    ProjectorConfig,
+    Qwen2EncoderConfig,
+    TextConfig,
+    VisionConfig,
+)
+from .deepseekocr import DeepseekVLV2Processor, LanguageModel, Model
+from .vision import Qwen2Decoder2Encoder, VisionModel
