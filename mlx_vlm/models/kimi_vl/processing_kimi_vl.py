@@ -150,8 +150,12 @@ class KimiVLImageProcessor(BaseImageProcessor):
                 image = new_image
         else:
             new_w, new_h = image.size
-            new_w = new_w - new_w % patch_size
-            new_h = new_h - new_h % patch_size
+            # Ensure dimensions are divisible by merge_kernel_size * patch_size
+            # so that the grid dimensions are divisible by merge_kernel_size
+            crop_size_w = merge_kernel_size[1] * patch_size
+            crop_size_h = merge_kernel_size[0] * patch_size
+            new_w = new_w - new_w % crop_size_w
+            new_h = new_h - new_h % crop_size_h
             # Center crop
             left = (image.size[0] - new_w) // 2
             top = (image.size[1] - new_h) // 2
