@@ -28,6 +28,8 @@ class InputEmbeddingsFeatures:
     cross_attention_states: Optional[mx.array] = None
     cross_attention_mask: Optional[mx.array] = None
     full_text_row_masked_out_mask: Optional[mx.array] = None
+    decoder_inputs_embeds: Optional[mx.array] = None
+    attention_mask: Optional[mx.array] = None  # For encoder-decoder models
 
     def to_dict(self):
         return {
@@ -39,6 +41,8 @@ class InputEmbeddingsFeatures:
             "cross_attention_states": self.cross_attention_states,
             "cross_attention_mask": self.cross_attention_mask,
             "full_text_row_masked_out_mask": self.full_text_row_masked_out_mask,
+            "decoder_inputs_embeds": self.decoder_inputs_embeds,
+            "attention_mask": self.attention_mask,
         }
 
 

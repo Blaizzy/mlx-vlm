@@ -53,6 +53,7 @@ class TextConfig(BaseModelConfig):
     pad_token_id: int = 1
     bos_token_id: int = 0
     eos_token_id: int = 2
+    decoder_start_token_id: int = 2
     encoder_layers: int = 6
     decoder_layers: int = 6
 
@@ -69,7 +70,8 @@ class ModelConfig(BaseModelConfig):
     pad_token_id: int = 1
     bos_token_id: int = 0
     eos_token_id: int = 2
-    image_token_index: int = 0
+    image_token_id: int = 51289
+    image_token_index: int = 51289
     image_feature_source: List[str] = field(
         default_factory=lambda: ["temporal_avg_pool", "spatial_avg_pool"]
     )
