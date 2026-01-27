@@ -42,11 +42,15 @@ class Model(nn.Module):
 
         image_grid_thw = kwargs.pop("image_grid_thw", None)
 
+        position_ids_from_processor = kwargs.pop("position_ids", None)
+
         # Get text embeddings
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # If no image, return text embeddings
         if pixel_values is None:
+            # Reset stored position_ids when no image
+            self.language_model._position_ids = None
             return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
         # Get vision features
@@ -94,6 +98,18 @@ class Model(nn.Module):
 
         # Stack batches
         inputs_embeds = mx.concatenate(output_parts, axis=0)  # (B, L, D)
+
+        # Pre-calculate position_ids for chunked prefill
+        if position_ids_from_processor is not None:
+            self.language_model._position_ids = position_ids_from_processor
+        elif image_grid_thw is not None:
+            position_ids = self.language_model.get_xdrope_input_positions(
+                input_tokens=input_ids[0].tolist(),
+                image_grid_thw=image_grid_thw,
+                image_token_id=self.config.image_token_id,
+                spatial_merge_size=self.config.vision_config.spatial_merge_size,
+            )[None, ...]
+            self.language_model._position_ids = position_ids
 
         return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
