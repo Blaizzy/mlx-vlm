@@ -35,7 +35,8 @@ class Ernie4_5_VLTokenizer(PreTrainedTokenizer):
     """
     Tokenizer for ERNIE 4.5 VL model using SentencePiece.
 
-    This is a local implementation that doesn't require decord.
+    Matches the original Baidu implementation: a thin wrapper around SentencePiece
+    with no custom pre-tokenization or added_tokens handling.
     """
 
     vocab_files_names = {"vocab_file": "tokenizer.model"}
@@ -92,6 +93,14 @@ class Ernie4_5_VLTokenizer(PreTrainedTokenizer):
     def vocab_size(self):
         return self.sp_model.vocab_size()
 
+    @property
+    def space_token_id(self):
+        return self.sp_model.piece_to_id("<mask:1>")
+
+    @property
+    def gend_token_id(self):
+        return self.sp_model.piece_to_id("<mask:7>")
+
     def get_vocab(self):
         vocab = {self.convert_ids_to_tokens(i): i for i in range(self.vocab_size)}
         vocab.update(self.added_tokens_encoder)
@@ -105,6 +114,12 @@ class Ernie4_5_VLTokenizer(PreTrainedTokenizer):
 
     def _convert_id_to_token(self, id):
         return self.sp_model.id_to_piece(id)
+
+    def build_inputs_with_special_tokens(self, token_ids_0, token_ids_1=None):
+        """Do not add CLS/SEP tokens - the chat template handles BOS."""
+        if token_ids_1 is None:
+            return token_ids_0
+        return token_ids_0 + token_ids_1
 
     def convert_tokens_to_string(self, tokens):
         current_sub_tokens = []

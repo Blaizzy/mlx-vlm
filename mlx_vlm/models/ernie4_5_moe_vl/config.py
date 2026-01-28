@@ -77,22 +77,22 @@ class ModelConfig(BaseModelConfig):
     vision_config: VisionConfig = None
     model_type: str = "ernie4_5_moe_vl"
     ignore_index: int = -100
-    # Token IDs
-    im_patch_id: int = 151655
-    image_token_id: int = 151655
-    image_start_token_id: int = 151652
-    image_end_token_id: int = 151653
-    video_token_id: int = 151656
-    video_start_token_id: int = 151657
-    video_end_token_id: int = 151658
-    vision_start_token_id: int = 151652
-    vision_end_token_id: int = 151653
-    vision_token_id: int = 151654
-    vocab_size: int = 151936
+    # Token IDs (defaults will be overridden by from_dict / __post_init__)
+    im_patch_id: int = 100295
+    image_token_id: int = 100295
+    image_start_token_id: int = 101304
+    image_end_token_id: int = 101305
+    video_token_id: int = 100295
+    video_start_token_id: int = 101306
+    video_end_token_id: int = 101307
+    vision_start_token_id: int = 101304
+    vision_end_token_id: int = 101305
+    vision_token_id: int = 100295
+    vocab_size: int = 103424
     eos_token_id: Optional[List[int]] = None
     # Vision-language integration
     pixel_hidden_size: int = 1280
-    hidden_size: int = 3584
+    hidden_size: int = 2560
     # Resampler config
     spatial_conv_size: int = 2
     temporal_conv_size: int = 2
@@ -100,6 +100,16 @@ class ModelConfig(BaseModelConfig):
     # 3D RoPE config
     rope_3d: bool = True
     freq_allocation: int = 20
+
+    def __post_init__(self):
+        # Derive image_token_id from im_patch_id if not explicitly set differently
+        if self.image_token_id != self.im_patch_id:
+            self.image_token_id = self.im_patch_id
+        # vision_start/end should match image_start/end
+        if self.vision_start_token_id != self.image_start_token_id:
+            self.vision_start_token_id = self.image_start_token_id
+        if self.vision_end_token_id != self.image_end_token_id:
+            self.vision_end_token_id = self.image_end_token_id
 
     @classmethod
     def from_dict(cls, params):

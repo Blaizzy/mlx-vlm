@@ -22,95 +22,147 @@ class Ernie4_5RotaryEmbedding:
         self,
         dim: int,
         base: float = 10000,
-        mrope_section: list = None,
+        freq_allocation: int = 20,
     ):
-        self.dim = dim
+        self.dim = dim  # head_dim
         self.base = base
-        self.mrope_section = mrope_section or [36, 36, 20]  # Default for ERNIE
+        self.freq_allocation = freq_allocation  # frequencies allocated to temporal dim
 
-        inv_freq = 1.0 / (
-            self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
-        )
-        self.inv_freq = inv_freq
+        # Pre-compute inverse frequencies for all positions
+        indices = mx.arange(0, self.dim, 2, dtype=mx.float32)
+        self.inv_freq = 1.0 / (self.base ** (indices / self.dim))
 
-    def apply_mrope(self, freqs, mrope_section):
-        """Apply MRoPE to 3D rotary embeddings."""
-        # freqs: (3, bs, seq_len, head_dim // 2)
-        # Combine T, H, W frequencies according to mrope_section
-        freqs_t = freqs[0]  # Start with T dimension (will overwrite parts)
-        offset = mrope_section[0]
-        for dim_idx, length in enumerate(mrope_section[1:], start=1):
-            # Replace the slice with frequencies from H or W dimension
-            freqs_t = mx.concatenate(
-                [
-                    freqs_t[..., :offset],
-                    freqs[dim_idx, ..., offset : offset + length],
-                    freqs_t[..., offset + length :],
-                ],
-                axis=-1,
-            )
-            offset += length
-        return freqs_t
+    def _compute_pos_emb(self, position_ids):
+        """Compute sin/cos embeddings for given position IDs.
+
+        Args:
+            position_ids: [batch, seq_len] or scalar
+        Returns:
+            pos_emb: [batch, seq_len, head_dim] with sin in first half, cos in second half
+        """
+        # position_ids: [batch, seq_len] -> [batch, seq_len, 1]
+        if position_ids.ndim == 1:
+            position_ids = position_ids[None, :]
+        position_ids = position_ids.astype(mx.float32)
+
+        # sinusoid_inp: [batch, seq_len, head_dim//2]
+        sinusoid_inp = position_ids[:, :, None] * self.inv_freq[None, None, :]
+
+        # pos_emb: [batch, seq_len, head_dim] - sin first, cos second
+        pos_emb = mx.concatenate([mx.sin(sinusoid_inp), mx.cos(sinusoid_inp)], axis=-1)
+        return pos_emb
 
     def __call__(self, x, position_ids):
         """
-        Compute rotary embeddings.
+        Compute 3D rotary embeddings matching PyTorch's apply_rotary_3d.
 
         Args:
             x: Input tensor for dtype reference
-            position_ids: Position IDs, shape (batch, seq_len, 3) for 3D or (batch, seq_len) for 1D
-        """
-        # Handle 3D position IDs
-        if position_ids.ndim == 3:
-            # position_ids: (batch, seq_len, 3) -> (3, batch, seq_len)
-            position_ids = position_ids.transpose(2, 0, 1)
-        else:
-            # Broadcast 1D to 3D format
-            position_ids = mx.broadcast_to(
-                position_ids[None, ...],
-                (3, position_ids.shape[0], position_ids.shape[1]),
-            )
+            position_ids: Position IDs, shape (batch, seq_len, 3) for 3D positions [T, H, W]
 
-        # Expand inv_freq: (3, batch, head_dim//2, 1)
-        inv_freq_expanded = mx.broadcast_to(
-            self.inv_freq[None, None, :, None].astype(mx.float32),
-            (3, position_ids.shape[1], self.inv_freq.shape[0], 1),
+        Returns:
+            sin_pos, cos_pos: [batch, seq_len, head_dim] ready for rotation
+        """
+        if position_ids.ndim == 2:
+            # 1D positions - expand to 3D with same values
+            position_ids = mx.stack([position_ids, position_ids, position_ids], axis=-1)
+
+        batch_size, seq_len, _ = position_ids.shape
+        half_dim = self.dim // 2
+        freq_alloc = self.freq_allocation
+
+        # Compute full position embeddings for maximum position
+        max_pos = int(mx.max(position_ids).item()) + 1
+        full_positions = mx.arange(max_pos)
+        full_emb = self._compute_pos_emb(
+            full_positions[None, :]
+        )  # [1, max_pos, head_dim]
+
+        # Split into sin and cos (each head_dim//2)
+        full_sin = full_emb[0, :, :half_dim]  # [max_pos, head_dim//2]
+        full_cos = full_emb[0, :, half_dim:]  # [max_pos, head_dim//2]
+
+        # Extract positions for each dimension
+        pos_t = position_ids[:, :, 0]  # [batch, seq_len] temporal
+        pos_h = position_ids[:, :, 1]  # [batch, seq_len] height
+        pos_w = position_ids[:, :, 2]  # [batch, seq_len] width
+
+        # Gather sin/cos for each position
+        # sin_t: temporal uses last freq_allocation frequencies
+        sin_t = full_sin[pos_t, -freq_alloc:]  # [batch, seq_len, freq_alloc]
+        cos_t = full_cos[pos_t, -freq_alloc:]
+
+        # sin_h: height uses even indices of first (half_dim - freq_alloc)
+        hw_range = half_dim - freq_alloc  # 44 for dim=128, freq=20
+        sin_h = full_sin[pos_h, :hw_range:2]  # [batch, seq_len, hw_range//2]
+        cos_h = full_cos[pos_h, :hw_range:2]
+
+        # sin_w: width uses odd indices of first (half_dim - freq_alloc)
+        sin_w = full_sin[pos_w, 1:hw_range:2]  # [batch, seq_len, hw_range//2]
+        cos_w = full_cos[pos_w, 1:hw_range:2]
+
+        # Interleave H and W: [h0, w0, h1, w1, ...]
+        sin_hw = mx.stack([sin_h, sin_w], axis=-1).reshape(
+            batch_size, seq_len, -1
+        )  # [batch, seq_len, hw_range]
+        cos_hw = mx.stack([cos_h, cos_w], axis=-1).reshape(batch_size, seq_len, -1)
+
+        # Concatenate HW and T
+        sin_thw = mx.concatenate([sin_hw, sin_t], axis=-1)  # [batch, seq_len, half_dim]
+        cos_thw = mx.concatenate([cos_hw, cos_t], axis=-1)
+
+        # Double for full head_dim: [s0, s0, s1, s1, ...]
+        sin_pos = mx.stack([sin_thw, sin_thw], axis=-1).reshape(
+            batch_size, seq_len, self.dim
+        )
+        cos_pos = mx.stack([cos_thw, cos_thw], axis=-1).reshape(
+            batch_size, seq_len, self.dim
         )
 
-        # Position IDs: (3, batch, 1, seq_len)
-        position_ids_expanded = position_ids[:, :, None, :].astype(mx.float32)
-
-        # Compute frequencies: (3, batch, head_dim//2, seq_len) -> (3, batch, seq_len, head_dim//2)
-        freqs = inv_freq_expanded @ position_ids_expanded
-        freqs = mx.swapaxes(freqs, 2, 3)
-
-        # Apply MRoPE
-        freqs = self.apply_mrope(freqs, self.mrope_section)
-
-        # Create full embeddings
-        emb = mx.concatenate([freqs, freqs], axis=-1)
-        cos = mx.cos(emb)
-        sin = mx.sin(emb)
-
-        return cos.astype(x.dtype), sin.astype(x.dtype)
+        return cos_pos.astype(x.dtype), sin_pos.astype(x.dtype)
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
+def rotate_half_interleaved(x):
+    """Rotates using interleaved pattern: [-x1, x0, -x3, x2, ...].
+
+    This matches PyTorch's rotation: stack([-x[1::2], x[0::2]], dim=-1).reshape()
+    """
+    x_even = x[..., 0::2]  # [x0, x2, x4, ...]
+    x_odd = x[..., 1::2]  # [x1, x3, x5, ...]
+    # Stack as [-odd, even] and reshape
+    rotated = mx.stack([-x_odd, x_even], axis=-1)
+    return rotated.reshape(x.shape)
 
 
-def apply_rotary_pos_emb(q, k, cos, sin):
-    """Apply rotary position embeddings to queries and keys."""
-    cos = mx.expand_dims(cos, axis=1)
-    sin = mx.expand_dims(sin, axis=1)
+def apply_rotary_pos_emb(q, k, cos_pos, sin_pos):
+    """Apply rotary position embeddings to queries and keys.
 
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    Uses interleaved rotation matching PyTorch's apply_rotary_3d.
 
-    return q_embed, k_embed
+    Args:
+        q: [batch, n_heads, seq_len, head_dim]
+        k: [batch, n_kv_heads, seq_len, head_dim]
+        cos_pos: [batch, seq_len, head_dim]
+        sin_pos: [batch, seq_len, head_dim]
+    """
+    orig_dtype = q.dtype
+    # Expand for heads dimension
+
+    cos_pos = mx.expand_dims(cos_pos, axis=1)  # [batch, 1, seq_len, head_dim]
+    sin_pos = mx.expand_dims(sin_pos, axis=1)
+
+    # Apply rotation: q_rotated = q * cos + rotate_half(q) * sin
+    q_rotated = rotate_half_interleaved(q)
+    k_rotated = rotate_half_interleaved(k)
+
+    q_embed = (q.astype(mx.float32) * cos_pos) + (
+        q_rotated.astype(mx.float32) * sin_pos
+    )
+    k_embed = (k.astype(mx.float32) * cos_pos) + (
+        k_rotated.astype(mx.float32) * sin_pos
+    )
+
+    return q_embed.astype(orig_dtype), k_embed.astype(orig_dtype)
 
 
 class Attention(nn.Module):
@@ -131,20 +183,13 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=args.use_bias)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=args.use_bias)
 
-        # MRoPE section: prefer explicit rope_scaling.mrope_section, fallback to freq_allocation
-        rope_scaling = getattr(args, "rope_scaling", None)
-        if rope_scaling and "mrope_section" in rope_scaling:
-            self.mrope_section = rope_scaling["mrope_section"]
-        else:
-            freq_alloc = getattr(args, "freq_allocation", 20)
-            half_dim = head_dim // 2
-            spatial_dim = (half_dim - freq_alloc) // 2
-            self.mrope_section = [spatial_dim, spatial_dim, freq_alloc]
+        # Get freq_allocation for 3D RoPE (temporal dimension frequency allocation)
+        self.freq_allocation = getattr(args, "freq_allocation", 20)
 
         self.rotary_emb = Ernie4_5RotaryEmbedding(
             head_dim,
             base=args.rope_theta,
-            mrope_section=self.mrope_section,
+            freq_allocation=self.freq_allocation,
         )
 
     def __call__(
@@ -286,14 +331,15 @@ class Ernie4_5_MoeMLP(nn.Module):
 
         Args:
             x: Input tensor [batch, seq_len, hidden_size]
-            token_type_ids: Optional token type IDs to route text vs multimodal tokens
+            token_type_ids: Optional token type IDs to route text vs multimodal tokens.
+                            0 = text tokens -> text experts, >0 = multimodal tokens -> MM experts.
 
         Returns:
             Output tensor [batch, seq_len, hidden_size]
         """
         k = self.k
 
-        # Process text experts
+        # Process text experts (gate + switch_mlp)
         gates = self.gate(x)
         gates = self.gate_act(gates.astype(mx.float32))
         inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
@@ -302,11 +348,19 @@ class Ernie4_5_MoeMLP(nn.Module):
         if self.norm_gate_logits:
             scores = scores / mx.maximum(scores.sum(axis=-1, keepdims=True), 1e-12)
 
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+        y_text = self.switch_mlp(x, inds)
+        y_text = (y_text * scores[..., None]).sum(axis=-2).astype(y_text.dtype)
 
-        # Process multimodal experts if present
-        if self.has_dual_experts and self.num_mm_experts > 0:
+        # Route based on token_type_ids
+        if (
+            not self.has_dual_experts
+            or self.num_mm_experts == 0
+            or token_type_ids is None
+        ):
+            # Text-only: use only text experts
+            y = y_text
+        else:
+            # Multimodal: process MM experts and selectively route
             gates_mm = self.gate_1(x)
             gates_mm = self.gate_act(gates_mm.astype(mx.float32))
             inds_mm = mx.stop_gradient(
@@ -322,10 +376,10 @@ class Ernie4_5_MoeMLP(nn.Module):
             y_mm = self.switch_mlp_1(x, inds_mm)
             y_mm = (y_mm * scores_mm[..., None]).sum(axis=-2).astype(y_mm.dtype)
 
-            # Combine text and multimodal expert outputs
-            # Simple approach: average both outputs
-            # TODO: Could use token_type_ids to selectively route
-            y = y + y_mm
+            # Select based on token type: text tokens -> text experts, mm tokens -> mm experts
+            is_text = token_type_ids == 0  # [batch, seq_len]
+            is_text_expanded = mx.expand_dims(is_text, axis=-1)  # [batch, seq_len, 1]
+            y = mx.where(is_text_expanded, y_text, y_mm)
 
         # Add shared experts output
         if self.shared_experts is not None:
@@ -378,10 +432,16 @@ class Ernie4_5VLDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
         position_ids: Optional[mx.array] = None,
+        token_type_ids: Optional[mx.array] = None,
     ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
         h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
+        if isinstance(self.mlp, Ernie4_5_MoeMLP):
+            r = self.mlp(
+                self.post_attention_layernorm(h), token_type_ids=token_type_ids
+            )
+        else:
+            r = self.mlp(self.post_attention_layernorm(h))
         return h + r
 
 
@@ -408,6 +468,7 @@ class Ernie4_5Model(nn.Module):
         mask: Optional[mx.array] = None,
         cache=None,
         position_ids: Optional[mx.array] = None,
+        token_type_ids: Optional[mx.array] = None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -421,7 +482,7 @@ class Ernie4_5Model(nn.Module):
             mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c, position_ids)
+            h = layer(h, mask, c, position_ids, token_type_ids=token_type_ids)
 
         return self.norm(h)
 
@@ -607,8 +668,15 @@ class LanguageModel(nn.Module):
                     [position_ids, position_ids, position_ids], axis=-1
                 )
 
+        token_type_ids = kwargs.pop("token_type_ids", None)
+
         out = self.model(
-            inputs, cache=cache, inputs_embeds=inputs_embeds, position_ids=position_ids
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            mask=mask,
+            position_ids=position_ids,
+            token_type_ids=token_type_ids,
         )
 
         if self.args.tie_word_embeddings:

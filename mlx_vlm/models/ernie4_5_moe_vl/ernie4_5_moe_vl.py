@@ -308,6 +308,32 @@ class Model(nn.Module):
     def layers(self):
         return self.language_model.model.layers
 
+    def _build_token_type_ids(
+        self, input_ids: mx.array, pixel_values: Optional[mx.array] = None
+    ) -> Optional[mx.array]:
+        """Build token_type_ids from input_ids for MoE routing.
+
+        Returns None if no image/video tokens are present (text-only),
+        otherwise returns 0 for text tokens and 1 for image/video tokens.
+        """
+        if pixel_values is None:
+            return None
+
+        image_token_id = self.config.image_token_id
+        video_token_id = self.config.video_token_id
+
+        is_image = input_ids == image_token_id
+        is_video = input_ids == video_token_id
+        is_vision = is_image | is_video
+
+        if mx.sum(is_vision) == 0:
+            return None
+
+        token_type_ids = mx.where(
+            is_vision, mx.ones_like(input_ids), mx.zeros_like(input_ids)
+        )
+        return token_type_ids
+
     def __call__(
         self,
         input_ids: mx.array,
@@ -317,8 +343,11 @@ class Model(nn.Module):
         **kwargs,
     ):
 
+        # Build token_type_ids for MoE routing (only on prefill with images)
+        token_type_ids = self._build_token_type_ids(input_ids, pixel_values)
+
         inputs_embeds_features = self.get_input_embeddings(
-            input_ids, pixel_values, kwargs
+            input_ids, pixel_values, **kwargs
         )
 
         logits = self.language_model(
@@ -327,6 +356,7 @@ class Model(nn.Module):
             mask=mask,
             cache=cache,
             pixel_values=pixel_values,
+            token_type_ids=token_type_ids,
             **kwargs,
         )
 
