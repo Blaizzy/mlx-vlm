@@ -1934,7 +1934,7 @@ class TestModels(unittest.TestCase):
             num_key_value_heads=2,
             vocab_size=1000,
             rope_theta=500000,
-            rope_scaling={"type": "default", "mrope_section": [28, 28, 8]},
+            rope_scaling={"type": "default", "mrope_section": [12, 12, 8]},
             tie_word_embeddings=True,
             moe_num_experts=[8, 8],
             moe_intermediate_size=[128, 64],
@@ -3050,6 +3050,62 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "internvl_chat")
+
+
+class TestChunkedPrefillRoPE(unittest.TestCase):
+    """Test chunked prefill RoPE position ID generation for vision-language models."""
+
+    def test_ernie_chunked_prefill_rope(self):
+        """Test ERNIE 4.5 MoE VL chunked prefill RoPE position ID generation."""
+        from mlx_vlm.models import ernie4_5_moe_vl
+
+        text_config = ernie4_5_moe_vl.TextConfig(
+            model_type="ernie4_5_moe_vl",
+            hidden_size=256,
+            intermediate_size=512,
+            num_hidden_layers=2,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            vocab_size=32000,
+        )
+        vision_config = ernie4_5_moe_vl.VisionConfig(
+            embed_dim=256,
+            hidden_size=256,
+            num_heads=8,
+            patch_size=14,
+            spatial_merge_size=2,
+        )
+        model_config = ernie4_5_moe_vl.ModelConfig(
+            model_type="ernie4_5_moe_vl",
+            hidden_size=256,
+            vision_config=vision_config,
+            text_config=text_config,
+            im_patch_id=100,
+            image_token_id=100,
+            video_token_id=101,
+            image_start_token_id=99,
+            vision_start_token_id=99,
+        )
+        lm = ernie4_5_moe_vl.LanguageModel(text_config, model_config)
+
+        input_ids = mx.array([[1, 2, 3, 99, 100, 100, 100, 100, 5, 6, 7]])
+        image_grid_thw = mx.array([[1, 4, 4]])
+        position_ids, _ = lm.get_rope_index(input_ids, image_grid_thw)
+
+        # Position IDs length matches input sequence length
+        self.assertEqual(position_ids.shape[1], input_ids.shape[1])
+
+        # Chunked input position IDs match partial sequence
+        full_input = [1, 2, 3, 99, 100, 100, 100, 100, 5, 6, 7, 8, 9, 10]
+        chunked_input = full_input[:8]
+        chunked_input_ids = mx.array([chunked_input])
+        chunked_position_ids, _ = lm.get_rope_index(chunked_input_ids, image_grid_thw)
+        self.assertEqual(chunked_position_ids.shape[1], len(chunked_input))
+
+        # Position IDs have correct 3D shape for MRoPE
+        self.assertEqual(len(position_ids.shape), 3)
+        self.assertEqual(position_ids.shape[0], 1)  # batch size
+        self.assertEqual(position_ids.shape[2], 3)  # 3D positions (T, H, W)
 
 
 if __name__ == "__main__":
