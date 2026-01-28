@@ -4,7 +4,6 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
@@ -132,11 +131,15 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=args.use_bias)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=args.use_bias)
 
-        # MRoPE section based on freq_allocation
-        freq_alloc = getattr(args, "freq_allocation", 20)
-        half_dim = head_dim // 2
-        spatial_dim = (half_dim - freq_alloc) // 2
-        self.mrope_section = [spatial_dim, spatial_dim, freq_alloc]
+        # MRoPE section: prefer explicit rope_scaling.mrope_section, fallback to freq_allocation
+        rope_scaling = getattr(args, "rope_scaling", None)
+        if rope_scaling and "mrope_section" in rope_scaling:
+            self.mrope_section = rope_scaling["mrope_section"]
+        else:
+            freq_alloc = getattr(args, "freq_allocation", 20)
+            half_dim = head_dim // 2
+            spatial_dim = (half_dim - freq_alloc) // 2
+            self.mrope_section = [spatial_dim, spatial_dim, freq_alloc]
 
         self.rotary_emb = Ernie4_5RotaryEmbedding(
             head_dim,
@@ -452,8 +455,8 @@ class LanguageModel(nn.Module):
         vision_start_token_id = self.config.vision_start_token_id
 
         if image_grid_thw is not None or video_grid_thw is not None:
-            # Initialize position_ids with shape [batch_size, seq_length, 3]
-            position_ids = mx.zeros((batch_size, seq_length, 3), dtype=mx.int32)
+            # Build position_ids for each batch element
+            batch_position_ids = []
             mrope_position_deltas = []
 
             image_index, video_index = 0, 0
@@ -463,9 +466,17 @@ class LanguageModel(nn.Module):
                 llm_pos_ids_list = []
                 st = 0
 
-                # Count images and videos
-                image_nums = input_tokens.count(image_token_id)
-                video_nums = input_tokens.count(video_token_id)
+                # Count images and videos by looking at vision_start tokens
+                # This is more robust than counting all image/video tokens
+                image_nums, video_nums = 0, 0
+                for idx, token in enumerate(input_tokens):
+                    if token == vision_start_token_id and idx + 1 < len(input_tokens):
+                        next_token = input_tokens[idx + 1]
+                        if next_token == image_token_id:
+                            image_nums += 1
+                        elif next_token == video_token_id:
+                            video_nums += 1
+
                 remain_images, remain_videos = image_nums, video_nums
 
                 for _ in range(image_nums + video_nums):
@@ -534,9 +545,13 @@ class LanguageModel(nn.Module):
                     llm_pos_ids_list.append(text_pos_3d)
 
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1)  # [3, seq_len]
-                position_ids = position_ids.at[i].set(llm_positions.T)  # [seq_len, 3]
+                batch_position_ids.append(llm_positions.T)  # [seq_len, 3]
                 mrope_position_deltas.append(llm_positions.max() + 1 - seq_length)
 
+            # Stack all batch position IDs
+            position_ids = mx.stack(
+                batch_position_ids, axis=0
+            )  # [batch_size, seq_len, 3]
             mrope_position_deltas = mx.array(mrope_position_deltas)
             return position_ids, mrope_position_deltas
         else:

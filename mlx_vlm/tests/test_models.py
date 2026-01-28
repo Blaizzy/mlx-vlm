@@ -1921,6 +1921,61 @@ class TestModels(unittest.TestCase):
             ),  # image temporals shape (num_images, 3)
         )
 
+    def test_ernie4_5_moe_vl(self):
+        from mlx_vlm.models import ernie4_5_moe_vl
+
+        # Config based on baidu/ERNIE-4.5-VL-28B-A3B-Thinking (scaled down for testing)
+        text_config = ernie4_5_moe_vl.TextConfig(
+            model_type="ernie",
+            hidden_size=256,
+            intermediate_size=512,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=1000,
+            rope_theta=500000,
+            rope_scaling={"type": "default", "mrope_section": [28, 28, 8]},
+            tie_word_embeddings=True,
+            moe_num_experts=[8, 8],
+            moe_intermediate_size=[128, 64],
+            moe_k=2,
+            moe_layer_start_index=[1, 1],
+            moe_layer_end_index=[4, 3],
+            moe_num_shared_experts=1,
+            use_bias=False,
+        )
+
+        vision_config = ernie4_5_moe_vl.VisionConfig(
+            model_type="DFNRope_vision_transformer",
+            depth=4,
+            embed_dim=128,
+            hidden_size=128,
+            num_heads=4,
+            patch_size=14,
+            spatial_merge_size=2,
+            in_channels=3,
+        )
+
+        config = ernie4_5_moe_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="ernie4_5_moe_vl",
+            hidden_size=256,
+            pixel_hidden_size=128,
+            spatial_conv_size=2,
+            temporal_conv_size=2,
+            vocab_size=1000,
+        )
+
+        model = ernie4_5_moe_vl.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""

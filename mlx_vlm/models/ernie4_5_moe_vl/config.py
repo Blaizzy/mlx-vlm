@@ -58,12 +58,17 @@ class TextConfig(BaseModelConfig):
     # 3D RoPE config
     rope_3d: bool = True
     freq_allocation: int = 20
+    rope_scaling: Optional[Dict[str, Union[str, List[int]]]] = None
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         if self.head_dim is None:
             self.head_dim = self.hidden_size // self.num_attention_heads
+        # Normalize rope_scaling keys
+        if self.rope_scaling:
+            if "type" not in self.rope_scaling and "rope_type" in self.rope_scaling:
+                self.rope_scaling["type"] = self.rope_scaling.pop("rope_type")
 
 
 @dataclass
