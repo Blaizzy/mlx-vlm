@@ -4,7 +4,7 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwiGLU, _gather_sort, _scatter_unsort
+from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -304,58 +304,15 @@ class MoEGate(nn.Module):
         )
 
 
-class DeepseekSwitchMLP(nn.Module):
-    def __init__(
-        self,
-        input_dims: int,
-        hidden_dims: int,
-        num_experts: int,
-        activation=SwiGLU(),
-        bias: bool = False,
-    ):
-        super().__init__()
-
-        self.gate_proj = QuantizedSwitchLinear(input_dims, hidden_dims, num_experts, bias=bias, group_size=32)
-        self.up_proj = QuantizedSwitchLinear(input_dims, hidden_dims, num_experts, bias=bias, group_size=32)
-        self.down_proj = QuantizedSwitchLinear(hidden_dims, input_dims, num_experts, bias=bias, group_size=32)
-        self.activation = activation
-
-    def __call__(self, x, indices) -> mx.array:
-        x = mx.expand_dims(x, (-2, -3))
-
-        # When we have many tokens, then sort them to make sure that the access
-        # of different experts is in order.
-        do_sort = indices.size >= 64
-        idx = indices
-        inv_order = None
-        if do_sort:
-            x, idx, inv_order = _gather_sort(x, indices)
-        if self.training:
-            idx = mx.stop_gradient(idx)
-        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
-        x = self.down_proj(
-            self.activation(x_up, x_gate),
-            idx,
-            sorted_indices=do_sort,
-        )
-
-        if do_sort:
-            x = _scatter_unsort(x, inv_order, indices.shape)
-
-        return x.squeeze(-2)
-
-
 class DeepseekV3MoE(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
-        self.switch_mlp = DeepseekSwitchMLP(
+        self.switch_mlp = SwitchGLU(
             config.hidden_size,
             config.moe_intermediate_size,
             config.n_routed_experts,
-            activation=clipped_silu,
         )
 
         self.gate = MoEGate(config)
