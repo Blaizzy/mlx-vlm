@@ -6,6 +6,8 @@ import mlx.nn as nn
 import numpy as np
 from transformers import AutoProcessor
 
+from mlx_vlm.models.base import InputEmbeddingsFeatures
+
 from .config import ModelConfig, ProjectorConfig, SAMViTConfig
 from .language import LanguageModel
 from .processing_deepseekocr import DeepseekVLV2Processor
@@ -114,8 +116,6 @@ class Model(nn.Module):
         )
         self.language_model = LanguageModel(config.text_config)
         self.projector = MlpProjector(config)
-        self.vision_feature_layer = config.select_layer
-        self.vision_feature_select_strategy = config.vision_feature_select_strategy
 
         self.tile_tag = config.tile_tag
         self.global_view_pos = config.global_view_pos
@@ -145,15 +145,17 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
         images_spatial_crop: Optional[mx.array] = None,
         images_seq_mask: Optional[mx.array] = None,
+        **kwargs,
     ):
         input_embeds = self.language_model.model.embed_tokens(input_ids)
 
         if pixel_values is None:
-            return input_embeds
+            return InputEmbeddingsFeatures(inputs_embeds=input_embeds)
 
+        # Only process images on prefill (input_ids.shape[1] != 1), not during autoregressive decoding
         if (
             self.sam_model is not None
-            and (input_ids.shape[1] != 1 or self.training)
+            and input_ids.shape[1] != 1
             and mx.sum(pixel_values[1]).item() != 0
         ):
 
@@ -305,7 +307,7 @@ class Model(nn.Module):
 
                 idx += 1
 
-        return input_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=input_embeds)
 
     @property
     def layers(self):
@@ -328,7 +330,7 @@ class Model(nn.Module):
         )
 
         logits = self.language_model(
-            input_ids, cache=cache, inputs_embeds=input_embeddings
+            input_ids, cache=cache, inputs_embeds=input_embeddings.inputs_embeds
         )
         return logits
 

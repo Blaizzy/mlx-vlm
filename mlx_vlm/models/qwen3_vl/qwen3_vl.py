@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -45,14 +46,16 @@ class Model(nn.Module):
     ):
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
+        mask = kwargs.get("mask", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
-            return {
-                "inputs_embeds": self.language_model.model.embed_tokens(input_ids),
-                "visual_pos_masks": None,
-                "deepstack_visual_embeds": None,
-            }
+            # Reset position state for text-only generation
+            self.language_model._position_ids = None
+            self.language_model._rope_deltas = None
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
         pixel_values = pixel_values.astype(dtype)
@@ -81,11 +84,19 @@ class Model(nn.Module):
         visual_pos_masks = image_mask
         deepstack_visual_embeds = deepstack_image_embeds
 
-        return {
-            "inputs_embeds": inputs_embeds,
-            "visual_pos_masks": visual_pos_masks,
-            "deepstack_visual_embeds": deepstack_visual_embeds,
-        }
+        # Pre-calculate position_ids for chunked prefill
+        if image_grid_thw is not None or video_grid_thw is not None:
+            position_ids, rope_deltas = self.language_model.get_rope_index(
+                input_ids, image_grid_thw, video_grid_thw, mask
+            )
+            self.language_model._position_ids = position_ids
+            self.language_model._rope_deltas = rope_deltas
+
+        return InputEmbeddingsFeatures(
+            inputs_embeds=inputs_embeds,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+        )
 
     @staticmethod
     def merge_input_ids_with_image_features(
@@ -124,12 +135,14 @@ class Model(nn.Module):
         **kwargs,
     ):
 
-        inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
+        input_embeddings_features = self.get_input_embeddings(
+            input_ids, pixel_values, **kwargs
+        )
 
         kwargs.update(
             {
                 "pixel_values": pixel_values,
-                **inputs_embeds,
+                **input_embeddings_features.to_dict(),
             }
         )
 

@@ -277,14 +277,15 @@ class LanguageModel(nn.Module):
 
     def __call__(
         self,
-        input_ids: mx.array = None,
-        input_embeds: mx.array = None,
+        inputs: mx.array = None,
+        inputs_embeds: mx.array = None,
         mask: mx.array = None,
         cache=None,
+        **kwargs,
     ):
         out = self.model(
-            input_ids=input_ids,
-            input_embeds=input_embeds,
+            input_ids=inputs,
+            input_embeds=inputs_embeds,
             mask=mask,
             cache=cache,
         )

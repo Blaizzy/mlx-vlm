@@ -7,7 +7,7 @@ from PIL import Image
 from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import to_numpy_array
 
-from ..base import BaseImageProcessor, expand2square
+from ..base import BaseImageProcessor, InputEmbeddingsFeatures, expand2square
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -250,9 +250,12 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        **kwargs,
     ):
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids)
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         image_token_index = self.config.image_token_index
         num_image_tokens = self.config.num_image_tokens
@@ -289,7 +292,7 @@ class Model(nn.Module):
         final_inputs_embeds = self._merge_input_ids_with_image_features(
             image_features, inputs_embeds, input_ids
         )
-        return final_inputs_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
     def _merge_input_ids_with_image_features(
         self, image_features, inputs_embeds, input_ids
@@ -326,8 +329,10 @@ class Model(nn.Module):
         **kwargs,
     ):
 
-        input_embeddings = self.get_input_embeddings(input_ids, pixel_values)
+        input_embeddings_features = self.get_input_embeddings(input_ids, pixel_values)
         logits = self.language_model(
-            input_ids, cache=cache, inputs_embeds=input_embeddings
+            input_ids,
+            cache=cache,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
         )
         return logits

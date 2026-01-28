@@ -3,10 +3,23 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from transformers import AutoImageProcessor, AutoProcessor
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
+from .processing_kimi_vl import KimiVLImageProcessor, KimiVLProcessor
 from .vision import VisionModel
+
+# Register custom processor classes for kimi_vl model type
+try:
+    MODEL_TYPE = "kimi_vl"
+    AutoImageProcessor.register(
+        MODEL_TYPE, slow_image_processor_class=KimiVLImageProcessor
+    )
+    AutoProcessor.register(MODEL_TYPE, KimiVLProcessor)
+except Exception:
+    raise Exception("Failed to register kimi_vl processor")
 
 
 class KimiVLMultiModalProjector(nn.Module):
@@ -50,10 +63,15 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        grid_thw: Optional[mx.array] = None,
+        **kwargs,
     ):
+        image_grid_thw = kwargs.pop("image_grid_hws", None)
+        video_grid_thw = kwargs.pop("video_grid_hws", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+
         if pixel_values is None:
-            return self.language_model.embed_tokens(input_ids)
+            inputs_embeds = self.language_model.embed_tokens(input_ids)
+            return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
         inputs_embeds = self.language_model.embed_tokens(input_ids)
 
@@ -68,7 +86,7 @@ class Model(nn.Module):
         final_inputs_embeds = self._prepare_inputs_for_multimodal(
             image_features, inputs_embeds, input_ids
         )
-        return final_inputs_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
     def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
         image_token_index = self.config.image_token_index
@@ -91,14 +109,14 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        image_grid_thw = kwargs.pop("image_grid_hws", None)
-        video_grid_thw = kwargs.pop("video_grid_hws", None)
-        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
-        input_embeddings = self.get_input_embeddings(
-            input_ids, pixel_values, grid_thw=grid_thw
+
+        input_embeddings_features = self.get_input_embeddings(
+            input_ids, pixel_values, **kwargs
         )
         logits = self.language_model(
-            inputs=input_ids, cache=cache, inputs_embeds=input_embeddings
+            inputs=input_ids,
+            cache=cache,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
         )
         return logits
 
