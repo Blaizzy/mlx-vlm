@@ -229,7 +229,6 @@ class Attention(nn.Module):
             position_ids = mx.arange(offset, offset + L)
             position_ids = mx.expand_dims(position_ids, axis=0)
 
-        # Apply rotary embeddings
         cos, sin = self.rotary_emb(values, position_ids)
         queries, keys = apply_rotary_pos_emb(queries, keys, cos, sin)
 
@@ -247,8 +246,6 @@ class Attention(nn.Module):
 
 
 class Ernie4_5_MLP(nn.Module):
-    """Standard MLP for ERNIE."""
-
     def __init__(self, dim, hidden_dim, use_bias=False):
         super().__init__()
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=use_bias)
@@ -260,12 +257,7 @@ class Ernie4_5_MLP(nn.Module):
 
 
 class Ernie4_5_MoeMLP(nn.Module):
-    """Mixture of Experts MLP for ERNIE with dual expert groups (text + multimodal).
-
-    Matches PyTorch implementation with:
-    - e_score_correction_bias for load balancing
-    - Correct gate activation order: softmax -> add bias -> topk -> gather -> normalize
-    """
+    """Mixture of Experts MLP for ERNIE with dual expert groups."""
 
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -273,12 +265,10 @@ class Ernie4_5_MoeMLP(nn.Module):
         self.k = args.moe_k
         self.norm_min = getattr(args, "moe_norm_min", 1e-12)
 
-        # Parse expert configuration - ERNIE has two groups of experts
         moe_num_experts = args.moe_num_experts
         moe_intermediate_size = args.moe_intermediate_size
 
         if isinstance(moe_num_experts, (list, tuple)) and len(moe_num_experts) == 2:
-            # Two groups: text experts and multimodal experts
             self.num_text_experts = moe_num_experts[0]
             self.num_mm_experts = moe_num_experts[1]
             self.has_dual_experts = True
@@ -305,9 +295,7 @@ class Ernie4_5_MoeMLP(nn.Module):
             )
             self.mm_intermediate_size = self.text_intermediate_size
 
-        # Text experts gate and switch_mlp
         self.gate = nn.Linear(args.hidden_size, self.num_text_experts, bias=False)
-        # e_score_correction_bias for load balancing (added to routing weights before topk)
         self.e_score_correction_bias = mx.zeros((self.num_text_experts,))
         self.switch_mlp = SwitchGLU(
             args.hidden_size,
@@ -316,7 +304,6 @@ class Ernie4_5_MoeMLP(nn.Module):
             bias=args.use_bias,
         )
 
-        # Multimodal experts gate and switch_mlp (if present)
         if self.has_dual_experts and self.num_mm_experts > 0:
             self.gate_1 = nn.Linear(args.hidden_size, self.num_mm_experts, bias=False)
             self.e_score_correction_bias_1 = mx.zeros((self.num_mm_experts,))
@@ -327,7 +314,6 @@ class Ernie4_5_MoeMLP(nn.Module):
                 bias=args.use_bias,
             )
 
-        # Shared experts
         if getattr(args, "moe_num_shared_experts", 0) > 0:
             shared_intermediate_size = (
                 self.text_intermediate_size * args.moe_num_shared_experts
@@ -341,38 +327,15 @@ class Ernie4_5_MoeMLP(nn.Module):
     def _route_experts(
         self, x: mx.array, gate: nn.Module, e_score_correction_bias: mx.array
     ) -> tuple:
-        """Route tokens to experts using PyTorch-compatible order.
-
-        Order: gate -> softmax -> add bias -> topk -> gather -> normalize
-
-        Args:
-            x: Input tensor [batch, seq_len, hidden_size]
-            gate: Gate linear layer
-            e_score_correction_bias: Bias for load balancing
-
-        Returns:
-            (selected_experts, routing_weights): Indices and weights for top-k experts
-        """
         k = self.k
-
-        # 1. Compute router logits
         router_logits = gate(x).astype(mx.float32)
-
-        # 2. Apply softmax first (PyTorch order)
         routing_weights = mx.softmax(router_logits, axis=-1)
-
-        # 3. Add e_score_correction_bias for load balancing before topk
         routing_weights_with_bias = routing_weights + e_score_correction_bias
 
-        # 4. Select top-k experts based on bias-adjusted weights
         selected_experts = mx.stop_gradient(
             mx.argpartition(-routing_weights_with_bias, kth=k - 1, axis=-1)[..., :k]
         )
-
-        # 5. Gather original routing weights (without bias) for the selected experts
         scores = mx.take_along_axis(routing_weights, selected_experts, axis=-1)
-
-        # 6. Normalize the gathered weights
         scores = scores / mx.maximum(scores.sum(axis=-1, keepdims=True), self.norm_min)
 
         return selected_experts, scores
@@ -380,44 +343,27 @@ class Ernie4_5_MoeMLP(nn.Module):
     def __call__(
         self, x: mx.array, token_type_ids: Optional[mx.array] = None
     ) -> mx.array:
-        """
-        Forward pass through the MoE layer.
-
-        Args:
-            x: Input tensor [batch, seq_len, hidden_size]
-            token_type_ids: Optional token type IDs to route text vs multimodal tokens.
-                            0 = text tokens -> text experts, >0 = multimodal tokens -> MM experts.
-
-        Returns:
-            Output tensor [batch, seq_len, hidden_size]
-        """
-        # Process text experts
         inds, scores = self._route_experts(x, self.gate, self.e_score_correction_bias)
         y_text = self.switch_mlp(x, inds)
         y_text = (y_text * scores[..., None]).sum(axis=-2).astype(y_text.dtype)
 
-        # Route based on token_type_ids
         if (
             not self.has_dual_experts
             or self.num_mm_experts == 0
             or token_type_ids is None
         ):
-            # Text-only: use only text experts
             y = y_text
         else:
-            # Multimodal: process MM experts and selectively route
             inds_mm, scores_mm = self._route_experts(
                 x, self.gate_1, self.e_score_correction_bias_1
             )
             y_mm = self.switch_mlp_1(x, inds_mm)
             y_mm = (y_mm * scores_mm[..., None]).sum(axis=-2).astype(y_mm.dtype)
 
-            # Select based on token type: text tokens -> text experts, mm tokens -> mm experts
-            is_text = token_type_ids == 0  # [batch, seq_len]
-            is_text_expanded = mx.expand_dims(is_text, axis=-1)  # [batch, seq_len, 1]
+            is_text = token_type_ids == 0
+            is_text_expanded = mx.expand_dims(is_text, axis=-1)
             y = mx.where(is_text_expanded, y_text, y_mm)
 
-        # Add shared experts output
         if self.shared_experts is not None:
             y = y + self.shared_experts(x)
 
@@ -425,14 +371,11 @@ class Ernie4_5_MoeMLP(nn.Module):
 
 
 class Ernie4_5VLDecoderLayer(nn.Module):
-    """Decoder layer for ERNIE 4.5 VL."""
-
     def __init__(self, args: TextConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = args.hidden_size
         self.self_attn = Attention(args)
 
-        # Determine MoE layer boundaries
         moe_layer_start_index = args.moe_layer_start_index
         if isinstance(moe_layer_start_index, (tuple, list)):
             moe_layer_start_index = min(moe_layer_start_index)
@@ -443,7 +386,6 @@ class Ernie4_5VLDecoderLayer(nn.Module):
         elif isinstance(moe_layer_end_index, (tuple, list)):
             moe_layer_end_index = max(moe_layer_end_index)
 
-        # Use MoE if within the MoE layer range
         use_moe = (
             ((layer_idx + 1) % args.moe_layer_interval == 0)
             and layer_idx >= moe_layer_start_index
@@ -482,8 +424,6 @@ class Ernie4_5VLDecoderLayer(nn.Module):
 
 
 class Ernie4_5Model(nn.Module):
-    """ERNIE 4.5 transformer model."""
-
     def __init__(self, args: TextConfig):
         super().__init__()
         self.args = args
@@ -524,8 +464,6 @@ class Ernie4_5Model(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    """Language model wrapper for ERNIE 4.5 VL."""
-
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
         self.args = args
@@ -544,7 +482,6 @@ class LanguageModel(nn.Module):
         video_grid_thw: Optional[mx.array] = None,
         attention_mask: Optional[mx.array] = None,
     ):
-        """Calculate 3D RoPE index for image/video tokens."""
         batch_size, seq_length = input_ids.shape
         spatial_merge_size = self.config.vision_config.spatial_merge_size
         image_token_id = self.config.image_token_id
@@ -552,7 +489,6 @@ class LanguageModel(nn.Module):
         vision_start_token_id = self.config.vision_start_token_id
 
         if image_grid_thw is not None or video_grid_thw is not None:
-            # Build position_ids for each batch element
             batch_position_ids = []
             mrope_position_deltas = []
 
@@ -563,8 +499,6 @@ class LanguageModel(nn.Module):
                 llm_pos_ids_list = []
                 st = 0
 
-                # Count images and videos by looking at vision_start tokens
-                # This is more robust than counting all image/video tokens
                 image_nums, video_nums = 0, 0
                 for idx, token in enumerate(input_tokens):
                     if token == vision_start_token_id and idx + 1 < len(input_tokens):
@@ -593,45 +527,56 @@ class LanguageModel(nn.Module):
                         image_index += 1
                         remain_images -= 1
                         ed = ed_image
+                        vision_token = image_token_id
                     else:
                         t, h, w = video_grid_thw[video_index].tolist()
                         video_index += 1
                         remain_videos -= 1
                         ed = ed_video
+                        vision_token = video_token_id
 
                     llm_grid_t = t
                     llm_grid_h = h // spatial_merge_size
                     llm_grid_w = w // spatial_merge_size
-                    text_len = ed - st
+                    expected_vision_len = llm_grid_t * llm_grid_h * llm_grid_w
 
+                    actual_vision_len = 0
+                    for j in range(
+                        ed, min(ed + expected_vision_len, len(input_tokens))
+                    ):
+                        if input_tokens[j] == vision_token:
+                            actual_vision_len += 1
+                        else:
+                            break
+
+                    text_len = ed - st
                     st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
 
-                    # Text positions (same for all 3 dims)
                     text_pos = mx.arange(text_len) + st_idx
                     text_pos_3d = mx.stack([text_pos, text_pos, text_pos], axis=0)
                     llm_pos_ids_list.append(text_pos_3d)
 
-                    # Image/video positions
-                    t_idx = mx.repeat(
-                        mx.arange(llm_grid_t).reshape(-1, 1),
-                        llm_grid_h * llm_grid_w,
-                        axis=1,
-                    ).flatten()
-                    h_idx = mx.tile(
-                        mx.arange(llm_grid_h).reshape(1, -1, 1),
-                        (llm_grid_t, 1, llm_grid_w),
-                    ).flatten()
-                    w_idx = mx.tile(
-                        mx.arange(llm_grid_w).reshape(1, 1, -1),
-                        (llm_grid_t, llm_grid_h, 1),
-                    ).flatten()
+                    if actual_vision_len > 0:
+                        t_idx = mx.repeat(
+                            mx.arange(llm_grid_t).reshape(-1, 1),
+                            llm_grid_h * llm_grid_w,
+                            axis=1,
+                        ).flatten()[:actual_vision_len]
+                        h_idx = mx.tile(
+                            mx.arange(llm_grid_h).reshape(1, -1, 1),
+                            (llm_grid_t, 1, llm_grid_w),
+                        ).flatten()[:actual_vision_len]
+                        w_idx = mx.tile(
+                            mx.arange(llm_grid_w).reshape(1, 1, -1),
+                            (llm_grid_t, llm_grid_h, 1),
+                        ).flatten()[:actual_vision_len]
 
-                    vision_pos = (
-                        mx.stack([t_idx, h_idx, w_idx], axis=0) + text_len + st_idx
-                    )
-                    llm_pos_ids_list.append(vision_pos)
+                        vision_pos = (
+                            mx.stack([t_idx, h_idx, w_idx], axis=0) + text_len + st_idx
+                        )
+                        llm_pos_ids_list.append(vision_pos)
 
-                    st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+                    st = ed + actual_vision_len
 
                 # Handle remaining text
                 if st < len(input_tokens):
@@ -645,19 +590,14 @@ class LanguageModel(nn.Module):
                 batch_position_ids.append(llm_positions.T)  # [seq_len, 3]
                 mrope_position_deltas.append(llm_positions.max() + 1 - seq_length)
 
-            # Stack all batch position IDs
-            position_ids = mx.stack(
-                batch_position_ids, axis=0
-            )  # [batch_size, seq_len, 3]
+            position_ids = mx.stack(batch_position_ids, axis=0)
             mrope_position_deltas = mx.array(mrope_position_deltas)
             return position_ids, mrope_position_deltas
         else:
-            # Standard sequential positions
             position_ids = mx.arange(seq_length)
             position_ids = mx.broadcast_to(
                 position_ids[None, :], (batch_size, seq_length)
             )
-            # Expand to 3D format
             position_ids = mx.stack([position_ids, position_ids, position_ids], axis=-1)
             return position_ids, mx.zeros((batch_size,), dtype=mx.int32)
 
@@ -674,7 +614,6 @@ class LanguageModel(nn.Module):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
 
-        # Reset rope deltas when processing new image/video
         if pixel_values is not None:
             self._rope_deltas = None
 
@@ -684,7 +623,6 @@ class LanguageModel(nn.Module):
             cache_offset = offset.item() if isinstance(offset, mx.array) else offset
 
         if position_ids is None and (mask is None or mask.ndim == 2):
-            # Calculate 3D RoPE positions
             if (
                 cache is None or cache[0] is None or cache_offset == 0
             ) or self._rope_deltas is None:
@@ -693,7 +631,6 @@ class LanguageModel(nn.Module):
                 )
                 self._rope_deltas = rope_deltas
             else:
-                # Use cached rope deltas for continuation
                 batch_size, seq_length = inputs.shape
                 delta = cache_offset + self._rope_deltas if cache is not None else 0
                 position_ids = mx.arange(seq_length) + delta

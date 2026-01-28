@@ -32,10 +32,7 @@ class TokenType:
 
 
 class VariableResolutionResamplerModel(nn.Module):
-    """
-    VariableResolutionResamplerModel - supports variable resolution image/video inputs.
-    Compresses vision features using spatial and temporal convolutions.
-    """
+    """Compresses vision features using spatial and temporal convolutions."""
 
     def __init__(
         self,
@@ -53,9 +50,7 @@ class VariableResolutionResamplerModel(nn.Module):
         self.temporal_conv_size = temporal_conv_size
         self.use_temporal_conv = config.use_temporal_conv
 
-        # Compress 2d conv (picture) to 1d
         self.spatial_dim = in_dim * spatial_conv_size * spatial_conv_size
-        # Compress 3d conv (video) to 1d
         self.temporal_dim = (
             in_dim * spatial_conv_size * spatial_conv_size * temporal_conv_size
         )
@@ -79,7 +74,6 @@ class VariableResolutionResamplerModel(nn.Module):
         self.after_norm = nn.RMSNorm(out_dim)
 
     def spatial_conv_reshape(self, x: mx.array) -> mx.array:
-        """Reshape before linear to imitate conv."""
         S, C = x.shape
         x = x.reshape(-1, C * (self.spatial_conv_size**2))
         return x
@@ -89,31 +83,12 @@ class VariableResolutionResamplerModel(nn.Module):
         x: mx.array,
         grid_thw: mx.array,
     ) -> mx.array:
-        """
-        Process vision features through the resampler.
-
-        Args:
-            x: Image features [num_patches, hidden_dim]
-            grid_thw: Grid dimensions [batch, 3] containing (t, h, w)
-
-        Returns:
-            Processed features
-        """
-
         def fwd_spatial(x):
-            """Apply spatial convolution."""
             x = self.spatial_conv_reshape(x)
             x = self.spatial_linear(x)
             return x
 
         def fwd_placeholder(x, grid_thw):
-            """
-            Reorganize features for temporal processing.
-
-            Args:
-                x: [S, H]
-                grid_thw: [batch, 3] - (t, h, w)
-            """
             grid_thw_np = np.array(grid_thw.tolist(), dtype=np.int64)
             grid_t = grid_thw_np[:, 0]
             grid_hw = grid_thw_np[:, 1:]
@@ -162,12 +137,10 @@ class VariableResolutionResamplerModel(nn.Module):
             return x
 
         def fwd_temporal(x):
-            """Apply temporal linear."""
             x = self.temporal_linear(x)
             return x
 
         def fwd_mlp(x):
-            """Final MLP projection."""
             x = self.mlp(x)
             x = self.after_norm(x)
             return x
@@ -202,7 +175,6 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
         **kwargs,
     ):
-        """Get input embeddings with optional image features merged in."""
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
@@ -215,18 +187,11 @@ class Model(nn.Module):
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
         pixel_values = pixel_values.astype(dtype)
 
-        # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
-
-        # Get the output hidden states from the vision model
         hidden_states = self.vision_tower(
             pixel_values, grid_thw, output_hidden_states=False
         )
-
-        # Process through resampler
         image_features = self.resampler_model(hidden_states, image_grid_thw)
-
-        # Insert image features at image token positions
         final_inputs_embeds = self._merge_input_ids_with_image_features(
             image_features,
             inputs_embeds,
@@ -240,20 +205,9 @@ class Model(nn.Module):
         inputs_embeds: mx.array,
         input_ids: mx.array,
     ) -> mx.array:
-        """Merge image features into input embeddings at image token positions.
-
-        Args:
-            image_features: Vision features from resampler [num_features, hidden_dim]
-            inputs_embeds: Input embeddings [batch_size, seq_len, hidden_dim]
-            input_ids: Input token IDs [batch_size, seq_len]
-
-        Returns:
-            Updated input embeddings with image features inserted
-        """
         image_token_id = self.config.image_token_id
         video_token_id = self.config.video_token_id
 
-        # Find positions of image tokens
         image_positions = input_ids == image_token_id
         if mx.sum(image_positions) == 0:
             image_positions = input_ids == video_token_id
@@ -270,7 +224,6 @@ class Model(nn.Module):
             num_positions = int(mx.sum(image_mask).item())
 
             if num_positions > 0:
-                # Extract features for this batch
                 batch_features = image_features[
                     feature_start_idx : feature_start_idx + num_positions
                 ]
@@ -281,16 +234,12 @@ class Model(nn.Module):
                         f"number of image features ({batch_features.shape[0]}) for batch {batch_idx}"
                     )
 
-                # Create indices for gathering
                 cumsum = mx.cumsum(image_mask.astype(mx.int32))
                 feature_indices = mx.where(
                     image_mask, cumsum - 1, mx.zeros_like(cumsum)
                 )
-
-                # Gather features
                 gathered_features = batch_features[feature_indices]
 
-                # Combine with original embeddings
                 image_mask_expanded = mx.expand_dims(image_mask, axis=-1)
                 batch_output = mx.where(
                     image_mask_expanded, gathered_features, inputs_embeds[batch_idx]
@@ -311,11 +260,6 @@ class Model(nn.Module):
     def _build_token_type_ids(
         self, input_ids: mx.array, pixel_values: Optional[mx.array] = None
     ) -> Optional[mx.array]:
-        """Build token_type_ids from input_ids for MoE routing.
-
-        Returns None if no image/video tokens are present (text-only),
-        otherwise returns 0 for text tokens and 1 for image/video tokens.
-        """
         if pixel_values is None:
             return None
 
@@ -342,8 +286,6 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-
-        # Build token_type_ids for MoE routing (only on prefill with images)
         token_type_ids = self._build_token_type_ids(input_ids, pixel_values)
 
         inputs_embeds_features = self.get_input_embeddings(
@@ -363,15 +305,12 @@ class Model(nn.Module):
         return logits
 
     def sanitize(self, weights):
-        """Sanitize weights for loading."""
         import re
 
         def transform_key(key):
-            # Handle vision tower naming
             if "vision_tower" not in key and "vision_model" in key:
                 key = key.replace("vision_model", "vision_tower")
 
-            # Handle language model naming
             if "language_model" not in key:
                 if (
                     "model.layers" in key
@@ -382,26 +321,17 @@ class Model(nn.Module):
                 elif "lm_head" in key:
                     key = key.replace("lm_head", "language_model.lm_head")
 
-            # Handle resampler naming
             if "model.resampler_model" in key:
                 key = key.replace("model.resampler_model", "resampler_model")
 
-            # Handle Sequential layer indices for resampler
-            # Transform spatial_linear.0 -> spatial_linear.layers.0
-            # Transform temporal_linear.0 -> temporal_linear.layers.0
             key = re.sub(
                 r"(spatial_linear|temporal_linear)\.(\d+)", r"\1.layers.\2", key
             )
 
             return key
 
-        # Transform keys
         weights = {transform_key(k): v for k, v in weights.items()}
-
-        # Sanitize vision weights
         weights = self.vision_tower.sanitize(weights)
-
-        # Sanitize language model weights
         weights = self.language_model.sanitize(weights)
 
         return weights
