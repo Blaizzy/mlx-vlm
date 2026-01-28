@@ -81,6 +81,45 @@ SINGLE_IMAGE_ONLY_MODELS = {
 }
 
 
+def extract_text_from_content(content: Any) -> str:
+    """
+    Extract text from multimodal content.
+
+    When using OpenAI-compatible multimodal API, content can be a list like:
+    [
+        {"type": "text", "text": "Describe this image"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+    ]
+
+    This function extracts only the text parts, preventing base64 image data
+    from being tokenized as text (which would cause token explosion).
+
+    Args:
+        content: Either a string or a list of content items
+
+    Returns:
+        A string containing only the text content
+    """
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict):
+                item_type = item.get("type", "")
+                # Extract text from text-type items
+                if item_type in ("text", "input_text"):
+                    text = item.get("text", "") or item.get("content", "")
+                    if text:
+                        text_parts.append(text)
+                # Skip image_url, input_image, input_audio - these are handled separately
+        return " ".join(text_parts).strip() if text_parts else ""
+
+    # Fallback: convert to string (shouldn't happen in normal usage)
+    return str(content) if content else ""
+
+
 class MessageBuilder:
     """Builder for creating messages in various formats."""
 
@@ -442,10 +481,11 @@ def apply_chat_template(
         )
     elif isinstance(prompt, dict):
         # Single dict prompt
+        content = extract_text_from_content(prompt["content"])
         messages.append(
             get_message_json(
                 model_type,
-                prompt["content"],
+                content,
                 prompt["role"],
                 num_images=num_images,
                 num_audios=num_audios,
@@ -477,6 +517,9 @@ def apply_chat_template(
                 else:
                     role = p.role
                     content = p.content
+                # Handle multimodal content: extract only text, skip image/audio URLs
+                # This prevents base64 image data from being tokenized as text
+                content = extract_text_from_content(content)
                 is_first = i == 0 or (i == 1 and role not in ["system", "assistant"])
                 messages.append(
                     get_message_json(
