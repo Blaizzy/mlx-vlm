@@ -2,6 +2,7 @@ import argparse
 import codecs
 import contextlib
 import functools
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
@@ -150,6 +151,13 @@ def parse_arguments():
         "--trust-remote-code",
         action="store_true",
         help="Trust remote code when loading the model.",
+    )
+    parser.add_argument(
+        "--processor-kwargs",
+        type=json.loads,
+        default={},
+        help="Extra processor kwargs as JSON. "
+        'Example: --processor-kwargs \'{"cropping": false, "max_patches": 3}\'',
     )
 
     return parser.parse_args()
@@ -1338,6 +1346,10 @@ def main():
 
     if args.skip_special_tokens:
         kwargs["skip_special_tokens"] = args.skip_special_tokens
+
+    # Add processor kwargs from JSON
+    if args.processor_kwargs:
+        kwargs.update(args.processor_kwargs)
 
     if args.chat:
         chat = []

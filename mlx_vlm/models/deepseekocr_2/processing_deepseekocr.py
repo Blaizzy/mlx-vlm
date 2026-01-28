@@ -265,8 +265,10 @@ class DeepseekVLV2Processor(ProcessorMixin):
         images: List[Image.Image] = None,
         inference_mode: bool = True,
         base_size: int = 1024,
-        image_size: int = 640,
+        image_size: int = 768,
         cropping: bool = True,
+        min_patches: int = 1,
+        max_patches: int = 6,
     ):
 
         sft_format = prompt
@@ -282,6 +284,8 @@ class DeepseekVLV2Processor(ProcessorMixin):
             base_size=base_size,
             image_size=image_size,
             cropping=cropping,
+            min_patches=min_patches,
+            max_patches=max_patches,
         )
 
         masked_tokenized_str = []
@@ -340,16 +344,26 @@ class DeepseekVLV2Processor(ProcessorMixin):
         conversation: str,
         images: List[Image.Image],
         base_size: int = 1024,
-        image_size: int = 640,
+        image_size: int = 768,
         cropping: bool = True,
+        min_patches: int = 1,
+        max_patches: int = 6,
     ):
         """Tokenize text with <image> tags.
 
-        For DeepSeek-OCR-2 with Qwen2 encoder, each image always produces
-        exactly 257 tokens: 256 from Qwen2 encoder + 1 view_separator.
+        For DeepSeek-OCR-2 with Qwen2 encoder:
+        - Global view (1024x1024): 256 tokens from Qwen2 encoder
+        - Local patches (768x768): 144 tokens each from Qwen2 encoder
+        - Plus 1 view_separator token
+
+        Dynamic resolution:
+        - Total tokens = (num_patches * 144) + 256 + 1
+        - Default: 0-6 patches at 768x768 + 1 global at 1024x1024
         """
-        # Fixed number of tokens per image for Qwen2 encoder architecture
-        NUM_IMAGE_TOKENS = 257  # 256 from Qwen2 queries + 1 view_separator
+        # Token counts for Qwen2 encoder
+        TOKENS_PER_PATCH = 144  # 12x12 SAM features for 768x768
+        TOKENS_PER_GLOBAL = 256  # 16x16 SAM features for 1024x1024
+        TOKENS_VIEW_SEP = 1
 
         assert conversation.count(self.image_token) == len(
             images
@@ -357,10 +371,12 @@ class DeepseekVLV2Processor(ProcessorMixin):
 
         text_splits = conversation.split(self.image_token)
 
-        images_list = []
+        all_patches_list = []
+        all_global_list = []
         images_seq_mask = []
         tokenized_str = []
         images_spatial_crop = []
+        num_image_tokens_list = []
 
         for text_sep, image in zip(text_splits, images):
             # Tokenize the text before this image
@@ -368,19 +384,52 @@ class DeepseekVLV2Processor(ProcessorMixin):
             tokenized_str += tokenized_sep
             images_seq_mask += [False] * len(tokenized_sep)
 
-            # Process image: pad to base_size x base_size
+            # Process global view: pad to base_size x base_size (1024x1024)
             global_view = ImageOps.pad(
                 image,
                 (base_size, base_size),
                 color=tuple(int(x * 255) for x in self.image_transform.mean),
             )
-            images_list.append(self.image_transform(global_view).astype(mx.bfloat16))
+            global_tensor = self.image_transform(global_view).astype(mx.bfloat16)
+            all_global_list.append(global_tensor)
 
-            # No cropping for Qwen2 encoder - single image processing
-            images_spatial_crop.append([1, 1])
+            # Process local patches using dynamic resolution
+            if cropping and min_patches > 0:
+                # Use dynamic_preprocess to split image into patches
+                patches, (rows, cols) = dynamic_preprocess(
+                    image,
+                    min_num=min_patches,
+                    max_num=max_patches,
+                    image_size=image_size,  # 768x768 patches
+                    use_thumbnail=False,
+                )
+                num_patches = len(patches)
 
-            # Add fixed number of image tokens (257 = 256 + 1 view_separator)
-            tokenized_image = [self.image_token_id] * NUM_IMAGE_TOKENS
+                # Transform each patch
+                patch_tensors = []
+                for patch in patches:
+                    patch_tensor = self.image_transform(patch).astype(mx.bfloat16)
+                    patch_tensors.append(patch_tensor)
+
+                if patch_tensors:
+                    patches_stacked = mx.stack(patch_tensors, axis=0)
+                    all_patches_list.append(patches_stacked)
+
+                images_spatial_crop.append([rows, cols])
+            else:
+                # No patches, only global view
+                num_patches = 0
+                images_spatial_crop.append([0, 0])
+
+            # Calculate number of image tokens for this image
+            # Order: [local_patches, global_view, view_separator]
+            num_image_tokens = (
+                (num_patches * TOKENS_PER_PATCH) + TOKENS_PER_GLOBAL + TOKENS_VIEW_SEP
+            )
+            num_image_tokens_list.append(num_image_tokens)
+
+            # Add image tokens to sequence
+            tokenized_image = [self.image_token_id] * num_image_tokens
             tokenized_str += tokenized_image
             images_seq_mask += [True] * len(tokenized_image)
 
@@ -396,15 +445,20 @@ class DeepseekVLV2Processor(ProcessorMixin):
 
         images_seq_mask = mx.array(images_seq_mask)
 
-        if len(images_list) == 0:
+        # Stack global images
+        if len(all_global_list) == 0:
             images_ori = mx.zeros((1, 3, base_size, base_size))
             images_spatial_crop = mx.zeros((1, 2))
         else:
-            images_ori = mx.stack(images_list, axis=0)
+            images_ori = mx.stack(all_global_list, axis=0)
             images_spatial_crop = mx.array(images_spatial_crop)
 
-        # No crop images for Qwen2 encoder architecture
-        images_crop = mx.zeros((1, 3, base_size, base_size))
+        # Stack patches (or zeros if no patches)
+        if all_patches_list:
+            # Concatenate all patches from all images
+            images_patches = mx.concatenate(all_patches_list, axis=0)
+        else:
+            images_patches = mx.zeros((1, 3, image_size, image_size))
 
         assert len(tokenized_str) == len(
             images_seq_mask
@@ -412,10 +466,10 @@ class DeepseekVLV2Processor(ProcessorMixin):
 
         return (
             tokenized_str,
-            [images_crop, images_ori],
+            [images_patches, images_ori],
             images_seq_mask,
             images_spatial_crop,
-            NUM_IMAGE_TOKENS,
+            num_image_tokens_list[0] if num_image_tokens_list else 257,
         )
 
     def __call__(
@@ -424,26 +478,33 @@ class DeepseekVLV2Processor(ProcessorMixin):
         text: str = None,
         images: List[Image.Image] = None,
         inference_mode: bool = True,
-        image_size: int = 640,
+        image_size: int = 768,
         base_size: int = 1024,
         cropping: bool = True,
+        min_patches: int = 1,
+        max_patches: int = 6,
         padding: bool = True,
         return_tensors: Literal["np", "mx", "pt"] = "mx",
         **kwargs,
     ):
-        """
+        """Process text and images for DeepSeek-OCR-2.
 
         Args:
-            text (str or List[str]): the formatted prompt(s);
-            images (List[ImageType]): the list of images (one per prompt for batched inputs);
-            inference_mode (bool): if True, then remove the last eos token;
+            text (str or List[str]): the formatted prompt(s)
+            images (List[ImageType]): the list of images (one per prompt for batched inputs)
+            inference_mode (bool): if True, remove the last eos token
+            image_size (int): size of local patches (default 768)
+            base_size (int): size of global view (default 1024)
+            cropping (bool): whether to use dynamic resolution with local patches
+            min_patches (int): minimum number of patches (default 1)
+            max_patches (int): maximum number of patches (default 6)
 
         Returns:
-            outputs (BaseProcessorOutput): the output of the processor,
+            outputs (dict): the output of the processor,
                 - input_ids (mx.array): [batch_size, N + image tokens]
-                - images (mx.array): [n_images, 3, H, W]
-                - image_id (int): the id of the image token
-                - num_image_tokens (List[int]): the number of image tokens
+                - images (List[mx.array]): [patches, global_images]
+                - images_seq_mask (mx.array): mask for image token positions
+                - images_spatial_crop (mx.array): patch grid dimensions
         """
 
         # Handle batched inputs (list of prompts with list of images)
@@ -462,6 +523,8 @@ class DeepseekVLV2Processor(ProcessorMixin):
                     image_size=image_size,
                     base_size=base_size,
                     cropping=cropping,
+                    min_patches=min_patches,
+                    max_patches=max_patches,
                 )
                 batch_results.append(result)
 
@@ -476,6 +539,8 @@ class DeepseekVLV2Processor(ProcessorMixin):
             image_size=image_size,
             base_size=base_size,
             cropping=cropping,
+            min_patches=min_patches,
+            max_patches=max_patches,
         )
 
         return prepare

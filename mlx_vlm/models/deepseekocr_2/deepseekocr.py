@@ -80,10 +80,10 @@ class Model(nn.Module):
             return InputEmbeddingsFeatures(inputs_embeds=input_embeds)
 
         # pixel_values is a list: [patches, global_images]
-        # For DeepSeek-OCR-2 with Qwen2 encoder, we only use global_images
         if isinstance(pixel_values, list):
-            _, global_images = pixel_values
+            patches, global_images = pixel_values
         else:
+            patches = None
             global_images = pixel_values
 
         # Check if we have valid pixel values
@@ -94,43 +94,87 @@ class Model(nn.Module):
         batch_size = input_ids.shape[0]
 
         for idx in range(batch_size):
-            # Get the image for this batch item
-            # global_images is (N, C, H, W) where N is number of images
-            image = global_images[idx : idx + 1]  # Keep batch dimension
+            all_features = []
+
+            # Check if we have valid patches (non-zero)
+            has_patches = patches is not None and mx.sum(patches).item() != 0
+
+            if has_patches:
+                # Get spatial crop info for this batch item
+                if (
+                    images_spatial_crop is not None
+                    and idx < images_spatial_crop.shape[0]
+                ):
+                    rows, cols = int(images_spatial_crop[idx, 0].item()), int(
+                        images_spatial_crop[idx, 1].item()
+                    )
+                    num_patches = rows * cols
+                else:
+                    num_patches = patches.shape[0]
+
+                # Process each patch through SAM -> Qwen2 -> Projector
+                # patches shape: (num_patches, C, H, W) where H=W=768
+                for patch_idx in range(num_patches):
+                    if patch_idx >= patches.shape[0]:
+                        break
+
+                    patch = patches[patch_idx : patch_idx + 1]  # (1, C, H, W)
+
+                    # Transpose to (B, H, W, C) for MLX conv2d
+                    patch_hwc = patch.transpose(0, 2, 3, 1)
+
+                    # SAM encoder: (1, 768, 768, 3) -> (1, 12, 12, 896)
+                    sam_features = self.sam_model(patch_hwc)
+
+                    # Qwen2 encoder: (1, 12, 12, 896) -> (1, 144, 896)
+                    # Uses query_768 automatically based on 144 input tokens
+                    vision_features = self.vision_model(patch_hwc, sam_features)
+
+                    # Linear projector: (1, 144, 896) -> (1, 144, 1280)
+                    vision_features = self.projector(vision_features)
+
+                    # Remove batch dimension: (144, 1280)
+                    all_features.append(vision_features[0])
+
+            # Process global view through SAM -> Qwen2 -> Projector
+            # global_images is (N, C, H, W) where H=W=1024
+            global_image = global_images[idx : idx + 1]  # (1, C, H, W)
 
             # Transpose to (B, H, W, C) for MLX conv2d
-            image_hwc = image.transpose(0, 2, 3, 1)
+            global_hwc = global_image.transpose(0, 2, 3, 1)
 
-            # SAM encoder: (B, H, W, C) -> (B, H', W', 896)
-            sam_features = self.sam_model(image_hwc)
+            # SAM encoder: (1, 1024, 1024, 3) -> (1, 16, 16, 896)
+            sam_features = self.sam_model(global_hwc)
 
-            # Qwen2 encoder: (B, H', W', 896) -> (B, 256, 896)
-            vision_features = self.vision_model(image_hwc, sam_features)
+            # Qwen2 encoder: (1, 16, 16, 896) -> (1, 256, 896)
+            # Uses query_1024 automatically based on 256 input tokens
+            global_features = self.vision_model(global_hwc, sam_features)
 
-            # Linear projector: (B, 256, 896) -> (B, 256, 1280)
-            vision_features = self.projector(vision_features)
+            # Linear projector: (1, 256, 896) -> (1, 256, 1280)
+            global_features = self.projector(global_features)
 
             # Remove batch dimension: (256, 1280)
-            vision_features = vision_features[0]
+            all_features.append(global_features[0])
 
-            # Add view_separator: (257, 1280)
-            vision_features = mx.concatenate(
-                [vision_features, self.view_separator[None, :]], axis=0
-            )
+            # Add view_separator
+            all_features.append(self.view_separator[None, :])
+
+            # Concatenate all features: [local_patches..., global, view_sep]
+            # Shape: (num_patches * 144 + 256 + 1, 1280)
+            vision_features = mx.concatenate(all_features, axis=0)
 
             # Find positions where images should be placed
             if images_seq_mask is not None:
                 image_indices = np.where(images_seq_mask[idx])[0].tolist()
                 # Assign image features to those positions
                 if len(image_indices) > 0:
-                    # Truncate or pad vision_features to match number of image tokens
                     num_positions = len(image_indices)
                     if vision_features.shape[0] >= num_positions:
                         input_embeds[idx, image_indices] = vision_features[
                             :num_positions
                         ]
                     else:
-                        # Pad with zeros if needed
+                        # If we have fewer features than expected, pad with the last features
                         input_embeds[idx, image_indices[: vision_features.shape[0]]] = (
                             vision_features
                         )
