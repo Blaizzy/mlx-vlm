@@ -58,7 +58,10 @@ class TextConfig(BaseModelConfig):
     # 3D RoPE config
     rope_3d: bool = True
     freq_allocation: int = 20
+    mrope_section: List[int] = field(default_factory=lambda: [22, 22, 20])
     rope_scaling: Optional[Dict[str, Union[str, List[int]]]] = None
+    rope_parameters: Optional[Dict[str, Union[str, float, List[int]]]] = None
+    moe_norm_min: float = 1e-12
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -69,6 +72,13 @@ class TextConfig(BaseModelConfig):
         if self.rope_scaling:
             if "type" not in self.rope_scaling and "rope_type" in self.rope_scaling:
                 self.rope_scaling["type"] = self.rope_scaling.pop("rope_type")
+            # Extract mrope_section from rope_scaling if present
+            if "mrope_section" in self.rope_scaling:
+                self.mrope_section = list(self.rope_scaling["mrope_section"])
+        # Also check rope_parameters (HuggingFace format)
+        if self.rope_parameters:
+            if "mrope_section" in self.rope_parameters:
+                self.mrope_section = list(self.rope_parameters["mrope_section"])
 
 
 @dataclass

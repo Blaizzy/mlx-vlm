@@ -16,110 +16,118 @@ from .config import ModelConfig, TextConfig
 
 
 class Ernie4_5RotaryEmbedding:
-    """Rotary Position Embedding for ERNIE 4.5 VL with MRoPE support."""
+    """Rotary Position Embedding for ERNIE 4.5 VL with MRoPE support.
+
+    Matches PyTorch's implementation with pre-rotated inverse frequencies.
+    """
 
     def __init__(
         self,
         dim: int,
         base: float = 10000,
-        freq_allocation: int = 20,
+        mrope_section: tuple = (22, 22, 20),
     ):
         self.dim = dim  # head_dim
         self.base = base
-        self.freq_allocation = freq_allocation  # frequencies allocated to temporal dim
+        self.mrope_section = mrope_section  # (h_dim, w_dim, t_dim)
 
-        # Pre-compute inverse frequencies for all positions
+        # Pre-compute inverse frequencies
         indices = mx.arange(0, self.dim, 2, dtype=mx.float32)
-        self.inv_freq = 1.0 / (self.base ** (indices / self.dim))
+        inv_freq = 1.0 / (self.base ** (indices / self.dim))
 
-    def _compute_pos_emb(self, position_ids):
-        """Compute sin/cos embeddings for given position IDs.
+        # Pre-rotate frequencies to match PyTorch's approach
+        # This avoids rotation during forward pass
+        hw_dim = mrope_section[0] + mrope_section[1]  # 44
+        t_dim = mrope_section[2]  # 20
+
+        inv_freq_3d = mx.zeros_like(inv_freq)
+        # Pre-rotate HW dimensions: [even, odd] -> interleaved during recomposition
+        hw_freqs = inv_freq[:-t_dim]  # First (dim/2 - t_dim) frequencies
+        inv_freq_3d = mx.concatenate(
+            [
+                mx.concatenate([hw_freqs[0::2], hw_freqs[1::2]]),  # Pre-rotated HW
+                inv_freq[-t_dim:],  # T frequencies unchanged
+            ]
+        )
+        self.inv_freq = inv_freq_3d
+
+    def _recomposition_to_3d(self, freq):
+        """Recompose frequencies for 3D positions matching PyTorch's approach.
 
         Args:
-            position_ids: [batch, seq_len] or scalar
+            freq: [3, batch, seq_len, dim//2] - frequencies for T, H, W dimensions
+
         Returns:
-            pos_emb: [batch, seq_len, head_dim] with sin in first half, cos in second half
+            Recomposed frequencies [batch, seq_len, dim]
         """
-        # position_ids: [batch, seq_len] -> [batch, seq_len, 1]
-        if position_ids.ndim == 1:
-            position_ids = position_ids[None, :]
-        position_ids = position_ids.astype(mx.float32)
+        # Split by mrope_section
+        h_dim, w_dim, t_dim = self.mrope_section
 
-        # sinusoid_inp: [batch, seq_len, head_dim//2]
-        sinusoid_inp = position_ids[:, :, None] * self.inv_freq[None, None, :]
+        # freq shape: [3, batch, seq_len, half_dim]
+        # Split each dimension's frequencies
+        freq_parts = []
+        for i in range(3):
+            freq_parts.append(mx.split(freq[i], [h_dim, h_dim + w_dim], axis=-1))
 
-        # pos_emb: [batch, seq_len, head_dim] - sin first, cos second
-        pos_emb = mx.concatenate([mx.sin(sinusoid_inp), mx.cos(sinusoid_inp)], axis=-1)
-        return pos_emb
+        # Recompose: freq_h from dim 1, freq_w from dim 2, freq_t from dim 0
+        # This matches PyTorch's (i + 1) % 3 indexing
+        freq_h = freq_parts[1][0]  # H from position 1
+        freq_w = freq_parts[2][1]  # W from position 2
+        freq_t = freq_parts[0][2]  # T from position 0
+
+        # Interleave H and W: [h0, w0, h1, w1, ...]
+        freq_hw = mx.stack([freq_h, freq_w], axis=-1).reshape(
+            freq_h.shape[0], freq_h.shape[1], -1
+        )
+
+        # Concatenate HW and T
+        freq_hwt = mx.concatenate([freq_hw, freq_t], axis=-1)
+
+        # Repeat interleave by 2 for full head_dim
+        freq_full = mx.repeat(freq_hwt, 2, axis=-1)
+
+        return freq_full
 
     def __call__(self, x, position_ids):
         """
-        Compute 3D rotary embeddings matching PyTorch's apply_rotary_3d.
+        Compute 3D rotary embeddings matching PyTorch's implementation.
 
         Args:
             x: Input tensor for dtype reference
             position_ids: Position IDs, shape (batch, seq_len, 3) for 3D positions [T, H, W]
 
         Returns:
-            sin_pos, cos_pos: [batch, seq_len, head_dim] ready for rotation
+            cos, sin: [batch, seq_len, head_dim] ready for rotation
         """
         if position_ids.ndim == 2:
             # 1D positions - expand to 3D with same values
             position_ids = mx.stack([position_ids, position_ids, position_ids], axis=-1)
 
         batch_size, seq_len, _ = position_ids.shape
-        half_dim = self.dim // 2
-        freq_alloc = self.freq_allocation
 
-        # Compute full position embeddings for maximum position
-        max_pos = int(mx.max(position_ids).item()) + 1
-        full_positions = mx.arange(max_pos)
-        full_emb = self._compute_pos_emb(
-            full_positions[None, :]
-        )  # [1, max_pos, head_dim]
+        # position_ids: [batch, seq_len, 3] -> [3, batch, seq_len]
+        position_ids = position_ids.transpose(2, 0, 1).astype(mx.float32)
 
-        # Split into sin and cos (each head_dim//2)
-        full_sin = full_emb[0, :, :half_dim]  # [max_pos, head_dim//2]
-        full_cos = full_emb[0, :, half_dim:]  # [max_pos, head_dim//2]
-
-        # Extract positions for each dimension
-        pos_t = position_ids[:, :, 0]  # [batch, seq_len] temporal
-        pos_h = position_ids[:, :, 1]  # [batch, seq_len] height
-        pos_w = position_ids[:, :, 2]  # [batch, seq_len] width
-
-        # Gather sin/cos for each position
-        # sin_t: temporal uses last freq_allocation frequencies
-        sin_t = full_sin[pos_t, -freq_alloc:]  # [batch, seq_len, freq_alloc]
-        cos_t = full_cos[pos_t, -freq_alloc:]
-
-        # sin_h: height uses even indices of first (half_dim - freq_alloc)
-        hw_range = half_dim - freq_alloc  # 44 for dim=128, freq=20
-        sin_h = full_sin[pos_h, :hw_range:2]  # [batch, seq_len, hw_range//2]
-        cos_h = full_cos[pos_h, :hw_range:2]
-
-        # sin_w: width uses odd indices of first (half_dim - freq_alloc)
-        sin_w = full_sin[pos_w, 1:hw_range:2]  # [batch, seq_len, hw_range//2]
-        cos_w = full_cos[pos_w, 1:hw_range:2]
-
-        # Interleave H and W: [h0, w0, h1, w1, ...]
-        sin_hw = mx.stack([sin_h, sin_w], axis=-1).reshape(
-            batch_size, seq_len, -1
-        )  # [batch, seq_len, hw_range]
-        cos_hw = mx.stack([cos_h, cos_w], axis=-1).reshape(batch_size, seq_len, -1)
-
-        # Concatenate HW and T
-        sin_thw = mx.concatenate([sin_hw, sin_t], axis=-1)  # [batch, seq_len, half_dim]
-        cos_thw = mx.concatenate([cos_hw, cos_t], axis=-1)
-
-        # Double for full head_dim: [s0, s0, s1, s1, ...]
-        sin_pos = mx.stack([sin_thw, sin_thw], axis=-1).reshape(
-            batch_size, seq_len, self.dim
-        )
-        cos_pos = mx.stack([cos_thw, cos_thw], axis=-1).reshape(
-            batch_size, seq_len, self.dim
+        # inv_freq: [dim//2] -> [1, 1, dim//2, 1] for broadcasting
+        inv_freq_expanded = self.inv_freq[None, None, :, None]  # [1, 1, dim//2, 1]
+        inv_freq_expanded = mx.broadcast_to(
+            inv_freq_expanded, (3, batch_size, self.dim // 2, 1)
         )
 
-        return cos_pos.astype(x.dtype), sin_pos.astype(x.dtype)
+        # position_ids: [3, batch, seq_len] -> [3, batch, 1, seq_len]
+        position_ids_expanded = position_ids[:, :, None, :]
+
+        # freqs: [3, batch, dim//2, seq_len] -> [3, batch, seq_len, dim//2]
+        freqs = (inv_freq_expanded * position_ids_expanded).transpose(0, 1, 3, 2)
+
+        cos = mx.cos(freqs)
+        sin = mx.sin(freqs)
+
+        # Recompose to 3D
+        cos = self._recomposition_to_3d(cos)
+        sin = self._recomposition_to_3d(sin)
+
+        return cos.astype(x.dtype), sin.astype(x.dtype)
 
 
 def rotate_half_interleaved(x):
@@ -183,13 +191,14 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=args.use_bias)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=args.use_bias)
 
-        # Get freq_allocation for 3D RoPE (temporal dimension frequency allocation)
-        self.freq_allocation = getattr(args, "freq_allocation", 20)
+        # Get mrope_section for 3D RoPE (H, W, T dimension allocation)
+        # Default [22, 22, 20] for head_dim=128
+        self.mrope_section = tuple(getattr(args, "mrope_section", [22, 22, 20]))
 
         self.rotary_emb = Ernie4_5RotaryEmbedding(
             head_dim,
             base=args.rope_theta,
-            freq_allocation=self.freq_allocation,
+            mrope_section=self.mrope_section,
         )
 
     def __call__(
@@ -251,12 +260,18 @@ class Ernie4_5_MLP(nn.Module):
 
 
 class Ernie4_5_MoeMLP(nn.Module):
-    """Mixture of Experts MLP for ERNIE with dual expert groups (text + multimodal)."""
+    """Mixture of Experts MLP for ERNIE with dual expert groups (text + multimodal).
+
+    Matches PyTorch implementation with:
+    - e_score_correction_bias for load balancing
+    - Correct gate activation order: softmax -> add bias -> topk -> gather -> normalize
+    """
 
     def __init__(self, args: TextConfig):
         super().__init__()
         self.args = args
         self.k = args.moe_k
+        self.norm_min = getattr(args, "moe_norm_min", 1e-12)
 
         # Parse expert configuration - ERNIE has two groups of experts
         moe_num_experts = args.moe_num_experts
@@ -292,6 +307,8 @@ class Ernie4_5_MoeMLP(nn.Module):
 
         # Text experts gate and switch_mlp
         self.gate = nn.Linear(args.hidden_size, self.num_text_experts, bias=False)
+        # e_score_correction_bias for load balancing (added to routing weights before topk)
+        self.e_score_correction_bias = mx.zeros((self.num_text_experts,))
         self.switch_mlp = SwitchGLU(
             args.hidden_size,
             self.text_intermediate_size,
@@ -302,6 +319,7 @@ class Ernie4_5_MoeMLP(nn.Module):
         # Multimodal experts gate and switch_mlp (if present)
         if self.has_dual_experts and self.num_mm_experts > 0:
             self.gate_1 = nn.Linear(args.hidden_size, self.num_mm_experts, bias=False)
+            self.e_score_correction_bias_1 = mx.zeros((self.num_mm_experts,))
             self.switch_mlp_1 = SwitchGLU(
                 args.hidden_size,
                 self.mm_intermediate_size,
@@ -320,8 +338,44 @@ class Ernie4_5_MoeMLP(nn.Module):
         else:
             self.shared_experts = None
 
-        self.gate_act = nn.Softmax() if args.moe_gate_act == "softmax" else nn.Sigmoid()
-        self.norm_gate_logits = getattr(args, "moe_norm_gate_logits", True)
+    def _route_experts(
+        self, x: mx.array, gate: nn.Module, e_score_correction_bias: mx.array
+    ) -> tuple:
+        """Route tokens to experts using PyTorch-compatible order.
+
+        Order: gate -> softmax -> add bias -> topk -> gather -> normalize
+
+        Args:
+            x: Input tensor [batch, seq_len, hidden_size]
+            gate: Gate linear layer
+            e_score_correction_bias: Bias for load balancing
+
+        Returns:
+            (selected_experts, routing_weights): Indices and weights for top-k experts
+        """
+        k = self.k
+
+        # 1. Compute router logits
+        router_logits = gate(x).astype(mx.float32)
+
+        # 2. Apply softmax first (PyTorch order)
+        routing_weights = mx.softmax(router_logits, axis=-1)
+
+        # 3. Add e_score_correction_bias for load balancing before topk
+        routing_weights_with_bias = routing_weights + e_score_correction_bias
+
+        # 4. Select top-k experts based on bias-adjusted weights
+        selected_experts = mx.stop_gradient(
+            mx.argpartition(-routing_weights_with_bias, kth=k - 1, axis=-1)[..., :k]
+        )
+
+        # 5. Gather original routing weights (without bias) for the selected experts
+        scores = mx.take_along_axis(routing_weights, selected_experts, axis=-1)
+
+        # 6. Normalize the gathered weights
+        scores = scores / mx.maximum(scores.sum(axis=-1, keepdims=True), self.norm_min)
+
+        return selected_experts, scores
 
     def __call__(
         self, x: mx.array, token_type_ids: Optional[mx.array] = None
@@ -337,17 +391,8 @@ class Ernie4_5_MoeMLP(nn.Module):
         Returns:
             Output tensor [batch, seq_len, hidden_size]
         """
-        k = self.k
-
-        # Process text experts (gate + switch_mlp)
-        gates = self.gate(x)
-        gates = self.gate_act(gates.astype(mx.float32))
-        inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
-        scores = mx.take_along_axis(gates, inds, axis=-1)
-
-        if self.norm_gate_logits:
-            scores = scores / mx.maximum(scores.sum(axis=-1, keepdims=True), 1e-12)
-
+        # Process text experts
+        inds, scores = self._route_experts(x, self.gate, self.e_score_correction_bias)
         y_text = self.switch_mlp(x, inds)
         y_text = (y_text * scores[..., None]).sum(axis=-2).astype(y_text.dtype)
 
@@ -361,18 +406,9 @@ class Ernie4_5_MoeMLP(nn.Module):
             y = y_text
         else:
             # Multimodal: process MM experts and selectively route
-            gates_mm = self.gate_1(x)
-            gates_mm = self.gate_act(gates_mm.astype(mx.float32))
-            inds_mm = mx.stop_gradient(
-                mx.argpartition(-gates_mm, kth=k - 1, axis=-1)[..., :k]
+            inds_mm, scores_mm = self._route_experts(
+                x, self.gate_1, self.e_score_correction_bias_1
             )
-            scores_mm = mx.take_along_axis(gates_mm, inds_mm, axis=-1)
-
-            if self.norm_gate_logits:
-                scores_mm = scores_mm / mx.maximum(
-                    scores_mm.sum(axis=-1, keepdims=True), 1e-12
-                )
-
             y_mm = self.switch_mlp_1(x, inds_mm)
             y_mm = (y_mm * scores_mm[..., None]).sum(axis=-2).astype(y_mm.dtype)
 
@@ -705,7 +741,6 @@ class LanguageModel(nn.Module):
             "mtp_linear_proj.",
             "mtp_hidden_norm.",
             "mtp_emb_norm.",
-            "e_score_correction_bias",
         ]
 
         weights = {
@@ -772,6 +807,22 @@ class LanguageModel(nn.Module):
                 if w.shape[0] > w.shape[1]:  # Only transpose if needed
                     w = w.T
                 weights[f"{prefix}.mlp.gate_1.weight"] = w
+
+            # Handle e_score_correction_bias
+            # HuggingFace stores as [2, num_experts] - row 0 for text, row 1 for multimodal
+            bias_key = f"{prefix}.mlp.moe_statics.e_score_correction_bias"
+            if bias_key in weights:
+                bias = weights.pop(bias_key)
+                if bias.ndim == 2 and bias.shape[0] == 2:
+                    # Split into text and multimodal biases
+                    weights[f"{prefix}.mlp.e_score_correction_bias"] = bias[0]
+                    if num_mm_experts > 0:
+                        weights[f"{prefix}.mlp.e_score_correction_bias_1"] = bias[1]
+                else:
+                    # Single bias (squeeze if needed)
+                    if bias.ndim > 1:
+                        bias = bias.squeeze()
+                    weights[f"{prefix}.mlp.e_score_correction_bias"] = bias
 
         # Remove lm_head if tie_word_embeddings is True
         if self.args.tie_word_embeddings:
