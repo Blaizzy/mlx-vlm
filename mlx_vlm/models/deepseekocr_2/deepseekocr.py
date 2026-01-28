@@ -6,10 +6,10 @@ import numpy as np
 from transformers import AutoProcessor
 
 from ..base import InputEmbeddingsFeatures
+from ..deepseekocr.language import LanguageModel
+from ..deepseekocr.sam import SAMEncoder
 from .config import ModelConfig, SAMViTConfig
-from .language import LanguageModel
 from .processing_deepseekocr import DeepseekVLV2Processor
-from .sam import SAMEncoder
 from .vision import VisionModel
 
 AutoProcessor.register("deepseekocr", DeepseekVLV2Processor)
@@ -47,6 +47,7 @@ class Model(nn.Module):
             num_heads=sam_config.heads,
             window_size=sam_config.window_size,
             global_attn_indexes=sam_config.global_attn_indexes,
+            final_out_chans=896,  # OCR-2 uses 896 output channels (vs 1024 in OCR)
         )
         self.language_model = LanguageModel(config.text_config)
         self.projector = MlpProjector(config)
