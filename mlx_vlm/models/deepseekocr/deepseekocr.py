@@ -10,11 +10,11 @@ from mlx_vlm.models.base import InputEmbeddingsFeatures
 
 from .config import ModelConfig, ProjectorConfig, SAMViTConfig
 from .language import LanguageModel
-from .processing_deepseekocr import DeepseekVLV2Processor
+from .processing_deepseekocr import DeepseekOCRProcessor
 from .sam import SAMEncoder
 from .vision import VisionModel
 
-AutoProcessor.register("deepseekocr", DeepseekVLV2Processor)
+AutoProcessor.register("deepseekocr", DeepseekOCRProcessor)
 
 
 class MlpProjector(nn.Module):

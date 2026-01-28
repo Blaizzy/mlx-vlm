@@ -8,5 +8,5 @@ from .config import (
     TextConfig,
     VisionConfig,
 )
-from .deepseekocr import DeepseekVLV2Processor, Model
+from .deepseekocr_2 import DeepseekOCR2Processor, Model
 from .vision import Qwen2Decoder2Encoder, VisionModel
