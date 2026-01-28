@@ -1,5 +1,4 @@
-import inspect
-from typing import Optional, Tuple
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -222,6 +221,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        **kwargs,
     ):
         out = self.model(inputs, mask=mask, cache=cache, inputs_embeds=inputs_embeds)
         out = self.model.embed_tokens.as_linear(out)

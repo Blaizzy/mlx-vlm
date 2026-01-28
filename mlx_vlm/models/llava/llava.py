@@ -1,15 +1,10 @@
-import glob
-import inspect
-import json
-from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from huggingface_hub import snapshot_download
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -47,9 +42,12 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        **kwargs,
     ):
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids)
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
@@ -82,7 +80,7 @@ class Model(nn.Module):
         final_inputs_embeds = self._merge_input_ids_with_image_features(
             image_features, inputs_embeds, input_ids
         )
-        return final_inputs_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
     def _merge_input_ids_with_image_features(
         self, image_features, inputs_embeds, input_ids
@@ -124,8 +122,11 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        input_embddings = self.get_input_embeddings(input_ids, pixel_values)
+        input_embeddings_features = self.get_input_embeddings(input_ids, pixel_values)
         logits = self.language_model(
-            input_ids, mask=mask, cache=cache, inputs_embeds=input_embddings
+            input_ids,
+            mask=mask,
+            cache=cache,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
         )
         return logits

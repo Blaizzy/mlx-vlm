@@ -1,5 +1,4 @@
 import math
-from math import sqrt
 from typing import Dict, Optional, Union
 
 import mlx.core as mx
@@ -70,7 +69,7 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config: Union[VisionConfig, Dict], bias: bool = True):
         super().__init__()
-        self.activation_fn = nn.GELU(approx="precise")
+        self.activation_fn = nn.GELU()
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=bias)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=bias)
 

@@ -70,7 +70,7 @@ class TestModels(unittest.TestCase):
                 )
 
             batch_size = kwargs.pop("batch_size", 1)
-            if model_type in ["qwen2_5_vl", "glm4v_moe", "glm4v"]:
+            if model_type in ["qwen2_5_vl", "glm4v_moe", "glm4v", "hunyuan_vl"]:
                 input_tensor = mx.random.uniform(shape=(image_size[0], image_size[1]))
             else:
                 shape = (
@@ -632,124 +632,27 @@ class TestModels(unittest.TestCase):
             num_img_tokens=144,
         )
 
+        # Use smaller model dimensions for CI memory constraints
         config = phi3_v.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
             **{
-                "hidden_size": 3072,
-                "intermediate_size": 8192,
-                "max_position_embeddings": 131072,
+                "hidden_size": 256,
+                "intermediate_size": 512,
+                "max_position_embeddings": 4096,
                 "model_type": "phi3_v",
-                "num_attention_heads": 32,
-                "num_hidden_layers": 32,
-                "num_key_value_heads": 32,
+                "num_attention_heads": 4,
+                "num_hidden_layers": 2,
+                "num_key_value_heads": 4,
                 "original_max_position_embeddings": 4096,
                 "rms_norm_eps": 1e-05,
                 "rope_scaling": {
-                    "long_factor": [
-                        1.0299999713897705,
-                        1.0499999523162842,
-                        1.0499999523162842,
-                        1.0799999237060547,
-                        1.2299998998641968,
-                        1.2299998998641968,
-                        1.2999999523162842,
-                        1.4499999284744263,
-                        1.5999999046325684,
-                        1.6499998569488525,
-                        1.8999998569488525,
-                        2.859999895095825,
-                        3.68999981880188,
-                        5.419999599456787,
-                        5.489999771118164,
-                        5.489999771118164,
-                        9.09000015258789,
-                        11.579999923706055,
-                        15.65999984741211,
-                        15.769999504089355,
-                        15.789999961853027,
-                        18.360000610351562,
-                        21.989999771118164,
-                        23.079999923706055,
-                        30.009998321533203,
-                        32.35000228881836,
-                        32.590003967285156,
-                        35.56000518798828,
-                        39.95000457763672,
-                        53.840003967285156,
-                        56.20000457763672,
-                        57.95000457763672,
-                        59.29000473022461,
-                        59.77000427246094,
-                        59.920005798339844,
-                        61.190006256103516,
-                        61.96000671386719,
-                        62.50000762939453,
-                        63.3700065612793,
-                        63.48000717163086,
-                        63.48000717163086,
-                        63.66000747680664,
-                        63.850006103515625,
-                        64.08000946044922,
-                        64.760009765625,
-                        64.80001068115234,
-                        64.81001281738281,
-                        64.81001281738281,
-                    ],
-                    "short_factor": [
-                        1.05,
-                        1.05,
-                        1.05,
-                        1.1,
-                        1.1,
-                        1.1,
-                        1.2500000000000002,
-                        1.2500000000000002,
-                        1.4000000000000004,
-                        1.4500000000000004,
-                        1.5500000000000005,
-                        1.8500000000000008,
-                        1.9000000000000008,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.000000000000001,
-                        2.1000000000000005,
-                        2.1000000000000005,
-                        2.2,
-                        2.3499999999999996,
-                        2.3499999999999996,
-                        2.3499999999999996,
-                        2.3499999999999996,
-                        2.3999999999999995,
-                        2.3999999999999995,
-                        2.6499999999999986,
-                        2.6999999999999984,
-                        2.8999999999999977,
-                        2.9499999999999975,
-                        3.049999999999997,
-                        3.049999999999997,
-                        3.049999999999997,
-                    ],
+                    "long_factor": [1.0] * 32,
+                    "short_factor": [1.0] * 32,
                     "type": "su",
                 },
                 "rope_theta": 10000.0,
-                "vocab_size": 32064,
+                "vocab_size": 1000,
             },
         )
 
@@ -764,6 +667,128 @@ class TestModels(unittest.TestCase):
 
         self.vision_test_runner(
             model.vision_model,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
+    def test_mistral3(self):
+        from mlx_vlm.models import mistral3
+
+        text_config = mistral3.TextConfig(
+            head_dim=128,
+            hidden_size=5120,
+            intermediate_size=32768,
+            max_position_embeddings=131072,
+            model_type="mistral",
+            num_attention_heads=32,
+            num_hidden_layers=40,
+            num_key_value_heads=8,
+            rms_norm_eps=1e-5,
+            rope_theta=1000000000.0,
+            vocab_size=131072,
+            rope_traditional=False,
+            rope_scaling=None,
+            tie_word_embeddings=False,
+            layer_types=["full_attention"] * 40,
+            use_qk_norm=False,
+        )
+
+        vision_config = mistral3.VisionConfig(
+            model_type="pixtral",
+            hidden_size=1024,
+            num_hidden_layers=24,
+            intermediate_size=4096,
+            num_attention_heads=16,
+            image_size=336,
+            patch_size=14,
+            projection_dim=768,
+            vocab_size=32000,
+            num_channels=3,
+            rms_norm_eps=1e-6,
+        )
+
+        config = mistral3.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="mistral3",
+        )
+
+        model = mistral3.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
+    def test_ministral3(self):
+        from mlx_vlm.models import mistral3
+
+        text_config = mistral3.TextConfig(
+            head_dim=128,
+            hidden_size=3072,
+            intermediate_size=9216,
+            max_position_embeddings=262144,
+            model_type="ministral3",
+            num_attention_heads=32,
+            num_hidden_layers=26,
+            rms_norm_eps=1e-05,
+            rope_parameters={
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "factor": 16.0,
+                "llama_4_scaling_beta": 0.1,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "original_max_position_embeddings": 16384,
+                "rope_theta": 1000000.0,
+                "rope_type": "yarn",
+                "type": "yarn",
+            },
+            rope_traditional=False,
+            rope_scaling=None,
+            tie_word_embeddings=True,
+            vocab_size=131072,
+        )
+
+        vision_config = mistral3.VisionConfig(
+            head_dim=64,
+            hidden_size=1024,
+            image_size=1540,
+            intermediate_size=4096,
+            model_type="pixtral",
+            num_attention_heads=16,
+            num_channels=3,
+            num_hidden_layers=24,
+            patch_size=14,
+            rope_theta=10000.0,
+        )
+
+        config = mistral3.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="pixtral",
+        )
+        model = mistral3.Model(config)
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+        self.vision_test_runner(
+            model.vision_tower,
             config.vision_config.model_type,
             config.vision_config.hidden_size,
             config.vision_config.num_channels,
@@ -1398,6 +1423,70 @@ class TestModels(unittest.TestCase):
             (576, 588),
         )
 
+    def test_molmo2(self):
+        from mlx_vlm.models import molmo2
+
+        text_config = molmo2.TextConfig(
+            model_type="molmo2",
+            hidden_size=256,  # Reduced for testing
+            intermediate_size=512,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=64,
+            vocab_size=151936,
+            additional_vocab_size=128,
+            hidden_act="silu",
+            layer_norm_eps=1e-6,
+            rope_theta=5000000.0,
+            use_qk_norm=True,
+        )
+
+        vit_config = molmo2.config.VitConfig(
+            model_type="molmo2",
+            hidden_size=128,  # Reduced for testing
+            intermediate_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=64,
+            image_patch_size=14,
+            image_num_pos=729,  # 27x27
+            image_default_input_size=[378, 378],
+        )
+
+        adapter_config = molmo2.config.AdapterConfig(
+            model_type="molmo2",
+            hidden_size=128,  # Match vit_config
+            intermediate_size=256,
+            text_hidden_size=256,  # Match text_config
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=64,
+            vit_layers=[-1, -2],  # Use last two layers
+        )
+
+        vision_config = molmo2.VisionConfig(
+            vit_config=vit_config,
+            adapter_config=adapter_config,
+        )
+
+        config = molmo2.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="molmo2",
+        )
+        model = molmo2.Model(config)
+
+        # Test language model
+        # Note: vocab_size in logits is base vocab only, additional tokens are handled separately
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
     def test_florence2(self):
         from mlx_vlm.models import florence2
 
@@ -1661,6 +1750,1251 @@ class TestModels(unittest.TestCase):
         )
 
         # TODO: Add test for vision model. Ensure I can pass input type and shapes.
+
+    def test_jina_vlm(self):
+        from mlx_vlm.models import jina_vlm
+
+        text_config = jina_vlm.TextConfig(
+            model_type="jina_vlm",
+            hidden_size=2048,
+            num_hidden_layers=4,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=128,
+            vocab_size=151936,
+            additional_vocab_size=128,
+            intermediate_size=6144,
+            rms_norm_eps=1e-6,
+            rope_theta=1000000.0,
+            use_qk_norm=True,
+        )
+
+        vision_config = jina_vlm.VisionConfig(
+            model_type="jina_vlm",
+            hidden_size=1152,
+            num_hidden_layers=4,
+            num_attention_heads=16,
+            head_dim=72,
+            patch_size=14,
+            image_size=378,
+            num_channels=3,
+            intermediate_size=4304,
+            vit_layers=(-2, -4),
+            output_size=2048,
+            pooling_h=2,
+            pooling_w=2,
+            connector_hidden_size=6144,
+        )
+
+        config = jina_vlm.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="jina_vlm",
+            vocab_size=151936,
+        )
+
+        model = jina_vlm.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        # Vision model expects patchified input from processor, skip standard test
+        # Test basic forward pass with patchified input instead
+        batch_size = 1
+        n_patches = (
+            config.vision_config.image_size // config.vision_config.patch_size
+        ) ** 2
+        patch_dim = (
+            config.vision_config.patch_size**2 * config.vision_config.num_channels
+        )
+        pixel_values = mx.random.uniform(shape=(batch_size, n_patches, patch_dim))
+        output, hidden_states = model.vision_model(pixel_values)
+        # Check output shape matches hidden size
+        self.assertEqual(output.shape[-1], config.vision_config.hidden_size)
+        self.assertEqual(len(hidden_states), config.vision_config.num_hidden_layers + 1)
+
+    def test_hunyuan_vl(self):
+        from mlx_vlm.models import hunyuan_vl
+
+        text_config = hunyuan_vl.TextConfig(
+            model_type="hunyuan_vl",
+            vocab_size=120818,
+            org_vocab_size=120818,
+            hidden_size=1024,
+            num_hidden_layers=6,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=128,
+            attention_head_dim=128,
+            intermediate_size=3584,
+            hidden_act="silu",
+            attention_bias=False,
+            mlp_bias=False,
+            attention_dropout=0.0,
+            use_qk_norm=True,
+            rope_theta=10000.0,
+            rope_scaling={
+                "alpha": 1000.0,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 1.0,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "type": "xdrope",
+                "xdrope_section": [16, 16, 16, 16],
+            },
+            max_position_embeddings=32768,
+            rms_norm_eps=1e-5,
+            norm_type="rms",
+            tie_word_embeddings=True,
+            use_cache=True,
+            initializer_range=0.02,
+            routed_scaling_factor=1.0,
+            bos_token_id=120000,
+            eos_token_id=120020,
+            eod_token_id=120020,
+            pad_token_id=-1,
+            pad_id=120002,
+        )
+
+        vision_config = hunyuan_vl.VisionConfig(
+            model_type="hunyuan_vl",
+            hidden_size=1152,
+            out_hidden_size=1024,
+            num_hidden_layers=5,
+            num_attention_heads=16,
+            intermediate_size=4304,
+            patch_size=16,
+            num_channels=3,
+            spatial_merge_size=2,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            rms_norm_eps=1e-5,
+            interpolate_mode="bilinear",
+            cat_extra_token=1,
+            img_max_token_num=4096,
+            max_vit_seq_len=16384,
+            add_patchemb_bias=True,
+            max_image_size=2048,
+            hidden_act="gelu",
+        )
+
+        config = hunyuan_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="hunyuan_vl",
+            image_token_id=120120,
+            image_start_token_id=120118,
+            image_end_token_id=120119,
+            image_newline_token_id=120121,
+            bos_token_id=120000,
+            eos_token_id=120020,
+            pad_token_id=-1,
+            pad_id=120002,
+            vocab_size=120818,
+            org_vocab_size=120818,
+            tie_word_embeddings=True,
+        )
+
+        model = hunyuan_vl.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.out_hidden_size,
+            config.vision_config.num_channels,
+            (1080, 768),
+            vision_feature_layer=-1,
+            grid_thw=mx.array(
+                [[1, 18, 60]], dtype=mx.int64
+            ),  # image temporals shape (num_images, 3)
+        )
+
+
+class TestGetInputEmbeddings(unittest.TestCase):
+    """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
+
+    def _check_returns_input_embeddings_features(self, model, model_name):
+        """Helper to test get_input_embeddings returns InputEmbeddingsFeatures."""
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        input_ids = mx.array([[1, 2, 3, 4, 5]])
+        result = model.get_input_embeddings(input_ids=input_ids)
+        self.assertIsInstance(
+            result,
+            InputEmbeddingsFeatures,
+            f"{model_name}: expected InputEmbeddingsFeatures, got {type(result).__name__}",
+        )
+        self.assertIsNotNone(result.inputs_embeds)
+
+    def test_llava_input_embeddings(self):
+        from mlx_vlm.models import llava
+
+        model = llava.Model(
+            llava.ModelConfig(
+                text_config=llava.TextConfig(
+                    model_type="llama",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    rms_norm_eps=1e-5,
+                ),
+                vision_config=llava.VisionConfig(
+                    model_type="clip_vision_model",
+                    num_hidden_layers=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                    num_channels=3,
+                ),
+                model_type="llava",
+                image_token_index=31,
+                vocab_size=32,
+                vision_feature_layer=-1,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "llava")
+
+    def test_llava_bunny_input_embeddings(self):
+        from mlx_vlm.models import llava_bunny
+
+        model = llava_bunny.Model(
+            llava_bunny.ModelConfig(
+                text_config=llava_bunny.TextConfig(
+                    model_type="qwen2",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    rms_norm_eps=1e-6,
+                ),
+                vision_config=llava_bunny.VisionConfig(
+                    model_type="siglip_vision_model",
+                    num_hidden_layers=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                    num_channels=3,
+                ),
+                model_type="llava-qwen2",
+                auto_map={
+                    "AutoConfig": "configuration_llava_qwen2.LlavaQwen2Config",
+                    "AutoModelForCausalLM": "modeling_llava_qwen2.LlavaQwen2ForCausalLM",
+                },
+                hidden_size=16,
+                mm_hidden_size=16,
+                image_token_index=-200,
+                vocab_size=32,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "llava_bunny")
+
+    def test_llava_next_input_embeddings(self):
+        from mlx_vlm.models import llava_next
+
+        model = llava_next.Model(
+            llava_next.ModelConfig(
+                text_config=llava_next.TextConfig(
+                    model_type="llama",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    rms_norm_eps=1e-5,
+                ),
+                vision_config=llava_next.VisionConfig(
+                    model_type="clip_vision_model",
+                    num_hidden_layers=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                    num_channels=3,
+                ),
+                model_type="llava",
+                image_token_index=31,
+                vocab_size=32,
+                vision_feature_layer=-1,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "llava_next")
+
+    def test_qwen2_vl_input_embeddings(self):
+        from mlx_vlm.models import qwen2_vl
+
+        model = qwen2_vl.Model(
+            qwen2_vl.ModelConfig(
+                text_config=qwen2_vl.TextConfig(
+                    model_type="qwen2_vl",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    rms_norm_eps=1e-6,
+                    rope_scaling={"type": "mrope", "mrope_section": [2, 1, 1]},
+                ),
+                vision_config=qwen2_vl.VisionConfig(
+                    model_type="qwen2_vl",
+                    depth=1,
+                    embed_dim=16,
+                    hidden_size=16,
+                    num_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                    in_channels=3,
+                ),
+                model_type="qwen2_vl",
+                image_token_id=31,
+                vocab_size=32,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "qwen2_vl")
+
+    def test_qwen2_5_vl_input_embeddings(self):
+        from mlx_vlm.models import qwen2_5_vl
+
+        model = qwen2_5_vl.Model(
+            qwen2_5_vl.ModelConfig(
+                text_config=qwen2_5_vl.TextConfig(
+                    model_type="qwen2_5_vl",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    rms_norm_eps=1e-6,
+                    rope_scaling={"type": "mrope", "mrope_section": [2, 1, 1]},
+                ),
+                vision_config=qwen2_5_vl.VisionConfig(
+                    model_type="qwen2_5_vl",
+                    depth=1,
+                    hidden_size=16,
+                    num_heads=2,
+                    out_hidden_size=16,
+                    image_size=28,
+                    patch_size=14,
+                    in_channels=3,
+                    fullatt_block_indexes=[0],
+                    window_size=14,
+                ),
+                model_type="qwen2_5_vl",
+                image_token_id=31,
+                vocab_size=32,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "qwen2_5_vl")
+
+    def test_qwen3_vl_input_embeddings(self):
+        from mlx_vlm.models import qwen3_vl
+
+        model = qwen3_vl.Model(
+            qwen3_vl.ModelConfig(
+                text_config=qwen3_vl.TextConfig(
+                    model_type="qwen3_vl_text",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    rms_norm_eps=1e-5,
+                    head_dim=8,
+                    rope_theta=1000.0,
+                    max_position_embeddings=1000,
+                    rope_scaling={"rope_type": "mrope", "mrope_section": [2, 1, 1]},
+                ),
+                vision_config=qwen3_vl.VisionConfig(
+                    model_type="qwen3_vl",
+                    depth=1,
+                    hidden_size=16,
+                    num_heads=2,
+                    out_hidden_size=16,
+                    patch_size=14,
+                    in_channels=3,
+                    num_position_embeddings=4,
+                    deepstack_visual_indexes=[],
+                ),
+                model_type="qwen3_vl",
+                image_token_id=31,
+                vocab_size=32,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "qwen3_vl")
+
+    def test_paligemma_input_embeddings(self):
+        from mlx_vlm.models import paligemma
+
+        model = paligemma.Model(
+            paligemma.ModelConfig(
+                text_config=paligemma.TextConfig(
+                    model_type="gemma",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=1,
+                    rms_norm_eps=1e-6,
+                ),
+                vision_config=paligemma.VisionConfig(
+                    model_type="siglip_vision_model",
+                    num_hidden_layers=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                    num_channels=3,
+                    projection_dim=16,
+                ),
+                model_type="paligemma",
+                image_token_index=31,
+                hidden_size=16,
+                vocab_size=32,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "paligemma")
+
+    def test_idefics2_input_embeddings(self):
+        from mlx_vlm.models import idefics2
+
+        model = idefics2.Model(
+            idefics2.ModelConfig(
+                text_config=idefics2.TextConfig(
+                    model_type="mistral",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    rms_norm_eps=1e-5,
+                ),
+                vision_config=idefics2.VisionConfig(
+                    model_type="idefics2",
+                    num_hidden_layers=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                    num_channels=3,
+                ),
+                perceiver_config=idefics2.PerceiverConfig(
+                    model_type="idefics2Perceiver",
+                    resampler_n_latents=2,
+                    resampler_depth=1,
+                    resampler_n_heads=2,
+                    resampler_head_dim=8,
+                    num_key_value_heads=2,
+                ),
+                model_type="idefics2",
+                image_token_index=31,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "idefics2")
+
+    def test_idefics3_input_embeddings(self):
+        from mlx_vlm.models import idefics3
+
+        model = idefics3.Model(
+            idefics3.ModelConfig(
+                text_config=idefics3.TextConfig(
+                    model_type="idefics3",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    rms_norm_eps=1e-5,
+                ),
+                vision_config=idefics3.VisionConfig(
+                    model_type="idefics3",
+                    num_hidden_layers=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                    num_channels=3,
+                ),
+                model_type="idefics3",
+                image_token_id=31,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "idefics3")
+
+    def test_gemma3_input_embeddings(self):
+        from mlx_vlm.models import gemma3
+
+        model = gemma3.Model(
+            gemma3.ModelConfig(
+                text_config=gemma3.TextConfig(
+                    model_type="gemma3",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    rms_norm_eps=1e-6,
+                    num_key_value_heads=2,
+                    head_dim=8,
+                ),
+                vision_config=gemma3.VisionConfig(
+                    model_type="gemma3",
+                    num_hidden_layers=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                    num_channels=3,
+                ),
+                model_type="gemma3",
+                hidden_size=16,
+                pad_token_id=0,
+                image_token_index=31,
+                vocab_size=32,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "gemma3")
+
+    def test_pixtral_input_embeddings(self):
+        from mlx_vlm.models import pixtral
+
+        model = pixtral.Model(
+            pixtral.ModelConfig(
+                text_config=pixtral.TextConfig(
+                    model_type="mistral",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    rms_norm_eps=1e-5,
+                ),
+                vision_config=pixtral.VisionConfig(
+                    model_type="pixtral",
+                    num_hidden_layers=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                    num_channels=3,
+                ),
+                model_type="pixtral",
+                image_token_index=31,
+                vocab_size=32,
+                vision_feature_layer=-1,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "pixtral")
+
+    def test_mistral3_input_embeddings(self):
+        from mlx_vlm.models import mistral3
+
+        model = mistral3.Model(
+            mistral3.ModelConfig(
+                text_config=mistral3.TextConfig(
+                    model_type="mistral",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    rms_norm_eps=1e-5,
+                    head_dim=8,
+                    layer_types=["full_attention"],
+                ),
+                vision_config=mistral3.VisionConfig(
+                    model_type="pixtral",
+                    num_hidden_layers=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                    num_channels=3,
+                ),
+                model_type="mistral3",
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "mistral3")
+
+    def test_multi_modality_input_embeddings(self):
+        from mlx_vlm.models import multi_modality
+
+        model = multi_modality.Model(
+            multi_modality.ModelConfig(
+                text_config=multi_modality.TextConfig(
+                    model_type="llama",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    rms_norm_eps=1e-6,
+                ),
+                vision_config=multi_modality.VisionConfig(
+                    model_type="vision",
+                    num_hidden_layers=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                    num_channels=3,
+                    params={},
+                ),
+                projector_config=multi_modality.ProjectorConfig(
+                    cls="MlpProjector",
+                    model_type="projector",
+                    params={
+                        "depth": 1,
+                        "input_dim": 16,
+                        "n_embed": 16,
+                        "projector_type": "mlp_gelu",
+                    },
+                ),
+                model_type="multi_modality",
+                image_token_index=31,
+                vocab_size=32,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "multi_modality")
+
+    def test_aya_vision_input_embeddings(self):
+        from mlx_vlm.models import aya_vision
+
+        model = aya_vision.Model(
+            aya_vision.ModelConfig(
+                text_config=aya_vision.TextConfig(
+                    model_type="aya_vision",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    vocab_size=32,
+                    head_dim=8,
+                ),
+                vision_config=aya_vision.VisionConfig(
+                    model_type="siglip_vision_model",
+                    hidden_size=16,
+                    num_attention_heads=2,
+                    patch_size=14,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    image_size=28,
+                ),
+                model_type="aya_vision",
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "aya_vision")
+
+    def test_deepseek_vl_v2_input_embeddings(self):
+        from mlx_vlm.models import deepseek_vl_v2
+
+        model = deepseek_vl_v2.Model(
+            deepseek_vl_v2.ModelConfig(
+                text_config=deepseek_vl_v2.TextConfig(
+                    model_type="deepseek_v2",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    kv_lora_rank=8,
+                    q_lora_rank=16,
+                    qk_rope_head_dim=8,
+                    v_head_dim=8,
+                    qk_nope_head_dim=0,
+                    moe_intermediate_size=16,
+                    n_shared_experts=1,
+                    n_routed_experts=2,
+                    num_experts_per_tok=1,
+                ),
+                vision_config=deepseek_vl_v2.VisionConfig(
+                    model_type="vision",
+                    layers=1,
+                    width=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                ),
+                projector_config=deepseek_vl_v2.ProjectorConfig(
+                    projector_type="downsample_mlp_gelu",
+                    input_dim=16,
+                    n_embed=16,
+                ),
+                model_type="deepseek_vl_v2",
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "deepseek_vl_v2")
+
+    def test_deepseekocr_input_embeddings(self):
+        from mlx_vlm.models import deepseekocr
+
+        model = deepseekocr.Model(
+            deepseekocr.ModelConfig(
+                text_config=deepseekocr.TextConfig(
+                    model_type="deepseek_v2",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    kv_lora_rank=8,
+                    q_lora_rank=16,
+                    qk_rope_head_dim=0,
+                    v_head_dim=8,
+                    qk_nope_head_dim=0,
+                    moe_intermediate_size=16,
+                    n_shared_experts=1,
+                    n_routed_experts=2,
+                    num_experts_per_tok=1,
+                ),
+                vision_config=deepseekocr.VisionConfig(
+                    model_type="vision",
+                    layers=1,
+                    width=16,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                ),
+                projector_config=deepseekocr.ProjectorConfig(
+                    projector_type="linear",
+                    input_dim=16,
+                    n_embed=16,
+                ),
+                model_type="deepseekocr",
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "deepseekocr")
+
+    def test_fastvlm_input_embeddings(self):
+        from mlx_vlm.models import fastvlm
+
+        model = fastvlm.Model(
+            fastvlm.ModelConfig(
+                text_config=fastvlm.TextConfig(
+                    model_type="fastvlm",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                ),
+                vision_config=fastvlm.VisionConfig(
+                    model_type="llava_qwen2",
+                    hidden_size=16,
+                ),
+                model_type="llava_qwen2",
+                mm_hidden_size=16,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "fastvlm")
+
+    def test_florence2_input_embeddings(self):
+        from mlx_vlm.models import florence2
+
+        model = florence2.Model(
+            florence2.ModelConfig(
+                vision_config=florence2.VisionConfig(
+                    model_type="davit",
+                    hidden_size=16,
+                    in_chans=3,
+                    depths=[1],
+                    dim_embed=[16],
+                    num_heads=[2],
+                    num_groups=[2],
+                    patch_size=[7],
+                    patch_stride=[4],
+                    patch_padding=[3],
+                    patch_prenorm=[False],
+                ),
+                text_config=florence2.TextConfig(
+                    d_model=16,
+                    encoder_attention_heads=2,
+                    decoder_attention_heads=2,
+                    encoder_ffn_dim=32,
+                    decoder_ffn_dim=32,
+                    encoder_layers=1,
+                    decoder_layers=1,
+                    vocab_size=32,
+                ),
+                model_type="florence2",
+                vocab_size=32,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "florence2")
+
+    def test_gemma3n_input_embeddings(self):
+        from mlx_vlm.models import gemma3n
+
+        model = gemma3n.Model(
+            gemma3n.ModelConfig(
+                text_config=gemma3n.TextConfig(
+                    model_type="gemma3n",
+                    hidden_size=16,
+                    num_hidden_layers=2,
+                    intermediate_size=[32, 32],
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    head_dim=8,
+                    vocab_size=32,
+                    vocab_size_per_layer_input=32,
+                    hidden_size_per_layer_input=16,
+                    altup_num_inputs=2,
+                    laurel_rank=8,
+                    layer_types=["sliding_attention", "full_attention"],
+                    sliding_window_pattern=1,
+                ),
+                vision_config=gemma3n.VisionConfig(
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=4,
+                    vocab_offset=32,
+                ),
+                audio_config=gemma3n.AudioConfig(
+                    vocab_size=4,
+                    vocab_offset=36,
+                    hidden_size=16,
+                ),
+                model_type="gemma3n",
+                hidden_size=16,
+                vocab_size=40,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "gemma3n")
+
+    def test_glm4v_input_embeddings(self):
+        from mlx_vlm.models import glm4v
+
+        model = glm4v.Model(
+            glm4v.ModelConfig(
+                text_config=glm4v.TextConfig(
+                    model_type="glm4v_text",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    vocab_size=32,
+                ),
+                vision_config=glm4v.VisionConfig(
+                    model_type="glm4v_vision",
+                    depth=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_heads=2,
+                    patch_size=14,
+                    out_hidden_size=16,
+                ),
+                model_type="glm4v",
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "glm4v")
+
+    def test_glm4v_moe_input_embeddings(self):
+        from mlx_vlm.models import glm4v_moe
+
+        model = glm4v_moe.Model(
+            glm4v_moe.ModelConfig(
+                text_config=glm4v_moe.TextConfig(
+                    model_type="glm4v_text",
+                    vocab_size=32,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    max_position_embeddings=128,
+                    moe_intermediate_size=16,
+                    norm_topk_prob=True,
+                    num_attention_heads=2,
+                    n_group=1,
+                    head_dim=8,
+                    topk_group=1,
+                    n_shared_experts=1,
+                    n_routed_experts=2,
+                    routed_scaling_factor=1.0,
+                    num_experts_per_tok=1,
+                    first_k_dense_replace=0,
+                    num_hidden_layers=1,
+                    num_key_value_heads=2,
+                    rms_norm_eps=1e-5,
+                    use_qk_norm=False,
+                    attention_bias=False,
+                    partial_rotary_factor=0.5,
+                    rope_theta=10000.0,
+                ),
+                vision_config=glm4v_moe.VisionConfig(
+                    model_type="glm4v_moe",
+                    depth=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_heads=2,
+                    patch_size=14,
+                    out_hidden_size=16,
+                ),
+                model_type="glm4v_moe",
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "glm4v_moe")
+
+    def test_hunyuan_vl_input_embeddings(self):
+        from mlx_vlm.models import hunyuan_vl
+
+        model = hunyuan_vl.Model(
+            hunyuan_vl.ModelConfig(
+                text_config=hunyuan_vl.TextConfig(
+                    model_type="hunyuan_vl",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    vocab_size=32,
+                    head_dim=8,
+                    attention_head_dim=8,
+                ),
+                vision_config=hunyuan_vl.VisionConfig(
+                    model_type="hunyuan_vl",
+                    hidden_size=16,
+                    out_hidden_size=16,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    intermediate_size=32,
+                ),
+                model_type="hunyuan_vl",
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "hunyuan_vl")
+
+    def test_jina_vlm_input_embeddings(self):
+        from mlx_vlm.models import jina_vlm
+
+        model = jina_vlm.Model(
+            jina_vlm.ModelConfig(
+                text_config=jina_vlm.TextConfig(
+                    model_type="jina_vlm",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    head_dim=8,
+                    vocab_size=32,
+                    intermediate_size=32,
+                ),
+                vision_config=jina_vlm.VisionConfig(
+                    model_type="jina_vlm",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    head_dim=8,
+                    intermediate_size=32,
+                    output_size=16,
+                    connector_hidden_size=32,
+                ),
+                model_type="jina_vlm",
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "jina_vlm")
+
+    def test_lfm2_vl_input_embeddings(self):
+        from mlx_vlm.models import lfm2_vl
+
+        model = lfm2_vl.Model(
+            lfm2_vl.ModelConfig(
+                text_config=lfm2_vl.TextConfig(
+                    model_type="lfm2",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    vocab_size=32,
+                    layer_types=["full_attention"],
+                    block_dim=16,
+                    block_ff_dim=32,
+                    conv_dim=16,
+                    conv_dim_out=16,
+                ),
+                vision_config=lfm2_vl.VisionConfig(
+                    model_type="lfm2_vl",
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                ),
+                model_type="lfm2-vl",
+                projector_hidden_size=16,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "lfm2_vl")
+
+    def test_molmo2_input_embeddings(self):
+        from mlx_vlm.models import molmo2
+
+        model = molmo2.Model(
+            molmo2.ModelConfig(
+                text_config=molmo2.TextConfig(
+                    model_type="molmo2",
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    head_dim=8,
+                    vocab_size=32,
+                    additional_vocab_size=4,
+                ),
+                vision_config=molmo2.VisionConfig(
+                    vit_config=molmo2.VitConfig(
+                        model_type="molmo2",
+                        hidden_size=16,
+                        intermediate_size=32,
+                        num_hidden_layers=1,
+                        num_attention_heads=2,
+                        num_key_value_heads=2,
+                        head_dim=8,
+                    ),
+                    adapter_config=molmo2.AdapterConfig(
+                        model_type="molmo2",
+                        hidden_size=16,
+                        intermediate_size=32,
+                        text_hidden_size=16,
+                        num_attention_heads=2,
+                        num_key_value_heads=2,
+                        head_dim=8,
+                        vit_layers=[-1],
+                    ),
+                ),
+                model_type="molmo2",
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "molmo2")
+
+    def test_paddleocr_vl_input_embeddings(self):
+        from mlx_vlm.models import paddleocr_vl
+
+        model = paddleocr_vl.Model(
+            paddleocr_vl.ModelConfig(
+                text_config=paddleocr_vl.TextConfig(
+                    model_type="paddleocr_vl",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    vocab_size=32,
+                    head_dim=8,
+                ),
+                vision_config=paddleocr_vl.VisionConfig(
+                    model_type="paddleocr_vl",
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                ),
+                model_type="paddleocr_vl",
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "paddleocr_vl")
+
+    def test_phi3_v_input_embeddings(self):
+        from mlx_vlm.models import phi3_v
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        model = phi3_v.Model(
+            phi3_v.ModelConfig(
+                text_config=phi3_v.TextConfig(),
+                vision_config=phi3_v.VisionConfig(
+                    model_type="phi3_v",
+                    num_hidden_layers=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                ),
+                model_type="phi3_v",
+                hidden_size=16,
+                num_hidden_layers=1,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                vocab_size=32,
+            )
+        )
+        # phi3_v uses 'inputs' as positional arg instead of 'input_ids'
+        input_ids = mx.array([[1, 2, 3, 4, 5]])
+        result = model.get_input_embeddings(input_ids)
+        self.assertIsInstance(result, InputEmbeddingsFeatures)
+        self.assertIsNotNone(result.inputs_embeds)
+
+    def test_qwen3_vl_moe_input_embeddings(self):
+        from mlx_vlm.models import qwen3_vl_moe
+
+        model = qwen3_vl_moe.Model(
+            qwen3_vl_moe.ModelConfig(
+                text_config=qwen3_vl_moe.TextConfig(
+                    model_type="qwen3_vl_moe",
+                    num_hidden_layers=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_experts=2,
+                    num_experts_per_tok=1,
+                    decoder_sparse_step=1,
+                    mlp_only_layers=[],
+                    moe_intermediate_size=16,
+                    rms_norm_eps=1e-5,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    head_dim=8,
+                    rope_theta=10000.0,
+                    max_position_embeddings=128,
+                ),
+                vision_config=qwen3_vl_moe.VisionConfig(
+                    model_type="qwen3_vl_moe",
+                    depth=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    out_hidden_size=16,
+                    num_heads=2,
+                ),
+                model_type="qwen3_vl_moe",
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "qwen3_vl_moe")
+
+    def test_qwen3_omni_moe_input_embeddings(self):
+        from mlx_vlm.models import qwen3_omni_moe
+
+        text_config = qwen3_omni_moe.TextConfig(
+            num_hidden_layers=1,
+            hidden_size=16,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_experts=2,
+            num_experts_per_tok=1,
+            decoder_sparse_step=1,
+            mlp_only_layers=[],
+            moe_intermediate_size=16,
+            rms_norm_eps=1e-5,
+            vocab_size=32,
+            num_key_value_heads=2,
+            head_dim=8,
+            rope_theta=10000.0,
+            max_position_embeddings=128,
+        )
+        model = qwen3_omni_moe.Model(
+            qwen3_omni_moe.ModelConfig(
+                thinker_config=qwen3_omni_moe.ThinkerConfig(
+                    text_config=text_config,
+                    vision_config=qwen3_omni_moe.VisionConfig(
+                        model_type="qwen3_omni_moe_vision_encoder",
+                        depth=1,
+                        hidden_size=16,
+                        intermediate_size=32,
+                        out_hidden_size=16,
+                        num_heads=2,
+                    ),
+                    audio_config=qwen3_omni_moe.AudioConfig(
+                        d_model=16,
+                        encoder_layers=1,
+                        encoder_attention_heads=2,
+                        encoder_ffn_dim=32,
+                        num_hidden_layers=1,
+                        output_dim=16,
+                    ),
+                ),
+                talker_config=qwen3_omni_moe.TalkerConfig(
+                    text_config=text_config,
+                    code_predictor_config=qwen3_omni_moe.CodePredictorConfig(
+                        num_hidden_layers=1,
+                        hidden_size=16,
+                        intermediate_size=32,
+                        num_attention_heads=2,
+                        num_key_value_heads=2,
+                        head_dim=8,
+                    ),
+                    thinker_hidden_size=16,
+                ),
+                code2wav_config=qwen3_omni_moe.Code2WavConfig(),
+                model_type="qwen3_omni_moe",
+                enable_audio_output=False,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "qwen3_omni_moe")
+
+    def test_internvl_chat_input_embeddings(self):
+        from mlx_vlm.models import internvl_chat
+
+        model = internvl_chat.Model(
+            internvl_chat.ModelConfig(
+                text_config=internvl_chat.TextConfig(
+                    model_type="qwen2",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    rms_norm_eps=1e-6,
+                    max_window_layers=1,
+                    hidden_act="silu",
+                ),
+                vision_config=internvl_chat.VisionConfig(
+                    model_type="intern_vit_6b",
+                    num_hidden_layers=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                    num_channels=3,
+                ),
+                model_type="internvl_chat",
+                image_token_index=31,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "internvl_chat")
 
 
 if __name__ == "__main__":

@@ -1,25 +1,16 @@
-import glob
-import inspect
-import json
 import math
-from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from huggingface_hub import snapshot_download
-from PIL import Image
 from transformers import AutoProcessor
-from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
-from transformers.image_utils import to_numpy_array
 
-from ..base import BaseModelConfig, expand2square
-from .config import ModelConfig, ProjectorConfig, TextConfig, VisionConfig
-from .language import LanguageModel, TextConfig
+from ..base import InputEmbeddingsFeatures
+from .config import ModelConfig, ProjectorConfig
+from .language import LanguageModel
 from .processing_deepsek_vl_v2 import DeepseekVLV2Processor
-from .vision import VisionConfig, VisionModel
+from .vision import VisionModel
 
 AutoProcessor.register("deepseek_vl_v2", DeepseekVLV2Processor)
 
@@ -326,10 +317,13 @@ class Model(nn.Module):
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
         images_spatial_crop: Optional[mx.array] = None,
-        image_seq_mask: Optional[mx.array] = None,
+        images_seq_mask: Optional[mx.array] = None,
+        **kwargs,
     ):
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids)
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         bs = pixel_values.shape[0]
         max_n_images = pixel_values.shape[1]
@@ -347,12 +341,14 @@ class Model(nn.Module):
                     1 + num_width_tiles * num_height_tiles
                 ).tolist()
 
-            total_tiles.append(pixel_values[idx, : batch_num_tiles[idx]])
+            total_tiles.append(pixel_values[idx][: batch_num_tiles[idx]])
 
         total_tiles = mx.concatenate(total_tiles, axis=0)
 
         if total_tiles.shape[0] == 0:
-            return self.language_model.model.embed_tokens(input_ids)
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         # Get the input embeddings from the language model
         input_embeds = self.language_model.model.embed_tokens(input_ids)
@@ -372,13 +368,13 @@ class Model(nn.Module):
             input_embeds,
             image_features,
             images_spatial_crop,
-            image_seq_mask,
+            images_seq_mask,
             h,
             w,
             n_dim,
         )
 
-        return image_features
+        return InputEmbeddingsFeatures(inputs_embeds=image_features)
 
     @property
     def layers(self):
@@ -395,11 +391,13 @@ class Model(nn.Module):
 
         images_spatial_crop = kwargs.get("images_spatial_crop", None)
         images_seq_mask = kwargs.get("images_seq_mask", None)
-        input_embeddings = self.get_input_embeddings(
+        input_embeddings_features = self.get_input_embeddings(
             input_ids, pixel_values, images_spatial_crop, images_seq_mask
         )
         logits = self.language_model(
-            input_ids, cache=cache, inputs_embeds=input_embeddings
+            input_ids,
+            cache=cache,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
         )
         return logits
 

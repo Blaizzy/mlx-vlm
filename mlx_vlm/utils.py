@@ -6,7 +6,7 @@ import logging
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -14,14 +14,9 @@ import numpy as np
 import requests
 import soundfile as sf
 from huggingface_hub import snapshot_download
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
-from transformers import (
-    AutoConfig,
-    AutoProcessor,
-    PreTrainedTokenizer,
-    PreTrainedTokenizerFast,
-)
+from transformers import AutoProcessor, PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from .models.base import BaseImageProcessor
 from .tokenizer_utils import load_tokenizer
@@ -34,6 +29,7 @@ MODEL_REMAPPING = {
     "bunny-llama": "llava_bunny",
     "lfm2-vl": "lfm2_vl",
     "cohere2_vision": "aya_vision",
+    "jvlm": "jina_vlm",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -54,9 +50,11 @@ def skip_multimodal_module(path: str) -> bool:
     return (
         "vision_model" in path
         or "vision_tower" in path
+        or "vl_connector" in path
         or "sam_model" in path
         or "audio_model" in path
         or "audio_tower" in path
+        or "code_predictor" in path
     )
 
 
@@ -141,7 +139,13 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     config = load_config(model_path, **kwargs)
     quantization = config.get("quantization", None)
 
-    weight_files = glob.glob(str(model_path / "*.safetensors"))
+    # Find all .safetensors files in the model_path, excluding consolidated model weights
+    weight_files = [
+        wf
+        for wf in glob.glob(str(model_path / "*.safetensors"))
+        if not wf.endswith("consolidated.safetensors")
+    ]
+
     if not weight_files:
         logging.error(f"No safetensors found in {model_path}")
         message = f"""
@@ -168,6 +172,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(mx.load(wf))
 
+    import safetensors
+
+    with safetensors.safe_open(weight_files[0], framework="np") as f:
+        is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
+
     model_class, _ = get_model_and_args(config=config)
 
     # Initialize text and vision configs if not present
@@ -182,18 +191,28 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     model = model_class.Model(model_config)
 
-    # Sanitize weights
-    weights = sanitize_weights(model, weights)
-    weights = sanitize_weights(
-        model_class.VisionModel, weights, model_config.vision_config
-    )
-    weights = sanitize_weights(
-        model_class.LanguageModel, weights, model_config.text_config
-    )
-    if hasattr(model_class, "AudioModel"):
-        weights = sanitize_weights(
-            model_class.AudioModel, weights, model_config.audio_config
-        )
+    if not is_mlx_format:
+        # Sanitize weights
+        weights = sanitize_weights(model, weights)
+
+        if hasattr(model, "thinker") and hasattr(model.thinker, "sanitize"):
+            weights = sanitize_weights(model.thinker, weights)
+            weights = sanitize_weights(model.thinker.vision_tower, weights)
+            weights = sanitize_weights(model.thinker.audio_tower, weights)
+            weights = sanitize_weights(model.thinker.language_model, weights)
+            weights = sanitize_weights(model.code2wav, weights)
+            weights = sanitize_weights(model.talker, weights)
+        else:
+            weights = sanitize_weights(
+                model_class.VisionModel, weights, model_config.vision_config
+            )
+            weights = sanitize_weights(
+                model_class.LanguageModel, weights, model_config.text_config
+            )
+            if hasattr(model_class, "AudioModel"):
+                weights = sanitize_weights(
+                    model_class.AudioModel, weights, model_config.audio_config
+                )
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may or may not have vision quantized
@@ -219,6 +238,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
+            mode=quantization.get("mode", "affine"),
             class_predicate=get_class_predicate,
         )
 
@@ -329,7 +349,22 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
 
     try:
         with open(model_path / "config.json", encoding="utf-8") as f:
-            return json.load(f)
+            config = json.load(f)
+
+        generation_config_file = model_path / "generation_config.json"
+        if generation_config_file.exists():
+            generation_config = {}
+            try:
+                with open(generation_config_file, "r") as f:
+                    generation_config = json.load(f)
+            except json.JSONDecodeError:
+                pass
+
+            if eos_token_id := generation_config.get("eos_token_id", False):
+                config["eos_token_id"] = eos_token_id
+
+        return config
+
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"Config not found at {model_path}") from exc
 
@@ -361,7 +396,7 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
 
-    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
+    processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
@@ -508,7 +543,6 @@ def save_weights(
         save_path = Path(save_path)
 
     weights = dict(tree_flatten(model.parameters()))
-    del model
 
     save_path.mkdir(parents=True, exist_ok=True)
 
@@ -526,8 +560,10 @@ def save_weights(
     # Write the weights and make sure no references are kept other than the
     # necessary ones
     if donate_weights:
-        weights.clear()
-        del weights
+        model.update(tree_map(lambda _: mx.array([]), model.parameters()))
+
+    weights.clear()
+    del weights
 
     for i in range(len(shards)):
         shard = shards[i]
@@ -699,38 +735,48 @@ def load_audio(
     return np.array(audio).mean(axis=1)
 
 
+def normalize_audio_features(features: mx.array) -> mx.array:
+    """Normalize mel spectrogram features for lossy audio formats (e.g., MP3)."""
+    return (features - mx.mean(features)) / (mx.std(features) + 1e-6)
+
+
 def process_inputs(
     processor,
     prompts,
     images=None,
     audio=None,
     add_special_tokens=False,
+    padding=True,
+    padding_side="left",
     return_tensors="mlx",
     **kwargs,
 ):
     # Get the process method from the processor
     process_method = getattr(processor, "process", processor)
+    parameters = inspect.signature(process_method).parameters
 
     # Prepare arguments
     args = {
         "text": prompts,
         "images": images,
-        "padding": True,
+        "padding": padding,
         "return_tensors": return_tensors,
     }
+    if "padding_side" in parameters:
+        args["padding_side"] = padding_side
 
     # Add special tokens if supported
-    if "add_special_tokens" in inspect.signature(process_method).parameters:
+    if "add_special_tokens" in parameters:
         args["add_special_tokens"] = add_special_tokens
 
-    for param in inspect.signature(process_method).parameters.keys():
+    for param in parameters.keys():
         if param in kwargs.keys():
             args[param] = kwargs.get(param, None)
             break
 
     # Add audio if provided and supported
-    if audio is not None:
-        if "audio" in inspect.signature(process_method).parameters:
+    if audio is not None and len(audio) > 0:
+        if "audio" in parameters:
             args["audio"] = audio
         else:
             raise ValueError(f"Processor {processor} does not support audio parameter")
@@ -787,6 +833,9 @@ def prepare_inputs(
     image_token_index=None,
     resize_shape=None,
     add_special_tokens=False,
+    padding=True,
+    padding_side="left",
+    pad_to_uniform_size=False,
     **kwargs,
 ):
 
@@ -794,7 +843,15 @@ def prepare_inputs(
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
-        inputs = tokenizer(prompts, add_special_tokens=add_special_tokens)
+        # Ensure pad_token exists when padding text-only inputs
+        if padding and tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        inputs = tokenizer(
+            prompts,
+            add_special_tokens=add_special_tokens,
+            padding=padding,
+            padding_side=padding_side,
+        )
         input_ids = mx.array([inputs.input_ids])
         mask = mx.array([inputs.attention_mask])
         return {
@@ -812,10 +869,76 @@ def prepare_inputs(
         )
         images = [process_image(img, resize_shape, image_processor) for img in images]
 
+        # For batching, we need uniform image sizes. Instead of padding to the
+        # largest image (which adds white borders that hurt accuracy), we resize
+        # all images to the model's expected input size.
+        if len(images) > 1 and pad_to_uniform_size:
+            # Get target size from image processor if available
+            target_size = None
+            if image_processor is not None and hasattr(image_processor, "size"):
+                size = image_processor.size
+                if isinstance(size, tuple):
+                    target_size = size
+                elif isinstance(size, dict):
+                    target_size = (size.get("height", 384), size.get("width", 384))
+                elif isinstance(size, int):
+                    target_size = (size, size)
+
+            if target_size is not None:
+                # Resize all images to the target size
+                resized_images = []
+                for img in images:
+                    if img.size != (
+                        target_size[1],
+                        target_size[0],
+                    ):  # PIL uses (width, height)
+                        img = img.resize(
+                            (target_size[1], target_size[0]), Image.Resampling.BICUBIC
+                        )
+                    resized_images.append(img)
+                images = resized_images
+            else:
+                # Fallback: pad to largest size (original behavior)
+                max_width = max(img.width for img in images)
+                max_height = max(img.height for img in images)
+
+                padded_images = []
+                for img in images:
+                    if img.width != max_width or img.height != max_height:
+                        padded_img = Image.new(
+                            "RGB", (max_width, max_height), (255, 255, 255)
+                        )
+                        x_offset = (max_width - img.width) // 2
+                        y_offset = (max_height - img.height) // 2
+                        padded_img.paste(img, (x_offset, y_offset))
+                        padded_images.append(padded_img)
+                    else:
+                        padded_images.append(img)
+                images = padded_images
+
     # Process audio
-    if audio:
+    audio_inputs = None
+    audio_feature_lengths = None
+    is_qwen3_omni_moe = False
+    processor_class_name = (
+        processor.__class__.__name__ if hasattr(processor, "__class__") else ""
+    )
+    if (
+        "qwen3" in processor_class_name.lower()
+        and "omni" in processor_class_name.lower()
+    ):
+        is_qwen3_omni_moe = True
+
+    is_lossy_audio = False
+    if audio is not None and len(audio) > 0:
         if not isinstance(audio, list):
             audio = [audio]
+
+        # Check if any audio file is a lossy format (MP3, AAC, OGG, etc.)
+        lossy_extensions = {".mp3", ".m4a"}
+        is_lossy_audio = any(
+            str(f).lower().endswith(tuple(lossy_extensions)) for f in audio
+        )
 
         if len(audio) > 1:
             print(
@@ -823,12 +946,41 @@ def prepare_inputs(
             )
             audio = audio[:1]
 
-        audio = [
-            load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
-            for audio_file in audio
-        ]
-    else:
-        audio = None
+        if is_qwen3_omni_moe:
+            audio_arrays = [
+                load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
+                for audio_file in audio
+            ]
+            audio_arrays = [
+                audio_array.astype(np.float32) for audio_array in audio_arrays
+            ]
+
+            feature_extractor = getattr(processor, "feature_extractor", None)
+            if feature_extractor is None:
+                raise ValueError("Processor missing feature_extractor for audio prep.")
+
+            audio_inputs = feature_extractor(
+                audio_arrays,
+                sampling_rate=feature_extractor.sampling_rate,
+                padding=True,
+                return_attention_mask=True,
+            )
+
+            audio_feature_lengths = np.sum(
+                audio_inputs["attention_mask"], axis=-1, dtype=np.int32
+            )
+        else:
+            feature_extractor = getattr(processor, "feature_extractor", None)
+            if feature_extractor is not None:
+                audio = [
+                    load_audio(audio_file, sr=feature_extractor.sampling_rate)
+                    for audio_file in audio
+                ]
+            else:
+                audio = [
+                    load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
+                    for audio_file in audio
+                ]
 
     model_inputs = {}
 
@@ -838,7 +990,8 @@ def prepare_inputs(
         if not isinstance(prompts, list):
             prompts = [prompts]
 
-        processor.pad_token = processor.eos_token
+        if processor.pad_token is None:
+            processor.pad_token = processor.eos_token
         text_chunks = [
             [processor(chunk).input_ids for chunk in prompt.split("<image>")]
             for prompt in prompts
@@ -864,7 +1017,7 @@ def prepare_inputs(
         ).astype(mx.int32)
 
     else:
-        if hasattr(processor, "tokenizer"):
+        if hasattr(processor, "tokenizer") and processor.tokenizer.pad_token is None:
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
         inputs = process_inputs_with_fallback(
@@ -892,7 +1045,77 @@ def prepare_inputs(
                 else:
                     model_inputs[key] = mx.array(value)
 
+    if audio_inputs is not None:
+        model_inputs["input_features"] = mx.array(audio_inputs["input_features"])
+        model_inputs["feature_attention_mask"] = mx.array(
+            audio_inputs["attention_mask"]
+        ).astype(mx.int32)
+        model_inputs["audio_feature_lengths"] = mx.array(
+            audio_feature_lengths, dtype=mx.int32
+        )
+
+    if is_lossy_audio and "input_features" in model_inputs:
+        f = model_inputs["input_features"]
+        if isinstance(f, list):
+            model_inputs["input_features"] = [
+                normalize_audio_features(mx.array(x)) for x in f
+            ]
+        else:
+            model_inputs["input_features"] = normalize_audio_features(f)
+
     return model_inputs
+
+
+def group_images_by_shape(
+    images: List[Image.Image],
+    disable_grouping: bool = False,
+) -> Tuple[Dict[Tuple[int, int], List[Image.Image]], Dict[Tuple[int, int], List[int]]]:
+    """
+    Group images by their dimensions for efficient batch processing.
+
+    Images with the same dimensions can be stacked and processed together,
+    which is much faster than processing individually (especially on GPU).
+
+    Args:
+        images: List of PIL images to group
+        disable_grouping: If True, each image gets its own group (useful for debugging)
+
+    Returns:
+        grouped_images: Dict mapping shape -> list of images with that shape
+        grouped_indices: Dict mapping shape -> list of original indices
+
+    Example:
+        >>> images = [img_400x300, img_800x600, img_400x300_2]
+        >>> grouped, indices = group_images_by_shape(images)
+        >>> grouped
+        {(300, 400): [img_400x300, img_400x300_2], (600, 800): [img_800x600]}
+        >>> indices
+        {(300, 400): [0, 2], (600, 800): [1]}
+    """
+    if disable_grouping:
+        # Each image in its own group
+        grouped_images = {}
+        grouped_indices = {}
+        for i, img in enumerate(images):
+            shape = (img.height, img.width)
+            # Make each shape unique by adding index
+            unique_shape = (img.height, img.width, i)
+            grouped_images[unique_shape] = [img]
+            grouped_indices[unique_shape] = [i]
+        return grouped_images, grouped_indices
+
+    grouped_images: Dict[Tuple[int, int], List[Image.Image]] = {}
+    grouped_indices: Dict[Tuple[int, int], List[int]] = {}
+
+    for i, img in enumerate(images):
+        shape = (img.height, img.width)
+        if shape not in grouped_images:
+            grouped_images[shape] = []
+            grouped_indices[shape] = []
+        grouped_images[shape].append(img)
+        grouped_indices[shape].append(i)
+
+    return grouped_images, grouped_indices
 
 
 class StoppingCriteria:
@@ -951,8 +1174,6 @@ def print_array_report(t: mx.array, label: Optional[str]) -> dict:
     Returns:
         Dictionary containing shape, dtype, value representation, and statistics
     """
-
-    from pprint import pprint
 
     # Get basic statistics
     mean_val = mx.mean(t)

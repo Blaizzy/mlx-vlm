@@ -6,7 +6,6 @@ import random
 import re
 from json import dump
 
-import numpy as np
 from datasets import load_dataset
 from tqdm import tqdm
 

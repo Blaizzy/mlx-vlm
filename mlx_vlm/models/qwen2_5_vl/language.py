@@ -2,7 +2,6 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..base import (
     LanguageModelOutput,
@@ -262,6 +261,7 @@ class LanguageModel(nn.Module):
         self.model_type = args.model_type
         self.model = Qwen2Model(args)
         self._rope_deltas = None
+        self._position_ids = None
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
@@ -456,9 +456,10 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
-        # reset rope_deltas when processing a new image/video
+        # reset rope_deltas and position_ids when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None
+            self._position_ids = None
 
         cache_offset = 0
         if cache and cache[0] is not None:
@@ -470,17 +471,30 @@ class LanguageModel(nn.Module):
             else:
                 raise ValueError(f"Unexpected cache offset type: {type(offset)}")
 
-        if position_ids is None and (mask is None or mask.ndim == 2):
+        # Check if mask shape matches input shape (for chunked prefill compatibility)
+        rope_mask = mask
+        if mask is not None and mask.shape[-1] != inputs.shape[-1]:
+            rope_mask = None
+
+        if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
             # Calculate RoPE index once per generation in the pre-fill stage only
             if (
                 (cache is not None and cache[0] is not None and (cache_offset == 0))
                 or self._rope_deltas is None
                 or cache is None
             ):
-                position_ids, rope_deltas = self.get_rope_index(
-                    inputs, image_grid_thw, video_grid_thw, mask
-                )
-                self._rope_deltas = rope_deltas
+                # Check if we have stored position_ids from chunked prefill
+                if self._position_ids is not None:
+                    seq_length = inputs.shape[1]
+                    position_ids = self._position_ids[
+                        :, :, cache_offset : cache_offset + seq_length
+                    ]
+                else:
+                    position_ids, rope_deltas = self.get_rope_index(
+                        inputs, image_grid_thw, video_grid_thw, rope_mask
+                    )
+                    self._rope_deltas = rope_deltas
+                    self._position_ids = position_ids
             else:
                 # Use the prev pre-calculated rope-deltas to get the correct position ids
                 batch_size, seq_length = inputs.shape
@@ -490,14 +504,12 @@ class LanguageModel(nn.Module):
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
 
-                if cache is not None:
+                if cache_offset is not None:
                     if delta.ndim == 0:
                         delta = mx.expand_dims(delta, axis=0)
 
                     if delta.shape[0] < batch_size:
-                        # Repeat delta to fill batch
-                        repeats = batch_size // delta.shape[0]
-                        delta = mx.repeat(delta, repeats, axis=0)
+                        delta = mx.tile(delta, (batch_size, 1))
                     else:
                         # Slice delta to match batch
                         delta = delta[:batch_size]

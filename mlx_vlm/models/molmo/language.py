@@ -1,5 +1,4 @@
-import inspect
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -182,12 +181,13 @@ class LanguageModel(nn.Module):
 
     def __call__(
         self,
-        input_ids: mx.array,
+        inputs: mx.array,
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
+        **kwargs,
     ) -> LanguageModelOutput:
-        outputs = self.model(input_ids, inputs_embeds, mask, cache)
+        outputs = self.model(inputs, inputs_embeds, mask, cache)
         return outputs
 
     @staticmethod

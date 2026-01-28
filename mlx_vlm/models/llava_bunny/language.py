@@ -1,17 +1,13 @@
-import inspect
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import (
-    BaseModelConfig,
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import KVCache
 from .config import TextConfig
 
 

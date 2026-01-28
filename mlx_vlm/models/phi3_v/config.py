@@ -1,6 +1,4 @@
-import inspect
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 from typing import Dict, List, Optional, Union
 
 from ..base import BaseModelConfig
@@ -26,6 +24,7 @@ class ModelConfig(BaseModelConfig):
     num_key_value_heads: int = None
     rope_theta: float = 10000
     rope_traditional: bool = False
+    partial_rotary_factor: float = 1.0
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     max_position_embeddings: int = 131072
     original_max_position_embeddings: int = 4096

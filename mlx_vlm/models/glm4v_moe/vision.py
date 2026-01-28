@@ -265,7 +265,7 @@ class VisionModel(nn.Module):
         super().__init__()
         self.config = config
         self.model_type = config.model_type
-        if self.model_type != "glm4v_moe":
+        if self.model_type not in ["glm4v_moe", "glm4v_moe_vision"]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
         self.spatial_merge_size = config.spatial_merge_size
 

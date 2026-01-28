@@ -139,7 +139,21 @@ print(output)
 
 Start the server:
 ```sh
-mlx_vlm.server
+mlx_vlm.server --port 8080
+
+# With trust remote code enabled (required for some models)
+mlx_vlm.server --trust-remote-code
+```
+
+#### Server Options
+
+- `--host`: Host address (default: `0.0.0.0`)
+- `--port`: Port number (default: `8080`)
+- `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
+
+You can also set trust remote code via environment variable:
+```sh
+MLX_TRUST_REMOTE_CODE=true mlx_vlm.server
 ```
 
 The server provides multiple endpoints for different use cases and supports dynamic model loading/unloading with caching (one model at a time).
@@ -147,7 +161,7 @@ The server provides multiple endpoints for different use cases and supports dyna
 #### Available Endpoints
 
 - `/models` - List models available locally
-- `/chat/completion` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
+- `/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` - OpenAI-compatible responses endpoint
 - `/health` - Check server status
 - `/unload` - Unload current model from memory
@@ -163,7 +177,7 @@ curl "http://localhost:8080/models"
 ##### Text Input
 
 ```sh
-curl -X POST "http://localhost:8080/chat/completion" \
+curl -X POST "http://localhost:8080/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/Qwen2-VL-2B-Instruct-4bit",
@@ -181,7 +195,7 @@ curl -X POST "http://localhost:8080/chat/completion" \
 ##### Image Input
 
 ```sh
-curl -X POST "http://localhost:8080/chat/completion" \
+curl -X POST "http://localhost:8080/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/Qwen2.5-VL-32B-Instruct-8bit",

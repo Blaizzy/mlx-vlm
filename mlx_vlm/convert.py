@@ -107,6 +107,7 @@ def convert(
     quantize: bool = False,
     q_group_size: int = 64,
     q_bits: int = 4,
+    q_mode: str = "affine",
     dtype: Optional[str] = None,
     upload_repo: str = None,
     revision: Optional[str] = None,
@@ -122,10 +123,6 @@ def convert(
 
     def base_quant_predicate(path, module):
         if skip_multimodal_module(path):
-            return False
-        if not hasattr(module, "to_quantized"):
-            return False
-        if module.weight.shape[1] % q_group_size != 0:
             return False
         return True
 
@@ -156,7 +153,12 @@ def convert(
         print("[INFO] Quantizing")
         config.setdefault("vision_config", {})
         model, config = quantize_model(
-            model, config, q_group_size, q_bits, quant_predicate=quant_predicate
+            model,
+            config,
+            q_group_size,
+            q_bits,
+            mode=q_mode,
+            quant_predicate=quant_predicate,
         )
 
     if dequantize:
@@ -172,6 +174,9 @@ def convert(
     for pattern in ["*.py", "*.json"]:
         files = glob.glob(str(model_path / pattern))
         for file in files:
+            # Skip the index file - save_weights() already generated the correct one
+            if Path(file).name == "model.safetensors.index.json":
+                continue
             shutil.copy(file, mlx_path)
 
     processor.save_pretrained(mlx_path)
@@ -192,8 +197,12 @@ def configure_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert Hugging Face model to MLX format"
     )
-
-    parser.add_argument("--hf-path", type=str, help="Path to the Hugging Face model.")
+    parser.add_argument(
+        "--hf-path",
+        "--model",
+        type=str,
+        help="Path to the model. This can be a local path or a Hugging Face Hub model identifier.",
+    )
     parser.add_argument(
         "--revision",
         type=str,
@@ -207,10 +216,23 @@ def configure_parser() -> argparse.ArgumentParser:
         "-q", "--quantize", help="Generate a quantized model.", action="store_true"
     )
     parser.add_argument(
-        "--q-group-size", help="Group size for quantization.", type=int, default=64
+        "--q-group-size",
+        help="Group size for quantization.",
+        type=int,
+        default=None,
     )
     parser.add_argument(
-        "--q-bits", help="Bits per weight for quantization.", type=int, default=4
+        "--q-bits",
+        help="Bits per weight for quantization.",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--q-mode",
+        help="The quantization mode.",
+        type=str,
+        choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
+        default="affine",
     )
     parser.add_argument(
         "--dtype",
@@ -236,6 +258,12 @@ def configure_parser() -> argparse.ArgumentParser:
         "-d",
         "--dequantize",
         help="Dequantize a quantized model.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        help="Trust remote code.",
         action="store_true",
         default=False,
     )
