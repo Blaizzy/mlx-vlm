@@ -6,6 +6,7 @@ import numpy as np
 
 from mlx_vlm.models.qwen3_omni_moe.audio import AudioModel
 
+from ..base import InputEmbeddingsFeatures
 from .config import ThinkerConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -135,6 +136,7 @@ class Thinker(nn.Module):
         input_features: Optional[mx.array] = None,
         feature_attention_mask: Optional[mx.array] = None,
         audio_feature_lengths: Optional[mx.array] = None,
+        **kwargs,
     ):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         visual_pos_masks = None
@@ -259,7 +261,11 @@ class Thinker(nn.Module):
                     visual_embeds_multiscale_joint.append(embed_joint)
                 visual_embeds_multiscale = tuple(visual_embeds_multiscale_joint)
 
-        return inputs_embeds, visual_pos_masks, deepstack_visual_embeds
+        return InputEmbeddingsFeatures(
+            inputs_embeds=inputs_embeds,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+        )
 
     @staticmethod
     def merge_input_ids_with_image_features(

@@ -176,6 +176,8 @@ class Gemma3Model(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
+        self.window_size = config.sliding_window
+        self.sliding_window_pattern = config.sliding_window_pattern
         self.num_hidden_layers = config.num_hidden_layers
         assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -203,19 +205,27 @@ class Gemma3Model(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            j = self.config.sliding_window_pattern
-            full_mask = create_attention_mask(h, cache[j - 1 : j])
-            sliding_window_mask = create_attention_mask(h, cache)
+            global_mask = create_attention_mask(
+                h, cache[self.sliding_window_pattern - 1]
+            )
+
+            if self.sliding_window_pattern > 1:
+                sliding_window_mask = create_attention_mask(
+                    h,
+                    cache[0],
+                    window_size=self.window_size,
+                )
+            else:
+                sliding_window_mask = None
 
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             is_global = (
-                i % self.config.sliding_window_pattern
-                == self.config.sliding_window_pattern - 1
+                i % self.sliding_window_pattern == self.sliding_window_pattern - 1
             )
 
             local_mask = mask
             if mask is None and is_global:
-                local_mask = full_mask
+                local_mask = global_mask
             elif mask is None:
                 local_mask = sliding_window_mask
 
@@ -238,6 +248,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        **kwargs,
     ):
         out = self.model(inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache)
         out = self.lm_head(out)

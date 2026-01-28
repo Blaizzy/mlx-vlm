@@ -181,12 +181,13 @@ class LanguageModel(nn.Module):
 
     def __call__(
         self,
-        input_ids: mx.array,
+        inputs: mx.array,
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
+        **kwargs,
     ) -> LanguageModelOutput:
-        outputs = self.model(input_ids, inputs_embeds, mask, cache)
+        outputs = self.model(inputs, inputs_embeds, mask, cache)
         return outputs
 
     @staticmethod

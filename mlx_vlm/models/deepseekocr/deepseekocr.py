@@ -6,6 +6,7 @@ import mlx.nn as nn
 import numpy as np
 from transformers import AutoProcessor
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig, ProjectorConfig, SAMViTConfig
 from .language import LanguageModel
 from .processing_deepseekocr import DeepseekVLV2Processor
@@ -145,11 +146,12 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
         images_spatial_crop: Optional[mx.array] = None,
         images_seq_mask: Optional[mx.array] = None,
+        **kwargs,
     ):
         input_embeds = self.language_model.model.embed_tokens(input_ids)
 
         if pixel_values is None:
-            return input_embeds
+            return InputEmbeddingsFeatures(inputs_embeds=input_embeds)
 
         if (
             self.sam_model is not None
@@ -305,7 +307,7 @@ class Model(nn.Module):
 
                 idx += 1
 
-        return input_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=input_embeds)
 
     @property
     def layers(self):
@@ -323,12 +325,14 @@ class Model(nn.Module):
         images_spatial_crop = kwargs.get("images_spatial_crop", None)
         images_seq_mask = kwargs.get("images_seq_mask", None)
 
-        input_embeddings = self.get_input_embeddings(
+        input_embeddings_features = self.get_input_embeddings(
             input_ids, pixel_values, images_spatial_crop, images_seq_mask
         )
 
         logits = self.language_model(
-            input_ids, cache=cache, inputs_embeds=input_embeddings
+            input_ids,
+            cache=cache,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
         )
         return logits
 

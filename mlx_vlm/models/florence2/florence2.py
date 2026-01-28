@@ -1,9 +1,14 @@
 import math
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map
 
+from ..base import InputEmbeddingsFeatures
+
+# Import to apply Florence2Processor compatibility patch
+from . import processing_florence2  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -252,7 +257,74 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.language_model.model.layers
+        return self.language_model.model.decoder.layers
+
+    def make_cache(self):
+        """Create cache for encoder-decoder model."""
+        return self.language_model.make_cache()
+
+    def get_input_embeddings(
+        self,
+        input_ids: Optional[mx.array] = None,
+        pixel_values: Optional[mx.array] = None,
+        **kwargs,
+    ):
+
+        if input_ids is not None:
+            # Filter out image placeholder tokens and only embed the task prompt
+            # Create mask for non-image tokens
+            non_image_mask = input_ids != self.config.image_token_id
+
+            # Use boolean indexing to filter - convert to list for processing
+            batch_size = input_ids.shape[0]
+
+            # For batch_size=1, filter directly
+            if batch_size == 1:
+                # Get non-image token indices using argwhere-like approach
+                mask_flat = non_image_mask[0]
+                # Sum up mask to count non-image tokens
+                num_non_image = int(mx.sum(mask_flat).item())
+
+                if num_non_image > 0:
+                    # Extract non-image tokens by iterating (simple approach)
+                    input_list = input_ids[0].tolist()
+                    filtered_tokens = [
+                        t for t in input_list if t != self.config.image_token_id
+                    ]
+                    task_input_ids = mx.array([filtered_tokens])
+                    inputs_embeds = self.language_model.model.shared(task_input_ids)
+                else:
+                    inputs_embeds = None
+            else:
+                # For batch processing, embed all and handle later
+                inputs_embeds = self.language_model.model.shared(input_ids)
+        else:
+            inputs_embeds = None
+
+        attention_mask = None
+
+        # Process image if provided
+        if pixel_values is not None:
+            image_features = self._encode_image(pixel_values)
+
+            # Merge image features with text embeddings (task prompt only)
+            inputs_embeds, attention_mask = self._merge_input_ids_with_image_features(
+                image_features, inputs_embeds
+            )
+
+        # For encoder-decoder models, prepare initial decoder input
+        # Use decoder_start_token_id from text_config (default 2 for Florence2/BART)
+        decoder_start_token_id = getattr(
+            self.config.text_config, "decoder_start_token_id", 2
+        )
+        decoder_input_ids = mx.array([[decoder_start_token_id]])
+        decoder_inputs_embeds = self.language_model.model.shared(decoder_input_ids)
+
+        return InputEmbeddingsFeatures(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,  # Use attention_mask for encoder-decoder
+            decoder_inputs_embeds=decoder_inputs_embeds,
+        )
 
     def __call__(
         self,
@@ -268,23 +340,11 @@ class Model(nn.Module):
         attention_mask = None
         decoder_inputs_embeds = None
 
-        # Process image if provided
-        if pixel_values is not None:
-            image_features = self._encode_image(pixel_values)
-
-            # Get input embeddings if needed
-            inputs_embeds = None
-            if input_ids is not None:
-                inputs_embeds = self.language_model.model.shared(input_ids)
-
-            # Merge image features with text embeddings
-            inputs_embeds, attention_mask = self._merge_input_ids_with_image_features(
-                image_features, inputs_embeds
-            )
-        else:
-            inputs_embeds = None
-            attention_mask = None
-
+        input_embeddings_features = self.get_input_embeddings(
+            input_ids, pixel_values, **kwargs
+        )
+        inputs_embeds = input_embeddings_features.inputs_embeds
+        attention_mask = input_embeddings_features.attention_mask
         # Handle decoder input IDs
         if labels is not None and decoder_input_ids is None:
             decoder_input_ids = shift_tokens_right(
@@ -292,19 +352,17 @@ class Model(nn.Module):
             )
 
         if decoder_input_ids is None and decoder_inputs_embeds is None:
+            # Use decoder_start_token_id from text_config (default 2 for Florence2/BART)
             decoder_start_token_id = getattr(
-                self.config, "decoder_start_token_id", 0
-            )  # 2 is common for many models
-            if decoder_start_token_id is None:
-                decoder_start_token_id = 0
-
+                self.config.text_config, "decoder_start_token_id", 2
+            )
             decoder_input_ids = mx.array([decoder_start_token_id])[None, :]
             decoder_inputs_embeds = self.language_model.model.shared(decoder_input_ids)
             decoder_input_ids = None
 
         # Forward through language model
         outputs = self.language_model(
-            input_ids=input_ids,
+            inputs=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
