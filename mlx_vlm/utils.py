@@ -14,7 +14,7 @@ import numpy as np
 import requests
 import soundfile as sf
 from huggingface_hub import snapshot_download
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
 from transformers import AutoProcessor, PreTrainedTokenizer, PreTrainedTokenizerFast
 
@@ -543,7 +543,6 @@ def save_weights(
         save_path = Path(save_path)
 
     weights = dict(tree_flatten(model.parameters()))
-    del model
 
     save_path.mkdir(parents=True, exist_ok=True)
 
@@ -561,8 +560,10 @@ def save_weights(
     # Write the weights and make sure no references are kept other than the
     # necessary ones
     if donate_weights:
-        weights.clear()
-        del weights
+        model.update(tree_map(lambda _: mx.array([]), model.parameters()))
+
+    weights.clear()
+    del weights
 
     for i in range(len(shards)):
         shard = shards[i]
