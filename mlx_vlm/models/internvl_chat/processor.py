@@ -10,7 +10,7 @@ from transformers import (
     BatchFeature,
     ProcessorMixin,
 )
-from transformers.image_utils import ImageFeatureExtractionMixin
+from transformers.image_processing_utils import BaseImageProcessor
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
@@ -164,7 +164,7 @@ def dynamic_preprocess(
     return processed_images
 
 
-class InternVLImageProcessor(ImageFeatureExtractionMixin):
+class InternVLImageProcessor(BaseImageProcessor):
     model_input_names = ["pixel_values"]
 
     def __init__(
@@ -185,7 +185,7 @@ class InternVLImageProcessor(ImageFeatureExtractionMixin):
         dynamic_use_thumbnail: bool = True,
         **kwargs,
     ):
-        super().__init__()
+        super().__init__(**kwargs)
         self.do_resize = (
             do_resize  # Although dynamic_preprocess handles resizing internally
         )

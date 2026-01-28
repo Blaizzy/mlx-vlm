@@ -1,4 +1,4 @@
-from .config import ModelConfig, TextConfig, VisionConfig
+from .config import AdapterConfig, ModelConfig, TextConfig, VisionConfig, VitConfig
 from .language import LanguageModel
 from .molmo2 import Model
 from .processing import Molmo2ImageProcessor as ImageProcessor

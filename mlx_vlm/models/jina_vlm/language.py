@@ -246,14 +246,14 @@ class LanguageModel(nn.Module):
 
     def __call__(
         self,
-        input_ids: mx.array,
+        inputs: mx.array,
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache: Optional[List[KVCache]] = None,
         **kwargs,
     ) -> LanguageModelOutput:
         if inputs_embeds is None:
-            x = self.embedding(input_ids)
+            x = self.embedding(inputs)
         else:
             x = inputs_embeds
 
@@ -265,14 +265,8 @@ class LanguageModel(nn.Module):
         mask = create_attention_mask(x, cache)
 
         for i, layer in enumerate(self.layers):
-            layer_cache = cache[i] if cache is not None else None
-            x = layer(x, mask=mask, cache=layer_cache)
+            x = layer(x, mask=mask, cache=cache[i])
 
         hidden_states = self.ln_f(x)
         logits = self.lm_head(hidden_states)
         return LanguageModelOutput(logits=logits)
-
-    def _create_causal_mask(self, seq_len: int, offset: int = 0) -> mx.array:
-        total_len = offset + seq_len
-        mask = mx.triu(mx.full((seq_len, total_len), float("-inf")), k=offset + 1)
-        return mask[None, None, :, :]

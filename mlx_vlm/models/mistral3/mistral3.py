@@ -3,6 +3,7 @@ from typing import List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import InputEmbeddingsFeatures
 from ..pixtral import VisionModel
 from .config import ModelConfig
 from .language import LanguageModel
@@ -218,7 +219,9 @@ class Model(nn.Module):
         image_sizes = kwargs.get("image_sizes", None)
 
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids)
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
@@ -248,7 +251,7 @@ class Model(nn.Module):
         final_inputs_embeds = self.merge_input_ids_with_image_features(
             self.config.image_token_index, image_features, inputs_embeds, input_ids
         )
-        return final_inputs_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
     @staticmethod
     def merge_input_ids_with_image_features(
@@ -328,9 +331,13 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        input_embddings = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
+        input_embeddings_features = self.get_input_embeddings(
+            input_ids, pixel_values, **kwargs
+        )
         logits = self.language_model(
-            input_ids, cache=cache, inputs_embeds=input_embddings
+            input_ids,
+            cache=cache,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
         )
         return logits
 

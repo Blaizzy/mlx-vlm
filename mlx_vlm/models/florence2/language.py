@@ -61,16 +61,16 @@ class Florence2Attention(nn.Module):
 
         if (
             is_cross_attention
+            and cache is not None
             and cache.cache_length > 0
             and cache.keys.shape[2] == key_value_states.shape[1]
         ):
-            # k = cache[0]
-            # v = cache[1]
+            # Cross-attention with cached keys/values - reuse them
             k = cache.keys
             v = cache.values
 
         elif is_cross_attention:
-            # Cross attention
+            # Cross attention - compute and cache keys/values from encoder
             k = (
                 self.k_proj(key_value_states)
                 .reshape(batch_size, src_len, self.num_heads, self.head_dim)
@@ -81,8 +81,12 @@ class Florence2Attention(nn.Module):
                 .reshape(batch_size, src_len, self.num_heads, self.head_dim)
                 .transpose(0, 2, 1, 3)
             )
+            # Cache the cross-attention keys/values
+            if cache is not None:
+                cache.update(k, v)
+
         elif cache is not None:
-            # reuse k, v, self_attention
+            # Self-attention with cache - compute new k,v and concatenate with cache
             k = (
                 self.k_proj(hidden_states)
                 .reshape(batch_size, src_len, self.num_heads, -1)
@@ -93,10 +97,11 @@ class Florence2Attention(nn.Module):
                 .reshape(batch_size, src_len, self.num_heads, -1)
                 .transpose(0, 2, 1, 3)
             )
-
+            # update_and_fetch handles cache concatenation
             k, v = cache.update_and_fetch(k, v)
+
         else:
-            # Self attention
+            # Self attention without cache (encoder)
             k = (
                 self.k_proj(hidden_states)
                 .reshape(batch_size, src_len, self.num_heads, self.head_dim)
@@ -107,9 +112,6 @@ class Florence2Attention(nn.Module):
                 .reshape(batch_size, src_len, self.num_heads, self.head_dim)
                 .transpose(0, 2, 1, 3)
             )
-
-        if self.is_decoder:
-            cache.update(k, v)
 
         if self.is_causal and self.is_decoder:
             causal_mask = create_attention_mask(hidden_states)
@@ -193,15 +195,13 @@ class Florence2DecoderLayer(nn.Module):
         if encoder_hidden_states is not None:
             residual = hidden_states
 
-            mask = create_attention_mask(hidden_states)
-
             # cross_attn cached key/values tuple is at positions 3,4 of cache tuple
             cross_attn_cache = cache[-1] if cache[-1] is not None else None
 
             hidden_states = self.encoder_attn(
                 hidden_states,
                 key_value_states=encoder_hidden_states,
-                attention_mask=mask,
+                attention_mask=encoder_attention_mask,
                 cache=cross_attn_cache,
             )
             hidden_states = residual + hidden_states
@@ -413,7 +413,7 @@ class LanguageModel(nn.Module):
 
     def __call__(
         self,
-        input_ids=None,
+        inputs=None,
         inputs_embeds=None,
         decoder_input_ids=None,
         decoder_inputs_embeds=None,
@@ -421,9 +421,10 @@ class LanguageModel(nn.Module):
         decoder_attention_mask=None,
         encoder_outputs=None,
         cache=None,
+        **kwargs,
     ):
         decoder_outputs, encoder_outputs = self.model(
-            input_ids,
+            inputs,
             inputs_embeds,
             decoder_input_ids,
             decoder_inputs_embeds,

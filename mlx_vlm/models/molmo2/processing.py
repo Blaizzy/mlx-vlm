@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
-from transformers import AutoImageProcessor, AutoProcessor
+from transformers import AutoProcessor
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import BaseImageProcessor, get_size_dict
 from transformers.image_transforms import convert_to_rgb
@@ -621,20 +621,153 @@ class Molmo2Processor(ProcessorMixin):
 
         return encoding
 
+    def apply_chat_template(
+        self,
+        conversation,
+        chat_template=None,
+        add_generation_prompt=False,
+        tokenize=False,
+        **kwargs,
+    ):
+        """Apply chat template to conversation."""
+        if chat_template is None:
+            chat_template = getattr(self, "chat_template", None)
+        if chat_template is None:
+            chat_template = getattr(self.tokenizer, "chat_template", None)
+        if chat_template is None:
+            # Default Molmo2 chat template
+            chat_template = (
+                "{% for message in messages %}"
+                "{% if message['role'] == 'user' %}"
+                "User: {{ message['content'] }}\n"
+                "{% elif message['role'] == 'assistant' %}"
+                "Assistant: {{ message['content'] }}\n"
+                "{% endif %}"
+                "{% endfor %}"
+                "{% if add_generation_prompt %}Assistant: {% endif %}"
+            )
+
+        from jinja2 import Environment
+
+        # Use Environment with loopcontrols extension to support {% continue %} and {% break %}
+        env = Environment(extensions=["jinja2.ext.loopcontrols"])
+        template = env.from_string(chat_template)
+        rendered = template.render(
+            messages=conversation,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
+
+        if tokenize:
+            return self.tokenizer.encode(rendered)
+        return rendered
+
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)
 
     def decode(self, *args, **kwargs):
         return self.tokenizer.decode(*args, **kwargs)
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """Load processor from pretrained model."""
+        import json
+        from pathlib import Path
 
-# Register the custom processor with transformers AutoProcessor
-MODEL_TYPE = "molmo2"
-try:
-    AutoImageProcessor.register(
-        MODEL_TYPE, slow_image_processor_class=Molmo2ImageProcessor
+        from huggingface_hub import hf_hub_download
+        from transformers import AutoTokenizer
+
+        kwargs.pop("trust_remote_code", None)
+
+        model_path = Path(pretrained_model_name_or_path)
+        is_local = model_path.exists() and model_path.is_dir()
+
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(model_path) if is_local else pretrained_model_name_or_path,
+            trust_remote_code=True,
+            local_files_only=is_local,
+        )
+
+        # Load image processor config
+        image_processor_config = {}
+        try:
+            if is_local:
+                config_path = model_path / "preprocessor_config.json"
+            else:
+                config_path = Path(
+                    hf_hub_download(
+                        pretrained_model_name_or_path, "preprocessor_config.json"
+                    )
+                )
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                for key in [
+                    "size",
+                    "max_crops",
+                    "overlap_margins",
+                    "patch_size",
+                    "pooling_size",
+                    "image_mean",
+                    "image_std",
+                    "do_convert_rgb",
+                ]:
+                    if key in config:
+                        image_processor_config[key] = config[key]
+        except Exception:
+            pass
+
+        image_processor = Molmo2ImageProcessor(**image_processor_config)
+
+        # Load chat template
+        chat_template = getattr(tokenizer, "chat_template", None)
+
+        return cls(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+        )
+
+
+# Patch AutoProcessor for Molmo2 models
+import json
+from pathlib import Path
+
+_original_auto_processor_from_pretrained_molmo2 = AutoProcessor.from_pretrained
+
+
+@classmethod
+def _patched_auto_processor_from_pretrained_molmo2(
+    cls, pretrained_model_name_or_path, **kwargs
+):
+    """Patched from_pretrained that returns Molmo2Processor for molmo2 models."""
+    from huggingface_hub import hf_hub_download
+
+    model_path = Path(pretrained_model_name_or_path)
+    is_local = model_path.exists() and model_path.is_dir()
+
+    # Check if this is a molmo2 model
+    is_molmo2 = False
+    try:
+        if is_local:
+            config_path = model_path / "config.json"
+        else:
+            config_path = Path(
+                hf_hub_download(pretrained_model_name_or_path, "config.json")
+            )
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        model_type = config.get("model_type", "").lower()
+        is_molmo2 = model_type == "molmo2"
+    except Exception:
+        pass
+
+    if is_molmo2:
+        return Molmo2Processor.from_pretrained(pretrained_model_name_or_path, **kwargs)
+
+    return _original_auto_processor_from_pretrained_molmo2.__func__(
+        cls, pretrained_model_name_or_path, **kwargs
     )
-    AutoProcessor.register(MODEL_TYPE, Molmo2Processor)
-    logger.info(f"Registered custom processor classes for model type '{MODEL_TYPE}'.")
-except Exception as e:
-    logger.warning(f"Failed to register custom processor for {MODEL_TYPE}: {e}")
+
+
+AutoProcessor.from_pretrained = _patched_auto_processor_from_pretrained_molmo2

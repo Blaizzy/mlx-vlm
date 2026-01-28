@@ -6,6 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from transformers import AutoProcessor
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig, VisionConfig
 from .language import LanguageModel
 from .processing_jinavlm import JinaVLMProcessor
@@ -201,23 +202,18 @@ class Model(nn.Module):
 
         return image_features
 
-    def __call__(
+    def get_input_embeddings(
         self,
-        input_ids: mx.array,
+        input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        mask: Optional[mx.array] = None,
-        cache=None,
         **kwargs,
-    ) -> mx.array:
-        if input_ids.ndim == 1:
-            input_ids = input_ids[None, :]
-
+    ):
         batch_size, seq_len = input_ids.shape
 
         image_masks = kwargs.get("image_masks", None)
         image_input_idx = kwargs.get("image_input_idx", None)
 
-        input_embeddings = self.language_model.embedding(input_ids)
+        inputs_embeds = self.language_model.embedding(input_ids)
 
         if pixel_values is not None and image_input_idx is not None:
             if pixel_values.ndim == 3:
@@ -247,11 +243,25 @@ class Model(nn.Module):
                 for i in range(idx.shape[0]):
                     pos = int(idx[i].item())
                     if pos >= 0 and pos < seq_len:
-                        input_embeddings = input_embeddings.at[b, pos].add(features[i])
+                        inputs_embeds = inputs_embeds.at[b, pos].add(features[i])
 
+        return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        pixel_values: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
+        cache=None,
+        **kwargs,
+    ) -> mx.array:
+
+        input_embeddings_features = self.get_input_embeddings(
+            input_ids, pixel_values, **kwargs
+        )
         return self.language_model(
             input_ids,
-            inputs_embeds=input_embeddings,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
             mask=mask,
             cache=cache,
         )
