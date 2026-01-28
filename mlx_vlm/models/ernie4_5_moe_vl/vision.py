@@ -129,57 +129,40 @@ class VisionAttention(nn.Module):
 
     def __call__(
         self,
-        hidden_states: mx.array,
+        x: mx.array,
         cu_seqlens: mx.array,
         rotary_pos_emb: Optional[mx.array] = None,
     ) -> mx.array:
         """Forward function for vision attention."""
-        seq_length = hidden_states.shape[0]
+        seq_length = x.shape[0]
         qkv = (
-            self.qkv(hidden_states)
-            .reshape(seq_length, 3, self.num_heads, -1)
-            .transpose(1, 0, 2, 3)
+            self.qkv(x).reshape(seq_length, 3, self.num_heads, -1).transpose(1, 0, 2, 3)
         )
-        q, k, v = mx.split(qkv, 3, axis=0)
-        q = q.squeeze(0)
-        k = k.squeeze(0)
-        v = v.squeeze(0)
+        q, k, v = mx.split(qkv, 3)
 
-        # Apply rotary position embeddings
-        q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb).squeeze(0)
-        k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb).squeeze(0)
+        q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
+        k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
 
-        # Transpose for attention: [seq, heads, dim] -> [heads, seq, dim]
-        q = q.transpose(1, 0, 2)
-        k = k.transpose(1, 0, 2)
-        v = v.transpose(1, 0, 2)
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
 
-        # Compute attention for each segment separately
-        cu_seqlens_list = (
-            cu_seqlens.tolist() if isinstance(cu_seqlens, mx.array) else cu_seqlens
-        )
+        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        splits = [
+            mx.split(tensor, [lengths[0], sum(lengths[:2])], axis=2)
+            for tensor in (q, k, v)
+        ]
+
         attn_outputs = []
-
-        for i in range(len(cu_seqlens_list) - 1):
-            start = int(cu_seqlens_list[i])
-            end = int(cu_seqlens_list[i + 1])
-
-            q_seg = q[:, start:end, :]
-            k_seg = k[:, start:end, :]
-            v_seg = v[:, start:end, :]
-
-            # Compute attention weights
-            attn_weights = (q_seg @ k_seg.transpose(0, 2, 1)) * self.scale
-            attn_weights = mx.softmax(attn_weights.astype(mx.float32), axis=-1).astype(
-                q.dtype
+        for q, k, v in zip(*splits):
+            output = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scale, mask=None
             )
-            attn_out = attn_weights @ v_seg
-            attn_outputs.append(attn_out.transpose(1, 0, 2))
+            attn_outputs.append(output)
 
-        # Concatenate all segments
-        attn_output = mx.concatenate(attn_outputs, axis=0)
-        attn_output = attn_output.reshape(seq_length, -1)
-        return self.proj(attn_output)
+        output = mx.concatenate(attn_outputs, axis=2)
+        output = output.transpose(0, 2, 1, 3).reshape(seq_length, -1)
+        return self.proj(output)
 
 
 class DFNRopeVisionBlock(nn.Module):
