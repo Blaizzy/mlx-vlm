@@ -1,4 +1,5 @@
 import argparse
+import gc
 import importlib.util
 import json
 import platform
@@ -217,7 +218,9 @@ def main():
             print("\n")
 
         console.print("[bold blue]Cleaning up...")
-        del model, processor
+        del model, processor, config
+        mx.synchronize()
+        gc.collect()
         mx.clear_cache()
         mx.reset_peak_memory()
         console.print("[bold green]✓[/] Cleanup complete\n")
