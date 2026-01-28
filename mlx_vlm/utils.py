@@ -214,6 +214,30 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     model_class.AudioModel, weights, model_config.audio_config
                 )
 
+    if quantization is None:
+        quantization_config = config.get("quantization_config", None)
+        if quantization_config is None:
+            text_config = config.get("text_config", {})
+            quantization_config = text_config.get("quantization_config", None)
+            if quantization_config is not None:
+                config["quantization_config"] = quantization_config
+
+        if quantization_config is not None:
+            quant_method = quantization_config.get("quant_method")
+            if quant_method == "compressed-tensors":
+                quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            elif quant_method == "mxfp4":
+                quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            elif quant_method in ("awq", "gptq", "bitnet"):
+                logging.warning(
+                    "Quantization method %s is not supported in mlx_vlm.load_model()",
+                    quant_method,
+                )
+
+            if quantization is not None:
+                config["quantization"] = quantization
+                config["quantization_config"] = quantization
+
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may or may not have vision quantized
         # TODO: Re-upload the models with the new quantization config and remove this
