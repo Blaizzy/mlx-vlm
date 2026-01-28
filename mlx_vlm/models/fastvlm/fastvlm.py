@@ -5,6 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import CallableModuleList, VisionModel
@@ -41,9 +42,12 @@ class Model(nn.Module):
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
+        **kwargs,
     ):
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids)
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         _, image_features, _ = self.vision_tower(pixel_values.transpose(0, 2, 3, 1))
         B, H, W, C = image_features.shape
@@ -53,7 +57,7 @@ class Model(nn.Module):
         final_inputs_embeds = self.prepare_inputs_for_multimodal(
             image_features, input_ids, mask
         )
-        return final_inputs_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
     # Source: https://github.com/apple/ml-fastvlm/blob/592b4add3c1c8a518e77d95dc6248e76c1dd591f/llava/model/llava_arch.py#L146
     def prepare_inputs_for_multimodal(self, image_features, input_ids, mask):
@@ -162,9 +166,14 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        input_embeddings = self.get_input_embeddings(input_ids, pixel_values, mask)
+        input_embeddings_features = self.get_input_embeddings(
+            input_ids, pixel_values, mask
+        )
         logits = self.language_model(
-            input_ids, mask=mask, cache=cache, inputs_embeds=input_embeddings
+            input_ids,
+            mask=mask,
+            cache=cache,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
         )
         return logits
 

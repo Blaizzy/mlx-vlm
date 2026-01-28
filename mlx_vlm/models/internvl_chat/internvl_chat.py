@@ -4,7 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..base import pixel_shuffle
+from ..base import InputEmbeddingsFeatures, pixel_shuffle
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -35,10 +35,13 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        **kwargs,
     ):
 
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids)
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         dtype = self.vision_model.embeddings.patch_embedding.weight.dtype
         pixel_values = pixel_values.astype(dtype)
@@ -71,7 +74,7 @@ class Model(nn.Module):
         final_inputs_embeds = self._merge_input_ids_with_image_features(
             hidden_states, inputs_embeds, input_ids
         )
-        return final_inputs_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
     def _merge_input_ids_with_image_features(
         self, image_features, inputs_embeds, input_ids
@@ -105,6 +108,8 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        input_embddings = self.get_input_embeddings(input_ids, pixel_values)
-        logits = self.language_model(None, cache=cache, inputs_embeds=input_embddings)
+        input_embeddings_features = self.get_input_embeddings(input_ids, pixel_values)
+        logits = self.language_model(
+            None, cache=cache, inputs_embeds=input_embeddings_features.inputs_embeds
+        )
         return logits

@@ -3,6 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import InputEmbeddingsFeatures
 from .audio import AudioModel
 from .config import ModelConfig, TextConfig
 from .language import Gemma3nRMSNorm, LanguageModel
@@ -113,11 +114,10 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        input_features: Optional[mx.array] = None,
-        input_features_mask: Optional[mx.array] = None,
         **kwargs,
     ):
-
+        input_features = kwargs.get("input_features", None)
+        input_features_mask = kwargs.get("input_features_mask", None)
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         per_layer_inputs_mask = mx.logical_and(
@@ -130,7 +130,9 @@ class Model(nn.Module):
             per_layer_inputs_tokens
         )
         if pixel_values is None and input_features is None:
-            return inputs_embeds, per_layer_inputs
+            return InputEmbeddingsFeatures(
+                inputs_embeds=inputs_embeds, per_layer_inputs=per_layer_inputs
+            )
 
         if input_ids is not None:
 
@@ -217,7 +219,9 @@ class Model(nn.Module):
                 modality=modality,
             )
 
-        return inputs_embeds, per_layer_inputs
+        return InputEmbeddingsFeatures(
+            inputs_embeds=inputs_embeds, per_layer_inputs=per_layer_inputs
+        )
 
     def get_audio_features(self, input_features, input_features_mask):
         audio_outputs, audio_mask = self.audio_tower(
@@ -289,21 +293,17 @@ class Model(nn.Module):
         **kwargs,
     ):
         # Audio features
-        input_features = kwargs.pop("input_features", None)
-        input_features_mask = kwargs.pop("input_features_mask", None)
-        inputs_embeds, per_layer_inputs = self.get_input_embeddings(
+        input_embeddings_features = self.get_input_embeddings(
             input_ids=input_ids,
             pixel_values=pixel_values,
-            input_features=input_features,
-            input_features_mask=input_features_mask,
             **kwargs,
         )
 
         logits = self.language_model(
             input_ids=None,
             cache=cache,
-            inputs_embeds=inputs_embeds,
-            per_layer_inputs=per_layer_inputs,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
+            per_layer_inputs=input_embeddings_features.per_layer_inputs,
         )
         return logits
 

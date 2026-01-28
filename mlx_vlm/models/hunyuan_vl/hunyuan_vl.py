@@ -3,8 +3,7 @@ from typing import Dict, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_vlm.models.base import check_array_shape
-
+from ..base import InputEmbeddingsFeatures, check_array_shape
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -38,16 +37,21 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        image_grid_thw: Optional[mx.array] = None,
         **kwargs,
     ) -> mx.array:
+
+        image_grid_thw = kwargs.pop("image_grid_thw", None)
+
+        position_ids_from_processor = kwargs.pop("position_ids", None)
 
         # Get text embeddings
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # If no image, return text embeddings
         if pixel_values is None:
-            return inputs_embeds
+            # Reset stored position_ids when no image
+            self.language_model._position_ids = None
+            return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
         # Get vision features
         vision_features = self.vision_tower(pixel_values, image_grid_thw)
@@ -95,7 +99,19 @@ class Model(nn.Module):
         # Stack batches
         inputs_embeds = mx.concatenate(output_parts, axis=0)  # (B, L, D)
 
-        return inputs_embeds
+        # Pre-calculate position_ids for chunked prefill
+        if position_ids_from_processor is not None:
+            self.language_model._position_ids = position_ids_from_processor
+        elif image_grid_thw is not None:
+            position_ids = self.language_model.get_xdrope_input_positions(
+                input_tokens=input_ids[0].tolist(),
+                image_grid_thw=image_grid_thw,
+                image_token_id=self.config.image_token_id,
+                spatial_merge_size=self.config.vision_config.spatial_merge_size,
+            )[None, ...]
+            self.language_model._position_ids = position_ids
+
+        return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
     @property
     def layers(self):
@@ -114,22 +130,21 @@ class Model(nn.Module):
         input_ids: mx.array,
         pixel_values: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
-        image_grid_thw: Optional[mx.array] = None,
         cache=None,
         **kwargs,
     ):
 
         # Get embeddings (with vision features merged if image provided)
-        inputs_embeds = self.get_input_embeddings(
+        input_embeddings_features = self.get_input_embeddings(
             input_ids=input_ids,
             pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
+            **kwargs,
         )
 
         # Forward through language model
         return self.language_model(
             input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
             mask=mask,
             cache=cache,
             image_grid_thw=image_grid_thw,

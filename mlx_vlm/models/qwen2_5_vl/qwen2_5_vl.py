@@ -3,6 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -19,10 +20,19 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        image_grid_thw: Optional[mx.array] = None,
+        **kwargs,
     ):
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        mask = kwargs.get("mask", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids)
+            # Reset position state for text-only generation
+            self.language_model._position_ids = None
+            self.language_model._rope_deltas = None
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
         pixel_values = pixel_values.astype(dtype)
@@ -32,7 +42,7 @@ class Model(nn.Module):
 
         # Get the ouptut hidden states from the vision model
         hidden_states = self.vision_tower(
-            pixel_values, image_grid_thw, output_hidden_states=False
+            pixel_values, grid_thw, output_hidden_states=False
         )
 
         # Insert special image tokens in the input_ids
@@ -43,7 +53,16 @@ class Model(nn.Module):
             inputs_embeds,
             input_ids,
         )
-        return final_inputs_embeds
+
+        # Pre-calculate position_ids for chunked prefill
+        if image_grid_thw is not None or video_grid_thw is not None:
+            position_ids, rope_deltas = self.language_model.get_rope_index(
+                input_ids, image_grid_thw, video_grid_thw, mask
+            )
+            self.language_model._position_ids = position_ids
+            self.language_model._rope_deltas = rope_deltas
+
+        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
     @staticmethod
     def merge_input_ids_with_image_features(
@@ -131,21 +150,22 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        image_grid_thw = kwargs.pop("image_grid_thw", None)
-        video_grid_thw = kwargs.pop("video_grid_thw", None)
-        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
-        inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, grid_thw)
+        input_embeddings_features = self.get_input_embeddings(
+            input_ids, pixel_values, **kwargs
+        )
 
         kwargs = {
             "pixel_values": pixel_values,
-            "image_grid_thw": image_grid_thw,
-            "video_grid_thw": video_grid_thw,
             **kwargs,
         }
 
         logits = self.language_model(
-            input_ids, inputs_embeds, mask=mask, cache=cache, **kwargs
+            input_ids,
+            input_embeddings_features.inputs_embeds,
+            mask=mask,
+            cache=cache,
+            **kwargs,
         )
 
         return logits

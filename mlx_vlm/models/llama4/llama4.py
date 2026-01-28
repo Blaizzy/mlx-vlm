@@ -2,8 +2,8 @@ from typing import List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import Llama4MultiModalProjector, VisionModel
@@ -57,7 +57,9 @@ class Model(nn.Module):
         **kwargs,
     ):
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids)
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
@@ -77,17 +79,49 @@ class Model(nn.Module):
         final_inputs_embeds = self._prepare_inputs_for_multimodal(
             projected_vision_flat, inputs_embeds, input_ids
         )
-        return final_inputs_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
     def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
         image_token_index = self.config.image_token_index
 
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(input_ids == image_token_index)[1].tolist()
+        # Find positions of <image> tokens
+        image_mask = input_ids == image_token_index
 
-        inputs_embeds[:, image_positions, :] = image_features
+        batch_size, seq_len = input_ids.shape
 
-        return inputs_embeds
+        # Process each batch item
+        batch_outputs = []
+        feature_start_idx = 0
+
+        for batch_idx in range(batch_size):
+            batch_mask = image_mask[batch_idx]
+            num_positions = mx.sum(batch_mask).item()
+
+            if num_positions > 0:
+                batch_features = image_features[
+                    feature_start_idx : feature_start_idx + num_positions
+                ]
+
+                # Create indices for gathering
+                cumsum = mx.cumsum(batch_mask.astype(mx.int32))
+                feature_indices = mx.where(batch_mask, cumsum - 1, 0)
+
+                # Gather features
+                gathered_features = batch_features[feature_indices]
+
+                # Combine with original embeddings
+                batch_mask_expanded = mx.expand_dims(batch_mask, axis=-1)
+                batch_output = mx.where(
+                    batch_mask_expanded, gathered_features, inputs_embeds[batch_idx]
+                )
+
+                feature_start_idx += num_positions
+            else:
+                batch_output = inputs_embeds[batch_idx]
+
+            batch_outputs.append(batch_output)
+
+        return mx.stack(batch_outputs, axis=0)
 
     @property
     def layers(self):
@@ -101,8 +135,12 @@ class Model(nn.Module):
         **kwargs,
     ):
 
-        input_embeddings = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
+        input_embeddings_features = self.get_input_embeddings(
+            input_ids, pixel_values, **kwargs
+        )
         logits = self.language_model(
-            input_ids=input_ids, cache=cache, input_embeds=input_embeddings
+            inputs=input_ids,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
+            cache=cache,
         )
         return logits

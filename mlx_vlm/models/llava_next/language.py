@@ -166,6 +166,7 @@ class LanguageModel(nn.Module):
         inputs_embeds=None,
         mask: Optional[mx.array] = None,
         cache=None,
+        **kwargs,
     ):
         out = self.model(inputs, mask=mask, cache=cache, inputs_embeds=inputs_embeds)
         logits = self.lm_head(out)
