@@ -10,6 +10,7 @@ class MessageFormat(Enum):
 
     LIST_WITH_IMAGE = "list_with_image"
     LIST_WITH_IMAGE_FIRST = "list_with_image_first"
+    LIST_WITH_IMAGE_URL_FIRST = "list_with_image_url_first"
     LIST_WITH_IMAGE_TYPE = "list_with_image_type"
     LIST_WITH_IMAGE_TYPE_TEXT = "list_with_image_type_text"
     LIST_WITH_IMAGE_TYPE_TEXT_IMAGE_LAST = "list_with_image_type_text_image_last"
@@ -43,7 +44,7 @@ MODEL_CONFIG = {
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
-    "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,
@@ -98,6 +99,11 @@ class MessageBuilder:
     def image_message() -> Dict[str, str]:
         """Create an image message."""
         return {"type": "image"}
+
+    @staticmethod
+    def image_url_message() -> Dict[str, str]:
+        """Create an image_url message (for models like ERNIE that expect this format)."""
+        return {"type": "image_url"}
 
     @staticmethod
     def audio_message() -> Dict[str, str]:
@@ -160,6 +166,9 @@ class MessageFormatter:
             MessageFormat.LIST_WITH_IMAGE_FIRST: partial(
                 self._format_list_with_image, image_first=True
             ),
+            MessageFormat.LIST_WITH_IMAGE_URL_FIRST: partial(
+                self._format_list_with_image, image_first=True, use_image_url=True
+            ),
             MessageFormat.LIST_WITH_IMAGE_TYPE: self._format_list_with_image_type,
             MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT: partial(
                 self._format_list_with_image_type, message_type="text"
@@ -211,13 +220,19 @@ class MessageFormatter:
         num_images: int,
         num_audios: int,
         image_first: bool = False,
+        use_image_url: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
         """Format as a list with image tokens."""
         content = [MessageBuilder.text_message(prompt)]
 
         if role == "user" and not skip_image_token and num_images > 0:
-            image_tokens = [MessageBuilder.image_message()] * num_images
+            image_builder = (
+                MessageBuilder.image_url_message
+                if use_image_url
+                else MessageBuilder.image_message
+            )
+            image_tokens = [image_builder()] * num_images
             content = image_tokens + content if image_first else content + image_tokens
 
         return {"role": role, "content": content}
