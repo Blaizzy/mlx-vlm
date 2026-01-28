@@ -1,10 +1,11 @@
 import unittest
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_vlm.trainer.trainer import Dataset, Trainer
+from mlx_vlm.trainer.trainer import train, TrainingArgs
+from mlx_vlm.trainer.datasets import VisionDataset
 
 
 class TestDataset(unittest.TestCase):
@@ -14,38 +15,23 @@ class TestDataset(unittest.TestCase):
         self.mock_processor = MagicMock()
         self.mock_image_processor = MagicMock()
 
-    def test_dataset_initialization(self):
-        dataset = Dataset(
-            self.mock_hf_dataset,
-            self.mock_config,
-            self.mock_processor,
-            self.mock_image_processor,
-            take=10,
-            split="train",
-        )
-
-        self.assertEqual(len(dataset), len(self.mock_hf_dataset["train"].take(10)))
-        self.assertEqual(dataset.config, self.mock_config)
-        self.assertEqual(dataset.processor, self.mock_processor)
-        self.assertEqual(dataset.image_processor, self.mock_image_processor)
-
-    @patch("mlx_vlm.trainer.trainer.get_prompt")
+    @patch("mlx_vlm.trainer.datasets.get_prompt")
     @patch("mlx_vlm.utils.prepare_inputs")
     def test_dataset_getitem(self, mock_prepare_inputs, mock_get_prompt):
-        dataset = Dataset(
+        dataset = VisionDataset(
             self.mock_hf_dataset,
             self.mock_config,
             self.mock_processor,
             self.mock_image_processor,
         )
+
+        mock_get_prompt.return_value = ""
 
         mock_item = {
             "images": ["image1.jpg"],
             "messages": [{"role": "user", "content": "Hello"}],
         }
         self.mock_hf_dataset.__getitem__.return_value = mock_item
-
-        mock_get_prompt.return_value = "Mocked prompt"
 
         mock_prepare_inputs.return_value = {
             "input_ids": mx.array([1, 2, 3]),  # input_ids
@@ -78,58 +64,68 @@ class TestDataset(unittest.TestCase):
         self.assertEqual(result["image_grid_thw"], (1, 1, 1))
         self.assertEqual(result["image_sizes"], [224, 224])
 
+    def test_dataset_initialization(self):
+        dataset = VisionDataset(
+            self.mock_hf_dataset,
+            self.mock_config,
+            self.mock_processor,
+            self.mock_image_processor,
+        )
+
+        self.assertEqual(len(dataset), len(self.mock_hf_dataset))
+        self.assertEqual(dataset.config, self.mock_config)
+        self.assertEqual(dataset.processor, self.mock_processor)
+        self.assertEqual(dataset.image_processor, self.mock_image_processor)
+
 
 class TestTrainer(unittest.TestCase):
     def setUp(self):
-        self.mock_model = MagicMock(spec=nn.Module)
+        class DummyOutput:
+            def __init__(self, logits):
+                self.logits = logits
+
+        class DummyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = mx.zeros((1,))
+
+            def __call__(self, *args, **kwargs):
+                # Return logits with shape [4, 3, 10] to match test batch (batch=4, seq=3, vocab=10)
+                return DummyOutput(logits=mx.zeros((4, 3, 10)))
+
+        self.mock_model = DummyModel()
         self.mock_optimizer = MagicMock()
-        self.trainer = Trainer(self.mock_model, self.mock_optimizer)
+        self.trainer = train(
+            model=self.mock_model,
+            optimizer=self.mock_optimizer,
+            train_dataset=MagicMock(__len__=lambda self: 4),
+            val_dataset=None,
+            args=TrainingArgs(iters=1, batch_size=4),
+        )
 
     def test_trainer_initialization(self):
         self.assertEqual(self.trainer.model, self.mock_model)
         self.assertEqual(self.trainer.optimizer, self.mock_optimizer)
-        self.assertFalse(self.trainer.train_on_completions)
-        self.assertEqual(self.trainer.assistant_id, 77091)
 
-    def test_loss_fn(self):
-        batch = {
-            "pixel_values": mx.array([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]),
-            "input_ids": mx.array([[1, 2, 3], [4, 5, 6]]),
-            "attention_mask": mx.array([[1, 1, 1], [1, 1, 0]]),
-            "image_grid_thw": (1, 1, 1),
-            "image_sizes": [224, 224],
-            "aspect_ratio_ids": mx.array([[1, 2], [3, 4]]),
-            "aspect_ratio_mask": mx.array([[1, 1], [1, 0]]),
-            "cross_attention_mask": mx.array([[1, 1], [1, 0]]),
+    @patch("mlx_vlm.trainer.trainer.iterate_batches")
+    def test_train_smoke(self, mock_iterate_batches):
+        mock_batch = {
+            "input_ids": mx.array([[1, 2, 3], [1, 2, 3], [1, 2, 3], [1, 2, 3]]),
+            "attention_mask": mx.array([[1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1]]),
+            "pixel_values": mx.array([[[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]]]),
+            "labels": mx.array([[0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1, 2]]),
         }
+        mock_iterate_batches.return_value = iter([mock_batch])
 
-        mock_logits = mx.array([[[0.1, 0.2, 0.3]], [[0.4, 0.5, 0.6]]])
-        # Create a mock LanguageModelOutput with the logits
-        mock_output = Mock()
-        mock_output.logits = mock_logits
-        self.mock_model.return_value = mock_output
-
-        loss = self.trainer.loss_fn(self.mock_model, batch)
-
-        self.assertIsInstance(loss, mx.array)
-        self.assertEqual(loss.shape, ())  # Scalar value
-
-    @patch.object(Trainer, "loss_fn")
-    @patch("mlx.nn.value_and_grad")
-    def test_train_step(self, mock_value_and_grad, mock_loss_fn):
-        mock_batch = MagicMock()
-        mock_loss = mx.array(0.5)
-        mock_grads = {"param1": mx.array([0.1, 0.2]), "param2": mx.array([0.3, 0.4])}
-
-        mock_value_and_grad.return_value = lambda *args, **kwargs: (
-            mock_loss,
-            mock_grads,
+        train(
+            model=self.mock_model,
+            optimizer=self.mock_optimizer,
+            train_dataset=MagicMock(__len__=lambda self: 4),
+            val_dataset=None,
+            args=TrainingArgs(iters=1, batch_size=4),
         )
 
-        loss = self.trainer.train_step(mock_batch)
-
-        self.mock_optimizer.update.assert_called_once_with(self.mock_model, mock_grads)
-        self.assertEqual(loss, mock_loss)
+        self.mock_optimizer.update.assert_called()
 
 
 if __name__ == "__main__":

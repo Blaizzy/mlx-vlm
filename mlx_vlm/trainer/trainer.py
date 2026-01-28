@@ -1,6 +1,5 @@
 # Copyright © 2024 MLX-VLM
 
-import json
 import time
 from dataclasses import dataclass, field
 from functools import partial

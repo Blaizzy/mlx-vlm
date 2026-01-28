@@ -1,128 +1,21 @@
 import argparse
 import logging
-import warnings
 import json
-import mlx.core as mx
 import mlx.optimizers as optim
 from datasets import load_dataset
 
-from .trainer import TrainingArgs, Colors, train, print_trainable_parameters
+from .trainer import TrainingArgs, Colors, train, print_trainable_parameters, VisionDataset
 from .trainer.utils import (
     apply_lora_layers,
     find_all_linear_names,
     get_peft_model,
     unfreeze_modules,
-    supported_for_training
+    not_supported_for_training
 )
 from .utils import load, load_image_processor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-def get_prompt(model_type, processor, conversation):
-    if model_type == "paligemma":
-        return conversation
-
-    if "chat_template" in processor.__dict__.keys():
-        prompt = processor.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-    elif "tokenizer" in processor.__dict__.keys():
-        prompt = processor.tokenizer.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-
-    return prompt
-
-
-class VisionDataset():
-    """Simplified dataset class for Vision LLMs"""
-    def __init__(self, hf_dataset, config, processor, image_processor=None,
-                 image_resize_shape=None):
-        self.dataset = hf_dataset
-        self.processor = processor
-        self.config = config
-        self.image_processor = image_processor
-        self.image_resize_shape = image_resize_shape
-        
-    def __len__(self):
-        if hasattr(self.dataset, "__len__"):
-            return len(self.dataset)
-        raise TypeError("Streaming dataset has no length")
-    
-    def __getitem__(self, idx):
-        return self.process(self.dataset[idx])
-    
-    def process(self, item):
-        """Process a single item from the dataset"""
-        from mlx_vlm.utils import prepare_inputs
-        
-        # Handle images
-        images = item.get("images", item.get("image", []))
-        if not isinstance(images, list):
-            images = [images] if images else []
-        
-        # Handle audio
-        audio = item.get("audio", item.get("audios", []))
-        if not isinstance(audio, list):
-            audio = [audio] if audio else []
-        
-        # Get conversations
-        conversations = item.get("messages", item.get("conversations"))
-
-        model_type = self.config.get("model_type")
-        
-        prompts = []
-        # Format prompt based on model type
-        if isinstance(conversations, list) and isinstance(conversations[0], list):
-            for conversation in conversations:
-                if model_type == "pixtral":
-                    conversation = [json.loads(i) for i in conversation]
-                    if len(conversations) > 1:
-                        warnings.warn(
-                            "Pixtral batch processing is not supported yet. Set batch size to 1."
-                        )
-
-                prompt = get_prompt(
-                    model_type, self.processor, conversation
-                )
-                prompts.append(prompt)
-
-        else:
-            if model_type == "pixtral":
-                conversations = [json.loads(i) for i in conversations]
-            prompt = get_prompt(
-                model_type, self.processor, conversations
-            )
-            prompts.append(prompt)
-        
-        # Prepare inputs
-        image_token_index = (self.config.get("image_token_index") or
-                           self.config.get("image_token_id"))
-        if not image_token_index:
-            raise ValueError("Config must contain 'image_token_index' or 'image_token_id'")
-        
-        inputs = prepare_inputs(
-            processor=self.processor,
-            images=None if images else None,
-            audio=audio if audio else None,
-            prompts=prompts,
-            image_token_index=image_token_index,
-            resize_shape=self.image_resize_shape,
-        )
-        
-        return {
-            "pixel_values": inputs.get("pixel_values"),
-            "input_ids": inputs["input_ids"],
-            "attention_mask": inputs.get("attention_mask", mx.ones_like(inputs["input_ids"])),
-            **{k: v for k, v in inputs.items()
-               if k not in ["input_ids", "pixel_values", "attention_mask"]}
-        }
 
 
 def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None):
@@ -168,7 +61,7 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
                 raise ValueError(f"Failed to parse or fill custom prompt format: {e}")
             
         # VLM-specific message formats (fallback)
-        if model_type == "gemma3" or model_type.startswith("qwen") or model_type == "smolvlm":
+        if model_type == model_type.startswith("gemma") or model_type.startswith("qwen") or model_type == "smolvlm":
             return {
                 "messages": [
                     {"role": "user", "content": [
@@ -235,7 +128,7 @@ def main(args):
     
     # Validate model type
     model_type = getattr(getattr(model, "config", None), "model_type", None)
-    if model_type not in supported_for_training:
+    if model_type in not_supported_for_training:
         raise ValueError(f"Model type {model_type} not supported for training")
     
     config = model.config.__dict__
