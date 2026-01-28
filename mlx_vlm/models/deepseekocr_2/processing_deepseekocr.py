@@ -145,7 +145,7 @@ class ImageTransform:
         return img
 
 
-class DeepseekVLV2Processor(ProcessorMixin):
+class DeepseekOCR2Processor(ProcessorMixin):
     tokenizer_class = ("LlamaTokenizer", "LlamaTokenizerFast")
     attributes = ["tokenizer"]
 
@@ -616,3 +616,9 @@ class DeepseekVLV2Processor(ProcessorMixin):
             "images_seq_mask": images_seq_mask,
             "images_spatial_crop": combined_spatial_crops,
         }
+
+
+# Install a composable AutoProcessor patch for DeepSeek-OCR-2
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("deepseekocr_2", DeepseekOCR2Processor)

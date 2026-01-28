@@ -9,10 +9,10 @@ from ..base import InputEmbeddingsFeatures
 from ..deepseekocr.language import LanguageModel
 from ..deepseekocr.sam import SAMEncoder
 from .config import ModelConfig, SAMViTConfig
-from .processing_deepseekocr import DeepseekVLV2Processor
+from .processing_deepseekocr import DeepseekOCR2Processor
 from .vision import VisionModel
 
-AutoProcessor.register("deepseekocr", DeepseekVLV2Processor)
+AutoProcessor.register("deepseekocr_2", DeepseekOCR2Processor)
 
 
 class MlpProjector(nn.Module):
