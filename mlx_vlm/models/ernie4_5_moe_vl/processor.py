@@ -9,6 +9,7 @@ import mlx.core as mx
 import numpy as np
 import sentencepiece as spm
 from PIL import Image
+from transformers import AutoImageProcessor, AutoProcessor
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import (
     BaseImageProcessor as HFBaseImageProcessor,
@@ -823,3 +824,33 @@ class Ernie4_5_VLProcessor(ProcessorMixin):
         if tokenize:
             return self.tokenizer.encode(rendered)
         return rendered
+
+    @staticmethod
+    def from_pretrained(pretrained_model_name_or_path, **kwargs):
+        """Load processor from pretrained model path."""
+        from pathlib import Path
+
+        # Get the actual path if it's a HuggingFace model ID
+        if not Path(pretrained_model_name_or_path).exists():
+            from huggingface_hub import snapshot_download
+
+            pretrained_model_name_or_path = snapshot_download(
+                pretrained_model_name_or_path,
+                allow_patterns=["*.json", "*.model", "*.txt"],
+            )
+
+        tokenizer = Ernie4_5_VLTokenizer.from_pretrained(pretrained_model_name_or_path)
+        image_processor = ImageProcessor()
+
+        return Ernie4_5_VLProcessor(
+            image_processor=image_processor, tokenizer=tokenizer
+        )
+
+
+MODEL_TYPE = "ernie4_5_moe_vl"
+
+try:
+    AutoImageProcessor.register(MODEL_TYPE, slow_image_processor_class=ImageProcessor)
+    AutoProcessor.register(MODEL_TYPE, Ernie4_5_VLProcessor)
+except Exception as e:
+    raise Exception(f"Error registering {MODEL_TYPE} processor: {e}")
