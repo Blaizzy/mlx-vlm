@@ -1,8 +1,8 @@
 mlx>=0.30.0
 datasets>=2.19.1
 tqdm>=4.66.2
-mlx-lm>=0.30.2
-transformers>=5.0.0rc1
+transformers>=5.0.0rc3
+mlx-lm>=0.30.5
 Pillow>=10.3.0
 requests>=2.31.0
 fastapi>=0.95.1
