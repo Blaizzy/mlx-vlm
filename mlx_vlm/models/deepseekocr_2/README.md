@@ -73,7 +73,7 @@ Coordinates are normalized to 0-1000 range.
 ### Document to Markdown
 ```bash
 mlx_vlm.generate \
-    --model deepseek-ai/DeepSeek-OCR-2 \
+    --model mlx-community/DeepSeek-OCR-2-bf16 \
     --image document.png \
     --prompt "<|grounding|>Convert the document to markdown." \
     --max-tokens 2000
@@ -82,7 +82,7 @@ mlx_vlm.generate \
 ### General OCR
 ```bash
 mlx_vlm.generate \
-    --model deepseek-ai/DeepSeek-OCR-2 \
+    --model mlx-community/DeepSeek-OCR-2-bf16 \
     --image receipt.jpg \
     --prompt "<|grounding|>OCR this image." \
     --max-tokens 1000
@@ -91,7 +91,7 @@ mlx_vlm.generate \
 ### Free OCR
 ```bash
 mlx_vlm.generate \
-    --model deepseek-ai/DeepSeek-OCR-2 \
+    --model mlx-community/DeepSeek-OCR-2-bf16 \
     --image text_image.png \
     --prompt "Free OCR." \
     --max-tokens 500
@@ -100,7 +100,7 @@ mlx_vlm.generate \
 ### Text Localization
 ```bash
 mlx_vlm.generate \
-    --model deepseek-ai/DeepSeek-OCR-2 \
+    --model mlx-community/DeepSeek-OCR-2-bf16 \
     --image table.jpeg \
     --prompt "Locate <|ref|>Total assets<|/ref|> in the image." \
     --max-tokens 100
@@ -114,7 +114,7 @@ from mlx_vlm import load, generate
 from mlx_vlm.prompt_utils import apply_chat_template
 
 # Load model
-model, processor = load("deepseek-ai/DeepSeek-OCR-2")
+model, processor = load("mlx-community/DeepSeek-OCR-2-bf16")
 
 # OCR prompt
 prompt = "<|grounding|>OCR this image."
@@ -137,7 +137,7 @@ print(result.text)
 from mlx_vlm import load, generate
 from mlx_vlm.prompt_utils import apply_chat_template
 
-model, processor = load("deepseek-ai/DeepSeek-OCR-2")
+model, processor = load("mlx-community/DeepSeek-OCR-2-bf16")
 
 prompt = "<|grounding|>Convert the document to markdown."
 formatted_prompt = apply_chat_template(processor, model.config, prompt, num_images=1)
@@ -158,7 +158,7 @@ print(result.text)
 from mlx_vlm import load, generate
 from mlx_vlm.prompt_utils import apply_chat_template
 
-model, processor = load("deepseek-ai/DeepSeek-OCR-2")
+model, processor = load("mlx-community/DeepSeek-OCR-2-bf16")
 
 # Locate specific text
 text_to_find = "Total liabilities"
@@ -190,7 +190,7 @@ from mlx_vlm import load, generate
 from mlx_vlm.prompt_utils import apply_chat_template
 from pathlib import Path
 
-model, processor = load("deepseek-ai/DeepSeek-OCR-2")
+model, processor = load("mlx-community/DeepSeek-OCR-2-bf16")
 
 prompt = "<|grounding|>OCR this image."
 formatted_prompt = apply_chat_template(processor, model.config, prompt, num_images=1)
@@ -247,7 +247,7 @@ You can control the number of patches via the `cropping`, `min_patches`, and `ma
 from mlx_vlm import load, generate
 from mlx_vlm.prompt_utils import apply_chat_template
 
-model, processor = load("deepseek-ai/DeepSeek-OCR-2")
+model, processor = load("mlx-community/DeepSeek-OCR-2-bf16")
 
 prompt = "<|grounding|>OCR this image."
 formatted_prompt = apply_chat_template(processor, model.config, prompt, num_images=1)
@@ -299,14 +299,14 @@ result = generate(
 ```bash
 # Default: dynamic resolution with 1-6 patches
 mlx_vlm.generate \
-    --model deepseek-ai/DeepSeek-OCR-2 \
+    --model mlx-community/DeepSeek-OCR-2-bf16 \
     --image document.png \
     --prompt "<|grounding|>OCR this image." \
     --max-tokens 1000
 
 # Global view only (faster, 257 tokens)
 mlx_vlm.generate \
-    --model deepseek-ai/DeepSeek-OCR-2 \
+    --model mlx-community/DeepSeek-OCR-2-bf16 \
     --image document.png \
     --prompt "<|grounding|>OCR this image." \
     --max-tokens 1000 \
@@ -314,7 +314,7 @@ mlx_vlm.generate \
 
 # Limit to 3 patches max
 mlx_vlm.generate \
-    --model deepseek-ai/DeepSeek-OCR-2 \
+    --model mlx-community/DeepSeek-OCR-2-bf16 \
     --image document.png \
     --prompt "<|grounding|>OCR this image." \
     --max-tokens 1000 \
