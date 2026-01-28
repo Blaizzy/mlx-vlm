@@ -26,15 +26,15 @@ if missing_packages:
     print("Please install them using: pip install " + " ".join(missing_packages))
     sys.exit(1)
 
+from importlib.metadata import version
+
 import psutil
 from rich.console import Console
 from rich.panel import Panel
 from tqdm import tqdm
-from transformers import __version__ as transformers_version
 
 from mlx_vlm import generate, load
 from mlx_vlm.prompt_utils import apply_chat_template
-from mlx_vlm.version import __version__
 
 # Initialize console
 console = Console()
@@ -245,9 +245,9 @@ def main():
                 f"""{platform.machine() == 'arm64' and f'''
             MAC OS:       v{platform.mac_ver()[0]}
             Python:       v{sys.version.split()[0]}
-            MLX:          v{mx.__version__}
-            MLX-VLM:      v{__version__}
-            Transformers: v{transformers_version}
+            MLX:          v{version('mlx')}
+            MLX-VLM:      v{version('mlx-vlm')}
+            Transformers: v{version('transformers')}
 
             Hardware:
             • Chip:       {device_info['SPDisplaysDataType'][0]['_name']}
