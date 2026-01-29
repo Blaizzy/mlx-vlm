@@ -866,6 +866,7 @@ class BatchGenerator:
         logprobs: mx.array
         finish_reason: Optional[str]
         prompt_cache: Optional[Callable[[], List[Any]]] = None  # Cache getter for reuse
+        peak_memory: float = 0.0
 
     def __init__(
         self,
@@ -1253,7 +1254,14 @@ class BatchGenerator:
                 prompt_cache = lambda idx=e: batch.extract_cache(idx)
 
             responses.append(
-                self.Response(uid, t, logprobs[e], finish_reason, prompt_cache)
+                self.Response(
+                    uid,
+                    t,
+                    logprobs[e],
+                    finish_reason,
+                    prompt_cache,
+                    mx.get_peak_memory() / 1e9,
+                )
             )
 
         # Remove any finished completions
@@ -1309,6 +1317,7 @@ class StreamingToken:
     token: int
     logprobs: float
     finish_reason: Optional[str]
+    peak_memory: float = 0.0
 
 
 class ResponseGenerator:
@@ -1391,6 +1400,25 @@ class ResponseGenerator:
         args = args or GenerationArguments()
         response_queue: Queue = Queue()
 
+        # Preprocess images/audio BEFORE queueing to avoid blocking generation thread
+        preprocessed_inputs = None
+        if images or audio:
+            add_special_tokens = (
+                not hasattr(self.processor, "chat_template")
+                if self.model.config.model_type in ["gemma3", "gemma3n"]
+                else True
+            )
+            image_token_index = getattr(self.model.config, "image_token_index", None)
+
+            preprocessed_inputs = prepare_inputs(
+                self.processor,
+                images=images,
+                audio=audio,
+                prompts=prompt,
+                image_token_index=image_token_index,
+                add_special_tokens=add_special_tokens,
+            )
+
         # Create request tuple
         request = {
             "prompt": prompt,
@@ -1398,6 +1426,7 @@ class ResponseGenerator:
             "audio": audio,
             "args": args,
             "progress_callback": progress_callback,
+            "preprocessed_inputs": preprocessed_inputs,
         }
 
         self.requests.put((response_queue, request))
@@ -1463,22 +1492,26 @@ class ResponseGenerator:
         images = request["images"]
         audio = request["audio"]
 
-        add_special_tokens = (
-            not hasattr(self.processor, "chat_template")
-            if self.model.config.model_type in ["gemma3", "gemma3n"]
-            else True
-        )
+        # Use preprocessed inputs if available (preprocessing done before queueing)
+        if request.get("preprocessed_inputs") is not None:
+            inputs = request["preprocessed_inputs"]
+        else:
+            add_special_tokens = (
+                not hasattr(self.processor, "chat_template")
+                if self.model.config.model_type in ["gemma3", "gemma3n"]
+                else True
+            )
 
-        image_token_index = getattr(self.model.config, "image_token_index", None)
+            image_token_index = getattr(self.model.config, "image_token_index", None)
 
-        inputs = prepare_inputs(
-            self.processor,
-            images=images,
-            audio=audio,
-            prompts=prompt,
-            image_token_index=image_token_index,
-            add_special_tokens=add_special_tokens,
-        )
+            inputs = prepare_inputs(
+                self.processor,
+                images=images,
+                audio=audio,
+                prompts=prompt,
+                image_token_index=image_token_index,
+                add_special_tokens=add_special_tokens,
+            )
 
         input_ids = inputs.get("input_ids", None)
         pixel_values = inputs.get("pixel_values", None)
@@ -1522,17 +1555,33 @@ class ResponseGenerator:
         images = request["images"]
         audio = request["audio"]
         args = request["args"]
+        preprocessed_inputs = request.get("preprocessed_inputs")
 
         try:
             # Set seed if specified
             if args.seed is not None:
                 mx.random.seed(args.seed)
 
-            # Get input for context
-            input_ids, _ = self._preprocess_request(request)
-            prompt_tokens = (
-                input_ids.size if hasattr(input_ids, "size") else len(input_ids)
-            )
+            # Build kwargs for stream_generate
+            gen_kwargs = {
+                "max_tokens": args.max_tokens,
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "repetition_penalty": args.repetition_penalty,
+                "repetition_context_size": args.repetition_context_size,
+                "logit_bias": args.logit_bias,
+            }
+
+            # Use preprocessed inputs if available to skip re-preprocessing
+            if preprocessed_inputs is not None:
+                gen_kwargs.update(preprocessed_inputs)
+                prompt_tokens = preprocessed_inputs.get("input_ids").size
+            else:
+                # Fall back to getting input_ids for context
+                input_ids, _ = self._preprocess_request(request)
+                prompt_tokens = (
+                    input_ids.size if hasattr(input_ids, "size") else len(input_ids)
+                )
 
             # Send context
             ctx = GenerationContext(uid=-1, prompt_tokens=prompt_tokens)
@@ -1543,24 +1592,33 @@ class ResponseGenerator:
                 self.model,
                 self.processor,
                 prompt,
-                image=images,
-                audio=audio,
-                max_tokens=args.max_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                repetition_penalty=args.repetition_penalty,
-                repetition_context_size=args.repetition_context_size,
-                logit_bias=args.logit_bias,
+                image=images if preprocessed_inputs is None else None,
+                audio=audio if preprocessed_inputs is None else None,
+                **gen_kwargs,
             ):
+                # Handle token as scalar or array
+                tok = result.token
+                if hasattr(tok, "item"):
+                    tok = tok.item()
+
+                # Safely extract logprobs
+                lp = 0.0
+                if result.logprobs is not None:
+                    try:
+                        lp_val = result.logprobs[tok]
+                        if hasattr(lp_val, "item"):
+                            lp = lp_val.item()
+                        else:
+                            lp = float(lp_val)
+                    except (IndexError, TypeError, ValueError):
+                        lp = 0.0
+
                 token = StreamingToken(
                     text=result.text,
-                    token=result.token,
-                    logprobs=(
-                        result.logprobs[result.token].item()
-                        if result.logprobs is not None
-                        else 0.0
-                    ),
+                    token=tok,
+                    logprobs=lp,
                     finish_reason=None,
+                    peak_memory=result.peak_memory,
                 )
                 response_queue.put(token)
 
@@ -1617,14 +1675,10 @@ class ResponseGenerator:
 
                 response_queue, request = item
                 args = request["args"]
-                has_media = bool(request.get("images") or request.get("audio"))
 
-                # Non-batchable: model doesn't support batching, has seed, or has images/audio
-                if (
-                    not self._supports_batching
-                    or not self._is_batchable(args)
-                    or has_media
-                ):
+                # Non-batchable: model doesn't support batching or has seed
+                # Note: image/audio requests now go through batch generator for interleaved processing
+                if not self._supports_batching or not self._is_batchable(args):
                     # Drain current batch first
                     if batch_generator is not None and batch_results:
                         while batch_results:
@@ -1651,6 +1705,7 @@ class ResponseGenerator:
                     )
 
                     sampler = self._make_sampler(args)
+                    has_embeddings = bool(gen_kwargs.get("inputs_embeds") is not None)
 
                     # Insert and get UID
                     (uid,) = batch_generator.insert(
@@ -1668,7 +1723,15 @@ class ResponseGenerator:
                         "rqueue": response_queue,
                         "tokens": [],
                         "gen_kwargs": gen_kwargs,
+                        "needs_prefill": has_embeddings,
                     }
+
+                    # If this request has embeddings, do its prefill immediately
+                    # This ensures each image request gets its own embeddings during prefill
+                    if has_embeddings:
+                        responses = batch_generator.next(**gen_kwargs)
+                        if responses:
+                            self._handle_responses(responses, batch_results)
 
                 except Exception as e:
                     response_queue.put(e)
@@ -1683,19 +1746,8 @@ class ResponseGenerator:
         if batch_generator is not None:
             batch_generator.close()
 
-    def _process_batch_step(self, batch_generator: BatchGenerator, batch_results: dict):
-        """Process one generation step for all active requests."""
-        # Get gen_kwargs from first request (text-only batching uses empty kwargs)
-        gen_kwargs = {}
-        for result in batch_results.values():
-            if result.get("gen_kwargs"):
-                gen_kwargs = result["gen_kwargs"]
-                break
-
-        responses = batch_generator.next(**gen_kwargs)
-        if not responses:
-            return
-
+    def _handle_responses(self, responses, batch_results: dict):
+        """Handle responses from batch generator and dispatch to clients."""
         for r in responses:
             # r.uid identifies which request this token belongs to
             if r.uid not in batch_results:
@@ -1720,12 +1772,30 @@ class ResponseGenerator:
                 else:
                     text = self.tokenizer.decode(tokens)
 
+            # Handle token as scalar or array
+            tok = r.token
+            if hasattr(tok, "item"):
+                tok = tok.item()
+
+            # Safely extract logprobs
+            lp = 0.0
+            if r.logprobs is not None:
+                try:
+                    lp_val = r.logprobs[tok]
+                    if hasattr(lp_val, "item"):
+                        lp = lp_val.item()
+                    else:
+                        lp = float(lp_val)
+                except (IndexError, TypeError, ValueError):
+                    lp = 0.0
+
             # Send token to this request's queue
             token_response = StreamingToken(
                 text=text,
-                token=r.token,
-                logprobs=r.logprobs[r.token].item() if r.logprobs is not None else 0.0,
+                token=tok,
+                logprobs=lp,
                 finish_reason=r.finish_reason,
+                peak_memory=r.peak_memory,
             )
             rqueue.put(token_response)
 
@@ -1733,6 +1803,17 @@ class ResponseGenerator:
             if r.finish_reason is not None:
                 rqueue.put(None)  # Signal end
                 del batch_results[r.uid]
+
+    def _process_batch_step(self, batch_generator: BatchGenerator, batch_results: dict):
+        """Process one generation step for all active requests."""
+        # Don't pass any gen_kwargs during batch step - embeddings were already
+        # processed during individual prefills. Passing image kwargs here would
+        # cause shape mismatches with text-only requests.
+        responses = batch_generator.next()
+        if not responses:
+            return
+
+        self._handle_responses(responses, batch_results)
 
 
 def batch_generate(
