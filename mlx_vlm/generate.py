@@ -1272,18 +1272,26 @@ def _generate_batch(
 
     with wired_limit(model, [generation_stream]):
         if pixel_values is not None:
-            inputs_embeds = model.get_input_embeddings(
+            embedding_output = model.get_input_embeddings(
                 input_ids, pixel_values, **data_kwargs
             )
+
+            # Normalize embedding output to a kwargs dict expected by BatchGenerator
+            if isinstance(embedding_output, dict):
+                embed_kwargs = embedding_output
+            elif hasattr(embedding_output, "to_dict"):
+                # Convert to dict and keep non-None fields
+                embed_kwargs = {
+                    k: v for k, v in embedding_output.to_dict().items() if v is not None
+                }
+            else:
+                # Assume it's directly an inputs_embeds array
+                embed_kwargs = {"inputs_embeds": embedding_output}
 
             gen_kwargs = {
                 "pixel_values": pixel_values,
                 **data_kwargs,
-                **(
-                    inputs_embeds
-                    if isinstance(inputs_embeds, dict)
-                    else {"inputs_embeds": inputs_embeds}
-                ),
+                **embed_kwargs,
             }
         else:
             input_ids = mx.squeeze(input_ids, axis=0)
