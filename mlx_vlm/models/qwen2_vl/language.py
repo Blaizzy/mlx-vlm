@@ -483,8 +483,9 @@ class LanguageModel(nn.Module):
                 or self._rope_deltas is None
                 or cache is None
             ):
-                # Check if we have stored position_ids from chunked prefill
-                if self._position_ids is not None:
+                # Only reuse _position_ids for chunked prefill (cache_offset > 0)
+                # For new prompts (cache_offset == 0), always recalculate
+                if self._position_ids is not None and cache_offset > 0:
                     seq_length = inputs.shape[1]
                     position_ids = self._position_ids[
                         :, :, cache_offset : cache_offset + seq_length

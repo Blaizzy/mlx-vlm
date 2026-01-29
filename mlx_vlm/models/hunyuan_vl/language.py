@@ -456,7 +456,9 @@ class LanguageModel(nn.Module):
         position_ids = None
         if cache is None or cache_offset == 0:
             # Prefill phase - need xdrope position_ids
-            if self._position_ids is not None:
+            # Only reuse _position_ids for chunked prefill (cache_offset > 0)
+            # For new prompts (cache_offset == 0), always recalculate
+            if self._position_ids is not None and cache_offset > 0:
                 # Use stored position_ids (sliced for chunked prefill)
                 position_ids = self._position_ids[
                     :, :, cache_offset : cache_offset + seq_length

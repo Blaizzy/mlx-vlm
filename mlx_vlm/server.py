@@ -932,7 +932,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 "total_tokens": ctx.prompt_tokens + output_tokens,
                                 "prompt_tps": 0.0,
                                 "generation_tps": 0.0,
-                                "peak_memory": 0.0,
+                                "peak_memory": token.peak_memory,
                             }
 
                             choices = [
