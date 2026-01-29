@@ -4,24 +4,35 @@ import contextlib
 import functools
 import json
 import time
-from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+from queue import Empty as QueueEmpty
+from queue import Queue
+from threading import Thread
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
-from mlx_lm.generate import maybe_quantize_kv_cache as mlx_maybe_quantize_kv_cache
-from mlx_lm.sample_utils import make_logits_processors, make_sampler
+from mlx_lm.generate import maybe_quantize_kv_cache
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
-from .turboquant import TurboQuantKVCache, turboquant_enabled
+from .sample_utils import top_p_sampling
 from .utils import (
     StoppingCriteria,
-    ThinkingBudgetCriteria,
+    apply_repetition_penalty,
     group_images_by_shape,
     load,
     prepare_inputs,
@@ -32,20 +43,10 @@ DEFAULT_IMAGE = None
 DEFAULT_AUDIO = None
 DEFAULT_PROMPT = "What are these?"
 DEFAULT_MAX_TOKENS = 256
-DEFAULT_TEMPERATURE = 0.0
+DEFAULT_TEMPERATURE = 0.5
 DEFAULT_TOP_P = 1.0
 DEFAULT_SEED = 0
-DEFAULT_TOP_K = 0
-DEFAULT_MIN_P = 0.0
-DEFAULT_REPETITION_CONTEXT_SIZE = 20
-DEFAULT_KV_GROUP_SIZE = 64
-DEFAULT_KV_QUANT_SCHEME = "uniform"
-DEFAULT_COMPLETION_BATCH_SIZE = 32
-DEFAULT_PREFILL_BATCH_SIZE = 8
-DEFAULT_THINKING_START_TOKEN = "<think>"
-DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
-DEFAULT_PREFILL_STEP_SIZE = 2048
 
 
 def parse_arguments():
@@ -127,23 +128,15 @@ def parse_arguments():
     )
     parser.add_argument(
         "--kv-bits",
-        type=float,
+        type=int,
         default=None,
         help="Number of bits to quantize the KV cache to.",
     )
     parser.add_argument(
-        "--kv-quant-scheme",
-        type=str,
-        choices=("uniform", "turboquant"),
-        default=DEFAULT_KV_QUANT_SCHEME,
-        help="KV cache quantization backend. Fractional --kv-bits values use "
-        "TurboQuant automatically.",
-    )
-    parser.add_argument(
         "--kv-group-size",
         type=int,
-        default=DEFAULT_KV_GROUP_SIZE,
-        help="Group size for uniform KV cache quantization.",
+        default=64,
+        help="Group size for the KV cache.",
     )
     parser.add_argument(
         "--quantized-kv-start",
@@ -173,123 +166,18 @@ def parse_arguments():
         help="Trust remote code when loading the model.",
     )
     parser.add_argument(
-        "--quantize-activations",
-        "-qa",
-        action="store_true",
-        help="Enable activation quantization for QQLinear layers. "
-        "Only supported for models quantized with 'nvfp4' or 'mxfp8' modes.",
-    )
-    parser.add_argument(
         "--processor-kwargs",
         type=json.loads,
         default={},
         help="Extra processor kwargs as JSON. "
         'Example: --processor-kwargs \'{"cropping": false, "max_patches": 3}\'',
     )
-    parser.add_argument(
-        "--prefill-step-size",
-        type=int,
-        default=DEFAULT_PREFILL_STEP_SIZE,
-        help="Number of tokens to process per prefill step. "
-        "Lower values reduce peak memory usage but may be slower. "
-        "Try 512 or 256 if you hit GPU memory errors during prefill.",
-    )
-    parser.add_argument(
-        "--enable-thinking",
-        action="store_true",
-        help="Enable thinking mode in the chat template (e.g. for Qwen3.5).",
-    )
-    parser.add_argument(
-        "--thinking-budget",
-        type=int,
-        default=None,
-        help="Maximum number of thinking tokens before forcing the end-of-thinking token.",
-    )
-    parser.add_argument(
-        "--thinking-start-token",
-        type=str,
-        default=DEFAULT_THINKING_START_TOKEN,
-        help="Token that marks the start of a thinking block (default: %(default)s).",
-    )
-    parser.add_argument(
-        "--thinking-end-token",
-        type=str,
-        default=DEFAULT_THINKING_END_TOKEN,
-        help="Token that marks the end of a thinking block (default: %(default)s).",
-    )
 
     return parser.parse_args()
 
 
-def normalize_resize_shape(
-    values: Optional[Sequence[int]],
-) -> Optional[Tuple[int, int]]:
-    if values is None:
-        return None
-    if not (
-        isinstance(values, Sequence)
-        and not isinstance(values, (str, bytes))
-        and len(values) in (1, 2)
-        and all(type(value) is int for value in values)
-    ):
-        raise ValueError("resize_shape must contain 1 or 2 integers")
-    return (values[0], values[0]) if len(values) == 1 else tuple(values)
-
-
 # A stream on the default device just for generation
 generation_stream = mx.new_stream(mx.default_device())
-
-
-def maybe_quantize_kv_cache(
-    prompt_cache,
-    quantized_kv_start,
-    kv_group_size,
-    kv_bits,
-    kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
-):
-    if kv_bits is None:
-        return
-
-    if turboquant_enabled(kv_bits, kv_quant_scheme):
-
-        def quantize_entry(entry):
-            if isinstance(entry, TurboQuantKVCache):
-                return entry
-            if isinstance(entry, cache.RotatingKVCache):
-                return entry
-            if isinstance(entry, cache.KVCache):
-                if entry.offset == 0:
-                    # Empty: replace so update_and_fetch quantizes on the fly
-                    return TurboQuantKVCache(bits=kv_bits)
-                if entry.offset < quantized_kv_start:
-                    return entry
-                return TurboQuantKVCache.from_cache(entry, bits=kv_bits)
-            if isinstance(entry, cache.CacheList):
-                entry.caches = [quantize_entry(sub_entry) for sub_entry in entry.caches]
-                return entry
-            if isinstance(entry, list):
-                for i, sub_entry in enumerate(entry):
-                    entry[i] = quantize_entry(sub_entry)
-                return entry
-            if isinstance(entry, tuple):
-                return tuple(quantize_entry(sub_entry) for sub_entry in entry)
-            return entry
-
-        # Skip the last layer (before final norm/LM head) — it's highly
-        # sensitive to quantization in deep models (e.g. gemma-4-31b).
-        last_idx = len(prompt_cache) - 1 if len(prompt_cache) > 2 else -1
-        for index, layer_cache in enumerate(prompt_cache):
-            if index == last_idx:
-                continue
-            prompt_cache[index] = quantize_entry(layer_cache)
-        return
-
-    mlx_maybe_quantize_kv_cache(
-        prompt_cache,
-        quantized_kv_start=quantized_kv_start,
-        kv_group_size=kv_group_size,
-        kv_bits=int(kv_bits),
-    )
 
 
 @contextlib.contextmanager
@@ -343,57 +231,25 @@ class GenerationResult:
     peak_memory: float = 0.0
 
 
-class PromptCacheState:
-    """Holds KV cache and token history across conversation turns.
-
-    Pass this to stream_generate via the ``prompt_cache_state`` kwarg to
-    reuse the KV cache from previous turns.  Only the new tokens (after
-    the common prefix) are processed, avoiding redundant prefill.
-    """
-
-    def __init__(self):
-        self.cache: Optional[List[Any]] = None
-        self.token_ids: Optional[List[int]] = None
-
-    def find_prefix_length(self, new_ids: list) -> int:
-        """Return the number of leading tokens that match the cached ids."""
-        if self.token_ids is None:
-            return 0
-        max_len = min(len(self.token_ids), len(new_ids))
-        for i in range(max_len):
-            if self.token_ids[i] != new_ids[i]:
-                return i
-        return max_len
-
-    def update(self, token_ids: list, kv_cache: list):
-        """Store the full token sequence and corresponding KV cache."""
-        self.token_ids = list(token_ids)
-        self.cache = kv_cache
-
-
 def generate_step(
     input_ids: mx.array,
     model: nn.Module,
     pixel_values,
     mask,
     *,
-    max_tokens: int = DEFAULT_MAX_TOKENS,
-    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = 256,
+    temperature: float = 0.0,
     repetition_penalty: Optional[float] = None,
-    repetition_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
-    top_p: float = DEFAULT_TOP_P,
-    min_p: float = DEFAULT_MIN_P,
-    top_k: int = DEFAULT_TOP_K,
+    repetition_context_size: Optional[int] = 20,
+    top_p: float = 1.0,
     logit_bias: Optional[Dict[int, float]] = None,
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
-    kv_bits: Optional[float] = None,
-    kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
-    kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
-    quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
-    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
-    prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
+    prefill_step_size: Optional[int] = 2048,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -404,32 +260,25 @@ def generate_step(
         model (nn.Module): The model to use for generation.
         pixel_values: The pixel values for vision models (optional).
         mask: The attention mask (optional).
-        max_tokens (int): Maximum number of tokens to generate.
+        max_tokens (int): Maximum number of tokens to generate. Default: ``256``.
         temperature (float): The temperature for sampling, if 0 the argmax is used.
+          Default: ``0``.
         repetition_penalty (float, optional): The penalty factor for repeating
           tokens.
         repetition_context_size (int, optional): The number of tokens to
-          consider for repetition penalty.
+          consider for repetition penalty. Default: ``20``.
         top_p (float, optional): Nucleus sampling, higher means model considers
           more less likely words.
-        min_p (float, optional): Minimum probability threshold relative to the
-          highest-probability token.
-        top_k (int, optional): Restrict sampling to the top-k tokens.
         logit_bias (dictionary, optional): Additive logit bias.
         prompt_cache (list, optional): Pre-existing KV cache for the prompt.
         max_kv_size (int, optional): Maximum KV cache size.
-        kv_bits (float, optional): Number of bits for KV cache quantization.
-        kv_group_size (int): Group size for uniform KV cache quantization.
-        kv_quant_scheme (str): KV cache quantization backend.
-        quantized_kv_start (int): Start index for quantized KV cache.
-        sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
-          token from a vector of log probabilities.
-        logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
-          A list of functions that take tokens and logits and return the processed
-          logits.
+        kv_bits (int, optional): Number of bits for KV cache quantization.
+        kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
+        quantized_kv_start (int): Start index for quantized KV cache. Default: ``0``.
+        logits_processors (list, optional): List of logits processor functions.
         prefill_step_size (int): Number of tokens to process per prefill step.
           Chunked prefill processes prompts in smaller chunks to reduce peak
-          memory usage.
+          memory usage. Default: ``2048``.
 
     Yields:
         Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
@@ -441,27 +290,34 @@ def generate_step(
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
-        kv_quant_scheme=kv_quant_scheme,
     )
 
-    if sampler is None:
-        sampler = make_sampler(
-            temp=temperature,
-            top_p=top_p,
-            min_p=min_p,
-            top_k=top_k,
+    def sample(logits: mx.array) -> Tuple[mx.array, float]:
+        if logit_bias:
+            indices = mx.array(list(logit_bias.keys()))
+            values = mx.array(list(logit_bias.values()))
+            logits[:, indices] += values
+        logprobs = logits - mx.logsumexp(logits)
+
+        if temperature == 0:
+            token = mx.argmax(logits, axis=-1)
+        else:
+            if top_p > 0 and top_p < 1.0:
+                token = top_p_sampling(logits, top_p, temperature)
+            else:
+                token = mx.random.categorical(logits * (1 / temperature))
+
+        return token, logprobs
+
+    if repetition_penalty and (
+        repetition_penalty < 0 or not isinstance(repetition_penalty, float)
+    ):
+        raise ValueError(
+            f"repetition_penalty must be a non-negative float, got {repetition_penalty}"
         )
 
-    processors = make_logits_processors(
-        logit_bias, repetition_penalty, repetition_context_size
-    )
-    if logits_processors is not None:
-        processors.extend(logits_processors)
-
     y = input_ids
-    tokens = mx.array([], dtype=input_ids.dtype)
-
-    thinking_budget_criteria = kwargs.pop("thinking_budget_criteria", None)
+    tokens = None  # Track tokens for logits processors
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -470,10 +326,15 @@ def generate_step(
             max_kv_size=max_kv_size,
         )
 
-    def _step(y, inputs_embeds=None):
-        nonlocal tokens, kwargs
+    repetition_context = input_ids.reshape(-1).tolist()
 
+    if repetition_context_size:
+        repetition_context = repetition_context[-repetition_context_size:]
+
+    def _step(y, **kwargs):
+        nonlocal tokens
         with mx.stream(generation_stream):
+            nonlocal repetition_context
             if "decoder_input_ids" in kwargs:
                 outputs = model.language_model(
                     cache=prompt_cache,
@@ -481,95 +342,128 @@ def generate_step(
                 )
             else:
                 outputs = model.language_model(
-                    y,
-                    inputs_embeds=inputs_embeds,
+                    y[None],
                     cache=prompt_cache,
                     **kwargs,
                 )
 
             logits = outputs.logits[:, -1, :]
 
-            if len(processors) > 0 and len(y) > 0:
-                tokens = mx.concat([tokens, y.flatten()])
-
-                for processor in processors:
+            # Apply logits processors before repetition penalty
+            if logits_processors:
+                # Efficiently update tokens by concatenating only the new token
+                tokens = mx.concat([tokens, y])
+                for processor in logits_processors:
                     logits = processor(tokens, logits)
 
-            quantize_cache_fn(prompt_cache)
-
-            logprobs = logits - mx.logsumexp(logits)
-            y = sampler(logprobs)
-
-            if outputs.cross_attention_states is not None:
-                kwargs = {"cross_attention_states": outputs.cross_attention_states}
-            elif outputs.encoder_outputs is not None:
-                kwargs = {"encoder_outputs": outputs.encoder_outputs}
+            if repetition_penalty:
+                logits = apply_repetition_penalty(
+                    logits, repetition_context, repetition_penalty
+                )
+                y, logprobs = sample(logits)
+                repetition_context.append(y.item())
             else:
-                kwargs = {}
+                y, logprobs = sample(logits)
 
+            if repetition_context_size:
+                if len(repetition_context) > repetition_context_size:
+                    repetition_context = repetition_context[-repetition_context_size:]
+
+            quantize_cache_fn(prompt_cache)
             return y, logprobs.squeeze(0)
 
-    with mx.stream(generation_stream):
-        # Get input embeddings (handles both multimodal and text-only)
-        embedding_output = model.get_input_embeddings(
-            input_ids, pixel_values, mask=mask, **kwargs
-        )
+    # Get input embeddings (handles both multimodal and text-only)
+    embedding_output = model.get_input_embeddings(
+        input_ids, pixel_values, mask=mask, **kwargs
+    )
 
-        inputs_embeds = embedding_output.inputs_embeds
+    inputs_embeds = embedding_output.inputs_embeds
 
-        kwargs.update(
-            {
-                k: v
-                for k, v in embedding_output.to_dict().items()
-                if k != "inputs_embeds" and v is not None
-            }
-        )
-        if getattr(model, "no_chunked_prefill", False):
-            prefill_step_size = None
-        if prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size:
-            # Chunked prefill with embeddings
-            total_tokens = inputs_embeds.shape[1]
-            with tqdm(total=total_tokens, desc="Prefill", unit="tok") as pbar:
-                while inputs_embeds.shape[1] > 1:
-                    n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
-                    model.language_model(
-                        inputs=input_ids[:, :n_to_process],
-                        inputs_embeds=inputs_embeds[:, :n_to_process],
-                        cache=prompt_cache,
-                        n_to_process=n_to_process,
-                        **kwargs,
-                    )
-                    quantize_cache_fn(prompt_cache)
-                    mx.eval([c.state for c in prompt_cache])
-                    inputs_embeds = inputs_embeds[:, n_to_process:]
-                    input_ids = input_ids[:, n_to_process:]
-                    mx.clear_cache()
-                    pbar.update(n_to_process)
+    kwargs.update(
+        {
+            k: v
+            for k, v in embedding_output.to_dict().items()
+            if k != "inputs_embeds" and v is not None
+        }
+    )
 
-            input_ids = input_ids[:, -1:]
+    if inputs_embeds.shape[1] > prefill_step_size:
+        # Chunked prefill with embeddings
+        total_tokens = inputs_embeds.shape[1]
+        input_offset = 0
+        with tqdm(total=total_tokens, desc="Prefill", unit="tok") as pbar:
+            while inputs_embeds.shape[1] > 1:
+                n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
+                model.language_model(
+                    inputs=input_ids[:, input_offset : input_offset + n_to_process],
+                    inputs_embeds=inputs_embeds[:, :n_to_process],
+                    cache=prompt_cache,
+                    **kwargs,
+                )
+                mx.eval([c.state for c in prompt_cache])
+                inputs_embeds = inputs_embeds[:, n_to_process:]
+                input_offset += n_to_process
+                quantize_cache_fn(prompt_cache)
+                mx.clear_cache()
+                pbar.update(n_to_process)
 
-        y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
+        input_ids = input_ids[:, -1:]
+
+    # Final step with last embedding to get logits
+    outputs = model.language_model(
+        inputs=input_ids,
+        inputs_embeds=inputs_embeds,
+        cache=prompt_cache,
+        **kwargs,
+    )
+
+    logits = outputs.logits[:, -1, :]
+    quantize_cache_fn(prompt_cache)
+
+    if logits_processors:
+        # get the last token from input_ids
+        final_input_token = input_ids[0][-1].item()
+        tokens = mx.array([final_input_token])
+        for processor in logits_processors:
+            logits = processor(tokens, logits)
+
+    # Final sampling with processed logits
+    y, logprobs = sample(logits)
 
     mx.async_eval(y)
+
+    if outputs.cross_attention_states is not None:
+        kwargs = {
+            k: v
+            for k, v in zip(
+                ["cross_attention_states"], [outputs.cross_attention_states]
+            )
+        }
+    elif outputs.encoder_outputs is not None:
+        kwargs = {
+            "decoder_input_ids": y[None],
+            "encoder_outputs": outputs.encoder_outputs,
+        }
+    else:
+        kwargs = {}
 
     n = 0
     while True:
         if n != max_tokens:
-            next_y, next_logprobs = _step(y[None])
+            next_y, next_logprobs = _step(y, **kwargs)
             mx.async_eval(next_y)
-        if n == 0:
-            mx.eval(y)
+            if "decoder_input_ids" in kwargs:
+                kwargs["decoder_input_ids"] = next_y[None]
+            yield y.item(), logprobs
+            y, logprobs = next_y, next_logprobs
         if n == max_tokens:
             break
 
-        yield y.item(), logprobs
-        if n % 256 == 0:
-            mx.clear_cache()
-
-        if thinking_budget_criteria is not None:
-            next_y = thinking_budget_criteria.apply_forced_token(next_y)
-        y, logprobs = next_y, next_logprobs
         n += 1
+
+        # Periodically clear cache to prevent memory accumulation
+        if n % 256 == 0:  # Clear cache every 256 tokens
+            mx.clear_cache()
 
 
 def stream_generate(
@@ -601,14 +495,6 @@ def stream_generate(
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
-    # Set up thinking budget criteria if requested
-    thinking_budget = kwargs.pop("thinking_budget", None)
-    thinking_end_token = kwargs.pop("thinking_end_token", DEFAULT_THINKING_END_TOKEN)
-    thinking_start_token = kwargs.pop(
-        "thinking_start_token", DEFAULT_THINKING_START_TOKEN
-    )
-    enable_thinking = kwargs.pop("enable_thinking", False)
-
     # Skip special tokens
     skip_special_tokens = kwargs.pop("skip_special_tokens", False)
     skip_special_token_ids = (
@@ -618,14 +504,13 @@ def stream_generate(
     )
 
     add_special_tokens = (
-        getattr(processor, "chat_template", None) is None
-        if model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
+        not hasattr(processor, "chat_template")
+        if model.config.model_type in ["gemma3", "gemma3n"]
         else True
     )
 
-    resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
+    resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)
-    vision_cache = kwargs.pop("vision_cache", None)
 
     if kwargs.get("input_ids", None) is not None:
         input_ids = kwargs.pop("input_ids")
@@ -652,97 +537,17 @@ def stream_generate(
         }
         kwargs.update(data_kwargs)
 
-    # Vision feature caching: reuse cached image features across turns
-    if vision_cache is not None and image is not None and pixel_values is not None:
-        cached = vision_cache.get(image)
-        if cached is not None:
-            kwargs["cached_image_features"] = cached
-        elif hasattr(model, "encode_image"):
-            features = model.encode_image(pixel_values)
-            mx.eval(features)
-            vision_cache.put(image, features)
-            kwargs["cached_image_features"] = features
-
-    # Prompt cache reuse: skip common prefix from previous turn
-    prompt_cache_state = kwargs.pop("prompt_cache_state", None)
-    reused_prefix_len = 0
-    full_input_ids_list = input_ids.flatten().tolist()
-
-    if prompt_cache_state is not None and prompt_cache_state.cache is not None:
-        prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
-        if prefix_len > 0 and prefix_len < input_ids.shape[1]:
-            reused_prefix_len = prefix_len
-            # Trim to only new tokens
-            input_ids = input_ids[:, prefix_len:]
-            # Only skip vision if no image tokens in the new (trimmed) tokens
-            image_token_id = getattr(model.config, "image_token_id", None) or getattr(
-                model.config, "image_token_index", None
-            )
-            new_ids = input_ids.flatten().tolist()
-            has_image_in_new = image_token_id is not None and image_token_id in new_ids
-            if not has_image_in_new:
-                pixel_values = None
-                kwargs.pop("cached_image_features", None)
-            # Reuse the saved KV cache (trimmed to prefix length)
-            kv_cache = prompt_cache_state.cache
-            # Trim cache to prefix_len in case it includes generated tokens
-            for c in kv_cache:
-                if hasattr(c, "keys") and c.keys is not None:
-                    cached_len = c.keys.shape[2]
-                    if cached_len > prefix_len:
-                        c.keys = c.keys[:, :, :prefix_len, :]
-                        c.values = c.values[:, :, :prefix_len, :]
-                        if hasattr(c, "offset"):
-                            c.offset = prefix_len
-            kwargs["prompt_cache"] = kv_cache
-
-    if thinking_budget is not None:
-        thinking_start_token_id = tokenizer.encode(
-            thinking_start_token, add_special_tokens=False
-        )[-1]
-        enable_thinking = enable_thinking and (
-            thinking_start_token_id in input_ids.flatten().tolist()
-        )
-        tokenizer.thinking_budget_criteria = ThinkingBudgetCriteria(
-            tokenizer=tokenizer,
-            thinking_budget=thinking_budget,
-            thinking_end_token=thinking_end_token,
-            thinking_start_token=thinking_start_token,
-            enable_thinking=enable_thinking,
-        )
-        kwargs["thinking_budget_criteria"] = tokenizer.thinking_budget_criteria
-    else:
-        tokenizer.thinking_budget_criteria = None
-
-    # Ensure we have a prompt_cache we can track for reuse
-    if "prompt_cache" not in kwargs:
-        kwargs["prompt_cache"] = cache.make_prompt_cache(
-            model.language_model,
-            max_kv_size=kwargs.get("max_kv_size", None),
-        )
-    tracked_cache = kwargs["prompt_cache"]
-
-    total_prompt_tokens = reused_prefix_len + input_ids.size
-
     with wired_limit(model, [generation_stream]):
         detokenizer = processor.detokenizer
         detokenizer.reset()
-        thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
-        gen = generate_step(input_ids, model, pixel_values, mask, **kwargs)
         tic = time.perf_counter()
-
-        generated_tokens = []
-        for n, (token, logprobs) in enumerate(gen):
+        for n, (token, logprobs) in enumerate(
+            generate_step(input_ids, model, pixel_values, mask, **kwargs)
+        ):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
-                prompt_tps = total_prompt_tokens / prompt_time
+                prompt_tps = input_ids.size / prompt_time
                 tic = time.perf_counter()
-
-            generated_tokens.append(token)
-
-            # Check thinking budget and force token if needed
-            if thinking_criteria is not None:
-                thinking_criteria(token)
 
             # Stop generation if the token is in the eos_token_ids
             if tokenizer.stopping_criteria(token):
@@ -755,9 +560,9 @@ def stream_generate(
                 text=detokenizer.last_segment,
                 token=token,
                 logprobs=logprobs,
-                prompt_tokens=total_prompt_tokens,
+                prompt_tokens=input_ids.size,
                 generation_tokens=n + 1,
-                total_tokens=total_prompt_tokens + n + 1,
+                total_tokens=input_ids.size + n + 1,
                 prompt_tps=prompt_tps,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
@@ -768,20 +573,13 @@ def stream_generate(
             text=detokenizer.last_segment,
             token=token,
             logprobs=logprobs,
-            prompt_tokens=total_prompt_tokens,
+            prompt_tokens=input_ids.size,
             generation_tokens=n + 1,
-            total_tokens=total_prompt_tokens + n + 1,
+            total_tokens=input_ids.size + n + 1,
             prompt_tps=prompt_tps,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
         )
-
-        # Save cache state for potential reuse on next turn
-        if prompt_cache_state is not None:
-            all_ids = full_input_ids_list + [
-                t.item() if hasattr(t, "item") else t for t in generated_tokens
-            ]
-            prompt_cache_state.update(all_ids, tracked_cache)
 
         # Cleanup after generation
         mx.clear_cache()
@@ -943,10 +741,6 @@ def _make_cache(model, left_padding):
     def to_batch_cache(c):
         if isinstance(c, cache.KVCache):
             return cache.BatchKVCache(left_padding)
-        elif isinstance(c, cache.ChunkedKVCache):
-            return cache.BatchKVCache(left_padding)
-        elif isinstance(c, cache.SimpleKVCache):
-            return cache.BatchKVCache(left_padding)
         elif isinstance(c, cache.ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
@@ -955,9 +749,7 @@ def _make_cache(model, left_padding):
                 raise ValueError("RotatingKVCache with keep tokens is not supported.")
             return cache.BatchRotatingKVCache(c.max_size, left_padding)
         elif isinstance(c, cache.CacheList):
-            return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
-        elif isinstance(c, tuple):
-            return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c))
+            return cache.BatchCacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
         else:
             raise ValueError(f"{type(c)} does not yet support batching")
 
@@ -1012,56 +804,89 @@ class BatchResponse:
 
 @dataclass
 class Batch:
+    """Holds state for multiple sequences being generated in parallel."""
+
     uids: List[int]
     y: mx.array
-    logprobs: mx.array
+    logprobs: List[mx.array]  # Per-sequence logprobs
     max_tokens: List[int]
     num_tokens: List[int]
     cache: List[Any]
+    samplers: List[Optional[Callable]]  # Per-sequence samplers
+    logits_processors: List[List[Callable]]  # Per-sequence logit processors
+    tokens: List[mx.array]  # Token history per sequence
 
     def __len__(self):
         return len(self.uids)
 
     def filter(self, keep_idx: List[int]):
+        """Remove finished sequences, keeping only those at keep_idx."""
         self.uids = [self.uids[k] for k in keep_idx]
         self.max_tokens = [self.max_tokens[k] for k in keep_idx]
         self.num_tokens = [self.num_tokens[k] for k in keep_idx]
+        self.logprobs = [self.logprobs[k] for k in keep_idx]
+        self.samplers = [self.samplers[k] for k in keep_idx]
+        self.logits_processors = [self.logits_processors[k] for k in keep_idx]
+        self.tokens = [self.tokens[k] for k in keep_idx]
         keep_idx = mx.array(keep_idx, mx.int32)
         self.y = self.y[keep_idx]
-        self.logprobs = self.logprobs[keep_idx]
         for c in self.cache:
             c.filter(keep_idx)
 
     def extend(self, other):
+        """Merge another batch into this one."""
         self.uids.extend(other.uids)
         self.y = mx.concatenate([self.y, other.y])
-        self.logprobs = mx.concatenate([self.logprobs, other.logprobs])
+        self.logprobs.extend(other.logprobs)
         self.num_tokens.extend(other.num_tokens)
         self.max_tokens.extend(other.max_tokens)
+        self.samplers.extend(other.samplers)
+        self.logits_processors.extend(other.logits_processors)
+        self.tokens.extend(other.tokens)
         for c, o in zip(self.cache, other.cache):
             c.extend(o)
 
+    def extract_cache(self, idx: int) -> List[Any]:
+        """Extract KV cache for a single sequence (for reuse after completion)."""
+        return [c.extract(idx) if hasattr(c, "extract") else None for c in self.cache]
+
 
 class BatchGenerator:
+    """
+    Manages batch generation with dynamic scheduling and per-sequence control.
+
+    Supports continuous batching where new prompts can be added while generation
+    is in progress. Each sequence can have its own sampler and logits processors.
+    """
+
     @dataclass
     class Response:
         uid: int
         token: int
         logprobs: mx.array
         finish_reason: Optional[str]
+        prompt_cache: Optional[Callable[[], List[Any]]] = None  # Cache getter for reuse
 
     def __init__(
         self,
         model,
         processor,
-        max_tokens: int = DEFAULT_MAX_TOKENS,
+        max_tokens: int = 128,
         stop_tokens: Optional[set] = None,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
-        completion_batch_size: int = DEFAULT_COMPLETION_BATCH_SIZE,
-        prefill_batch_size: int = DEFAULT_PREFILL_BATCH_SIZE,
-        prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
-        prompt_cache=None,
+        logits_processors: Optional[
+            List[Callable[[mx.array, mx.array], mx.array]]
+        ] = None,
+        completion_batch_size: int = 32,
+        prefill_batch_size: int = 8,
+        prefill_step_size: int = 2048,
+        prompt_progress_callback: Optional[
+            Callable[[List[Tuple[int, int, int]]], None]
+        ] = None,
     ):
+        # Initialize _old_wired_limit first to ensure __del__ works even if __init__ fails
+        self._old_wired_limit = None
+
         self.model = model
         self.unprocessed_prompts = []
         self.max_tokens = max_tokens
@@ -1070,50 +895,125 @@ class BatchGenerator:
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
         self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+        self.logits_processors = logits_processors or []
+        self.stop_tokens = stop_tokens or set()
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
-        self.completion_batch_size = completion_batch_size
-        self.prompt_cache = prompt_cache
+        self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
+        self.prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
         self._stats = BatchStats()
-
-        self.tokenizer.stopping_criteria.add_eos_token_ids(stop_tokens)
 
         self.active_batch = None
 
-    def insert(self, prompts, max_tokens: Union[List[int], int, None] = None):
+        # Set wired limit for memory management (if supported by MLX version)
+        if mx.metal.is_available() and hasattr(mx, "device_info"):
+            try:
+                self._old_wired_limit = mx.set_wired_limit(
+                    mx.device_info()["max_recommended_working_set_size"]
+                )
+            except Exception:
+                pass  # Older MLX version, skip wired limit management
+
+    def close(self):
+        """Clean up resources and restore wired limit."""
+        if self._old_wired_limit is not None:
+            mx.synchronize(generation_stream)
+            mx.set_wired_limit(self._old_wired_limit)
+            self._old_wired_limit = None
+
+    def __del__(self):
+        self.close()
+
+    def insert(
+        self,
+        prompts,
+        max_tokens: Union[List[int], int, None] = None,
+        samplers: Optional[List[Optional[Callable]]] = None,
+        logits_processors: Optional[List[List[Callable]]] = None,
+    ):
+        """
+        Add prompts to the generation queue.
+
+        Args:
+            prompts: List of token ID lists to generate from.
+            max_tokens: Maximum tokens to generate per prompt (int or list).
+            samplers: Per-prompt sampler functions (optional).
+            logits_processors: Per-prompt logits processor lists (optional).
+
+        Returns:
+            List of unique IDs for tracking each prompt's generation.
+        """
         uids = []
 
         if max_tokens is None or isinstance(max_tokens, int):
             max_tokens = [max_tokens or self.max_tokens] * len(prompts)
 
-        for p, m in zip(prompts, max_tokens):
-            self.unprocessed_prompts.append((self.uid_count, p, m))
+        # Default samplers and logits processors
+        samplers = samplers or [None] * len(prompts)
+        logits_processors = logits_processors or [self.logits_processors] * len(prompts)
+
+        for p, m, s, lp in zip(prompts, max_tokens, samplers, logits_processors):
+            self.unprocessed_prompts.append((self.uid_count, p, m, s, lp))
             uids.append(self.uid_count)
             self.uid_count += 1
-        # Sort in ascending order of length
+
+        # Sort in ascending order of length for efficient batching
         self.unprocessed_prompts = sorted(
             self.unprocessed_prompts, key=lambda x: len(x[1])
         )
         return uids
 
+    def remove(self, uids: List[int]):
+        """
+        Remove sequences from the batch by their UIDs.
+
+        Can remove from either the active batch or the unprocessed queue.
+        Useful for cancelling requests.
+
+        Args:
+            uids: List of UIDs to remove.
+        """
+        uids_set = set(uids)
+
+        # Remove from active batch
+        if self.active_batch is not None:
+            batch = self.active_batch
+            keep_idx = [e for e, uid in enumerate(batch.uids) if uid not in uids_set]
+            if len(keep_idx) > 0:
+                batch.filter(keep_idx)
+            else:
+                self.active_batch = None
+
+        # Remove from unprocessed queue
+        for i in reversed(range(len(self.unprocessed_prompts))):
+            if self.unprocessed_prompts[i][0] in uids_set:
+                self.unprocessed_prompts.pop(i)
+
     def _process_prompts(self, prompts, **kwargs) -> Batch:
-        uids, inputs, max_tokens = zip(*prompts)
+        """
+        Process a batch of prompts through prefill phase.
+
+        Args:
+            prompts: List of tuples (uid, tokens, max_tokens, sampler, logits_processors).
+            **kwargs: Additional model kwargs (inputs_embeds, etc.).
+
+        Returns:
+            Initialized Batch ready for generation.
+        """
+        uids, inputs, max_tokens, samplers, logits_processors = zip(*prompts)
         lengths = [len(p) for p in inputs]
         max_length = max(lengths)
 
         self._stats.prompt_tokens += sum(lengths)
         left_padding = [max_length - l for l in lengths]
-        inputs = _left_pad_prompts(inputs, max_length=max_length)
+        padded_inputs = _left_pad_prompts(inputs, max_length=max_length)
 
-        if self.prompt_cache is not None:
-            prompt_cache = self.prompt_cache
-        elif len(uids) == 1 and max(left_padding) == 0:
-            # Single prompt with no padding: use standard caches to avoid
-            # numerical divergence from batch cache wrappers.
-            prompt_cache = cache.make_prompt_cache(self.model)
-        else:
-            prompt_cache = _make_cache(self.model, left_padding)
+        prompt_cache = _make_cache(self.model, left_padding)
+
+        # Initialize token history for each sequence
+        tokens = [mx.array(inp) for inp in inputs]
+        processed_tokens = 0
 
         # Slice batch data in kwargs to match current batch size
         batch_size = len(uids)
@@ -1122,18 +1022,13 @@ class BatchGenerator:
                 kwargs[key] = value[:batch_size]
 
         inputs_embeds = kwargs.pop("inputs_embeds", None)
-        if inputs_embeds is None:
-            raise ValueError("inputs_embeds is required")
 
-        if (
-            self.prefill_step_size is not None
-            and inputs_embeds.shape[1] > self.prefill_step_size
-        ):
-            # Chunked prefill with embeddings
+        if inputs_embeds is not None:
+            # Multimodal prefill with progress tracking
             while inputs_embeds.shape[1] > 1:
                 n_to_process = min(self.prefill_step_size, inputs_embeds.shape[1] - 1)
                 self.model(
-                    inputs[:, :n_to_process],
+                    padded_inputs[:, :n_to_process],
                     cache=prompt_cache,
                     inputs_embeds=inputs_embeds[:, :n_to_process],
                     n_to_process=n_to_process,
@@ -1141,27 +1036,114 @@ class BatchGenerator:
                 )
                 mx.eval([c.state for c in prompt_cache])
                 inputs_embeds = inputs_embeds[:, n_to_process:]
-                inputs = inputs[:, n_to_process:]
+                padded_inputs = padded_inputs[:, n_to_process:]
+                processed_tokens += n_to_process
+                self.prompt_progress_callback(
+                    [
+                        (uid, processed_tokens, length)
+                        for uid, length in zip(uids, lengths)
+                    ]
+                )
                 mx.clear_cache()
 
+            step_kwargs = {"inputs_embeds": inputs_embeds}
+
+        else:
+            # Text-only prefill with progress tracking
+            while padded_inputs.shape[1] > 1:
+                n_to_process = min(self.prefill_step_size, padded_inputs.shape[1] - 1)
+                self.model(padded_inputs[:, :n_to_process], cache=prompt_cache)
+                mx.eval([c.state for c in prompt_cache])
+                padded_inputs = padded_inputs[:, n_to_process:]
+                processed_tokens += n_to_process
+                self.prompt_progress_callback(
+                    [
+                        (uid, processed_tokens, length)
+                        for uid, length in zip(uids, lengths)
+                    ]
+                )
+                mx.clear_cache()
+
+            step_kwargs = {}
+
         y, logprobs = self._step(
-            inputs, prompt_cache, inputs_embeds=inputs_embeds, **kwargs
+            padded_inputs,
+            prompt_cache,
+            list(samplers),
+            list(logits_processors),
+            tokens,
+            **step_kwargs,
         )
-
-        mx.async_eval(y, logprobs)
+        mx.async_eval(y, *logprobs)
         mx.clear_cache()
+
         return Batch(
-            list(uids), y, logprobs, list(max_tokens), [0] * len(uids), prompt_cache
+            uids=list(uids),
+            y=y,
+            logprobs=logprobs,
+            max_tokens=list(max_tokens),
+            num_tokens=[0] * len(uids),
+            cache=prompt_cache,
+            samplers=list(samplers),
+            logits_processors=list(logits_processors),
+            tokens=tokens,
         )
 
-    def _step(self, input_tokens: mx.array, prompt_cache: List[Any], **kwargs):
+    def _step(
+        self,
+        input_tokens: mx.array,
+        prompt_cache: List[Any],
+        samplers: List[Optional[Callable]],
+        logits_processors: List[List[Callable]],
+        tokens: List[mx.array],
+        **kwargs,
+    ):
+        """
+        Execute one generation step for all sequences in the batch.
+
+        Args:
+            input_tokens: Current input tokens [batch_size, 1] or [batch_size, seq_len].
+            prompt_cache: KV cache for the batch.
+            samplers: Per-sequence sampler functions.
+            logits_processors: Per-sequence logits processor lists.
+            tokens: Token history per sequence (for logits processors).
+            **kwargs: Additional model kwargs.
+
+        Returns:
+            Tuple of (sampled_tokens, per_sequence_logprobs).
+        """
+        batch_size = input_tokens.shape[0]
+
         output = self.model(input_tokens, cache=prompt_cache, **kwargs)
         logits = output.logits[:, -1, :]
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        sampled = self.sampler(logprobs)
 
-        # TODO: Add KV cache quantization if specified
-        return sampled, logprobs
+        # Apply per-sequence logits processors
+        if any(logits_processors):
+            processed_logits = []
+            for e in range(batch_size):
+                sample_logits = logits[e : e + 1]
+                for processor in logits_processors[e]:
+                    sample_logits = processor(tokens[e], sample_logits)
+                processed_logits.append(sample_logits)
+            logits = mx.concatenate(processed_logits, axis=0)
+
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+        # Apply per-sequence samplers
+        if any(samplers):
+            all_samples = []
+            for e in range(batch_size):
+                sample_sampler = samplers[e] or self.sampler
+                sampled = sample_sampler(logprobs[e : e + 1])
+                all_samples.append(sampled)
+            sampled = mx.concatenate(all_samples, axis=0)
+        else:
+            sampled = self.sampler(logprobs)
+
+        # Return per-sequence logprobs as list
+        per_seq_logprobs = [logprobs[e] for e in range(batch_size)]
+
+        return sampled, per_seq_logprobs
 
     def stats(self):
         self._stats.prompt_tps = self._stats.prompt_tokens / self._stats.prompt_time
@@ -1172,12 +1154,25 @@ class BatchGenerator:
         return self._stats
 
     def _next(self, **kwargs):
+        """
+        Execute one generation step, processing prompts and generating tokens.
+
+        This is the core scheduling method that:
+        1. Adds unprocessed prompts to the active batch (prefill phase)
+        2. Generates one token for all sequences in the batch
+        3. Removes finished sequences and returns responses
+
+        Returns:
+            List of Response objects for each sequence in the batch.
+        """
         tic = time.perf_counter()
 
         prompt_processing = False
         batch = self.active_batch
         num_active = len(batch) if batch else 0
         num_to_add = self.completion_batch_size - num_active
+
+        # Prefill phase: add new prompts to the batch
         while num_to_add >= self.prefill_batch_size:
             prompts = self.unprocessed_prompts[: self.prefill_batch_size]
             # Finish processing the last examples of the last batch
@@ -1190,7 +1185,7 @@ class BatchGenerator:
             # Process prompts
             if batch is not None and not prompt_processing:
                 # Finish any active completion tokens
-                mx.eval(batch.y, batch.logprobs)
+                mx.eval(batch.y, *batch.logprobs)
                 self._stats.generation_time += time.perf_counter() - tic
                 tic = time.perf_counter()
 
@@ -1210,8 +1205,20 @@ class BatchGenerator:
 
         batch = self.active_batch
         y, logprobs = batch.y, batch.logprobs
-        batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
-        mx.async_eval(batch.y, batch.logprobs)
+
+        # Update token history for each sequence
+        for i, toks in enumerate(batch.tokens):
+            batch.tokens[i] = mx.concatenate((toks, y[i : i + 1]))
+
+        # Generate next token
+        batch.y, batch.logprobs = self._step(
+            y[:, None],
+            batch.cache,
+            batch.samplers,
+            batch.logits_processors,
+            batch.tokens,
+        )
+        mx.async_eval(batch.y, *batch.logprobs)
 
         y = y.tolist()
         toc = time.perf_counter()
@@ -1219,6 +1226,7 @@ class BatchGenerator:
             self._stats.prompt_time += toc - tic
         else:
             self._stats.generation_time += toc - tic
+
         keep_idx = []
         end_idx = []
         responses = []
@@ -1226,9 +1234,11 @@ class BatchGenerator:
         for e, (t, uid, num_tok, max_tok) in enumerate(
             zip(y, batch.uids, batch.num_tokens, batch.max_tokens)
         ):
+            prompt_cache = None
             num_tok += 1
             batch.num_tokens[e] = num_tok
-            if self.tokenizer.stopping_criteria(t):
+
+            if t in self.stop_tokens:
                 finish_reason = "stop"
                 end_idx.append(e)
             elif num_tok >= max_tok:
@@ -1237,7 +1247,14 @@ class BatchGenerator:
             else:
                 finish_reason = None
                 keep_idx.append(e)
-            responses.append(self.Response(uid, t, logprobs[e], finish_reason))
+
+            # Extract cache for completed sequences (for potential reuse)
+            if finish_reason is not None:
+                prompt_cache = lambda idx=e: batch.extract_cache(idx)
+
+            responses.append(
+                self.Response(uid, t, logprobs[e], finish_reason, prompt_cache)
+            )
 
         # Remove any finished completions
         if len(end_idx):
@@ -1254,7 +1271,468 @@ class BatchGenerator:
         return responses
 
     def next(self, **kwargs):
-        return self._next(**kwargs)
+        with mx.stream(generation_stream):
+            return self._next(**kwargs)
+
+
+# =============================================================================
+# ResponseGenerator - Concurrent Request Handling with Threaded Batching
+# =============================================================================
+
+
+@dataclass
+class GenerationArguments:
+    """Arguments for a generation request."""
+
+    max_tokens: int = 256
+    temperature: float = 0.0
+    top_p: float = 1.0
+    seed: Optional[int] = None
+    repetition_penalty: Optional[float] = None
+    repetition_context_size: Optional[int] = 20
+    logit_bias: Optional[Dict[int, float]] = None
+
+
+@dataclass
+class GenerationContext:
+    """Context returned when a request is queued."""
+
+    uid: int
+    prompt_tokens: int
+
+
+@dataclass
+class StreamingToken:
+    """A single token response during streaming generation."""
+
+    text: str
+    token: int
+    logprobs: float
+    finish_reason: Optional[str]
+
+
+class ResponseGenerator:
+    """
+    Manages concurrent request handling with threaded batching.
+
+    This class runs a dedicated generation thread that processes requests
+    from a queue using BatchGenerator. Requests are batched when possible
+    (same model, no seed) for better throughput.
+
+    Usage:
+        generator = ResponseGenerator(model, processor, stop_tokens)
+
+        # Submit a request
+        ctx, token_iterator = generator.generate(request, args)
+
+        # Consume tokens
+        for token in token_iterator:
+            print(token.text, end="")
+
+        # Cleanup when done
+        generator.stop_and_join()
+    """
+
+    def __init__(
+        self,
+        model,
+        processor,
+        stop_tokens: Optional[set] = None,
+    ):
+        """
+        Initialize the ResponseGenerator.
+
+        Args:
+            model: The VLM model.
+            processor: The tokenizer/processor.
+            stop_tokens: Set of token IDs that signal end of generation.
+        """
+        self.model = model
+        self.processor = processor
+        self.stop_tokens = stop_tokens or set()
+        self.tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        self.requests: Queue = Queue()
+        self._stop = False
+        self._supports_batching = True
+
+        self._generation_thread = Thread(target=self._generate, daemon=True)
+        self._generation_thread.start()
+
+    def stop_and_join(self):
+        """Stop the generation thread gracefully."""
+        self._stop = True
+        # Put a sentinel to wake up the thread if it's waiting
+        self.requests.put(None)
+        self._generation_thread.join(timeout=5.0)
+
+    def generate(
+        self,
+        prompt: str,
+        images: Optional[List] = None,
+        audio: Optional[List] = None,
+        args: Optional[GenerationArguments] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> Tuple[GenerationContext, Iterator[StreamingToken]]:
+        """
+        Submit a generation request and return a context and token iterator.
+
+        Args:
+            prompt: The formatted prompt text.
+            images: Optional list of images (paths, URLs, or PIL images).
+            audio: Optional list of audio files.
+            args: Generation arguments (max_tokens, temperature, etc.).
+            progress_callback: Optional callback for prefill progress.
+
+        Returns:
+            Tuple of (GenerationContext, token iterator).
+        """
+        args = args or GenerationArguments()
+        response_queue: Queue = Queue()
+
+        # Create request tuple
+        request = {
+            "prompt": prompt,
+            "images": images,
+            "audio": audio,
+            "args": args,
+            "progress_callback": progress_callback,
+        }
+
+        self.requests.put((response_queue, request))
+
+        # Get the initial context
+        ctx = response_queue.get()
+        if isinstance(ctx, Exception):
+            raise ctx
+
+        def token_iterator():
+            """Iterate over response tokens from the queue."""
+            try:
+                while True:
+                    response = response_queue.get(
+                        timeout=30.0
+                    )  # Timeout to prevent infinite wait
+                    if response is None:
+                        break
+                    if isinstance(response, Exception):
+                        raise response
+                    if isinstance(response, tuple):
+                        # Progress update (processed_tokens, total_tokens)
+                        if progress_callback is not None:
+                            progress_callback(*response)
+                        continue
+                    yield response
+            finally:
+                # Always request cleanup when iterator is done
+                self._request_cleanup(ctx.uid)
+
+        return ctx, token_iterator()
+
+    def _request_cleanup(self, uid: int):
+        """Request cleanup of a UID from the batch (called from client side)."""
+        # Put a cleanup request in the queue
+        self.requests.put(("_cleanup", uid))
+
+    def _is_batchable(self, args: GenerationArguments) -> bool:
+        """Check if request can be batched (no seed = batchable)."""
+        return args.seed is None
+
+    def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
+        """Create a sampler function for the given arguments."""
+        if args.temperature == 0:
+            return None  # Use default argmax
+
+        def sampler(logprobs: mx.array) -> mx.array:
+            if args.top_p > 0 and args.top_p < 1.0:
+                return top_p_sampling(logprobs, args.top_p, args.temperature)
+            else:
+                return mx.random.categorical(logprobs * (1 / args.temperature))
+
+        return sampler
+
+    def _preprocess_request(self, request: dict) -> Tuple[mx.array, dict]:
+        """
+        Preprocess a request to get input_ids and embeddings.
+
+        Returns:
+            Tuple of (input_ids, gen_kwargs with embeddings if multimodal).
+        """
+        prompt = request["prompt"]
+        images = request["images"]
+        audio = request["audio"]
+
+        add_special_tokens = (
+            not hasattr(self.processor, "chat_template")
+            if self.model.config.model_type in ["gemma3", "gemma3n"]
+            else True
+        )
+
+        image_token_index = getattr(self.model.config, "image_token_index", None)
+
+        inputs = prepare_inputs(
+            self.processor,
+            images=images,
+            audio=audio,
+            prompts=prompt,
+            image_token_index=image_token_index,
+            add_special_tokens=add_special_tokens,
+        )
+
+        input_ids = inputs.get("input_ids", None)
+        pixel_values = inputs.get("pixel_values", None)
+
+        data_kwargs = {
+            k: v
+            for k, v in inputs.items()
+            if k not in ["input_ids", "pixel_values", "attention_mask"]
+        }
+
+        gen_kwargs = {}
+        if pixel_values is not None:
+            embedding_output = self.model.get_input_embeddings(
+                input_ids, pixel_values, **data_kwargs
+            )
+
+            if isinstance(embedding_output, dict):
+                embed_kwargs = embedding_output
+            elif hasattr(embedding_output, "to_dict"):
+                embed_kwargs = {
+                    k: v for k, v in embedding_output.to_dict().items() if v is not None
+                }
+            else:
+                embed_kwargs = {"inputs_embeds": embedding_output}
+
+            gen_kwargs = {
+                "pixel_values": pixel_values,
+                **data_kwargs,
+                **embed_kwargs,
+            }
+
+        return input_ids, gen_kwargs
+
+    def _serve_single(self, response_queue: Queue, request: dict):
+        """
+        Serve a single non-batchable request (e.g., with seed).
+
+        Uses stream_generate for direct generation.
+        """
+        prompt = request["prompt"]
+        images = request["images"]
+        audio = request["audio"]
+        args = request["args"]
+
+        try:
+            # Set seed if specified
+            if args.seed is not None:
+                mx.random.seed(args.seed)
+
+            # Get input for context
+            input_ids, _ = self._preprocess_request(request)
+            prompt_tokens = (
+                input_ids.size if hasattr(input_ids, "size") else len(input_ids)
+            )
+
+            # Send context
+            ctx = GenerationContext(uid=-1, prompt_tokens=prompt_tokens)
+            response_queue.put(ctx)
+
+            # Generate using stream_generate
+            for result in stream_generate(
+                self.model,
+                self.processor,
+                prompt,
+                image=images,
+                audio=audio,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                repetition_penalty=args.repetition_penalty,
+                repetition_context_size=args.repetition_context_size,
+                logit_bias=args.logit_bias,
+            ):
+                token = StreamingToken(
+                    text=result.text,
+                    token=result.token,
+                    logprobs=(
+                        result.logprobs[result.token].item()
+                        if result.logprobs is not None
+                        else 0.0
+                    ),
+                    finish_reason=None,
+                )
+                response_queue.put(token)
+
+            # Send final token with finish reason
+            response_queue.put(None)
+
+        except Exception as e:
+            response_queue.put(e)
+        finally:
+            mx.clear_cache()
+
+    def _generate(self):
+        """
+        Main generation loop running in a dedicated thread.
+
+        Processes requests with continuous batching - multiple requests
+        can be processed together for better throughput.
+        """
+        batch_generator = None
+        # Maps UID -> {rqueue, tokens, gen_kwargs}
+        batch_results = {}
+
+        while not self._stop:
+            try:
+                # Determine timeout based on whether we have active work
+                timeout = 0.01 if batch_results else 0.1
+
+                # Try to get a new request
+                try:
+                    item = self.requests.get(timeout=timeout)
+                except QueueEmpty:
+                    item = None
+
+                if item is None:
+                    if self._stop:
+                        break
+                    # No new request - process existing batch if any
+                    if batch_generator is not None and batch_results:
+                        self._process_batch_step(batch_generator, batch_results)
+                    continue
+
+                # Sentinel for shutdown
+                if item is None:
+                    break
+
+                # Handle cleanup request
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "_cleanup":
+                    cleanup_uid = item[1]
+                    if cleanup_uid in batch_results:
+                        del batch_results[cleanup_uid]
+                    if batch_generator is not None:
+                        batch_generator.remove([cleanup_uid])
+                    continue
+
+                response_queue, request = item
+                args = request["args"]
+                has_media = bool(request.get("images") or request.get("audio"))
+
+                # Non-batchable: model doesn't support batching, has seed, or has images/audio
+                if (
+                    not self._supports_batching
+                    or not self._is_batchable(args)
+                    or has_media
+                ):
+                    # Drain current batch first
+                    if batch_generator is not None and batch_results:
+                        while batch_results:
+                            self._process_batch_step(batch_generator, batch_results)
+                        batch_generator.close()
+                        batch_generator = None
+
+                    self._serve_single(response_queue, request)
+                    continue
+
+                # Initialize batch generator if needed
+                if batch_generator is None:
+                    batch_generator = BatchGenerator(
+                        self.model.language_model,
+                        self.processor,
+                        stop_tokens=self.stop_tokens,
+                    )
+
+                # Preprocess and add to batch
+                try:
+                    input_ids, gen_kwargs = self._preprocess_request(request)
+                    prompt_tokens = (
+                        input_ids.size if hasattr(input_ids, "size") else len(input_ids)
+                    )
+
+                    sampler = self._make_sampler(args)
+
+                    # Insert and get UID
+                    (uid,) = batch_generator.insert(
+                        [input_ids.squeeze(0).tolist()],
+                        max_tokens=args.max_tokens,
+                        samplers=[sampler],
+                    )
+
+                    # Send context to client
+                    ctx = GenerationContext(uid=uid, prompt_tokens=prompt_tokens)
+                    response_queue.put(ctx)
+
+                    # Track this request by UID
+                    batch_results[uid] = {
+                        "rqueue": response_queue,
+                        "tokens": [],
+                        "gen_kwargs": gen_kwargs,
+                    }
+
+                except Exception as e:
+                    response_queue.put(e)
+
+            except Exception as e:
+                print(f"Error in generation thread: {e}")
+                import traceback
+
+                traceback.print_exc()
+
+        # Cleanup
+        if batch_generator is not None:
+            batch_generator.close()
+
+    def _process_batch_step(self, batch_generator: BatchGenerator, batch_results: dict):
+        """Process one generation step for all active requests."""
+        # Get gen_kwargs from first request (text-only batching uses empty kwargs)
+        gen_kwargs = {}
+        for result in batch_results.values():
+            if result.get("gen_kwargs"):
+                gen_kwargs = result["gen_kwargs"]
+                break
+
+        responses = batch_generator.next(**gen_kwargs)
+        if not responses:
+            return
+
+        for r in responses:
+            # r.uid identifies which request this token belongs to
+            if r.uid not in batch_results:
+                continue
+
+            result = batch_results[r.uid]
+            rqueue = result["rqueue"]
+            tokens = result["tokens"]
+
+            # Don't include stop tokens in output
+            if r.finish_reason == "stop":
+                text = ""
+            else:
+                # Collect token for this specific request
+                tokens.append(r.token)
+
+                # Decode incrementally for this request's tokens only
+                if len(tokens) >= 2:
+                    prev_text = self.tokenizer.decode(tokens[:-1])
+                    curr_text = self.tokenizer.decode(tokens)
+                    text = curr_text[len(prev_text) :]
+                else:
+                    text = self.tokenizer.decode(tokens)
+
+            # Send token to this request's queue
+            token_response = StreamingToken(
+                text=text,
+                token=r.token,
+                logprobs=r.logprobs[r.token].item() if r.logprobs is not None else 0.0,
+                finish_reason=r.finish_reason,
+            )
+            rqueue.put(token_response)
+
+            # Clean up finished request
+            if r.finish_reason is not None:
+                rqueue.put(None)  # Signal end
+                del batch_results[r.uid]
 
 
 def batch_generate(
@@ -1291,9 +1769,11 @@ def batch_generate(
        max_tokens (Union[int, List[int]]): Maximum number of output tokens. This
           can be per prompt if a list is provided.
        verbose (bool): If ``True``, print tokens and timing information.
+          Default: ``False``.
        group_by_shape (bool): If ``True``, group same-shaped images for efficient
-          batch processing.
+          batch processing. Default: ``True``.
        track_image_sizes (bool): If ``True``, track and return original image sizes.
+          Default: ``True``.
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
 
@@ -1449,12 +1929,12 @@ def _generate_batch(
     ]
 
     add_special_tokens = (
-        getattr(processor, "chat_template", None) is None
-        if model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
+        not hasattr(processor, "chat_template")
+        if model.config.model_type in ["gemma3", "gemma3n"]
         else True
     )
 
-    resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
+    resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)
 
     inputs = prepare_inputs(
@@ -1469,7 +1949,6 @@ def _generate_batch(
     )
     input_ids = inputs.get("input_ids", None)
     pixel_values = inputs.get("pixel_values", None)
-    mask = inputs.get("attention_mask", None)
 
     data_kwargs = {
         k: v
@@ -1477,11 +1956,8 @@ def _generate_batch(
         if k not in ["input_ids", "pixel_values", "attention_mask"]
     }
 
-    if getattr(model, "no_chunked_prefill", False):
-        kwargs.pop("prefill_step_size", None)
-        kwargs["prefill_step_size"] = None
-
     # Use batch_size for prefill and completion to ensure consistent processing
+    # BatchGenerator now handles wired_limit internally
     gen = BatchGenerator(
         model.language_model,
         processor,
@@ -1490,12 +1966,32 @@ def _generate_batch(
         **kwargs,
     )
 
-    with wired_limit(model, [generation_stream]):
-        embedding_output = model.get_input_embeddings(
-            input_ids, pixel_values, mask=mask, **data_kwargs
-        )
+    try:
+        if pixel_values is not None:
+            embedding_output = model.get_input_embeddings(
+                input_ids, pixel_values, **data_kwargs
+            )
 
-        gen_kwargs = {**data_kwargs, **embedding_output.to_dict()}
+            # Normalize embedding output to a kwargs dict expected by BatchGenerator
+            if isinstance(embedding_output, dict):
+                embed_kwargs = embedding_output
+            elif hasattr(embedding_output, "to_dict"):
+                # Convert to dict and keep non-None fields
+                embed_kwargs = {
+                    k: v for k, v in embedding_output.to_dict().items() if v is not None
+                }
+            else:
+                # Assume it's directly an inputs_embeds array
+                embed_kwargs = {"inputs_embeds": embedding_output}
+
+            gen_kwargs = {
+                "pixel_values": pixel_values,
+                **data_kwargs,
+                **embed_kwargs,
+            }
+        else:
+            input_ids = mx.squeeze(input_ids, axis=0)
+            gen_kwargs = {}
 
         uids = gen.insert(input_ids.tolist(), max_tokens)
         results = {uid: [] for uid in uids}
@@ -1503,15 +1999,10 @@ def _generate_batch(
             for r in responses:
                 if r.finish_reason != "stop":
                     results[r.uid].append(r.token)
+    finally:
+        gen.close()
 
-    detokenizer = processor.detokenizer
-    texts = []
-    for uid in uids:
-        detokenizer.reset()
-        for t in results[uid]:
-            detokenizer.add_token(t)
-        detokenizer.finalize()
-        texts.append(detokenizer.text)
+    texts = [tokenizer.decode(results[uid]) for uid in uids]
     return texts, gen.stats()
 
 
@@ -1525,7 +2016,6 @@ def main():
         args.adapter_path,
         revision=args.revision,
         trust_remote_code=args.trust_remote_code,
-        quantize_activations=args.quantize_activations,
     )
     config = model.config
 
@@ -1535,19 +2025,20 @@ def main():
     num_audios = (
         1 if args.audio is not None else 0
     )  # TODO: Support multiple audio files
-
-    chat_template_kwargs = {"enable_thinking": args.enable_thinking}
-
     prompt = apply_chat_template(
-        processor,
-        config,
-        prompt,
-        num_images=num_images,
-        num_audios=num_audios,
-        **chat_template_kwargs,
+        processor, config, prompt, num_images=num_images, num_audios=num_audios
     )
 
     kwargs = {}
+
+    if args.resize_shape is not None:
+        if len(args.resize_shape) not in [1, 2]:
+            raise ValueError("Resize shape must be 1 or 2 integers")
+        kwargs["resize_shape"] = (
+            (args.resize_shape[0],) * 2
+            if len(args.resize_shape) == 1
+            else tuple(args.resize_shape)
+        )
 
     if args.eos_tokens is not None:
         eos_tokens = []
@@ -1566,46 +2057,24 @@ def main():
     if args.processor_kwargs:
         kwargs.update(args.processor_kwargs)
 
-    # Add thinking kwargs
-    kwargs["enable_thinking"] = args.enable_thinking
-    if args.thinking_budget is not None:
-        kwargs["thinking_budget"] = args.thinking_budget
-        kwargs["thinking_end_token"] = args.thinking_end_token
-        if args.thinking_start_token is not None:
-            kwargs["thinking_start_token"] = args.thinking_start_token
-
     if args.chat:
-        from .vision_cache import VisionFeatureCache
-
-        vision_cache = VisionFeatureCache()
         chat = []
         if args.system:
             chat.append({"role": "system", "content": args.system})
         while user := input("User:"):
             chat.append({"role": "user", "content": user})
-            prompt = apply_chat_template(
-                processor, config, chat, num_images=num_images, **chat_template_kwargs
-            )
+            prompt = apply_chat_template(processor, config, chat, num_images=num_images)
             response = ""
             print("Assistant:", end="")
-            stream_kwargs = {
-                "max_tokens": args.max_tokens,
-                "temperature": args.temperature,
-                "vision_cache": vision_cache,
-                **kwargs,
-            }
-            if args.resize_shape is not None:
-                stream_kwargs["resize_shape"] = args.resize_shape
-            if args.prefill_step_size is not None:
-                stream_kwargs["prefill_step_size"] = args.prefill_step_size
-
             for chunk in stream_generate(
                 model,
                 processor,
                 prompt,
                 args.image,
                 args.audio,
-                **stream_kwargs,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                **kwargs,
             ):
                 response += chunk.text
                 print(chunk.text, end="")
@@ -1614,31 +2083,21 @@ def main():
             print()
 
     else:
-        gen_kwargs = {
-            "image": args.image,
-            "audio": args.audio,
-            "temperature": args.temperature,
-            "max_tokens": args.max_tokens,
-            "verbose": args.verbose,
-            "max_kv_size": args.max_kv_size,
-            "kv_bits": args.kv_bits,
-            "kv_group_size": args.kv_group_size,
-            "kv_quant_scheme": getattr(
-                args, "kv_quant_scheme", DEFAULT_KV_QUANT_SCHEME
-            ),
-            "quantized_kv_start": args.quantized_kv_start,
-            **kwargs,
-        }
-        if args.resize_shape is not None:
-            gen_kwargs["resize_shape"] = args.resize_shape
-        if args.prefill_step_size is not None:
-            gen_kwargs["prefill_step_size"] = args.prefill_step_size
-
         result = generate(
             model,
             processor,
             prompt,
-            **gen_kwargs,
+            image=args.image,
+            audio=args.audio,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            verbose=args.verbose,
+            prompt_cache=None,  # TODO: Load prompt cache from file
+            max_kv_size=args.max_kv_size,
+            kv_bits=args.kv_bits,
+            kv_group_size=args.kv_group_size,
+            quantized_kv_start=args.quantized_kv_start,
+            **kwargs,
         )
         if not args.verbose:
             print(result.text)
