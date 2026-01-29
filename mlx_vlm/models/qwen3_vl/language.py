@@ -513,12 +513,18 @@ class LanguageModel(nn.Module):
             self._rope_deltas = None
 
         cache_offset = 0
+        cache_offset_array = None  # For per-sequence offsets in batch mode
         if cache and cache[0] is not None:
             offset = cache[0].offset
             if isinstance(offset, int):
                 cache_offset = offset
             elif isinstance(offset, mx.array):
-                cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
+                if offset.ndim == 0:
+                    cache_offset = offset.item()
+                else:
+                    # Per-sequence offsets for batched generation
+                    cache_offset_array = offset
+                    cache_offset = offset[0].item()  # For compatibility checks
             else:
                 raise ValueError(f"Unexpected cache offset type: {type(offset)}")
 
@@ -529,12 +535,15 @@ class LanguageModel(nn.Module):
 
         if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
             # Calculate RoPE index once per generation in the pre-fill stage only
-            if (
+            recalc_condition = (
                 (cache is not None and cache[0] is not None and (cache_offset == 0))
                 or self._rope_deltas is None
                 or cache is None
-            ):
-                if self._position_ids is not None:
+            )
+            if recalc_condition:
+                # Only reuse _position_ids for chunked prefill (cache_offset > 0)
+                # For new prompts (cache_offset == 0), always recalculate
+                if self._position_ids is not None and cache_offset > 0:
                     seq_length = inputs.shape[1]
                     position_ids = self._position_ids[
                         :, :, cache_offset : cache_offset + seq_length
@@ -548,21 +557,34 @@ class LanguageModel(nn.Module):
             else:
                 # Use the prev pre-calculated rope-deltas to get the correct position ids
                 batch_size, seq_length = inputs.shape
-                delta = mx.array(
-                    cache_offset + self._rope_deltas if cache is not None else 0
-                )
+
+                # Use per-sequence offsets if available (for batched generation)
+                if cache_offset_array is not None:
+                    # Per-sequence cache offsets for continuous batching
+                    base_offset = cache_offset_array[:batch_size].reshape(-1, 1)
+                else:
+                    base_offset = mx.array(cache_offset)
+
+                # Add rope_deltas if available
+                if self._rope_deltas is not None:
+                    rope_delta = self._rope_deltas
+                    if rope_delta.ndim == 0:
+                        rope_delta = mx.expand_dims(rope_delta, axis=0)
+                    if rope_delta.shape[0] < batch_size:
+                        rope_delta = mx.tile(rope_delta, (batch_size, 1))
+                    else:
+                        rope_delta = rope_delta[:batch_size]
+                    delta = base_offset + rope_delta
+                else:
+                    delta = base_offset
+
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
 
-                if cache_offset is not None:
-                    if delta.ndim == 0:
-                        delta = mx.expand_dims(delta, axis=0)
-
-                    if delta.shape[0] < batch_size:
-                        delta = mx.tile(delta, (batch_size, 1))
-                    else:
-                        # Slice delta to match batch
-                        delta = delta[:batch_size]
+                if delta.ndim == 0:
+                    delta = mx.expand_dims(delta, axis=0)
+                if delta.ndim == 1:
+                    delta = delta.reshape(-1, 1)
 
                 position_ids = mx.add(position_ids, delta)[None, ...]
                 position_ids = mx.broadcast_to(

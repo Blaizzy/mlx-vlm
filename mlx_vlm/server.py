@@ -22,12 +22,17 @@ from .generate import (
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
+    GenerationArguments,
+    ResponseGenerator,
     generate,
     stream_generate,
 )
 from .prompt_utils import apply_chat_template
 from .utils import load
 from .version import __version__
+
+# Global response generator for continuous batching
+response_generator: Optional[ResponseGenerator] = None
 
 app = FastAPI(
     title="MLX-VLM Inference API",
@@ -76,8 +81,9 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
 def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
     """
     Factory function to get or load the appropriate model resources from cache or by loading.
+    Also creates/updates the ResponseGenerator for continuous batching.
     """
-    global model_cache
+    global model_cache, response_generator
 
     cache_key = (model_path, adapter_path)
 
@@ -94,6 +100,21 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
     # Load the model resources
     model, processor, config = load_model_resources(model_path, adapter_path)
 
+    # Get stop tokens from model config
+    stop_tokens = set()
+    if hasattr(config, "eos_token_id"):
+        if isinstance(config.eos_token_id, list):
+            stop_tokens.update(config.eos_token_id)
+        elif config.eos_token_id is not None:
+            stop_tokens.add(config.eos_token_id)
+
+    # Create ResponseGenerator for continuous batching
+    response_generator = ResponseGenerator(
+        model=model,
+        processor=processor,
+        stop_tokens=stop_tokens,
+    )
+
     model_cache = {
         "cache_key": cache_key,
         "model_path": model_path,
@@ -108,13 +129,20 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
 
 # Synchronous unload function for internal use
 def unload_model_sync():
-    global model_cache
+    global model_cache, response_generator
     if not model_cache:
         return False
 
     print(
         f"Unloading model: {model_cache.get('model_path')}, Adapter: {model_cache.get('adapter_path')}"
     )
+
+    # Stop the ResponseGenerator if running
+    if response_generator is not None:
+        print("Stopping ResponseGenerator...")
+        response_generator.stop_and_join()
+        response_generator = None
+
     # Clear references
     model_cache = {}
     # Force garbage collection
@@ -875,52 +903,98 @@ async def chat_completions_endpoint(request: ChatRequest):
         )
 
         if request.stream:
-            # Streaming response
+            # Streaming response using ResponseGenerator for continuous batching
             async def stream_generator():
+                global response_generator
                 token_iterator = None
+                token_iter = None  # For ResponseGenerator cleanup
                 try:
-                    # Use stream_generate from utils
-                    token_iterator = stream_generate(
-                        model=model,
-                        processor=processor,
-                        prompt=formatted_prompt,
-                        image=images,
-                        audio=audio,
-                        temperature=request.temperature,
-                        max_tokens=request.max_tokens,
-                        top_p=request.top_p,
-                        **kwargs,
-                    )
-
-                    for chunk in token_iterator:
-                        if chunk is None or not hasattr(chunk, "text"):
-                            print("Warning: Received unexpected chunk format:", chunk)
-                            continue
-
-                        # Yield chunks in Server-Sent Events (SSE) format
-                        usage_stats = {
-                            "input_tokens": chunk.prompt_tokens,
-                            "output_tokens": chunk.generation_tokens,
-                            "total_tokens": chunk.prompt_tokens
-                            + chunk.generation_tokens,
-                            "prompt_tps": chunk.prompt_tps,
-                            "generation_tps": chunk.generation_tps,
-                            "peak_memory": chunk.peak_memory,
-                        }
-
-                        choices = [
-                            ChatStreamChoice(
-                                delta=ChatMessage(role="assistant", content=chunk.text)
-                            )
-                        ]
-                        chunk_data = ChatStreamChunk(
-                            model=request.model, usage=usage_stats, choices=choices
+                    # Use ResponseGenerator if available, otherwise fall back to stream_generate
+                    if response_generator is not None:
+                        args = GenerationArguments(
+                            max_tokens=request.max_tokens,
+                            temperature=request.temperature,
+                            top_p=request.top_p,
+                        )
+                        ctx, token_iter = response_generator.generate(
+                            prompt=formatted_prompt,
+                            images=images if images else None,
+                            audio=audio if audio else None,
+                            args=args,
                         )
 
-                        yield f"data: {chunk_data.model_dump_json()}\n\n"
-                        await asyncio.sleep(
-                            0.01
-                        )  # Small sleep to prevent blocking event loop entirely
+                        output_tokens = 0
+                        for token in token_iter:
+                            output_tokens += 1
+                            usage_stats = {
+                                "input_tokens": ctx.prompt_tokens,
+                                "output_tokens": output_tokens,
+                                "total_tokens": ctx.prompt_tokens + output_tokens,
+                                "prompt_tps": 0.0,
+                                "generation_tps": 0.0,
+                                "peak_memory": 0.0,
+                            }
+
+                            choices = [
+                                ChatStreamChoice(
+                                    delta=ChatMessage(
+                                        role="assistant", content=token.text
+                                    )
+                                )
+                            ]
+                            chunk_data = ChatStreamChunk(
+                                model=request.model, usage=usage_stats, choices=choices
+                            )
+
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+                            await asyncio.sleep(0.01)
+
+                            if token.finish_reason:
+                                break
+                    else:
+                        # Fallback to stream_generate
+                        token_iterator = stream_generate(
+                            model=model,
+                            processor=processor,
+                            prompt=formatted_prompt,
+                            image=images,
+                            audio=audio,
+                            temperature=request.temperature,
+                            max_tokens=request.max_tokens,
+                            top_p=request.top_p,
+                            **kwargs,
+                        )
+
+                        for chunk in token_iterator:
+                            if chunk is None or not hasattr(chunk, "text"):
+                                print(
+                                    "Warning: Received unexpected chunk format:", chunk
+                                )
+                                continue
+
+                            usage_stats = {
+                                "input_tokens": chunk.prompt_tokens,
+                                "output_tokens": chunk.generation_tokens,
+                                "total_tokens": chunk.prompt_tokens
+                                + chunk.generation_tokens,
+                                "prompt_tps": chunk.prompt_tps,
+                                "generation_tps": chunk.generation_tps,
+                                "peak_memory": chunk.peak_memory,
+                            }
+
+                            choices = [
+                                ChatStreamChoice(
+                                    delta=ChatMessage(
+                                        role="assistant", content=chunk.text
+                                    )
+                                )
+                            ]
+                            chunk_data = ChatStreamChunk(
+                                model=request.model, usage=usage_stats, choices=choices
+                            )
+
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+                            await asyncio.sleep(0.01)
 
                     # Signal stream end
                     choices = [
@@ -941,6 +1015,12 @@ async def chat_completions_endpoint(request: ChatRequest):
                     yield f"data: {error_data}\n\n"
 
                 finally:
+                    # Close the token iterator to trigger cleanup (important for ResponseGenerator)
+                    if token_iter is not None:
+                        try:
+                            token_iter.close()
+                        except Exception:
+                            pass
                     mx.clear_cache()
                     gc.collect()
                     print("Stream finished, cleared cache.")
@@ -1053,6 +1133,7 @@ async def health_check():
         "status": "healthy",
         "loaded_model": model_cache.get("model_path", None),
         "loaded_adapter": model_cache.get("adapter_path", None),
+        "continuous_batching_enabled": response_generator is not None,
     }
 
 

@@ -209,7 +209,7 @@ curl -X POST "http://localhost:8080/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/Qwen2.5-VL-32B-Instruct-8bit",
-    [
+    "messages": [
       {
         "role": "system",
         "content": "You are a helpful assistant."
@@ -219,7 +219,7 @@ curl -X POST "http://localhost:8080/chat/completions" \
         "content": [
           {
             "type": "text",
-            "text": This is today's chart for energy demand in California. Can you provide an analysis of the chart and comment on the implications for renewable energy in California?"
+            "text": "This is today'\''s chart for energy demand in California. Can you provide an analysis of the chart and comment on the implications for renewable energy in California?"
           },
           {
             "type": "input_image",

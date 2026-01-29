@@ -5,7 +5,20 @@ import functools
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+from queue import Empty as QueueEmpty
+from queue import Queue
+from threading import Thread
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -177,10 +190,8 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
     to exiting the context manager.
     """
     if not mx.metal.is_available():
-        try:
-            yield
-        finally:
-            return
+        yield
+        return
 
     model_bytes = tree_reduce(
         lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
@@ -793,37 +804,60 @@ class BatchResponse:
 
 @dataclass
 class Batch:
+    """Holds state for multiple sequences being generated in parallel."""
+
     uids: List[int]
     y: mx.array
-    logprobs: mx.array
+    logprobs: List[mx.array]  # Per-sequence logprobs
     max_tokens: List[int]
     num_tokens: List[int]
     cache: List[Any]
+    samplers: List[Optional[Callable]]  # Per-sequence samplers
+    logits_processors: List[List[Callable]]  # Per-sequence logit processors
+    tokens: List[mx.array]  # Token history per sequence
 
     def __len__(self):
         return len(self.uids)
 
     def filter(self, keep_idx: List[int]):
+        """Remove finished sequences, keeping only those at keep_idx."""
         self.uids = [self.uids[k] for k in keep_idx]
         self.max_tokens = [self.max_tokens[k] for k in keep_idx]
         self.num_tokens = [self.num_tokens[k] for k in keep_idx]
+        self.logprobs = [self.logprobs[k] for k in keep_idx]
+        self.samplers = [self.samplers[k] for k in keep_idx]
+        self.logits_processors = [self.logits_processors[k] for k in keep_idx]
+        self.tokens = [self.tokens[k] for k in keep_idx]
         keep_idx = mx.array(keep_idx, mx.int32)
         self.y = self.y[keep_idx]
-        self.logprobs = self.logprobs[keep_idx]
         for c in self.cache:
             c.filter(keep_idx)
 
     def extend(self, other):
+        """Merge another batch into this one."""
         self.uids.extend(other.uids)
         self.y = mx.concatenate([self.y, other.y])
-        self.logprobs = mx.concatenate([self.logprobs, other.logprobs])
+        self.logprobs.extend(other.logprobs)
         self.num_tokens.extend(other.num_tokens)
         self.max_tokens.extend(other.max_tokens)
+        self.samplers.extend(other.samplers)
+        self.logits_processors.extend(other.logits_processors)
+        self.tokens.extend(other.tokens)
         for c, o in zip(self.cache, other.cache):
             c.extend(o)
 
+    def extract_cache(self, idx: int) -> List[Any]:
+        """Extract KV cache for a single sequence (for reuse after completion)."""
+        return [c.extract(idx) if hasattr(c, "extract") else None for c in self.cache]
+
 
 class BatchGenerator:
+    """
+    Manages batch generation with dynamic scheduling and per-sequence control.
+
+    Supports continuous batching where new prompts can be added while generation
+    is in progress. Each sequence can have its own sampler and logits processors.
+    """
 
     @dataclass
     class Response:
@@ -831,6 +865,7 @@ class BatchGenerator:
         token: int
         logprobs: mx.array
         finish_reason: Optional[str]
+        prompt_cache: Optional[Callable[[], List[Any]]] = None  # Cache getter for reuse
 
     def __init__(
         self,
@@ -839,11 +874,19 @@ class BatchGenerator:
         max_tokens: int = 128,
         stop_tokens: Optional[set] = None,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
+        logits_processors: Optional[
+            List[Callable[[mx.array, mx.array], mx.array]]
+        ] = None,
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
-        prompt_cache=None,
+        prompt_progress_callback: Optional[
+            Callable[[List[Tuple[int, int, int]]], None]
+        ] = None,
     ):
+        # Initialize _old_wired_limit first to ensure __del__ works even if __init__ fails
+        self._old_wired_limit = None
+
         self.model = model
         self.unprocessed_prompts = []
         self.max_tokens = max_tokens
@@ -852,47 +895,125 @@ class BatchGenerator:
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
         self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+        self.logits_processors = logits_processors or []
+        self.stop_tokens = stop_tokens or set()
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
-        self.completion_batch_size = completion_batch_size
-        self.prompt_cache = prompt_cache
+        self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
+        self.prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
         self._stats = BatchStats()
-
-        self.tokenizer.stopping_criteria.add_eos_token_ids(stop_tokens)
 
         self.active_batch = None
 
-    def insert(self, prompts, max_tokens: Union[List[int], int, None] = None):
+        # Set wired limit for memory management (if supported by MLX version)
+        if mx.metal.is_available() and hasattr(mx, "device_info"):
+            try:
+                self._old_wired_limit = mx.set_wired_limit(
+                    mx.device_info()["max_recommended_working_set_size"]
+                )
+            except Exception:
+                pass  # Older MLX version, skip wired limit management
+
+    def close(self):
+        """Clean up resources and restore wired limit."""
+        if self._old_wired_limit is not None:
+            mx.synchronize(generation_stream)
+            mx.set_wired_limit(self._old_wired_limit)
+            self._old_wired_limit = None
+
+    def __del__(self):
+        self.close()
+
+    def insert(
+        self,
+        prompts,
+        max_tokens: Union[List[int], int, None] = None,
+        samplers: Optional[List[Optional[Callable]]] = None,
+        logits_processors: Optional[List[List[Callable]]] = None,
+    ):
+        """
+        Add prompts to the generation queue.
+
+        Args:
+            prompts: List of token ID lists to generate from.
+            max_tokens: Maximum tokens to generate per prompt (int or list).
+            samplers: Per-prompt sampler functions (optional).
+            logits_processors: Per-prompt logits processor lists (optional).
+
+        Returns:
+            List of unique IDs for tracking each prompt's generation.
+        """
         uids = []
 
         if max_tokens is None or isinstance(max_tokens, int):
             max_tokens = [max_tokens or self.max_tokens] * len(prompts)
 
-        for p, m in zip(prompts, max_tokens):
-            self.unprocessed_prompts.append((self.uid_count, p, m))
+        # Default samplers and logits processors
+        samplers = samplers or [None] * len(prompts)
+        logits_processors = logits_processors or [self.logits_processors] * len(prompts)
+
+        for p, m, s, lp in zip(prompts, max_tokens, samplers, logits_processors):
+            self.unprocessed_prompts.append((self.uid_count, p, m, s, lp))
             uids.append(self.uid_count)
             self.uid_count += 1
-        # Sort in ascending order of length
+
+        # Sort in ascending order of length for efficient batching
         self.unprocessed_prompts = sorted(
             self.unprocessed_prompts, key=lambda x: len(x[1])
         )
         return uids
 
+    def remove(self, uids: List[int]):
+        """
+        Remove sequences from the batch by their UIDs.
+
+        Can remove from either the active batch or the unprocessed queue.
+        Useful for cancelling requests.
+
+        Args:
+            uids: List of UIDs to remove.
+        """
+        uids_set = set(uids)
+
+        # Remove from active batch
+        if self.active_batch is not None:
+            batch = self.active_batch
+            keep_idx = [e for e, uid in enumerate(batch.uids) if uid not in uids_set]
+            if len(keep_idx) > 0:
+                batch.filter(keep_idx)
+            else:
+                self.active_batch = None
+
+        # Remove from unprocessed queue
+        for i in reversed(range(len(self.unprocessed_prompts))):
+            if self.unprocessed_prompts[i][0] in uids_set:
+                self.unprocessed_prompts.pop(i)
+
     def _process_prompts(self, prompts, **kwargs) -> Batch:
-        uids, inputs, max_tokens = zip(*prompts)
+        """
+        Process a batch of prompts through prefill phase.
+
+        Args:
+            prompts: List of tuples (uid, tokens, max_tokens, sampler, logits_processors).
+            **kwargs: Additional model kwargs (inputs_embeds, etc.).
+
+        Returns:
+            Initialized Batch ready for generation.
+        """
+        uids, inputs, max_tokens, samplers, logits_processors = zip(*prompts)
         lengths = [len(p) for p in inputs]
         max_length = max(lengths)
 
         self._stats.prompt_tokens += sum(lengths)
         left_padding = [max_length - l for l in lengths]
-        inputs = _left_pad_prompts(inputs, max_length=max_length)
+        padded_inputs = _left_pad_prompts(inputs, max_length=max_length)
 
-        prompt_cache = (
-            _make_cache(self.model, left_padding)
-            if self.prompt_cache is None
-            else self.prompt_cache
-        )
+        prompt_cache = _make_cache(self.model, left_padding)
+
+        # Initialize token history for each sequence
+        tokens = [mx.array(inp) for inp in inputs]
+        processed_tokens = 0
 
         # Slice batch data in kwargs to match current batch size
         batch_size = len(uids)
@@ -903,11 +1024,11 @@ class BatchGenerator:
         inputs_embeds = kwargs.pop("inputs_embeds", None)
 
         if inputs_embeds is not None:
-            # Multimodal prefill
+            # Multimodal prefill with progress tracking
             while inputs_embeds.shape[1] > 1:
                 n_to_process = min(self.prefill_step_size, inputs_embeds.shape[1] - 1)
                 self.model(
-                    inputs[:, :n_to_process],
+                    padded_inputs[:, :n_to_process],
                     cache=prompt_cache,
                     inputs_embeds=inputs_embeds[:, :n_to_process],
                     n_to_process=n_to_process,
@@ -915,35 +1036,114 @@ class BatchGenerator:
                 )
                 mx.eval([c.state for c in prompt_cache])
                 inputs_embeds = inputs_embeds[:, n_to_process:]
-                inputs = inputs[:, n_to_process:]
+                padded_inputs = padded_inputs[:, n_to_process:]
+                processed_tokens += n_to_process
+                self.prompt_progress_callback(
+                    [
+                        (uid, processed_tokens, length)
+                        for uid, length in zip(uids, lengths)
+                    ]
+                )
                 mx.clear_cache()
 
-            kwargs = {"inputs_embeds": inputs_embeds}
+            step_kwargs = {"inputs_embeds": inputs_embeds}
 
         else:
-            # Text-only prefill
-            while inputs.shape[1] > 1 and inputs_embeds is None:
-                n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
-                self.model(inputs[:, :n_to_process], cache=prompt_cache)
+            # Text-only prefill with progress tracking
+            while padded_inputs.shape[1] > 1:
+                n_to_process = min(self.prefill_step_size, padded_inputs.shape[1] - 1)
+                self.model(padded_inputs[:, :n_to_process], cache=prompt_cache)
                 mx.eval([c.state for c in prompt_cache])
-                inputs = inputs[:, n_to_process:]
+                padded_inputs = padded_inputs[:, n_to_process:]
+                processed_tokens += n_to_process
+                self.prompt_progress_callback(
+                    [
+                        (uid, processed_tokens, length)
+                        for uid, length in zip(uids, lengths)
+                    ]
+                )
                 mx.clear_cache()
 
-        y, logprobs = self._step(inputs, prompt_cache, **kwargs)
-        mx.async_eval(y, logprobs)
+            step_kwargs = {}
+
+        y, logprobs = self._step(
+            padded_inputs,
+            prompt_cache,
+            list(samplers),
+            list(logits_processors),
+            tokens,
+            **step_kwargs,
+        )
+        mx.async_eval(y, *logprobs)
         mx.clear_cache()
+
         return Batch(
-            list(uids), y, logprobs, list(max_tokens), [0] * len(uids), prompt_cache
+            uids=list(uids),
+            y=y,
+            logprobs=logprobs,
+            max_tokens=list(max_tokens),
+            num_tokens=[0] * len(uids),
+            cache=prompt_cache,
+            samplers=list(samplers),
+            logits_processors=list(logits_processors),
+            tokens=tokens,
         )
 
-    def _step(self, input_tokens: mx.array, prompt_cache: List[Any], **kwargs):
+    def _step(
+        self,
+        input_tokens: mx.array,
+        prompt_cache: List[Any],
+        samplers: List[Optional[Callable]],
+        logits_processors: List[List[Callable]],
+        tokens: List[mx.array],
+        **kwargs,
+    ):
+        """
+        Execute one generation step for all sequences in the batch.
+
+        Args:
+            input_tokens: Current input tokens [batch_size, 1] or [batch_size, seq_len].
+            prompt_cache: KV cache for the batch.
+            samplers: Per-sequence sampler functions.
+            logits_processors: Per-sequence logits processor lists.
+            tokens: Token history per sequence (for logits processors).
+            **kwargs: Additional model kwargs.
+
+        Returns:
+            Tuple of (sampled_tokens, per_sequence_logprobs).
+        """
+        batch_size = input_tokens.shape[0]
+
         output = self.model(input_tokens, cache=prompt_cache, **kwargs)
         logits = output.logits[:, -1, :]
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        sampled = self.sampler(logprobs)
 
-        # TODO: Add KV cache quantization if specified
-        return sampled, logprobs
+        # Apply per-sequence logits processors
+        if any(logits_processors):
+            processed_logits = []
+            for e in range(batch_size):
+                sample_logits = logits[e : e + 1]
+                for processor in logits_processors[e]:
+                    sample_logits = processor(tokens[e], sample_logits)
+                processed_logits.append(sample_logits)
+            logits = mx.concatenate(processed_logits, axis=0)
+
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+        # Apply per-sequence samplers
+        if any(samplers):
+            all_samples = []
+            for e in range(batch_size):
+                sample_sampler = samplers[e] or self.sampler
+                sampled = sample_sampler(logprobs[e : e + 1])
+                all_samples.append(sampled)
+            sampled = mx.concatenate(all_samples, axis=0)
+        else:
+            sampled = self.sampler(logprobs)
+
+        # Return per-sequence logprobs as list
+        per_seq_logprobs = [logprobs[e] for e in range(batch_size)]
+
+        return sampled, per_seq_logprobs
 
     def stats(self):
         self._stats.prompt_tps = self._stats.prompt_tokens / self._stats.prompt_time
@@ -954,12 +1154,25 @@ class BatchGenerator:
         return self._stats
 
     def _next(self, **kwargs):
+        """
+        Execute one generation step, processing prompts and generating tokens.
+
+        This is the core scheduling method that:
+        1. Adds unprocessed prompts to the active batch (prefill phase)
+        2. Generates one token for all sequences in the batch
+        3. Removes finished sequences and returns responses
+
+        Returns:
+            List of Response objects for each sequence in the batch.
+        """
         tic = time.perf_counter()
 
         prompt_processing = False
         batch = self.active_batch
         num_active = len(batch) if batch else 0
         num_to_add = self.completion_batch_size - num_active
+
+        # Prefill phase: add new prompts to the batch
         while num_to_add >= self.prefill_batch_size:
             prompts = self.unprocessed_prompts[: self.prefill_batch_size]
             # Finish processing the last examples of the last batch
@@ -972,7 +1185,7 @@ class BatchGenerator:
             # Process prompts
             if batch is not None and not prompt_processing:
                 # Finish any active completion tokens
-                mx.eval(batch.y, batch.logprobs)
+                mx.eval(batch.y, *batch.logprobs)
                 self._stats.generation_time += time.perf_counter() - tic
                 tic = time.perf_counter()
 
@@ -992,8 +1205,20 @@ class BatchGenerator:
 
         batch = self.active_batch
         y, logprobs = batch.y, batch.logprobs
-        batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
-        mx.async_eval(batch.y, batch.logprobs)
+
+        # Update token history for each sequence
+        for i, toks in enumerate(batch.tokens):
+            batch.tokens[i] = mx.concatenate((toks, y[i : i + 1]))
+
+        # Generate next token
+        batch.y, batch.logprobs = self._step(
+            y[:, None],
+            batch.cache,
+            batch.samplers,
+            batch.logits_processors,
+            batch.tokens,
+        )
+        mx.async_eval(batch.y, *batch.logprobs)
 
         y = y.tolist()
         toc = time.perf_counter()
@@ -1001,6 +1226,7 @@ class BatchGenerator:
             self._stats.prompt_time += toc - tic
         else:
             self._stats.generation_time += toc - tic
+
         keep_idx = []
         end_idx = []
         responses = []
@@ -1008,9 +1234,11 @@ class BatchGenerator:
         for e, (t, uid, num_tok, max_tok) in enumerate(
             zip(y, batch.uids, batch.num_tokens, batch.max_tokens)
         ):
+            prompt_cache = None
             num_tok += 1
             batch.num_tokens[e] = num_tok
-            if self.tokenizer.stopping_criteria(t):
+
+            if t in self.stop_tokens:
                 finish_reason = "stop"
                 end_idx.append(e)
             elif num_tok >= max_tok:
@@ -1019,7 +1247,14 @@ class BatchGenerator:
             else:
                 finish_reason = None
                 keep_idx.append(e)
-            responses.append(self.Response(uid, t, logprobs[e], finish_reason))
+
+            # Extract cache for completed sequences (for potential reuse)
+            if finish_reason is not None:
+                prompt_cache = lambda idx=e: batch.extract_cache(idx)
+
+            responses.append(
+                self.Response(uid, t, logprobs[e], finish_reason, prompt_cache)
+            )
 
         # Remove any finished completions
         if len(end_idx):
@@ -1038,6 +1273,466 @@ class BatchGenerator:
     def next(self, **kwargs):
         with mx.stream(generation_stream):
             return self._next(**kwargs)
+
+
+# =============================================================================
+# ResponseGenerator - Concurrent Request Handling with Threaded Batching
+# =============================================================================
+
+
+@dataclass
+class GenerationArguments:
+    """Arguments for a generation request."""
+
+    max_tokens: int = 256
+    temperature: float = 0.0
+    top_p: float = 1.0
+    seed: Optional[int] = None
+    repetition_penalty: Optional[float] = None
+    repetition_context_size: Optional[int] = 20
+    logit_bias: Optional[Dict[int, float]] = None
+
+
+@dataclass
+class GenerationContext:
+    """Context returned when a request is queued."""
+
+    uid: int
+    prompt_tokens: int
+
+
+@dataclass
+class StreamingToken:
+    """A single token response during streaming generation."""
+
+    text: str
+    token: int
+    logprobs: float
+    finish_reason: Optional[str]
+
+
+class ResponseGenerator:
+    """
+    Manages concurrent request handling with threaded batching.
+
+    This class runs a dedicated generation thread that processes requests
+    from a queue using BatchGenerator. Requests are batched when possible
+    (same model, no seed) for better throughput.
+
+    Usage:
+        generator = ResponseGenerator(model, processor, stop_tokens)
+
+        # Submit a request
+        ctx, token_iterator = generator.generate(request, args)
+
+        # Consume tokens
+        for token in token_iterator:
+            print(token.text, end="")
+
+        # Cleanup when done
+        generator.stop_and_join()
+    """
+
+    def __init__(
+        self,
+        model,
+        processor,
+        stop_tokens: Optional[set] = None,
+    ):
+        """
+        Initialize the ResponseGenerator.
+
+        Args:
+            model: The VLM model.
+            processor: The tokenizer/processor.
+            stop_tokens: Set of token IDs that signal end of generation.
+        """
+        self.model = model
+        self.processor = processor
+        self.stop_tokens = stop_tokens or set()
+        self.tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        self.requests: Queue = Queue()
+        self._stop = False
+        self._supports_batching = True
+
+        self._generation_thread = Thread(target=self._generate, daemon=True)
+        self._generation_thread.start()
+
+    def stop_and_join(self):
+        """Stop the generation thread gracefully."""
+        self._stop = True
+        # Put a sentinel to wake up the thread if it's waiting
+        self.requests.put(None)
+        self._generation_thread.join(timeout=5.0)
+
+    def generate(
+        self,
+        prompt: str,
+        images: Optional[List] = None,
+        audio: Optional[List] = None,
+        args: Optional[GenerationArguments] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> Tuple[GenerationContext, Iterator[StreamingToken]]:
+        """
+        Submit a generation request and return a context and token iterator.
+
+        Args:
+            prompt: The formatted prompt text.
+            images: Optional list of images (paths, URLs, or PIL images).
+            audio: Optional list of audio files.
+            args: Generation arguments (max_tokens, temperature, etc.).
+            progress_callback: Optional callback for prefill progress.
+
+        Returns:
+            Tuple of (GenerationContext, token iterator).
+        """
+        args = args or GenerationArguments()
+        response_queue: Queue = Queue()
+
+        # Create request tuple
+        request = {
+            "prompt": prompt,
+            "images": images,
+            "audio": audio,
+            "args": args,
+            "progress_callback": progress_callback,
+        }
+
+        self.requests.put((response_queue, request))
+
+        # Get the initial context
+        ctx = response_queue.get()
+        if isinstance(ctx, Exception):
+            raise ctx
+
+        def token_iterator():
+            """Iterate over response tokens from the queue."""
+            try:
+                while True:
+                    response = response_queue.get(
+                        timeout=30.0
+                    )  # Timeout to prevent infinite wait
+                    if response is None:
+                        break
+                    if isinstance(response, Exception):
+                        raise response
+                    if isinstance(response, tuple):
+                        # Progress update (processed_tokens, total_tokens)
+                        if progress_callback is not None:
+                            progress_callback(*response)
+                        continue
+                    yield response
+            finally:
+                # Always request cleanup when iterator is done
+                self._request_cleanup(ctx.uid)
+
+        return ctx, token_iterator()
+
+    def _request_cleanup(self, uid: int):
+        """Request cleanup of a UID from the batch (called from client side)."""
+        # Put a cleanup request in the queue
+        self.requests.put(("_cleanup", uid))
+
+    def _is_batchable(self, args: GenerationArguments) -> bool:
+        """Check if request can be batched (no seed = batchable)."""
+        return args.seed is None
+
+    def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
+        """Create a sampler function for the given arguments."""
+        if args.temperature == 0:
+            return None  # Use default argmax
+
+        def sampler(logprobs: mx.array) -> mx.array:
+            if args.top_p > 0 and args.top_p < 1.0:
+                return top_p_sampling(logprobs, args.top_p, args.temperature)
+            else:
+                return mx.random.categorical(logprobs * (1 / args.temperature))
+
+        return sampler
+
+    def _preprocess_request(self, request: dict) -> Tuple[mx.array, dict]:
+        """
+        Preprocess a request to get input_ids and embeddings.
+
+        Returns:
+            Tuple of (input_ids, gen_kwargs with embeddings if multimodal).
+        """
+        prompt = request["prompt"]
+        images = request["images"]
+        audio = request["audio"]
+
+        add_special_tokens = (
+            not hasattr(self.processor, "chat_template")
+            if self.model.config.model_type in ["gemma3", "gemma3n"]
+            else True
+        )
+
+        image_token_index = getattr(self.model.config, "image_token_index", None)
+
+        inputs = prepare_inputs(
+            self.processor,
+            images=images,
+            audio=audio,
+            prompts=prompt,
+            image_token_index=image_token_index,
+            add_special_tokens=add_special_tokens,
+        )
+
+        input_ids = inputs.get("input_ids", None)
+        pixel_values = inputs.get("pixel_values", None)
+
+        data_kwargs = {
+            k: v
+            for k, v in inputs.items()
+            if k not in ["input_ids", "pixel_values", "attention_mask"]
+        }
+
+        gen_kwargs = {}
+        if pixel_values is not None:
+            embedding_output = self.model.get_input_embeddings(
+                input_ids, pixel_values, **data_kwargs
+            )
+
+            if isinstance(embedding_output, dict):
+                embed_kwargs = embedding_output
+            elif hasattr(embedding_output, "to_dict"):
+                embed_kwargs = {
+                    k: v for k, v in embedding_output.to_dict().items() if v is not None
+                }
+            else:
+                embed_kwargs = {"inputs_embeds": embedding_output}
+
+            gen_kwargs = {
+                "pixel_values": pixel_values,
+                **data_kwargs,
+                **embed_kwargs,
+            }
+
+        return input_ids, gen_kwargs
+
+    def _serve_single(self, response_queue: Queue, request: dict):
+        """
+        Serve a single non-batchable request (e.g., with seed).
+
+        Uses stream_generate for direct generation.
+        """
+        prompt = request["prompt"]
+        images = request["images"]
+        audio = request["audio"]
+        args = request["args"]
+
+        try:
+            # Set seed if specified
+            if args.seed is not None:
+                mx.random.seed(args.seed)
+
+            # Get input for context
+            input_ids, _ = self._preprocess_request(request)
+            prompt_tokens = (
+                input_ids.size if hasattr(input_ids, "size") else len(input_ids)
+            )
+
+            # Send context
+            ctx = GenerationContext(uid=-1, prompt_tokens=prompt_tokens)
+            response_queue.put(ctx)
+
+            # Generate using stream_generate
+            for result in stream_generate(
+                self.model,
+                self.processor,
+                prompt,
+                image=images,
+                audio=audio,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                repetition_penalty=args.repetition_penalty,
+                repetition_context_size=args.repetition_context_size,
+                logit_bias=args.logit_bias,
+            ):
+                token = StreamingToken(
+                    text=result.text,
+                    token=result.token,
+                    logprobs=(
+                        result.logprobs[result.token].item()
+                        if result.logprobs is not None
+                        else 0.0
+                    ),
+                    finish_reason=None,
+                )
+                response_queue.put(token)
+
+            # Send final token with finish reason
+            response_queue.put(None)
+
+        except Exception as e:
+            response_queue.put(e)
+        finally:
+            mx.clear_cache()
+
+    def _generate(self):
+        """
+        Main generation loop running in a dedicated thread.
+
+        Processes requests with continuous batching - multiple requests
+        can be processed together for better throughput.
+        """
+        batch_generator = None
+        # Maps UID -> {rqueue, tokens, gen_kwargs}
+        batch_results = {}
+
+        while not self._stop:
+            try:
+                # Determine timeout based on whether we have active work
+                timeout = 0.01 if batch_results else 0.1
+
+                # Try to get a new request
+                try:
+                    item = self.requests.get(timeout=timeout)
+                except QueueEmpty:
+                    item = None
+
+                if item is None:
+                    if self._stop:
+                        break
+                    # No new request - process existing batch if any
+                    if batch_generator is not None and batch_results:
+                        self._process_batch_step(batch_generator, batch_results)
+                    continue
+
+                # Sentinel for shutdown
+                if item is None:
+                    break
+
+                # Handle cleanup request
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "_cleanup":
+                    cleanup_uid = item[1]
+                    if cleanup_uid in batch_results:
+                        del batch_results[cleanup_uid]
+                    if batch_generator is not None:
+                        batch_generator.remove([cleanup_uid])
+                    continue
+
+                response_queue, request = item
+                args = request["args"]
+                has_media = bool(request.get("images") or request.get("audio"))
+
+                # Non-batchable: model doesn't support batching, has seed, or has images/audio
+                if (
+                    not self._supports_batching
+                    or not self._is_batchable(args)
+                    or has_media
+                ):
+                    # Drain current batch first
+                    if batch_generator is not None and batch_results:
+                        while batch_results:
+                            self._process_batch_step(batch_generator, batch_results)
+                        batch_generator.close()
+                        batch_generator = None
+
+                    self._serve_single(response_queue, request)
+                    continue
+
+                # Initialize batch generator if needed
+                if batch_generator is None:
+                    batch_generator = BatchGenerator(
+                        self.model.language_model,
+                        self.processor,
+                        stop_tokens=self.stop_tokens,
+                    )
+
+                # Preprocess and add to batch
+                try:
+                    input_ids, gen_kwargs = self._preprocess_request(request)
+                    prompt_tokens = (
+                        input_ids.size if hasattr(input_ids, "size") else len(input_ids)
+                    )
+
+                    sampler = self._make_sampler(args)
+
+                    # Insert and get UID
+                    (uid,) = batch_generator.insert(
+                        [input_ids.squeeze(0).tolist()],
+                        max_tokens=args.max_tokens,
+                        samplers=[sampler],
+                    )
+
+                    # Send context to client
+                    ctx = GenerationContext(uid=uid, prompt_tokens=prompt_tokens)
+                    response_queue.put(ctx)
+
+                    # Track this request by UID
+                    batch_results[uid] = {
+                        "rqueue": response_queue,
+                        "tokens": [],
+                        "gen_kwargs": gen_kwargs,
+                    }
+
+                except Exception as e:
+                    response_queue.put(e)
+
+            except Exception as e:
+                print(f"Error in generation thread: {e}")
+                import traceback
+
+                traceback.print_exc()
+
+        # Cleanup
+        if batch_generator is not None:
+            batch_generator.close()
+
+    def _process_batch_step(self, batch_generator: BatchGenerator, batch_results: dict):
+        """Process one generation step for all active requests."""
+        # Get gen_kwargs from first request (text-only batching uses empty kwargs)
+        gen_kwargs = {}
+        for result in batch_results.values():
+            if result.get("gen_kwargs"):
+                gen_kwargs = result["gen_kwargs"]
+                break
+
+        responses = batch_generator.next(**gen_kwargs)
+        if not responses:
+            return
+
+        for r in responses:
+            # r.uid identifies which request this token belongs to
+            if r.uid not in batch_results:
+                continue
+
+            result = batch_results[r.uid]
+            rqueue = result["rqueue"]
+            tokens = result["tokens"]
+
+            # Don't include stop tokens in output
+            if r.finish_reason == "stop":
+                text = ""
+            else:
+                # Collect token for this specific request
+                tokens.append(r.token)
+
+                # Decode incrementally for this request's tokens only
+                if len(tokens) >= 2:
+                    prev_text = self.tokenizer.decode(tokens[:-1])
+                    curr_text = self.tokenizer.decode(tokens)
+                    text = curr_text[len(prev_text) :]
+                else:
+                    text = self.tokenizer.decode(tokens)
+
+            # Send token to this request's queue
+            token_response = StreamingToken(
+                text=text,
+                token=r.token,
+                logprobs=r.logprobs[r.token].item() if r.logprobs is not None else 0.0,
+                finish_reason=r.finish_reason,
+            )
+            rqueue.put(token_response)
+
+            # Clean up finished request
+            if r.finish_reason is not None:
+                rqueue.put(None)  # Signal end
+                del batch_results[r.uid]
 
 
 def batch_generate(
@@ -1262,6 +1957,7 @@ def _generate_batch(
     }
 
     # Use batch_size for prefill and completion to ensure consistent processing
+    # BatchGenerator now handles wired_limit internally
     gen = BatchGenerator(
         model.language_model,
         processor,
@@ -1270,7 +1966,7 @@ def _generate_batch(
         **kwargs,
     )
 
-    with wired_limit(model, [generation_stream]):
+    try:
         if pixel_values is not None:
             embedding_output = model.get_input_embeddings(
                 input_ids, pixel_values, **data_kwargs
@@ -1303,6 +1999,8 @@ def _generate_batch(
             for r in responses:
                 if r.finish_reason != "stop":
                     results[r.uid].append(r.token)
+    finally:
+        gen.close()
 
     texts = [tokenizer.decode(results[uid]) for uid in uids]
     return texts, gen.stats()
