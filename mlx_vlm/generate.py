@@ -395,8 +395,8 @@ def generate_step(
                     input_offset += n_to_process
                     quantize_cache_fn(prompt_cache)
                     mx.clear_cache()
-                    # pbar.update(n_to_process)
-                input_ids = input_ids[:, -1:]
+                    pbar.update(n_to_process)
+            input_ids = input_ids[:, -1:]
 
         # Final step with last embedding to get logits
         # print("calling language model")
