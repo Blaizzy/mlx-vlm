@@ -159,6 +159,14 @@ def parse_arguments():
         help="Extra processor kwargs as JSON. "
         'Example: --processor-kwargs \'{"cropping": false, "max_patches": 3}\'',
     )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=None,
+        help="Number of tokens to process per prefill step. "
+        "Lower values reduce peak memory usage but may be slower. "
+        "Try 512 or 256 if you hit GPU memory errors during prefill.",
+    )
 
     return parser.parse_args()
 
@@ -177,10 +185,8 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
     to exiting the context manager.
     """
     if not mx.metal.is_available():
-        try:
-            yield
-        finally:
-            return
+        yield
+        return
 
     model_bytes = tree_reduce(
         lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
@@ -376,7 +382,7 @@ def generate_step(
         }
     )
 
-    if inputs_embeds.shape[1] > prefill_step_size:
+    if prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size:
         # Chunked prefill with embeddings
         total_tokens = inputs_embeds.shape[1]
         input_offset = 0
@@ -1368,15 +1374,21 @@ def main():
             prompt = apply_chat_template(processor, config, chat, num_images=num_images)
             response = ""
             print("Assistant:", end="")
+            stream_kwargs = {
+                "max_tokens": args.max_tokens,
+                "temperature": args.temperature,
+                **kwargs,
+            }
+            if args.prefill_step_size is not None:
+                stream_kwargs["prefill_step_size"] = args.prefill_step_size
+
             for chunk in stream_generate(
                 model,
                 processor,
                 prompt,
                 args.image,
                 args.audio,
-                max_tokens=args.max_tokens,
-                temperature=args.temperature,
-                **kwargs,
+                **stream_kwargs,
             ):
                 response += chunk.text
                 print(chunk.text, end="")
@@ -1385,21 +1397,26 @@ def main():
             print()
 
     else:
+        gen_kwargs = {
+            "image": args.image,
+            "audio": args.audio,
+            "temperature": args.temperature,
+            "max_tokens": args.max_tokens,
+            "verbose": args.verbose,
+            "max_kv_size": args.max_kv_size,
+            "kv_bits": args.kv_bits,
+            "kv_group_size": args.kv_group_size,
+            "quantized_kv_start": args.quantized_kv_start,
+            **kwargs,
+        }
+        if args.prefill_step_size is not None:
+            gen_kwargs["prefill_step_size"] = args.prefill_step_size
+
         result = generate(
             model,
             processor,
             prompt,
-            image=args.image,
-            audio=args.audio,
-            temperature=args.temperature,
-            max_tokens=args.max_tokens,
-            verbose=args.verbose,
-            prompt_cache=None,  # TODO: Load prompt cache from file
-            max_kv_size=args.max_kv_size,
-            kv_bits=args.kv_bits,
-            kv_group_size=args.kv_group_size,
-            quantized_kv_start=args.quantized_kv_start,
-            **kwargs,
+            **gen_kwargs,
         )
         if not args.verbose:
             print(result.text)
