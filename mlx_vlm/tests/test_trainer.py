@@ -95,20 +95,42 @@ class TestTrainer(unittest.TestCase):
 
         self.mock_model = DummyModel()
         self.mock_optimizer = MagicMock()
-        self.trainer = train(
+        # Configure the optimizer to have a proper learning_rate
+        self.mock_optimizer.learning_rate = 1e-4
+
+    @patch("mlx_vlm.trainer.trainer.iterate_batches")
+    @patch("mlx_vlm.trainer.trainer.mx.save_safetensors")
+    def test_trainer_initialization(self, mock_save_safetensors, mock_iterate_batches):
+        # Create a properly shaped mock batch
+        mock_batch = {
+            "input_ids": mx.array([[1, 2, 3], [1, 2, 3], [1, 2, 3], [1, 2, 3]]),
+            "attention_mask": mx.array([[1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1]]),
+            "pixel_values": mx.array([[[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]]]),
+            "labels": mx.array([[0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1, 2]]),
+        }
+        mock_iterate_batches.return_value = iter([mock_batch])
+        
+        # train() function doesn't return a trainer object, it just runs training
+        # Test that it completes without errors
+        result = train(
             model=self.mock_model,
             optimizer=self.mock_optimizer,
             train_dataset=MagicMock(__len__=lambda self: 4),
             val_dataset=None,
             args=TrainingArgs(iters=1, batch_size=4),
         )
-
-    def test_trainer_initialization(self):
-        self.assertEqual(self.trainer.model, self.mock_model)
-        self.assertEqual(self.trainer.optimizer, self.mock_optimizer)
+        
+        # Verify the function completed (returns None)
+        self.assertIsNone(result)
+        # Verify optimizer was called during training
+        self.mock_optimizer.update.assert_called()
+        # Verify model weights were saved
+        mock_save_safetensors.assert_called()
 
     @patch("mlx_vlm.trainer.trainer.iterate_batches")
-    def test_train_smoke(self, mock_iterate_batches):
+    @patch("mlx_vlm.trainer.trainer.mx.save_safetensors")
+    def test_train_smoke(self, mock_save_safetensors, mock_iterate_batches):
+        # Create a properly shaped mock batch with labels matching logits shape
         mock_batch = {
             "input_ids": mx.array([[1, 2, 3], [1, 2, 3], [1, 2, 3], [1, 2, 3]]),
             "attention_mask": mx.array([[1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1]]),
@@ -126,6 +148,8 @@ class TestTrainer(unittest.TestCase):
         )
 
         self.mock_optimizer.update.assert_called()
+        # Verify model weights were saved at the end of training
+        mock_save_safetensors.assert_called()
 
 
 if __name__ == "__main__":
