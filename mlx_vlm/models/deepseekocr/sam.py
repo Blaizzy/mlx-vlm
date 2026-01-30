@@ -251,6 +251,7 @@ class SAMEncoder(nn.Module):
         use_rel_pos: bool = True,
         window_size: int = 14,
         global_attn_indexes: Tuple[int, ...] = (2, 5, 8, 11),
+        final_out_chans: int = 1024,
     ) -> None:
         """
         Args:
@@ -269,6 +270,7 @@ class SAMEncoder(nn.Module):
             use_rel_pos (bool): If True, add relative positional embeddings to the attention map.
             window_size (int): Window size for window attention blocks.
             global_attn_indexes (tuple): Indexes for blocks using global attention.
+            final_out_chans (int): Final output channels after net_3 (1024 for OCR, 896 for OCR-2).
         """
         super().__init__()
         self.img_size = img_size
@@ -313,7 +315,7 @@ class SAMEncoder(nn.Module):
         # Additional downsampling layers
         self.net_2 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1, bias=False)
         self.net_3 = nn.Conv2d(
-            512, 1024, kernel_size=3, stride=2, padding=1, bias=False
+            512, final_out_chans, kernel_size=3, stride=2, padding=1, bias=False
         )
 
     def __call__(self, x: mx.array) -> mx.array:

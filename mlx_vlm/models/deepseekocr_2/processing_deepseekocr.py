@@ -2,7 +2,6 @@
 From https://github.com/deepseek-ai/DeepSeek-VL2
 """
 
-import math
 from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Tuple
 
@@ -146,7 +145,7 @@ class ImageTransform:
         return img
 
 
-class DeepseekOCRProcessor(ProcessorMixin):
+class DeepseekOCR2Processor(ProcessorMixin):
     tokenizer_class = ("LlamaTokenizer", "LlamaTokenizerFast")
     attributes = ["tokenizer"]
 
@@ -266,8 +265,10 @@ class DeepseekOCRProcessor(ProcessorMixin):
         images: List[Image.Image] = None,
         inference_mode: bool = True,
         base_size: int = 1024,
-        image_size: int = 640,
+        image_size: int = 768,
         cropping: bool = True,
+        min_patches: int = 1,
+        max_patches: int = 6,
     ):
 
         sft_format = prompt
@@ -283,6 +284,8 @@ class DeepseekOCRProcessor(ProcessorMixin):
             base_size=base_size,
             image_size=image_size,
             cropping=cropping,
+            min_patches=min_patches,
+            max_patches=max_patches,
         )
 
         masked_tokenized_str = []
@@ -341,177 +344,132 @@ class DeepseekOCRProcessor(ProcessorMixin):
         conversation: str,
         images: List[Image.Image],
         base_size: int = 1024,
-        image_size: int = 640,
+        image_size: int = 768,
         cropping: bool = True,
+        min_patches: int = 1,
+        max_patches: int = 6,
     ):
+        """Tokenize text with <image> tags.
 
-        patch_size = 16
-        downsample_ratio = 4
-        valid_img_tokens = 0
-        ratio = 1
+        For DeepSeek-OCR-2 with Qwen2 encoder:
+        - Global view (1024x1024): 256 tokens from Qwen2 encoder
+        - Local patches (768x768): 144 tokens each from Qwen2 encoder
+        - Plus 1 view_separator token
 
-        image_draw = images[0].copy()
+        Dynamic resolution:
+        - Total tokens = (num_patches * 144) + 256 + 1
+        - Default: 0-6 patches at 768x768 + 1 global at 1024x1024
+        """
+        # Token counts for Qwen2 encoder
+        TOKENS_PER_PATCH = 144  # 12x12 SAM features for 768x768
+        TOKENS_PER_GLOBAL = 256  # 16x16 SAM features for 1024x1024
+        TOKENS_VIEW_SEP = 1
 
-        w, h = image_draw.size
-
-        ratio = 1 - ((max(w, h) - min(w, h)) / (max(w, h)))
-
-        """Tokenize text with <image> tags."""
         assert conversation.count(self.image_token) == len(
             images
         ), f"The number of image tokens in the prompt does not match the number of images: {conversation.count(self.image_token)} != {len(images)}"
+
         text_splits = conversation.split(self.image_token)
 
-        images_list, images_crop_list, images_seq_mask = [], [], []
+        all_patches_list = []
+        all_global_list = []
+        images_seq_mask = []
         tokenized_str = []
         images_spatial_crop = []
-        for text_sep, image in zip(text_splits, images):
+        num_image_tokens_list = []
 
+        for text_sep, image in zip(text_splits, images):
+            # Tokenize the text before this image
             tokenized_sep = self.encode(text_sep, bos=False, eos=False)
             tokenized_str += tokenized_sep
             images_seq_mask += [False] * len(tokenized_sep)
 
-            if cropping:
+            # Process global view: pad to base_size x base_size (1024x1024)
+            global_view = ImageOps.pad(
+                image,
+                (base_size, base_size),
+                color=tuple(int(x * 255) for x in self.image_transform.mean),
+            )
+            global_tensor = self.image_transform(global_view).astype(mx.bfloat16)
+            all_global_list.append(global_tensor)
 
-                if image.size[0] <= 640 and image.size[1] <= 640:
-                    crop_ratio = [1, 1]
-
-                else:
-                    if cropping:
-                        # best_width, best_height = select_best_resolution(image.size, self.candidate_resolutions)
-                        images_crop_raw, crop_ratio = dynamic_preprocess(image)
-
-                    else:
-                        # best_width, best_height = self.image_size, self.image_size
-                        crop_ratio = [1, 1]
-
-                """process the global view"""
-                # image = image.resize((base_size, base_size))
-                global_view = ImageOps.pad(
+            # Process local patches using dynamic resolution
+            if cropping and min_patches > 0:
+                # Use dynamic_preprocess to split image into patches
+                patches, (rows, cols) = dynamic_preprocess(
                     image,
-                    (base_size, base_size),
-                    color=tuple(int(x * 255) for x in self.image_transform.mean),
+                    min_num=min_patches,
+                    max_num=max_patches,
+                    image_size=image_size,  # 768x768 patches
+                    use_thumbnail=False,
                 )
+                num_patches = len(patches)
 
-                if base_size == 1024:
-                    valid_img_tokens += int(256 * ratio)
-                elif base_size == 1280:
-                    valid_img_tokens += int(400 * ratio)
-                elif base_size == 640:
-                    valid_img_tokens += int(100 * ratio)
+                # Transform each patch
+                patch_tensors = []
+                for patch in patches:
+                    patch_tensor = self.image_transform(patch).astype(mx.bfloat16)
+                    patch_tensors.append(patch_tensor)
 
-                images_list.append(
-                    self.image_transform(global_view).astype(mx.bfloat16)
-                )
+                if patch_tensors:
+                    patches_stacked = mx.stack(patch_tensors, axis=0)
+                    all_patches_list.append(patches_stacked)
 
-                width_crop_num, height_crop_num = crop_ratio
-
-                images_spatial_crop.append([width_crop_num, height_crop_num])
-
-                if width_crop_num > 1 or height_crop_num > 1:
-                    """process the local views"""
-
-                    for i in range(len(images_crop_raw)):
-                        images_crop_list.append(
-                            self.image_transform(images_crop_raw[i]).astype(mx.bfloat16)
-                        )
-
-                if image_size == 640:
-                    valid_img_tokens += len(images_crop_list) * 100
-
-                num_queries = math.ceil((image_size // patch_size) / downsample_ratio)
-                num_queries_base = math.ceil(
-                    (base_size // patch_size) / downsample_ratio
-                )
-
-                """add image tokens"""
-
-                tokenized_image = (
-                    [self.image_token_id] * num_queries_base + [self.image_token_id]
-                ) * num_queries_base
-                tokenized_image += [self.image_token_id]
-                if width_crop_num > 1 or height_crop_num > 1:
-                    tokenized_image += (
-                        [self.image_token_id] * (num_queries * width_crop_num)
-                        + [self.image_token_id]
-                    ) * (num_queries * height_crop_num)
-                tokenized_str += tokenized_image
-                images_seq_mask += [True] * len(tokenized_image)
-
+                images_spatial_crop.append([rows, cols])
             else:
+                # No patches, only global view
+                num_patches = 0
+                images_spatial_crop.append([0, 0])
 
-                """process the global view"""
-                if image_size <= 640:
-                    print("directly resize")
-                    image = image.resize((image_size, image_size))
+            # Calculate number of image tokens for this image
+            # Order: [local_patches, global_view, view_separator]
+            num_image_tokens = (
+                (num_patches * TOKENS_PER_PATCH) + TOKENS_PER_GLOBAL + TOKENS_VIEW_SEP
+            )
+            num_image_tokens_list.append(num_image_tokens)
 
-                global_view = ImageOps.pad(
-                    image,
-                    (image_size, image_size),
-                    color=tuple(int(x * 255) for x in self.image_transform.mean),
-                )
-                images_list.append(
-                    self.image_transform(global_view).astype(mx.bfloat16)
-                )
+            # Add image tokens to sequence
+            tokenized_image = [self.image_token_id] * num_image_tokens
+            tokenized_str += tokenized_image
+            images_seq_mask += [True] * len(tokenized_image)
 
-                if base_size == 1024:
-                    valid_img_tokens += int(256 * ratio)
-                elif base_size == 1280:
-                    valid_img_tokens += int(400 * ratio)
-                elif base_size == 640:
-                    valid_img_tokens += int(100 * 1)
-                elif base_size == 512:
-                    valid_img_tokens += int(64 * 1)
-
-                width_crop_num, height_crop_num = 1, 1
-
-                images_spatial_crop.append([width_crop_num, height_crop_num])
-
-                """add image tokens"""
-                num_queries = math.ceil((image_size // patch_size) / downsample_ratio)
-
-                tokenized_image = (
-                    [self.image_token_id] * num_queries + [self.image_token_id]
-                ) * num_queries
-                tokenized_image += [self.image_token_id]
-
-                tokenized_str += tokenized_image
-                images_seq_mask += [True] * len(tokenized_image)
-
+        # Tokenize the text after the last image
         tokenized_sep = self.encode(text_splits[-1], bos=False, eos=False)
         tokenized_str += tokenized_sep
         images_seq_mask += [False] * len(tokenized_sep)
 
-        """add the bos tokens"""
+        # Add the bos token
         bos_id = 0
         tokenized_str = [bos_id] + tokenized_str
         images_seq_mask = [False] + images_seq_mask
 
         images_seq_mask = mx.array(images_seq_mask)
 
-        if len(images_list) == 0:
-            images_ori = mx.zeros((1, 3, image_size, image_size))
+        # Stack global images
+        if len(all_global_list) == 0:
+            images_ori = mx.zeros((1, 3, base_size, base_size))
             images_spatial_crop = mx.zeros((1, 2))
-            images_crop = mx.zeros((1, 3, base_size, base_size))
-
         else:
-            images_ori = mx.stack(images_list, axis=0)
+            images_ori = mx.stack(all_global_list, axis=0)
             images_spatial_crop = mx.array(images_spatial_crop)
-            if images_crop_list:
-                images_crop = mx.stack(images_crop_list, axis=0)
-            else:
-                images_crop = mx.zeros((1, 3, base_size, base_size))
+
+        # Stack patches (or zeros if no patches)
+        if all_patches_list:
+            # Concatenate all patches from all images
+            images_patches = mx.concatenate(all_patches_list, axis=0)
+        else:
+            images_patches = mx.zeros((1, 3, image_size, image_size))
 
         assert len(tokenized_str) == len(
             images_seq_mask
-        ), f"tokenize_with_images func: tokenized_str's length {len(tokenized_str)} is not equal to imags_seq_mask's length {len(images_seq_mask)}"
+        ), f"tokenize_with_images func: tokenized_str's length {len(tokenized_str)} is not equal to images_seq_mask's length {len(images_seq_mask)}"
 
         return (
             tokenized_str,
-            [images_crop, images_ori],
+            [images_patches, images_ori],
             images_seq_mask,
             images_spatial_crop,
-            valid_img_tokens,
+            num_image_tokens_list[0] if num_image_tokens_list else 257,
         )
 
     def __call__(
@@ -520,26 +478,33 @@ class DeepseekOCRProcessor(ProcessorMixin):
         text: str = None,
         images: List[Image.Image] = None,
         inference_mode: bool = True,
-        image_size: int = 640,
+        image_size: int = 768,
         base_size: int = 1024,
         cropping: bool = True,
+        min_patches: int = 1,
+        max_patches: int = 6,
         padding: bool = True,
         return_tensors: Literal["np", "mx", "pt"] = "mx",
         **kwargs,
     ):
-        """
+        """Process text and images for DeepSeek-OCR-2.
 
         Args:
-            text (str or List[str]): the formatted prompt(s);
-            images (List[ImageType]): the list of images (one per prompt for batched inputs);
-            inference_mode (bool): if True, then remove the last eos token;
+            text (str or List[str]): the formatted prompt(s)
+            images (List[ImageType]): the list of images (one per prompt for batched inputs)
+            inference_mode (bool): if True, remove the last eos token
+            image_size (int): size of local patches (default 768)
+            base_size (int): size of global view (default 1024)
+            cropping (bool): whether to use dynamic resolution with local patches
+            min_patches (int): minimum number of patches (default 1)
+            max_patches (int): maximum number of patches (default 6)
 
         Returns:
-            outputs (BaseProcessorOutput): the output of the processor,
+            outputs (dict): the output of the processor,
                 - input_ids (mx.array): [batch_size, N + image tokens]
-                - images (mx.array): [n_images, 3, H, W]
-                - image_id (int): the id of the image token
-                - num_image_tokens (List[int]): the number of image tokens
+                - images (List[mx.array]): [patches, global_images]
+                - images_seq_mask (mx.array): mask for image token positions
+                - images_spatial_crop (mx.array): patch grid dimensions
         """
 
         # Handle batched inputs (list of prompts with list of images)
@@ -558,6 +523,8 @@ class DeepseekOCRProcessor(ProcessorMixin):
                     image_size=image_size,
                     base_size=base_size,
                     cropping=cropping,
+                    min_patches=min_patches,
+                    max_patches=max_patches,
                 )
                 batch_results.append(result)
 
@@ -572,6 +539,8 @@ class DeepseekOCRProcessor(ProcessorMixin):
             image_size=image_size,
             base_size=base_size,
             cropping=cropping,
+            min_patches=min_patches,
+            max_patches=max_patches,
         )
 
         return prepare
@@ -649,7 +618,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
         }
 
 
-# Install a composable AutoProcessor patch for DeepSeek-OCR (v1)
+# Install a composable AutoProcessor patch for DeepSeek-OCR-2
 from ..base import install_auto_processor_patch
 
-install_auto_processor_patch("deepseekocr", DeepseekOCRProcessor)
+install_auto_processor_patch("deepseekocr_2", DeepseekOCR2Processor)
