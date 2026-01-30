@@ -392,11 +392,44 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
     return image_processor
 
 
+def _patch_video_processor_mapping():
+    """Patch transformers video processor mapping when torchvision is missing.
+
+    Transformers >= 5.0.0rc1 sets VIDEO_PROCESSOR_MAPPING_NAMES values to None
+    when torchvision is unavailable, causing ``video_processor_class_from_name``
+    to crash with ``TypeError: argument of type 'NoneType' is not iterable``.
+    """
+    try:
+        from transformers.models.auto import video_processing_auto as vpa
+
+        mapping = getattr(vpa, "VIDEO_PROCESSOR_MAPPING_NAMES", None)
+        if mapping is None:
+            vpa.VIDEO_PROCESSOR_MAPPING_NAMES = {}
+        else:
+            for key, value in list(mapping.items()):
+                if value is None:
+                    mapping[key] = ()
+    except ImportError:
+        pass
+
+
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
 
-    processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
+    # sanitize processor config — pop trust_remote_code to avoid duplicate kwarg
+    # (fetch_from_hub forwards it via **kwargs and we hardcode it here)
+    kwargs.pop("trust_remote_code", None)
+    try:
+        processor = AutoProcessor.from_pretrained(model_path, use_fast=False, trust_remote_code=True, **kwargs)
+    except TypeError as e:
+        if "NoneType" in str(e) and "not iterable" in str(e):
+            # Transformers video processor mapping can be None when torchvision
+            # is not installed. Patch and retry.
+            _patch_video_processor_mapping()
+            processor = AutoProcessor.from_pretrained(model_path, use_fast=False, trust_remote_code=True, **kwargs)
+        else:
+            raise
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
@@ -571,11 +604,20 @@ def save_weights(
         shard_name = shard_file_format.format(i + 1, shards_count)
         shard_path = save_path / shard_name
 
+        # Materialize this shard's lazy computation graph before saving.
+        # Without this, the entire model's deferred ops (dtype cast,
+        # quantization) can accumulate into a single Metal command buffer
+        # that exceeds the GPU timeout on very large models (235B+).
+        mx.eval(*shard.values())
+
         mx.save_safetensors(str(shard_path), shard, metadata={"format": "mlx"})
 
         for weight_name in shard.keys():
             index_data["weight_map"][weight_name] = shard_name
         del shard
+
+        # Release GPU memory between shards
+        mx.clear_cache()
 
     index_data["weight_map"] = {
         k: index_data["weight_map"][k] for k in sorted(index_data["weight_map"])

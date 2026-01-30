@@ -150,6 +150,25 @@ def convert(
         raise ValueError("Choose either quantize or dequantize, not both.")
 
     if quantize:
+        # Materialize lazy weights in chunks BEFORE quantization to avoid
+        # GPU timeout on very large models (235B+).  The model is loaded
+        # with lazy=True, so all weights are deferred.  Quantizing on top
+        # of lazy weights creates a deep computation graph that exceeds
+        # the Metal command buffer timeout when evaluated all at once.
+        from mlx.utils import tree_flatten as _tree_flatten
+
+        params = dict(_tree_flatten(model.parameters()))
+        keys = list(params.keys())
+        total = len(keys)
+        print(f"[INFO] Materializing {total} tensors one by one...")
+        for i, k in enumerate(keys):
+            mx.eval(params[k])
+            if (i + 1) % 50 == 0 or i == 0:
+                print(f"  [{i + 1}/{total}] {k} {params[k].shape}", flush=True)
+        print(f"  [{total}/{total}] done.")
+        del params
+        mx.clear_cache()
+
         print("[INFO] Quantizing")
         config.setdefault("vision_config", {})
         model, config = quantize_model(

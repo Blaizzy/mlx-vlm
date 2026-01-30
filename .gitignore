@@ -25,3 +25,4 @@ var/
 # virtual environment
 .myenv
 .venv
+/.claude
