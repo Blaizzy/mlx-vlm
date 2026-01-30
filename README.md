@@ -23,6 +23,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 |-------|---------------|
 | DeepSeek-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
 | DeepSeek-OCR-2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
+| PaddleOCR-VL | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/paddleocr_vl/README.md) |
 
 ## Installation
 
