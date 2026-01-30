@@ -1,16 +1,23 @@
 import argparse
-import logging
 import json
+import logging
+
 import mlx.optimizers as optim
 from datasets import load_dataset
 
-from .trainer import TrainingArgs, Colors, train, print_trainable_parameters, VisionDataset
+from .trainer import (
+    Colors,
+    TrainingArgs,
+    VisionDataset,
+    print_trainable_parameters,
+    train,
+)
 from .trainer.utils import (
     apply_lora_layers,
     find_all_linear_names,
     get_peft_model,
+    not_supported_for_training,
     unfreeze_modules,
-    not_supported_for_training
 )
 from .utils import load, load_image_processor
 
@@ -25,7 +32,9 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
     Otherwise, require 'question', 'answer', and 'image' or 'images' columns.
     No multi-turn or template logic. No audio support.
     """
-    has_messages = "messages" in dataset.column_names or "conversations" in dataset.column_names
+    has_messages = (
+        "messages" in dataset.column_names or "conversations" in dataset.column_names
+    )
     has_qa = "question" in dataset.column_names and "answer" in dataset.column_names
     has_images = "images" in dataset.column_names or "image" in dataset.column_names
 
@@ -33,7 +42,9 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
         return dataset
 
     if not (has_qa and has_images):
-        raise ValueError("Dataset must have 'messages' column or both 'question' and 'answer' columns and an 'image' or 'images' column.")
+        raise ValueError(
+            "Dataset must have 'messages' column or both 'question' and 'answer' columns and an 'image' or 'images' column."
+        )
 
     image_col = "images" if "images" in dataset.column_names else "image"
 
@@ -44,6 +55,7 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
         if custom_prompt_format:
             try:
                 template = json.loads(custom_prompt_format)
+
                 def fill(node):
                     if isinstance(node, str):
                         try:
@@ -55,85 +67,115 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
                     if isinstance(node, list):
                         return [fill(v) for v in node]
                     return node
+
                 filled = fill(template)
                 return {"messages": filled}
             except Exception as e:
                 raise ValueError(f"Failed to parse or fill custom prompt format: {e}")
-            
+
         # VLM-specific message formats (fallback)
-        if model_type == model_type.startswith("gemma") or model_type.startswith("qwen") or model_type == "smolvlm":
+        if (
+            model_type == model_type.startswith("gemma")
+            or model_type.startswith("qwen")
+            or model_type == "smolvlm"
+        ):
             return {
                 "messages": [
-                    {"role": "user", "content": [
-                        {"type": "image", "image": img},
-                        {"type": "text", "text": q}
-                    ]},
-                    {"role": "assistant", "content": [
-                        {"type": "text", "text": a}
-                    ]}
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": img},
+                            {"type": "text", "text": q},
+                        ],
+                    },
+                    {"role": "assistant", "content": [{"type": "text", "text": a}]},
                 ]
             }
         elif model_type == "deepseek_vl_v2":
             return {
                 "messages": [
-                    {"role": "<|User|>", "content": f"<image>\n<|ref|>{q}<|/ref|>.", "images": [img]},
-                    {"role": "<|Assistant|>", "content": a}
+                    {
+                        "role": "<|User|>",
+                        "content": f"<image>\n<|ref|>{q}<|/ref|>.",
+                        "images": [img],
+                    },
+                    {"role": "<|Assistant|>", "content": a},
                 ]
             }
         else:
             return {
                 "messages": [
-                    {"role": "user", "content": f"<image>{q}" if "<image>" not in str(q) else q},
-                    {"role": "assistant", "content": a}
+                    {
+                        "role": "user",
+                        "content": f"<image>{q}" if "<image>" not in str(q) else q,
+                    },
+                    {"role": "assistant", "content": a},
                 ]
             }
 
-    return dataset.map(to_message, )
+    return dataset.map(
+        to_message,
+    )
 
 
 def setup_model_for_training(model, args, adapter_path=None):
     """Setup model with LoRA or full finetuning"""
-    
+
     if adapter_path:
-        logger.info(f"{Colors.UNDERLINE}Resuming from adapter path {adapter_path}{Colors.ENDC}")
+        logger.info(
+            f"{Colors.UNDERLINE}Resuming from adapter path {adapter_path}{Colors.ENDC}"
+        )
         model = apply_lora_layers(model, adapter_path)
     elif args.full_finetune:
-        logger.info(f"{Colors.UNDERLINE}Training with full weight finetuning{Colors.ENDC}")
+        logger.info(
+            f"{Colors.UNDERLINE}Training with full weight finetuning{Colors.ENDC}"
+        )
         unfreeze_modules(model, ["language_model"])
     else:
         logger.info(f"{Colors.UNDERLINE}Setting up LoRA{Colors.ENDC}")
         modules = find_all_linear_names(model.language_model)
         model = get_peft_model(
-            model, modules,
+            model,
+            modules,
             rank=args.lora_rank,
             alpha=args.lora_alpha,
             dropout=args.lora_dropout,
-            verbose=False
+            verbose=False,
         )
-    
+
     if args.train_vision:
         logger.info(f"{Colors.OKBLUE}Unfreezing vision stack for training{Colors.ENDC}")
-        unfreeze_modules(model, [
-            "vision_model", "vision_tower", "mm_projector",
-            "multi_modal_projector", "aligner", "connector", "vision_resampler"
-        ])
-    
+        unfreeze_modules(
+            model,
+            [
+                "vision_model",
+                "vision_tower",
+                "mm_projector",
+                "multi_modal_projector",
+                "aligner",
+                "connector",
+                "vision_resampler",
+            ],
+        )
+
     return model
 
 
 def main(args):
     # Load model and processor
     logger.info(f"{Colors.HEADER}Loading model from {args.model_path}{Colors.ENDC}")
-    model, processor = load(args.model_path, processor_config={"trust_remote_code": True})
-    
+    model, processor = load(
+        args.model_path, processor_config={"trust_remote_code": True}
+    )
+
     # Validate model type
     model_type = getattr(getattr(model, "config", None), "model_type", None)
     if model_type in not_supported_for_training:
         raise ValueError(f"Model type {model_type} not supported for training")
-    
+
     config = model.config.__dict__
     image_processor = load_image_processor(args.model_path)
-    
+
     # Load and prepare dataset
     logger.info(f"{Colors.HEADER}Loading dataset from {args.dataset}{Colors.ENDC}")
     dataset = load_dataset(
@@ -141,33 +183,37 @@ def main(args):
         args.dataset_config if args.dataset_config else None,
         split=args.split,
     )
-    
+
     # Calculate training iterations
     if args.epochs is not None:
         iters = (len(dataset) // args.batch_size) * args.epochs
     else:
         iters = args.iters
-    
+
     dataset = dataset.select(range(iters))
 
     # Transform dataset to messages format (support custom prompt template)
-    dataset = transform_dataset_to_messages(dataset, model_type, args.custom_prompt_format)
-    
+    dataset = transform_dataset_to_messages(
+        dataset, model_type, args.custom_prompt_format
+    )
+
     # Create training dataset
     train_dataset = VisionDataset(
-        dataset, config, processor,
+        dataset,
+        config,
+        processor,
         image_processor=image_processor,
-        image_resize_shape=args.image_resize_shape
+        image_resize_shape=args.image_resize_shape,
     )
-    
+
     # Setup model for training
     model = setup_model_for_training(model, args, args.adapter_path)
     print_trainable_parameters(model)
-    
+
     # Setup optimizer
     logger.info(f"{Colors.HEADER}Setting up optimizer{Colors.ENDC}")
     optimizer = optim.Adam(learning_rate=args.learning_rate)
-    
+
     # Create training arguments
     training_args = TrainingArgs(
         batch_size=args.batch_size,
@@ -184,7 +230,7 @@ def main(args):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         full_finetune=args.full_finetune,
     )
-    
+
     # Train model
     logger.info(f"{Colors.HEADER}Training model{Colors.ENDC}")
     train(
@@ -196,26 +242,34 @@ def main(args):
         train_on_completions=args.train_on_completions,
         assistant_id=args.assistant_id,
     )
-    
-    logger.info(f"{Colors.HEADER}Training completed! Model saved to {args.output_path}{Colors.ENDC}")
+
+    logger.info(
+        f"{Colors.HEADER}Training completed! Model saved to {args.output_path}{Colors.ENDC}"
+    )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Vision-Language Model")
-    
+
     # Model arguments
-    parser.add_argument("--model-path", type=str, default="mlx-community/Qwen2-VL-2B-Instruct-bf16")
+    parser.add_argument(
+        "--model-path", type=str, default="mlx-community/Qwen2-VL-2B-Instruct-bf16"
+    )
     parser.add_argument("--full-finetune", action="store_true")
     parser.add_argument("--train-vision", action="store_true")
-    
+
     # Dataset arguments
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--split", type=str, default="train")
     parser.add_argument("--dataset-config", type=str, default=None)
     parser.add_argument("--image-resize-shape", type=int, nargs=2, default=None)
-    parser.add_argument("--custom-prompt-format", type=str, default=None,
-                        help='Custom JSON prompt template. Example: {"user": [{"type": "image","image":"{image}"}, {"type": "text","text":"{question}"}], "assistant": [{"type": "text","text":"{answer}"}]}')
-    
+    parser.add_argument(
+        "--custom-prompt-format",
+        type=str,
+        default=None,
+        help='Custom JSON prompt template. Example: {"user": [{"type": "image","image":"{image}"}, {"type": "text","text":"{question}"}], "assistant": [{"type": "text","text":"{answer}"}]}',
+    )
+
     # Training arguments
     parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -231,15 +285,15 @@ if __name__ == "__main__":
     parser.add_argument("--train-on-completions", action="store_true")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--assistant-id", type=int, default=77091)
-    
+
     # LoRA arguments
     parser.add_argument("--lora-alpha", type=float, default=16)
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
-    
+
     # Output arguments
     parser.add_argument("--output-path", type=str, default="adapters.safetensors")
     parser.add_argument("--adapter-path", type=str, default=None)
-    
+
     args = parser.parse_args()
     main(args)

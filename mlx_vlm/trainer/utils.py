@@ -1,29 +1,29 @@
 import json
-from pathlib import Path
 import math
-
-import mlx.nn as nn
-import mlx.core as mx
-from mlx.utils import tree_flatten
+from pathlib import Path
 from typing import Union
+
+import mlx.core as mx
+import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 from .lora import LoRaLayer
 
 
 class Colors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
+    HEADER = "\033[95m"
+    OKBLUE = "\033[94m"
+    OKCYAN = "\033[96m"
+    OKGREEN = "\033[92m"
+    WARNING = "\033[93m"
+    FAIL = "\033[91m"
+    ENDC = "\033[0m"
+    BOLD = "\033[1m"
+    UNDERLINE = "\033[4m"
 
-not_supported_for_training = {
-    "gemma3n"
-}
+
+not_supported_for_training = {"gemma3n"}
+
 
 def grad_checkpoint(layer):
     """
@@ -41,10 +41,16 @@ def grad_checkpoint(layer):
     type(layer).__call__ = checkpointed_fn
 
 
-def get_learning_rate(iters: int, step: int, warmup_steps: int, learning_rate: float, min_learning_rate: float):
+def get_learning_rate(
+    iters: int,
+    step: int,
+    warmup_steps: int,
+    learning_rate: float,
+    min_learning_rate: float,
+):
     if step < warmup_steps:
         return learning_rate * (step / warmup_steps)
-    
+
     progress = (step - warmup_steps) / (iters - warmup_steps)
     cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
     return min_learning_rate + (learning_rate - min_learning_rate) * cosine_decay
@@ -228,12 +234,12 @@ def save_adapter(model: nn.Module, adapter_file: Union[str, Path]):
     """Save adapter weights and config."""
     path = Path(adapter_file)
     path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # Save adapter config if available
-    if hasattr(model, 'config') and hasattr(model.config, "lora"):
+    if hasattr(model, "config") and hasattr(model.config, "lora"):
         with open(path.parent / "adapter_config.json", "w") as f:
             json.dump(model.config.lora, f, indent=2)
-    
+
     # Save weights
     flattened_tree = tree_flatten(model.trainable_parameters())
     mx.save_safetensors(str(adapter_file), dict(flattened_tree))

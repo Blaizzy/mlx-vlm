@@ -4,8 +4,8 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_vlm.trainer.trainer import train, TrainingArgs
 from mlx_vlm.trainer.datasets import VisionDataset
+from mlx_vlm.trainer.trainer import TrainingArgs, train
 
 
 class TestDataset(unittest.TestCase):
@@ -34,13 +34,13 @@ class TestDataset(unittest.TestCase):
         self.mock_hf_dataset.__getitem__.return_value = mock_item
 
         mock_prepare_inputs.return_value = {
-            "input_ids": mx.array([1, 2, 3]),  # input_ids
+            "input_ids": mx.array([1, 2, 3]),
             "pixel_values": mx.array(
                 [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]]
-            ),  # pixel_values
-            "attention_mask": mx.array([1, 1, 1]),  # mask
-            "image_grid_thw": (1, 1, 1),  # image_grid_thw
-            "image_sizes": [224, 224],  # image_sizes
+            ),
+            "attention_mask": mx.array([1, 1, 1]),
+            "image_grid_thw": (1, 1, 1),
+            "image_sizes": [224, 224],
         }
 
         result = dataset[0]
@@ -52,7 +52,6 @@ class TestDataset(unittest.TestCase):
         self.assertIn("image_grid_thw", result)
         self.assertIn("image_sizes", result)
 
-        # Check if the returned values match the mocked input
         self.assertTrue(mx.array_equal(result["input_ids"], mx.array([1, 2, 3])))
         self.assertTrue(
             mx.array_equal(
@@ -90,28 +89,25 @@ class TestTrainer(unittest.TestCase):
                 self.w = mx.zeros((1,))
 
             def __call__(self, *args, **kwargs):
-                # Return logits with shape [4, 3, 10] to match test batch (batch=4, seq=3, vocab=10)
                 return DummyOutput(logits=mx.zeros((4, 3, 10)))
 
         self.mock_model = DummyModel()
         self.mock_optimizer = MagicMock()
-        # Configure the optimizer to have a proper learning_rate
         self.mock_optimizer.learning_rate = 1e-4
 
     @patch("mlx_vlm.trainer.trainer.iterate_batches")
     @patch("mlx_vlm.trainer.trainer.mx.save_safetensors")
     def test_trainer_initialization(self, mock_save_safetensors, mock_iterate_batches):
-        # Create a properly shaped mock batch
         mock_batch = {
             "input_ids": mx.array([[1, 2, 3], [1, 2, 3], [1, 2, 3], [1, 2, 3]]),
             "attention_mask": mx.array([[1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1]]),
-            "pixel_values": mx.array([[[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]]]),
+            "pixel_values": mx.array(
+                [[[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]]]
+            ),
             "labels": mx.array([[0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1, 2]]),
         }
         mock_iterate_batches.return_value = iter([mock_batch])
-        
-        # train() function doesn't return a trainer object, it just runs training
-        # Test that it completes without errors
+
         result = train(
             model=self.mock_model,
             optimizer=self.mock_optimizer,
@@ -119,22 +115,20 @@ class TestTrainer(unittest.TestCase):
             val_dataset=None,
             args=TrainingArgs(iters=1, batch_size=4),
         )
-        
-        # Verify the function completed (returns None)
+
         self.assertIsNone(result)
-        # Verify optimizer was called during training
         self.mock_optimizer.update.assert_called()
-        # Verify model weights were saved
         mock_save_safetensors.assert_called()
 
     @patch("mlx_vlm.trainer.trainer.iterate_batches")
     @patch("mlx_vlm.trainer.trainer.mx.save_safetensors")
     def test_train_smoke(self, mock_save_safetensors, mock_iterate_batches):
-        # Create a properly shaped mock batch with labels matching logits shape
         mock_batch = {
             "input_ids": mx.array([[1, 2, 3], [1, 2, 3], [1, 2, 3], [1, 2, 3]]),
             "attention_mask": mx.array([[1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1]]),
-            "pixel_values": mx.array([[[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]]]),
+            "pixel_values": mx.array(
+                [[[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]]]
+            ),
             "labels": mx.array([[0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1, 2]]),
         }
         mock_iterate_batches.return_value = iter([mock_batch])
@@ -148,7 +142,6 @@ class TestTrainer(unittest.TestCase):
         )
 
         self.mock_optimizer.update.assert_called()
-        # Verify model weights were saved at the end of training
         mock_save_safetensors.assert_called()
 
 

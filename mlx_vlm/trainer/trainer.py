@@ -12,7 +12,8 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_map
 from tqdm import tqdm
 
-from .utils import grad_checkpoint, save_adapter, Colors
+from .utils import Colors, grad_checkpoint, save_adapter
+
 
 @dataclass
 class TrainingArgs:
@@ -71,7 +72,9 @@ class TrainingArgs:
     )
 
 
-def vision_language_loss_fn(model, batch, train_on_completions=False, assistant_id=77091):
+def vision_language_loss_fn(
+    model, batch, train_on_completions=False, assistant_id=77091
+):
     pixel_values = batch["pixel_values"]
     input_ids = batch["input_ids"]
     attention_mask = batch["attention_mask"]
@@ -88,9 +91,9 @@ def vision_language_loss_fn(model, batch, train_on_completions=False, assistant_
         assistant_mask = range_matrix <= mx.array(assistant_response_index).reshape(
             -1, 1
         )
-        weight_mask = mx.where(
-            assistant_mask, mx.zeros_like(weight_mask), weight_mask
-        )[:, 1:]
+        weight_mask = mx.where(assistant_mask, mx.zeros_like(weight_mask), weight_mask)[
+            :, 1:
+        ]
     else:
         weight_mask = None
 
@@ -120,12 +123,19 @@ def vision_language_loss_fn(model, batch, train_on_completions=False, assistant_
         return logits
 
     logits = align_logits_with_labels(logits, labels)
-    
+
     seq_len = input_ids.shape[1]
     lengths = mx.minimum(lengths, seq_len)
     length_mask = mx.arange(seq_len)[None, :] < lengths[:, None]
-    
-    ce = (nn.losses.cross_entropy(logits, labels, weights=weight_mask,)* length_mask)
+
+    ce = (
+        nn.losses.cross_entropy(
+            logits,
+            labels,
+            weights=weight_mask,
+        )
+        * length_mask
+    )
     ntoks = length_mask.sum()
     ce = ce.sum() / ntoks
 
@@ -147,7 +157,11 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
     ]
 
     while True:
-        order = np.random.permutation(len(batch_indices)) if train else range(len(batch_indices))
+        order = (
+            np.random.permutation(len(batch_indices))
+            if train
+            else range(len(batch_indices))
+        )
         for b in order:
             items = [dataset[idx] for idx in batch_indices[b]]
             lengths = [min(len(x["input_ids"]), max_seq_length) for x in items]
@@ -173,14 +187,12 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
 
             pixel_values_batch = None
             if "pixel_values" in items[0] and items[0]["pixel_values"] is not None:
-                pixel_values_batch = mx.stack(
-                    [item["pixel_values"] for item in items]
-                )
-            
+                pixel_values_batch = mx.stack([item["pixel_values"] for item in items])
+
             yield {
                 "input_ids": mx.array(input_ids_batch),
                 "attention_mask": mx.array(attention_mask_batch),
-                "pixel_values": pixel_values_batch
+                "pixel_values": pixel_values_batch,
             }
         if not train:
             break
@@ -202,13 +214,11 @@ def evaluate(
     model.eval()
     all_losses = mx.array(0.0)
     ntokens = mx.array(0)
-    
+
     loss_fn_partial = partial(
-        loss_fn,
-        train_on_completions=train_on_completions,
-        assistant_id=assistant_id
+        loss_fn, train_on_completions=train_on_completions, assistant_id=assistant_id
     )
-    
+
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
     for _, batch in tqdm(
         zip(
@@ -220,21 +230,27 @@ def evaluate(
             ),
         ),
         desc="Calculating loss...",
-        total=min(len(dataset) // batch_size, num_batches) if num_batches != -1 else len(dataset) // batch_size,
+        total=(
+            min(len(dataset) // batch_size, num_batches)
+            if num_batches != -1
+            else len(dataset) // batch_size
+        ),
     ):
         # Calculate number of tokens for averaging
         if "attention_mask" in batch:
             lengths = batch["attention_mask"].sum(axis=1)
         else:
-            lengths = mx.full((batch["input_ids"].shape[0],), batch["input_ids"].shape[1])
-        
+            lengths = mx.full(
+                (batch["input_ids"].shape[0],), batch["input_ids"].shape[1]
+            )
+
         ntoks = lengths.sum()
         losses = loss_fn_partial(model, batch)
-        
+
         all_losses += losses * ntoks
         ntokens += ntoks
         mx.eval(all_losses, ntokens)
-    
+
     all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
     ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
 
@@ -268,43 +284,42 @@ def train(
         print(f"Node {rank} of {world_size}")
 
     if val_dataset is None and rank == 0:
-        print(f"{Colors.OKBLUE}No validation dataset provided — training will run without validation.{Colors.ENDC}")
-    
+        print(
+            f"{Colors.OKBLUE}No validation dataset provided — training will run without validation.{Colors.ENDC}"
+        )
+
     # Enable gradient checkpointing if requested
     if args.grad_checkpoint:
         for module in model.children().values():
-            if hasattr(module, 'layers'):
+            if hasattr(module, "layers"):
                 grad_checkpoint(module.layers[0])
-    
+
     grad_accum_steps = args.gradient_accumulation_steps
     if grad_accum_steps < 1 and args:
         raise ValueError("gradient_accumulation_steps must be at least 1")
-    
+
     # Create loss function with partial application
     loss_fn_partial = partial(
-        loss_fn,
-        train_on_completions=train_on_completions,
-        assistant_id=assistant_id
+        loss_fn, train_on_completions=train_on_completions, assistant_id=assistant_id
     )
-    
+
     state = [model.state, optimizer.state, mx.random.state]
-    
+
     def step(batch, prev_grad, do_update):
         # Calculate number of tokens for metrics
         if "attention_mask" in batch:
             lengths = batch["attention_mask"].sum(axis=1)
         else:
-            lengths = mx.full((batch["input_ids"].shape[0],), batch["input_ids"].shape[1])
-        
+            lengths = mx.full(
+                (batch["input_ids"].shape[0],), batch["input_ids"].shape[1]
+            )
+
         toks = lengths.sum()
         lvalue, grad = loss_value_and_grad(model, batch)
 
         # Gradient clipping
         if args.grad_clip is not None:
-            grad = tree_map(
-                lambda g: mx.clip(g, -args.grad_clip, args.grad_clip),
-                grad
-            )
+            grad = tree_map(lambda g: mx.clip(g, -args.grad_clip, args.grad_clip), grad)
 
         if prev_grad is not None:
             grad = tree_map(lambda x, y: x + y, grad, prev_grad)
@@ -317,7 +332,7 @@ def train(
             grad = None
 
         return lvalue, toks, grad
-    
+
     # Create value and grad function
     loss_value_and_grad = nn.value_and_grad(model, loss_fn_partial)
 
@@ -343,7 +358,9 @@ def train(
         tic = time.perf_counter()
 
         # Validation (only if a validation dataset is provided)
-        if val_dataset is not None and (it == 1 or it % args.steps_per_eval == 0 or it == args.iters):
+        if val_dataset is not None and (
+            it == 1 or it % args.steps_per_eval == 0 or it == args.iters
+        ):
             tic_val = time.perf_counter()
             val_loss = evaluate(
                 model=model,
@@ -386,7 +403,11 @@ def train(
             train_loss = mx.distributed.all_sum(losses, stream=mx.cpu).item()
             train_loss /= steps * world_size
             n_tokens_total = mx.distributed.all_sum(n_tokens, stream=mx.cpu).item()
-            learning_rate = optimizer.learning_rate.item() if hasattr(optimizer.learning_rate, 'item') else args.learning_rate
+            learning_rate = (
+                optimizer.learning_rate.item()
+                if hasattr(optimizer.learning_rate, "item")
+                else args.learning_rate
+            )
             it_sec = args.steps_per_report / train_time
             tokens_sec = float(n_tokens_total) / train_time
             trained_tokens += n_tokens_total
@@ -425,4 +446,6 @@ def train(
     # Save final weights
     if rank == 0:
         save_adapter(model, args.adapter_file)
-        print(f"{Colors.OKGREEN}Saved final adapter weights to {args.adapter_file}.{Colors.ENDC}")
+        print(
+            f"{Colors.OKGREEN}Saved final adapter weights to {args.adapter_file}.{Colors.ENDC}"
+        )

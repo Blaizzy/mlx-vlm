@@ -170,7 +170,7 @@ class Model(nn.Module):
         weights = {
             k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
         }
-        
+
         def transform_key(key):
             if "vision_tower" not in key:
                 key = key.replace("visual", "vision_tower")
