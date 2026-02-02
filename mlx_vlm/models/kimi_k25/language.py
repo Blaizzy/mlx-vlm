@@ -3,7 +3,8 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import create_attention_mask
-from mlx_lm.models.deepseek_v3 import DeepseekV3Model, Model as DeepseekV3LM
+from mlx_lm.models.deepseek_v3 import DeepseekV3Model
+from mlx_lm.models.deepseek_v3 import Model as DeepseekV3LM
 
 from ..base import LanguageModelOutput
 from .config import TextConfig

@@ -1,22 +1,25 @@
-from typing import Optional
-
 import mlx.core as mx
+from transformers.image_utils import load_image
+
 from mlx_vlm.generate import stream_generate
 from mlx_vlm.utils import load
-
-from transformers.image_utils import load_image
 
 model_id = "moonshotai/Kimi-K2.5"
 prompt = "Describe this image"
 image_url = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/0052a70beed5bf71b92610a43a52df6d286cd5f3/diffusers/rabbit.jpg"
 
+
 def _compute_embeddings(model, inputs):
     input_ids = mx.array(inputs["input_ids"])
     attention_mask = mx.array(inputs["attention_mask"])
-    pixel_values = mx.array(inputs["pixel_values"]) if "pixel_values" in inputs else None
+    pixel_values = (
+        mx.array(inputs["pixel_values"]) if "pixel_values" in inputs else None
+    )
     grid_thws = mx.array(inputs["grid_thws"])[:, -2:] if "grid_thws" in inputs else None
 
-    embeddings, attention_mask, position_ids, expanded_ids = model.get_input_embeddings(input_ids, pixel_values, attention_mask, grid_thws)
+    embeddings, attention_mask, position_ids, expanded_ids = model.get_input_embeddings(
+        input_ids, pixel_values, attention_mask, grid_thws
+    )
     return embeddings, attention_mask, position_ids, expanded_ids
 
 
@@ -44,7 +47,7 @@ def main():
             "content": [
                 {"type": "text", "text": "Describe this image"},
                 {"type": "image", "image_url": image},
-            ]
+            ],
         },
     ]
     inputs = processor(messages)

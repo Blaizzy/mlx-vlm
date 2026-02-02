@@ -32,7 +32,9 @@ class KimiK25MultiModalProjector(nn.Module):
         self.proj = CallableModuleList()
         self.proj.append(nn.Linear(self.hidden_size, self.hidden_size, bias=True))
         self.proj.append(nn.GELU())
-        self.proj.append(nn.Linear(self.hidden_size, config.text_config.hidden_size, bias=True))
+        self.proj.append(
+            nn.Linear(self.hidden_size, config.text_config.hidden_size, bias=True)
+        )
 
     def __call__(self, image_features: list[mx.array]) -> mx.array:
         outputs = []
@@ -73,8 +75,10 @@ class Model(nn.Module):
 
         image_features = self.mm_projector(hidden_state)
 
-        final_inputs_embeds, expanded_mask, position_ids, expanded_ids = self._merge_input_ids_with_image_features(
-            image_features, inputs_embeds, input_ids, attention_mask
+        final_inputs_embeds, expanded_mask, position_ids, expanded_ids = (
+            self._merge_input_ids_with_image_features(
+                image_features, inputs_embeds, input_ids, attention_mask
+            )
         )
         return final_inputs_embeds, expanded_mask, position_ids, expanded_ids
 
@@ -154,9 +158,9 @@ class Model(nn.Module):
 
         image_to_overwrite = mx.ones((batch_size, max_embed_dim), dtype=mx.bool_)
         image_to_overwrite[batch_indices, text_to_overwrite] = False
-        image_to_overwrite &= (mx.cumsum(image_to_overwrite, axis=1) - 1) >= nb_image_pad[
-            :, None
-        ]
+        image_to_overwrite &= (
+            mx.cumsum(image_to_overwrite, axis=1) - 1
+        ) >= nb_image_pad[:, None]
 
         if int(mx.sum(image_to_overwrite).item()) != image_features.shape[0]:
             raise ValueError(
@@ -172,8 +176,10 @@ class Model(nn.Module):
         final_attention_mask = mx.logical_or(final_attention_mask, image_to_overwrite)
         final_input_ids[image_batch, image_pos] = image_token_index
 
-        position_ids = (mx.cumsum(final_attention_mask, axis=1) - 1)
-        position_ids = mx.where(final_attention_mask, position_ids, mx.ones_like(position_ids))
+        position_ids = mx.cumsum(final_attention_mask, axis=1) - 1
+        position_ids = mx.where(
+            final_attention_mask, position_ids, mx.ones_like(position_ids)
+        )
 
         pad_positions = np.where(np.array(attention_mask) == 0)
         if pad_positions[0].size > 0:

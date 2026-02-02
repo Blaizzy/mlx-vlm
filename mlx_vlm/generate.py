@@ -419,7 +419,7 @@ def generate_step(
         # Final sampling with processed logits
         y, logprobs = sample(logits)
 
-    mx.async_eval(y) #, logprobs)
+    mx.async_eval(y)
 
     if outputs.cross_attention_states is not None:
         kwargs = {
@@ -440,7 +440,7 @@ def generate_step(
     while True:
         if n != max_tokens:
             next_y, next_logprobs = _step(y, **kwargs)
-            mx.async_eval(next_y)#, next_logprobs)
+            mx.async_eval(next_y)
             if "decoder_input_ids" in kwargs:
                 kwargs["decoder_input_ids"] = next_y[None]
             yield y.item(), logprobs
@@ -529,7 +529,7 @@ def stream_generate(
         kwargs.update(data_kwargs)
         inputs_embeds = kwargs.pop("inputs_embeds", None)
         embedding_kwargs = kwargs.pop("embedding_kwargs", None)
-    
+
     if inputs_embeds is not None and input_ids is None:
         raise ValueError("inputs_embeds requires input_ids")
 
