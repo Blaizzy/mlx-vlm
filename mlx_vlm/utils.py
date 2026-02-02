@@ -137,7 +137,6 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
     config = load_config(model_path, **kwargs)
-    quantization = config.get("quantization", None)
 
     # Find all .safetensors files in the model_path, excluding consolidated model weights
     weight_files = [
@@ -214,7 +213,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     model_class.AudioModel, weights, model_config.audio_config
                 )
 
-    if quantization is None:
+    if not "quantization" in config:
         quantization_config = config.get("quantization_config", None)
         if quantization_config is None:
             text_config = config.get("text_config", {})
