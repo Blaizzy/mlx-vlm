@@ -2,6 +2,7 @@ import argparse
 import codecs
 import contextlib
 import functools
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
@@ -151,6 +152,13 @@ def parse_arguments():
         action="store_true",
         help="Trust remote code when loading the model.",
     )
+    parser.add_argument(
+        "--processor-kwargs",
+        type=json.loads,
+        default={},
+        help="Extra processor kwargs as JSON. "
+        'Example: --processor-kwargs \'{"cropping": false, "max_patches": 3}\'',
+    )
 
     return parser.parse_args()
 
@@ -177,7 +185,7 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
     model_bytes = tree_reduce(
         lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
     )
-    max_rec_size = mx.metal.device_info()["max_recommended_working_set_size"]
+    max_rec_size = mx.device_info()["max_recommended_working_set_size"]
     if model_bytes > 0.9 * max_rec_size:
         model_mb = model_bytes // 2**20
         max_rec_mb = max_rec_size // 2**20
@@ -1264,18 +1272,26 @@ def _generate_batch(
 
     with wired_limit(model, [generation_stream]):
         if pixel_values is not None:
-            inputs_embeds = model.get_input_embeddings(
+            embedding_output = model.get_input_embeddings(
                 input_ids, pixel_values, **data_kwargs
             )
+
+            # Normalize embedding output to a kwargs dict expected by BatchGenerator
+            if isinstance(embedding_output, dict):
+                embed_kwargs = embedding_output
+            elif hasattr(embedding_output, "to_dict"):
+                # Convert to dict and keep non-None fields
+                embed_kwargs = {
+                    k: v for k, v in embedding_output.to_dict().items() if v is not None
+                }
+            else:
+                # Assume it's directly an inputs_embeds array
+                embed_kwargs = {"inputs_embeds": embedding_output}
 
             gen_kwargs = {
                 "pixel_values": pixel_values,
                 **data_kwargs,
-                **(
-                    inputs_embeds
-                    if isinstance(inputs_embeds, dict)
-                    else {"inputs_embeds": inputs_embeds}
-                ),
+                **embed_kwargs,
             }
         else:
             input_ids = mx.squeeze(input_ids, axis=0)
@@ -1338,6 +1354,10 @@ def main():
 
     if args.skip_special_tokens:
         kwargs["skip_special_tokens"] = args.skip_special_tokens
+
+    # Add processor kwargs from JSON
+    if args.processor_kwargs:
+        kwargs.update(args.processor_kwargs)
 
     if args.chat:
         chat = []

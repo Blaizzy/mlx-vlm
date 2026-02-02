@@ -6,14 +6,15 @@ import mlx.nn as nn
 import numpy as np
 from transformers import AutoProcessor
 
-from ..base import InputEmbeddingsFeatures
+from mlx_vlm.models.base import InputEmbeddingsFeatures
+
 from .config import ModelConfig, ProjectorConfig, SAMViTConfig
 from .language import LanguageModel
-from .processing_deepseekocr import DeepseekVLV2Processor
+from .processing_deepseekocr import DeepseekOCRProcessor
 from .sam import SAMEncoder
 from .vision import VisionModel
 
-AutoProcessor.register("deepseekocr", DeepseekVLV2Processor)
+AutoProcessor.register("deepseekocr", DeepseekOCRProcessor)
 
 
 class MlpProjector(nn.Module):
@@ -115,8 +116,6 @@ class Model(nn.Module):
         )
         self.language_model = LanguageModel(config.text_config)
         self.projector = MlpProjector(config)
-        self.vision_feature_layer = config.select_layer
-        self.vision_feature_select_strategy = config.vision_feature_select_strategy
 
         self.tile_tag = config.tile_tag
         self.global_view_pos = config.global_view_pos
@@ -153,9 +152,10 @@ class Model(nn.Module):
         if pixel_values is None:
             return InputEmbeddingsFeatures(inputs_embeds=input_embeds)
 
+        # Only process images on prefill (input_ids.shape[1] != 1), not during autoregressive decoding
         if (
             self.sam_model is not None
-            and (input_ids.shape[1] != 1 or self.training)
+            and input_ids.shape[1] != 1
             and mx.sum(pixel_values[1]).item() != 0
         ):
 
@@ -325,14 +325,12 @@ class Model(nn.Module):
         images_spatial_crop = kwargs.get("images_spatial_crop", None)
         images_seq_mask = kwargs.get("images_seq_mask", None)
 
-        input_embeddings_features = self.get_input_embeddings(
+        input_embeddings = self.get_input_embeddings(
             input_ids, pixel_values, images_spatial_crop, images_seq_mask
         )
 
         logits = self.language_model(
-            input_ids,
-            cache=cache,
-            inputs_embeds=input_embeddings_features.inputs_embeds,
+            input_ids, cache=cache, inputs_embeds=input_embeddings.inputs_embeds
         )
         return logits
 

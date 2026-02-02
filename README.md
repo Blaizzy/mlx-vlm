@@ -12,7 +12,17 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 - [Multi-Image Chat Support](#multi-image-chat-support)
   - [Supported Models](#supported-models)
   - [Usage Examples](#usage-examples)
+- [Model-Specific Documentation](#model-specific-documentation)
 - [Fine-tuning](#fine-tuning)
+
+## Model-Specific Documentation
+
+Some models have detailed documentation with prompt formats, examples, and best practices:
+
+| Model | Documentation |
+|-------|---------------|
+| DeepSeek-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
+| DeepSeek-OCR-2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
 
 ## Installation
 

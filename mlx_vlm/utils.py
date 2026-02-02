@@ -795,7 +795,6 @@ def process_inputs(
     for param in parameters.keys():
         if param in kwargs.keys():
             args[param] = kwargs.get(param, None)
-            break
 
     # Add audio if provided and supported
     if audio is not None and len(audio) > 0:

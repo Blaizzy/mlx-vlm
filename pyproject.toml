@@ -45,7 +45,6 @@ dependencies = {file = ["requirements.txt"]}
 
 [project.optional-dependencies]
 ui = ["gradio>=5.19.0"]
-audio = ["mlx-audio"]
 torch = ["torch", "torchvision", "einops", "blobfile", "tiktoken"]
 cuda = ["mlx-cuda"]
 cpu = ["mlx-cpu"]
