@@ -378,7 +378,7 @@ def generate_step(
         kwargs.update(embedding_kwargs)
 
     with mx.stream(generation_stream):
-        if inputs_embeds.shape[1] > prefill_step_size:
+        if prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size:
             total_tokens = inputs_embeds.shape[1]
             input_offset = 0
             with tqdm(total=total_tokens, desc="Prefill", unit="tok") as pbar:
@@ -399,7 +399,6 @@ def generate_step(
             input_ids = input_ids[:, -1:]
 
         # Final step with last embedding to get logits
-        # print("calling language model")
         outputs = model.language_model(
             inputs=input_ids,
             inputs_embeds=inputs_embeds,

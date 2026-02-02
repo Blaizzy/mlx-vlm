@@ -88,8 +88,7 @@ class Model(nn.Module):
 
         return inputs_embeds
 
-    # This complex logic was co-authored with codex based on the custom modeling code
-    # To be verified / simplified / improved
+    # This logic was co-authored with codex based on the custom modeling code
     def _merge_input_ids_with_image_features(
         self,
         image_features: list[mx.array],
@@ -106,7 +105,7 @@ class Model(nn.Module):
         if attention_mask is None:
             attention_mask = mx.ones_like(input_ids)
 
-        batch_size, sequence_length = input_ids.shape
+        batch_size, _ = input_ids.shape
         left_padding = mx.sum(attention_mask[:, -1] == 0) == 0
 
         flat_ids = input_ids.reshape(-1)
