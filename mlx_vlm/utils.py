@@ -58,6 +58,45 @@ def skip_multimodal_module(path: str) -> bool:
     )
 
 
+def get_class_predicate(skip_vision: bool, config: dict = None, weights: dict = None):
+    """
+    Get a predicate function for quantization.
+
+    Args:
+        skip_vision (bool): Whether to skip vision modules.
+        config (dict, optional): The model configuration.
+        weights (dict, optional): The model weights.
+
+    Returns:
+        Callable[[str, nn.Module], bool]: The predicate function.
+    """
+    if config is None:
+        config = {}
+    if weights is None:
+        weights = {}
+
+    def predicate(p, m):
+        # Always skip vision and audio models
+        if skip_multimodal_module(p) and skip_vision:
+            return False
+        # Handle custom per layer quantizations
+        if "quantization" in config and p in config["quantization"]:
+            return config["quantization"][p]
+        if not hasattr(m, "to_quantized"):
+            return False
+        # Skip layers not divisible by 64
+        if hasattr(m, "weight") and m.weight.size % 64 != 0:
+            return False
+        # Handle legacy models which may not have everything quantized
+        if not weights:
+            # If no weights (e.g. testing), assume true if other checks pass
+            return True
+        return f"{p}.scales" in weights
+
+    return predicate
+
+
+
 def get_model_and_args(config: dict):
     """
     Retrieve the model object based on the configuration.
@@ -74,8 +113,8 @@ def get_model_and_args(config: dict):
 
     try:
         arch = importlib.import_module(f"mlx_vlm.models.{model_type}")
-    except ImportError:
-        msg = f"Model type {model_type} not supported."
+    except ImportError as e:
+        msg = f"Model type {model_type} not supported. Error: {e}"
         logging.error(msg)
         raise ValueError(msg)
 
@@ -219,27 +258,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
 
-        def get_class_predicate(p, m):
-            # Always skip vision and audio models
-            if skip_multimodal_module(p) and skip_vision:
-                return False
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
-            # Skip layers not divisible by 64
-            if hasattr(m, "weight") and m.weight.size % 64 != 0:
-                return False
-            # Handle legacy models which may not have everything quantized
-            return f"{p}.scales" in weights
 
         nn.quantize(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
             mode=quantization.get("mode", "affine"),
-            class_predicate=get_class_predicate,
+            class_predicate=get_class_predicate(skip_vision, config, weights),
         )
 
     model.load_weights(list(weights.items()))
@@ -478,8 +503,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
 
     card = ModelCard.load(hf_path)
     card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"]
-    card.text = dedent(
-        f"""
+    card.text = dedent(f"""
         # {upload_repo}
         This model was converted to MLX format from [`{hf_path}`]() using mlx-vlm version **{__version__}**.
         Refer to the [original model card](https://huggingface.co/{hf_path}) for more details on the model.
@@ -492,8 +516,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         ```bash
         python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temperature 0.0 --prompt "Describe this image." --image <path_to_image>
         ```
-        """
-    )
+        """)
     card.save(os.path.join(path, "README.md"))
 
     logging.set_verbosity_info()

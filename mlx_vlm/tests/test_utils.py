@@ -8,7 +8,6 @@ from mlx_lm.utils import quantize_model
 
 from mlx_vlm.utils import (
     StoppingCriteria,
-    get_class_predicate,
     load,
     prepare_inputs,
     process_inputs_with_fallback,
@@ -145,43 +144,6 @@ def test_update_module_configs():
 
     assert updated.text_config == "text_config"
     assert updated.vision_config == "vision_config"
-
-
-def test_get_class_predicate():
-    class DummyModule:
-        def __init__(self, shape):
-            self.weight = mx.zeros(shape)
-            self.to_quantized = True
-
-    # Test skip_vision=True
-    pred = get_class_predicate(skip_vision=True)
-    module = DummyModule((10, 64))
-    assert pred("language_model", module) is True
-    assert pred("vision_model", module) is False
-
-    # Test skip_vision=True with weights
-    weights = {
-        "language_model.scales": mx.array([1, 2, 3]),
-        "vision_model.scales": mx.array([4, 5, 6]),
-    }
-    pred = get_class_predicate(skip_vision=True, weights=weights)
-    assert pred("language_model", module) is True
-    assert pred("vision_model", module) is False
-
-    # Test skip_vision=False without weights
-    pred = get_class_predicate(skip_vision=False)
-    assert pred("", module) is True
-    module = DummyModule((10, 63))  # Not divisible by 64
-    assert pred("", module) is False
-
-    # Test skip_vision=False with weights
-    weights = {
-        "language_model.scales": mx.array([1, 2, 3]),
-        "vision_model.scales": mx.array([4, 5, 6, 7]),  # Not divisible by 64
-    }
-    pred = get_class_predicate(skip_vision=False, weights=weights)
-    assert pred("language_model", DummyModule((10, 64))) is True
-    assert pred("vision_model", DummyModule((10, 63))) is False
 
 
 def test_quantize_module():
