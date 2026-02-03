@@ -6,10 +6,11 @@ built on the GLM-V encoder-decoder architecture.
 Model: THUDM/glm-ocr-0.9b
 """
 
-from ..glm4v import LanguageModel, VisionModel
-from .config import ModelConfig, TextConfig, VisionConfig
-from .processing import GlmOcrProcessor
+from ..glm4v.config import TextConfig, VisionConfig
+from ..glm4v.glm4v import LanguageModel, VisionModel
+from .config import ModelConfig
 from .model import Model
+from .processing import GlmOcrProcessor
 
 __all__ = [
     "Model",
