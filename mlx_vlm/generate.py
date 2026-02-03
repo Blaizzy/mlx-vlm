@@ -398,7 +398,7 @@ def generate_step(
             {
                 k: v
                 for k, v in embedding_output.to_dict().items()
-                if k != "inputs_embeds" and v is not None
+                if k not in ("inputs_embeds", "per_layer_inputs") and v is not None
             }
         )
         if prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size:
