@@ -404,26 +404,25 @@ def generate_step(
         if prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size:
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
-            input_offset = 0
             with tqdm(total=total_tokens, desc="Prefill", unit="tok") as pbar:
                 while inputs_embeds.shape[1] > 1:
                     n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
                     model.language_model(
-                        inputs=input_ids[:, input_offset : input_offset + n_to_process],
+                        inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
                         cache=prompt_cache,
                         **kwargs,
                     )
+                    quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
                     inputs_embeds = inputs_embeds[:, n_to_process:]
-                    input_offset += n_to_process
-                    quantize_cache_fn(prompt_cache)
+                    input_ids = input_ids[:, n_to_process:]
                     mx.clear_cache()
                     pbar.update(n_to_process)
 
             input_ids = input_ids[:, -1:]
 
-            y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds, **kwargs)
+        y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds, **kwargs)
 
     mx.async_eval(y)
 
@@ -432,16 +431,16 @@ def generate_step(
         if n != max_tokens:
             next_y, next_logprobs = _step(y[None], **kwargs)
             mx.async_eval(next_y)
-            yield y.item(), logprobs
-            y, logprobs = next_y, next_logprobs
+        if n == 0:
+            mx.eval(y)
         if n == max_tokens:
             break
 
-        n += 1
-
-        # Periodically clear cache to prevent memory accumulation
-        if n % 256 == 0:  # Clear cache every 256 tokens
+        yield y.item(), logprobs
+        if n % 256 == 0:
             mx.clear_cache()
+        y, logprobs = next_y, next_logprobs
+        n += 1
 
 
 def stream_generate(
