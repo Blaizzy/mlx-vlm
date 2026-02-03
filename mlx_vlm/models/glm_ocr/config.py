@@ -6,15 +6,16 @@ from ..base import BaseModelConfig
 
 @dataclass
 class TextConfig(BaseModelConfig):
-    """Text config for GLM-OCR (0.9B params)"""
     model_type: str = "glm_ocr_text"
     vocab_size: int = 59392
     hidden_size: int = 1536
-    eos_token_id: List[int] = field(default_factory=lambda: [59246, 59253])
+    eos_token_id: List[int] = field(
+        default_factory=lambda: [59246, 59253]
+    )
     intermediate_size: int = 4608
     max_position_embeddings: int = 131072
     num_attention_heads: int = 16
-    num_hidden_layers: int = 16
+    num_hidden_layers: int = 17  # GLM-OCR has 17 layers (16 + 1 nextn)
     num_key_value_heads: int = 8
     rms_norm_eps: float = 1e-05
     rope_theta: float = 10000
@@ -28,20 +29,18 @@ class TextConfig(BaseModelConfig):
     )
     pad_token_id: int = 59246
     use_cache: bool = True
-    dtype: str = "bfloat16"
 
 
 @dataclass
 class VisionConfig(BaseModelConfig):
-    """Vision config for GLM-OCR"""
-    model_type: str = "glm_ocr_vision"
-    hidden_size: int = 1024
+    model_type: str = "glm4v_vision"  # Must be glm4v_vision for compatibility
     depth: int = 24
-    num_heads: int = 16
+    hidden_size: int = 1024
     intermediate_size: int = 4096
+    num_heads: int = 16
     patch_size: int = 14
-    image_size: int = 336
     window_size: int = 112
+    image_size: int = 336
     in_channels: int = 3
     rms_norm_eps: float = 1e-05
     attention_bias: bool = True
@@ -55,21 +54,11 @@ class VisionConfig(BaseModelConfig):
 
 @dataclass
 class ModelConfig(BaseModelConfig):
-    """Configuration for GLM-OCR model.
-    
-    GLM-OCR (0.9B) is a multimodal OCR model for complex document understanding.
-    
-    Reference: https://huggingface.co/zai-org/GLM-OCR
-    """
     text_config: TextConfig
     vision_config: VisionConfig
     model_type: str = "glm_ocr"
     vocab_size: int = 59392
     ignore_index: int = -100
-    image_start_token_id: int = 59256
-    image_end_token_id: int = 59257
-    video_start_token_id: int = 59258
-    video_end_token_id: int = 59259
     image_token_index: int = 59256
     image_token_id: int = 59280
     video_token_index: int = 59258

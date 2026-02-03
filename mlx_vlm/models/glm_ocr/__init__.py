@@ -8,14 +8,14 @@ Model: zai-org/GLM-OCR
 
 from .config import ModelConfig, TextConfig, VisionConfig
 from .model import LanguageModel, Model, VisionModel
-from .processing import GlmOcrProcessor
+from .processing import Glm46VProcessor
 
 __all__ = [
     "Model",
-    "ModelConfig",
+    "ModelConfig", 
     "TextConfig",
     "VisionConfig",
     "LanguageModel",
     "VisionModel",
-    "GlmOcrProcessor",
+    "Glm46VProcessor",
 ]

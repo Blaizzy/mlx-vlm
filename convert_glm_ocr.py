@@ -29,8 +29,8 @@ def main():
     parser.add_argument(
         "--hf-path",
         type=str,
-        default="THUDM/glm-ocr-0.9b",
-        help="HuggingFace model path (default: THUDM/glm-ocr-0.9b)",
+        default="./glm-ocr-hf",
+        help="HuggingFace model path (default: ./glm-ocr-hf)",
     )
     parser.add_argument(
         "--mlx-path",
