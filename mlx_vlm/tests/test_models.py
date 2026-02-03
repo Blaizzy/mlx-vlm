@@ -1976,6 +1976,95 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
+    def test_glm_ocr(self):
+        from mlx_vlm.models import glm_ocr
+
+        text_config = glm_ocr.TextConfig(
+            model_type="glm_ocr_text",
+            vocab_size=1000,
+            hidden_size=128,
+            num_hidden_layers=2,
+            intermediate_size=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            rms_norm_eps=1e-5,
+            max_position_embeddings=1000,
+            rope_parameters={
+                "rope_type": "default",
+                "mrope_section": [8, 12, 12],
+                "partial_rotary_factor": 1.0,
+                "rope_theta": 10000,
+            },
+        )
+
+        vision_config = glm_ocr.VisionConfig(
+            model_type="glm_ocr_vision",
+            depth=2,
+            hidden_size=128,
+            intermediate_size=256,
+            num_heads=4,
+            patch_size=14,
+            in_channels=3,
+            out_hidden_size=128,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            rms_norm_eps=1e-5,
+        )
+
+        config = glm_ocr.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="glm_ocr",
+            image_token_id=999,
+            video_token_id=998,
+            vocab_size=1000,
+        )
+
+        model = glm_ocr.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        # Test vision model with proper input format
+        # grid_thw format: [temporal, height/patch, width/patch]
+        # For grid_thw = [2, 14, 14], we have 2*14*14 = 392 patches
+        # Height/width must be divisible by spatial_merge_size (2)
+        grid_thw = mx.array([[2, 14, 14]], dtype=mx.int64)
+        num_patches = int(grid_thw[0, 0] * grid_thw[0, 1] * grid_thw[0, 2])
+
+        # Create input tensor - flat array that gets reshaped internally
+        # Shape: (num_patches * in_channels * temporal_patch_size * patch_size * patch_size)
+        total_elements = (
+            num_patches
+            * config.vision_config.in_channels
+            * config.vision_config.temporal_patch_size
+            * config.vision_config.patch_size
+            * config.vision_config.patch_size
+        )
+        pixel_values = mx.random.uniform(shape=(total_elements,))
+
+        # Forward pass
+        hidden_states = model.vision_tower(
+            pixel_values, grid_thw, output_hidden_states=False
+        )
+
+        # Check output shape
+        # After spatial merge (2x2), we should have:
+        # temporal * (height/spatial_merge) * (width/spatial_merge)
+        # = 2 * (14/2) * (14/2) = 2 * 7 * 7 = 98 patches
+        expected_patches = int(
+            grid_thw[0, 0]
+            * (grid_thw[0, 1] // config.vision_config.spatial_merge_size)
+            * (grid_thw[0, 2] // config.vision_config.spatial_merge_size)
+        )
+        self.assertEqual(hidden_states.shape[0], expected_patches)
+        self.assertEqual(hidden_states.shape[1], config.vision_config.out_hidden_size)
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
@@ -3050,6 +3139,47 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "internvl_chat")
+
+    def test_glm_ocr_input_embeddings(self):
+        from mlx_vlm.models import glm_ocr
+
+        model = glm_ocr.Model(
+            glm_ocr.ModelConfig(
+                text_config=glm_ocr.TextConfig(
+                    model_type="glm_ocr_text",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    head_dim=8,
+                    rms_norm_eps=1e-5,
+                    max_position_embeddings=1000,
+                    rope_parameters={
+                        "rope_type": "default",
+                        "mrope_section": [2, 3, 3],
+                        "partial_rotary_factor": 1.0,
+                        "rope_theta": 10000,
+                    },
+                ),
+                vision_config=glm_ocr.VisionConfig(
+                    model_type="glm_ocr_vision",
+                    depth=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_heads=2,
+                    out_hidden_size=16,
+                    patch_size=14,
+                    in_channels=3,
+                    rms_norm_eps=1e-5,
+                ),
+                model_type="glm_ocr",
+                image_token_id=31,
+                vocab_size=32,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "glm_ocr")
 
 
 class TestChunkedPrefillRoPE(unittest.TestCase):
