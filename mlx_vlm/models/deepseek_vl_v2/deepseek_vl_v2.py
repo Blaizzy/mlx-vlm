@@ -337,11 +337,11 @@ class Model(nn.Module):
                 num_width_tiles, num_height_tiles = images_spatial_crop[idx][jdx]
                 if num_width_tiles == 0 or num_height_tiles == 0:
                     break
-                batch_num_tiles[idx] += (
-                    1 + num_width_tiles * num_height_tiles
-                ).tolist()
+                batch_num_tiles[idx] += int(
+                    (1 + num_width_tiles * num_height_tiles).item()
+                )
 
-            total_tiles.append(pixel_values[idx][: batch_num_tiles[idx]])
+            total_tiles.append(pixel_values[idx, : batch_num_tiles[idx]])
 
         total_tiles = mx.concatenate(total_tiles, axis=0)
 
