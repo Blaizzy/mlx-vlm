@@ -326,10 +326,9 @@ def generate_step(
     if repetition_context_size:
         repetition_context = repetition_context[-repetition_context_size:]
 
-    def _step(y, inputs_embeds=None, **kwargs):
-        nonlocal tokens
+    def _step(y, inputs_embeds=None):
+        nonlocal tokens, repetition_context, kwargs
         with mx.stream(generation_stream):
-            nonlocal repetition_context
             if "decoder_input_ids" in kwargs:
                 outputs = model.language_model(
                     cache=prompt_cache,
@@ -368,18 +367,12 @@ def generate_step(
             quantize_cache_fn(prompt_cache)
 
             if outputs.cross_attention_states is not None:
-                kwargs = {
-                    k: v
-                    for k, v in zip(
-                        ["cross_attention_states"], [outputs.cross_attention_states]
-                    )
-                }
+                kwargs = {"cross_attention_states": outputs.cross_attention_states}
             elif outputs.encoder_outputs is not None:
                 kwargs = {
                     "decoder_input_ids": y[None],
                     "encoder_outputs": outputs.encoder_outputs,
                 }
-
             else:
                 kwargs = {}
 
@@ -398,7 +391,7 @@ def generate_step(
             {
                 k: v
                 for k, v in embedding_output.to_dict().items()
-                if k not in ("inputs_embeds", "per_layer_inputs") and v is not None
+                if k != "inputs_embeds" and v is not None
             }
         )
         if prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size:
@@ -422,14 +415,14 @@ def generate_step(
 
             input_ids = input_ids[:, -1:]
 
-        y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds, **kwargs)
+        y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
     mx.async_eval(y)
 
     n = 0
     while True:
         if n != max_tokens:
-            next_y, next_logprobs = _step(y[None], **kwargs)
+            next_y, next_logprobs = _step(y[None])
             mx.async_eval(next_y)
         if n == 0:
             mx.eval(y)
