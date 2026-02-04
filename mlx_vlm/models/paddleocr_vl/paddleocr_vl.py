@@ -2,15 +2,14 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from transformers import AutoProcessor
 
-from ..base import InputEmbeddingsFeatures
+from ..base import InputEmbeddingsFeatures, install_auto_processor_patch
 from .config import ModelConfig
 from .language import LanguageModel
 from .processing_paddleocr_vl import PaddleOCRVLProcessor
 from .vision import VisionModel
 
-AutoProcessor.register("paddleocr_vl", PaddleOCRVLProcessor)
+install_auto_processor_patch("paddleocr_vl", PaddleOCRVLProcessor)
 
 
 class Model(nn.Module):
