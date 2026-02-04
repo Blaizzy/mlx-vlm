@@ -74,8 +74,8 @@ def get_model_and_args(config: dict):
 
     try:
         arch = importlib.import_module(f"mlx_vlm.models.{model_type}")
-    except ImportError:
-        msg = f"Model type {model_type} not supported."
+    except ImportError as e:
+        msg = f"Model type {model_type} not supported. Error: {e}"
         logging.error(msg)
         raise ValueError(msg)
 
