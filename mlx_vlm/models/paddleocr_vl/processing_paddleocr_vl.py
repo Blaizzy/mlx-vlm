@@ -1,4 +1,6 @@
+import json
 import math
+from pathlib import Path
 from typing import List, Optional, Union
 
 import numpy as np
@@ -248,6 +250,7 @@ class PaddleOCRVLProcessor(ProcessorMixin):
         chat_template=None,
         **kwargs,
     ):
+
         if image_processor is None:
             image_processor = ImageProcessor(**kwargs)
 
@@ -356,14 +359,63 @@ class PaddleOCRVLProcessor(ProcessorMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         """Load processor from pretrained model path."""
+        import warnings
+
+        from huggingface_hub import hf_hub_download
+
         trust_remote_code = kwargs.pop("trust_remote_code", True)
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path,
-            trust_remote_code=trust_remote_code,
-            **kwargs,
-        )
-        image_processor = ImageProcessor(**kwargs)
+        model_path = Path(pretrained_model_name_or_path)
+        is_local = model_path.exists() and model_path.is_dir()
+
+        # Suppress warning about mrope_section in rope_parameters
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message="Unrecognized keys in `rope_parameters`"
+            )
+            tokenizer = AutoTokenizer.from_pretrained(
+                str(model_path) if is_local else pretrained_model_name_or_path,
+                trust_remote_code=trust_remote_code,
+                local_files_only=is_local,
+                **kwargs,
+            )
+
+        # Load image processor config from preprocessor_config.json
+        image_processor_config = {}
+        try:
+            if is_local:
+                config_path = model_path / "preprocessor_config.json"
+            else:
+                config_path = Path(
+                    hf_hub_download(
+                        pretrained_model_name_or_path, "preprocessor_config.json"
+                    )
+                )
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    preprocessor_config = json.load(f)
+                # Extract relevant image processor parameters
+                relevant_keys = [
+                    "min_pixels",
+                    "max_pixels",
+                    "patch_size",
+                    "temporal_patch_size",
+                    "merge_size",
+                    "image_mean",
+                    "image_std",
+                    "do_resize",
+                    "do_rescale",
+                    "do_normalize",
+                    "do_convert_rgb",
+                ]
+                for key in relevant_keys:
+                    if key in preprocessor_config:
+                        image_processor_config[key] = preprocessor_config[key]
+
+        except Exception:
+            pass
+
+        image_processor = ImageProcessor(**image_processor_config)
         return cls(image_processor=image_processor, tokenizer=tokenizer, **kwargs)
 
 
