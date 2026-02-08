@@ -415,7 +415,7 @@ def is_video_model(model):
 def is_video_file(video_path: List[str]) -> bool:
     video_extensions = [".mp4", ".avi", ".mov"]
     for path in video_path:
-        if not any(path.endswith(ext) for ext in video_extensions):
+        if not any(path.lower().endswith(ext) for ext in video_extensions):
             return False
     return True
 
