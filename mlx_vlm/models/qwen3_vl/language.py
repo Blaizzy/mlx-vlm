@@ -508,8 +508,6 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
-        rope_deltas = kwargs.pop("rope_deltas", None)
-
         # reset rope_deltas when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None

@@ -82,7 +82,7 @@ class Model(nn.Module):
 
         image_mask = image_mask[..., 0]
         visual_pos_masks = image_mask
-        deepstack_visual_embeds = deepstack_image_embeds
+        deepstack_visual_embeds = mx.eval(deepstack_image_embeds)
 
         # Pre-calculate position_ids for chunked prefill
         if image_grid_thw is not None or video_grid_thw is not None:
@@ -150,10 +150,6 @@ class Model(nn.Module):
         return logits
 
     def sanitize(self, weights):
-        weights = {
-            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
-        }
-
         sanitized_weights = {}
         for key, value in weights.items():
             if "model" in key:
