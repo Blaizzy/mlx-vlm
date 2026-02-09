@@ -1,8 +1,9 @@
-from typing import Optional, Any
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
+from mlx_lm.models.activations import swiglu
+from mlx_lm.models.gated_delta import gated_delta_update
 
 from ..base import (
     LanguageModelOutput,
@@ -11,9 +12,6 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
-from mlx_lm.models.gated_delta import gated_delta_update
-from mlx_lm.models.activations import swiglu
-
 from .config import ModelConfig, TextConfig
 
 

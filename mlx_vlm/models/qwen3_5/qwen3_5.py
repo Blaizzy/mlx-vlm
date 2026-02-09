@@ -1,15 +1,15 @@
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from typing import Optional
 
 from ..base import InputEmbeddingsFeatures
 from ..qwen3_vl import Model as Qwen3VLModel
 from ..qwen3_vl.qwen3_vl import masked_scatter
-
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
+
 
 class Model(Qwen3VLModel):
 
@@ -46,9 +46,7 @@ class Model(Qwen3VLModel):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
-        hidden_states, _ = self.vision_tower(
-            pixel_values, grid_thw
-        )
+        hidden_states, _ = self.vision_tower(pixel_values, grid_thw)
 
         # Insert special image tokens in the input_ids
         inputs_embeds, _ = self.merge_input_ids_with_image_features(

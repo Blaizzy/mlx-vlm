@@ -2,10 +2,10 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..qwen3_5 import Model as Qwen3_5Model
-
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
+
 
 class Model(Qwen3_5Model):
 
@@ -31,7 +31,9 @@ class Model(Qwen3_5Model):
             weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
             weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_weights
             # down_proj
-            weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(f"{prefix}.experts.down_proj")
+            weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
+                f"{prefix}.experts.down_proj"
+            )
 
         norm_keys = (
             ".input_layernorm.weight",

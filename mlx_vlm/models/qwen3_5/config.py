@@ -11,8 +11,13 @@ class VisionConfig(Qwen3VLVisionConfig):
     model_type: str = "qwen3_5"
 
     def __post_init__(self):
-        if self.deepstack_visual_indexes is not None and len(self.deepstack_visual_indexes) > 0:
-            raise ValueError(f"deepstack is disabled for qwen3.5 temporally, but it is set to {self.deepstack_visual_indexes}")
+        if (
+            self.deepstack_visual_indexes is not None
+            and len(self.deepstack_visual_indexes) > 0
+        ):
+            raise ValueError(
+                f"deepstack is disabled for qwen3.5 temporally, but it is set to {self.deepstack_visual_indexes}"
+            )
         self.deepstack_visual_indexes = []
 
 
@@ -36,17 +41,30 @@ class TextConfig(BaseModelConfig):
     attention_bias: bool = False
     head_dim: Optional[int] = None
     rope_parameters: Optional[Dict[str, Union[float, str, bool, List[int]]]] = field(
-        default_factory=lambda: {"type": "default", "mrope_section": [11, 11, 10], "rope_theta": 100000, "partial_rotary_factor": 0.25}
+        default_factory=lambda: {
+            "type": "default",
+            "mrope_section": [11, 11, 10],
+            "rope_theta": 100000,
+            "partial_rotary_factor": 0.25,
+        }
     )
     full_attention_interval: int = 4
 
     def __post_init__(self):
         if self.rope_parameters:
             # Normalize rope_parameters keys (accept both 'rope_type' and 'type')
-            if "type" not in self.rope_parameters and "rope_type" in self.rope_parameters:
+            if (
+                "type" not in self.rope_parameters
+                and "rope_type" in self.rope_parameters
+            ):
                 self.rope_parameters["type"] = self.rope_parameters.pop("rope_type")
 
-            required_keys = {"mrope_section", "type", "rope_theta", "partial_rotary_factor"}
+            required_keys = {
+                "mrope_section",
+                "type",
+                "rope_theta",
+                "partial_rotary_factor",
+            }
             if not all(key in self.rope_parameters for key in required_keys):
                 raise ValueError(f"rope_parameters must contain keys {required_keys}")
 
@@ -81,4 +99,3 @@ class ModelConfig(BaseModelConfig):
                 if k in inspect.signature(cls).parameters
             }
         )
-

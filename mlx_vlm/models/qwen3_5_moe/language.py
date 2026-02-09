@@ -1,17 +1,14 @@
-from typing import Optional, Any
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-
 from mlx_lm.models.switch_layers import SwitchGLU
 
-from ..qwen3_5.language import (
-    LanguageModel as Qwen3_5LanguageModel,
-    Qwen3_5Attention as Qwen3_5MoeAttention,
-    Qwen3_5GatedDeltaNet as Qwen3_5MoeGatedDeltaNet,
-    Qwen3_5MLP as Qwen3_5MoeMLP,
-    Qwen3_5Model,
-)
+from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
+from ..qwen3_5.language import Qwen3_5Attention as Qwen3_5MoeAttention
+from ..qwen3_5.language import Qwen3_5GatedDeltaNet as Qwen3_5MoeGatedDeltaNet
+from ..qwen3_5.language import Qwen3_5MLP as Qwen3_5MoeMLP
+from ..qwen3_5.language import Qwen3_5Model
 from .config import ModelConfig, TextConfig
 
 
