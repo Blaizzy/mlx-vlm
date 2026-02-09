@@ -3,10 +3,81 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import InputEmbeddingsFeatures
-from .config import ModelConfig
-from .language import LanguageModel
-from .vision import VisionModel
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
+from ..cache import KVCache
+from .config import ModelConfig, TextConfig
+
+
+class Qwen2RotaryEmbedding:
+    def __init__(
+        self, dim, max_position_embeddings=2048, base=10000, rope_scaling=None
+    ):
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+
+        inv_freq = 1.0 / (
+            self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
+        )
+        self.inv_freq = inv_freq
+        self.attention_scaling = 1.0  # type: default
+
+        self.mrope_section = rope_scaling.get("mrope_section", [24, 20, 20])
+
+    def apply_mrope(self, freqs, mrope_section):
+        """Apply MRoPE to 3D rotary embeddings.
+        Reorganizes frequency layout to chunked [TTT...HHH...WWW]
+        args:
+            freqs: (3, bs, seq_len, head_dim // 2)
+            mrope_section: (3,)
+        returns:
+            x_t: (bs, seq_len, head_dim // 2)
+        """
+        freqs_t = freqs[0]  # just overwrite the first dimension T
+        offset = mrope_section[0]
+        for dim, length in enumerate(mrope_section[1:], start=1):  # H, W
+            idx = slice(offset, offset + length)
+            freqs_t[..., idx] = freqs[dim, ..., idx]
+            offset += length
+        return freqs_t
+
+    def __call__(self, x, position_ids):
+        # In contrast to other models, Qwen3VL has different position ids for the grids
+        # So we expand the inv_freq to shape (3, ...)
+        if position_ids.ndim == 2:
+            position_ids = mx.broadcast_to(
+                position_ids[None, ...],
+                (3, position_ids.shape[0], position_ids.shape[1]),
+            )
+
+        inv_freq_expanded = mx.broadcast_to(
+            self.inv_freq[None, None, :, None].astype(mx.float32),
+            (3, position_ids.shape[1], self.inv_freq.shape[0], 1),
+        )
+        position_ids_expanded = position_ids[:, :, None, :].astype(
+            mx.float32
+        )  # shape (3, bs, 1, positions)
+
+        freqs = inv_freq_expanded @ position_ids_expanded
+        freqs = mx.swapaxes(freqs, 2, 3)
+        freqs = self.apply_mrope(freqs, self.mrope_section)
+        emb = mx.concatenate([freqs, freqs], axis=-1)
+        cos = mx.cos(emb) * self.attention_scaling
+        sin = mx.sin(emb) * self.attention_scaling
+
+        return cos.astype(x.dtype), sin.astype(x.dtype)
+
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return mx.concatenate([-x2, x1], axis=-1)
+
 
 
 class Model(nn.Module):
@@ -114,9 +185,8 @@ class Model(nn.Module):
                         f"number of image features ({batch_features.shape[0]}) for batch {batch_idx}"
                     )
 
-                # Create indices for gathering
-                cumsum = mx.cumsum(image_mask.astype(mx.int32))
-                feature_indices = mx.where(image_mask, cumsum - 1, 0)
+        if mask is None:
+            mask = create_attention_mask(h, cache[0])
 
                 # Gather features
                 gathered_features = batch_features[feature_indices]
@@ -149,9 +219,75 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
+        position_ids = kwargs.pop("position_ids", None)
+        pixel_values = kwargs.pop("pixel_values", None)
+        image_grid_thw = kwargs.pop("image_grid_thw", None)
+        video_grid_thw = kwargs.pop("video_grid_thw", None)
+        # reset rope_deltas and position_ids when processing a new image/video
+        if pixel_values is not None:
+            self._rope_deltas = None
+            self._position_ids = None
 
-        input_embeddings_features = self.get_input_embeddings(
-            input_ids, pixel_values, **kwargs
+        cache_offset = 0
+        if cache and cache[0] is not None:
+            offset = cache[0].offset
+            if isinstance(offset, int):
+                cache_offset = offset
+            elif isinstance(offset, mx.array):
+                cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
+            else:
+                raise ValueError(f"Unexpected cache offset type: {type(offset)}")
+
+        # Check if mask shape matches input shape (for chunked prefill compatibility)
+        rope_mask = mask
+        if mask is not None and mask.shape[-1] != inputs.shape[-1]:
+            rope_mask = None
+
+        if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
+            # Calculate RoPE index once per generation in the pre-fill stage only
+            if (
+                (cache is not None and cache[0] is not None and (cache_offset == 0))
+                or self._rope_deltas is None
+                or cache is None
+            ):
+                # Check if we have stored position_ids from chunked prefill
+                if self._position_ids is not None:
+                    seq_length = inputs.shape[1]
+                    position_ids = self._position_ids[
+                        :, :, cache_offset : cache_offset + seq_length
+                    ]
+                else:
+                    position_ids, rope_deltas = self.get_rope_index(
+                        inputs, image_grid_thw, video_grid_thw, rope_mask
+                    )
+                    self._rope_deltas = rope_deltas
+                    self._position_ids = position_ids
+            else:
+                # Use the prev pre-calculated rope-deltas to get the correct position ids
+                batch_size, seq_length = inputs.shape
+                delta = mx.array(
+                    cache_offset + self._rope_deltas if cache is not None else 0
+                )
+                position_ids = mx.arange(seq_length).reshape(1, -1)
+                position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
+
+                if cache_offset is not None:
+                    if delta.ndim == 0:
+                        delta = mx.expand_dims(delta, axis=0)
+
+                    if delta.shape[0] < batch_size:
+                        delta = mx.tile(delta, (batch_size, 1))
+                    else:
+                        # Slice delta to match batch
+                        delta = delta[:batch_size]
+
+                position_ids = mx.add(position_ids, delta)[None, ...]
+                position_ids = mx.broadcast_to(
+                    position_ids, (3, batch_size, seq_length)
+                )
+
+        out = self.model(
+            inputs, cache=cache, inputs_embeds=inputs_embeds, position_ids=position_ids
         )
         kwargs = {
             "pixel_values": pixel_values,
