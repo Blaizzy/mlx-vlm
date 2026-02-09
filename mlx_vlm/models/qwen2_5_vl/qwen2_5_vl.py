@@ -182,4 +182,3 @@ class Model(nn.Module):
             return key
 
         return {transform_key(k): v for k, v in weights.items()}
-    
