@@ -71,7 +71,7 @@ if __name__ == "__main__":
         processor,
         model.config,
         args.prompt,
-        num_images=1,
+        num_images=1 if args.image is not None else 0,
         num_audios=0,
     )
 
