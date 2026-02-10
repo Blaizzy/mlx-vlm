@@ -17,14 +17,7 @@ from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
-from .sample_utils import top_p_sampling
-from .utils import (
-    StoppingCriteria,
-    apply_repetition_penalty,
-    group_images_by_shape,
-    load,
-    prepare_inputs,
-)
+from .utils import StoppingCriteria, group_images_by_shape, load, prepare_inputs
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
