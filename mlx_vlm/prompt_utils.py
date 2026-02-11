@@ -41,9 +41,12 @@ MODEL_CONFIG = {
     "qwen2_5_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "qwen3_5": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "qwen3_5_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "glm_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
@@ -197,6 +200,8 @@ class MessageFormatter:
             "qwen2_5_vl",
             "qwen3_vl",
             "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
         ] and kwargs.get("video"):
             return self._format_video_message(prompt, kwargs)
 

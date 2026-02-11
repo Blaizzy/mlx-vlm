@@ -23,6 +23,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 |-------|---------------|
 | DeepSeek-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
 | DeepSeek-OCR-2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
+| GLM-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/glm_ocr/README.md) |
 
 ## Installation
 
@@ -31,6 +32,14 @@ The easiest way to get started is to install the `mlx-vlm` package using pip:
 ```sh
 pip install -U mlx-vlm
 ```
+
+Some models (e.g., Qwen2-VL) require additional dependencies from the `torch` extra:
+
+```sh
+pip install -U mlx-vlm[torch]
+```
+
+This installs `torch`, `torchvision`, and other dependencies needed by certain model processors.
 
 ## Usage
 

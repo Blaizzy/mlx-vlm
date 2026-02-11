@@ -121,9 +121,10 @@ class Model(nn.Module):
                 "audio_feature_lengths",
             ]
         }
-        inputs_embeds, _, _ = self.thinker.get_input_embeddings(
+        input_embedding_features = self.thinker.get_input_embeddings(
             input_ids, **embed_kwargs
         )
+        inputs_embeds = input_embedding_features.inputs_embeds
 
         lm_kwargs = {
             k: v for k, v in kwargs.items() if k in ["image_grid_thw", "video_grid_thw"]

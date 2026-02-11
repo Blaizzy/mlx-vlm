@@ -88,7 +88,16 @@ class Dataset:
             )
             prompts.append(prompt)
 
-        image_token_index = self.config["image_token_index"]
+        # Handle both image_token_index and image_token_id config keys
+        # Some models (e.g., Qwen2-VL) use image_token_id instead
+        image_token_index = self.config.get("image_token_index")
+        if image_token_index is None:
+            image_token_index = self.config.get("image_token_id")
+        if image_token_index is None:
+            raise KeyError(
+                "Missing image token config: expected 'image_token_index' or 'image_token_id' "
+                f"in config. Available keys: {list(self.config.keys())}"
+            )
 
         inputs = prepare_inputs(
             processor=self.processor,

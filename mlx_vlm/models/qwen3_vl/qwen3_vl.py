@@ -82,7 +82,7 @@ class Model(nn.Module):
 
         image_mask = image_mask[..., 0]
         visual_pos_masks = image_mask
-        deepstack_visual_embeds = deepstack_image_embeds
+        deepstack_visual_embeds = mx.eval(deepstack_image_embeds)
 
         # Pre-calculate position_ids for chunked prefill
         if image_grid_thw is not None or video_grid_thw is not None:

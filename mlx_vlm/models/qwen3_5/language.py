@@ -1,20 +1,23 @@
-from typing import Optional
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.activations import swiglu
+from mlx_lm.models.gated_delta import gated_delta_update
 
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    create_ssm_mask,
     scaled_dot_product_attention,
 )
-from ..cache import KVCache
+from ..cache import ArraysCache, KVCache
 from .config import ModelConfig, TextConfig
 
 
-class Qwen2RotaryEmbedding:
+class Qwen3_5RotaryEmbedding:
     def __init__(
-        self, dim, max_position_embeddings=2048, base=10000, rope_scaling=None
+        self, dim, max_position_embeddings=2048, base=10000, mrope_section=[11, 11, 0]
     ):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
@@ -24,30 +27,18 @@ class Qwen2RotaryEmbedding:
             self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
         )
         self.inv_freq = inv_freq
-        self.attention_scaling = 1.0  # type: default
 
-        self.mrope_section = rope_scaling.get("mrope_section", [24, 20, 20])
+        self.mrope_section = mrope_section
 
-    def apply_mrope(self, freqs, mrope_section):
-        """Apply MRoPE to 3D rotary embeddings.
-        Reorganizes frequency layout to chunked [TTT...HHH...WWW]
-        args:
-            freqs: (3, bs, seq_len, head_dim // 2)
-            mrope_section: (3,)
-        returns:
-            x_t: (bs, seq_len, head_dim // 2)
-        """
-        freqs_t = freqs[0]  # just overwrite the first dimension T
-        offset = mrope_section[0]
-        for dim, length in enumerate(mrope_section[1:], start=1):  # H, W
-            idx = slice(offset, offset + length)
+    def apply_interleaved_mrope(self, freqs, mrope_section):
+        freqs_t = freqs[0]
+        for dim, offset in enumerate((1, 2), start=1):
+            length = mrope_section[dim] * 3
+            idx = slice(offset, length, 3)
             freqs_t[..., idx] = freqs[dim, ..., idx]
-            offset += length
         return freqs_t
 
     def __call__(self, x, position_ids):
-        # In contrast to other models, Qwen3VL has different position ids for the grids
-        # So we expand the inv_freq to shape (3, ...)
         if position_ids.ndim == 2:
             position_ids = mx.broadcast_to(
                 position_ids[None, ...],
@@ -58,93 +49,120 @@ class Qwen2RotaryEmbedding:
             self.inv_freq[None, None, :, None].astype(mx.float32),
             (3, position_ids.shape[1], self.inv_freq.shape[0], 1),
         )
-        position_ids_expanded = position_ids[:, :, None, :].astype(
-            mx.float32
-        )  # shape (3, bs, 1, positions)
+        position_ids_expanded = position_ids[:, :, None, :].astype(mx.float32)
 
         freqs = inv_freq_expanded @ position_ids_expanded
         freqs = mx.swapaxes(freqs, 2, 3)
-        freqs = self.apply_mrope(freqs, self.mrope_section)
+        freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
         emb = mx.concatenate([freqs, freqs], axis=-1)
-        cos = mx.cos(emb) * self.attention_scaling
-        sin = mx.sin(emb) * self.attention_scaling
+        cos = mx.cos(emb)
+        sin = mx.sin(emb)
 
         return cos.astype(x.dtype), sin.astype(x.dtype)
 
 
 def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return mx.concatenate([-x2, x1], axis=-1)
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
-    """
-    Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors.
-    Args:
-        q (mx.array): The query tensor.
-        k (mx.array): The key tensor.
-        cos (mx.array): The cosine part of the rotary embedding.
-        sin (mx.array): The sine part of the rotary embedding.
-        unsqueeze_dim (int, optional): Dimension to unsqueeze. Defaults to 1.
-    Returns:
-        tuple(mx.array): The rotated query and key tensors.
-    """
-
     cos = mx.expand_dims(cos, axis=unqueeze_dim)
     sin = mx.expand_dims(sin, axis=unqueeze_dim)
 
-    # Apply rotary embedding
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    rotary_dim = cos.shape[-1]
+    q_rot = q[..., :rotary_dim]
+    q_pass = q[..., rotary_dim:]
+
+    k_rot = k[..., :rotary_dim]
+    k_pass = k[..., rotary_dim:]
+
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+
+    q_embed = mx.concatenate([q_embed, q_pass], axis=-1)
+    k_embed = mx.concatenate([k_embed, k_pass], axis=-1)
 
     return q_embed, k_embed
 
 
-class Attention(nn.Module):
+class Qwen3_5RMSNormGated(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = mx.ones(hidden_size)
+
+    def __call__(
+        self, hidden_states: mx.array, gate: mx.array | None = None
+    ) -> mx.array:
+        x = mx.fast.rms_norm(hidden_states, self.weight, self.eps)
+        if gate is not None:
+            x = swiglu(gate, x)
+        return x
+
+
+class Qwen3_5Attention(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
+        self.num_key_value_heads = args.num_key_value_heads
+        self.num_attention_heads = args.num_attention_heads
+        self.head_dim = args.head_dim
+        self.scale = self.head_dim**-0.5
 
-        dim = args.hidden_size
-        self.n_heads = n_heads = args.num_attention_heads
-        assert args.num_key_value_heads is not None
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
+        self.q_proj = nn.Linear(
+            args.hidden_size,
+            self.num_attention_heads * self.head_dim * 2,
+            bias=args.attention_bias,
+        )
+        self.k_proj = nn.Linear(
+            args.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
+        self.o_proj = nn.Linear(
+            self.num_attention_heads * self.head_dim,
+            args.hidden_size,
+            bias=args.attention_bias,
+        )
 
-        self.head_dim = head_dim = args.hidden_size // n_heads
-        self.scale = head_dim**-0.5
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
-        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
-
-        self.rope_scaling = args.rope_scaling
-
-        self.rotary_emb = Qwen2RotaryEmbedding(
-            head_dim,
+        self.rotary_emb = Qwen3_5RotaryEmbedding(
+            int(self.head_dim * args.rope_parameters["partial_rotary_factor"]),
             max_position_embeddings=args.max_position_embeddings,
-            base=args.rope_theta,
-            rope_scaling=args.rope_scaling,
+            base=args.rope_parameters["rope_theta"],
+            mrope_section=args.rope_parameters["mrope_section"],
         )
 
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[KVCache] = None,
+        cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        q_proj_output = self.q_proj(x)
+        queries, gate = mx.split(
+            q_proj_output.reshape(B, L, self.num_attention_heads, -1), 2, axis=-1
+        )
+        gate = gate.reshape(B, L, -1)
 
-        # Prepare the queries, keys and values for the attention computation
-        queries = queries.reshape(B, L, self.n_heads, self.head_dim).transpose(
+        keys, values = self.k_proj(x), self.v_proj(x)
+
+        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+        keys = self.k_norm(keys.reshape(B, L, self.num_key_value_heads, -1)).transpose(
             0, 2, 1, 3
         )
-        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
             0, 2, 1, 3
         )
 
@@ -161,22 +179,22 @@ class Attention(nn.Module):
         cos, sin = self.rotary_emb(values, position_ids)
 
         if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., : keys.shape[-2]]
-        queries, keys = apply_multimodal_rotary_pos_emb(
-            queries, keys, cos, sin, unqueeze_dim=1
-        )
+            mask = mask[..., :kv_seq_len]
+
+        queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
         output = scaled_dot_product_attention(
-            queries, keys, values, cache, scale=self.scale, mask=mask
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+
+        return self.o_proj(output * mx.sigmoid(gate))
 
 
-class MLP(nn.Module):
+class Qwen3_5MLP(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
@@ -184,48 +202,161 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
-class Qwen2VLDecoderLayer(nn.Module):
-    def __init__(self, args: TextConfig):
+class Qwen3_5GatedDeltaNet(nn.Module):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.num_attention_heads = args.num_attention_heads
-        self.hidden_size = args.hidden_size
-        self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size)
+        self.hidden_size = config.hidden_size
+        self.num_v_heads = config.linear_num_value_heads
+        self.num_k_heads = config.linear_num_key_heads
+        self.head_k_dim = config.linear_key_head_dim
+        self.head_v_dim = config.linear_value_head_dim
+        self.key_dim = self.head_k_dim * self.num_k_heads
+        self.value_dim = self.head_v_dim * self.num_v_heads
+        if self.num_v_heads % self.num_k_heads != 0:
+            raise ValueError(
+                f"num_v_heads ({self.num_v_heads}) must be divisible by num_k_heads ({self.num_k_heads})"
+            )
+
+        self.conv_kernel_size = config.linear_conv_kernel_dim
+        self.layer_norm_epsilon = config.rms_norm_eps
+
+        self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            bias=False,
+            kernel_size=self.conv_kernel_size,
+            groups=self.conv_dim,
+            padding=0,
+        )
+
+        self.in_proj_qkv = nn.Linear(
+            self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False
+        )
+        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
+        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+
+        self.dt_bias = mx.ones(self.num_v_heads)
+
+        A = mx.random.uniform(low=0, high=16, shape=(self.num_v_heads,))
+        self.A_log = mx.log(A)
+
+        self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+
+        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        B, S, _ = inputs.shape
+
+        mixed_qkv = self.in_proj_qkv(inputs)
+
+        z = self.in_proj_z(inputs)
+        z = z.reshape(B, S, -1, self.head_v_dim)
+
+        b = self.in_proj_b(inputs)
+        a = self.in_proj_a(inputs)
+
+        if cache is not None and cache[0] is not None:
+            conv_state = cache[0]
+        else:
+            conv_state = mx.zeros(
+                (B, self.conv_kernel_size - 1, self.conv_dim),
+                dtype=inputs.dtype,
+            )
+
+        if mask is not None:
+            mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
+        conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
+        if cache is not None:
+            cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
+        conv_out = nn.silu(self.conv1d(conv_input))
+
+        q, k, v = [
+            t.reshape(B, S, h, d)
+            for t, h, d in zip(
+                mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
+                [self.num_k_heads, self.num_k_heads, self.num_v_heads],
+                [self.head_k_dim, self.head_k_dim, self.head_v_dim],
+            )
+        ]
+
+        state = cache[1] if cache else None
+        inv_scale = k.shape[-1] ** -0.5
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+
+        out, state = gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            state,
+            mask,
+            use_kernel=not self.training,
+        )
+
+        if cache is not None:
+            cache[1] = state
+
+        out = self.norm(out, z)
+        return self.out_proj(out.reshape(B, S, -1))
+
+
+class Qwen3_5DecoderLayer(nn.Module):
+    def __init__(self, args: TextConfig, layer_idx: int):
+        super().__init__()
+        self.is_linear = (layer_idx + 1) % args.full_attention_interval != 0
+        if self.is_linear:
+            self.linear_attn = Qwen3_5GatedDeltaNet(args)
+        else:
+            self.self_attn = Qwen3_5Attention(args)
+
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
-        self.args = args
+        self.mlp = Qwen3_5MLP(args.hidden_size, args.intermediate_size)
 
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[KVCache] = None,
+        cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
+        if self.is_linear:
+            r = self.linear_attn(self.input_layernorm(x), mask, cache)
+        else:
+            r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
         h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        out = h + r
+        out = h + self.mlp(self.post_attention_layernorm(h))
         return out
 
 
-class Qwen2Model(nn.Module):
+class Qwen3_5Model(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
         self.args = args
-        self.vocab_size = args.vocab_size
-        self.num_hidden_layers = args.num_hidden_layers
-        assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            Qwen2VLDecoderLayer(args=args) for _ in range(args.num_hidden_layers)
+            Qwen3_5DecoderLayer(args=args, layer_idx=i)
+            for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.ssm_idx = 0
+        self.fa_idx = args.full_attention_interval - 1
 
     def __call__(
         self,
@@ -243,24 +374,24 @@ class Qwen2Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache[0])
+        fa_mask = create_attention_mask(h, cache[self.fa_idx])
+        ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
 
         for layer, c in zip(self.layers, cache):
+            mask = ssm_mask if layer.is_linear else fa_mask
             h = layer(h, mask, c, position_ids)
 
         return self.norm(h)
 
 
 class LanguageModel(nn.Module):
-    def __init__(self, args: TextConfig, config: ModelConfig):
+    def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
         self.args = args
         self.config = config
         self.model_type = args.model_type
-        self.model = Qwen2Model(args)
+        self.model = Qwen3_5Model(args)
         self._rope_deltas = None
-        self._position_ids = None
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
@@ -272,7 +403,6 @@ class LanguageModel(nn.Module):
         video_grid_thw: Optional[mx.array] = None,
         attention_mask: Optional[mx.array] = None,
     ):
-        # Calculate RoPE index for image/video tokens
         batch_size, seq_length = input_ids.shape
         position_ids = mx.arange(seq_length, dtype=mx.int32)
         position_ids = mx.broadcast_to(position_ids[None, :], (batch_size, seq_length))
@@ -352,29 +482,23 @@ class LanguageModel(nn.Module):
                     index = mx.broadcast_to(index, (3, text_len))
                     index = index + st_idx
                     llm_pos_ids_list.append(index)
-                    t_index = mx.arange(llm_grid_t).reshape(
-                        llm_grid_t, 1
-                    )  # Equivalent to .view(-1, 1)
+                    t_index = mx.arange(llm_grid_t).reshape(llm_grid_t, 1)
                     t_index = mx.broadcast_to(
                         t_index, (llm_grid_t, llm_grid_h * llm_grid_w)
-                    )  # Equivalent to expand()
-                    t_index = t_index.flatten()  # Flattens to 1D
+                    )
+                    t_index = t_index.flatten()
 
-                    h_index = mx.arange(llm_grid_h).reshape(
-                        1, llm_grid_h, 1
-                    )  # Equivalent to .view(1, -1)
+                    h_index = mx.arange(llm_grid_h).reshape(1, llm_grid_h, 1)
                     h_index = mx.broadcast_to(
                         h_index, (llm_grid_t, llm_grid_h, llm_grid_w)
-                    )  # Equivalent to expand()
-                    h_index = h_index.flatten()  # Flattens to 1D
+                    )
+                    h_index = h_index.flatten()
 
-                    w_index = mx.arange(llm_grid_w).reshape(
-                        1, 1, llm_grid_w
-                    )  # Equivalent to .view(1, -1)
+                    w_index = mx.arange(llm_grid_w).reshape(1, 1, llm_grid_w)
                     w_index = mx.broadcast_to(
                         w_index, (llm_grid_t, llm_grid_h, llm_grid_w)
-                    )  # Equivalent to expand()
-                    w_index = w_index.flatten()  # Flattens to 1D
+                    )
+                    w_index = w_index.flatten()
 
                     llm_pos_ids_list.append(
                         mx.stack([t_index, h_index, w_index]) + text_len + st_idx
@@ -388,12 +512,8 @@ class LanguageModel(nn.Module):
                     )
                     text_len = len(input_tokens) - st
 
-                    t_index = mx.arange(text_len).reshape(
-                        1, text_len
-                    )  # Equivalent to .view(-1, 1)
-                    t_index = mx.broadcast_to(
-                        t_index, (3, text_len)
-                    )  # Equivalent to expand(3, -1)
+                    t_index = mx.arange(text_len).reshape(1, text_len)
+                    t_index = mx.broadcast_to(t_index, (3, text_len))
 
                     llm_pos_ids_list.append(t_index + st_idx)
 
@@ -454,14 +574,12 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
-        # reset rope_deltas and position_ids when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None
-            self._position_ids = None
 
         cache_offset = 0
-        if cache and cache[0] is not None:
-            offset = cache[0].offset
+        if cache and cache[self.model.fa_idx] is not None:
+            offset = cache[self.model.fa_idx].offset
             if isinstance(offset, int):
                 cache_offset = offset
             elif isinstance(offset, mx.array):
@@ -469,32 +587,21 @@ class LanguageModel(nn.Module):
             else:
                 raise ValueError(f"Unexpected cache offset type: {type(offset)}")
 
-        # Check if mask shape matches input shape (for chunked prefill compatibility)
-        rope_mask = mask
-        if mask is not None and mask.shape[-1] != inputs.shape[-1]:
-            rope_mask = None
-
-        if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
-            # Calculate RoPE index once per generation in the pre-fill stage only
+        if position_ids is None and (mask is None or mask.ndim == 2):
             if (
-                (cache is not None and cache[0] is not None and (cache_offset == 0))
+                (
+                    cache is not None
+                    and cache[self.model.fa_idx] is not None
+                    and (cache_offset == 0)
+                )
                 or self._rope_deltas is None
                 or cache is None
             ):
-                # Check if we have stored position_ids from chunked prefill
-                if self._position_ids is not None:
-                    seq_length = inputs.shape[1]
-                    position_ids = self._position_ids[
-                        :, :, cache_offset : cache_offset + seq_length
-                    ]
-                else:
-                    position_ids, rope_deltas = self.get_rope_index(
-                        inputs, image_grid_thw, video_grid_thw, rope_mask
-                    )
-                    self._rope_deltas = rope_deltas
-                    self._position_ids = position_ids
+                position_ids, rope_deltas = self.get_rope_index(
+                    inputs, image_grid_thw, video_grid_thw, mask
+                )
+                self._rope_deltas = rope_deltas
             else:
-                # Use the prev pre-calculated rope-deltas to get the correct position ids
                 batch_size, seq_length = inputs.shape
                 delta = mx.array(
                     cache_offset + self._rope_deltas if cache is not None else 0
@@ -509,7 +616,6 @@ class LanguageModel(nn.Module):
                     if delta.shape[0] < batch_size:
                         delta = mx.tile(delta, (batch_size, 1))
                     else:
-                        # Slice delta to match batch
                         delta = delta[:batch_size]
 
                 position_ids = mx.add(position_ids, delta)[None, ...]
@@ -518,7 +624,10 @@ class LanguageModel(nn.Module):
                 )
 
         out = self.model(
-            inputs, cache=cache, inputs_embeds=inputs_embeds, position_ids=position_ids
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
         )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
@@ -529,6 +638,9 @@ class LanguageModel(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    def make_cache(self):
+        return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
     @property
     def head_dim(self):
