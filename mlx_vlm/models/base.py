@@ -6,7 +6,11 @@ from typing import Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import create_attention_mask, scaled_dot_product_attention
+from mlx_lm.models.base import (
+    create_attention_mask,
+    create_ssm_mask,
+    scaled_dot_product_attention,
+)
 from PIL import Image
 
 

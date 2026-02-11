@@ -33,6 +33,14 @@ The easiest way to get started is to install the `mlx-vlm` package using pip:
 pip install -U mlx-vlm
 ```
 
+Some models (e.g., Qwen2-VL) require additional dependencies from the `torch` extra:
+
+```sh
+pip install -U mlx-vlm[torch]
+```
+
+This installs `torch`, `torchvision`, and other dependencies needed by certain model processors.
+
 ## Usage
 
 ### Command Line Interface (CLI)
