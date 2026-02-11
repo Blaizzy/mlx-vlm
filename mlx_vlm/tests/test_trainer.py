@@ -135,13 +135,14 @@ class TestTrainer(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
-
     @patch("mlx_vlm.trainer.trainer.get_prompt")
     @patch("mlx_vlm.utils.prepare_inputs")
-    def test_dataset_getitem_falls_back_to_image_token_id(self, mock_prepare_inputs, mock_get_prompt):
+    def test_dataset_getitem_falls_back_to_image_token_id(
+        self, mock_prepare_inputs, mock_get_prompt
+    ):
         """Test that image_token_id is used when image_token_index is missing."""
         config_with_token_id = {"model_type": "test_model", "image_token_id": 151655}
-        
+
         dataset = Dataset(
             self.mock_hf_dataset,
             config_with_token_id,
@@ -165,11 +166,10 @@ if __name__ == "__main__":
         call_kwargs = mock_prepare_inputs.call_args[1]
         self.assertEqual(call_kwargs["image_token_index"], 151655)
 
-
     def test_dataset_getitem_raises_when_image_token_keys_missing(self):
         """Test that a clear KeyError is raised when neither key exists."""
         config_missing_token = {"model_type": "test_model"}
-        
+
         dataset = Dataset(
             self.mock_hf_dataset,
             config_missing_token,
@@ -185,5 +185,5 @@ if __name__ == "__main__":
 
         with self.assertRaises(KeyError) as context:
             dataset[0]
-        
+
         self.assertIn("image_token_index", str(context.exception))
