@@ -199,7 +199,7 @@ class VisionModel(nn.Module):
         self.config = config
         self.model_type = config.model_type
 
-        if self.model_type != "qwen3_vl":
+        if self.model_type not in ["qwen3_vl", "qwen3_5", "qwen3_5_moe"]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
         self.spatial_merge_size = config.spatial_merge_size
