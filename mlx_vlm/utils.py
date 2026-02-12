@@ -223,6 +223,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
         if quantization_config is not None:
             quant_method = quantization_config.get("quant_method")
+            quantization = None
             if quant_method == "compressed-tensors":
                 quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             elif quant_method == "mxfp4":
