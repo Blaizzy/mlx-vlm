@@ -147,6 +147,13 @@ def parse_arguments():
         help="Trust remote code when loading the model.",
     )
     parser.add_argument(
+        "--quantize-activations",
+        "-qa",
+        action="store_true",
+        help="Enable activation quantization for QQLinear layers. "
+        "Only supported for models quantized with 'nvfp4' or 'mxfp8' modes.",
+    )
+    parser.add_argument(
         "--processor-kwargs",
         type=json.loads,
         default={},
@@ -1267,6 +1274,7 @@ def main():
         args.adapter_path,
         revision=args.revision,
         trust_remote_code=args.trust_remote_code,
+        quantize_activations=args.quantize_activations,
     )
     config = model.config
 

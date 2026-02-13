@@ -9,6 +9,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
   - [Command Line Interface (CLI)](#command-line-interface-cli)
   - [Chat UI with Gradio](#chat-ui-with-gradio)
   - [Python Script](#python-script)
+- [Activation Quantization (CUDA)](#activation-quantization-cuda)
 - [Multi-Image Chat Support](#multi-image-chat-support)
   - [Supported Models](#supported-models)
   - [Usage Examples](#usage-examples)
@@ -310,6 +311,42 @@ curl -X POST "http://localhost:8080/responses" \
 - `top_p`: Top-p sampling parameter
 - `stream`: Enable streaming responses
 
+
+## Activation Quantization (CUDA)
+
+When running on NVIDIA GPUs with MLX CUDA, models quantized with `mxfp8` or `nvfp4` modes require activation quantization to work properly. This converts `QuantizedLinear` layers to `QQLinear` layers which quantize both weights and activations.
+
+### Command Line
+
+Use the `-qa` or `--quantize-activations` flag:
+
+```sh
+mlx_vlm.generate --model /path/to/mxfp8-model --prompt "Describe this image" --image /path/to/image.jpg -qa
+```
+
+### Python API
+
+Pass `quantize_activations=True` to the `load` function:
+
+```python
+from mlx_vlm import load, generate
+
+# Load with activation quantization enabled
+model, processor = load(
+    "path/to/mxfp8-quantized-model",
+    quantize_activations=True
+)
+
+# Generate as usual
+output = generate(model, processor, "Describe this image", image=["image.jpg"])
+```
+
+### Supported Quantization Modes
+
+- `mxfp8` - 8-bit MX floating point
+- `nvfp4` - 4-bit NVIDIA floating point
+
+> **Note**: This feature is required for mxfp/nvfp quantized models on CUDA. On Apple Silicon (Metal), these models work without the flag.
 
 ## Multi-Image Chat Support
 
