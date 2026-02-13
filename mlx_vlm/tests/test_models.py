@@ -3301,7 +3301,8 @@ class TestChunkedPrefillRoPE(unittest.TestCase):
         lm._rope_deltas = rope_deltas
         outputs = lm(chunked_input_ids, mask=full_mask, image_grid_thw=image_grid_thw)
         self.assertEqual(
-            outputs.logits.shape, (1, chunked_input_ids.shape[1], text_config.vocab_size)
+            outputs.logits.shape,
+            (1, chunked_input_ids.shape[1], text_config.vocab_size),
         )
 
     def test_glm4v_moe_chunked_prefill_rope(self):
@@ -3385,7 +3386,8 @@ class TestChunkedPrefillRoPE(unittest.TestCase):
         lm._rope_deltas = rope_deltas
         outputs = lm(chunked_input_ids, mask=full_mask, image_grid_thw=image_grid_thw)
         self.assertEqual(
-            outputs.logits.shape, (1, chunked_input_ids.shape[1], text_config.vocab_size)
+            outputs.logits.shape,
+            (1, chunked_input_ids.shape[1], text_config.vocab_size),
         )
 
 
