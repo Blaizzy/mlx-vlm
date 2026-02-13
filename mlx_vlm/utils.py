@@ -16,11 +16,15 @@ import soundfile as sf
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
-from transformers import AutoProcessor, PreTrainedTokenizer, PreTrainedTokenizerFast
+from transformers import AutoProcessor
+from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
+
+# Modes that support activation quantization
+ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
 
 # Constants
 MODEL_REMAPPING = {
@@ -35,6 +39,34 @@ MODEL_REMAPPING = {
 MAX_FILE_SIZE_GB = 5
 
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
+
+
+def quantize_activations(model: nn.Module) -> nn.Module:
+
+    def _maybe_qq(m: nn.Module) -> nn.Module:
+        """Convert a QuantizedLinear layer to QQLinear if compatible."""
+        if isinstance(m, nn.QuantizedLinear):
+            if m.mode not in ACTIVATION_QUANTIZATION_MODES:
+                raise ValueError(
+                    f"Mode ({m.mode}) does not support activation quantization. "
+                    f"Supported modes: {', '.join(ACTIVATION_QUANTIZATION_MODES)}"
+                )
+            if m.get("bias", False):
+                raise ValueError(
+                    "Linear layer with bias does not support activation quantization"
+                )
+            # Get dimensions from quantized weight
+            out_dims, in_dims = m.weight.shape
+            in_dims *= 32 // m.bits
+            qq = nn.QQLinear(in_dims, out_dims, m.group_size, m.bits, m.mode)
+            qq.quantize()
+            return qq
+        return m
+
+    leaves = tree_map(_maybe_qq, model.leaf_modules(), is_leaf=nn.Module.is_module)
+    model.update_modules(leaves)
+
+    return model
 
 
 def skip_multimodal_module(path: str) -> bool:
@@ -128,6 +160,12 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
             when needed. Default: ``False``
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
+        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
+            to QQLinear layers for activation quantization. Only supported for models
+            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
+        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
+            to QQLinear layers for activation quantization. Only supported for models
+            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -137,7 +175,6 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
     config = load_config(model_path, **kwargs)
-    quantization = config.get("quantization", None)
 
     # Find all .safetensors files in the model_path, excluding consolidated model weights
     weight_files = [
@@ -214,6 +251,31 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     model_class.AudioModel, weights, model_config.audio_config
                 )
 
+    if not "quantization" in config:
+        quantization_config = config.get("quantization_config", None)
+        if quantization_config is None:
+            text_config = config.get("text_config", {})
+            quantization_config = text_config.get("quantization_config", None)
+            if quantization_config is not None:
+                config["quantization_config"] = quantization_config
+
+        if quantization_config is not None:
+            quant_method = quantization_config.get("quant_method")
+            quantization = None
+            if quant_method == "compressed-tensors":
+                quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            elif quant_method == "mxfp4":
+                quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            elif quant_method in ("awq", "gptq", "bitnet"):
+                logging.warning(
+                    "Quantization method %s is not supported in mlx_vlm.load_model()",
+                    quant_method,
+                )
+
+            if quantization is not None:
+                config["quantization"] = quantization
+                config["quantization_config"] = quantization
+
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may or may not have vision quantized
         # TODO: Re-upload the models with the new quantization config and remove this
@@ -242,7 +304,16 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             class_predicate=get_class_predicate,
         )
 
+    if kwargs.get("quantize_activations", False):
+        if quantization is None:
+            raise ValueError(
+                "Activation quantization requires the model to be quantized first. "
+                "Please use a quantized model with mode 'nvfp4' or 'mxfp8'."
+            )
+        model = quantize_activations(model)
+
     model.load_weights(list(weights.items()))
+
     if not lazy:
         mx.eval(model.parameters())
 
@@ -287,7 +358,7 @@ def load(
     lazy: bool = False,
     revision: Optional[str] = None,
     **kwargs,
-) -> Tuple[nn.Module, Union[PreTrainedTokenizer, PreTrainedTokenizerFast]]:
+) -> Tuple[nn.Module, ProcessorMixin]:
     """
     Load the model and tokenizer from a given path or a huggingface repository.
 
@@ -302,6 +373,14 @@ def load(
             when needed. Default: ``False``
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
+        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
+            to QQLinear layers for activation quantization. Only supported for models
+            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
+
+        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
+            to QQLinear layers for activation quantization. Only supported for models
+            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
+
     Returns:
         Tuple[nn.Module, TokenizerWrapper]: A tuple containing the loaded model and tokenizer.
 
@@ -436,7 +515,7 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
-) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+) -> ProcessorMixin:
 
     processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
     if add_detokenizer:
@@ -467,7 +546,7 @@ def load_processor(
 
 def fetch_from_hub(
     model_path: Path, lazy: bool = False, **kwargs
-) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
+) -> Tuple[nn.Module, dict, ProcessorMixin]:
     model = load_model(model_path, lazy, **kwargs)
     config = load_config(model_path, **kwargs)
     processor = load_processor(

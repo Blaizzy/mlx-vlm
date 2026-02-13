@@ -11,19 +11,13 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
 from mlx_lm.generate import maybe_quantize_kv_cache
+from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
-from .sample_utils import top_p_sampling
-from .utils import (
-    StoppingCriteria,
-    apply_repetition_penalty,
-    group_images_by_shape,
-    load,
-    prepare_inputs,
-)
+from .utils import StoppingCriteria, group_images_by_shape, load, prepare_inputs
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
@@ -153,6 +147,13 @@ def parse_arguments():
         help="Trust remote code when loading the model.",
     )
     parser.add_argument(
+        "--quantize-activations",
+        "-qa",
+        action="store_true",
+        help="Enable activation quantization for QQLinear layers. "
+        "Only supported for models quantized with 'nvfp4' or 'mxfp8' modes.",
+    )
+    parser.add_argument(
         "--processor-kwargs",
         type=json.loads,
         default={},
@@ -243,6 +244,7 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = 2048,
     **kwargs,
@@ -270,7 +272,11 @@ def generate_step(
         kv_bits (int, optional): Number of bits for KV cache quantization.
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Start index for quantized KV cache. Default: ``0``.
-        logits_processors (list, optional): List of logits processor functions.
+        sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
+          token from a vector of log probabilities. Default: ``None``.
+        logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
+          A list of functions that take tokens and logits and return the processed
+          logits. Default: ``None``.
         prefill_step_size (int): Number of tokens to process per prefill step.
           Chunked prefill processes prompts in smaller chunks to reduce peak
           memory usage. Default: ``2048``.
@@ -287,32 +293,17 @@ def generate_step(
         kv_bits=kv_bits,
     )
 
-    def sample(logits: mx.array) -> Tuple[mx.array, float]:
-        if logit_bias:
-            indices = mx.array(list(logit_bias.keys()))
-            values = mx.array(list(logit_bias.values()))
-            logits[:, indices] += values
-        logprobs = logits - mx.logsumexp(logits)
+    if sampler is None:
+        sampler = make_sampler(temperature, top_p)
 
-        if temperature == 0:
-            token = mx.argmax(logits, axis=-1)
-        else:
-            if top_p > 0 and top_p < 1.0:
-                token = top_p_sampling(logits, top_p, temperature)
-            else:
-                token = mx.random.categorical(logits * (1 / temperature))
-
-        return token, logprobs
-
-    if repetition_penalty and (
-        repetition_penalty < 0 or not isinstance(repetition_penalty, float)
-    ):
-        raise ValueError(
-            f"repetition_penalty must be a non-negative float, got {repetition_penalty}"
-        )
+    processors = make_logits_processors(
+        logit_bias, repetition_penalty, repetition_context_size
+    )
+    if logits_processors is not None:
+        processors.extend(logits_processors)
 
     y = input_ids
-    tokens = None  # Track tokens for logits processors
+    tokens = mx.array([], dtype=input_ids.dtype)
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -321,13 +312,9 @@ def generate_step(
             max_kv_size=max_kv_size,
         )
 
-    repetition_context = input_ids.reshape(-1).tolist()
-
-    if repetition_context_size:
-        repetition_context = repetition_context[-repetition_context_size:]
-
     def _step(y, inputs_embeds=None):
-        nonlocal tokens, repetition_context, kwargs
+        nonlocal tokens, kwargs
+
         with mx.stream(generation_stream):
             if "decoder_input_ids" in kwargs:
                 outputs = model.language_model(
@@ -344,25 +331,11 @@ def generate_step(
 
             logits = outputs.logits[:, -1, :]
 
-            # Apply logits processors before repetition penalty
-            if logits_processors:
-                # Efficiently update tokens by concatenating only the new token
-                tokens = mx.concat([tokens, y])
-                for processor in logits_processors:
+            if len(processors) > 0 and len(y) > 0:
+                tokens = mx.concat([tokens, y.flatten()])
+
+                for processor in processors:
                     logits = processor(tokens, logits)
-
-            if repetition_penalty:
-                logits = apply_repetition_penalty(
-                    logits, repetition_context, repetition_penalty
-                )
-                y, logprobs = sample(logits)
-                repetition_context.append(y.item())
-            else:
-                y, logprobs = sample(logits)
-
-            if repetition_context_size:
-                if len(repetition_context) > repetition_context_size:
-                    repetition_context = repetition_context[-repetition_context_size:]
 
             quantize_cache_fn(prompt_cache)
 
@@ -376,6 +349,8 @@ def generate_step(
             else:
                 kwargs = {}
 
+            logprobs = logits - mx.logsumexp(logits)
+            y = sampler(logprobs)
             return y, logprobs.squeeze(0)
 
     with mx.stream(generation_stream):
@@ -1299,6 +1274,7 @@ def main():
         args.adapter_path,
         revision=args.revision,
         trust_remote_code=args.trust_remote_code,
+        quantize_activations=args.quantize_activations,
     )
     config = model.config
 

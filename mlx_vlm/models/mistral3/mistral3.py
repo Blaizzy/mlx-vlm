@@ -376,7 +376,49 @@ class Model(nn.Module):
 
             return key
 
-        return {transform_key(k): v for k, v in weights.items()}
+        # FP8 dequantization helper
+        def dequant(weight, scale_inv):
+            dtype = mx.bfloat16
+            weight = mx.from_fp8(weight, dtype=dtype)
+
+            # Handle different scale_inv shapes:
+            # - Scalar (0-dim): per-tensor scaling
+            # - 2D: block-wise scaling
+            if scale_inv.ndim == 0:
+                # Per-tensor scaling (scalar)
+                return (weight * scale_inv).astype(dtype)
+            else:
+                # Block-wise scaling
+                bs = 128  # block size
+                m, n = weight.shape
+                pad_bottom = (-m) % bs
+                pad_side = (-n) % bs
+                if pad_bottom > 0 or pad_side > 0:
+                    weight = mx.pad(weight, ((0, pad_bottom), (0, pad_side)))
+                weight = weight.reshape(
+                    (m + pad_bottom) // bs, bs, (n + pad_side) // bs, bs
+                )
+                weight = (weight * scale_inv[:, None, :, None]).reshape(
+                    m + pad_bottom, n + pad_side
+                )
+                return weight[:m, :n].astype(dtype)
+
+        # Transform keys first
+        weights = {transform_key(k): v for k, v in weights.items()}
+
+        # Dequantize FP8 weights
+        new_weights = {}
+        for k, v in weights.items():
+            if k.endswith("_scale_inv"):
+                continue  # Skip scale_inv, will be used during dequantization
+            weight_scale_key = f"{k}_scale_inv"
+            if weight_scale_key in weights:
+                scale_inv = weights[weight_scale_key]
+                new_weights[k] = dequant(v, scale_inv)
+            else:
+                new_weights[k] = v
+
+        return new_weights
 
     @property
     def layers(self):

@@ -23,6 +23,27 @@ from transformers.models.lfm2_vl.processing_lfm2_vl import (
     Lfm2VlProcessorKwargs,
 )
 
+
+def _num_image_tokens_from_patch_grid(
+    rows: int, cols: int, downsample_factor: int
+) -> int:
+    """
+    Compute the number of <image> placeholder tokens expected by the model.
+
+    The LFM2-VL model downsamples the patch grid via PixelUnshuffleBlock. That
+    block pads odd patch-grid dimensions up to the next multiple of
+    `downsample_factor` before downsampling. The text expansion must mirror
+    that padding behavior to keep image token count aligned with the produced
+    image embeddings.
+    """
+    if downsample_factor <= 0:
+        raise ValueError("downsample_factor must be a positive integer")
+
+    padded_rows = rows + (-rows % downsample_factor)
+    padded_cols = cols + (-cols % downsample_factor)
+    return (padded_rows // downsample_factor) * (padded_cols // downsample_factor)
+
+
 # Try to import the slow image processor to force its use
 try:
     from transformers.models.siglip2.image_processing_siglip2 import (
@@ -272,11 +293,12 @@ def _patched_call(self, images=None, text=None, **kwargs):
 
     # For slow processor, use simplified text expansion
     # (no tiling support, just add image tokens)
-    # Account for downsample_factor: the vision tower reduces patches by factor^2
+    # Account for downsample_factor: the model pads odd patch-grid dimensions
+    # before downsampling, so the token count is ceil(rows/f)*ceil(cols/f).
     downsample_factor = getattr(self.image_processor, "downsample_factor", 2)
 
     expanded_text = []
-    for sample_text, sample_images, rows, cols, sizes in zip(
+    for sample_text, sample_images, rows, cols, _sizes in zip(
         text, batched_images, image_rows, image_cols, image_sizes
     ):
         split_sample = sample_text.split(self.image_token)
@@ -286,9 +308,13 @@ def _patched_call(self, images=None, text=None, **kwargs):
             if use_image_special_tokens:
                 result += self.image_start_token
             # Add image tokens based on the number of patches AFTER downsampling
-            # The vision tower downsamples by factor^2, so divide by that
-            num_patches = sizes[i] if i < len(sizes) else sizes[0]
-            num_image_tokens = num_patches // (downsample_factor**2)
+            # The model pads odd patch-grid dimensions before downsampling.
+            # Use rows/cols (patch grid) rather than total patches to mirror it.
+            num_rows = rows[i] if i < len(rows) else rows[0]
+            num_cols = cols[i] if i < len(cols) else cols[0]
+            num_image_tokens = _num_image_tokens_from_patch_grid(
+                int(num_rows), int(num_cols), downsample_factor
+            )
             result += self.image_token * num_image_tokens
             if use_image_special_tokens:
                 result += self.image_end_token
