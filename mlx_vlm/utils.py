@@ -23,7 +23,7 @@ from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
 
 # Modes that support activation quantization
-ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp4", "mxfp8"}
+ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
 
 # Constants
 MODEL_REMAPPING = {
