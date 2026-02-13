@@ -107,5 +107,23 @@ class TestErnie4_5VLProcessor(unittest.TestCase):
         )
 
 
+class TestLfm2VlProcessorPatch(unittest.TestCase):
+    def test_num_image_tokens_matches_pixel_unshuffle_padding(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import (
+            _num_image_tokens_from_patch_grid,
+        )
+
+        # Even patch grids: rows/cols divisible by factor
+        self.assertEqual(_num_image_tokens_from_patch_grid(16, 16, 2), 64)
+
+        # Odd patch grids: PixelUnshuffleBlock pads to next multiple of factor
+        # before downsampling, so we need ceil(rows/f)*ceil(cols/f).
+        self.assertEqual(_num_image_tokens_from_patch_grid(23, 43, 2), 264)
+        self.assertEqual(_num_image_tokens_from_patch_grid(1, 1, 2), 1)
+
+        # Different factor
+        self.assertEqual(_num_image_tokens_from_patch_grid(7, 9, 4), 6)
+
+
 if __name__ == "__main__":
     unittest.main()
