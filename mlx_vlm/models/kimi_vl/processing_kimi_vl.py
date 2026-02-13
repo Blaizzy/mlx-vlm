@@ -428,7 +428,11 @@ class KimiVLProcessor(ProcessorMixin):
         else:
             text_inputs = {}
 
-        return BatchFeature(data={**text_inputs, **image_inputs})
+        data = {**text_inputs, **image_inputs}
+        image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_token)
+        if image_token_id is not None:
+            data["image_token_id"] = int(image_token_id)
+        return BatchFeature(data=data)
 
     def batch_decode(self, *args, **kwargs):
         """Forward to tokenizer's batch_decode."""
