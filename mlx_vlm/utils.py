@@ -16,7 +16,8 @@ import soundfile as sf
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
-from transformers import AutoProcessor, PreTrainedTokenizer, PreTrainedTokenizerFast
+from transformers import AutoProcessor
+from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
 from .tokenizer_utils import load_tokenizer
@@ -357,7 +358,7 @@ def load(
     lazy: bool = False,
     revision: Optional[str] = None,
     **kwargs,
-) -> Tuple[nn.Module, Union[PreTrainedTokenizer, PreTrainedTokenizerFast]]:
+) -> Tuple[nn.Module, ProcessorMixin]:
     """
     Load the model and tokenizer from a given path or a huggingface repository.
 
@@ -472,7 +473,7 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
-) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+) -> ProcessorMixin:
 
     processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
     if add_detokenizer:
@@ -503,7 +504,7 @@ def load_processor(
 
 def fetch_from_hub(
     model_path: Path, lazy: bool = False, **kwargs
-) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
+) -> Tuple[nn.Module, dict, ProcessorMixin]:
     model = load_model(model_path, lazy, **kwargs)
     config = load_config(model_path, **kwargs)
     processor = load_processor(
