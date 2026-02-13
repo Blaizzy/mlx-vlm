@@ -41,24 +41,6 @@ MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
 
 def quantize_activations(model: nn.Module) -> nn.Module:
-    """
-    Convert QuantizedLinear layers to QQLinear layers for activation quantization.
-
-    This enables quantizing both weights and activations for supported modes
-    (nvfp4 and mxfp8), which can improve inference performance.
-
-    Note: On CUDA, this is required for mxfp8/nvfp4 models to work properly.
-
-    Args:
-        model: The model with QuantizedLinear layers to convert.
-
-    Returns:
-        The model with QQLinear layers replacing compatible QuantizedLinear layers.
-
-    Raises:
-        ValueError: If the quantization mode doesn't support activation quantization,
-            or if a layer has bias (not supported by QQLinear).
-    """
 
     def _maybe_qq(m: nn.Module) -> nn.Module:
         """Convert a QuantizedLinear layer to QQLinear if compatible."""
@@ -76,12 +58,10 @@ def quantize_activations(model: nn.Module) -> nn.Module:
             out_dims, in_dims = m.weight.shape
             in_dims *= 32 // m.bits
             qq = nn.QQLinear(in_dims, out_dims, m.group_size, m.bits, m.mode)
-            # Call quantize() to create the scales attribute so load_weights works
             qq.quantize()
             return qq
         return m
 
-    # Use tree_map with is_leaf to properly traverse module tree
     leaves = tree_map(_maybe_qq, model.leaf_modules(), is_leaf=nn.Module.is_module)
     model.update_modules(leaves)
 
@@ -320,7 +300,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             class_predicate=get_class_predicate,
         )
 
-    # Apply activation quantization if requested (must be before load_weights)
     if kwargs.get("quantize_activations", False):
         if quantization is None:
             raise ValueError(
