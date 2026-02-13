@@ -162,6 +162,9 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
+        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
+            to QQLinear layers for activation quantization. Only supported for models
+            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -310,6 +313,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     model.load_weights(list(weights.items()))
 
+
     if not lazy:
         mx.eval(model.parameters())
 
@@ -369,6 +373,10 @@ def load(
             when needed. Default: ``False``
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
+        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
+            to QQLinear layers for activation quantization. Only supported for models
+            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
+
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
