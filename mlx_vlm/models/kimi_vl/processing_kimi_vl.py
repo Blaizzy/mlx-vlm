@@ -103,9 +103,11 @@ def _ensure_gpt2_bytes_to_unicode():
         return
 
     def bytes_to_unicode():
-        bs = list(range(ord("!"), ord("~") + 1)) + list(
-            range(ord("¡"), ord("¬") + 1)
-        ) + list(range(ord("®"), ord("ÿ") + 1))
+        bs = (
+            list(range(ord("!"), ord("~") + 1))
+            + list(range(ord("¡"), ord("¬") + 1))
+            + list(range(ord("®"), ord("ÿ") + 1))
+        )
         cs = bs[:]
         n = 0
         for b in range(2**8):
