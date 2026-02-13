@@ -229,7 +229,9 @@ class Attention(nn.Module):
 
         if attention_mask is None:
             if cu_seqlens is None:
-                raise ValueError("Either attention_mask or cu_seqlens must be provided.")
+                raise ValueError(
+                    "Either attention_mask or cu_seqlens must be provided."
+                )
             attention_mask = make_block_attention_mask(cu_seqlens, seq_length)
 
         q = q.transpose(1, 0, 2)[None, ...]
