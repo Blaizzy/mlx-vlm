@@ -79,7 +79,9 @@ class Model(nn.Module):
 
         # Pre-compute image token masks and counts for all batch items (single eval)
         image_token_index = self.config.image_token_index
-        image_masks = [cur_input_ids == image_token_index for cur_input_ids in input_ids]
+        image_masks = [
+            cur_input_ids == image_token_index for cur_input_ids in input_ids
+        ]
         num_images_list = [m.sum() for m in image_masks]
         mx.eval(image_masks + num_images_list)
         num_images_list = [n.item() for n in num_images_list]
