@@ -363,6 +363,23 @@ class MiniCPMOProcessor(ProcessorMixin):
         if len(audio_placeholders) == 0:
             return text
 
+        text = text or ""
+        marker_count = self._count_audio_markers(text)
+        if marker_count == 0:
+
+            audio_prefix = "".join(audio_placeholders)
+            user_tag = "<|im_start|>user\n"
+            user_idx = text.rfind(user_tag)
+            if user_idx >= 0:
+                insert_pos = user_idx + len(user_tag)
+                return text[:insert_pos] + audio_prefix + text[insert_pos:]
+            return audio_prefix + text
+
+        if marker_count != len(audio_placeholders):
+            raise ValueError(
+                f"Audio markers ({marker_count}) do not match audio inputs ({len(audio_placeholders)})."
+            )
+
         used = 0
 
         def _replace(match):
@@ -373,7 +390,7 @@ class MiniCPMOProcessor(ProcessorMixin):
                 return token
             return match.group(0)
 
-        output = self._AUDIO_MARKER_PATTERN.sub(_replace, text or "")
+        output = self._AUDIO_MARKER_PATTERN.sub(_replace, text)
         return output
 
     def _compute_image_bounds(self, input_ids: np.ndarray) -> np.ndarray:
