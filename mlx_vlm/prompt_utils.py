@@ -1,6 +1,6 @@
 from enum import Enum
 from functools import partial
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel
 
@@ -466,6 +466,7 @@ def apply_chat_template(
     return_messages: bool = False,
     num_images: int = 0,
     num_audios: int = 0,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
     **kwargs,
 ) -> Union[List[Dict[str, Any]], str, Any]:
     """
@@ -565,4 +566,9 @@ def apply_chat_template(
     if model_type in ["paligemma", "molmo", "florence2"]:
         return messages[-1]
 
-    return get_chat_template(processor, messages, add_generation_prompt)
+    return get_chat_template(
+        processor,
+        messages,
+        add_generation_prompt,
+        **(chat_template_kwargs or {}),
+    )

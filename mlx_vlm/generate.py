@@ -154,6 +154,13 @@ def parse_arguments():
         'Example: --processor-kwargs \'{"cropping": false, "max_patches": 3}\'',
     )
     parser.add_argument(
+        "--chat-template-kwargs",
+        type=json.loads,
+        default={},
+        help="Extra chat-template kwargs as JSON. "
+        "Example: --chat-template-kwargs '{\"enable_thinking\": false}'",
+    )
+    parser.add_argument(
         "--prefill-step-size",
         type=int,
         default=None,
@@ -1276,8 +1283,14 @@ def main():
     num_audios = (
         1 if args.audio is not None else 0
     )  # TODO: Support multiple audio files
+    chat_template_kwargs = args.chat_template_kwargs or {}
     prompt = apply_chat_template(
-        processor, config, prompt, num_images=num_images, num_audios=num_audios
+        processor,
+        config,
+        prompt,
+        num_images=num_images,
+        num_audios=num_audios,
+        chat_template_kwargs=chat_template_kwargs,
     )
 
     kwargs = {}
@@ -1314,7 +1327,13 @@ def main():
             chat.append({"role": "system", "content": args.system})
         while user := input("User:"):
             chat.append({"role": "user", "content": user})
-            prompt = apply_chat_template(processor, config, chat, num_images=num_images)
+            prompt = apply_chat_template(
+                processor,
+                config,
+                chat,
+                num_images=num_images,
+                chat_template_kwargs=chat_template_kwargs,
+            )
             response = ""
             print("Assistant:", end="")
             stream_kwargs = {
