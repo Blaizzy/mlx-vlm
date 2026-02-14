@@ -88,3 +88,15 @@ def test_minicpmo_sanitize_key_mapping_and_qkv_split():
     assert "resampler.attn.q_proj.bias" in sanitized
     assert "resampler.attn.k_proj.bias" in sanitized
     assert "resampler.attn.v_proj.bias" in sanitized
+
+
+def test_minicpmo_sanitize_audio_conv_layout():
+    model = minicpmo.Model(_tiny_config())
+    weights = {
+        "apm.conv1.weight": mx.zeros((8, 80, 3)),
+        "apm.conv2.weight": mx.zeros((8, 8, 3)),
+    }
+
+    sanitized = model.sanitize(weights)
+    assert sanitized["audio_tower.conv1.weight"].shape == (8, 3, 80)
+    assert sanitized["audio_tower.conv2.weight"].shape == (8, 3, 8)
