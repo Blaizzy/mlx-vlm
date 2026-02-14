@@ -1656,6 +1656,8 @@ class TestModels(unittest.TestCase):
         )
 
     def test_kimi_vl(self):
+        from types import SimpleNamespace
+
         from mlx_vlm.models import kimi_vl
 
         text_config = kimi_vl.TextConfig()
@@ -1686,6 +1688,32 @@ class TestModels(unittest.TestCase):
             batch_size=1176,
             vision_feature_layer=-1,
         )
+
+        # Regression check: runtime image token id from tokenizer should be used
+
+        dummy_model = SimpleNamespace(config=model.config)
+        dummy_model.config.media_placeholder_token_id = 163605
+        dummy_model.config.image_token_index = 163605
+
+        input_ids = mx.array([[11, 163592, 12, 163592, 13]], dtype=mx.int32)
+        inputs_embeds = mx.zeros((1, 5, 8), dtype=mx.float32)
+        image_features = mx.ones((2, 8), dtype=mx.float32)
+
+        with self.assertRaises(ValueError):
+            kimi_vl.Model._prepare_inputs_for_multimodal(
+                dummy_model, image_features, inputs_embeds, input_ids
+            )
+
+        merged = kimi_vl.Model._prepare_inputs_for_multimodal(
+            dummy_model,
+            image_features,
+            inputs_embeds,
+            input_ids,
+            image_token_id=163592,
+        )
+        self.assertEqual(merged.shape, inputs_embeds.shape)
+        self.assertTrue(mx.all(merged[0, 1] == 1).item())
+        self.assertTrue(mx.all(merged[0, 3] == 1).item())
 
     def test_gemma3(self):
         from mlx_vlm.models import gemma3
@@ -3236,6 +3264,159 @@ class TestChunkedPrefillRoPE(unittest.TestCase):
         self.assertEqual(len(position_ids.shape), 3)
         self.assertEqual(position_ids.shape[0], 1)  # batch size
         self.assertEqual(position_ids.shape[2], 3)  # 3D positions (T, H, W)
+
+    def test_glm4v_chunked_prefill_rope(self):
+        """Test GLM4V chunked prefill RoPE position ID generation."""
+        from mlx_vlm.models import glm4v
+
+        text_config = glm4v.TextConfig(
+            model_type="glm4v_text",
+            hidden_size=16,
+            num_hidden_layers=1,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            vocab_size=64,
+            max_position_embeddings=256,
+        )
+        vision_config = glm4v.VisionConfig(
+            model_type="glm4v_vision",
+            depth=1,
+            hidden_size=16,
+            intermediate_size=32,
+            num_heads=2,
+            patch_size=14,
+            out_hidden_size=16,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            image_size=28,
+        )
+        model_config = glm4v.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="glm4v",
+            vocab_size=64,
+            image_token_id=61,
+            image_token_index=61,
+            video_token_id=62,
+            video_token_index=62,
+            vision_start_token_id=60,
+            vision_end_token_id=59,
+            pad_token_id=0,
+        )
+        lm = glm4v.LanguageModel(text_config, model_config)
+
+        input_ids = mx.array([[10, 60, 61, 11, 12, 13, 14, 15]], dtype=mx.int32)
+        image_grid_thw = mx.array([[1, 2, 2]], dtype=mx.int32)
+        position_ids, rope_deltas = lm.get_rope_index(input_ids, image_grid_thw)
+
+        # Position IDs length matches input sequence length
+        self.assertEqual(position_ids.shape[2], input_ids.shape[1])
+
+        # Chunked input position IDs match partial sequence
+        chunked_input_ids = input_ids[:, :4]
+        chunked_position_ids, _ = lm.get_rope_index(chunked_input_ids, image_grid_thw)
+        self.assertEqual(chunked_position_ids.shape[2], chunked_input_ids.shape[1])
+
+        # Position IDs have expected MRoPE shape
+        self.assertEqual(len(position_ids.shape), 3)
+        self.assertEqual(position_ids.shape[0], 3)  # MRoPE dimensions
+        self.assertEqual(position_ids.shape[1], 1)  # batch size
+
+        # Regression guard: full-length mask with chunked inputs should not fail
+        full_mask = mx.ones((1, input_ids.shape[1]), dtype=mx.int32)
+        lm._position_ids = position_ids
+        lm._rope_deltas = rope_deltas
+        outputs = lm(chunked_input_ids, mask=full_mask, image_grid_thw=image_grid_thw)
+        self.assertEqual(
+            outputs.logits.shape,
+            (1, chunked_input_ids.shape[1], text_config.vocab_size),
+        )
+
+    def test_glm4v_moe_chunked_prefill_rope(self):
+        """Test GLM4V-MoE chunked prefill RoPE position ID generation."""
+        from mlx_vlm.models import glm4v_moe
+
+        text_config = glm4v_moe.TextConfig(
+            model_type="glm4v_moe_text",
+            vocab_size=64,
+            hidden_size=16,
+            intermediate_size=32,
+            max_position_embeddings=256,
+            moe_intermediate_size=16,
+            norm_topk_prob=True,
+            num_attention_heads=2,
+            n_group=1,
+            head_dim=8,
+            topk_group=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            routed_scaling_factor=1.0,
+            num_experts_per_tok=1,
+            first_k_dense_replace=0,
+            num_hidden_layers=1,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            use_qk_norm=False,
+            attention_bias=False,
+            partial_rotary_factor=0.5,
+            rope_theta=10000.0,
+            rope_scaling={"rope_type": "default", "mrope_section": [2, 3, 3]},
+            tie_word_embeddings=False,
+        )
+        vision_config = glm4v_moe.VisionConfig(
+            model_type="glm4v_moe",
+            depth=1,
+            hidden_size=16,
+            intermediate_size=32,
+            num_heads=2,
+            patch_size=14,
+            out_hidden_size=16,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            image_size=28,
+        )
+        model_config = glm4v_moe.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="glm4v_moe",
+            vocab_size=64,
+            image_token_id=61,
+            image_token_index=61,
+            video_token_id=62,
+            video_token_index=62,
+            vision_start_token_id=60,
+            vision_end_token_id=59,
+            pad_token_id=0,
+        )
+        lm = glm4v_moe.LanguageModel(text_config, model_config)
+
+        input_ids = mx.array([[10, 60, 61, 11, 12, 13, 14, 15]], dtype=mx.int32)
+        image_grid_thw = mx.array([[1, 2, 2]], dtype=mx.int32)
+        position_ids, rope_deltas = lm.get_rope_index(input_ids, image_grid_thw)
+
+        # Position IDs length matches input sequence length
+        self.assertEqual(position_ids.shape[2], input_ids.shape[1])
+
+        # Chunked input position IDs match partial sequence
+        chunked_input_ids = input_ids[:, :4]
+        chunked_position_ids, _ = lm.get_rope_index(chunked_input_ids, image_grid_thw)
+        self.assertEqual(chunked_position_ids.shape[2], chunked_input_ids.shape[1])
+
+        # Position IDs have expected MRoPE shape
+        self.assertEqual(len(position_ids.shape), 3)
+        self.assertEqual(position_ids.shape[0], 3)  # MRoPE dimensions
+        self.assertEqual(position_ids.shape[1], 1)  # batch size
+
+        # Regression guard: full-length mask with chunked inputs should not fail
+        full_mask = mx.ones((1, input_ids.shape[1]), dtype=mx.int32)
+        lm._position_ids = position_ids
+        lm._rope_deltas = rope_deltas
+        outputs = lm(chunked_input_ids, mask=full_mask, image_grid_thw=image_grid_thw)
+        self.assertEqual(
+            outputs.logits.shape,
+            (1, chunked_input_ids.shape[1], text_config.vocab_size),
+        )
 
 
 if __name__ == "__main__":
