@@ -204,7 +204,7 @@ curl -X POST "http://localhost:8080/chat/completions" \
     "messages": [
       {
         "role": "user",
-        "content": "Hello, how are you",
+        "content": "Hello, how are you"
       }
     ],
     "stream": true,
@@ -254,8 +254,8 @@ curl -X POST "http://localhost:8080/generate" \
         "role": "user",
         "content": [
           { "type": "text", "text": "Describe what you hear in these audio files" },
-          {"type": "input_audio", "input_audio": "/path/to/audio1.wav"}
-          {"type": "input_audio", "input_audio": "https://example.com/audio2.mp3"}
+          { "type": "input_audio", "input_audio": "/path/to/audio1.wav" },
+          { "type": "input_audio", "input_audio": "https://example.com/audio2.mp3" }
         ]
       }
     ],
