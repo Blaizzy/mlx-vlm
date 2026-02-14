@@ -385,7 +385,7 @@ class TestModels(unittest.TestCase):
             num_attention_heads=32,
             rms_norm_eps=1e-5,
             vocab_size=49155,
-            num_key_value_heads=32,
+            num_key_value_heads=8,
             rope_theta=273768.0,
             rope_traditional=False,
         )
@@ -412,6 +412,19 @@ class TestModels(unittest.TestCase):
 
         model = idefics3.Model(config)
 
+        head_dim = (
+            config.text_config.hidden_size // config.text_config.num_attention_heads
+        )
+        expected_kv_width = config.text_config.num_key_value_heads * head_dim
+        self.assertEqual(
+            model.language_model.layers[0].self_attn.k_proj.weight.shape,
+            (expected_kv_width, config.text_config.hidden_size),
+        )
+        self.assertEqual(
+            model.language_model.layers[0].self_attn.v_proj.weight.shape,
+            (expected_kv_width, config.text_config.hidden_size),
+        )
+
         self.language_test_runner(
             model.language_model,
             config.text_config.model_type,
@@ -426,6 +439,39 @@ class TestModels(unittest.TestCase):
             config.vision_config.num_channels,
             (config.vision_config.image_size, config.vision_config.image_size),
         )
+
+    def test_smolvlm_text_config_infers_heads_from_head_dim(self):
+        from mlx_vlm.models import smolvlm
+
+        text_config = smolvlm.TextConfig.from_dict(
+            {
+                "hidden_size": 2048,
+                "head_dim": 64,
+                "intermediate_size": 8192,
+                "num_hidden_layers": 24,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 49280,
+            }
+        )
+
+        self.assertEqual(text_config.num_attention_heads, 32)
+        self.assertEqual(text_config.num_key_value_heads, 32)
+
+    def test_smolvlm_vision_config_infers_500m_defaults(self):
+        from mlx_vlm.models import smolvlm
+
+        vision_config = smolvlm.VisionConfig.from_dict(
+            {
+                "hidden_size": 768,
+                "num_attention_heads": 12,
+                "patch_size": 16,
+                "image_size": 512,
+                "model_type": "smolvlm_vision",
+            }
+        )
+
+        self.assertEqual(vision_config.num_hidden_layers, 12)
+        self.assertEqual(vision_config.intermediate_size, 3072)
 
     def test_internvl_chat(self):
         from mlx_vlm.models import internvl_chat
