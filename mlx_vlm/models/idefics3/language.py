@@ -19,7 +19,7 @@ class Attention(nn.Module):
         dim = config.hidden_size
         self.n_heads = n_heads = config.num_attention_heads
         head_dim = config.hidden_size // n_heads
-        self.n_kv_heads = n_kv_heads = dim // head_dim
+        self.n_kv_heads = n_kv_heads = config.num_key_value_heads
 
         self.scale = head_dim**-0.5
 

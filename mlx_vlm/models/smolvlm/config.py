@@ -11,10 +11,11 @@ class TextConfig(BaseModelConfig):
     model_type: str = "smolvlm"
     hidden_size: int = 4096
     intermediate_size: int = 11008
-    num_attention_heads: int = 32
+    num_attention_heads: Optional[int] = None
     rms_norm_eps: float = 1e-5
     vocab_size: int = 49152
-    num_key_value_heads: int = 8
+    num_key_value_heads: Optional[int] = None
+    head_dim: Optional[int] = None
     rope_theta: float = 1000000.0
     num_hidden_layers: int = 32
     rope_traditional: bool = False
@@ -22,6 +23,11 @@ class TextConfig(BaseModelConfig):
     tie_word_embeddings: bool = False
 
     def __post_init__(self):
+        if self.num_attention_heads is None:
+            if self.head_dim is not None and self.head_dim > 0:
+                self.num_attention_heads = self.hidden_size // self.head_dim
+            else:
+                self.num_attention_heads = 32
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
