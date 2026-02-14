@@ -206,14 +206,18 @@ class DeepseekV3Attention(nn.Module):
         if cache is not None:
             q_pe = self.rope(q_pe, cache.offset)
             k_pe = self.rope(k_pe, cache.offset)
-            k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
+            k_pe = mx.broadcast_to(
+                k_pe, (B, self.num_heads, k_pe.shape[2], k_pe.shape[3])
+            )
             keys, values = cache.update_and_fetch(
                 mx.concatenate([k_nope, k_pe], axis=-1), values
             )
         else:
             q_pe = self.rope(q_pe)
             k_pe = self.rope(k_pe)
-            k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
+            k_pe = mx.broadcast_to(
+                k_pe, (B, self.num_heads, k_pe.shape[2], k_pe.shape[3])
+            )
             keys = mx.concatenate([k_nope, k_pe], axis=-1)
 
         queries = mx.concatenate([q_nope, q_pe], axis=-1)
@@ -256,19 +260,21 @@ def group_expert_select(
     norm_topk_prob,
 ):
 
-    k = top_k
     scores = mx.sigmoid(gates.astype(mx.float32))
     orig_scores = scores
     scores = scores + e_score_correction_bias
-    scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
-    group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
-    k = n_group - topk_group
-    group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
-    scores = mx.put_along_axis(scores, group_idx, mx.array(0.0), axis=-2)
-    scores = mx.flatten(scores, -2, -1)
-
-    k = top_k
-    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    if n_group > 1:
+        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
+        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
+        k = n_group - topk_group
+        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+        scores = mx.put_along_axis(
+            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+        )
+        scores = mx.flatten(scores, -2, -1)
+        inds = mx.argpartition(-scores, kth=top_k - 1, axis=-1)[..., :top_k]
+    else:
+        inds = mx.argsort(scores, axis=-1)[..., -top_k:]
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
         denominator = scores.sum(axis=-1, keepdims=True)

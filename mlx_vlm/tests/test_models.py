@@ -1656,6 +1656,8 @@ class TestModels(unittest.TestCase):
         )
 
     def test_kimi_vl(self):
+        from types import SimpleNamespace
+
         from mlx_vlm.models import kimi_vl
 
         text_config = kimi_vl.TextConfig()
@@ -1686,6 +1688,32 @@ class TestModels(unittest.TestCase):
             batch_size=1176,
             vision_feature_layer=-1,
         )
+
+        # Regression check: runtime image token id from tokenizer should be used
+
+        dummy_model = SimpleNamespace(config=model.config)
+        dummy_model.config.media_placeholder_token_id = 163605
+        dummy_model.config.image_token_index = 163605
+
+        input_ids = mx.array([[11, 163592, 12, 163592, 13]], dtype=mx.int32)
+        inputs_embeds = mx.zeros((1, 5, 8), dtype=mx.float32)
+        image_features = mx.ones((2, 8), dtype=mx.float32)
+
+        with self.assertRaises(ValueError):
+            kimi_vl.Model._prepare_inputs_for_multimodal(
+                dummy_model, image_features, inputs_embeds, input_ids
+            )
+
+        merged = kimi_vl.Model._prepare_inputs_for_multimodal(
+            dummy_model,
+            image_features,
+            inputs_embeds,
+            input_ids,
+            image_token_id=163592,
+        )
+        self.assertEqual(merged.shape, inputs_embeds.shape)
+        self.assertTrue(mx.all(merged[0, 1] == 1).item())
+        self.assertTrue(mx.all(merged[0, 3] == 1).item())
 
     def test_gemma3(self):
         from mlx_vlm.models import gemma3
