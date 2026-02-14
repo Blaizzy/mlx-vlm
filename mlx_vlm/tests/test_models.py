@@ -592,6 +592,45 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
         )
 
+    def test_paligemma_from_dict_defaults_bidirectional_attention(self):
+        from mlx_vlm.models import paligemma
+
+        config = paligemma.ModelConfig.from_dict(
+            {
+                "model_type": "paligemma",
+                "hidden_size": 2048,
+                "projection_dim": 2048,
+                "text_config": {
+                    "model_type": "gemma2",
+                    "hidden_size": 2048,
+                    "num_hidden_layers": 2,
+                    "intermediate_size": 8192,
+                    "num_attention_heads": 8,
+                    "num_key_value_heads": 8,
+                    "vocab_size": 256000,
+                    "head_dim": 256,
+                    "query_pre_attn_scalar": 256,
+                    "attn_logit_softcapping": 50.0,
+                    "final_logit_softcapping": 30.0,
+                    "hidden_act": "gelu_pytorch_tanh",
+                },
+                "vision_config": {
+                    "model_type": "siglip_vision_model",
+                    "num_hidden_layers": 27,
+                    "hidden_size": 1152,
+                    "intermediate_size": 4304,
+                    "num_attention_heads": 16,
+                    "image_size": 896,
+                    "patch_size": 14,
+                },
+            }
+        )
+
+        self.assertTrue(config.text_config.use_bidirectional_attention)
+        self.assertEqual(config.text_config.hidden_activation, "gelu_pytorch_tanh")
+        self.assertEqual(config.text_config.num_image_tokens, 4096)
+        self.assertEqual(config.vision_config.projection_dim, 2048)
+
     def test_multi_modality(self):
         from mlx_vlm.models import multi_modality
 
