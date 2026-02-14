@@ -96,6 +96,7 @@ class Attention(nn.Module):
             scores *= self.attn_logit_softcapping
 
             if mask is not None and isinstance(mask, mx.array):
+                mask = mask[..., : keys.shape[-2]]
                 scores = scores + mask
             scores = mx.softmax(scores, precise=True, axis=-1)
             output = scores @ values
@@ -194,7 +195,7 @@ class GemmaModel(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None or cache[0].offset > 0:
-            mask = create_attention_mask(h, cache, return_array=True)
+            mask = create_attention_mask(h, cache[0], return_array=True)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
