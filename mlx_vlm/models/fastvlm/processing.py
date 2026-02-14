@@ -156,7 +156,9 @@ class FastVLMImageProcessor(BaseImageProcessor):
 
         # Default to 1024 for FastVLM
         size = size if size is not None else {"shortest_edge": 1024}
-        crop_size = crop_size if crop_size is not None else {"height": 1024, "width": 1024}
+        crop_size = (
+            crop_size if crop_size is not None else {"height": 1024, "width": 1024}
+        )
 
         self.size = size
         self.crop_size = crop_size
@@ -194,10 +196,14 @@ class FastVLMImageProcessor(BaseImageProcessor):
         crop_size = crop_size if crop_size is not None else self.crop_size
         resample = resample if resample is not None else self.resample
         do_resize = do_resize if do_resize is not None else self.do_resize
-        do_center_crop = do_center_crop if do_center_crop is not None else self.do_center_crop
+        do_center_crop = (
+            do_center_crop if do_center_crop is not None else self.do_center_crop
+        )
         do_rescale = do_rescale if do_rescale is not None else self.do_rescale
         do_normalize = do_normalize if do_normalize is not None else self.do_normalize
-        do_convert_rgb = do_convert_rgb if do_convert_rgb is not None else self.do_convert_rgb
+        do_convert_rgb = (
+            do_convert_rgb if do_convert_rgb is not None else self.do_convert_rgb
+        )
         image_mean = image_mean if image_mean is not None else self.image_mean
         image_std = image_std if image_std is not None else self.image_std
 
@@ -231,7 +237,9 @@ class FastVLMImageProcessor(BaseImageProcessor):
         images = [to_numpy_array(image) for image in images]
 
         # Store original sizes before processing
-        image_sizes = [(img.shape[1], img.shape[0]) for img in images]  # (width, height)
+        image_sizes = [
+            (img.shape[1], img.shape[0]) for img in images
+        ]  # (width, height)
 
         processed_images = []
         for image in images:
@@ -340,7 +348,9 @@ class FastVLMProcessor(ProcessorMixin):
 
             if len(parts) == 1:
                 # No image token, just tokenize
-                tokens = self.tokenizer(prompt, return_tensors=None, add_special_tokens=False)
+                tokens = self.tokenizer(
+                    prompt, return_tensors=None, add_special_tokens=False
+                )
                 sample_ids = np.array(tokens["input_ids"], dtype=np.int64)
             else:
                 # Has image token(s) - tokenize parts separately and insert image token
@@ -350,13 +360,19 @@ class FastVLMProcessor(ProcessorMixin):
                         part_tokens = self.tokenizer(
                             part, return_tensors=None, add_special_tokens=False
                         )
-                        all_ids.append(np.array(part_tokens["input_ids"], dtype=np.int64))
+                        all_ids.append(
+                            np.array(part_tokens["input_ids"], dtype=np.int64)
+                        )
 
                     # Add image token between parts (not after last part)
                     if i < len(parts) - 1:
-                        all_ids.append(np.array([self.image_token_index], dtype=np.int64))
+                        all_ids.append(
+                            np.array([self.image_token_index], dtype=np.int64)
+                        )
 
-                sample_ids = np.concatenate(all_ids) if all_ids else np.array([], dtype=np.int64)
+                sample_ids = (
+                    np.concatenate(all_ids) if all_ids else np.array([], dtype=np.int64)
+                )
 
             # Add batch dimension
             if sample_ids.ndim == 1:
