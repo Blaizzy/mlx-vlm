@@ -51,7 +51,7 @@ MODEL_CONFIG = {
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,
-    "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT_IMAGE_LAST,
+    "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "llama4": MessageFormat.LIST_WITH_IMAGE,
     "smolvlm": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "llava": MessageFormat.LIST_WITH_IMAGE,
