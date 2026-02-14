@@ -6,12 +6,12 @@ import mlx.nn as nn
 from .config import AudioConfig
 
 
-def check_conv1d_weight_shape(arr):
+def check_conv1d_weight_shape(arr, kernel_size: int = 3):
+    """Return True when weights are in MLX Conv1d layout [out, kernel, in]."""
     shape = arr.shape
     if len(shape) != 3:
         return False
-    out_channels, kernel_size, in_channels = shape
-    return out_channels >= kernel_size and in_channels >= 1
+    return shape[1] == kernel_size
 
 
 class AudioAttention(nn.Module):
@@ -26,7 +26,8 @@ class AudioAttention(nn.Module):
             )
         self.scale = self.head_dim**-0.5
 
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+        # MiniCPM-o checkpoints do not include k_proj bias.
+        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
@@ -75,20 +76,6 @@ class AudioAttention(nn.Module):
         return self.out_proj(attn_output)
 
 
-class AudioMLP(nn.Module):
-    def __init__(self, config: AudioConfig):
-        super().__init__()
-        self.fc1 = nn.Linear(config.d_model, config.encoder_ffn_dim, bias=True)
-        self.fc2 = nn.Linear(config.encoder_ffn_dim, config.d_model, bias=True)
-        self.activation_fn = nn.GELU()
-
-    def __call__(self, hidden_states: mx.array) -> mx.array:
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
-        hidden_states = self.fc2(hidden_states)
-        return hidden_states
-
-
 class AudioEncoderLayer(nn.Module):
     def __init__(self, config: AudioConfig):
         super().__init__()
@@ -97,7 +84,9 @@ class AudioEncoderLayer(nn.Module):
         )
         self.final_layer_norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
         self.self_attn = AudioAttention(config)
-        self.mlp = AudioMLP(config)
+        self.fc1 = nn.Linear(config.d_model, config.encoder_ffn_dim, bias=True)
+        self.fc2 = nn.Linear(config.encoder_ffn_dim, config.d_model, bias=True)
+        self.activation_fn = nn.GELU()
 
     def __call__(
         self,
@@ -111,23 +100,10 @@ class AudioEncoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.fc1(hidden_states)
+        hidden_states = self.activation_fn(hidden_states)
+        hidden_states = self.fc2(hidden_states)
         hidden_states = residual + hidden_states
-        return hidden_states
-
-
-class AudioEncoder(nn.Module):
-    def __init__(self, config: AudioConfig):
-        super().__init__()
-        self.layers = [AudioEncoderLayer(config) for _ in range(config.encoder_layers)]
-
-    def __call__(
-        self,
-        hidden_states: mx.array,
-        attention_mask: Optional[mx.array] = None,
-    ) -> mx.array:
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask)
         return hidden_states
 
 
@@ -167,7 +143,7 @@ class AudioModel(nn.Module):
             bias=True,
         )
         self.embed_positions = nn.Embedding(config.max_source_positions, config.d_model)
-        self.layers = AudioEncoder(config)
+        self.layers = [AudioEncoderLayer(config) for _ in range(config.encoder_layers)]
         self.layer_norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
 
     def __call__(
@@ -197,7 +173,8 @@ class AudioModel(nn.Module):
             token_ids = mx.arange(seq_len, dtype=mx.int32)[None, :]
             attention_mask = token_ids < conv_lengths[:, None]
 
-        hidden_states = self.layers(hidden_states, attention_mask)
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, attention_mask)
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states
 
@@ -206,7 +183,7 @@ class AudioModel(nn.Module):
         for key, value in weights.items():
             if key.endswith("conv1.weight") or key.endswith("conv2.weight"):
                 # PyTorch Conv1d: [out, in, k], MLX Conv1d: [out, k, in]
-                if not check_conv1d_weight_shape(value):
+                if len(value.shape) == 3 and not check_conv1d_weight_shape(value):
                     value = value.transpose(0, 2, 1)
             sanitized_weights[key] = value
         return sanitized_weights

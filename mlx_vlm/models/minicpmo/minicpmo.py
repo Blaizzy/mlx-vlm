@@ -531,9 +531,13 @@ class Model(nn.Module):
             ) and not check_array_shape(value):
                 value = value.transpose(0, 2, 3, 1)
             if (
-                key.endswith("audio_tower.conv1.weight")
-                or key.endswith("audio_tower.conv2.weight")
-            ) and not check_conv1d_weight_shape(value):
+                (
+                    key.endswith("audio_tower.conv1.weight")
+                    or key.endswith("audio_tower.conv2.weight")
+                )
+                and len(value.shape) == 3
+                and not check_conv1d_weight_shape(value)
+            ):
                 value = value.transpose(0, 2, 1)
 
             sanitized_weights[key] = value

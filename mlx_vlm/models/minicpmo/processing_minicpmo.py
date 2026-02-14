@@ -374,8 +374,6 @@ class MiniCPMOProcessor(ProcessorMixin):
             return match.group(0)
 
         output = self._AUDIO_MARKER_PATTERN.sub(_replace, text or "")
-        if used < len(audio_placeholders):
-            output = ("".join(audio_placeholders[used:])) + output
         return output
 
     def _compute_image_bounds(self, input_ids: np.ndarray) -> np.ndarray:
