@@ -11,10 +11,11 @@ class TextConfig(BaseModelConfig):
     model_type: str = "smolvlm"
     hidden_size: int = 4096
     intermediate_size: int = 11008
-    num_attention_heads: int = 32
+    num_attention_heads: Optional[int] = None
     rms_norm_eps: float = 1e-5
     vocab_size: int = 49152
-    num_key_value_heads: int = 8
+    num_key_value_heads: Optional[int] = None
+    head_dim: Optional[int] = None
     rope_theta: float = 1000000.0
     num_hidden_layers: int = 32
     rope_traditional: bool = False
@@ -22,6 +23,11 @@ class TextConfig(BaseModelConfig):
     tie_word_embeddings: bool = False
 
     def __post_init__(self):
+        if self.num_attention_heads is None:
+            if self.head_dim is not None and self.head_dim > 0:
+                self.num_attention_heads = self.hidden_size // self.head_dim
+            else:
+                self.num_attention_heads = 32
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
@@ -29,14 +35,36 @@ class TextConfig(BaseModelConfig):
 @dataclass
 class VisionConfig(BaseModelConfig):
     model_type: str = "siglip_vision_model"
-    hidden_size: int = 1152
-    num_attention_heads: int = 16
+    hidden_size: Optional[int] = None
+    num_attention_heads: Optional[int] = None
     patch_size: int = 14
-    num_hidden_layers: int = 27
-    intermediate_size: int = 4304
+    num_hidden_layers: Optional[int] = None
+    intermediate_size: Optional[int] = None
     image_size: int = 384
     num_channels: int = 3
     layer_norm_eps: float = 1e-6
+
+    def __post_init__(self):
+        if self.hidden_size is None:
+            self.hidden_size = 1152
+
+        if self.num_attention_heads is None:
+            if self.hidden_size % 64 == 0:
+                self.num_attention_heads = self.hidden_size // 64
+            else:
+                self.num_attention_heads = 16
+
+        if self.num_hidden_layers is None:
+            # SmolVLM2 variants use either the 12-layer (500M) or 27-layer (2.2B) vision tower.
+            self.num_hidden_layers = 12 if self.hidden_size <= 768 else 27
+
+        if self.intermediate_size is None:
+            if self.hidden_size == 768:
+                self.intermediate_size = 3072
+            elif self.hidden_size == 1152:
+                self.intermediate_size = 4304
+            else:
+                self.intermediate_size = self.hidden_size * 4
 
 
 @dataclass
