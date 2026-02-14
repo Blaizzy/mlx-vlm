@@ -12,6 +12,19 @@ from ..cache import KVCache
 from .config import TextConfig
 
 
+def _activation_from_config(config: TextConfig):
+    act = getattr(config, "hidden_activation", None)
+    if act is None:
+        act = getattr(config, "hidden_act", "gelu_pytorch_tanh")
+
+    if act == "gelu":
+        return nn.GELU()
+    if act in ("gelu_pytorch_tanh", "gelu_new", "gelu_fast", "tanh"):
+        return nn.GELU(approx="precise")
+
+    raise ValueError(f"Unsupported activation '{act}' for PaliGemma")
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dims: int, eps: float = 1e-6):
         super().__init__()
@@ -42,11 +55,12 @@ class Attention(nn.Module):
             if self.model_type == "gemma"
             else 1.0 / (config.query_pre_attn_scalar**0.5)
         )
+        attention_bias = getattr(config, "attention_bias", False)
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
-        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=attention_bias)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=attention_bias)
 
         self.rope = nn.RoPE(
             head_dim,
@@ -85,37 +99,59 @@ class Attention(nn.Module):
             queries = queries * self.scale
 
             if self.repeats > 1:
-                queries = queries.reshape(
-                    B, self.n_kv_heads, self.repeats, L, self.head_dim
-                )
-                keys = mx.expand_dims(keys, 2)
-                values = mx.expand_dims(values, 2)
+                keys = mx.repeat(keys, self.repeats, axis=1)
+                values = mx.repeat(values, self.repeats, axis=1)
 
-            scores = queries @ keys.swapaxes(-1, -2)
-            scores = mx.tanh(scores / self.attn_logit_softcapping)
-            scores *= self.attn_logit_softcapping
+            # Match HF eager semantics: compute logits in fp32, softmax in fp32,
+            # then cast attention weights back to query dtype before value matmul.
+            scores = queries.astype(mx.float32) @ keys.astype(mx.float32).swapaxes(
+                -1, -2
+            )
+            if self.attn_logit_softcapping is not None:
+                scores = mx.tanh(scores / self.attn_logit_softcapping)
+                scores *= self.attn_logit_softcapping
 
-            if mask is not None and isinstance(mask, mx.array):
+            if mask is not None:
+                # Match HF mask handling: accept attention-mask style [B, S] inputs,
+                # precomputed additive masks, or 4D masks.
+                if mask.ndim == 2:
+                    if mask.shape[0] == B:
+                        mask = mask[:, None, None, :]
+                    else:
+                        mask = mask[None, None, :, :]
+                elif mask.ndim == 3:
+                    mask = mask[:, None, :, :]
+
+                mask = mask[..., : keys.shape[-2]]
+                if mask.dtype not in (mx.float16, mx.bfloat16, mx.float32):
+                    mask = mask.astype(scores.dtype)
+                    mask = (1.0 - mask) * mx.finfo(scores.dtype).min
+                else:
+                    mask = mask.astype(scores.dtype)
                 scores = scores + mask
-            scores = mx.softmax(scores, precise=True, axis=-1)
+            scores = mx.softmax(scores, precise=True, axis=-1).astype(queries.dtype)
             output = scores @ values
-            if self.repeats > 1:
-                output = output.reshape(B, self.n_heads, L, self.head_dim)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
 
 class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim, model_type):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.gelu = nn.GELU() if model_type == "gemma" else nn.GELU(approx="precise")
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.activation = _activation_from_config(config)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(self.gelu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(self.activation(self.gate_proj(x)) * self.up_proj(x))
 
 
 class TransformerBlock(nn.Module):
@@ -125,7 +161,7 @@ class TransformerBlock(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.self_attn = Attention(config)
-        self.mlp = MLP(config.hidden_size, config.intermediate_size, config.model_type)
+        self.mlp = MLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -188,13 +224,21 @@ class GemmaModel(nn.Module):
         else:
             h = inputs_embeds
 
-        h *= self.config.hidden_size**0.5
+        normalizer = mx.array(self.config.hidden_size**0.5, dtype=h.dtype)
+        h = h * normalizer
 
         if cache is None:
             cache = [None] * len(self.layers)
 
-        if mask is None or cache[0].offset > 0:
-            mask = create_attention_mask(h, cache, return_array=True)
+        use_bidirectional = bool(
+            getattr(self.config, "use_bidirectional_attention", False)
+        )
+        if mask is None:
+            if not use_bidirectional:
+                mask = create_attention_mask(h, cache[0], return_array=True)
+        elif not use_bidirectional and cache[0] is not None and cache[0].offset > 0:
+            # For causal decoding, rebuild the mask against current cache length.
+            mask = create_attention_mask(h, cache[0], return_array=True)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
