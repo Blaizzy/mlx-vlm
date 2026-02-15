@@ -1,5 +1,6 @@
 import argparse
 import glob
+import json
 import shutil
 from pathlib import Path
 from typing import Callable, Optional, Union
@@ -180,6 +181,20 @@ def convert(
             shutil.copy(file, mlx_path)
 
     processor.save_pretrained(mlx_path)
+
+    # Fix for spatial_merge_size not being preserved by processor.save_pretrained()
+    # Some processors (e.g., PixtralProcessor) don't serialize this field, causing
+    # "Number of image token positions does not match number of image features" errors.
+    # See: https://github.com/huggingface/transformers/pull/37019
+    if "spatial_merge_size" in config:
+        proc_config_path = mlx_path / "processor_config.json"
+        if proc_config_path.exists():
+            with open(proc_config_path) as f:
+                proc_config = json.load(f)
+            if "spatial_merge_size" not in proc_config:
+                proc_config["spatial_merge_size"] = config["spatial_merge_size"]
+                with open(proc_config_path, "w") as f:
+                    json.dump(proc_config, f, indent=2)
 
     save_config(config, config_path=mlx_path / "config.json")
 
