@@ -1,11 +1,6 @@
 """Tests for convert.py functionality."""
 
 import json
-import tempfile
-from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-import pytest
 
 
 class TestSpatialMergeSizePreservation:
@@ -54,8 +49,13 @@ class TestSpatialMergeSizePreservation:
             if proc_config_path.exists():
                 with open(proc_config_path) as f:
                     loaded_proc_config = json.load(f)
-                if "spatial_merge_size" not in loaded_proc_config:
-                    loaded_proc_config["spatial_merge_size"] = config["spatial_merge_size"]
+                if (
+                    loaded_proc_config.get("spatial_merge_size")
+                    != config["spatial_merge_size"]
+                ):
+                    loaded_proc_config["spatial_merge_size"] = config[
+                        "spatial_merge_size"
+                    ]
                     with open(proc_config_path, "w") as f:
                         json.dump(loaded_proc_config, f, indent=2)
 
@@ -66,17 +66,17 @@ class TestSpatialMergeSizePreservation:
         assert "spatial_merge_size" in result
         assert result["spatial_merge_size"] == 2
 
-    def test_spatial_merge_size_not_overwritten_if_present(self, tmp_path):
-        """Test that existing spatial_merge_size in processor_config is preserved."""
+    def test_spatial_merge_size_corrected_when_wrong_default(self, tmp_path):
+        """Test that wrong spatial_merge_size default (1) is corrected to config value (2)."""
         config = {
             "model_type": "mistral3",
             "spatial_merge_size": 2,
         }
 
-        # processor_config already has spatial_merge_size (different value)
+        # processor_config has wrong default value (1 instead of 2)
         proc_config = {
             "image_token": "[IMG]",
-            "spatial_merge_size": 4,  # Different from config
+            "spatial_merge_size": 1,  # Wrong default from processor.save_pretrained()
         }
 
         mlx_path = tmp_path / "mlx_model"
@@ -86,21 +86,26 @@ class TestSpatialMergeSizePreservation:
         with open(proc_config_path, "w") as f:
             json.dump(proc_config, f, indent=2)
 
-        # Execute: Run the fix logic
+        # Execute: Run the fix logic (updated version)
         if "spatial_merge_size" in config:
             if proc_config_path.exists():
                 with open(proc_config_path) as f:
                     loaded_proc_config = json.load(f)
-                if "spatial_merge_size" not in loaded_proc_config:
-                    loaded_proc_config["spatial_merge_size"] = config["spatial_merge_size"]
+                if (
+                    loaded_proc_config.get("spatial_merge_size")
+                    != config["spatial_merge_size"]
+                ):
+                    loaded_proc_config["spatial_merge_size"] = config[
+                        "spatial_merge_size"
+                    ]
                     with open(proc_config_path, "w") as f:
                         json.dump(loaded_proc_config, f, indent=2)
 
-        # Verify: Original value is preserved
+        # Verify: Value is corrected to match config.json
         with open(proc_config_path) as f:
             result = json.load(f)
 
-        assert result["spatial_merge_size"] == 4  # Not overwritten
+        assert result["spatial_merge_size"] == 2  # Corrected from 1 to 2
 
     def test_no_action_when_config_lacks_spatial_merge_size(self, tmp_path):
         """Test that nothing happens if config doesn't have spatial_merge_size."""
@@ -127,8 +132,13 @@ class TestSpatialMergeSizePreservation:
             if proc_config_path.exists():
                 with open(proc_config_path) as f:
                     loaded_proc_config = json.load(f)
-                if "spatial_merge_size" not in loaded_proc_config:
-                    loaded_proc_config["spatial_merge_size"] = config["spatial_merge_size"]
+                if (
+                    loaded_proc_config.get("spatial_merge_size")
+                    != config["spatial_merge_size"]
+                ):
+                    loaded_proc_config["spatial_merge_size"] = config[
+                        "spatial_merge_size"
+                    ]
                     with open(proc_config_path, "w") as f:
                         json.dump(loaded_proc_config, f, indent=2)
 
@@ -156,10 +166,61 @@ class TestSpatialMergeSizePreservation:
             if proc_config_path.exists():
                 with open(proc_config_path) as f:
                     loaded_proc_config = json.load(f)
-                if "spatial_merge_size" not in loaded_proc_config:
-                    loaded_proc_config["spatial_merge_size"] = config["spatial_merge_size"]
+                if (
+                    loaded_proc_config.get("spatial_merge_size")
+                    != config["spatial_merge_size"]
+                ):
+                    loaded_proc_config["spatial_merge_size"] = config[
+                        "spatial_merge_size"
+                    ]
                     with open(proc_config_path, "w") as f:
                         json.dump(loaded_proc_config, f, indent=2)
 
         # Verify: File still doesn't exist (no error thrown)
         assert not proc_config_path.exists()
+
+    def test_no_action_when_values_match(self, tmp_path):
+        """Test that no write happens if values already match."""
+        config = {
+            "model_type": "mistral3",
+            "spatial_merge_size": 2,
+        }
+
+        proc_config = {
+            "image_token": "[IMG]",
+            "spatial_merge_size": 2,  # Already correct
+        }
+
+        mlx_path = tmp_path / "mlx_model"
+        mlx_path.mkdir()
+
+        proc_config_path = mlx_path / "processor_config.json"
+        with open(proc_config_path, "w") as f:
+            json.dump(proc_config, f, indent=2)
+
+        import os
+
+        original_mtime = os.path.getmtime(proc_config_path)
+
+        # Small delay to ensure mtime would change if file is written
+        import time
+
+        time.sleep(0.01)
+
+        # Execute: Run the fix logic
+        if "spatial_merge_size" in config:
+            if proc_config_path.exists():
+                with open(proc_config_path) as f:
+                    loaded_proc_config = json.load(f)
+                if (
+                    loaded_proc_config.get("spatial_merge_size")
+                    != config["spatial_merge_size"]
+                ):
+                    loaded_proc_config["spatial_merge_size"] = config[
+                        "spatial_merge_size"
+                    ]
+                    with open(proc_config_path, "w") as f:
+                        json.dump(loaded_proc_config, f, indent=2)
+
+        # Verify: File was not rewritten (mtime unchanged)
+        assert os.path.getmtime(proc_config_path) == original_mtime
