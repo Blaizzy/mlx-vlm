@@ -380,4 +380,13 @@ class Model(nn.Module):
             if "final_logits_bias" in k:
                 continue
             sanitized_weights[k] = v
+
+        # Florence-2 checkpoints can omit lm_head when it is tied to shared embeddings.
+        if (
+            "language_model.lm_head.weight" not in sanitized_weights
+            and "language_model.model.shared.weight" in sanitized_weights
+        ):
+            sanitized_weights["language_model.lm_head.weight"] = sanitized_weights[
+                "language_model.model.shared.weight"
+            ]
         return sanitized_weights
