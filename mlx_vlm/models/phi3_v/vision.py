@@ -228,8 +228,7 @@ class VisionModel(nn.Module):
             return self.img_processor.vision_model(
                 img_embeds, output_hidden_states=output_hidden_states
             )
-        img_embeds = mx.array(img_embeds)
-        img_sizes = mx.array(img_sizes)
+
         B = img_embeds.shape[0]
         img_sizes = (img_sizes // 336).tolist()
         img_features = self.img_processor.vision_model(
