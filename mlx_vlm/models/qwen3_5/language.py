@@ -674,7 +674,7 @@ class LanguageModel(nn.Module):
             if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
                 return {"group_size": 64, "bits": 8}
             return True
-            
+
         return predicate
 
     @property
@@ -683,6 +683,5 @@ class LanguageModel(nn.Module):
             if path.endswith("A_log"):
                 return False
             return True
+
         return predicate
-
-
