@@ -339,18 +339,16 @@ def generate_step(
 
             quantize_cache_fn(prompt_cache)
 
+            logprobs = logits - mx.logsumexp(logits)
+            y = sampler(logprobs)
+
             if outputs.cross_attention_states is not None:
                 kwargs = {"cross_attention_states": outputs.cross_attention_states}
             elif outputs.encoder_outputs is not None:
-                kwargs = {
-                    "decoder_input_ids": y[None],
-                    "encoder_outputs": outputs.encoder_outputs,
-                }
+                kwargs = {"encoder_outputs": outputs.encoder_outputs}
             else:
                 kwargs = {}
 
-            logprobs = logits - mx.logsumexp(logits)
-            y = sampler(logprobs)
             return y, logprobs.squeeze(0)
 
     with mx.stream(generation_stream):
