@@ -1074,6 +1074,67 @@ class TestModels(unittest.TestCase):
             ),  # image temporals shape (num_images, 3)
         )
 
+    def test_dots_ocr(self):
+        from mlx_vlm.models import dots_ocr
+
+        text_config = dots_ocr.TextConfig(
+            model_type="dots_ocr",
+            vocab_size=256,
+            hidden_size=64,
+            intermediate_size=160,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=512,
+            attention_bias=True,
+            tie_word_embeddings=False,
+        )
+
+        vision_config = dots_ocr.VisionConfig(
+            model_type="dots_vit",
+            embed_dim=64,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_channels=3,
+            patch_size=14,
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+            use_bias=False,
+        )
+
+        config = dots_ocr.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="dots_ocr",
+            image_token_id=10,
+            video_token_id=11,
+            vocab_size=256,
+        )
+
+        model = dots_ocr.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        pixel_values = mx.random.uniform(shape=(4, 3 * 14 * 14), dtype=mx.float32)
+        image_grid_thw = mx.array([[1, 2, 2]], dtype=mx.int32)
+        vision_features = model.vision_tower(pixel_values, image_grid_thw)
+        self.assertEqual(vision_features.shape, (1, 64))
+
+        input_ids = mx.array([[1, config.image_token_id, 2]], dtype=mx.int32)
+        embeddings = model.get_input_embeddings(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, 64))
+
     def test_qwen3_vl(self):
         from mlx_vlm.models import qwen3_vl
 
