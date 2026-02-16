@@ -11,7 +11,7 @@ class Model(Qwen3_5Model):
 
     def __init__(self, config: ModelConfig):
         # only initialize nn.Module, skip the initialization of vision_tower and language_model in the parent class
-        nn.Module.__init__()
+        nn.Module.__init__(self)
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config, config)
