@@ -664,3 +664,24 @@ class LanguageModel(nn.Module):
     @property
     def n_kv_heads(self):
         return self.args.num_key_value_heads
+
+    @property
+    def quant_predicate(self):
+        if self.config.num_experts <= 0:
+            return None
+
+        def predicate(path, _):
+            if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
+
+    @property
+    def cast_predicate(self):
+        def predicate(path: str):
+            if path.endswith("A_log"):
+                return False
+            return True
+
+        return predicate
