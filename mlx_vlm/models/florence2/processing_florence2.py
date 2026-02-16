@@ -64,7 +64,6 @@ def _ensure_florence_tokens(tokenizer) -> None:
             {"additional_special_tokens": [_added_token(tok) for tok in missing]}
         )
 
-
     added_vocab = tokenizer.get_added_vocab()
     if _IMAGE_PLACEHOLDER_TOKEN not in added_vocab:
         tokenizer.add_special_tokens(
