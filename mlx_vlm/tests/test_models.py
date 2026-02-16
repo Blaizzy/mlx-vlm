@@ -3145,6 +3145,22 @@ class TestGetInputEmbeddings(unittest.TestCase):
         self.assertIsInstance(result, InputEmbeddingsFeatures)
         self.assertIsNotNone(result.inputs_embeds)
 
+        # Test with bfloat16 pixel values
+        pixel_values_bf16 = mx.random.normal(shape=(1, 3, 28, 28)).astype(mx.bfloat16)
+        result_bf16 = model.get_input_embeddings(input_ids, pixel_values=pixel_values_bf16)
+        self.assertIsInstance(result_bf16, InputEmbeddingsFeatures)
+        self.assertIsNotNone(result_bf16.inputs_embeds)
+        self.assertEqual(result_bf16.inputs_embeds.dtype, mx.bfloat16)
+
+        # Test with float32 pixel values
+        pixel_values_f32 = mx.random.normal(shape=(1, 3, 28, 28)).astype(mx.float32)
+        result_f32 = model.get_input_embeddings(input_ids, pixel_values=pixel_values_f32)
+        self.assertIsInstance(result_f32, InputEmbeddingsFeatures)
+        self.assertIsNotNone(result_f32.inputs_embeds)
+        self.assertEqual(result_f32.inputs_embeds.dtype, mx.float32)
+
+
+
     def test_qwen3_vl_moe_input_embeddings(self):
         from mlx_vlm.models import qwen3_vl_moe
 

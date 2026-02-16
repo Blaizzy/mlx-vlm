@@ -237,7 +237,8 @@ class VisionModel(nn.Module):
         )[-1][-2][:, 1:]
         img_features = img_features.reshape(B, -1, *img_features.shape[1:])
         C, H = self.image_dim_out, int(img_features.shape[2] ** 0.5)
-        output_imgs, output_len = [], []
+        target_dtype = txt_embeds.dtype
+        idx = 0
         for _bs in range(B):
             h, w = img_sizes[_bs]
             B_ = h * w
@@ -266,16 +267,14 @@ class VisionModel(nn.Module):
             x = mx.concatenate([sub_img, self.glb_GN, glb_img], axis=1)
             for l in self.img_projection:
                 x = l(x)
-            output_imgs.append(np.array(x.astype(mx.float32)))
-            output_len.append(int((h * w + 1) * 144 + 1 + (h + 1) * 12))
-        idx = 0
-        txt_embeds = np.array(txt_embeds.astype(mx.float32))
-        for i, cnt in enumerate(output_len):
-            txt_embeds[
-                positions[idx][0], positions[idx][1] : positions[idx][1] + cnt
-            ] = output_imgs[i]
+
+            cnt = int((h * w + 1) * 144 + 1 + (h + 1) * 12)
+            batch_idx, start_idx = positions[idx]
+            txt_embeds[batch_idx, start_idx : start_idx + cnt, :] = x[0].astype(
+                target_dtype
+            )
             idx += cnt
-        txt_embeds = mx.array(txt_embeds)
+
         return txt_embeds
 
     def sanitize(self, weights):
