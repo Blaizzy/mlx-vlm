@@ -3145,7 +3145,6 @@ class TestGetInputEmbeddings(unittest.TestCase):
         self.assertIsInstance(result, InputEmbeddingsFeatures)
         self.assertIsNotNone(result.inputs_embeds)
 
-
         num_image_tokens = int((1 * 1 + 1) * 144 + 1 + (1 + 1) * 12)
         mm_input_ids = mx.array([[1, 2] + [-1] * num_image_tokens + [3]])
         image_sizes = mx.array([[336, 336]], dtype=mx.int64)
@@ -3159,7 +3158,6 @@ class TestGetInputEmbeddings(unittest.TestCase):
         self.assertIsInstance(result_bf16, InputEmbeddingsFeatures)
         self.assertIsNotNone(result_bf16.inputs_embeds)
         self.assertEqual(result_bf16.inputs_embeds.dtype, mx.bfloat16)
-
 
     def test_qwen3_vl_moe_input_embeddings(self):
         from mlx_vlm.models import qwen3_vl_moe
