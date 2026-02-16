@@ -127,3 +127,11 @@ class Model(Qwen3VLModel):
             sanitized_weights[key] = value
 
         return sanitized_weights
+
+    @property
+    def quant_predicate(self):
+        return self.language_model.quant_predicate
+
+    @property
+    def cast_predicate(self):
+        return self.language_model.cast_predicate
