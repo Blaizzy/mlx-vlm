@@ -924,6 +924,28 @@ class TestModels(unittest.TestCase):
 
         model = pixtral.Model(config)
 
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+
+        pixel_values = mx.random.uniform(shape=(2, 56, 56, 3))
+        image_sizes = mx.array([[28, 42], [56, 56]])
+
+        full_hidden, _ = model.vision_tower(pixel_values, output_hidden_states=True)
+        sized_hidden, _ = model.vision_tower(
+            pixel_values, output_hidden_states=True, image_sizes=image_sizes
+        )
+
+        expected_full_tokens = 2 * (56 // 14) * (56 // 14)
+        expected_sized_tokens = (28 // 14) * (42 // 14) + (56 // 14) * (56 // 14)
+
+        self.assertEqual(full_hidden.shape[1], expected_full_tokens)
+        self.assertEqual(sized_hidden.shape[1], expected_sized_tokens)
+
     def test_qwen2_vl(self):
         from mlx_vlm.models import qwen2_vl
 
