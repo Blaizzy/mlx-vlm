@@ -24,6 +24,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 |-------|---------------|
 | DeepSeek-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
 | DeepSeek-OCR-2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
+| DOTS-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
 | GLM-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/glm_ocr/README.md) |
 
 ## Installation
@@ -204,7 +205,7 @@ curl -X POST "http://localhost:8080/chat/completions" \
     "messages": [
       {
         "role": "user",
-        "content": "Hello, how are you",
+        "content": "Hello, how are you"
       }
     ],
     "stream": true,
@@ -254,8 +255,8 @@ curl -X POST "http://localhost:8080/generate" \
         "role": "user",
         "content": [
           { "type": "text", "text": "Describe what you hear in these audio files" },
-          {"type": "input_audio", "input_audio": "/path/to/audio1.wav"}
-          {"type": "input_audio", "input_audio": "https://example.com/audio2.mp3"}
+          { "type": "input_audio", "input_audio": "/path/to/audio1.wav" },
+          { "type": "input_audio", "input_audio": "https://example.com/audio2.mp3" }
         ]
       }
     ],

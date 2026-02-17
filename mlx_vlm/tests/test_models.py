@@ -385,7 +385,7 @@ class TestModels(unittest.TestCase):
             num_attention_heads=32,
             rms_norm_eps=1e-5,
             vocab_size=49155,
-            num_key_value_heads=32,
+            num_key_value_heads=8,
             rope_theta=273768.0,
             rope_traditional=False,
         )
@@ -412,6 +412,19 @@ class TestModels(unittest.TestCase):
 
         model = idefics3.Model(config)
 
+        head_dim = (
+            config.text_config.hidden_size // config.text_config.num_attention_heads
+        )
+        expected_kv_width = config.text_config.num_key_value_heads * head_dim
+        self.assertEqual(
+            model.language_model.layers[0].self_attn.k_proj.weight.shape,
+            (expected_kv_width, config.text_config.hidden_size),
+        )
+        self.assertEqual(
+            model.language_model.layers[0].self_attn.v_proj.weight.shape,
+            (expected_kv_width, config.text_config.hidden_size),
+        )
+
         self.language_test_runner(
             model.language_model,
             config.text_config.model_type,
@@ -426,6 +439,39 @@ class TestModels(unittest.TestCase):
             config.vision_config.num_channels,
             (config.vision_config.image_size, config.vision_config.image_size),
         )
+
+    def test_smolvlm_text_config_infers_heads_from_head_dim(self):
+        from mlx_vlm.models import smolvlm
+
+        text_config = smolvlm.TextConfig.from_dict(
+            {
+                "hidden_size": 2048,
+                "head_dim": 64,
+                "intermediate_size": 8192,
+                "num_hidden_layers": 24,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 49280,
+            }
+        )
+
+        self.assertEqual(text_config.num_attention_heads, 32)
+        self.assertEqual(text_config.num_key_value_heads, 32)
+
+    def test_smolvlm_vision_config_infers_500m_defaults(self):
+        from mlx_vlm.models import smolvlm
+
+        vision_config = smolvlm.VisionConfig.from_dict(
+            {
+                "hidden_size": 768,
+                "num_attention_heads": 12,
+                "patch_size": 16,
+                "image_size": 512,
+                "model_type": "smolvlm_vision",
+            }
+        )
+
+        self.assertEqual(vision_config.num_hidden_layers, 12)
+        self.assertEqual(vision_config.intermediate_size, 3072)
 
     def test_internvl_chat(self):
         from mlx_vlm.models import internvl_chat
@@ -545,6 +591,45 @@ class TestModels(unittest.TestCase):
             config.vision_config.num_channels,
             (config.vision_config.image_size, config.vision_config.image_size),
         )
+
+    def test_paligemma_from_dict_defaults_bidirectional_attention(self):
+        from mlx_vlm.models import paligemma
+
+        config = paligemma.ModelConfig.from_dict(
+            {
+                "model_type": "paligemma",
+                "hidden_size": 2048,
+                "projection_dim": 2048,
+                "text_config": {
+                    "model_type": "gemma2",
+                    "hidden_size": 2048,
+                    "num_hidden_layers": 2,
+                    "intermediate_size": 8192,
+                    "num_attention_heads": 8,
+                    "num_key_value_heads": 8,
+                    "vocab_size": 256000,
+                    "head_dim": 256,
+                    "query_pre_attn_scalar": 256,
+                    "attn_logit_softcapping": 50.0,
+                    "final_logit_softcapping": 30.0,
+                    "hidden_act": "gelu_pytorch_tanh",
+                },
+                "vision_config": {
+                    "model_type": "siglip_vision_model",
+                    "num_hidden_layers": 27,
+                    "hidden_size": 1152,
+                    "intermediate_size": 4304,
+                    "num_attention_heads": 16,
+                    "image_size": 896,
+                    "patch_size": 14,
+                },
+            }
+        )
+
+        self.assertTrue(config.text_config.use_bidirectional_attention)
+        self.assertEqual(config.text_config.hidden_activation, "gelu_pytorch_tanh")
+        self.assertEqual(config.text_config.num_image_tokens, 4096)
+        self.assertEqual(config.vision_config.projection_dim, 2048)
 
     def test_multi_modality(self):
         from mlx_vlm.models import multi_modality
@@ -839,6 +924,27 @@ class TestModels(unittest.TestCase):
 
         model = pixtral.Model(config)
 
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        pixel_values = mx.random.uniform(shape=(2, 56, 56, 3))
+        image_sizes = mx.array([[28, 42], [56, 56]])
+
+        full_hidden, _ = model.vision_tower(pixel_values, output_hidden_states=True)
+        sized_hidden, _ = model.vision_tower(
+            pixel_values, output_hidden_states=True, image_sizes=image_sizes
+        )
+
+        expected_full_tokens = 2 * (56 // 14) * (56 // 14)
+        expected_sized_tokens = (28 // 14) * (42 // 14) + (56 // 14) * (56 // 14)
+
+        self.assertEqual(full_hidden.shape[1], expected_full_tokens)
+        self.assertEqual(sized_hidden.shape[1], expected_sized_tokens)
+
     def test_qwen2_vl(self):
         from mlx_vlm.models import qwen2_vl
 
@@ -967,6 +1073,67 @@ class TestModels(unittest.TestCase):
                 [[1, 10, 14]], dtype=mx.int64
             ),  # image temporals shape (num_images, 3)
         )
+
+    def test_dots_ocr(self):
+        from mlx_vlm.models import dots_ocr
+
+        text_config = dots_ocr.TextConfig(
+            model_type="dots_ocr",
+            vocab_size=256,
+            hidden_size=64,
+            intermediate_size=160,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=512,
+            attention_bias=True,
+            tie_word_embeddings=False,
+        )
+
+        vision_config = dots_ocr.VisionConfig(
+            model_type="dots_vit",
+            embed_dim=64,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_channels=3,
+            patch_size=14,
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+            use_bias=False,
+        )
+
+        config = dots_ocr.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="dots_ocr",
+            image_token_id=10,
+            video_token_id=11,
+            vocab_size=256,
+        )
+
+        model = dots_ocr.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        pixel_values = mx.random.uniform(shape=(4, 3 * 14 * 14), dtype=mx.float32)
+        image_grid_thw = mx.array([[1, 2, 2]], dtype=mx.int32)
+        vision_features = model.vision_tower(pixel_values, image_grid_thw)
+        self.assertEqual(vision_features.shape, (1, 64))
+
+        input_ids = mx.array([[1, config.image_token_id, 2]], dtype=mx.int32)
+        embeddings = model.get_input_embeddings(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, 64))
 
     def test_qwen3_vl(self):
         from mlx_vlm.models import qwen3_vl
@@ -3038,6 +3205,20 @@ class TestGetInputEmbeddings(unittest.TestCase):
         result = model.get_input_embeddings(input_ids)
         self.assertIsInstance(result, InputEmbeddingsFeatures)
         self.assertIsNotNone(result.inputs_embeds)
+
+        num_image_tokens = int((1 * 1 + 1) * 144 + 1 + (1 + 1) * 12)
+        mm_input_ids = mx.array([[1, 2] + [-1] * num_image_tokens + [3]])
+        image_sizes = mx.array([[336, 336]], dtype=mx.int64)
+
+        model.update(tree_map(lambda p: p.astype(mx.bfloat16), model.parameters()))
+
+        pixel_values = mx.random.normal(shape=(1, 2, 3, 336, 336))
+        result_bf16 = model.get_input_embeddings(
+            mm_input_ids, pixel_values=pixel_values, image_sizes=image_sizes
+        )
+        self.assertIsInstance(result_bf16, InputEmbeddingsFeatures)
+        self.assertIsNotNone(result_bf16.inputs_embeds)
+        self.assertEqual(result_bf16.inputs_embeds.dtype, mx.bfloat16)
 
     def test_qwen3_vl_moe_input_embeddings(self):
         from mlx_vlm.models import qwen3_vl_moe

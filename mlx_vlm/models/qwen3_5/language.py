@@ -391,6 +391,7 @@ class LanguageModel(nn.Module):
         self.config = config
         self.model_type = args.model_type
         self.model = Qwen3_5Model(args)
+        self._position_ids = None
         self._rope_deltas = None
 
         if not args.tie_word_embeddings:
@@ -576,6 +577,7 @@ class LanguageModel(nn.Module):
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         if pixel_values is not None:
             self._rope_deltas = None
+            self._position_ids = None
 
         cache_offset = 0
         if cache and cache[self.model.fa_idx] is not None:
@@ -587,7 +589,12 @@ class LanguageModel(nn.Module):
             else:
                 raise ValueError(f"Unexpected cache offset type: {type(offset)}")
 
-        if position_ids is None and (mask is None or mask.ndim == 2):
+        # Check if mask shape matches input shape (for chunked prefill compatibility)
+        rope_mask = mask
+        if mask is not None and mask.shape[-1] != inputs.shape[-1]:
+            rope_mask = None
+
+        if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
             if (
                 (
                     cache is not None
@@ -597,10 +604,18 @@ class LanguageModel(nn.Module):
                 or self._rope_deltas is None
                 or cache is None
             ):
-                position_ids, rope_deltas = self.get_rope_index(
-                    inputs, image_grid_thw, video_grid_thw, mask
-                )
-                self._rope_deltas = rope_deltas
+                # Use cached position_ids when available (pre-computed in get_input_embeddings)
+                if self._position_ids is not None:
+                    seq_length = inputs.shape[1]
+                    position_ids = self._position_ids[
+                        :, :, cache_offset : cache_offset + seq_length
+                    ]
+                else:
+                    position_ids, rope_deltas = self.get_rope_index(
+                        inputs, image_grid_thw, video_grid_thw, rope_mask
+                    )
+                    self._rope_deltas = rope_deltas
+                    self._position_ids = position_ids
             else:
                 batch_size, seq_length = inputs.shape
                 delta = mx.array(
@@ -649,3 +664,24 @@ class LanguageModel(nn.Module):
     @property
     def n_kv_heads(self):
         return self.args.num_key_value_heads
+
+    @property
+    def quant_predicate(self):
+        if self.config.num_experts <= 0:
+            return None
+
+        def predicate(path, _):
+            if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
+
+    @property
+    def cast_predicate(self):
+        def predicate(path: str):
+            if path.endswith("A_log"):
+                return False
+            return True
+
+        return predicate

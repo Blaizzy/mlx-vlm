@@ -47,11 +47,12 @@ MODEL_CONFIG = {
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "dots_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,
-    "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT_IMAGE_LAST,
+    "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "llama4": MessageFormat.LIST_WITH_IMAGE,
     "smolvlm": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "llava": MessageFormat.LIST_WITH_IMAGE,
@@ -438,23 +439,165 @@ def get_chat_template(
     **kwargs,
 ) -> Any:
     """Apply chat template using processor's tokenizer."""
-    try:
-        processor = (
-            processor
-            if processor.__dict__.get("chat_template")
-            else processor.tokenizer
+
+    def _get_image_token() -> str:
+        if processor is None:
+            return "<image>"
+
+        image_token = getattr(processor, "image_token", None)
+        if isinstance(image_token, str) and image_token:
+            return image_token
+
+        tokenizer = getattr(processor, "tokenizer", None)
+        image_token = getattr(tokenizer, "image_token", None)
+        if isinstance(image_token, str) and image_token:
+            return image_token
+
+        return "<image>"
+
+    def _flatten_content(content: Any, image_token: str) -> str:
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            parts = []
+            multimodal_markers = {image_token, "<audio>", "<video>"}
+            for item in content:
+                if isinstance(item, dict):
+                    item_type = item.get("type", "")
+                    if item_type in ("text", "input_text"):
+                        text = item.get("text", "") or item.get("content", "")
+                        if text:
+                            parts.append(str(text))
+                    elif item_type in ("image", "image_url", "input_image"):
+                        parts.append(image_token)
+                    elif item_type in ("audio", "input_audio"):
+                        parts.append("<audio>")
+                    elif item_type == "video":
+                        parts.append("<video>")
+                    else:
+                        text = item.get("text", "") or item.get("content", "")
+                        if text:
+                            parts.append(str(text))
+                elif item is not None:
+                    parts.append(str(item))
+
+            stitched_parts = []
+            prev_is_marker = False
+            for part in parts:
+                if not part:
+                    continue
+                current_is_marker = part in multimodal_markers
+                if prev_is_marker and not current_is_marker and not part[0].isspace():
+                    stitched_parts.append(" ")
+                stitched_parts.append(part)
+                prev_is_marker = current_is_marker
+
+            return "".join(stitched_parts).strip()
+
+        if isinstance(content, dict):
+            text = content.get("text", "") or content.get("content", "")
+            return str(text) if text else ""
+
+        return str(content) if content is not None else ""
+
+    def _messages_to_plain_prompt() -> str:
+        image_token = _get_image_token()
+        normalized = []
+
+        for message in messages:
+            if isinstance(message, str):
+                normalized.append({"role": "user", "content": message})
+                continue
+
+            if isinstance(message, dict):
+                normalized.append(
+                    {
+                        "role": message.get("role", "user"),
+                        "content": _flatten_content(
+                            message.get("content", ""), image_token
+                        ),
+                    }
+                )
+                continue
+
+            normalized.append({"role": "user", "content": str(message)})
+
+        if not normalized:
+            return ""
+
+        if len(normalized) == 1 and normalized[0]["role"] == "user":
+            return normalized[0]["content"]
+
+        lines = []
+        for message in normalized:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            if role in ("system", "user", "assistant"):
+                prefix = role.capitalize()
+                lines.append(f"{prefix}: {content}" if content else f"{prefix}:")
+            else:
+                lines.append(content)
+
+        if add_generation_prompt:
+            lines.append("Assistant:")
+
+        return "\n".join(lines).strip()
+
+    def _missing_template_error(error: Exception) -> bool:
+        message = str(error)
+        return (
+            "chat_template is not set" in message
+            or "no template argument was passed" in message
         )
 
-        return processor.apply_chat_template(
-            messages,
-            tokenize=tokenize,
-            add_generation_prompt=add_generation_prompt,
-            **kwargs,
-        )
+    chat_template_override = kwargs.get("chat_template", None)
+
+    try:
+        template_processor = None
+        if (
+            processor is not None
+            and hasattr(processor, "apply_chat_template")
+            and (
+                chat_template_override is not None
+                or getattr(processor, "chat_template", None) is not None
+            )
+        ):
+            template_processor = processor
+        elif (
+            processor is not None
+            and hasattr(processor, "tokenizer")
+            and hasattr(processor.tokenizer, "apply_chat_template")
+            and (
+                chat_template_override is not None
+                or getattr(processor.tokenizer, "chat_template", None) is not None
+            )
+        ):
+            template_processor = processor.tokenizer
+        elif processor is not None and hasattr(processor, "apply_chat_template"):
+            # Handles tokenizers passed directly.
+            if (
+                chat_template_override is not None
+                or getattr(processor, "chat_template", None) is not None
+            ):
+                template_processor = processor
+
+        if template_processor is None:
+            return _messages_to_plain_prompt()
+
+        try:
+            return template_processor.apply_chat_template(
+                messages,
+                tokenize=tokenize,
+                add_generation_prompt=add_generation_prompt,
+                **kwargs,
+            )
+        except ValueError as e:
+            if chat_template_override is None and _missing_template_error(e):
+                return _messages_to_plain_prompt()
+            raise
     except AttributeError:
-        raise ValueError(
-            "Error: processor does not have 'chat_template' or 'tokenizer' attribute."
-        )
+        return _messages_to_plain_prompt()
 
 
 def apply_chat_template(

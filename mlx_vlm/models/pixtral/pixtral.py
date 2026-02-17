@@ -43,6 +43,7 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
         **kwargs,
     ):
+        image_sizes = kwargs.get("image_sizes", None)
         if pixel_values is None:
             return InputEmbeddingsFeatures(
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids)
@@ -65,6 +66,7 @@ class Model(nn.Module):
         *_, hidden_states = self.vision_tower(
             pixel_values.transpose(0, 2, 3, 1),
             output_hidden_states=True,
+            image_sizes=image_sizes,
         )
         # Select the hidden states from the desired layer
         selected_image_feature = hidden_states[self.vision_feature_layer]
