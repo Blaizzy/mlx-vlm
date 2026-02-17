@@ -397,7 +397,7 @@ def generate_step(
 
             input_ids = input_ids[:, -1:]
 
-        y, logprobs = sample(logits)
+        y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
     mx.async_eval(y)
 
