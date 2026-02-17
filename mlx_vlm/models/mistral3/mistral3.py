@@ -125,14 +125,31 @@ class Mistral3PatchMerger(nn.Module):
     def __call__(self, image_features: mx.array, image_sizes: mx.array) -> mx.array:
 
         image_sizes = [
-            (image_size[0] // self.patch_size, image_size[1] // self.patch_size)
+            (
+                int(
+                    image_size[0].item()
+                    if hasattr(image_size[0], "item")
+                    else image_size[0]
+                )
+                // self.patch_size,
+                int(
+                    image_size[1].item()
+                    if hasattr(image_size[1], "item")
+                    else image_size[1]
+                )
+                // self.patch_size,
+            )
             for image_size in image_sizes
         ]
 
         tokens_per_image = [h * w for h, w in image_sizes]
         d = image_features.shape[-1]
-        image_features = image_features.astype(mx.bfloat16)
-        image_sizes = mx.array(image_sizes)
+        if image_features.ndim == 3 and image_features.shape[0] == 1:
+            image_features = image_features.squeeze(0)
+        if image_features.ndim != 2:
+            raise ValueError(
+                f"Expected image_features to be 2D [tokens, dim], got shape {image_features.shape}"
+            )
 
         # Split the image features into chunks based on tokens_per_image
         split_indices = []
@@ -142,35 +159,33 @@ class Mistral3PatchMerger(nn.Module):
             current_index += tokens
 
         # Perform the split
-        chunks = mx.split(image_features, split_indices[:-1], axis=1)
+        chunks = mx.split(image_features, split_indices[:-1], axis=0)
 
         permuted_tensor = []
         for image_index, image_tokens in enumerate(chunks):
-
             # Reshape image_tokens into a 2D grid
-            if image_tokens.shape[1] > 0:
-                h, w = image_sizes[image_index].tolist()
-
-                image_grid = image_tokens.reshape(h, w, d).transpose(2, 0, 1)[None, ...]
-
-                grid = unfold(
-                    image_grid,
-                    kernel_size=self.spatial_merge_size,
-                    stride=self.spatial_merge_size,
-                )
-                grid = grid.reshape(d * self.spatial_merge_size**2, -1).T
-                permuted_tensor.append(grid)
+            h, w = image_sizes[image_index]
+            image_grid = image_tokens.reshape(h, w, d).transpose(2, 0, 1)[None, ...]
+            grid = unfold(
+                image_grid,
+                kernel_size=self.spatial_merge_size,
+                stride=self.spatial_merge_size,
+            )
+            grid = grid.reshape(d * self.spatial_merge_size**2, -1).T
+            permuted_tensor.append(grid)
 
         image_features = mx.concatenate(permuted_tensor, axis=0)
         image_features = self.merging_layer(image_features)
-        return image_features[None, ...]
+        return image_features
 
 
 class Mistral3MultiModalProjector(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
 
-        self.norm = nn.RMSNorm(config.vision_config.hidden_size)
+        self.norm = nn.RMSNorm(
+            config.vision_config.hidden_size, eps=config.text_config.rms_norm_eps
+        )
         self.patch_merger = Mistral3PatchMerger(config)
 
         num_feature_layers = (
@@ -240,9 +255,12 @@ class Model(nn.Module):
         *_, hidden_states = self.vision_tower(
             pixel_values.transpose(0, 2, 3, 1),
             output_hidden_states=True,
+            image_sizes=image_sizes,
         )
         # Select the hidden states from the desired layer
         selected_image_feature = hidden_states[self.vision_feature_layer]
+        if selected_image_feature.ndim == 3 and selected_image_feature.shape[0] == 1:
+            selected_image_feature = selected_image_feature.squeeze(0)
 
         # Pass image features through the multi-modal projector
         image_features = self.multi_modal_projector(selected_image_feature, image_sizes)
@@ -376,7 +394,49 @@ class Model(nn.Module):
 
             return key
 
-        return {transform_key(k): v for k, v in weights.items()}
+        # FP8 dequantization helper
+        def dequant(weight, scale_inv):
+            dtype = mx.bfloat16
+            weight = mx.from_fp8(weight, dtype=dtype)
+
+            # Handle different scale_inv shapes:
+            # - Scalar (0-dim): per-tensor scaling
+            # - 2D: block-wise scaling
+            if scale_inv.ndim == 0:
+                # Per-tensor scaling (scalar)
+                return (weight * scale_inv).astype(dtype)
+            else:
+                # Block-wise scaling
+                bs = 128  # block size
+                m, n = weight.shape
+                pad_bottom = (-m) % bs
+                pad_side = (-n) % bs
+                if pad_bottom > 0 or pad_side > 0:
+                    weight = mx.pad(weight, ((0, pad_bottom), (0, pad_side)))
+                weight = weight.reshape(
+                    (m + pad_bottom) // bs, bs, (n + pad_side) // bs, bs
+                )
+                weight = (weight * scale_inv[:, None, :, None]).reshape(
+                    m + pad_bottom, n + pad_side
+                )
+                return weight[:m, :n].astype(dtype)
+
+        # Transform keys first
+        weights = {transform_key(k): v for k, v in weights.items()}
+
+        # Dequantize FP8 weights
+        new_weights = {}
+        for k, v in weights.items():
+            if k.endswith("_scale_inv"):
+                continue  # Skip scale_inv, will be used during dequantization
+            weight_scale_key = f"{k}_scale_inv"
+            if weight_scale_key in weights:
+                scale_inv = weights[weight_scale_key]
+                new_weights[k] = dequant(v, scale_inv)
+            else:
+                new_weights[k] = v
+
+        return new_weights
 
     @property
     def layers(self):

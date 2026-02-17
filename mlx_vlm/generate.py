@@ -2,6 +2,7 @@ import argparse
 import codecs
 import contextlib
 import functools
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
@@ -10,19 +11,13 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
 from mlx_lm.generate import maybe_quantize_kv_cache
+from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
-from .sample_utils import top_p_sampling
-from .utils import (
-    StoppingCriteria,
-    apply_repetition_penalty,
-    group_images_by_shape,
-    load,
-    prepare_inputs,
-)
+from .utils import StoppingCriteria, group_images_by_shape, load, prepare_inputs
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
@@ -151,6 +146,28 @@ def parse_arguments():
         action="store_true",
         help="Trust remote code when loading the model.",
     )
+    parser.add_argument(
+        "--quantize-activations",
+        "-qa",
+        action="store_true",
+        help="Enable activation quantization for QQLinear layers. "
+        "Only supported for models quantized with 'nvfp4' or 'mxfp8' modes.",
+    )
+    parser.add_argument(
+        "--processor-kwargs",
+        type=json.loads,
+        default={},
+        help="Extra processor kwargs as JSON. "
+        'Example: --processor-kwargs \'{"cropping": false, "max_patches": 3}\'',
+    )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=None,
+        help="Number of tokens to process per prefill step. "
+        "Lower values reduce peak memory usage but may be slower. "
+        "Try 512 or 256 if you hit GPU memory errors during prefill.",
+    )
 
     return parser.parse_args()
 
@@ -169,15 +186,13 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
     to exiting the context manager.
     """
     if not mx.metal.is_available():
-        try:
-            yield
-        finally:
-            return
+        yield
+        return
 
     model_bytes = tree_reduce(
         lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
     )
-    max_rec_size = mx.metal.device_info()["max_recommended_working_set_size"]
+    max_rec_size = mx.device_info()["max_recommended_working_set_size"]
     if model_bytes > 0.9 * max_rec_size:
         model_mb = model_bytes // 2**20
         max_rec_mb = max_rec_size // 2**20
@@ -231,6 +246,7 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = 2048,
     **kwargs,
@@ -262,7 +278,11 @@ def generate_step(
         kv_bits (int, optional): Number of bits for KV cache quantization.
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Start index for quantized KV cache. Default: ``0``.
-        logits_processors (list, optional): List of logits processor functions.
+        sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
+          token from a vector of log probabilities. Default: ``None``.
+        logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
+          A list of functions that take tokens and logits and return the processed
+          logits. Default: ``None``.
         prefill_step_size (int): Number of tokens to process per prefill step.
           Chunked prefill processes prompts in smaller chunks to reduce peak
           memory usage. Default: ``2048``.
@@ -279,32 +299,17 @@ def generate_step(
         kv_bits=kv_bits,
     )
 
-    def sample(logits: mx.array) -> Tuple[mx.array, float]:
-        if logit_bias:
-            indices = mx.array(list(logit_bias.keys()))
-            values = mx.array(list(logit_bias.values()))
-            logits[:, indices] += values
-        logprobs = logits - mx.logsumexp(logits)
+    if sampler is None:
+        sampler = make_sampler(temperature, top_p)
 
-        if temperature == 0:
-            token = mx.argmax(logits, axis=-1)
-        else:
-            if top_p > 0 and top_p < 1.0:
-                token = top_p_sampling(logits, top_p, temperature)
-            else:
-                token = mx.random.categorical(logits * (1 / temperature))
-
-        return token, logprobs
-
-    if repetition_penalty and (
-        repetition_penalty < 0 or not isinstance(repetition_penalty, float)
-    ):
-        raise ValueError(
-            f"repetition_penalty must be a non-negative float, got {repetition_penalty}"
-        )
+    processors = make_logits_processors(
+        logit_bias, repetition_penalty, repetition_context_size
+    )
+    if logits_processors is not None:
+        processors.extend(logits_processors)
 
     y = input_ids
-    tokens = None  # Track tokens for logits processors
+    tokens = mx.array([], dtype=input_ids.dtype)
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -313,15 +318,10 @@ def generate_step(
             max_kv_size=max_kv_size,
         )
 
-    repetition_context = input_ids.reshape(-1).tolist()
+    def _step(y, inputs_embeds=None):
+        nonlocal tokens, kwargs
 
-    if repetition_context_size:
-        repetition_context = repetition_context[-repetition_context_size:]
-
-    def _step(y, **kwargs):
-        nonlocal tokens
         with mx.stream(generation_stream):
-            nonlocal repetition_context
             if "decoder_input_ids" in kwargs:
                 outputs = model.language_model(
                     cache=prompt_cache,
@@ -329,34 +329,32 @@ def generate_step(
                 )
             else:
                 outputs = model.language_model(
-                    y[None],
+                    y,
+                    inputs_embeds=inputs_embeds,
                     cache=prompt_cache,
                     **kwargs,
                 )
 
             logits = outputs.logits[:, -1, :]
 
-            # Apply logits processors before repetition penalty
-            if logits_processors:
-                # Efficiently update tokens by concatenating only the new token
-                tokens = mx.concat([tokens, y])
-                for processor in logits_processors:
+            if len(processors) > 0 and len(y) > 0:
+                tokens = mx.concat([tokens, y.flatten()])
+
+                for processor in processors:
                     logits = processor(tokens, logits)
 
-            if repetition_penalty:
-                logits = apply_repetition_penalty(
-                    logits, repetition_context, repetition_penalty
-                )
-                y, logprobs = sample(logits)
-                repetition_context.append(y.item())
-            else:
-                y, logprobs = sample(logits)
-
-            if repetition_context_size:
-                if len(repetition_context) > repetition_context_size:
-                    repetition_context = repetition_context[-repetition_context_size:]
-
             quantize_cache_fn(prompt_cache)
+
+            logprobs = logits - mx.logsumexp(logits)
+            y = sampler(logprobs)
+
+            if outputs.cross_attention_states is not None:
+                kwargs = {"cross_attention_states": outputs.cross_attention_states}
+            elif outputs.encoder_outputs is not None:
+                kwargs = {"encoder_outputs": outputs.encoder_outputs}
+            else:
+                kwargs = {}
+
             return y, logprobs.squeeze(0)
 
     if inputs_embeds is None:
@@ -379,80 +377,45 @@ def generate_step(
 
     with mx.stream(generation_stream):
         if prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size:
+            # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
-            input_offset = 0
             with tqdm(total=total_tokens, desc="Prefill", unit="tok") as pbar:
                 while inputs_embeds.shape[1] > 1:
                     n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
                     model.language_model(
-                        inputs=input_ids[:, input_offset : input_offset + n_to_process],
+                        inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
                         cache=prompt_cache,
                         **kwargs,
                     )
+                    quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
                     inputs_embeds = inputs_embeds[:, n_to_process:]
-                    input_offset += n_to_process
-                    quantize_cache_fn(prompt_cache)
+                    input_ids = input_ids[:, n_to_process:]
                     mx.clear_cache()
                     pbar.update(n_to_process)
+
             input_ids = input_ids[:, -1:]
 
-        # Final step with last embedding to get logits
-        outputs = model.language_model(
-            inputs=input_ids,
-            inputs_embeds=inputs_embeds,
-            cache=prompt_cache,
-            **kwargs,
-        )
-
-        logits = outputs.logits[:, -1, :]
-        quantize_cache_fn(prompt_cache)
-
-        if logits_processors:
-            # get the last token from input_ids
-            final_input_token = input_ids[0][-1].item()
-            tokens = mx.array([final_input_token])
-            for processor in logits_processors:
-                logits = processor(tokens, logits)
-
-        # Final sampling with processed logits
         y, logprobs = sample(logits)
 
     mx.async_eval(y)
 
-    if outputs.cross_attention_states is not None:
-        kwargs = {
-            k: v
-            for k, v in zip(
-                ["cross_attention_states"], [outputs.cross_attention_states]
-            )
-        }
-    elif outputs.encoder_outputs is not None:
-        kwargs = {
-            "decoder_input_ids": y[None],
-            "encoder_outputs": outputs.encoder_outputs,
-        }
-    else:
-        kwargs = {}
-
     n = 0
     while True:
         if n != max_tokens:
-            next_y, next_logprobs = _step(y, **kwargs)
+            next_y, next_logprobs = _step(y[None])
             mx.async_eval(next_y)
-            if "decoder_input_ids" in kwargs:
-                kwargs["decoder_input_ids"] = next_y[None]
-            yield y.item(), logprobs
-            y, logprobs = next_y, next_logprobs
+        if n == 0:
+            mx.eval(y)
         if n == max_tokens:
             break
 
-        n += 1
-
-        # Periodically clear cache to prevent memory accumulation
-        if n % 256 == 0:  # Clear cache every 256 tokens
+        yield y.item(), logprobs
+        if n % 256 == 0:
             mx.clear_cache()
+        y, logprobs = next_y, next_logprobs
+        n += 1
 
 
 def stream_generate(
@@ -1287,18 +1250,26 @@ def _generate_batch(
 
     with wired_limit(model, [generation_stream]):
         if pixel_values is not None:
-            inputs_embeds = model.get_input_embeddings(
+            embedding_output = model.get_input_embeddings(
                 input_ids, pixel_values, **data_kwargs
             )
+
+            # Normalize embedding output to a kwargs dict expected by BatchGenerator
+            if isinstance(embedding_output, dict):
+                embed_kwargs = embedding_output
+            elif hasattr(embedding_output, "to_dict"):
+                # Convert to dict and keep non-None fields
+                embed_kwargs = {
+                    k: v for k, v in embedding_output.to_dict().items() if v is not None
+                }
+            else:
+                # Assume it's directly an inputs_embeds array
+                embed_kwargs = {"inputs_embeds": embedding_output}
 
             gen_kwargs = {
                 "pixel_values": pixel_values,
                 **data_kwargs,
-                **(
-                    inputs_embeds
-                    if isinstance(inputs_embeds, dict)
-                    else {"inputs_embeds": inputs_embeds}
-                ),
+                **embed_kwargs,
             }
         else:
             input_ids = mx.squeeze(input_ids, axis=0)
@@ -1325,6 +1296,7 @@ def main():
         args.adapter_path,
         revision=args.revision,
         trust_remote_code=args.trust_remote_code,
+        quantize_activations=args.quantize_activations,
     )
     config = model.config
 
@@ -1362,6 +1334,10 @@ def main():
     if args.skip_special_tokens:
         kwargs["skip_special_tokens"] = args.skip_special_tokens
 
+    # Add processor kwargs from JSON
+    if args.processor_kwargs:
+        kwargs.update(args.processor_kwargs)
+
     if args.chat:
         chat = []
         if args.system:
@@ -1371,15 +1347,21 @@ def main():
             prompt = apply_chat_template(processor, config, chat, num_images=num_images)
             response = ""
             print("Assistant:", end="")
+            stream_kwargs = {
+                "max_tokens": args.max_tokens,
+                "temperature": args.temperature,
+                **kwargs,
+            }
+            if args.prefill_step_size is not None:
+                stream_kwargs["prefill_step_size"] = args.prefill_step_size
+
             for chunk in stream_generate(
                 model,
                 processor,
                 prompt,
                 args.image,
                 args.audio,
-                max_tokens=args.max_tokens,
-                temperature=args.temperature,
-                **kwargs,
+                **stream_kwargs,
             ):
                 response += chunk.text
                 print(chunk.text, end="")
@@ -1388,21 +1370,26 @@ def main():
             print()
 
     else:
+        gen_kwargs = {
+            "image": args.image,
+            "audio": args.audio,
+            "temperature": args.temperature,
+            "max_tokens": args.max_tokens,
+            "verbose": args.verbose,
+            "max_kv_size": args.max_kv_size,
+            "kv_bits": args.kv_bits,
+            "kv_group_size": args.kv_group_size,
+            "quantized_kv_start": args.quantized_kv_start,
+            **kwargs,
+        }
+        if args.prefill_step_size is not None:
+            gen_kwargs["prefill_step_size"] = args.prefill_step_size
+
         result = generate(
             model,
             processor,
             prompt,
-            image=args.image,
-            audio=args.audio,
-            temperature=args.temperature,
-            max_tokens=args.max_tokens,
-            verbose=args.verbose,
-            prompt_cache=None,  # TODO: Load prompt cache from file
-            max_kv_size=args.max_kv_size,
-            kv_bits=args.kv_bits,
-            kv_group_size=args.kv_group_size,
-            quantized_kv_start=args.quantized_kv_start,
-            **kwargs,
+            **gen_kwargs,
         )
         if not args.verbose:
             print(result.text)

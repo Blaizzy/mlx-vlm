@@ -209,6 +209,7 @@ class PixtralVisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.config = config
+        self.patch_size = config.patch_size
         self.patch_conv = nn.Conv2d(
             in_channels=config.num_channels,
             out_channels=config.hidden_size,
@@ -224,13 +225,39 @@ class PixtralVisionModel(nn.Module):
         self,
         x: List[mx.array],
         output_hidden_states: Optional[bool] = None,
+        image_sizes: Optional[mx.array] = None,
     ) -> mx.array:
 
         if x.dtype != self.patch_conv.weight.dtype:
             x = x.astype(self.patch_conv.weight.dtype)
 
-        patch_embeds_list = self.patch_conv(x)
-        patch_embeds = patch_embeds_list.reshape(1, -1, patch_embeds_list.shape[-1])
+        if image_sizes is None:
+            image_sizes = [(x.shape[1], x.shape[2])] * x.shape[0]
+        else:
+            normalized_sizes = []
+            for image_size in image_sizes:
+                size = (
+                    image_size.tolist() if hasattr(image_size, "tolist") else image_size
+                )
+                normalized_sizes.append((int(size[0]), int(size[1])))
+            image_sizes = normalized_sizes
+
+        if len(image_sizes) != x.shape[0]:
+            raise ValueError(
+                f"image_sizes length ({len(image_sizes)}) must match batch size ({x.shape[0]})"
+            )
+
+        patch_embeds = self.patch_conv(x)
+        patch_embeds_list = [
+            image_embed[
+                : (image_size[0] // self.patch_size),
+                : (image_size[1] // self.patch_size),
+            ]
+            for image_embed, image_size in zip(patch_embeds, image_sizes)
+        ]
+        patch_embeds = mx.concatenate(
+            [patch.reshape(-1, patch.shape[-1]) for patch in patch_embeds_list], axis=0
+        )[None, ...]
 
         patch_embeds = self.ln_pre(patch_embeds)
 
@@ -268,9 +295,14 @@ class VisionModel(nn.Module):
         self.vision_model = PixtralVisionModel(config)
 
     def __call__(
-        self, x: List[mx.array], output_hidden_states: Optional[bool] = None
+        self,
+        x: List[mx.array],
+        output_hidden_states: Optional[bool] = None,
+        image_sizes: Optional[mx.array] = None,
     ) -> mx.array:
-        return self.vision_model(x, output_hidden_states)
+        return self.vision_model(
+            x, output_hidden_states=output_hidden_states, image_sizes=image_sizes
+        )
 
     def sanitize(self, weights):
         sanitized_weights = {}

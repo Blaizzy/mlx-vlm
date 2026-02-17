@@ -46,7 +46,6 @@ class Qwen2RotaryEmbedding:
         return freqs_t
 
     def __call__(self, x, position_ids):
-
         # In contrast to other models, Qwen3VL has different position ids for the grids
         # So we expand the inv_freq to shape (3, ...)
         if position_ids.ndim == 2:
@@ -245,7 +244,7 @@ class Qwen2Model(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c, position_ids)
@@ -451,7 +450,6 @@ class LanguageModel(nn.Module):
         cache=None,
         **kwargs,
     ):
-
         position_ids = kwargs.pop("position_ids", None)
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
