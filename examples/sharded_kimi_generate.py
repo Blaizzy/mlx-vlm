@@ -80,7 +80,6 @@ def main():
         max_tokens=1024,
         temperature=0,
         top_p=1,
-        prefill_step_size=None,
     ):
         rprint(response.text, end="", flush=True)
 
