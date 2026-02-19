@@ -104,6 +104,7 @@ class LanguageModel(Qwen3_5LanguageModel):
         self.model_type = args.model_type
         self.model = Qwen3_5MoeModel(args)
         self._rope_deltas = None
+        self._position_ids = None
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
