@@ -8,20 +8,19 @@ def get_prompt(model_type, processor, conversation):
     if model_type == "paligemma":
         return conversation
 
-    if "chat_template" in processor.__dict__.keys():
-        prompt = processor.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-    elif "tokenizer" in processor.__dict__.keys():
-        prompt = processor.tokenizer.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
+    tokenizer = getattr(processor, "tokenizer", processor)
+    chat_template = getattr(tokenizer, "chat_template", None)
 
-    return prompt
+    apply_fn = tokenizer.apply_chat_template if chat_template else getattr(processor, "apply_chat_template", None)
+
+    if apply_fn is None:
+        raise ValueError("Processor/Tokenizer has no apply_chat_template method.")
+
+    return apply_fn(
+        conversation,
+        tokenize=False,
+        add_generation_prompt=False,
+    )
 
 
 class VisionDataset:
