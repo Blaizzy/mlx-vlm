@@ -22,7 +22,7 @@ class Colors:
     UNDERLINE = "\033[4m"
 
 
-not_supported_for_training = {"gemma3n"}
+not_supported_for_training = {"gemma3n", "qwen3_omni"}
 
 
 def grad_checkpoint(layer):
