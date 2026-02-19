@@ -212,6 +212,9 @@ class Model(nn.Module):
         p = np.argwhere(np.array(inputs_list) < 0).tolist()
 
         if pixel_values is not None:
+            if pixel_values.dtype != inputs_embeds.dtype:
+                pixel_values = pixel_values.astype(inputs_embeds.dtype)
+
             inputs_embeds = self.model.vision_embed_tokens(
                 pixel_values, inputs_embeds, image_sizes, p
             )

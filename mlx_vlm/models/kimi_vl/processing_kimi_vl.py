@@ -86,6 +86,41 @@ if not hasattr(processing_utils, "Unpack"):
         processing_utils.Unpack = Unpack
 
 
+def _ensure_gpt2_bytes_to_unicode():
+    """
+    Compatibility shim for tokenizer remote code expecting legacy GPT-2 helper.
+
+    Newer Transformers versions removed bytes_to_unicode from
+    transformers.models.gpt2.tokenization_gpt2, but remote tokenizers may still
+    import it from there.
+    """
+    try:
+        import transformers.models.gpt2.tokenization_gpt2 as gpt2_tokenization
+    except Exception:
+        return
+
+    if hasattr(gpt2_tokenization, "bytes_to_unicode"):
+        return
+
+    def bytes_to_unicode():
+        bs = (
+            list(range(ord("!"), ord("~") + 1))
+            + list(range(ord("¡"), ord("¬") + 1))
+            + list(range(ord("®"), ord("ÿ") + 1))
+        )
+        cs = bs[:]
+        n = 0
+        for b in range(2**8):
+            if b not in bs:
+                bs.append(b)
+                cs.append(2**8 + n)
+                n += 1
+        cs = [chr(n) for n in cs]
+        return dict(zip(bs, cs))
+
+    gpt2_tokenization.bytes_to_unicode = bytes_to_unicode
+
+
 # CLIP-style normalization constants
 OPENAI_DATASET_MEAN = (0.48145466, 0.4578275, 0.40821073)
 OPENAI_DATASET_STD = (0.26862954, 0.26130258, 0.27577711)
@@ -395,7 +430,11 @@ class KimiVLProcessor(ProcessorMixin):
         else:
             text_inputs = {}
 
-        return BatchFeature(data={**text_inputs, **image_inputs})
+        data = {**text_inputs, **image_inputs}
+        image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_token)
+        if image_token_id is not None:
+            data["image_token_id"] = int(image_token_id)
+        return BatchFeature(data=data)
 
     def batch_decode(self, *args, **kwargs):
         """Forward to tokenizer's batch_decode."""
@@ -455,6 +494,7 @@ class KimiVLProcessor(ProcessorMixin):
         from huggingface_hub import hf_hub_download
 
         kwargs.pop("trust_remote_code", None)
+        _ensure_gpt2_bytes_to_unicode()
 
         model_path = Path(pretrained_model_name_or_path)
         is_local = model_path.exists() and model_path.is_dir()

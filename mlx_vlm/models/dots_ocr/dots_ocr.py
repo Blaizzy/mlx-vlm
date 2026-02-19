@@ -4,19 +4,9 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
+from ..llava_bunny.language import LanguageModel
 from .config import ModelConfig
-from .language import LanguageModel
-from .processing import Glm46VMoEProcessor
 from .vision import VisionModel
-
-# Register the processor with the name expected by the model config
-try:
-    from transformers import AutoProcessor
-
-    # Register for both possible processor class names
-    AutoProcessor.register("Glm46VMoEProcessor", Glm46VMoEProcessor)
-except Exception as e:
-    print(f"Error registering glm4v_moe processor: {e}")
 
 
 class Model(nn.Module):
@@ -24,7 +14,7 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
-        self.language_model = LanguageModel(config.text_config, config)
+        self.language_model = LanguageModel(config.text_config)
 
     def get_input_embeddings(
         self,
@@ -32,32 +22,23 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
         **kwargs,
     ):
-
-        image_grid_thw = kwargs.pop("image_grid_thw", None)
-        video_grid_thw = kwargs.pop("video_grid_thw", None)
-        mask = kwargs.get("mask", None)
-        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
-
         if pixel_values is None:
-            # Reset position state for text-only generation
-            self.language_model._position_ids = None
-            self.language_model._rope_deltas = None
             return InputEmbeddingsFeatures(
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids)
             )
 
-        dtype = self.vision_tower.patch_embed.proj.weight.dtype
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        if image_grid_thw is None:
+            raise ValueError("image_grid_thw is required when pixel_values is provided")
+
+        dtype = self.vision_tower.patch_embed.patchifier.proj.weight.dtype
         pixel_values = pixel_values.astype(dtype)
 
-        # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
-
-        # Get the ouptut hidden states from the vision model
         hidden_states = self.vision_tower(
-            pixel_values, grid_thw, output_hidden_states=False
+            pixel_values, image_grid_thw, output_hidden_states=False
         )
 
-        # Insert special image tokens in the input_ids
         final_inputs_embeds = self.merge_input_ids_with_image_features(
             self.config.image_token_id,
             self.config.video_token_id,
@@ -65,14 +46,6 @@ class Model(nn.Module):
             inputs_embeds,
             input_ids,
         )
-
-        # Pre-calculate position_ids for chunked prefill
-        if image_grid_thw is not None or video_grid_thw is not None:
-            position_ids, rope_deltas = self.language_model.get_rope_index(
-                input_ids, image_grid_thw, video_grid_thw, mask
-            )
-            self.language_model._position_ids = position_ids
-            self.language_model._rope_deltas = rope_deltas
 
         return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
@@ -84,57 +57,32 @@ class Model(nn.Module):
         inputs_embeds,
         input_ids,
     ):
-        """Merge image features into input embeddings at image token positions.
-
-        Args:
-            image_token_id: The token ID for image placeholders
-            video_token_id: The token ID for video placeholders (fallback)
-            image_features: Vision features from the vision tower [num_features, hidden_dim]
-            inputs_embeds: Input embeddings [batch_size, seq_len, hidden_dim]
-            input_ids: Input token IDs [batch_size, seq_len]
-            grid_thw: Grid dimensions for each image (optional, not used in simple case)
-
-        Returns:
-            Updated input embeddings with image features inserted
-        """
-        # Find positions of image tokens
         image_positions = input_ids == image_token_id
         if mx.sum(image_positions) == 0:
             image_positions = input_ids == video_token_id
 
-        # Get dimensions
-        batch_size, seq_len = input_ids.shape
-
-        # Process each batch item
         batch_outputs = []
         feature_start_idx = 0
 
-        for batch_idx in range(batch_size):
-            # Get mask for this batch
+        for batch_idx in range(input_ids.shape[0]):
             image_mask = image_positions[batch_idx]
             num_positions = mx.sum(image_mask).item()
 
             if num_positions > 0:
-                # Extract features for this batch
                 batch_features = image_features[
                     feature_start_idx : feature_start_idx + num_positions
                 ]
 
-                # Validate we have the right number of features
                 if batch_features.shape[0] != num_positions:
                     raise ValueError(
                         f"Number of image token positions ({num_positions}) does not match "
                         f"number of image features ({batch_features.shape[0]}) for batch {batch_idx}"
                     )
 
-                # Create indices for gathering
                 cumsum = mx.cumsum(image_mask.astype(mx.int32))
                 feature_indices = mx.where(image_mask, cumsum - 1, 0)
-
-                # Gather features
                 gathered_features = batch_features[feature_indices]
 
-                # Combine with original embeddings
                 image_mask_expanded = mx.expand_dims(image_mask, axis=-1)
                 batch_output = mx.where(
                     image_mask_expanded, gathered_features, inputs_embeds[batch_idx]
@@ -142,17 +90,15 @@ class Model(nn.Module):
 
                 feature_start_idx += num_positions
             else:
-                # No image tokens in this batch item
                 batch_output = inputs_embeds[batch_idx]
 
             batch_outputs.append(batch_output)
 
-        # Stack all batch outputs
         return mx.stack(batch_outputs, axis=0)
 
     @property
     def layers(self):
-        return self.language_model.model.layers
+        return self.language_model.layers
 
     def __call__(
         self,
@@ -163,27 +109,27 @@ class Model(nn.Module):
         **kwargs,
     ):
         input_embeddings_features = self.get_input_embeddings(
-            input_ids, pixel_values, **kwargs
-        )
-        logits = self.language_model(
-            input_ids,
-            input_embeddings_features.inputs_embeds,
-            mask=mask,
-            cache=cache,
+            input_ids=input_ids,
+            pixel_values=pixel_values,
             **kwargs,
         )
 
+        logits = self.language_model(
+            input_ids,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
+            mask=mask,
+            cache=cache,
+        )
         return logits
 
     def sanitize(self, weights):
         def transform_key(key):
-            if "visual" in key:
-                if "vision_tower" not in key:
-                    key = key.replace("model.", "").replace("visual", "vision_tower")
-            if "model.language_model" in key:
-                key = key.replace("model.language_model", "language_model.model")
-            if "lm_head" in key and not key.startswith("language_model"):
-                key = key.replace("lm_head", "language_model.lm_head")
+            if key.startswith("model.vision_tower."):
+                key = key.replace("model.vision_tower.", "vision_tower.", 1)
+            elif key.startswith("model."):
+                key = key.replace("model.", "language_model.model.", 1)
+            elif key.startswith("lm_head."):
+                key = key.replace("lm_head.", "language_model.model.lm_head.", 1)
             return key
 
         return {transform_key(k): v for k, v in weights.items()}

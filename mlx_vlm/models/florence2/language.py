@@ -411,6 +411,17 @@ class LanguageModel(nn.Module):
         self.model = Florence2LanguageModel(config)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
+    @staticmethod
+    def _to_decoder_step_ids(inputs: mx.array) -> mx.array:
+        """Normalize token tensors to one-step decoder ids with shape [batch, 1]."""
+        if inputs.ndim == 0:
+            return inputs[None, None]
+        if inputs.ndim == 1:
+            return inputs[:, None]
+        if inputs.ndim == 2:
+            return inputs[:, -1:] if inputs.shape[-1] != 1 else inputs
+        return mx.reshape(inputs, (inputs.shape[0], -1))[:, -1:]
+
     def __call__(
         self,
         inputs=None,
@@ -423,6 +434,22 @@ class LanguageModel(nn.Module):
         cache=None,
         **kwargs,
     ):
+        cross_attention_states = kwargs.get("cross_attention_states", None)
+        if encoder_outputs is None and cross_attention_states is not None:
+            encoder_outputs = cross_attention_states
+
+        # In generation, callers may pass the next decode token as `inputs`.
+        # Normalize it to decoder_input_ids so encoder-decoder decoding stays robust
+        # across caller-specific tensor rank conventions.
+        if (
+            encoder_outputs is not None
+            and decoder_input_ids is None
+            and decoder_inputs_embeds is None
+            and inputs is not None
+        ):
+            decoder_input_ids = self._to_decoder_step_ids(inputs)
+            inputs = None
+
         decoder_outputs, encoder_outputs = self.model(
             inputs,
             inputs_embeds,
@@ -434,7 +461,11 @@ class LanguageModel(nn.Module):
             cache,
         )
         out = self.lm_head(decoder_outputs)
-        return LanguageModelOutput(logits=out, encoder_outputs=encoder_outputs)
+        return LanguageModelOutput(
+            logits=out,
+            encoder_outputs=encoder_outputs,
+            cross_attention_states=encoder_outputs,
+        )
 
     @property
     def layers(self):

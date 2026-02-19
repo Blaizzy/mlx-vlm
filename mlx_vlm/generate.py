@@ -147,6 +147,13 @@ def parse_arguments():
         help="Trust remote code when loading the model.",
     )
     parser.add_argument(
+        "--quantize-activations",
+        "-qa",
+        action="store_true",
+        help="Enable activation quantization for QQLinear layers. "
+        "Only supported for models quantized with 'nvfp4' or 'mxfp8' modes.",
+    )
+    parser.add_argument(
         "--processor-kwargs",
         type=json.loads,
         default={},
@@ -332,18 +339,16 @@ def generate_step(
 
             quantize_cache_fn(prompt_cache)
 
+            logprobs = logits - mx.logsumexp(logits)
+            y = sampler(logprobs)
+
             if outputs.cross_attention_states is not None:
                 kwargs = {"cross_attention_states": outputs.cross_attention_states}
             elif outputs.encoder_outputs is not None:
-                kwargs = {
-                    "decoder_input_ids": y[None],
-                    "encoder_outputs": outputs.encoder_outputs,
-                }
+                kwargs = {"encoder_outputs": outputs.encoder_outputs}
             else:
                 kwargs = {}
 
-            logprobs = logits - mx.logsumexp(logits)
-            y = sampler(logprobs)
             return y, logprobs.squeeze(0)
 
     with mx.stream(generation_stream):
@@ -372,6 +377,7 @@ def generate_step(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
                         cache=prompt_cache,
+                        n_to_process=n_to_process,
                         **kwargs,
                     )
                     quantize_cache_fn(prompt_cache)
@@ -1267,6 +1273,7 @@ def main():
         args.adapter_path,
         revision=args.revision,
         trust_remote_code=args.trust_remote_code,
+        quantize_activations=args.quantize_activations,
     )
     config = model.config
 

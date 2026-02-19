@@ -24,6 +24,7 @@ class LanguageModel(nn.Module):
         mask: mx.array = None,
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
+        **kwargs,
     ):
         out = self.model(inputs, cache=cache, input_embeddings=inputs_embeds)
         out = self.model.embed_tokens.as_linear(out)
