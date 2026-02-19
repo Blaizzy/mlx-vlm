@@ -11,7 +11,11 @@ def get_prompt(model_type, processor, conversation):
     tokenizer = getattr(processor, "tokenizer", processor)
     chat_template = getattr(tokenizer, "chat_template", None)
 
-    apply_fn = tokenizer.apply_chat_template if chat_template else getattr(processor, "apply_chat_template", None)
+    apply_fn = (
+        tokenizer.apply_chat_template
+        if chat_template
+        else getattr(processor, "apply_chat_template", None)
+    )
 
     if apply_fn is None:
         raise ValueError("Processor/Tokenizer has no apply_chat_template method.")
