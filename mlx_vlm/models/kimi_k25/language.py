@@ -35,7 +35,7 @@ class LanguageModel(nn.Module):
             cache = [None] * len(self.model.pipeline_layers)
 
         if mask is None:
-            mask = create_attention_mask(h, cache[0])
+            mask = create_attention_mask(h, cache[0], return_array=True)
 
         pipeline_rank = self.model.pipeline_rank
         pipeline_size = self.model.pipeline_size
