@@ -1,10 +1,59 @@
 import json
+import math
 from pathlib import Path
+from typing import Union
 
+import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
 from .lora import LoRaLayer
+
+
+class Colors:
+    HEADER = "\033[95m"
+    OKBLUE = "\033[94m"
+    OKCYAN = "\033[96m"
+    OKGREEN = "\033[92m"
+    WARNING = "\033[93m"
+    FAIL = "\033[91m"
+    ENDC = "\033[0m"
+    BOLD = "\033[1m"
+    UNDERLINE = "\033[4m"
+
+
+not_supported_for_training = {"gemma3n", "qwen3_omni"}
+
+
+def grad_checkpoint(layer):
+    """
+    Update all instances of type(layer) to use gradient checkpointing.
+    """
+    fn = type(layer).__call__
+
+    def checkpointed_fn(model, *args, **kwargs):
+        def inner_fn(params, *args, **kwargs):
+            model.update(params)
+            return fn(model, *args, **kwargs)
+
+        return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
+
+    type(layer).__call__ = checkpointed_fn
+
+
+def get_learning_rate(
+    iters: int,
+    step: int,
+    warmup_steps: int,
+    learning_rate: float,
+    min_learning_rate: float,
+):
+    if step < warmup_steps:
+        return learning_rate * (step / warmup_steps)
+
+    progress = (step - warmup_steps) / (iters - warmup_steps)
+    cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+    return min_learning_rate + (learning_rate - min_learning_rate) * cosine_decay
 
 
 def get_module_by_name(model, name):
@@ -148,7 +197,7 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
             raise ValueError("The adapter does not have lora params in the config")
 
     # TODO: add lora params to the config and load them here
-    list_of_modules = find_all_linear_names(model.language_model.model)
+    list_of_modules = find_all_linear_names(model.language_model)
     if config is not None:
         model = get_peft_model(model, list_of_modules, **config)
     else:
@@ -158,3 +207,39 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
     model.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
 
     return model
+
+
+def unfreeze_modules(model: nn.Module, module_names):
+    """Unfreeze modules whose qualified names match any of the given patterns.
+
+    This scans model.named_modules() so nested components like
+    "vision_tower.layers.0" are handled as well.
+    """
+    targets = set(module_names)
+    found = set()
+    for full_name, sub in model.named_modules():
+        top = full_name.split(".")[0] if full_name else ""
+        if any((name == top) or (name in full_name) for name in targets):
+            if hasattr(sub, "unfreeze"):
+                sub.unfreeze()
+                found.add(top or full_name)
+    if not found:
+        print(
+            "[warn] unfreeze_modules: no matching modules found for patterns:",
+            ", ".join(module_names),
+        )
+
+
+def save_adapter(model: nn.Module, adapter_file: Union[str, Path]):
+    """Save adapter weights and config."""
+    path = Path(adapter_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Save adapter config if available
+    if hasattr(model, "config") and hasattr(model.config, "lora"):
+        with open(path.parent / "adapter_config.json", "w") as f:
+            json.dump(model.config.lora, f, indent=2)
+
+    # Save weights
+    flattened_tree = tree_flatten(model.trainable_parameters())
+    mx.save_safetensors(str(adapter_file), dict(flattened_tree))

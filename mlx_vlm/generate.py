@@ -377,6 +377,7 @@ def generate_step(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
                         cache=prompt_cache,
+                        n_to_process=n_to_process,
                         **kwargs,
                     )
                     quantize_cache_fn(prompt_cache)
