@@ -440,7 +440,8 @@ def sharded_load(
     if tensor_group is not None:
         model.shard(tensor_group)
 
-    mx.eval(model.language_model.parameters())
+    mx.eval(model.parameters())
+    model.eval()
 
     # Synchronize processes to avoid timeout
     mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
