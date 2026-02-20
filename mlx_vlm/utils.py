@@ -433,13 +433,9 @@ def sharded_load(
         if has_tensor_parallel:
             tensor_group = mx.distributed.init()
 
-    get_model_path(repo)
-
-    # Load and shard the model, and load the weights
     processor = load_processor(
         model_path, True, eos_token_ids=config.get("eos_token_id", None)
     )
-    model = load_model(model_path, lazy=True, strict=False)
 
     if tensor_group is not None:
         model.shard(tensor_group)
