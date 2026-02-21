@@ -3,6 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
@@ -184,7 +185,7 @@ class Attention(nn.Module):
         return self.o_proj(output)
 
 
-class MLP(nn.Module):
+class Qwen3VLMoEMLP(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
@@ -195,7 +196,7 @@ class MLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Qwen3MoeSparseMoeBlock(nn.Module):
+class Qwen3VLMoESparseMoeBlock(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
         dim = args.hidden_size
@@ -208,10 +209,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
 
+        self.sharding_group = None
+
     def __call__(
         self,
         x: mx.array,
     ):
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
         gates = self.gate(x)
         gates = mx.softmax(gates, axis=-1, precise=True)
 
@@ -223,6 +229,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
 
         return y
 
@@ -242,9 +251,9 @@ class Qwen3VLMoEDecoderLayer(nn.Module):
         if (layer_idx not in args.mlp_only_layers) and (
             args.num_experts > 0 and (layer_idx + 1) % args.decoder_sparse_step == 0
         ):
-            self.mlp = Qwen3MoeSparseMoeBlock(args)
+            self.mlp = Qwen3VLMoESparseMoeBlock(args)
         else:
-            self.mlp = MLP(args.hidden_size, args.intermediate_size)
+            self.mlp = Qwen3VLMoEMLP(args.hidden_size, args.intermediate_size)
 
     def __call__(
         self,
@@ -654,3 +663,46 @@ class LanguageModel(nn.Module):
     @property
     def n_kv_heads(self):
         return self.args.num_key_value_heads
+
+    def shard(self, group: Optional[mx.distributed.Group] = None) -> None:
+
+        group = group or mx.distributed.init()
+        N = group.size()
+
+        for layer in self.layers:
+            layer.self_attn.q_proj = shard_linear(
+                layer.self_attn.q_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.k_proj = shard_linear(
+                layer.self_attn.k_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.v_proj = shard_linear(
+                layer.self_attn.v_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.o_proj = shard_linear(
+                layer.self_attn.o_proj, "sharded-to-all", group=group
+            )
+            layer.self_attn.n_heads //= N
+            layer.self_attn.n_kv_heads //= N
+
+            if isinstance(layer.mlp, Qwen3VLMoEMLP):
+                layer.mlp.gate_proj = shard_linear(
+                    layer.mlp.gate_proj, "all-to-sharded", group=group
+                )
+                layer.mlp.up_proj = shard_linear(
+                    layer.mlp.up_proj, "all-to-sharded", group=group
+                )
+                layer.mlp.down_proj = shard_linear(
+                    layer.mlp.down_proj, "sharded-to-all", group=group
+                )
+            else:
+                layer.mlp.sharding_group = group
+                shard_inplace(
+                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
+                )

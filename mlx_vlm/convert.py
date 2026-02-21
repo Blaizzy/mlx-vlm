@@ -7,7 +7,6 @@ from typing import Callable, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map_with_path
-from mlx_lm.utils import dequantize_model, quantize_model
 
 from .utils import (
     MODEL_CONVERSION_DTYPES,
@@ -152,6 +151,8 @@ def convert(
         raise ValueError("Choose either quantize or dequantize, not both.")
 
     if quantize:
+        from mlx_lm.utils import quantize_model
+
         print("[INFO] Quantizing")
         config.setdefault("vision_config", {})
         model, config = quantize_model(
@@ -164,6 +165,8 @@ def convert(
         )
 
     if dequantize:
+        from mlx_lm.utils import dequantize_model
+
         print("[INFO] Dequantizing")
         model = dequantize_model(model)
 
