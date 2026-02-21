@@ -437,6 +437,10 @@ def sharded_load(
         model_path, True, eos_token_ids=config.get("eos_token_id", None)
     )
 
+    image_processor = load_image_processor(model_path)
+    if image_processor is not None:
+        processor.image_processor = image_processor
+
     if tensor_group is not None:
         model.shard(tensor_group)
 
