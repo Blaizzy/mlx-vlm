@@ -475,7 +475,22 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
+    use_fast = kwargs.pop("use_fast", True)
+    try:
+        processor = AutoProcessor.from_pretrained(
+            model_path, use_fast=use_fast, **kwargs
+        )
+    except Exception:
+        if use_fast:
+            logging.warning(
+                f"Failed to load processor with use_fast=True for {model_path}, "
+                f"falling back to use_fast=False"
+            )
+            processor = AutoProcessor.from_pretrained(
+                model_path, use_fast=False, **kwargs
+            )
+        else:
+            raise
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
