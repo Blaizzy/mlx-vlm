@@ -945,8 +945,8 @@ def prepare_inputs(
             padding=padding,
             padding_side=padding_side,
         )
-        input_ids = mx.array([inputs.input_ids])
-        mask = mx.array([inputs.attention_mask])
+        input_ids = mx.array(inputs.input_ids)
+        mask = mx.array(inputs.attention_mask)
         return {
             "input_ids": input_ids,
             "attention_mask": mask,
