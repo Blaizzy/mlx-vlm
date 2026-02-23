@@ -796,7 +796,7 @@ class BatchGenerator:
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
-        prefill_step_size: int = 2048,
+        prefill_step_size: Optional[int] = 2048,
         prompt_cache=None,
     ):
         self.model = model
@@ -856,9 +856,14 @@ class BatchGenerator:
                 kwargs[key] = value[:batch_size]
 
         inputs_embeds = kwargs.pop("inputs_embeds", None)
+        if inputs_embeds is None:
+            raise ValueError("inputs_embeds is required")
 
-        if inputs_embeds is not None:
-            # Multimodal prefill
+        if (
+            self.prefill_step_size is not None
+            and inputs_embeds.shape[1] > self.prefill_step_size
+        ):
+            # Chunked prefill with embeddings
             while inputs_embeds.shape[1] > 1:
                 n_to_process = min(self.prefill_step_size, inputs_embeds.shape[1] - 1)
                 self.model(
@@ -873,18 +878,10 @@ class BatchGenerator:
                 inputs = inputs[:, n_to_process:]
                 mx.clear_cache()
 
-            kwargs = {"inputs_embeds": inputs_embeds}
+        y, logprobs = self._step(
+            inputs, prompt_cache, inputs_embeds=inputs_embeds, **kwargs
+        )
 
-        else:
-            # Text-only prefill
-            while inputs.shape[1] > 1 and inputs_embeds is None:
-                n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
-                self.model(inputs[:, :n_to_process], cache=prompt_cache)
-                mx.eval([c.state for c in prompt_cache])
-                inputs = inputs[:, n_to_process:]
-                mx.clear_cache()
-
-        y, logprobs = self._step(inputs, prompt_cache, **kwargs)
         mx.async_eval(y, logprobs)
         mx.clear_cache()
         return Batch(
@@ -1209,6 +1206,7 @@ def _generate_batch(
     )
     input_ids = inputs.get("input_ids", None)
     pixel_values = inputs.get("pixel_values", None)
+    mask = inputs.get("attention_mask", None)
 
     data_kwargs = {
         k: v
@@ -1226,31 +1224,12 @@ def _generate_batch(
     )
 
     with wired_limit(model, [generation_stream]):
-        if pixel_values is not None:
-            embedding_output = model.get_input_embeddings(
-                input_ids, pixel_values, **data_kwargs
-            )
 
-            # Normalize embedding output to a kwargs dict expected by BatchGenerator
-            if isinstance(embedding_output, dict):
-                embed_kwargs = embedding_output
-            elif hasattr(embedding_output, "to_dict"):
-                # Convert to dict and keep non-None fields
-                embed_kwargs = {
-                    k: v for k, v in embedding_output.to_dict().items() if v is not None
-                }
-            else:
-                # Assume it's directly an inputs_embeds array
-                embed_kwargs = {"inputs_embeds": embedding_output}
+        embedding_output = model.get_input_embeddings(
+            input_ids, pixel_values, mask=mask, **data_kwargs
+        )
 
-            gen_kwargs = {
-                "pixel_values": pixel_values,
-                **data_kwargs,
-                **embed_kwargs,
-            }
-        else:
-            input_ids = mx.squeeze(input_ids, axis=0)
-            gen_kwargs = {}
+        gen_kwargs = {**data_kwargs, **embedding_output.to_dict()}
 
         uids = gen.insert(input_ids.tolist(), max_tokens)
         results = {uid: [] for uid in uids}
