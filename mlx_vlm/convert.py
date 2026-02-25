@@ -1,5 +1,6 @@
 import argparse
 import glob
+import os
 import shutil
 from pathlib import Path
 from typing import Callable, Optional, Union
@@ -170,6 +171,33 @@ def convert(
     if isinstance(mlx_path, str):
         mlx_path = Path(mlx_path)
 
+    # Free HF cache for this model before saving to reclaim disk space.
+    # The model weights are already in memory so the cache is no longer needed.
+    if os.environ.get("MLX_VLM_FREE_CACHE", ""):
+        # Force materialization of all lazy weights before deleting cache
+        print("[INFO] Materializing weights into memory...")
+        mx.eval(model.parameters())
+        import gc
+        import time
+
+        try:
+            from huggingface_hub import scan_cache_dir
+
+            cache = scan_cache_dir()
+            for repo in cache.repos:
+                if hf_path in repo.repo_id:
+                    for rev in repo.revisions:
+                        strategy = cache.delete_revisions(rev.commit_hash)
+                        print(
+                            f"[INFO] Freeing {strategy.expected_freed_size / 1e9:.1f} GB from HF cache"
+                        )
+                        strategy.execute()
+            gc.collect()
+            time.sleep(2)
+            print("[INFO] HF cache freed, proceeding to save")
+        except Exception as e:
+            print(f"[WARN] Could not free HF cache: {e}")
+
     save_weights(mlx_path, model, donate_weights=True)
 
     # Copy Python and JSON files from the model path to the MLX path
@@ -181,7 +209,11 @@ def convert(
                 continue
             shutil.copy(file, mlx_path)
 
-    processor.save_pretrained(mlx_path)
+    try:
+        processor.save_pretrained(mlx_path)
+    except AttributeError as e:
+        print(f"[WARN] processor.save_pretrained() failed: {e}")
+        print("[INFO] Processor config files were already copied from source.")
 
     save_config(config, config_path=mlx_path / "config.json")
 

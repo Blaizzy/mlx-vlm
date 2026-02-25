@@ -475,7 +475,12 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
+    try:
+        processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
+    except ImportError:
+        processor = AutoProcessor.from_pretrained(
+            model_path, use_fast=True, video_processor=None, **kwargs
+        )
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 

@@ -316,6 +316,12 @@ def generate_step(
         nonlocal tokens, kwargs
 
         with mx.stream(generation_stream):
+            # Ensure inputs are 2D [batch, seq] (matches mlx-lm convention)
+            if y.ndim == 1:
+                y = y[None]
+            if inputs_embeds is not None and inputs_embeds.ndim == 2:
+                inputs_embeds = inputs_embeds[None]
+
             if "decoder_input_ids" in kwargs:
                 outputs = model.language_model(
                     cache=prompt_cache,
