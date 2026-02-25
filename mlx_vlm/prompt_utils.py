@@ -51,6 +51,7 @@ MODEL_CONFIG = {
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
+    "kimi_k25": MessageFormat.LIST_WITH_IMAGE,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,
     "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "llama4": MessageFormat.LIST_WITH_IMAGE,

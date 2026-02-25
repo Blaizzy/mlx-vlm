@@ -233,6 +233,8 @@ def generate_step(
     pixel_values,
     mask,
     *,
+    inputs_embeds: Optional[mx.array] = None,
+    embedding_kwargs: Optional[Dict[str, Any]] = None,
     max_tokens: int = 256,
     temperature: float = 0.0,
     repetition_penalty: Optional[float] = None,
@@ -257,6 +259,10 @@ def generate_step(
         model (nn.Module): The model to use for generation.
         pixel_values: The pixel values for vision models (optional).
         mask: The attention mask (optional).
+        inputs_embeds (Optional[mx.array]): Precomputed input embeddings.
+          If provided, model.get_input_embeddings is skipped.
+        embedding_kwargs (Optional[Dict[str, Any]]): Additional kwargs to pass
+          to the language model when using inputs_embeds.
         max_tokens (int): Maximum number of tokens to generate. Default: ``256``.
         temperature (float): The temperature for sampling, if 0 the argmax is used.
           Default: ``0``.
@@ -351,8 +357,7 @@ def generate_step(
 
             return y, logprobs.squeeze(0)
 
-    with mx.stream(generation_stream):
-
+    if inputs_embeds is None:
         # Get input embeddings (handles both multimodal and text-only)
         embedding_output = model.get_input_embeddings(
             input_ids, pixel_values, mask=mask, **kwargs
@@ -367,6 +372,10 @@ def generate_step(
                 if k != "inputs_embeds" and v is not None
             }
         )
+    elif embedding_kwargs:
+        kwargs.update(embedding_kwargs)
+
+    with mx.stream(generation_stream):
         if prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size:
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
@@ -460,6 +469,8 @@ def stream_generate(
         input_ids = kwargs.pop("input_ids")
         pixel_values = kwargs.pop("pixel_values", None)
         mask = kwargs.pop("mask", None)
+        inputs_embeds = kwargs.pop("inputs_embeds", None)
+        embedding_kwargs = kwargs.pop("embedding_kwargs", None)
     else:
         inputs = prepare_inputs(
             processor,
@@ -480,13 +491,26 @@ def stream_generate(
             if k not in ["input_ids", "pixel_values", "attention_mask"]
         }
         kwargs.update(data_kwargs)
+        inputs_embeds = kwargs.pop("inputs_embeds", None)
+        embedding_kwargs = kwargs.pop("embedding_kwargs", None)
+
+    if inputs_embeds is not None and input_ids is None:
+        raise ValueError("inputs_embeds requires input_ids")
 
     with wired_limit(model, [generation_stream]):
         detokenizer = processor.detokenizer
         detokenizer.reset()
         tic = time.perf_counter()
         for n, (token, logprobs) in enumerate(
-            generate_step(input_ids, model, pixel_values, mask, **kwargs)
+            generate_step(
+                input_ids,
+                model,
+                pixel_values,
+                mask,
+                inputs_embeds=inputs_embeds,
+                embedding_kwargs=embedding_kwargs,
+                **kwargs,
+            )
         ):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
