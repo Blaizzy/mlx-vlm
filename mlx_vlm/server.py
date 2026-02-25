@@ -5,11 +5,14 @@ import json
 import os
 import traceback
 import uuid
+import importlib
+import re
 from datetime import datetime
 from typing import Any, List, Literal, Optional, Tuple, Union
 
 import mlx.core as mx
 import uvicorn
+from mlx_lm.tokenizer_utils import _infer_tool_parser
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
@@ -198,7 +201,7 @@ ResponseOutputMessageContentList: TypeAlias = List[ResponseOutputText]
 
 
 class ChatMessage(FlexibleBaseModel):
-    role: Literal["user", "assistant", "system", "developer"] = Field(
+    role: Literal["user", "assistant", "system", "developer", "tool"] = Field(
         ...,
         description="Role of the message sender (e.g., 'system', 'user', 'assistant').",
     )
@@ -866,12 +869,25 @@ async def chat_completions_endpoint(request: ChatRequest):
                     {"role": message.role, "content": text_content}
                 )
 
+        tools = None
+        if hasattr(request, "tools"):
+            tools = request.tools
+
+        tool_parser_type = None
+        tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        if hasattr(tokenizer, "chat_template"):
+            chat_template = tokenizer.chat_template if hasattr(tokenizer, "chat_template") else tokenizer
+            tool_parser_type = _infer_tool_parser(chat_template)
+            if tool_parser_type is not None:
+                tool_module = importlib.import_module(f"mlx_lm.tool_parsers.{tool_parser_type}")
+
         formatted_prompt = apply_chat_template(
             processor,
             config,
             processed_messages,
             num_images=len(images),
             num_audios=len(audio),
+            tools=tools,
         )
 
         if request.stream:
@@ -892,10 +908,14 @@ async def chat_completions_endpoint(request: ChatRequest):
                         **kwargs,
                     )
 
+                    output_text = ""
+
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
                             print("Warning: Received unexpected chunk format:", chunk)
                             continue
+
+                        output_text += chunk.text
 
                         # Yield chunks in Server-Sent Events (SSE) format
                         usage_stats = {
@@ -929,6 +949,36 @@ async def chat_completions_endpoint(request: ChatRequest):
                             delta=ChatMessage(role="assistant", content=""),
                         )
                     ]
+
+                    if tool_parser_type is not None:
+                        called_tools = []
+                        if tool_module.tool_call_start in output_text:
+                            if tool_module.tool_call_end == "":
+                                pattern = rf'{re.escape(tool_module.tool_call_start)}(.*)$'
+                            else:
+                                pattern = rf'{re.escape(tool_module.tool_call_start)}(.*){re.escape(tool_module.tool_call_end)}'
+
+                            matches = re.findall(pattern, output_text, re.DOTALL)
+                            if matches:
+                                for match in matches:
+                                    try:
+                                        tool_call = tool_module.parse_tool_call(match, tools)
+                                        called_tool = {}
+                                        called_tool["type"] = "function"
+                                        called_tool["id"] = str(uuid.uuid4())
+                                        called_tool["function"] = {}
+                                        called_tool["function"]["name"] = tool_call["name"]
+                                        called_tool["function"]["arguments"] = json.dumps(tool_call["arguments"], ensure_ascii=False)
+                                        called_tools.append(called_tool)
+                                    except:
+                                        print(f"Invalid tool call: {match}")
+                                choices = [
+                                    ChatStreamChoice(
+                                        finish_reason="stop",
+                                        delta=ChatMessage(role="assistant", content="", tool_calls=called_tools),
+                                    )
+                                ]
+
                     chunk_data = ChatStreamChunk(
                         model=request.model, usage=usage_stats, choices=choices
                     )
@@ -983,6 +1033,36 @@ async def chat_completions_endpoint(request: ChatRequest):
                         message=ChatMessage(role="assistant", content=gen_result.text),
                     )
                 ]
+
+                if tool_parser_type is not None:
+                    called_tools = []
+                    if tool_module.tool_call_start in output_text:
+                        if tool_module.tool_call_end == "":
+                            pattern = rf'{re.escape(tool_module.tool_call_start)}(.*)$'
+                        else:
+                            pattern = rf'{re.escape(tool_module.tool_call_start)}(.*){re.escape(tool_module.tool_call_end)}'
+
+                        matches = re.findall(pattern, gen_result.text, re.DOTALL)
+                        if matches:
+                            for match in matches:
+                                try:
+                                    tool_call = tool_module.parse_tool_call(match, tools)
+                                    called_tool = {}
+                                    called_tool["type"] = "function"
+                                    called_tool["id"] = str(uuid.uuid4())
+                                    called_tool["function"] = {}
+                                    called_tool["function"]["name"] = tool_call["name"]
+                                    called_tool["function"]["arguments"] = json.dumps(tool_call["arguments"], ensure_ascii=False)
+                                    called_tools.append(called_tool)
+                                except:
+                                    print(f"Invalid tool call: {match}")
+                            choices = [
+                                ChatChoice(
+                                    finish_reason="stop",
+                                    delta=ChatMessage(role="assistant", content=gen_result.text, tool_calls=called_tools),
+                                )
+                            ]
+
                 result = ChatResponse(
                     model=request.model, usage=usage_stats, choices=choices
                 )
