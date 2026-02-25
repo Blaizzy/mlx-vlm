@@ -208,6 +208,7 @@ class ChatMessage(FlexibleBaseModel):
     content: Union[
         str, ResponseInputMessageContentListParam, ResponseOutputMessageContentList
     ] = Field(..., description="Content of the message.")
+    tool_calls: List = []
 
 
 class OpenAIRequest(FlexibleBaseModel):
@@ -460,6 +461,32 @@ class ChatStreamChunk(BaseModel):
     choices: List[ChatStreamChoice]
     usage: Optional[UsageStats]
 
+
+def process_tool_calls(model_output: str, tool_module, tools):
+    called_tools = []
+
+    if tool_module.tool_call_start in model_output:
+        if tool_module.tool_call_end == "":
+            pattern = rf'{re.escape(tool_module.tool_call_start)}(.*)$'
+        else:
+            pattern = rf'{re.escape(tool_module.tool_call_start)}(.*){re.escape(tool_module.tool_call_end)}'
+
+        matches = re.findall(pattern, model_output, re.DOTALL)
+        if matches:
+            for match in matches:
+                try:
+                    tool_call = tool_module.parse_tool_call(match, tools)
+                    called_tool = {}
+                    called_tool["type"] = "function"
+                    called_tool["id"] = str(uuid.uuid4())
+                    called_tool["function"] = {}
+                    called_tool["function"]["name"] = tool_call["name"]
+                    called_tool["function"]["arguments"] = json.dumps(tool_call["arguments"], ensure_ascii=False)
+                    called_tools.append(called_tool)
+                except:
+                    print(f"Invalid tool call: {match}")
+
+    return called_tools
 
 # Models for /models endpoint
 
@@ -942,42 +969,18 @@ async def chat_completions_endpoint(request: ChatRequest):
                             0.01
                         )  # Small sleep to prevent blocking event loop entirely
 
+                    if tool_parser_type is not None:
+                        tool_calls = process_tool_calls(model_output=output_text, tool_module=tool_module, tools=tools)
+                    else:
+                        tool_calls = []
+
                     # Signal stream end
                     choices = [
                         ChatStreamChoice(
                             finish_reason="stop",
-                            delta=ChatMessage(role="assistant", content=""),
+                            delta=ChatMessage(role="assistant", content="", tool_calls=tool_calls),
                         )
                     ]
-
-                    if tool_parser_type is not None:
-                        called_tools = []
-                        if tool_module.tool_call_start in output_text:
-                            if tool_module.tool_call_end == "":
-                                pattern = rf'{re.escape(tool_module.tool_call_start)}(.*)$'
-                            else:
-                                pattern = rf'{re.escape(tool_module.tool_call_start)}(.*){re.escape(tool_module.tool_call_end)}'
-
-                            matches = re.findall(pattern, output_text, re.DOTALL)
-                            if matches:
-                                for match in matches:
-                                    try:
-                                        tool_call = tool_module.parse_tool_call(match, tools)
-                                        called_tool = {}
-                                        called_tool["type"] = "function"
-                                        called_tool["id"] = str(uuid.uuid4())
-                                        called_tool["function"] = {}
-                                        called_tool["function"]["name"] = tool_call["name"]
-                                        called_tool["function"]["arguments"] = json.dumps(tool_call["arguments"], ensure_ascii=False)
-                                        called_tools.append(called_tool)
-                                    except:
-                                        print(f"Invalid tool call: {match}")
-                                choices = [
-                                    ChatStreamChoice(
-                                        finish_reason="stop",
-                                        delta=ChatMessage(role="assistant", content="", tool_calls=called_tools),
-                                    )
-                                ]
 
                     chunk_data = ChatStreamChunk(
                         model=request.model, usage=usage_stats, choices=choices
@@ -1027,41 +1030,17 @@ async def chat_completions_endpoint(request: ChatRequest):
                     peak_memory=gen_result.peak_memory,
                 )
 
+                if tool_parser_type is not None:
+                    tool_calls = process_tool_calls(model_output=gen_result.text, tool_module=tool_module, tools=tools)
+                else:
+                    tool_calls = []
+
                 choices = [
                     ChatChoice(
                         finish_reason="stop",
-                        message=ChatMessage(role="assistant", content=gen_result.text),
+                        message=ChatMessage(role="assistant", content=gen_result.text, tool_calls=tool_calls),
                     )
                 ]
-
-                if tool_parser_type is not None:
-                    called_tools = []
-                    if tool_module.tool_call_start in gen_result.text:
-                        if tool_module.tool_call_end == "":
-                            pattern = rf'{re.escape(tool_module.tool_call_start)}(.*)$'
-                        else:
-                            pattern = rf'{re.escape(tool_module.tool_call_start)}(.*){re.escape(tool_module.tool_call_end)}'
-
-                        matches = re.findall(pattern, gen_result.text, re.DOTALL)
-                        if matches:
-                            for match in matches:
-                                try:
-                                    tool_call = tool_module.parse_tool_call(match, tools)
-                                    called_tool = {}
-                                    called_tool["type"] = "function"
-                                    called_tool["id"] = str(uuid.uuid4())
-                                    called_tool["function"] = {}
-                                    called_tool["function"]["name"] = tool_call["name"]
-                                    called_tool["function"]["arguments"] = json.dumps(tool_call["arguments"], ensure_ascii=False)
-                                    called_tools.append(called_tool)
-                                except:
-                                    print(f"Invalid tool call: {match}")
-                            choices = [
-                                ChatChoice(
-                                    finish_reason="stop",
-                                    delta=ChatMessage(role="assistant", content=gen_result.text, tool_calls=called_tools),
-                                )
-                            ]
 
                 result = ChatResponse(
                     model=request.model, usage=usage_stats, choices=choices
