@@ -11,6 +11,7 @@ from typing import Any, List, Literal, Optional, Tuple, Union
 import mlx.core as mx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
 from pydantic import BaseModel, ConfigDict, Field
@@ -33,6 +34,14 @@ app = FastAPI(
     title="MLX-VLM Inference API",
     description="API for using Vision Language Models (VLMs) and Omni Models (Vision, Audio and Video support) with MLX.",
     version=__version__,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 MAX_IMAGES = 10  # Maximum number of images to process at once
@@ -736,7 +745,15 @@ async def responses_endpoint(request: Request):
                     gc.collect()
                     print("Stream finished, cleared cache.")
 
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
         else:
             # Non-streaming response
@@ -945,7 +962,15 @@ async def chat_completions_endpoint(request: ChatRequest):
                     gc.collect()
                     print("Stream finished, cleared cache.")
 
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
         else:
             # Non-streaming response
