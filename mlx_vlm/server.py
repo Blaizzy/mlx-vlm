@@ -747,7 +747,8 @@ async def responses_endpoint(request: Request):
 
             return StreamingResponse(stream_generator(), media_type="text/event-stream", headers={
                 "Cache-Control": "no-cache",
-                "Connection": "keep-alive",                                                                                                                                                                      "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
             })
 
         else:
@@ -959,7 +960,8 @@ async def chat_completions_endpoint(request: ChatRequest):
 
             return StreamingResponse(stream_generator(), media_type="text/event-stream", headers={
                 "Cache-Control": "no-cache",
-                "Connection": "keep-alive",                                                                                                                                                                      "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
             })
 
         else:
