@@ -11,8 +11,8 @@ from typing import Any, List, Literal, Optional, Tuple, Union
 import mlx.core as mx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import Required, TypeAlias, TypedDict
@@ -745,11 +745,15 @@ async def responses_endpoint(request: Request):
                     gc.collect()
                     print("Stream finished, cleared cache.")
 
-            return StreamingResponse(stream_generator(), media_type="text/event-stream", headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            })
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
         else:
             # Non-streaming response
@@ -958,11 +962,15 @@ async def chat_completions_endpoint(request: ChatRequest):
                     gc.collect()
                     print("Stream finished, cleared cache.")
 
-            return StreamingResponse(stream_generator(), media_type="text/event-stream", headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            })
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
         else:
             # Non-streaming response
