@@ -1,21 +1,21 @@
 import argparse
 import asyncio
 import gc
+import importlib
 import json
 import os
+import re
 import traceback
 import uuid
-import importlib
-import re
 from datetime import datetime
 from typing import Any, List, Literal, Optional, Tuple, Union
 
 import mlx.core as mx
 import uvicorn
-from mlx_lm.tokenizer_utils import _infer_tool_parser
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
+from mlx_lm.tokenizer_utils import _infer_tool_parser
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import Required, TypeAlias, TypedDict
 
@@ -467,9 +467,9 @@ def process_tool_calls(model_output: str, tool_module, tools):
 
     if tool_module.tool_call_start in model_output:
         if tool_module.tool_call_end == "":
-            pattern = rf'{re.escape(tool_module.tool_call_start)}(.*)$'
+            pattern = rf"{re.escape(tool_module.tool_call_start)}(.*)$"
         else:
-            pattern = rf'{re.escape(tool_module.tool_call_start)}(.*){re.escape(tool_module.tool_call_end)}'
+            pattern = rf"{re.escape(tool_module.tool_call_start)}(.*){re.escape(tool_module.tool_call_end)}"
 
         matches = re.findall(pattern, model_output, re.DOTALL)
         if matches:
@@ -481,12 +481,15 @@ def process_tool_calls(model_output: str, tool_module, tools):
                     called_tool["id"] = str(uuid.uuid4())
                     called_tool["function"] = {}
                     called_tool["function"]["name"] = tool_call["name"]
-                    called_tool["function"]["arguments"] = json.dumps(tool_call["arguments"], ensure_ascii=False)
+                    called_tool["function"]["arguments"] = json.dumps(
+                        tool_call["arguments"], ensure_ascii=False
+                    )
                     called_tools.append(called_tool)
                 except:
                     print(f"Invalid tool call: {match}")
 
     return called_tools
+
 
 # Models for /models endpoint
 
@@ -901,12 +904,20 @@ async def chat_completions_endpoint(request: ChatRequest):
             tools = request.tools
 
         tool_parser_type = None
-        tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
         if hasattr(tokenizer, "chat_template"):
-            chat_template = tokenizer.chat_template if hasattr(tokenizer, "chat_template") else tokenizer
+            chat_template = (
+                tokenizer.chat_template
+                if hasattr(tokenizer, "chat_template")
+                else tokenizer
+            )
             tool_parser_type = _infer_tool_parser(chat_template)
             if tool_parser_type is not None:
-                tool_module = importlib.import_module(f"mlx_lm.tool_parsers.{tool_parser_type}")
+                tool_module = importlib.import_module(
+                    f"mlx_lm.tool_parsers.{tool_parser_type}"
+                )
 
         formatted_prompt = apply_chat_template(
             processor,
@@ -970,7 +981,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                         )  # Small sleep to prevent blocking event loop entirely
 
                     if tool_parser_type is not None:
-                        tool_calls = process_tool_calls(model_output=output_text, tool_module=tool_module, tools=tools)
+                        tool_calls = process_tool_calls(
+                            model_output=output_text,
+                            tool_module=tool_module,
+                            tools=tools,
+                        )
                     else:
                         tool_calls = []
 
@@ -978,7 +993,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                     choices = [
                         ChatStreamChoice(
                             finish_reason="stop",
-                            delta=ChatMessage(role="assistant", content="", tool_calls=tool_calls),
+                            delta=ChatMessage(
+                                role="assistant", content="", tool_calls=tool_calls
+                            ),
                         )
                     ]
 
@@ -1031,14 +1048,22 @@ async def chat_completions_endpoint(request: ChatRequest):
                 )
 
                 if tool_parser_type is not None:
-                    tool_calls = process_tool_calls(model_output=gen_result.text, tool_module=tool_module, tools=tools)
+                    tool_calls = process_tool_calls(
+                        model_output=gen_result.text,
+                        tool_module=tool_module,
+                        tools=tools,
+                    )
                 else:
                     tool_calls = []
 
                 choices = [
                     ChatChoice(
                         finish_reason="stop",
-                        message=ChatMessage(role="assistant", content=gen_result.text, tool_calls=tool_calls),
+                        message=ChatMessage(
+                            role="assistant",
+                            content=gen_result.text,
+                            tool_calls=tool_calls,
+                        ),
                     )
                 ]
 
