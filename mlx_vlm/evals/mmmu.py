@@ -57,7 +57,7 @@ def normalize_number(s):
     """Normalize numeric strings for comparison."""
     try:
         return float(str(s).strip().replace(",", ""))
-    except:
+    except Exception:
         return str(s).strip()
 
 
@@ -147,7 +147,7 @@ def MMMU_eval(data: list, eval_file: str):
                         if abs(normalize_number(num_str) - answer_num) < 0.01:
                             is_correct = True
                             break
-                    except:
+                    except Exception:
                         pass
             # Word-level match for text answers
             else:
