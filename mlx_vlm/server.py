@@ -1036,7 +1036,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                 if tool_parser_type is not None:
                     called_tools = []
-                    if tool_module.tool_call_start in output_text:
+                    if tool_module.tool_call_start in gen_result.text:
                         if tool_module.tool_call_end == "":
                             pattern = rf'{re.escape(tool_module.tool_call_start)}(.*)$'
                         else:
