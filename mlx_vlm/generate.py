@@ -157,7 +157,7 @@ def parse_arguments():
         "--processor-kwargs",
         type=json.loads,
         default={},
-        help="Extra processor kwargs as JSON. "
+        help="Extra processor/chat-template kwargs as JSON. "
         'Example: --processor-kwargs \'{"cropping": false, "max_patches": 3}\'',
     )
     parser.add_argument(
@@ -481,9 +481,21 @@ def stream_generate(
         }
         kwargs.update(data_kwargs)
 
+    # Detect thinking-mode prefix that the chat template pre-filled in the
+    # prompt.  Models like Qwen3/3.5 append "<think>\n" to force the model
+    # into thinking mode.  These tokens are consumed as part of the prompt so
+    # the generated output won't contain the opening <think> tag.  Restore it
+    # here so callers get properly matched <think>…</think> blocks.
+    generation_prefix = ""
+    if isinstance(prompt, str):
+        stripped = prompt.rstrip("\n")
+        if stripped.endswith("<think>") and not stripped.endswith("</think>"):
+            generation_prefix = prompt[prompt.rindex("<think>") :]
+
     with wired_limit(model, [generation_stream]):
         detokenizer = processor.detokenizer
         detokenizer.reset()
+        prefix_emitted = not generation_prefix
         tic = time.perf_counter()
         for n, (token, logprobs) in enumerate(
             generate_step(input_ids, model, pixel_values, mask, **kwargs)
@@ -499,9 +511,14 @@ def stream_generate(
 
             detokenizer.add_token(token, skip_special_token_ids=skip_special_token_ids)
 
+            segment = detokenizer.last_segment
+            if not prefix_emitted:
+                segment = generation_prefix + segment
+                prefix_emitted = True
+
             # Yield the last segment if streaming
             yield GenerationResult(
-                text=detokenizer.last_segment,
+                text=segment,
                 token=token,
                 logprobs=logprobs,
                 prompt_tokens=input_ids.size,
@@ -513,8 +530,11 @@ def stream_generate(
             )
 
         detokenizer.finalize()
+        segment = detokenizer.last_segment
+        if not prefix_emitted:
+            segment = generation_prefix + segment
         yield GenerationResult(
-            text=detokenizer.last_segment,
+            text=segment,
             token=token,
             logprobs=logprobs,
             prompt_tokens=input_ids.size,
@@ -1263,7 +1283,12 @@ def main():
         1 if args.audio is not None else 0
     )  # TODO: Support multiple audio files
     prompt = apply_chat_template(
-        processor, config, prompt, num_images=num_images, num_audios=num_audios
+        processor,
+        config,
+        prompt,
+        num_images=num_images,
+        num_audios=num_audios,
+        **(args.processor_kwargs or {}),
     )
 
     kwargs = {}
@@ -1300,7 +1325,13 @@ def main():
             chat.append({"role": "system", "content": args.system})
         while user := input("User:"):
             chat.append({"role": "user", "content": user})
-            prompt = apply_chat_template(processor, config, chat, num_images=num_images)
+            prompt = apply_chat_template(
+                processor,
+                config,
+                chat,
+                num_images=num_images,
+                **(args.processor_kwargs or {}),
+            )
             response = ""
             print("Assistant:", end="")
             stream_kwargs = {

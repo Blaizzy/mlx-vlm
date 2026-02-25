@@ -932,6 +932,10 @@ def prepare_inputs(
         )
         input_ids = mx.array(inputs.input_ids)
         mask = mx.array(inputs.attention_mask)
+        # Ensure 2D (batch, seq) so downstream models (e.g. Qwen3.5) get consistent shape
+        if input_ids.ndim == 1:
+            input_ids = input_ids[None, :]
+            mask = mask[None, :]
         return {
             "input_ids": input_ids,
             "attention_mask": mask,
@@ -1140,6 +1144,12 @@ def prepare_inputs(
             ]
         else:
             model_inputs["input_features"] = normalize_audio_features(f)
+
+    # Ensure input_ids is 2D (batch, seq) for models that expect it (e.g. Qwen3.5)
+    if "input_ids" in model_inputs and model_inputs["input_ids"].ndim == 1:
+        model_inputs["input_ids"] = model_inputs["input_ids"][None, :]
+        if model_inputs.get("attention_mask") is not None:
+            model_inputs["attention_mask"] = model_inputs["attention_mask"][None, :]
 
     return model_inputs
 

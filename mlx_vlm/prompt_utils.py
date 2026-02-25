@@ -621,7 +621,10 @@ def apply_chat_template(
         return_messages: Whether to return messages list instead of template
         num_images: Number of images in the input
         num_audios: Number of audio files in the input
-        **kwargs: Additional arguments for message formatting
+        **kwargs: Additional arguments for message formatting and chat template.
+            For Qwen3.5 / Qwen3 thinking models, pass enable_thinking=False to get
+            direct answers without a thinking block (e.g. enable_thinking=False or
+            chat_template_kwargs={"enable_thinking": False}).
 
     Returns:
         Formatted messages or chat template
@@ -707,4 +710,4 @@ def apply_chat_template(
     if model_type in ["paligemma", "molmo", "florence2"]:
         return messages[-1]
 
-    return get_chat_template(processor, messages, add_generation_prompt)
+    return get_chat_template(processor, messages, add_generation_prompt, **kwargs)
