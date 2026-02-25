@@ -23,6 +23,7 @@ class MessageFormat(Enum):
     PROMPT_WITH_IMAGE_TOKEN = "prompt_with_image_token"
     PROMPT_WITH_START_IMAGE_TOKEN = "prompt_with_start_image_token"
     VIDEO_WITH_TEXT = "video_with_text"
+    CUSTOM_JOYCAPTION = "custom_joycaption"
 
 
 # Model configuration mapping
@@ -60,6 +61,7 @@ MODEL_CONFIG = {
     "mllama": MessageFormat.LIST_WITH_IMAGE,
     "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "molmo2": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "llava_joycaption": MessageFormat.CUSTOM_JOYCAPTION,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
@@ -84,6 +86,7 @@ SINGLE_IMAGE_ONLY_MODELS = {
     "paligemma",
     "multi_modality",
     "mllama",
+    "llava_joycaption",
 }
 
 
@@ -244,6 +247,7 @@ class MessageFormatter:
             MessageFormat.PROMPT_WITH_START_IMAGE_TOKEN: lambda *args, **kw: prompt
             + "<start_of_image>" * num_images,
             MessageFormat.VIDEO_WITH_TEXT: self._format_video_message,
+            MessageFormat.CUSTOM_JOYCAPTION: self._format_joycaption,
         }
 
         formatter = formatter_map.get(self.format_type)
@@ -390,6 +394,20 @@ class MessageFormatter:
                 MessageBuilder.text_message(prompt),
             ],
         }
+
+    def _format_joycaption(
+        self,
+        prompt: str,
+        role: str = "user",
+        skip_image_token: bool = False,
+        skip_audio_token: bool = False,
+        num_images: int = 0,
+        num_audios: int = 0,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Format a simple response with prompt."""
+        return { "role": role, "content": prompt }
+
 
 
 def get_message_json(
