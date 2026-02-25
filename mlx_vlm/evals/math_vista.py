@@ -139,14 +139,14 @@ def normalize_answer(response: str, problem: dict) -> Optional[str]:
             if sci_numbers:
                 try:
                     return str(int(float(sci_numbers[0])))
-                except:
+                except Exception:
                     pass
             # Then regular numbers
             numbers = re.findall(r"-?\d+", boxed_content)
             if numbers:
                 try:
                     return str(int(numbers[0]))
-                except:
+                except Exception:
                     pass
 
         # Try common answer patterns near the end
@@ -164,7 +164,7 @@ def normalize_answer(response: str, problem: dict) -> Optional[str]:
                     # Remove commas before converting
                     num_str = matches[-1].group(1).replace(",", "")
                     return str(int(float(num_str)))
-                except:
+                except Exception:
                     pass
 
         # Look for scientific notation anywhere in response
@@ -172,7 +172,7 @@ def normalize_answer(response: str, problem: dict) -> Optional[str]:
         if sci_numbers:
             try:
                 return str(int(float(sci_numbers[-1])))
-            except:
+            except Exception:
                 pass
 
         # Fall back to finding all numbers (including comma-formatted) and taking the last one
@@ -182,7 +182,7 @@ def normalize_answer(response: str, problem: dict) -> Optional[str]:
             try:
                 # Remove commas and try the last number first
                 return str(int(numbers[-1].replace(",", "")))
-            except:
+            except Exception:
                 pass
 
     # For float answers
@@ -198,14 +198,14 @@ def normalize_answer(response: str, problem: dict) -> Optional[str]:
             if sci_numbers:
                 try:
                     return str(round(float(sci_numbers[0]), precision))
-                except:
+                except Exception:
                     pass
             # Then regular numbers
             numbers = re.findall(r"-?\d+\.?\d*", boxed_content)
             if numbers:
                 try:
                     return str(round(float(numbers[0]), precision))
-                except:
+                except Exception:
                     pass
 
         # Try common answer patterns near the end
@@ -221,7 +221,7 @@ def normalize_answer(response: str, problem: dict) -> Optional[str]:
             if matches:
                 try:
                     return str(round(float(matches[-1].group(1)), precision))
-                except:
+                except Exception:
                     pass
 
         # Look for scientific notation anywhere in response
@@ -229,7 +229,7 @@ def normalize_answer(response: str, problem: dict) -> Optional[str]:
         if sci_numbers:
             try:
                 return str(round(float(sci_numbers[-1]), precision))
-            except:
+            except Exception:
                 pass
 
         # Fall back to finding all numbers and taking the last one
@@ -238,7 +238,7 @@ def normalize_answer(response: str, problem: dict) -> Optional[str]:
             try:
                 # Try the last number first
                 return str(round(float(numbers[-1]), precision))
-            except:
+            except Exception:
                 pass
 
     return response
@@ -288,7 +288,7 @@ def evaluate_answer(prediction: Optional[str], ground_truth: str) -> bool:
             gt_normalized = word_to_num[gt_normalized]
 
         return pred_normalized == gt_normalized
-    except:
+    except Exception:
         return False
 
 

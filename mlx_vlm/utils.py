@@ -914,6 +914,7 @@ def prepare_inputs(
     padding=True,
     padding_side="left",
     pad_to_uniform_size=False,
+    return_tensors="mlx",
     **kwargs,
 ):
 
@@ -929,9 +930,18 @@ def prepare_inputs(
             add_special_tokens=add_special_tokens,
             padding=padding,
             padding_side=padding_side,
+            return_tensors=return_tensors,
         )
-        input_ids = mx.array(inputs.input_ids)
-        mask = mx.array(inputs.attention_mask)
+        input_ids = (
+            inputs.input_ids
+            if isinstance(inputs.input_ids, mx.array)
+            else mx.array(inputs.input_ids)
+        )
+        mask = (
+            inputs.attention_mask
+            if isinstance(inputs.attention_mask, mx.array)
+            else mx.array(inputs.attention_mask)
+        )
         return {
             "input_ids": input_ids,
             "attention_mask": mask,
