@@ -456,7 +456,7 @@ class ChatStreamChoice(BaseModel):
 
 class ChatStreamChunk(BaseModel):
     id: str
-    object: str
+    object: str = "chat.completion.chunk"
     created: int
     model: str
     choices: List[ChatStreamChoice]
@@ -920,7 +920,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             )
                         ]
                         chunk_data = ChatStreamChunk(
-                            id=request_id, object="chat.completion.chunk", created=int(time.time()), model=request.model, usage=usage_stats, choices=choices
+                            id=request_id, created=int(time.time()), model=request.model, usage=usage_stats, choices=choices
                         )
 
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
@@ -936,7 +936,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         )
                     ]
                     chunk_data = ChatStreamChunk(
-                        id=request_id, object="chat.completion.chunk", created=int(time.time()), model=request.model, usage=usage_stats, choices=choices
+                        id=request_id, created=int(time.time()), model=request.model, usage=usage_stats, choices=choices
                     )
                     yield f"data: {chunk_data.model_dump_json()}\n\n"
 
