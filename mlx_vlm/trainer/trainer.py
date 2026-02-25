@@ -110,7 +110,11 @@ def vision_language_loss_fn(
         if k not in ["input_ids", "pixel_values", "attention_mask"]
     }
 
-    outputs = model(input_ids, pixel_values, attention_mask, **kwargs)
+    # Pass None as mask so the model creates its own causal attention mask.
+    # The 2D attention_mask is used for computing sequence lengths but is not
+    # suitable as the mask argument for self-attention layers which expect
+    # either None or a 4D causal mask (e.g., mllama architecture).
+    outputs = model(input_ids, pixel_values, None, **kwargs)
     logits = outputs.logits.astype(mx.float32)
 
     def align_logits_with_labels(logits, labels):
@@ -189,11 +193,31 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
             if "pixel_values" in items[0] and items[0]["pixel_values"] is not None:
                 pixel_values_batch = mx.stack([item["pixel_values"] for item in items])
 
-            yield {
+            batch = {
                 "input_ids": mx.array(input_ids_batch),
                 "attention_mask": mx.array(attention_mask_batch),
                 "pixel_values": pixel_values_batch,
             }
+
+            # Pass through extra kwargs from the dataset items that models
+            # like mllama need (e.g., cross_attention_mask, aspect_ratio_ids,
+            # aspect_ratio_mask). These are stripped from the standard keys
+            # above and forwarded as-is.
+            extra_keys = [
+                k for k in items[0]
+                if k not in ("input_ids", "attention_mask", "pixel_values")
+            ]
+            for k in extra_keys:
+                vals = [item[k] for item in items]
+                if isinstance(vals[0], mx.array):
+                    try:
+                        batch[k] = mx.stack(vals)
+                    except Exception:
+                        batch[k] = vals[0]  # fallback for non-stackable
+                else:
+                    batch[k] = vals[0]
+
+            yield batch
         if not train:
             break
 
