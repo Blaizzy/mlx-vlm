@@ -552,6 +552,7 @@ class LanguageModel(nn.Module):
         # reset rope_deltas when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None
+            self._position_ids = None
 
         cache_offset = 0
         if cache and cache[0] is not None:
