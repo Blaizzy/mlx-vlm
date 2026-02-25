@@ -3,9 +3,9 @@ import asyncio
 import gc
 import json
 import os
+import time
 import traceback
 import uuid
-import time
 from datetime import datetime
 from typing import Any, List, Literal, Optional, Tuple, Union
 
@@ -920,7 +920,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                             )
                         ]
                         chunk_data = ChatStreamChunk(
-                            id=request_id, created=int(time.time()), model=request.model, usage=usage_stats, choices=choices
+                            id=request_id,
+                            created=int(time.time()),
+                            model=request.model,
+                            usage=usage_stats,
+                            choices=choices,
                         )
 
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
@@ -936,7 +940,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                         )
                     ]
                     chunk_data = ChatStreamChunk(
-                        id=request_id, created=int(time.time()), model=request.model, usage=usage_stats, choices=choices
+                        id=request_id,
+                        created=int(time.time()),
+                        model=request.model,
+                        usage=usage_stats,
+                        choices=choices,
                     )
                     yield f"data: {chunk_data.model_dump_json()}\n\n"
 
