@@ -102,7 +102,9 @@ def vision_language_loss_fn(
         range_matrix = mx.repeat(
             mx.expand_dims(mx.arange(seq_length), 0), batch_size, axis=0
         )
-        assistant_mask = range_matrix <= mx.array(assistant_response_index).reshape(-1, 1)
+        assistant_mask = range_matrix <= mx.array(assistant_response_index).reshape(
+            -1, 1
+        )
         weight_mask = mx.where(assistant_mask, mx.zeros_like(weight_mask), weight_mask)[
             :, 1:
         ]
@@ -210,7 +212,8 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
             }
 
             extra_keys = [
-                k for k in items[0]
+                k
+                for k in items[0]
                 if k not in ("input_ids", "attention_mask", "pixel_values")
             ]
             for k in extra_keys:

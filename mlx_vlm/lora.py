@@ -50,7 +50,11 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
             "Dataset must have a 'messages' column or both 'question' and 'answer' columns. Optional image columns: 'image' or 'images'."
         )
 
-    image_col = "images" if "images" in dataset.column_names else "image" if has_images else None
+    image_col = (
+        "images"
+        if "images" in dataset.column_names
+        else "image" if has_images else None
+    )
 
     def to_message(example):
         q = example["question"]
@@ -78,7 +82,14 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
                 raise ValueError(f"Failed to parse or fill custom prompt format: {e}")
 
         # VLM-specific message formats (fallback)
-        vlm_message_model_prefixes = ["gemma", "qwen", "smolvlm", "mllama", "mistral3", "llama"]
+        vlm_message_model_prefixes = [
+            "gemma",
+            "qwen",
+            "smolvlm",
+            "mllama",
+            "mistral3",
+            "llama",
+        ]
         if model_type and any(
             model_type.startswith(prefix) for prefix in vlm_message_model_prefixes
         ):
