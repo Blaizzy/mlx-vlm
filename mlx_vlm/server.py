@@ -908,12 +908,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
         if hasattr(tokenizer, "chat_template"):
-            chat_template = (
-                tokenizer.chat_template
-                if hasattr(tokenizer, "chat_template")
-                else tokenizer
-            )
-            tool_parser_type = _infer_tool_parser(chat_template)
+            tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
             if tool_parser_type is not None:
                 tool_module = importlib.import_module(
                     f"mlx_lm.tool_parsers.{tool_parser_type}"
