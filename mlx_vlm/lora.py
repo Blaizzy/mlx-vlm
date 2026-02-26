@@ -19,7 +19,7 @@ from .trainer.utils import (
     not_supported_for_training,
     unfreeze_modules,
 )
-from .utils import load, load_image_processor
+from .utils import load
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -78,7 +78,7 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
                 raise ValueError(f"Failed to parse or fill custom prompt format: {e}")
 
         # VLM-specific message formats (fallback)
-        vlm_message_model_prefixes = ["gemma", "qwen", "smolvlm", "mllama", "mistral3"]
+        vlm_message_model_prefixes = ["gemma", "qwen", "smolvlm", "mllama", "mistral3", "llama"]
         if model_type and any(
             model_type.startswith(prefix) for prefix in vlm_message_model_prefixes
         ):
@@ -182,7 +182,6 @@ def main(args):
         raise ValueError(f"Model type {model_type} not supported for training")
 
     config = model.config.__dict__
-    image_processor = load_image_processor(args.model_path)
 
     # Load and prepare dataset
     logger.info(f"{Colors.HEADER}Loading dataset from {args.dataset}{Colors.ENDC}")
@@ -210,7 +209,6 @@ def main(args):
         dataset,
         config,
         processor,
-        image_processor=image_processor,
         image_resize_shape=args.image_resize_shape,
     )
 
