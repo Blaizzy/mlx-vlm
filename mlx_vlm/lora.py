@@ -32,7 +32,8 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
     """
     Only transform dataset to messages format for VLMs with single-turn QA and image columns.
     If the dataset already has a 'messages' column, return as is.
-    Otherwise, require 'question', 'answer', and 'image' or 'images' columns.
+    Otherwise, require 'question' and 'answer' columns.
+    If present, 'image' or 'images' columns are included in the user content.
     No multi-turn or template logic. No audio support.
     """
     has_messages = (
@@ -44,17 +45,17 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
     if has_messages:
         return dataset
 
-    if not (has_qa and has_images):
+    if not has_qa:
         raise ValueError(
-            "Dataset must have 'messages' column or both 'question' and 'answer' columns and an 'image' or 'images' column."
+            "Dataset must have a 'messages' column or both 'question' and 'answer' columns. Optional image columns: 'image' or 'images'."
         )
 
-    image_col = "images" if "images" in dataset.column_names else "image"
+    image_col = "images" if "images" in dataset.column_names else "image" if has_images else None
 
     def to_message(example):
         q = example["question"]
         a = example["answer"]
-        img = example[image_col] if has_images else None
+        img = example[image_col] if image_col else None
         if custom_prompt_format:
             try:
                 template = json.loads(custom_prompt_format)
@@ -81,19 +82,20 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
         if model_type and any(
             model_type.startswith(prefix) for prefix in vlm_message_model_prefixes
         ):
+            user_content = []
+            if img is not None:
+                user_content.append({"type": "image", "image": img})
+            user_content.append({"type": "text", "text": q})
             return {
                 "messages": [
                     {
                         "role": "user",
-                        "content": [
-                            {"type": "image", "image": img},
-                            {"type": "text", "text": q},
-                        ],
+                        "content": user_content,
                     },
                     {"role": "assistant", "content": [{"type": "text", "text": a}]},
                 ]
             }
-        elif model_type == "deepseek_vl_v2":
+        elif model_type == "deepseek_vl_v2" and img is not None:
             return {
                 "messages": [
                     {
@@ -109,7 +111,11 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
                 "messages": [
                     {
                         "role": "user",
-                        "content": f"<image>{q}" if "<image>" not in str(q) else q,
+                        "content": (
+                            f"<image>{q}"
+                            if img is not None and "<image>" not in str(q)
+                            else q
+                        ),
                     },
                     {"role": "assistant", "content": a},
                 ]
