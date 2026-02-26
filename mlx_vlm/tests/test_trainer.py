@@ -156,7 +156,7 @@ if __name__ == "__main__":
         """Test that image_token_id is used when image_token_index is missing."""
         config_with_token_id = {"model_type": "test_model", "image_token_id": 151655}
 
-        dataset = Dataset(
+        dataset = VisionDataset(
             self.mock_hf_dataset,
             config_with_token_id,
             self.mock_processor,
@@ -183,7 +183,7 @@ if __name__ == "__main__":
         """Test that a clear KeyError is raised when neither key exists."""
         config_missing_token = {"model_type": "test_model"}
 
-        dataset = Dataset(
+        dataset = VisionDataset(
             self.mock_hf_dataset,
             config_missing_token,
             self.mock_processor,

@@ -23,6 +23,9 @@ from .utils import load, load_image_processor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 
 def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None):
@@ -74,10 +77,9 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
                 raise ValueError(f"Failed to parse or fill custom prompt format: {e}")
 
         # VLM-specific message formats (fallback)
-        if (
-            model_type == model_type.startswith("gemma")
-            or model_type.startswith("qwen")
-            or model_type == "smolvlm"
+        vlm_message_model_prefixes = ["gemma", "qwen", "smolvlm", "mllama", "mistral3"]
+        if model_type and any(
+            model_type.startswith(prefix) for prefix in vlm_message_model_prefixes
         ):
             return {
                 "messages": [
