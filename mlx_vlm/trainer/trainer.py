@@ -219,7 +219,7 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                     try:
                         batch[k] = mx.stack(vals)
                     except Exception:
-                        batch[k] = vals[0]  # fallback for non-stackable
+                        batch[k] = vals[0]
                 else:
                     batch[k] = vals[0]
 
