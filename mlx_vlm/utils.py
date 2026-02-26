@@ -16,7 +16,7 @@ import soundfile as sf
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
-from transformers import AutoProcessor
+from transformers import AutoProcessor, AutoTokenizer
 from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
@@ -34,6 +34,9 @@ MODEL_REMAPPING = {
     "lfm2-vl": "lfm2_vl",
     "cohere2_vision": "aya_vision",
     "jvlm": "jina_vlm",
+    "minicpmo": "minicpmo",
+    "minicpm-o": "minicpmo",
+    "minicpm_o": "minicpmo",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -216,11 +219,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     model_class, _ = get_model_and_args(config=config)
 
-    # Initialize text and vision configs if not present
-    config.setdefault("text_config", {})
-    config.setdefault("vision_config", {})
-    config.setdefault("audio_config", {})
-
     # Initialize model config and update it with module configs
     model_config = model_class.ModelConfig.from_dict(config)
     modules = ["text", "vision", "perceiver", "projector", "audio"]
@@ -228,7 +226,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     model = model_class.Model(model_config)
 
-    if not is_mlx_format:
+    force_sanitize = str(config.get("model_type", "")).lower() in {
+        "minicpmo",
+        "minicpm-o",
+        "minicpm_o",
+    }
+
+    if not is_mlx_format or force_sanitize:
         # Sanitize weights
         weights = sanitize_weights(model, weights)
 
@@ -251,7 +255,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     model_class.AudioModel, weights, model_config.audio_config
                 )
 
-    if not "quantization" in config:
+    if "quantization" not in config:
         quantization_config = config.get("quantization_config", None)
         if quantization_config is None:
             text_config = config.get("text_config", {})
@@ -344,7 +348,7 @@ def update_module_configs(model_config, model_class, config, modules):
     """
     for config_name in modules:
         config_attr = f"{config_name}_config"
-        if hasattr(model_config, config_attr):
+        if hasattr(model_config, config_attr) and config_attr in config:
             config_class = getattr(model_class, f"{config_name.title()}Config")
             setattr(
                 model_config, config_attr, config_class.from_dict(config[config_attr])
@@ -404,7 +408,13 @@ def load(
 
     processor = load_processor(model_path, True, eos_token_ids=eos_token_id, **kwargs)
 
-    if image_processor is not None:
+    if image_processor is not None and str(
+        getattr(model.config, "model_type", "")
+    ).lower() not in {
+        "minicpmo",
+        "minicpm-o",
+        "minicpm_o",
+    }:
         processor.image_processor = image_processor
 
     return model, processor
@@ -475,7 +485,35 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
+    cfg = None
+    try:
+        cfg = load_config(model_path, **kwargs)
+    except Exception:
+        cfg = None
+
+    processor = None
+    if cfg is not None:
+        try:
+            model_class, _ = get_model_and_args(cfg)
+            if hasattr(model_class, "Processor"):
+                processor = model_class.Processor.from_pretrained(model_path, **kwargs)
+        except Exception:
+            processor = None
+
+    is_minicpmo = bool(
+        cfg
+        and str(cfg.get("model_type", "")).lower()
+        in {"minicpmo", "minicpm-o", "minicpm_o"}
+    )
+
+    if processor is None and is_minicpmo:
+        processor = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            use_fast=True,
+        )
+    elif processor is None:
+        processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
