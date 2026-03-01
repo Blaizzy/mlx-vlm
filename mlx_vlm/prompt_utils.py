@@ -707,4 +707,4 @@ def apply_chat_template(
     if model_type in ["paligemma", "molmo", "florence2"]:
         return messages[-1]
 
-    return get_chat_template(processor, messages, add_generation_prompt)
+    return get_chat_template(processor, messages, add_generation_prompt, **kwargs)
