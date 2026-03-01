@@ -464,31 +464,43 @@ class ChatStreamChunk(BaseModel):
 
 def process_tool_calls(model_output: str, tool_module, tools):
     called_tools = []
+    remaining = model_output
 
     if tool_module.tool_call_start in model_output:
         if tool_module.tool_call_end == "":
-            pattern = rf"{re.escape(tool_module.tool_call_start)}(.*)$"
-        else:
-            pattern = rf"{re.escape(tool_module.tool_call_start)}(.*){re.escape(tool_module.tool_call_end)}"
+            pattern = re.compile(
+                f"{re.escape(tool_module.tool_call_start)}.*?(?:\n|$)", re.DOTALL
+            )
 
-        matches = re.findall(pattern, model_output, re.DOTALL)
+        else:
+            pattern = re.compile(
+                f"{re.escape(tool_module.tool_call_start)}.*?{re.escape(tool_module.tool_call_end)}",
+                re.DOTALL,
+            )
+
+        matches = re.findall(pattern, model_output)
         if matches:
+            remaining = re.sub(pattern, " ", model_output).strip()
             for match in matches:
+                call = (
+                    match.strip()
+                    .removeprefix(tool_module.tool_call_start)
+                    .removesuffix(tool_module.tool_call_end)
+                )
                 try:
-                    tool_call = tool_module.parse_tool_call(match, tools)
+                    tool_call = tool_module.parse_tool_call(call, tools)
                     called_tool = {}
                     called_tool["type"] = "function"
                     called_tool["id"] = str(uuid.uuid4())
                     called_tool["function"] = {}
-                    called_tool["function"]["name"] = tool_call["name"]
+                    called_tool["function"]["name"] = tool_call["name"].strip()
                     called_tool["function"]["arguments"] = json.dumps(
                         tool_call["arguments"], ensure_ascii=False
                     )
                     called_tools.append(called_tool)
                 except:
-                    print(f"Invalid tool call: {match}")
-
-    return called_tools
+                    print(f"Invalid tool call: {call}")
+    return dict(calls=called_tools, remaining_text=remaining)
 
 
 # Models for /models endpoint
@@ -982,14 +994,17 @@ async def chat_completions_endpoint(request: ChatRequest):
                             tools=tools,
                         )
                     else:
-                        tool_calls = []
+                        tool_calls = {}
+                        tool_calls["calls"] = []
 
                     # Signal stream end
                     choices = [
                         ChatStreamChoice(
                             finish_reason="stop",
                             delta=ChatMessage(
-                                role="assistant", content="", tool_calls=tool_calls
+                                role="assistant",
+                                content="",
+                                tool_calls=tool_calls["calls"],
                             ),
                         )
                     ]
@@ -1049,15 +1064,17 @@ async def chat_completions_endpoint(request: ChatRequest):
                         tools=tools,
                     )
                 else:
-                    tool_calls = []
+                    tool_calls = {}
+                    tool_calls["calls"] = []
+                    tool_calls["remaining_text"] = gen_result.text
 
                 choices = [
                     ChatChoice(
                         finish_reason="stop",
                         message=ChatMessage(
                             role="assistant",
-                            content=gen_result.text,
-                            tool_calls=tool_calls,
+                            content=tool_calls["remaining_text"],
+                            tool_calls=tool_calls["calls"],
                         ),
                     )
                 ]
