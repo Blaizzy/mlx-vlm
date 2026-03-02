@@ -181,9 +181,9 @@ The server provides multiple endpoints for different use cases and supports dyna
 
 #### Available Endpoints
 
-- `/models` - List models available locally
-- `/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
-- `/responses` - OpenAI-compatible responses endpoint
+- `/models` and `/v1/models` - List models available locally
+- `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
+- `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
 - `/health` - Check server status
 - `/unload` - Unload current model from memory
 
