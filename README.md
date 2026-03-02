@@ -193,7 +193,6 @@ The server provides multiple endpoints for different use cases and supports dyna
 
 ```sh
 curl "http://localhost:8080/models"
-curl "http://localhost:8080/v1/models"
 ```
 
 ##### Text Input
