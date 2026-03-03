@@ -866,12 +866,16 @@ async def chat_completions_endpoint(request: ChatRequest):
                     {"role": message.role, "content": text_content}
                 )
 
+        # Forward extra request body params (e.g. enable_thinking) to the chat template
+        template_kwargs = dict(request.__pydantic_extra__) if request.__pydantic_extra__ else {}
+
         formatted_prompt = apply_chat_template(
             processor,
             config,
             processed_messages,
             num_images=len(images),
             num_audios=len(audio),
+            **template_kwargs,
         )
 
         if request.stream:
