@@ -3,6 +3,7 @@ import asyncio
 import gc
 import json
 import os
+import time
 import traceback
 import uuid
 from datetime import datetime
@@ -457,11 +458,15 @@ class ChatResponse(BaseModel):
 
 
 class ChatStreamChoice(BaseModel):
+    index: int = 0
     finish_reason: Optional[str] = None
     delta: ChatMessage
 
 
 class ChatStreamChunk(BaseModel):
+    id: str
+    object: str = "chat.completion.chunk"
+    created: int
     model: str
     choices: List[ChatStreamChoice]
     usage: Optional[UsageStats]
@@ -911,6 +916,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         **kwargs,
                     )
 
+                    request_id = f"chatcmpl-{uuid.uuid4()}"
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
                             print("Warning: Received unexpected chunk format:", chunk)
@@ -933,7 +939,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                             )
                         ]
                         chunk_data = ChatStreamChunk(
-                            model=request.model, usage=usage_stats, choices=choices
+                            id=request_id,
+                            created=int(time.time()),
+                            model=request.model,
+                            usage=usage_stats,
+                            choices=choices,
                         )
 
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
@@ -949,9 +959,15 @@ async def chat_completions_endpoint(request: ChatRequest):
                         )
                     ]
                     chunk_data = ChatStreamChunk(
-                        model=request.model, usage=usage_stats, choices=choices
+                        id=request_id,
+                        created=int(time.time()),
+                        model=request.model,
+                        usage=usage_stats,
+                        choices=choices,
                     )
                     yield f"data: {chunk_data.model_dump_json()}\n\n"
+
+                    yield f"data: [DONE]\n\n"
 
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
