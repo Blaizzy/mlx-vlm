@@ -22,7 +22,6 @@ class TestDataset(unittest.TestCase):
             self.mock_hf_dataset,
             self.mock_config,
             self.mock_processor,
-            self.mock_image_processor,
         )
 
         mock_get_prompt.return_value = ""
@@ -68,13 +67,11 @@ class TestDataset(unittest.TestCase):
             self.mock_hf_dataset,
             self.mock_config,
             self.mock_processor,
-            self.mock_image_processor,
         )
 
         self.assertEqual(len(dataset), len(self.mock_hf_dataset))
         self.assertEqual(dataset.config, self.mock_config)
         self.assertEqual(dataset.processor, self.mock_processor)
-        self.assertEqual(dataset.image_processor, self.mock_image_processor)
 
 
 class TestTrainer(unittest.TestCase):
@@ -160,7 +157,6 @@ if __name__ == "__main__":
             self.mock_hf_dataset,
             config_with_token_id,
             self.mock_processor,
-            self.mock_image_processor,
         )
 
         mock_item = {
@@ -187,7 +183,6 @@ if __name__ == "__main__":
             self.mock_hf_dataset,
             config_missing_token,
             self.mock_processor,
-            self.mock_image_processor,
         )
 
         mock_item = {
