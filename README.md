@@ -181,9 +181,9 @@ The server provides multiple endpoints for different use cases and supports dyna
 
 #### Available Endpoints
 
-- `/models` - List models available locally
-- `/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
-- `/responses` - OpenAI-compatible responses endpoint
+- `/models` and `/v1/models` - List models available locally
+- `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
+- `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
 - `/health` - Check server status
 - `/unload` - Unload current model from memory
 
@@ -220,6 +220,7 @@ curl -X POST "http://localhost:8080/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/Qwen2.5-VL-32B-Instruct-8bit",
+    "messages":
     [
       {
         "role": "system",
@@ -230,7 +231,7 @@ curl -X POST "http://localhost:8080/chat/completions" \
         "content": [
           {
             "type": "text",
-            "text": This is today's chart for energy demand in California. Can you provide an analysis of the chart and comment on the implications for renewable energy in California?"
+            "text": "This is today's chart for energy demand in California. Can you provide an analysis of the chart and comment on the implications for renewable energy in California?"
           },
           {
             "type": "input_image",
