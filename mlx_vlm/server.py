@@ -995,7 +995,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                     {"role": message.role, "content": text_content}
                 )
 
-<<<<<<< tool_calls
         tools = None
         if hasattr(request, "tools"):
             tools = request.tools
@@ -1010,13 +1009,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                 tool_module = importlib.import_module(
                     f"mlx_lm.tool_parsers.{tool_parser_type}"
                 )
-=======
         template_kwargs = {
             k: v
             for k, v in (request.__pydantic_extra__ or {}).items()
             if k in ALLOWED_TEMPLATE_KWARGS
         }
->>>>>>> main
 
         formatted_prompt = apply_chat_template(
             processor,
@@ -1024,11 +1021,8 @@ async def chat_completions_endpoint(request: ChatRequest):
             processed_messages,
             num_images=len(images),
             num_audios=len(audio),
-<<<<<<< tool_calls
             tools=tools,
-=======
             **template_kwargs,
->>>>>>> main
         )
 
         # Forward extra kwargs to stream_generate/generate
