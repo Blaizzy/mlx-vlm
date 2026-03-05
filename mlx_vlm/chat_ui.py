@@ -3,7 +3,13 @@ import gc
 import json
 import threading
 
-import gradio as gr
+try:
+    import gradio as gr
+except ImportError:
+    raise SystemExit(
+        "mlx_vlm.chat_ui requires 'gradio'. "
+        "Install it with: pip install 'mlx-vlm[ui]'"
+    )
 import mlx.core as mx
 
 from mlx_vlm import load
