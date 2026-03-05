@@ -479,18 +479,6 @@ def stream_generate(
     thinking_start_token = kwargs.pop("thinking_start_token", None)
     enable_thinking = kwargs.pop("enable_thinking", False)
 
-    if thinking_budget is not None:
-        tokenizer.thinking_budget_criteria = ThinkingBudgetCriteria(
-            tokenizer=tokenizer,
-            thinking_budget=thinking_budget,
-            thinking_end_token=thinking_end_token,
-            thinking_start_token=thinking_start_token,
-            enable_thinking=enable_thinking,
-        )
-        kwargs["thinking_budget_criteria"] = tokenizer.thinking_budget_criteria
-    else:
-        tokenizer.thinking_budget_criteria = None
-
     # Skip special tokens
     skip_special_tokens = kwargs.pop("skip_special_tokens", False)
     skip_special_token_ids = (
@@ -532,6 +520,22 @@ def stream_generate(
             if k not in ["input_ids", "pixel_values", "attention_mask"]
         }
         kwargs.update(data_kwargs)
+
+    if thinking_budget is not None:
+        thinking_start_token_id = tokenizer.encode(
+            thinking_start_token, add_special_tokens=False
+        )[-1]
+        enable_thinking = enable_thinking and (thinking_start_token_id in input_ids.flatten().tolist())
+        tokenizer.thinking_budget_criteria = ThinkingBudgetCriteria(
+            tokenizer=tokenizer,
+            thinking_budget=thinking_budget,
+            thinking_end_token=thinking_end_token,
+            thinking_start_token=thinking_start_token,
+            enable_thinking=enable_thinking,
+        )
+        kwargs["thinking_budget_criteria"] = tokenizer.thinking_budget_criteria
+    else:
+        tokenizer.thinking_budget_criteria = None
 
     with wired_limit(model, [generation_stream]):
         detokenizer = processor.detokenizer

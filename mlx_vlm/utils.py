@@ -1272,21 +1272,18 @@ class ThinkingBudgetCriteria:
     ):
         self.tokenizer = tokenizer
         self.thinking_budget = thinking_budget
+        self.enable_thinking = enable_thinking
 
         # Resolve token IDs from strings
         self.thinking_end_token_id = tokenizer.encode(
             thinking_end_token, add_special_tokens=False
         )[-1]
 
-        # When enable_thinking is True, the prompt already contains the start
-        # token so generation begins inside a thinking block — use implicit start.
-        self.thinking_start_token_id = None
-        if thinking_start_token is not None and not enable_thinking:
-            self.thinking_start_token_id = tokenizer.encode(
-                thinking_start_token, add_special_tokens=False
-            )[-1]
 
-        # Build the forced closing sequence: \n followed by the end token
+        self.thinking_start_token_id = tokenizer.encode(
+            thinking_start_token, add_special_tokens=False
+        )[-1]
+
         self._forced_sequence: List[int] = []
         newline_ids = tokenizer.encode("\n", add_special_tokens=False)
         if newline_ids:
@@ -1294,14 +1291,13 @@ class ThinkingBudgetCriteria:
         self._forced_sequence.append(self.thinking_end_token_id)
         self._forced_index = 0
 
-        # Start immediately if no start token
-        self.in_thinking = self.thinking_start_token_id is None
+        self.in_thinking = self.enable_thinking
         self.thinking_token_count = 0
         self.budget_exceeded = False
 
     def reset_thinking_state(self):
         """Reset thinking state between generations."""
-        self.in_thinking = self.thinking_start_token_id is None
+        self.in_thinking = self.enable_thinking
         self.thinking_token_count = 0
         self.budget_exceeded = False
         self._forced_index = 0
@@ -1309,7 +1305,7 @@ class ThinkingBudgetCriteria:
     def __call__(self, token_id: int) -> Optional[int]:
         """Process a token and return a forced token ID if budget exceeded, else None."""
         if (
-            self.thinking_start_token_id is not None
+            self.enable_thinking
             and token_id == self.thinking_start_token_id
         ):
             self.in_thinking = True
@@ -1336,7 +1332,7 @@ class ThinkingBudgetCriteria:
         return None
 
     def apply_forced_token(self, next_y: mx.array) -> Optional[mx.array]:
-        if self.forced_token_id is not None:
+        if self.forced_token_id is not None and self.enable_thinking:
             next_y = mx.array([self.forced_token_id])
             self.forced_token_id = None
             return next_y
