@@ -17,7 +17,13 @@ from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
-from .utils import StoppingCriteria, group_images_by_shape, load, prepare_inputs
+from .utils import (
+    StoppingCriteria,
+    ThinkingBudgetCriteria,
+    group_images_by_shape,
+    load,
+    prepare_inputs,
+)
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
@@ -168,6 +174,30 @@ def parse_arguments():
         "Lower values reduce peak memory usage but may be slower. "
         "Try 512 or 256 if you hit GPU memory errors during prefill.",
     )
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="Enable thinking mode in the chat template (e.g. for Qwen3.5).",
+    )
+    parser.add_argument(
+        "--thinking-budget",
+        type=int,
+        default=None,
+        help="Maximum number of thinking tokens before forcing the end-of-thinking token.",
+    )
+    parser.add_argument(
+        "--thinking-start-token",
+        type=str,
+        default=None,
+        help="Token that marks the start of a thinking block (e.g. '<think>'). "
+        "If not set, thinking is assumed to start immediately.",
+    )
+    parser.add_argument(
+        "--thinking-end-token",
+        type=str,
+        default="</think>",
+        help="Token that marks the end of a thinking block (default: '</think>').",
+    )
 
     return parser.parse_args()
 
@@ -305,6 +335,8 @@ def generate_step(
     y = input_ids
     tokens = mx.array([], dtype=input_ids.dtype)
 
+    thinking_budget_criteria = kwargs.pop("thinking_budget_criteria", None)
+
     # Create the KV cache for generation
     if prompt_cache is None:
         prompt_cache = cache.make_prompt_cache(
@@ -406,6 +438,9 @@ def generate_step(
         yield y.item(), logprobs
         if n % 256 == 0:
             mx.clear_cache()
+
+        if thinking_budget_criteria is not None:
+            next_y = thinking_budget_criteria.apply_forced_token(next_y)
         y, logprobs = next_y, next_logprobs
         n += 1
 
@@ -438,6 +473,12 @@ def stream_generate(
           containing the generated text, tokens, and statistics.
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+    # Set up thinking budget criteria if requested
+    thinking_budget = kwargs.pop("thinking_budget", None)
+    thinking_end_token = kwargs.pop("thinking_end_token", "</think>")
+    thinking_start_token = kwargs.pop("thinking_start_token", None)
+    enable_thinking = kwargs.pop("enable_thinking", False)
 
     # Skip special tokens
     skip_special_tokens = kwargs.pop("skip_special_tokens", False)
@@ -481,17 +522,40 @@ def stream_generate(
         }
         kwargs.update(data_kwargs)
 
+    if thinking_budget is not None:
+        thinking_start_token_id = tokenizer.encode(
+            thinking_start_token, add_special_tokens=False
+        )[-1]
+        enable_thinking = enable_thinking and (
+            thinking_start_token_id in input_ids.flatten().tolist()
+        )
+        tokenizer.thinking_budget_criteria = ThinkingBudgetCriteria(
+            tokenizer=tokenizer,
+            thinking_budget=thinking_budget,
+            thinking_end_token=thinking_end_token,
+            thinking_start_token=thinking_start_token,
+            enable_thinking=enable_thinking,
+        )
+        kwargs["thinking_budget_criteria"] = tokenizer.thinking_budget_criteria
+    else:
+        tokenizer.thinking_budget_criteria = None
+
     with wired_limit(model, [generation_stream]):
         detokenizer = processor.detokenizer
         detokenizer.reset()
+        thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
+        gen = generate_step(input_ids, model, pixel_values, mask, **kwargs)
         tic = time.perf_counter()
-        for n, (token, logprobs) in enumerate(
-            generate_step(input_ids, model, pixel_values, mask, **kwargs)
-        ):
+
+        for n, (token, logprobs) in enumerate(gen):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = input_ids.size / prompt_time
                 tic = time.perf_counter()
+
+            # Check thinking budget and force token if needed
+            if thinking_criteria is not None:
+                thinking_criteria(token)
 
             # Stop generation if the token is in the eos_token_ids
             if tokenizer.stopping_criteria(token):
@@ -1262,8 +1326,17 @@ def main():
     num_audios = (
         1 if args.audio is not None else 0
     )  # TODO: Support multiple audio files
+    chat_template_kwargs = {}
+    if args.enable_thinking:
+        chat_template_kwargs["enable_thinking"] = True
+
     prompt = apply_chat_template(
-        processor, config, prompt, num_images=num_images, num_audios=num_audios
+        processor,
+        config,
+        prompt,
+        num_images=num_images,
+        num_audios=num_audios,
+        **chat_template_kwargs,
     )
 
     kwargs = {}
@@ -1294,13 +1367,24 @@ def main():
     if args.processor_kwargs:
         kwargs.update(args.processor_kwargs)
 
+    # Add thinking kwargs
+    if args.enable_thinking:
+        kwargs["enable_thinking"] = True
+    if args.thinking_budget is not None:
+        kwargs["thinking_budget"] = args.thinking_budget
+        kwargs["thinking_end_token"] = args.thinking_end_token
+        if args.thinking_start_token is not None:
+            kwargs["thinking_start_token"] = args.thinking_start_token
+
     if args.chat:
         chat = []
         if args.system:
             chat.append({"role": "system", "content": args.system})
         while user := input("User:"):
             chat.append({"role": "user", "content": user})
-            prompt = apply_chat_template(processor, config, chat, num_images=num_images)
+            prompt = apply_chat_template(
+                processor, config, chat, num_images=num_images, **chat_template_kwargs
+            )
             response = ""
             print("Assistant:", end="")
             stream_kwargs = {

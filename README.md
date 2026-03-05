@@ -7,6 +7,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 - [Installation](#installation)
 - [Usage](#usage)
   - [Command Line Interface (CLI)](#command-line-interface-cli)
+    - [Thinking Budget](#thinking-budget)
   - [Chat UI with Gradio](#chat-ui-with-gradio)
   - [Python Script](#python-script)
 - [Activation Quantization (CUDA)](#activation-quantization-cuda)
@@ -62,6 +63,28 @@ mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --p
 # Multi-modal generation (Image + Audio)
 mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --prompt "Describe what you see and hear" --image /path/to/image.jpg --audio /path/to/audio.wav
 ```
+
+#### Thinking Budget
+
+For thinking models (e.g., Qwen3.5), you can limit the number of tokens spent in the thinking block:
+
+```sh
+mlx_vlm.generate --model mlx-community/Qwen3.5-2B-4bit \
+  --thinking-budget 50 \
+  --thinking-start-token "<think>" \
+  --thinking-end-token "</think>" \
+  --enable-thinking \
+  --prompt "Solve 2+2"
+```
+
+| Flag | Description |
+|------|-------------|
+| `--enable-thinking` | Activate thinking mode in the chat template |
+| `--thinking-budget` | Max tokens allowed inside the thinking block |
+| `--thinking-start-token` | Token that opens a thinking block (default: `<think>`) |
+| `--thinking-end-token` | Token that closes a thinking block (default: `</think>`) |
+
+When the budget is exceeded, the model is forced to emit `\n</think>` and transition to the answer. If `--enable-thinking` is passed but the model's chat template does not support it, the budget is applied only if the model generates the start token on its own.
 
 ### Chat UI with Gradio
 
