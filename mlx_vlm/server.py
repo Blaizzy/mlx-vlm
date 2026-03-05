@@ -1,8 +1,10 @@
 import argparse
 import asyncio
 import gc
+import importlib
 import json
 import os
+import re
 import time
 import traceback
 import uuid
@@ -15,6 +17,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
+from mlx_lm.tokenizer_utils import _infer_tool_parser
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import Required, TypeAlias, TypedDict
 
@@ -249,13 +252,18 @@ ResponseOutputMessageContentList: TypeAlias = List[ResponseOutputText]
 
 
 class ChatMessage(FlexibleBaseModel):
-    role: Literal["user", "assistant", "system", "developer"] = Field(
+    role: Literal["user", "assistant", "system", "developer", "tool"] = Field(
         ...,
         description="Role of the message sender (e.g., 'system', 'user', 'assistant').",
     )
-    content: Union[
-        str, ResponseInputMessageContentListParam, ResponseOutputMessageContentList
-    ] = Field(..., description="Content of the message.")
+    content: Optional[
+        Union[
+            str,
+            ResponseInputMessageContentListParam,
+            ResponseOutputMessageContentList,
+        ]
+    ] = Field(None, description="Content of the message.")
+    tool_calls: List = []
 
 
 class OpenAIRequest(FlexibleBaseModel):
@@ -513,6 +521,47 @@ class ChatStreamChunk(BaseModel):
     usage: Optional[UsageStats]
 
 
+def process_tool_calls(model_output: str, tool_module, tools):
+    called_tools = []
+    remaining = model_output
+
+    if tool_module.tool_call_start in model_output:
+        if tool_module.tool_call_end == "":
+            pattern = re.compile(
+                f"{re.escape(tool_module.tool_call_start)}.*?(?:\n|$)", re.DOTALL
+            )
+
+        else:
+            pattern = re.compile(
+                f"{re.escape(tool_module.tool_call_start)}.*?{re.escape(tool_module.tool_call_end)}",
+                re.DOTALL,
+            )
+
+        matches = re.findall(pattern, model_output)
+        if matches:
+            remaining = re.sub(pattern, " ", model_output).strip()
+            for match in matches:
+                call = (
+                    match.strip()
+                    .removeprefix(tool_module.tool_call_start)
+                    .removesuffix(tool_module.tool_call_end)
+                )
+                try:
+                    tool_call = tool_module.parse_tool_call(call, tools)
+                    called_tool = {}
+                    called_tool["type"] = "function"
+                    called_tool["id"] = str(uuid.uuid4())
+                    called_tool["function"] = {}
+                    called_tool["function"]["name"] = tool_call["name"].strip()
+                    called_tool["function"]["arguments"] = json.dumps(
+                        tool_call["arguments"], ensure_ascii=False
+                    )
+                    called_tools.append(called_tool)
+                except:
+                    print(f"Invalid tool call: {call}")
+    return dict(calls=called_tools, remaining_text=remaining)
+
+
 # Models for /models endpoint
 
 
@@ -607,7 +656,9 @@ async def responses_endpoint(request: Request):
                 # If input is a list, treat it as a series of chat messages
                 for message in openai_request.input:
                     if isinstance(message, ChatMessage):
-                        if isinstance(message.content, str):
+                        if message.content is None:
+                            chat_messages.append({"role": message.role, "content": ""})
+                        elif isinstance(message.content, str):
                             chat_messages.append(
                                 {"role": message.role, "content": message.content}
                             )
@@ -928,7 +979,9 @@ async def chat_completions_endpoint(request: ChatRequest):
         audio = []
         processed_messages = []
         for message in request.messages:
-            if isinstance(message.content, str):
+            if message.content is None:
+                processed_messages.append({"role": message.role, "content": ""})
+            elif isinstance(message.content, str):
                 processed_messages.append(
                     {"role": message.role, "content": message.content}
                 )
@@ -950,6 +1003,20 @@ async def chat_completions_endpoint(request: ChatRequest):
                     {"role": message.role, "content": text_content}
                 )
 
+        tools = None
+        if hasattr(request, "tools"):
+            tools = request.tools
+
+        tool_parser_type = None
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        if hasattr(tokenizer, "chat_template"):
+            tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
+            if tool_parser_type is not None:
+                tool_module = importlib.import_module(
+                    f"mlx_lm.tool_parsers.{tool_parser_type}"
+                )
         template_kwargs = {
             k: v
             for k, v in (request.__pydantic_extra__ or {}).items()
@@ -962,6 +1029,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             processed_messages,
             num_images=len(images),
             num_audios=len(audio),
+            tools=tools,
             **template_kwargs,
         )
 
@@ -990,11 +1058,14 @@ async def chat_completions_endpoint(request: ChatRequest):
                         **kwargs,
                     )
 
+                    output_text = ""
                     request_id = f"chatcmpl-{uuid.uuid4()}"
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
                             print("Warning: Received unexpected chunk format:", chunk)
                             continue
+
+                        output_text += chunk.text
 
                         # Yield chunks in Server-Sent Events (SSE) format
                         usage_stats = {
@@ -1025,13 +1096,28 @@ async def chat_completions_endpoint(request: ChatRequest):
                             0.01
                         )  # Small sleep to prevent blocking event loop entirely
 
+                    if tool_parser_type is not None:
+                        tool_calls = process_tool_calls(
+                            model_output=output_text,
+                            tool_module=tool_module,
+                            tools=tools,
+                        )
+                    else:
+                        tool_calls = {}
+                        tool_calls["calls"] = []
+
                     # Signal stream end
                     choices = [
                         ChatStreamChoice(
                             finish_reason="stop",
-                            delta=ChatMessage(role="assistant", content=""),
+                            delta=ChatMessage(
+                                role="assistant",
+                                content="",
+                                tool_calls=tool_calls["calls"],
+                            ),
                         )
                     ]
+
                     chunk_data = ChatStreamChunk(
                         id=request_id,
                         created=int(time.time()),
@@ -1098,12 +1184,28 @@ async def chat_completions_endpoint(request: ChatRequest):
                     peak_memory=gen_result.peak_memory,
                 )
 
+                if tool_parser_type is not None:
+                    tool_calls = process_tool_calls(
+                        model_output=gen_result.text,
+                        tool_module=tool_module,
+                        tools=tools,
+                    )
+                else:
+                    tool_calls = {}
+                    tool_calls["calls"] = []
+                    tool_calls["remaining_text"] = gen_result.text
+
                 choices = [
                     ChatChoice(
                         finish_reason="stop",
-                        message=ChatMessage(role="assistant", content=gen_result.text),
+                        message=ChatMessage(
+                            role="assistant",
+                            content=tool_calls["remaining_text"],
+                            tool_calls=tool_calls["calls"],
+                        ),
                     )
                 ]
+
                 result = ChatResponse(
                     model=request.model, usage=usage_stats, choices=choices
                 )
