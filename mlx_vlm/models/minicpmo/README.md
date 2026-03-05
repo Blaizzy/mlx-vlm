@@ -10,7 +10,7 @@ This MLX-VLM integration includes:
 ## Model
 
 - Hugging Face ID: `openbmb/MiniCPM-o-4_5`
-- Use `--trust-remote-code` when loading from HF.
+- Remote tokenizer/processor code is ported in-tree, so `--trust-remote-code` is not required.
 
 ## Install
 
@@ -25,7 +25,6 @@ pip install -U mlx-vlm
 ```sh
 uv run mlx_vlm.generate \
   --model openbmb/MiniCPM-o-4_5 \
-  --trust-remote-code \
   --image /path/to/image.jpg \
   --prompt "Describe this image briefly." \
   --max-tokens 128 \
@@ -37,7 +36,6 @@ uv run mlx_vlm.generate \
 ```sh
 uv run mlx_vlm.generate \
   --model openbmb/MiniCPM-o-4_5 \
-  --trust-remote-code \
   --audio /path/to/audio.wav \
   --prompt "Describe this audio briefly." \
   --max-tokens 256 \
@@ -49,7 +47,6 @@ uv run mlx_vlm.generate \
 ```sh
 uv run mlx_vlm.generate \
   --model openbmb/MiniCPM-o-4_5 \
-  --trust-remote-code \
   --image /path/to/image.jpg \
   --audio /path/to/audio.wav \
   --prompt "Describe what you see and hear." \
@@ -62,7 +59,6 @@ uv run mlx_vlm.generate \
 ```sh
 uv run mlx_vlm.generate \
   --model openbmb/MiniCPM-o-4_5 \
-  --trust-remote-code \
   --audio /path/to/audio.wav \
   --prompt "Describe this audio briefly." \
   --chat-template-kwargs '{"enable_thinking": false}' \
@@ -78,7 +74,6 @@ from mlx_vlm.prompt_utils import apply_chat_template
 
 model, processor = load(
     "openbmb/MiniCPM-o-4_5",
-    trust_remote_code=True,
 )
 
 image = ["/path/to/image.jpg"]

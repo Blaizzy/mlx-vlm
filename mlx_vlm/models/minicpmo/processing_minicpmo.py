@@ -6,7 +6,12 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from PIL import Image
-from transformers import AutoTokenizer, WhisperFeatureExtractor
+from transformers import (
+    AddedToken,
+    AutoTokenizer,
+    Qwen2TokenizerFast,
+    WhisperFeatureExtractor,
+)
 from transformers.image_processing_utils import (
     BaseImageProcessor as HFBaseImageProcessor,
 )
@@ -18,6 +23,92 @@ from ..base import install_auto_processor_patch
 def _load_json(path: Path) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _normalize_token_config_value(value):
+    if isinstance(value, dict):
+        content = value.get("content")
+        if content is None:
+            return None
+        return AddedToken(
+            content=content,
+            lstrip=bool(value.get("lstrip", False)),
+            rstrip=bool(value.get("rstrip", False)),
+            normalized=bool(value.get("normalized", False)),
+            single_word=bool(value.get("single_word", False)),
+        )
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            normalized = _normalize_token_config_value(item)
+            if normalized is not None:
+                out.append(normalized)
+        return out
+    return value
+
+
+def _extract_hf_from_pretrained_kwargs(kwargs: Dict) -> Dict:
+    allowed = {
+        "cache_dir",
+        "force_download",
+        "local_files_only",
+        "proxies",
+        "revision",
+        "subfolder",
+        "token",
+        "use_auth_token",
+    }
+    return {k: v for k, v in kwargs.items() if k in allowed}
+
+
+def _load_local_qwen2_tokenizer(
+    pretrained_model_name_or_path: Union[str, Path],
+    *,
+    use_fast: bool = True,
+    hf_kwargs: Optional[Dict] = None,
+):
+    hf_kwargs = dict(hf_kwargs or {})
+    path = Path(pretrained_model_name_or_path)
+
+    token_kwargs: Dict = {}
+    if path.exists() and path.is_dir():
+        tokenizer_cfg_path = path / "tokenizer_config.json"
+        if tokenizer_cfg_path.exists():
+            tokenizer_cfg = _load_json(tokenizer_cfg_path)
+            for key in (
+                "bos_token",
+                "eos_token",
+                "unk_token",
+                "pad_token",
+                "additional_special_tokens",
+            ):
+                if key in tokenizer_cfg:
+                    token_kwargs[key] = _normalize_token_config_value(
+                        tokenizer_cfg[key]
+                    )
+
+            for key in (
+                "model_max_length",
+                "clean_up_tokenization_spaces",
+                "split_special_tokens",
+                "add_prefix_space",
+            ):
+                if key in tokenizer_cfg:
+                    token_kwargs[key] = tokenizer_cfg[key]
+
+        special_tokens_map_path = path / "special_tokens_map.json"
+        if special_tokens_map_path.exists():
+            special_tokens_map = _load_json(special_tokens_map_path)
+            for key, value in special_tokens_map.items():
+                token_kwargs[key] = _normalize_token_config_value(value)
+
+    return Qwen2TokenizerFast.from_pretrained(
+        pretrained_model_name_or_path,
+        trust_remote_code=False,
+        use_fast=use_fast,
+        **hf_kwargs,
+        **token_kwargs,
+    )
 
 
 class MiniCPMOImageProcessor(HFBaseImageProcessor):
@@ -603,18 +694,40 @@ class MiniCPMOProcessor(ProcessorMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         chat_template = kwargs.pop("chat_template", None)
-        trust_remote_code = kwargs.pop("trust_remote_code", True)
+        trust_remote_code = bool(kwargs.pop("trust_remote_code", False))
+        use_fast = bool(kwargs.pop("use_fast", True))
+        hf_kwargs = _extract_hf_from_pretrained_kwargs(kwargs)
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path,
-            trust_remote_code=trust_remote_code,
-            **kwargs,
-        )
+        tokenizer = None
+        local_tokenizer_error = None
+        try:
+            tokenizer = _load_local_qwen2_tokenizer(
+                pretrained_model_name_or_path,
+                use_fast=use_fast,
+                hf_kwargs=hf_kwargs,
+            )
+        except Exception as exc:
+            local_tokenizer_error = exc
+
+        if tokenizer is None:
+            if not trust_remote_code:
+                raise ValueError(
+                    "Failed to load MiniCPM-o tokenizer without remote code. "
+                    "Set --trust-remote-code only if you explicitly want HF custom code."
+                ) from local_tokenizer_error
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                pretrained_model_name_or_path,
+                trust_remote_code=True,
+                use_fast=use_fast,
+                **hf_kwargs,
+            )
+
         audio_processor = WhisperFeatureExtractor.from_pretrained(
-            pretrained_model_name_or_path
+            pretrained_model_name_or_path, **hf_kwargs
         )
         image_processor = MiniCPMOImageProcessor.from_pretrained(
-            pretrained_model_name_or_path
+            pretrained_model_name_or_path, **hf_kwargs
         )
         return cls(
             image_processor=image_processor,
