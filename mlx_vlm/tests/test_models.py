@@ -2171,6 +2171,59 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
+    def test_minicpmo(self):
+        from mlx_vlm.models import minicpmo
+
+        text_config = minicpmo.TextConfig(
+            model_type="minicpmo",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=256,
+            num_key_value_heads=4,
+            head_dim=16,
+            rope_theta=10000.0,
+            max_position_embeddings=2048,
+        )
+        vision_config = minicpmo.VisionConfig(
+            model_type="siglip_vision_model",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_channels=3,
+            image_size=28,
+            patch_size=14,
+        )
+        setattr(vision_config, "spatial_merge_size", 1)
+        config = minicpmo.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            query_num=4,
+        )
+        setattr(config, "image_token_id", 1)
+        setattr(config, "video_token_id", 2)
+        setattr(config, "vision_start_token_id", 3)
+        model = minicpmo.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+            vision_feature_layer=0,
+        )
+
     def test_glm_ocr(self):
         from mlx_vlm.models import glm_ocr
 
@@ -3598,6 +3651,113 @@ class TestChunkedPrefillRoPE(unittest.TestCase):
             outputs.logits.shape,
             (1, chunked_input_ids.shape[1], text_config.vocab_size),
         )
+
+
+class TestMiniCPMO(unittest.TestCase):
+
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import minicpmo
+
+        text_config = minicpmo.TextConfig(
+            model_type="minicpmo",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=256,
+            num_key_value_heads=4,
+            head_dim=16,
+            rope_theta=10000.0,
+            max_position_embeddings=2048,
+        )
+        vision_config = minicpmo.VisionConfig(
+            model_type="siglip_vision_model",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_channels=3,
+            image_size=28,
+            patch_size=14,
+        )
+        return minicpmo.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            query_num=4,
+        )
+
+    def test_minicpmo_config_from_root_fields(self):
+        from mlx_vlm.models import minicpmo
+
+        cfg = {
+            "model_type": "minicpmo",
+            "hidden_size": 4096,
+            "intermediate_size": 12288,
+            "num_hidden_layers": 36,
+            "num_attention_heads": 32,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 151936,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "rope_theta": 1000000.0,
+            "max_position_embeddings": 40960,
+            "query_num": 64,
+            "vision_config": {
+                "model_type": "siglip",
+                "hidden_size": 1152,
+                "intermediate_size": 4304,
+                "num_hidden_layers": 27,
+                "num_attention_heads": 16,
+                "num_channels": 3,
+                "image_size": 448,
+                "patch_size": 14,
+            },
+        }
+        model_config = minicpmo.ModelConfig.from_dict(cfg)
+        self.assertEqual(model_config.text_config.hidden_size, 4096)
+        self.assertEqual(model_config.vision_config.model_type, "siglip_vision_model")
+        self.assertEqual(model_config.query_num, 64)
+
+    def test_minicpmo_sanitize_key_mapping_and_qkv_split(self):
+        from mlx_vlm.models import minicpmo
+
+        model = minicpmo.Model(self._tiny_config())
+        weights = {
+            "llm.model.embed_tokens.weight": mx.zeros((10, 10)),
+            "llm.lm_head.weight": mx.zeros((10, 10)),
+            "vpm.embeddings.patch_embedding.weight": mx.zeros((8, 3, 14, 14)),
+            "resampler.attn.in_proj_weight": mx.zeros((192, 64)),
+            "resampler.attn.in_proj_bias": mx.zeros((192,)),
+            "apm.conv1.weight": mx.zeros((1, 1)),
+        }
+
+        sanitized = model.sanitize(weights)
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        self.assertIn("language_model.lm_head.weight", sanitized)
+        self.assertIn("vision_tower.embeddings.patch_embedding.weight", sanitized)
+        self.assertNotIn("apm.conv1.weight", sanitized)
+
+        self.assertIn("resampler.attn.q_proj.weight", sanitized)
+        self.assertIn("resampler.attn.k_proj.weight", sanitized)
+        self.assertIn("resampler.attn.v_proj.weight", sanitized)
+        self.assertIn("resampler.attn.q_proj.bias", sanitized)
+        self.assertIn("resampler.attn.k_proj.bias", sanitized)
+        self.assertIn("resampler.attn.v_proj.bias", sanitized)
+
+    def test_minicpmo_sanitize_audio_conv_layout(self):
+        from mlx_vlm.models import minicpmo
+
+        model = minicpmo.Model(self._tiny_config())
+        weights = {
+            "apm.conv1.weight": mx.zeros((8, 80, 3)),
+            "apm.conv2.weight": mx.zeros((8, 8, 3)),
+        }
+
+        sanitized = model.sanitize(weights)
+        self.assertEqual(sanitized["audio_tower.conv1.weight"].shape, (8, 3, 80))
+        self.assertEqual(sanitized["audio_tower.conv2.weight"].shape, (8, 3, 8))
 
 
 if __name__ == "__main__":
