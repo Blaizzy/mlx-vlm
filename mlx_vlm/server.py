@@ -34,6 +34,7 @@ from .version import __version__
 
 ALLOWED_TEMPLATE_KWARGS = {"enable_thinking", "thinking_budget"}
 
+
 def get_quantized_kv_bits(model: str):
     kv_bits = int(os.environ.get("KV_BITS", 0))
     if kv_bits == 0:
@@ -658,12 +659,16 @@ async def responses_endpoint(request: Request):
             raise HTTPException(status_code=400, detail="Missing input.")
 
         template_kwargs = {
-            k: v for k, v in (openai_request.__pydantic_extra__ or {}).items()
+            k: v
+            for k, v in (openai_request.__pydantic_extra__ or {}).items()
             if k in ALLOWED_TEMPLATE_KWARGS
         }
 
         formatted_prompt = apply_chat_template(
-            processor, config, chat_messages, num_images=len(images),
+            processor,
+            config,
+            chat_messages,
+            num_images=len(images),
             **template_kwargs,
         )
 
@@ -914,7 +919,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                 else tuple(request.resize_shape)
             )
 
-
         images = []
         audio = []
         processed_messages = []
@@ -942,7 +946,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                 )
 
         template_kwargs = {
-            k: v for k, v in (request.__pydantic_extra__ or {}).items()
+            k: v
+            for k, v in (request.__pydantic_extra__ or {}).items()
             if k in ALLOWED_TEMPLATE_KWARGS
         }
 
