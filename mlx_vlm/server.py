@@ -32,8 +32,12 @@ from .prompt_utils import apply_chat_template
 from .utils import load
 from .version import __version__
 
-
-ALLOWED_TEMPLATE_KWARGS = {"enable_thinking", "thinking_budget", "thinking_start_token", "thinking_end_token"}
+ALLOWED_TEMPLATE_KWARGS = {
+    "enable_thinking",
+    "thinking_budget",
+    "thinking_start_token",
+    "thinking_end_token",
+}
 
 
 def get_quantized_kv_bits(model: str):
