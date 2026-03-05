@@ -256,9 +256,13 @@ class ChatMessage(FlexibleBaseModel):
         ...,
         description="Role of the message sender (e.g., 'system', 'user', 'assistant').",
     )
-    content: Union[
-        str, ResponseInputMessageContentListParam, ResponseOutputMessageContentList
-    ] = Field(..., description="Content of the message.")
+    content: Optional[
+        Union[
+            str,
+            ResponseInputMessageContentListParam,
+            ResponseOutputMessageContentList,
+        ]
+    ] = Field(None, description="Content of the message.")
     tool_calls: List = []
 
 
@@ -652,7 +656,11 @@ async def responses_endpoint(request: Request):
                 # If input is a list, treat it as a series of chat messages
                 for message in openai_request.input:
                     if isinstance(message, ChatMessage):
-                        if isinstance(message.content, str):
+                        if message.content is None:
+                            chat_messages.append(
+                                {"role": message.role, "content": ""}
+                            )
+                        elif isinstance(message.content, str):
                             chat_messages.append(
                                 {"role": message.role, "content": message.content}
                             )
@@ -973,7 +981,11 @@ async def chat_completions_endpoint(request: ChatRequest):
         audio = []
         processed_messages = []
         for message in request.messages:
-            if isinstance(message.content, str):
+            if message.content is None:
+                processed_messages.append(
+                    {"role": message.role, "content": ""}
+                )
+            elif isinstance(message.content, str):
                 processed_messages.append(
                     {"role": message.role, "content": message.content}
                 )
