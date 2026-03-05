@@ -939,7 +939,7 @@ class TestThinkingBudgetCriteria:
         assert criteria.budget_exceeded is False
 
         # Exceeding budget forces \n then </think>
-        assert criteria(60) == 10   # \n
+        assert criteria(60) == 10  # \n
         assert criteria(60) == 100  # </think>
         assert criteria.budget_exceeded is True
 
@@ -975,7 +975,7 @@ class TestThinkingBudgetCriteria:
         assert criteria.thinking_token_count == 3
 
         # Exceeding budget forces \n then </think>
-        assert criteria(60) == 10   # \n
+        assert criteria(60) == 10  # \n
         assert criteria(60) == 100  # </think>
 
         # No more forced tokens

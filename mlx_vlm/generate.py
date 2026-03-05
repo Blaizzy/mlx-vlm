@@ -439,7 +439,11 @@ def generate_step(
         if n % 256 == 0:
             mx.clear_cache()
 
-        next_y = thinking_budget_criteria.apply_forced_token(next_y) if thinking_budget_criteria is not None else None
+        next_y = (
+            thinking_budget_criteria.apply_forced_token(next_y)
+            if thinking_budget_criteria is not None
+            else None
+        )
         y, logprobs = next_y, next_logprobs
         n += 1
 
@@ -525,7 +529,9 @@ def stream_generate(
         thinking_start_token_id = tokenizer.encode(
             thinking_start_token, add_special_tokens=False
         )[-1]
-        enable_thinking = enable_thinking and (thinking_start_token_id in input_ids.flatten().tolist())
+        enable_thinking = enable_thinking and (
+            thinking_start_token_id in input_ids.flatten().tolist()
+        )
         tokenizer.thinking_budget_criteria = ThinkingBudgetCriteria(
             tokenizer=tokenizer,
             thinking_budget=thinking_budget,
