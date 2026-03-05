@@ -7,6 +7,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 - [Installation](#installation)
 - [Usage](#usage)
   - [Command Line Interface (CLI)](#command-line-interface-cli)
+    - [Thinking Budget](#thinking-budget)
   - [Chat UI with Gradio](#chat-ui-with-gradio)
   - [Python Script](#python-script)
 - [Activation Quantization (CUDA)](#activation-quantization-cuda)
@@ -62,6 +63,28 @@ mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --p
 # Multi-modal generation (Image + Audio)
 mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --prompt "Describe what you see and hear" --image /path/to/image.jpg --audio /path/to/audio.wav
 ```
+
+#### Thinking Budget
+
+For thinking models (e.g., Qwen3.5), you can limit the number of tokens spent in the thinking block:
+
+```sh
+mlx_vlm.generate --model mlx-community/Qwen3.5-2B-4bit \
+  --thinking-budget 50 \
+  --thinking-start-token "<think>" \
+  --thinking-end-token "</think>" \
+  --enable-thinking \
+  --prompt "Solve 2+2"
+```
+
+| Flag | Description |
+|------|-------------|
+| `--enable-thinking` | Activate thinking mode in the chat template |
+| `--thinking-budget` | Max tokens allowed inside the thinking block |
+| `--thinking-start-token` | Token that opens a thinking block (default: `<think>`) |
+| `--thinking-end-token` | Token that closes a thinking block (default: `</think>`) |
+
+When the budget is exceeded, the model is forced to emit `\n</think>` and transition to the answer. If `--enable-thinking` is passed but the model's chat template does not support it, the budget is applied only if the model generates the start token on its own.
 
 ### Chat UI with Gradio
 
@@ -181,9 +204,9 @@ The server provides multiple endpoints for different use cases and supports dyna
 
 #### Available Endpoints
 
-- `/models` - List models available locally
-- `/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
-- `/responses` - OpenAI-compatible responses endpoint
+- `/models` and `/v1/models` - List models available locally
+- `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
+- `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
 - `/health` - Check server status
 - `/unload` - Unload current model from memory
 
@@ -220,6 +243,7 @@ curl -X POST "http://localhost:8080/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/Qwen2.5-VL-32B-Instruct-8bit",
+    "messages":
     [
       {
         "role": "system",
@@ -230,7 +254,7 @@ curl -X POST "http://localhost:8080/chat/completions" \
         "content": [
           {
             "type": "text",
-            "text": This is today's chart for energy demand in California. Can you provide an analysis of the chart and comment on the implications for renewable energy in California?"
+            "text": "This is today's chart for energy demand in California. Can you provide an analysis of the chart and comment on the implications for renewable energy in California?"
           },
           {
             "type": "input_image",

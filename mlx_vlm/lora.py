@@ -19,17 +19,21 @@ from .trainer.utils import (
     not_supported_for_training,
     unfreeze_modules,
 )
-from .utils import load, load_image_processor
+from .utils import load
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 
 def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None):
     """
     Only transform dataset to messages format for VLMs with single-turn QA and image columns.
     If the dataset already has a 'messages' column, return as is.
-    Otherwise, require 'question', 'answer', and 'image' or 'images' columns.
+    Otherwise, require 'question' and 'answer' columns.
+    If present, 'image' or 'images' columns are included in the user content.
     No multi-turn or template logic. No audio support.
     """
     has_messages = (
@@ -41,17 +45,21 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
     if has_messages:
         return dataset
 
-    if not (has_qa and has_images):
+    if not has_qa:
         raise ValueError(
-            "Dataset must have 'messages' column or both 'question' and 'answer' columns and an 'image' or 'images' column."
+            "Dataset must have a 'messages' column or both 'question' and 'answer' columns. Optional image columns: 'image' or 'images'."
         )
 
-    image_col = "images" if "images" in dataset.column_names else "image"
+    image_col = (
+        "images"
+        if "images" in dataset.column_names
+        else "image" if has_images else None
+    )
 
     def to_message(example):
         q = example["question"]
         a = example["answer"]
-        img = example[image_col] if has_images else None
+        img = example[image_col] if image_col else None
         if custom_prompt_format:
             try:
                 template = json.loads(custom_prompt_format)
@@ -74,24 +82,31 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
                 raise ValueError(f"Failed to parse or fill custom prompt format: {e}")
 
         # VLM-specific message formats (fallback)
-        if (
-            model_type == model_type.startswith("gemma")
-            or model_type.startswith("qwen")
-            or model_type == "smolvlm"
+        vlm_message_model_prefixes = [
+            "gemma",
+            "qwen",
+            "smolvlm",
+            "mllama",
+            "mistral3",
+            "llama",
+        ]
+        if model_type and any(
+            model_type.startswith(prefix) for prefix in vlm_message_model_prefixes
         ):
+            user_content = []
+            if img is not None:
+                user_content.append({"type": "image", "image": img})
+            user_content.append({"type": "text", "text": q})
             return {
                 "messages": [
                     {
                         "role": "user",
-                        "content": [
-                            {"type": "image", "image": img},
-                            {"type": "text", "text": q},
-                        ],
+                        "content": user_content,
                     },
                     {"role": "assistant", "content": [{"type": "text", "text": a}]},
                 ]
             }
-        elif model_type == "deepseek_vl_v2":
+        elif model_type == "deepseek_vl_v2" and img is not None:
             return {
                 "messages": [
                     {
@@ -107,7 +122,11 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
                 "messages": [
                     {
                         "role": "user",
-                        "content": f"<image>{q}" if "<image>" not in str(q) else q,
+                        "content": (
+                            f"<image>{q}"
+                            if img is not None and "<image>" not in str(q)
+                            else q
+                        ),
                     },
                     {"role": "assistant", "content": a},
                 ]
@@ -174,7 +193,6 @@ def main(args):
         raise ValueError(f"Model type {model_type} not supported for training")
 
     config = model.config.__dict__
-    image_processor = load_image_processor(args.model_path)
 
     # Load and prepare dataset
     logger.info(f"{Colors.HEADER}Loading dataset from {args.dataset}{Colors.ENDC}")
@@ -202,7 +220,6 @@ def main(args):
         dataset,
         config,
         processor,
-        image_processor=image_processor,
         image_resize_shape=args.image_resize_shape,
     )
 

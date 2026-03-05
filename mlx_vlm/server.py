@@ -3,6 +3,7 @@ import asyncio
 import gc
 import json
 import os
+import time
 import traceback
 import uuid
 from datetime import datetime
@@ -11,6 +12,7 @@ from typing import Any, List, Literal, Optional, Tuple, Union
 import mlx.core as mx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
 from pydantic import BaseModel, ConfigDict, Field
@@ -19,6 +21,7 @@ from typing_extensions import Required, TypeAlias, TypedDict
 from .generate import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL_PATH,
+    DEFAULT_QUANTIZED_KV_START,
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
@@ -29,10 +32,58 @@ from .prompt_utils import apply_chat_template
 from .utils import load
 from .version import __version__
 
+ALLOWED_TEMPLATE_KWARGS = {
+    "enable_thinking",
+    "thinking_budget",
+    "thinking_start_token",
+    "thinking_end_token",
+}
+
+
+def get_quantized_kv_bits(model: str):
+    kv_bits = int(os.environ.get("KV_BITS", 0))
+    if kv_bits == 0:
+        return None
+    if "qat" in model:
+        print(
+            f"Model {model} is quantization aware, (Rotating)KVCache cache will not be quantized to {kv_bits} bits, use --max-kv-size [tokens] instead."
+        )
+        return None
+    return kv_bits
+
+
+def get_kv_group_size():
+    return int(os.environ.get("KV_GROUP_SIZE", 64))
+
+
+def get_max_kv_size(model: str):
+    max_kv_tokens = int(os.environ.get("MAX_KV_SIZE", 0))
+    if max_kv_tokens == 0:
+        return None
+    if get_quantized_kv_bits(model) != None:
+        print(
+            f"Model {model} uses QuantizedKVCache cache, can't set max KV size, use --kv-bits [bits] instead."
+        )
+        return None
+    return max_kv_tokens
+
+
+def get_quantized_kv_start():
+    return int(os.environ.get("QUANTIZED_KV_START", DEFAULT_QUANTIZED_KV_START))
+
+
 app = FastAPI(
     title="MLX-VLM Inference API",
     description="API for using Vision Language Models (VLMs) and Omni Models (Vision, Audio and Video support) with MLX.",
     version=__version__,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 MAX_IMAGES = 10  # Maximum number of images to process at once
@@ -448,11 +499,15 @@ class ChatResponse(BaseModel):
 
 
 class ChatStreamChoice(BaseModel):
+    index: int = 0
     finish_reason: Optional[str] = None
     delta: ChatMessage
 
 
 class ChatStreamChunk(BaseModel):
+    id: str
+    object: str = "chat.completion.chunk"
+    created: int
     model: str
     choices: List[ChatStreamChoice]
     usage: Optional[UsageStats]
@@ -476,6 +531,7 @@ class ModelsResponse(BaseModel):
 
 
 @app.post("/responses")
+@app.post("/v1/responses", include_in_schema=False)
 async def responses_endpoint(request: Request):
     """
     OpenAI-compatible endpoint for generating text based on a prompt and optional images.
@@ -607,9 +663,22 @@ async def responses_endpoint(request: Request):
             print("no input")
             raise HTTPException(status_code=400, detail="Missing input.")
 
+        template_kwargs = {
+            k: v
+            for k, v in (openai_request.__pydantic_extra__ or {}).items()
+            if k in ALLOWED_TEMPLATE_KWARGS
+        }
+
         formatted_prompt = apply_chat_template(
-            processor, config, chat_messages, num_images=len(images)
+            processor,
+            config,
+            chat_messages,
+            num_images=len(images),
+            **template_kwargs,
         )
+
+        # Forward extra kwargs to stream_generate/generate
+        kwargs.update(template_kwargs)
 
         generated_at = datetime.now().timestamp()
         response_id = f"resp_{uuid.uuid4().hex}"
@@ -671,6 +740,10 @@ async def responses_endpoint(request: Request):
                         temperature=openai_request.temperature,
                         max_tokens=openai_request.max_output_tokens,
                         top_p=openai_request.top_p,
+                        kv_bits=get_quantized_kv_bits(openai_request.model),
+                        kv_group_size=get_kv_group_size(),
+                        max_kv_size=get_max_kv_size(openai_request.model),
+                        quantized_kv_start=get_quantized_kv_start(),
                         **kwargs,
                     )
 
@@ -736,7 +809,15 @@ async def responses_endpoint(request: Request):
                     gc.collect()
                     print("Stream finished, cleared cache.")
 
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
         else:
             # Non-streaming response
@@ -750,6 +831,10 @@ async def responses_endpoint(request: Request):
                     temperature=openai_request.temperature,
                     max_tokens=openai_request.max_output_tokens,
                     top_p=openai_request.top_p,
+                    kv_bits=get_quantized_kv_bits(openai_request.model),
+                    kv_group_size=get_kv_group_size(),
+                    max_kv_size=get_max_kv_size(openai_request.model),
+                    quantized_kv_start=get_quantized_kv_start(),
                     verbose=False,  # stats are passed in the response
                     **kwargs,
                 )
@@ -812,6 +897,7 @@ async def responses_endpoint(request: Request):
 @app.post(
     "/chat/completions", response_model=None
 )  # Response model handled dynamically based on stream flag
+@app.post("/v1/chat/completions", response_model=None, include_in_schema=False)
 async def chat_completions_endpoint(request: ChatRequest):
     """
     Generate text based on a prompt and optional images.
@@ -837,8 +923,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                 if len(request.resize_shape) == 1
                 else tuple(request.resize_shape)
             )
-
-        chat_messages = request.messages
 
         images = []
         audio = []
@@ -866,13 +950,23 @@ async def chat_completions_endpoint(request: ChatRequest):
                     {"role": message.role, "content": text_content}
                 )
 
+        template_kwargs = {
+            k: v
+            for k, v in (request.__pydantic_extra__ or {}).items()
+            if k in ALLOWED_TEMPLATE_KWARGS
+        }
+
         formatted_prompt = apply_chat_template(
             processor,
             config,
             processed_messages,
             num_images=len(images),
             num_audios=len(audio),
+            **template_kwargs,
         )
+
+        # Forward extra kwargs to stream_generate/generate
+        kwargs.update(template_kwargs)
 
         if request.stream:
             # Streaming response
@@ -889,9 +983,14 @@ async def chat_completions_endpoint(request: ChatRequest):
                         temperature=request.temperature,
                         max_tokens=request.max_tokens,
                         top_p=request.top_p,
+                        kv_bits=get_quantized_kv_bits(request.model),
+                        kv_group_size=get_kv_group_size(),
+                        max_kv_size=get_max_kv_size(request.model),
+                        quantized_kv_start=get_quantized_kv_start(),
                         **kwargs,
                     )
 
+                    request_id = f"chatcmpl-{uuid.uuid4()}"
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
                             print("Warning: Received unexpected chunk format:", chunk)
@@ -914,7 +1013,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                             )
                         ]
                         chunk_data = ChatStreamChunk(
-                            model=request.model, usage=usage_stats, choices=choices
+                            id=request_id,
+                            created=int(time.time()),
+                            model=request.model,
+                            usage=usage_stats,
+                            choices=choices,
                         )
 
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
@@ -930,9 +1033,15 @@ async def chat_completions_endpoint(request: ChatRequest):
                         )
                     ]
                     chunk_data = ChatStreamChunk(
-                        model=request.model, usage=usage_stats, choices=choices
+                        id=request_id,
+                        created=int(time.time()),
+                        model=request.model,
+                        usage=usage_stats,
+                        choices=choices,
                     )
                     yield f"data: {chunk_data.model_dump_json()}\n\n"
+
+                    yield f"data: [DONE]\n\n"
 
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
@@ -945,7 +1054,15 @@ async def chat_completions_endpoint(request: ChatRequest):
                     gc.collect()
                     print("Stream finished, cleared cache.")
 
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
         else:
             # Non-streaming response
@@ -960,6 +1077,10 @@ async def chat_completions_endpoint(request: ChatRequest):
                     temperature=request.temperature,
                     max_tokens=request.max_tokens,
                     top_p=request.top_p,
+                    kv_bits=get_quantized_kv_bits(request.model),
+                    kv_group_size=get_kv_group_size(),
+                    max_kv_size=get_max_kv_size(request.model),
+                    quantized_kv_start=get_quantized_kv_start(),
                     verbose=False,  # Keep API output clean
                     **kwargs,
                 )
@@ -1011,6 +1132,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
 
 @app.get("/models", response_model=ModelsResponse)
+@app.get("/v1/models", response_model=ModelsResponse, include_in_schema=False)
 def models_endpoint():
     """
     Return list of locally downloaded MLX models.
@@ -1095,9 +1217,38 @@ def main():
         action="store_true",
         help="Trust remote code when loading models from Hugging Face Hub.",
     )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=0,
+        help="Number of bits for KV cache quantization.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization.",
+    )
+    parser.add_argument(
+        "--max-kv-size",
+        type=int,
+        default=0,
+        help="Maximum KV size for the prompt cache (tokens).",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=DEFAULT_QUANTIZED_KV_START,
+        help="Start index (of token) for the quantized KV cache.",
+    )
     args = parser.parse_args()
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
+    os.environ["KV_BITS"] = str(args.kv_bits)
+    os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
+    os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
+    os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+
     uvicorn.run(
         "mlx_vlm.server:app", host=args.host, port=args.port, workers=1, reload=True
     )  # reload=True for development to automatically restart on code changes.
