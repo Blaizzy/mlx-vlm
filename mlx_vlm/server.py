@@ -35,6 +35,13 @@ from .prompt_utils import apply_chat_template
 from .utils import load
 from .version import __version__
 
+ALLOWED_TEMPLATE_KWARGS = {
+    "enable_thinking",
+    "thinking_budget",
+    "thinking_start_token",
+    "thinking_end_token",
+}
+
 
 def get_quantized_kv_bits(model: str):
     kv_bits = int(os.environ.get("KV_BITS", 0))
@@ -701,9 +708,22 @@ async def responses_endpoint(request: Request):
             print("no input")
             raise HTTPException(status_code=400, detail="Missing input.")
 
+        template_kwargs = {
+            k: v
+            for k, v in (openai_request.__pydantic_extra__ or {}).items()
+            if k in ALLOWED_TEMPLATE_KWARGS
+        }
+
         formatted_prompt = apply_chat_template(
-            processor, config, chat_messages, num_images=len(images)
+            processor,
+            config,
+            chat_messages,
+            num_images=len(images),
+            **template_kwargs,
         )
+
+        # Forward extra kwargs to stream_generate/generate
+        kwargs.update(template_kwargs)
 
         generated_at = datetime.now().timestamp()
         response_id = f"resp_{uuid.uuid4().hex}"
@@ -949,8 +969,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                 else tuple(request.resize_shape)
             )
 
-        chat_messages = request.messages
-
         images = []
         audio = []
         processed_messages = []
@@ -977,6 +995,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     {"role": message.role, "content": text_content}
                 )
 
+<<<<<<< tool_calls
         tools = None
         if hasattr(request, "tools"):
             tools = request.tools
@@ -991,6 +1010,13 @@ async def chat_completions_endpoint(request: ChatRequest):
                 tool_module = importlib.import_module(
                     f"mlx_lm.tool_parsers.{tool_parser_type}"
                 )
+=======
+        template_kwargs = {
+            k: v
+            for k, v in (request.__pydantic_extra__ or {}).items()
+            if k in ALLOWED_TEMPLATE_KWARGS
+        }
+>>>>>>> main
 
         formatted_prompt = apply_chat_template(
             processor,
@@ -998,8 +1024,15 @@ async def chat_completions_endpoint(request: ChatRequest):
             processed_messages,
             num_images=len(images),
             num_audios=len(audio),
+<<<<<<< tool_calls
             tools=tools,
+=======
+            **template_kwargs,
+>>>>>>> main
         )
+
+        # Forward extra kwargs to stream_generate/generate
+        kwargs.update(template_kwargs)
 
         if request.stream:
             # Streaming response

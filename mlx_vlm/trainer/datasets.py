@@ -35,13 +35,11 @@ class VisionDataset:
         hf_dataset,
         config,
         processor,
-        image_processor=None,
         image_resize_shape=None,
     ):
         self.dataset = hf_dataset
         self.processor = processor
         self.config = config
-        self.image_processor = image_processor
         self.image_resize_shape = image_resize_shape
 
     def __len__(self):

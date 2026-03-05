@@ -15,6 +15,7 @@ from mlx_vlm.generate import (
     GenerationResult,
     _left_pad_prompts,
 )
+from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
 
@@ -896,6 +897,83 @@ class TestEdgeCases:
 
         assert response.texts == []
         assert response.image_sizes is None
+
+
+# ============================================================================
+# Tests for ThinkingBudgetCriteria
+# ============================================================================
+
+
+class FakeTokenizer:
+    """Mock tokenizer that maps token strings to fixed IDs."""
+
+    TOKEN_MAP = {"<think>": 99, "</think>": 100, "\n": 10}
+
+    def encode(self, text, add_special_tokens=False):
+        if text in self.TOKEN_MAP:
+            return [self.TOKEN_MAP[text]]
+        return [0]
+
+
+class TestThinkingBudgetCriteria:
+    """Tests for ThinkingBudgetCriteria class."""
+
+    def test_thinking_model(self):
+        """Test thinking budget for thinking models (enable_thinking=True)."""
+        criteria = ThinkingBudgetCriteria(
+            tokenizer=FakeTokenizer(),
+            thinking_budget=5,
+            thinking_end_token="</think>",
+            thinking_start_token="<think>",
+            enable_thinking=True,
+        )
+
+        # enable_thinking=True — already in thinking mode
+        assert criteria.in_thinking is True
+
+        # Tokens within budget return None
+        for i in range(5):
+            assert criteria(50 + i) is None
+        assert criteria.thinking_token_count == 5
+        assert criteria.budget_exceeded is False
+
+        # Exceeding budget forces \n then </think>
+        assert criteria(60) == 10  # \n
+        assert criteria(60) == 100  # </think>
+        assert criteria.budget_exceeded is True
+
+        # End token resets state
+        assert criteria(100) is None
+        assert criteria.in_thinking is False
+        assert criteria.budget_exceeded is False
+
+    def test_non_thinking_model(self):
+        """Test thinking budget for non-thinking models (enable_thinking=False)."""
+        criteria = ThinkingBudgetCriteria(
+            tokenizer=FakeTokenizer(),
+            thinking_budget=3,
+            thinking_end_token="</think>",
+            thinking_start_token="<think>",
+            enable_thinking=False,
+        )
+
+        # Not in thinking initially
+        assert criteria.in_thinking is False
+
+        # Tokens are not counted — model is not in thinking mode
+        criteria(50)
+        criteria(51)
+        assert criteria.thinking_token_count == 0
+
+        # Start token does NOT enter thinking mode when enable_thinking=False
+        assert criteria(99) is None
+        assert criteria.in_thinking is False
+
+        # Tokens still not counted
+        for i in range(3):
+            assert criteria(50 + i) is None
+        assert criteria.thinking_token_count == 0
+        assert criteria.budget_exceeded is False
 
 
 if __name__ == "__main__":
