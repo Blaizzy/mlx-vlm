@@ -919,7 +919,7 @@ class TestThinkingBudgetCriteria:
     """Tests for ThinkingBudgetCriteria class."""
 
     def test_thinking_model(self):
-        """Test thinking budget for thinking models (enable_thinking=True, implicit start)."""
+        """Test thinking budget for thinking models (enable_thinking=True)."""
         criteria = ThinkingBudgetCriteria(
             tokenizer=FakeTokenizer(),
             thinking_budget=5,
@@ -928,9 +928,8 @@ class TestThinkingBudgetCriteria:
             enable_thinking=True,
         )
 
-        # enable_thinking uses implicit start — already in thinking mode
+        # enable_thinking=True — already in thinking mode
         assert criteria.in_thinking is True
-        assert criteria.thinking_start_token_id is None
 
         # Tokens within budget return None
         for i in range(5):
@@ -949,44 +948,32 @@ class TestThinkingBudgetCriteria:
         assert criteria.budget_exceeded is False
 
     def test_non_thinking_model(self):
-        """Test thinking budget for non-thinking models (explicit start token)."""
+        """Test thinking budget for non-thinking models (enable_thinking=False)."""
         criteria = ThinkingBudgetCriteria(
             tokenizer=FakeTokenizer(),
             thinking_budget=3,
             thinking_end_token="</think>",
             thinking_start_token="<think>",
+            enable_thinking=False,
         )
 
         # Not in thinking initially
         assert criteria.in_thinking is False
 
-        # Tokens before <think> are not counted
+        # Tokens are not counted — model is not in thinking mode
         criteria(50)
         criteria(51)
         assert criteria.thinking_token_count == 0
 
-        # Start token enters thinking mode
+        # Start token does NOT enter thinking mode when enable_thinking=False
         assert criteria(99) is None
-        assert criteria.in_thinking is True
+        assert criteria.in_thinking is False
 
-        # Tokens within budget return None
+        # Tokens still not counted
         for i in range(3):
             assert criteria(50 + i) is None
-        assert criteria.thinking_token_count == 3
-
-        # Exceeding budget forces \n then </think>
-        assert criteria(60) == 10  # \n
-        assert criteria(60) == 100  # </think>
-
-        # No more forced tokens
-        assert criteria(60) is None
-
-        # Tokens after </think> are not counted
-        criteria(100)
-        assert criteria.in_thinking is False
-        count_before = criteria.thinking_token_count
-        criteria(52)
-        assert criteria.thinking_token_count == count_before
+        assert criteria.thinking_token_count == 0
+        assert criteria.budget_exceeded is False
 
 
 if __name__ == "__main__":

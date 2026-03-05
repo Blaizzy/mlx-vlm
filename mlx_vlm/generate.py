@@ -439,11 +439,8 @@ def generate_step(
         if n % 256 == 0:
             mx.clear_cache()
 
-        next_y = (
-            thinking_budget_criteria.apply_forced_token(next_y)
-            if thinking_budget_criteria is not None
-            else None
-        )
+        if thinking_budget_criteria is not None:
+            next_y = thinking_budget_criteria.apply_forced_token(next_y)
         y, logprobs = next_y, next_logprobs
         n += 1
 
