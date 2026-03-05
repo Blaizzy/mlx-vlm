@@ -657,9 +657,7 @@ async def responses_endpoint(request: Request):
                 for message in openai_request.input:
                     if isinstance(message, ChatMessage):
                         if message.content is None:
-                            chat_messages.append(
-                                {"role": message.role, "content": ""}
-                            )
+                            chat_messages.append({"role": message.role, "content": ""})
                         elif isinstance(message.content, str):
                             chat_messages.append(
                                 {"role": message.role, "content": message.content}
@@ -982,9 +980,7 @@ async def chat_completions_endpoint(request: ChatRequest):
         processed_messages = []
         for message in request.messages:
             if message.content is None:
-                processed_messages.append(
-                    {"role": message.role, "content": ""}
-                )
+                processed_messages.append({"role": message.role, "content": ""})
             elif isinstance(message.content, str):
                 processed_messages.append(
                     {"role": message.role, "content": message.content}
