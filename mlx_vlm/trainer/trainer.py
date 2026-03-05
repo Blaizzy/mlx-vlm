@@ -15,6 +15,14 @@ from tqdm import tqdm
 from .utils import Colors, grad_checkpoint, save_adapter
 
 
+def _squeeze_leading_batch_dim(value):
+    if isinstance(value, mx.array) and value.ndim > 0 and value.shape[0] == 1:
+        return value[0]
+    if isinstance(value, np.ndarray) and value.ndim > 0 and value.shape[0] == 1:
+        return value[0]
+    return value
+
+
 @dataclass
 class TrainingArgs:
     batch_size: int = field(default=4, metadata={"help": "Minibatch size."})
@@ -84,7 +92,13 @@ def vision_language_loss_fn(
     if train_on_completions:
         weight_mask = mx.ones_like(attention_mask)
 
-        assistant_response_index = np.where(input_ids == assistant_id)[1]
+        assistant_response_index = np.full((batch_size,), -1, dtype=np.int32)
+        input_ids_np = np.array(input_ids)
+        for row_idx, row in enumerate(input_ids_np):
+            positions = np.where(row == assistant_id)[0]
+            if positions.size > 0:
+                assistant_response_index[row_idx] = positions[0]
+
         range_matrix = mx.repeat(
             mx.expand_dims(mx.arange(seq_length), 0), batch_size, axis=0
         )
@@ -187,13 +201,32 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
 
             pixel_values_batch = None
             if "pixel_values" in items[0] and items[0]["pixel_values"] is not None:
-                pixel_values_batch = mx.stack([item["pixel_values"] for item in items])
+                pixel_values_batch = mx.stack(
+                    [_squeeze_leading_batch_dim(item["pixel_values"]) for item in items]
+                )
 
-            yield {
+            batch = {
                 "input_ids": mx.array(input_ids_batch),
                 "attention_mask": mx.array(attention_mask_batch),
                 "pixel_values": pixel_values_batch,
             }
+
+            extra_keys = [
+                k
+                for k in items[0]
+                if k not in ("input_ids", "attention_mask", "pixel_values")
+            ]
+            for k in extra_keys:
+                vals = [_squeeze_leading_batch_dim(item[k]) for item in items]
+                if isinstance(vals[0], mx.array):
+                    try:
+                        batch[k] = mx.stack(vals)
+                    except Exception:
+                        batch[k] = vals[0]
+                else:
+                    batch[k] = vals[0]
+
+            yield batch
         if not train:
             break
 
@@ -273,7 +306,10 @@ def train(
     """
     # Set memory limit if using Metal
     if mx.metal.is_available():
-        mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
+        device_info = mx.device_info()
+        max_working_set_size = device_info.get("max_recommended_working_set_size")
+        if max_working_set_size is not None:
+            mx.set_wired_limit(max_working_set_size)
     print(f"{Colors.HEADER}Starting training..., iterations: {args.iters}{Colors.ENDC}")
 
     # Initialize distributed training
