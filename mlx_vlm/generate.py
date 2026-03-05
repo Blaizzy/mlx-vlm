@@ -1367,11 +1367,12 @@ def main():
     if args.processor_kwargs:
         kwargs.update(args.processor_kwargs)
 
-    # Add thinking budget kwargs
+    # Add thinking kwargs
+    if args.enable_thinking:
+        kwargs["enable_thinking"] = True
     if args.thinking_budget is not None:
         kwargs["thinking_budget"] = args.thinking_budget
         kwargs["thinking_end_token"] = args.thinking_end_token
-        kwargs["enable_thinking"] = args.enable_thinking
         if args.thinking_start_token is not None:
             kwargs["thinking_start_token"] = args.thinking_start_token
 
