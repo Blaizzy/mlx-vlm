@@ -15,6 +15,7 @@ from mlx_vlm.generate import (
     GenerationResult,
     _left_pad_prompts,
 )
+from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
 
@@ -896,6 +897,217 @@ class TestEdgeCases:
 
         assert response.texts == []
         assert response.image_sizes is None
+
+
+# ============================================================================
+# Tests for ThinkingBudgetCriteria
+# ============================================================================
+
+
+class TestThinkingBudgetCriteria:
+    """Tests for ThinkingBudgetCriteria class."""
+
+    def test_explicit_start_token(self):
+        """Test thinking budget with explicit start token."""
+        criteria = ThinkingBudgetCriteria(
+            eos_token_ids=[2],
+            thinking_budget=5,
+            thinking_end_token_id=100,
+            thinking_start_token_id=99,
+        )
+
+        # Should not be in thinking initially
+        assert criteria.in_thinking is False
+        assert criteria.thinking_token_count == 0
+
+        # Process start token
+        criteria.process_token(99)
+        assert criteria.in_thinking is True
+
+        # Process thinking tokens within budget
+        for i in range(5):
+            criteria.process_token(50 + i)
+
+        assert criteria.thinking_token_count == 5
+        assert criteria.should_force_end_token() is False
+
+        # One more token exceeds budget
+        criteria.process_token(60)
+        assert criteria.thinking_token_count == 6
+        assert criteria.should_force_end_token() is True
+        assert criteria.get_forced_token_id() == 100
+
+    def test_implicit_start(self):
+        """Test thinking budget with implicit start (no start token)."""
+        criteria = ThinkingBudgetCriteria(
+            eos_token_ids=[2],
+            thinking_budget=3,
+            thinking_end_token_id=100,
+            thinking_start_token_id=None,
+        )
+
+        # Should be in thinking immediately
+        assert criteria.in_thinking is True
+
+        # Process 3 tokens within budget
+        for i in range(3):
+            criteria.process_token(50 + i)
+
+        assert criteria.thinking_token_count == 3
+        assert criteria.should_force_end_token() is False
+
+        # Next token exceeds budget
+        criteria.process_token(60)
+        assert criteria.budget_exceeded is True
+        assert criteria.should_force_end_token() is True
+
+    def test_end_token_resets_state(self):
+        """Test that processing end token resets thinking state."""
+        criteria = ThinkingBudgetCriteria(
+            eos_token_ids=[2],
+            thinking_budget=3,
+            thinking_end_token_id=100,
+            thinking_start_token_id=99,
+        )
+
+        # Enter thinking and exceed budget
+        criteria.process_token(99)
+        for i in range(4):
+            criteria.process_token(50 + i)
+
+        assert criteria.budget_exceeded is True
+
+        # End token resets
+        criteria.process_token(100)
+        assert criteria.in_thinking is False
+        assert criteria.budget_exceeded is False
+
+    def test_eos_check_still_works(self):
+        """Test that EOS token checking still works via __call__."""
+        criteria = ThinkingBudgetCriteria(
+            eos_token_ids=[2, 3],
+            thinking_budget=10,
+            thinking_end_token_id=100,
+            thinking_start_token_id=99,
+        )
+
+        # Non-EOS token should not stop
+        assert criteria(mx.array(50)) is False
+
+        # EOS token should stop
+        assert criteria(mx.array(2)) is True
+
+    def test_call_processes_token(self):
+        """Test that __call__ also processes tokens for thinking state."""
+        criteria = ThinkingBudgetCriteria(
+            eos_token_ids=[2],
+            thinking_budget=2,
+            thinking_end_token_id=100,
+            thinking_start_token_id=None,
+        )
+
+        # __call__ should process the token and update state
+        criteria(mx.array(50))
+        assert criteria.thinking_token_count == 1
+
+        criteria(mx.array(51))
+        assert criteria.thinking_token_count == 2
+
+        criteria(mx.array(52))
+        assert criteria.thinking_token_count == 3
+        assert criteria.budget_exceeded is True
+
+    def test_reset_thinking_state(self):
+        """Test resetting thinking state."""
+        criteria = ThinkingBudgetCriteria(
+            eos_token_ids=[2],
+            thinking_budget=3,
+            thinking_end_token_id=100,
+            thinking_start_token_id=99,
+        )
+
+        criteria.process_token(99)
+        criteria.process_token(50)
+        criteria.process_token(51)
+
+        assert criteria.in_thinking is True
+        assert criteria.thinking_token_count == 2
+
+        criteria.reset_thinking_state()
+
+        assert criteria.in_thinking is False
+        assert criteria.thinking_token_count == 0
+        assert criteria.budget_exceeded is False
+
+    def test_get_forced_token_id_when_not_exceeded(self):
+        """Test that get_forced_token_id returns None when budget not exceeded."""
+        criteria = ThinkingBudgetCriteria(
+            eos_token_ids=[2],
+            thinking_budget=5,
+            thinking_end_token_id=100,
+            thinking_start_token_id=None,
+        )
+
+        assert criteria.get_forced_token_id() is None
+
+    def test_forced_sequence_with_newline(self):
+        """Test that forcing produces \\n then end token when tokenizer is provided."""
+
+        class FakeTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                if text == "\n":
+                    return [10]
+                return [0]
+
+        criteria = ThinkingBudgetCriteria(
+            eos_token_ids=[2],
+            thinking_budget=2,
+            thinking_end_token_id=100,
+            thinking_start_token_id=None,
+            tokenizer=FakeTokenizer(),
+        )
+
+        # Exceed budget
+        for i in range(3):
+            criteria.process_token(50 + i)
+
+        assert criteria.budget_exceeded is True
+
+        # First forced token should be newline
+        assert criteria.get_forced_token_id() == 10
+        # Second forced token should be end token
+        assert criteria.get_forced_token_id() == 100
+        # No more forced tokens
+        assert criteria.get_forced_token_id() is None
+
+
+
+    def test_tokens_outside_thinking_not_counted(self):
+        """Test that tokens outside thinking blocks are not counted."""
+        criteria = ThinkingBudgetCriteria(
+            eos_token_ids=[2],
+            thinking_budget=3,
+            thinking_end_token_id=100,
+            thinking_start_token_id=99,
+        )
+
+        # Tokens before start should not be counted
+        criteria.process_token(50)
+        criteria.process_token(51)
+        assert criteria.thinking_token_count == 0
+
+        # Start thinking, generate 2 tokens, end thinking
+        criteria.process_token(99)
+        criteria.process_token(50)
+        criteria.process_token(51)
+        criteria.process_token(100)
+
+        assert criteria.thinking_token_count == 2
+        assert criteria.in_thinking is False
+
+        # Tokens after end should not be counted
+        criteria.process_token(52)
+        assert criteria.thinking_token_count == 2
 
 
 if __name__ == "__main__":

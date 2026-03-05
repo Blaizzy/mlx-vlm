@@ -17,7 +17,13 @@ from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
-from .utils import StoppingCriteria, group_images_by_shape, load, prepare_inputs
+from .utils import (
+    StoppingCriteria,
+    ThinkingBudgetCriteria,
+    group_images_by_shape,
+    load,
+    prepare_inputs,
+)
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
@@ -168,6 +174,30 @@ def parse_arguments():
         "Lower values reduce peak memory usage but may be slower. "
         "Try 512 or 256 if you hit GPU memory errors during prefill.",
     )
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="Enable thinking mode in the chat template (e.g. for Qwen3.5).",
+    )
+    parser.add_argument(
+        "--thinking-budget",
+        type=int,
+        default=None,
+        help="Maximum number of thinking tokens before forcing the end-of-thinking token.",
+    )
+    parser.add_argument(
+        "--thinking-start-token",
+        type=str,
+        default=None,
+        help="Token that marks the start of a thinking block (e.g. '<think>'). "
+        "If not set, thinking is assumed to start immediately.",
+    )
+    parser.add_argument(
+        "--thinking-end-token",
+        type=str,
+        default="</think>",
+        help="Token that marks the end of a thinking block (default: '</think>').",
+    )
 
     return parser.parse_args()
 
@@ -302,6 +332,8 @@ def generate_step(
     if logits_processors is not None:
         processors.extend(logits_processors)
 
+    stopping_criteria = kwargs.pop("stopping_criteria", None)
+
     y = input_ids
     tokens = mx.array([], dtype=input_ids.dtype)
 
@@ -404,6 +436,18 @@ def generate_step(
             break
 
         yield y.item(), logprobs
+
+        # After yield, stream_generate has updated stopping_criteria state.
+        # Force the thinking end token if budget is exceeded.
+        if (
+            stopping_criteria is not None
+            and hasattr(stopping_criteria, "should_force_end_token")
+            and stopping_criteria.should_force_end_token()
+        ):
+            forced_id = stopping_criteria.get_forced_token_id()
+            if forced_id is not None:
+                next_y = mx.array([forced_id])
+
         if n % 256 == 0:
             mx.clear_cache()
         y, logprobs = next_y, next_logprobs
@@ -438,6 +482,36 @@ def stream_generate(
           containing the generated text, tokens, and statistics.
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+    # Set up thinking budget criteria if requested
+    thinking_budget = kwargs.pop("thinking_budget", None)
+    thinking_end_token = kwargs.pop("thinking_end_token", "</think>")
+    thinking_start_token = kwargs.pop("thinking_start_token", None)
+    enable_thinking = kwargs.pop("enable_thinking", False)
+
+    if thinking_budget is not None:
+        thinking_end_token_id = tokenizer.encode(
+            thinking_end_token, add_special_tokens=False
+        )[-1]
+
+        # When enable_thinking is True, the prompt already contains the start
+        # token (e.g. <think>\n) so generation begins inside a thinking block.
+        # Use implicit start so the criteria tracks from the first token.
+        thinking_start_token_id = None
+        if thinking_start_token is not None and not enable_thinking:
+            thinking_start_token_id = tokenizer.encode(
+                thinking_start_token, add_special_tokens=False
+            )[-1]
+
+        thinking_criteria = ThinkingBudgetCriteria(
+            eos_token_ids=tokenizer.stopping_criteria.eos_token_ids,
+            thinking_budget=thinking_budget,
+            thinking_end_token_id=thinking_end_token_id,
+            thinking_start_token_id=thinking_start_token_id,
+            tokenizer=tokenizer,
+        )
+        tokenizer.stopping_criteria = thinking_criteria
+        kwargs["stopping_criteria"] = thinking_criteria
 
     # Skip special tokens
     skip_special_tokens = kwargs.pop("skip_special_tokens", False)
@@ -574,6 +648,7 @@ def generate(
 
     eos_tokens = kwargs.get("eos_tokens", None)
     stopping_criteria = kwargs.get("stopping_criteria", None)
+    has_thinking_budget = kwargs.get("thinking_budget", None) is not None
 
     # Get the tokenizer
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
@@ -592,7 +667,8 @@ def generate(
             raise ValueError(
                 "stopping_criteria must be an instance of StoppingCriteria or a callable"
             )
-    else:
+    elif not has_thinking_budget:
+        # Skip reset when thinking_budget is set; stream_generate will set up the criteria
         tokenizer.stopping_criteria.reset(model.config.eos_token_id)
 
     for response in stream_generate(model, processor, prompt, image, audio, **kwargs):
@@ -1262,8 +1338,17 @@ def main():
     num_audios = (
         1 if args.audio is not None else 0
     )  # TODO: Support multiple audio files
+    chat_template_kwargs = {}
+    if args.enable_thinking:
+        chat_template_kwargs["enable_thinking"] = True
+
     prompt = apply_chat_template(
-        processor, config, prompt, num_images=num_images, num_audios=num_audios
+        processor,
+        config,
+        prompt,
+        num_images=num_images,
+        num_audios=num_audios,
+        **chat_template_kwargs,
     )
 
     kwargs = {}
@@ -1294,13 +1379,23 @@ def main():
     if args.processor_kwargs:
         kwargs.update(args.processor_kwargs)
 
+    # Add thinking budget kwargs
+    if args.thinking_budget is not None:
+        kwargs["thinking_budget"] = args.thinking_budget
+        kwargs["thinking_end_token"] = args.thinking_end_token
+        kwargs["enable_thinking"] = args.enable_thinking
+        if args.thinking_start_token is not None:
+            kwargs["thinking_start_token"] = args.thinking_start_token
+
     if args.chat:
         chat = []
         if args.system:
             chat.append({"role": "system", "content": args.system})
         while user := input("User:"):
             chat.append({"role": "user", "content": user})
-            prompt = apply_chat_template(processor, config, chat, num_images=num_images)
+            prompt = apply_chat_template(
+                processor, config, chat, num_images=num_images, **chat_template_kwargs
+            )
             response = ""
             print("Assistant:", end="")
             stream_kwargs = {

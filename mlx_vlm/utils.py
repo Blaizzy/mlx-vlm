@@ -1254,6 +1254,87 @@ class StoppingCriteria:
         return input_ids in self.eos_token_ids
 
 
+class ThinkingBudgetCriteria(StoppingCriteria):
+    """
+    Stopping criteria that enforces a budget on thinking tokens.
+
+    Tracks tokens within thinking blocks (between start and end tokens) and
+    forces a closing sequence (e.g. ``\\n</think>``) when budget is exceeded.
+    """
+
+    def __init__(
+        self,
+        eos_token_ids: List[int],
+        thinking_budget: int,
+        thinking_end_token_id: int,
+        thinking_start_token_id: Optional[int] = None,
+        tokenizer=None,
+    ):
+        super().__init__(eos_token_ids, tokenizer)
+
+        self.thinking_budget = thinking_budget
+        self.thinking_start_token_id = thinking_start_token_id
+        self.thinking_end_token_id = thinking_end_token_id
+
+        # Build the forced closing sequence: \n followed by the end token
+        self._forced_sequence: List[int] = []
+        if tokenizer is not None:
+            newline_ids = tokenizer.encode("\n", add_special_tokens=False)
+            if newline_ids:
+                self._forced_sequence.append(newline_ids[-1])
+        self._forced_sequence.append(thinking_end_token_id)
+        self._forced_index = 0
+
+        # Start immediately if no start token
+        self.in_thinking = thinking_start_token_id is None
+        self.thinking_token_count = 0
+        self.budget_exceeded = False
+
+    def reset_thinking_state(self):
+        """Reset thinking state between generations."""
+        self.in_thinking = self.thinking_start_token_id is None
+        self.thinking_token_count = 0
+        self.budget_exceeded = False
+        self._forced_index = 0
+
+    def should_force_end_token(self) -> bool:
+        """Check if we should force the next token in the closing sequence."""
+        return self.budget_exceeded
+
+    def get_forced_token_id(self) -> Optional[int]:
+        """Get the next token ID to force from the closing sequence."""
+        if self.budget_exceeded and self._forced_index < len(self._forced_sequence):
+            token_id = self._forced_sequence[self._forced_index]
+            self._forced_index += 1
+            return token_id
+        return None
+
+    def process_token(self, token_id: int):
+        """Process a generated token and update thinking state."""
+        if (
+            self.thinking_start_token_id is not None
+            and token_id == self.thinking_start_token_id
+        ):
+            self.in_thinking = True
+            return
+
+        if token_id == self.thinking_end_token_id:
+            self.in_thinking = False
+            self.budget_exceeded = False
+            self._forced_index = 0
+            return
+
+        if self.in_thinking:
+            self.thinking_token_count += 1
+            if self.thinking_token_count > self.thinking_budget:
+                self.budget_exceeded = True
+
+    def __call__(self, input_ids: mx.array) -> bool:
+        token_id = input_ids.item() if isinstance(input_ids, mx.array) else input_ids
+        self.process_token(token_id)
+        return super().__call__(input_ids)
+
+
 def print_array_report(t: mx.array, label: Optional[str]) -> dict:
     """
     Return a dictionary report of an MLX array similar to PyTorch's tensor representation.
