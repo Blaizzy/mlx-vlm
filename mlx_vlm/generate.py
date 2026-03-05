@@ -332,10 +332,10 @@ def generate_step(
     if logits_processors is not None:
         processors.extend(logits_processors)
 
-    stopping_criteria = kwargs.pop("stopping_criteria", None)
-
     y = input_ids
     tokens = mx.array([], dtype=input_ids.dtype)
+
+    thinking_budget_criteria = kwargs.pop("thinking_budget_criteria", None)
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -436,20 +436,10 @@ def generate_step(
             break
 
         yield y.item(), logprobs
-
-        # After yield, stream_generate has updated stopping_criteria state.
-        # Force the thinking end token if budget is exceeded.
-        if (
-            stopping_criteria is not None
-            and hasattr(stopping_criteria, "should_force_end_token")
-            and stopping_criteria.should_force_end_token()
-        ):
-            forced_id = stopping_criteria.get_forced_token_id()
-            if forced_id is not None:
-                next_y = mx.array([forced_id])
-
         if n % 256 == 0:
             mx.clear_cache()
+
+        next_y = thinking_budget_criteria.apply_forced_token(next_y) if thinking_budget_criteria is not None else None
         y, logprobs = next_y, next_logprobs
         n += 1
 
@@ -490,28 +480,16 @@ def stream_generate(
     enable_thinking = kwargs.pop("enable_thinking", False)
 
     if thinking_budget is not None:
-        thinking_end_token_id = tokenizer.encode(
-            thinking_end_token, add_special_tokens=False
-        )[-1]
-
-        # When enable_thinking is True, the prompt already contains the start
-        # token (e.g. <think>\n) so generation begins inside a thinking block.
-        # Use implicit start so the criteria tracks from the first token.
-        thinking_start_token_id = None
-        if thinking_start_token is not None and not enable_thinking:
-            thinking_start_token_id = tokenizer.encode(
-                thinking_start_token, add_special_tokens=False
-            )[-1]
-
-        thinking_criteria = ThinkingBudgetCriteria(
-            eos_token_ids=tokenizer.stopping_criteria.eos_token_ids,
-            thinking_budget=thinking_budget,
-            thinking_end_token_id=thinking_end_token_id,
-            thinking_start_token_id=thinking_start_token_id,
+        tokenizer.thinking_budget_criteria = ThinkingBudgetCriteria(
             tokenizer=tokenizer,
+            thinking_budget=thinking_budget,
+            thinking_end_token=thinking_end_token,
+            thinking_start_token=thinking_start_token,
+            enable_thinking=enable_thinking,
         )
-        tokenizer.stopping_criteria = thinking_criteria
-        kwargs["stopping_criteria"] = thinking_criteria
+        kwargs["thinking_budget_criteria"] = tokenizer.thinking_budget_criteria
+    else:
+        tokenizer.thinking_budget_criteria = None
 
     # Skip special tokens
     skip_special_tokens = kwargs.pop("skip_special_tokens", False)
@@ -558,14 +536,19 @@ def stream_generate(
     with wired_limit(model, [generation_stream]):
         detokenizer = processor.detokenizer
         detokenizer.reset()
+        thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
+        gen = generate_step(input_ids, model, pixel_values, mask, **kwargs)
         tic = time.perf_counter()
-        for n, (token, logprobs) in enumerate(
-            generate_step(input_ids, model, pixel_values, mask, **kwargs)
-        ):
+
+        for n, (token, logprobs) in enumerate(gen):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = input_ids.size / prompt_time
                 tic = time.perf_counter()
+
+            # Check thinking budget and force token if needed
+            if thinking_criteria is not None:
+                thinking_criteria(token)
 
             # Stop generation if the token is in the eos_token_ids
             if tokenizer.stopping_criteria(token):
@@ -648,7 +631,6 @@ def generate(
 
     eos_tokens = kwargs.get("eos_tokens", None)
     stopping_criteria = kwargs.get("stopping_criteria", None)
-    has_thinking_budget = kwargs.get("thinking_budget", None) is not None
 
     # Get the tokenizer
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
@@ -667,8 +649,7 @@ def generate(
             raise ValueError(
                 "stopping_criteria must be an instance of StoppingCriteria or a callable"
             )
-    elif not has_thinking_budget:
-        # Skip reset when thinking_budget is set; stream_generate will set up the criteria
+    else:
         tokenizer.stopping_criteria.reset(model.config.eos_token_id)
 
     for response in stream_generate(model, processor, prompt, image, audio, **kwargs):
