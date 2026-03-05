@@ -32,6 +32,7 @@ from .prompt_utils import apply_chat_template
 from .utils import load
 from .version import __version__
 
+ALLOWED_TEMPLATE_KWARGS = {"enable_thinking", "thinking_budget"}
 
 def get_quantized_kv_bits(model: str):
     kv_bits = int(os.environ.get("KV_BITS", 0))
@@ -932,8 +933,10 @@ async def chat_completions_endpoint(request: ChatRequest):
                     {"role": message.role, "content": text_content}
                 )
 
-        # Forward extra request body params (e.g. enable_thinking) to the chat template
-        template_kwargs = dict(request.__pydantic_extra__) if request.__pydantic_extra__ else {}
+        template_kwargs = {
+            k: v for k, v in (request.__pydantic_extra__ or {}).items()
+            if k in ALLOWED_TEMPLATE_KWARGS
+        }
 
         formatted_prompt = apply_chat_template(
             processor,
