@@ -121,9 +121,13 @@ def convert(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
 
+    model_quant_predicate = getattr(model, "quant_predicate", None)
+
     def base_quant_predicate(path, module):
         if skip_multimodal_module(path):
             return False
+        if model_quant_predicate is not None:
+            return model_quant_predicate(path, module)
         return True
 
     if isinstance(quant_predicate, str):
@@ -180,6 +184,14 @@ def convert(
             if Path(file).name == "model.safetensors.index.json":
                 continue
             shutil.copy(file, mlx_path)
+
+    # Copy folders from the model path to the MLX path
+    for item in model_path.iterdir():
+        if item.is_dir():
+            dest = mlx_path / item.name
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(item, dest)
 
     processor.save_pretrained(mlx_path)
 
