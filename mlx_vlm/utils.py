@@ -34,6 +34,7 @@ MODEL_REMAPPING = {
     "lfm2-vl": "lfm2_vl",
     "cohere2_vision": "aya_vision",
     "jvlm": "jina_vlm",
+    "phi4-siglip": "phi4_siglip",
 }
 
 MAX_FILE_SIZE_GB = 5
