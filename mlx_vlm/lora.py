@@ -5,7 +5,7 @@ import logging
 import mlx.optimizers as optim
 from datasets import load_dataset
 
-from .trainer import (
+from .trainer.sft_trainer import (
     Colors,
     TrainingArgs,
     VisionDataset,

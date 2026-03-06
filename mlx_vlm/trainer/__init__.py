@@ -1,6 +1,6 @@
 from .datasets import VisionDataset, get_prompt
 from .lora import LoRaLayer, replace_lora_with_linear
-from .trainer import TrainingArgs, save_adapter, train
+from .sft_trainer import TrainingArgs, save_adapter, train
 from .utils import (
     Colors,
     apply_lora_layers,

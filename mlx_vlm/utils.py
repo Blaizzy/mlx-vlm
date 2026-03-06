@@ -21,7 +21,7 @@ from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
 from .tokenizer_utils import load_tokenizer
-from .trainer import apply_lora_layers
+from .trainer.sft_trainer import apply_lora_layers
 
 # Modes that support activation quantization
 ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
