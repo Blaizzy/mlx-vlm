@@ -3979,11 +3979,7 @@ class TestPhi4MM(unittest.TestCase):
 
     @staticmethod
     def _tiny_config():
-        from mlx_vlm.models.phi4mm.config import (
-            ModelConfig,
-            TextConfig,
-            VisionConfig,
-        )
+        from mlx_vlm.models.phi4mm.config import ModelConfig, TextConfig, VisionConfig
 
         text_config = TextConfig(
             model_type="phi4mm",
