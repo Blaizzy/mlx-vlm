@@ -141,6 +141,7 @@ class Thinker(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         visual_pos_masks = None
         deepstack_visual_embeds = None
+        visual_embeds_multiscale = None
 
         if input_features is not None:
             audio_features = self.get_audio_features(

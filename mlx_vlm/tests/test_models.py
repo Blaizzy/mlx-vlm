@@ -2402,6 +2402,49 @@ class TestModels(unittest.TestCase):
         self.assertEqual(hidden_states.shape[0], expected_patches)
         self.assertEqual(hidden_states.shape[1], config.vision_config.out_hidden_size)
 
+    def test_phi4_siglip(self):
+        from mlx_vlm.models import phi4_siglip
+
+        text_config = phi4_siglip.TextConfig(
+            model_type="phi4-siglip",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=1000,
+            rms_norm_eps=1e-5,
+            rope_theta=500000.0,
+            partial_rotary_factor=1.0,
+        )
+
+        vision_config = phi4_siglip.VisionConfig(
+            model_type="siglip2_vision_model",
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_channels=3,
+            patch_size=14,
+            num_patches=256,
+        )
+
+        config = phi4_siglip.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="phi4-siglip",
+            mm_hidden_size=16,
+        )
+
+        model = phi4_siglip.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
@@ -3578,6 +3621,40 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "glm_ocr")
+
+    def test_phi4_siglip_input_embeddings(self):
+        from mlx_vlm.models import phi4_siglip
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        model = phi4_siglip.Model(
+            phi4_siglip.ModelConfig(
+                text_config=phi4_siglip.TextConfig(
+                    model_type="phi4-siglip",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    vocab_size=32,
+                    rms_norm_eps=1e-5,
+                ),
+                vision_config=phi4_siglip.VisionConfig(
+                    model_type="siglip2_vision_model",
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    patch_size=14,
+                    num_patches=256,
+                ),
+                model_type="phi4-siglip",
+                mm_hidden_size=16,
+            )
+        )
+        input_ids = mx.array([[1, 2, 3, 4, 5]])
+        result = model.get_input_embeddings(input_ids)
+        self.assertIsInstance(result, InputEmbeddingsFeatures)
+        self.assertIsNotNone(result.inputs_embeds)
 
 
 class TestChunkedPrefillRoPE(unittest.TestCase):
