@@ -55,6 +55,7 @@ class ModelConfig(BaseModelConfig):
     mm_hidden_size: int = 1152
     mm_projector_type: str = "mlp2x_gelu"
     mm_vision_tower: Optional[str] = None
+    mm_vision_select_layer: int = -2
     min_num_patches: int = 256
     max_num_patches: int = 3600
     eos_token_id: Optional[Union[int, List[int]]] = None

@@ -85,11 +85,10 @@ class Model(nn.Module):
         if pixel_values is None:
             return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
-        select_layer = -2
         encoder_outputs, _, _ = self.vision_tower(
             pixel_values, output_hidden_states=True, spatial_shapes=spatial_shapes
         )
-        hidden_states = encoder_outputs[select_layer]
+        hidden_states = encoder_outputs[self.config.mm_vision_select_layer]
 
         image_features_list = []
         if pixel_attention_mask is not None:
