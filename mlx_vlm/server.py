@@ -566,6 +566,15 @@ def process_tool_calls(model_output: str, tool_module, tools):
                     print(f"Invalid tool call: {call}")
     return dict(calls=called_tools, remaining_text=remaining)
 
+# convenience method for async token->queue
+
+def token_producer(token_iterator, queue, loop):
+    try:
+        for chunk in token_iterator:
+            asyncio.run_coroutine_threadsafe(queue.put(chunk), loop)
+    finally:
+        asyncio.run_coroutine_threadsafe(queue.put(None), loop)  # sentinel
+
 
 # Models for /models endpoint
 
@@ -804,9 +813,24 @@ async def responses_endpoint(request: Request):
                         **kwargs,
                     )
 
+                    queue = asyncio.Queue(maxsize=1000)
+                    loop = asyncio.get_running_loop()
+
+                    threading.Thread(
+                        target=token_producer,
+                        args=(token_iterator, queue, loop),
+                        daemon=True,
+                    ).start()
+
                     full_text = ""
-                    for chunk in token_iterator:
-                        if chunk is None or not hasattr(chunk, "text"):
+
+                    while True:
+                        chunk = await queue.get()
+
+                        if chunk is None:
+                            break
+
+                        if hasattr(chunk, "text"):
                             continue
 
                         delta = chunk.text
@@ -1066,10 +1090,23 @@ async def chat_completions_endpoint(request: ChatRequest):
                         **kwargs,
                     )
 
+                    queue = asyncio.Queue(maxsize=1000)
+                    loop = asyncio.get_running_loop()
+
+                    threading.Thread(
+                        target=token_producer,
+                        args=(token_iterator, queue, loop),
+                        daemon=True,
+                    ).start()
+
                     output_text = ""
                     request_id = f"chatcmpl-{uuid.uuid4()}"
-                    for chunk in token_iterator:
-                        if chunk is None or not hasattr(chunk, "text"):
+
+                    while True:
+                        chunk = await queue.get()
+                        if chunk is None:
+                            break
+                        if not hasattr(chunk, "text"):
                             print("Warning: Received unexpected chunk format:", chunk)
                             continue
 
