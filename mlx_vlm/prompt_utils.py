@@ -65,6 +65,7 @@ MODEL_CONFIG = {
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
     "bunny-llama": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "phi3_v": MessageFormat.NUMBERED_IMAGE_TOKENS,
+    "phi4mm": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "multi_modality": MessageFormat.IMAGE_TOKEN,
     "deepseek_vl_v2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "deepseekocr_2": MessageFormat.IMAGE_TOKEN_NEWLINE,
