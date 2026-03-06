@@ -2255,18 +2255,20 @@ class TestModels(unittest.TestCase):
             mm_hidden_size=32,
             image_token_index=-200,
             audio_token_index=200,
-            audio_processor={"config": {
-                "attention_dim": 32,
-                "attention_heads": 4,
-                "num_blocks": 2,
-                "linear_units": 64,
-                "input_size": 80,
-                "time_reduction": 8,
-                "kernel_size": 3,
-                "conv_channels": 32,
-                "ext_pw_out_channel": 32,
-                "depthwise_seperable_out_channel": 32,
-            }},
+            audio_processor={
+                "config": {
+                    "attention_dim": 32,
+                    "attention_heads": 4,
+                    "num_blocks": 2,
+                    "linear_units": 64,
+                    "input_size": 80,
+                    "time_reduction": 8,
+                    "kernel_size": 3,
+                    "conv_channels": 32,
+                    "ext_pw_out_channel": 32,
+                    "depthwise_seperable_out_channel": 32,
+                }
+            },
         )
         model = phi4mm.Model(config)
 
@@ -2291,9 +2293,7 @@ class TestModels(unittest.TestCase):
         img_size = config.vision_config.image_size
         patch_dim = patch_size * patch_size * num_channels
         num_patches = (img_size // patch_size) ** 2
-        pixel_values = mx.random.uniform(
-            shape=(1, num_patches, patch_dim)
-        )
+        pixel_values = mx.random.uniform(shape=(1, num_patches, patch_dim))
         features = model.vision_tower(pixel_values)
         self.assertEqual(features.shape[-1], config.vision_config.hidden_size)
 
@@ -3436,18 +3436,20 @@ class TestGetInputEmbeddings(unittest.TestCase):
                 mm_hidden_size=32,
                 image_token_index=-200,
                 audio_token_index=200,
-                audio_processor={"config": {
-                    "attention_dim": 32,
-                    "attention_heads": 4,
-                    "num_blocks": 2,
-                    "linear_units": 64,
-                    "input_size": 80,
-                    "time_reduction": 8,
-                    "kernel_size": 3,
-                    "conv_channels": 32,
-                    "ext_pw_out_channel": 32,
-                    "depthwise_seperable_out_channel": 32,
-                }},
+                audio_processor={
+                    "config": {
+                        "attention_dim": 32,
+                        "attention_heads": 4,
+                        "num_blocks": 2,
+                        "linear_units": 64,
+                        "input_size": 80,
+                        "time_reduction": 8,
+                        "kernel_size": 3,
+                        "conv_channels": 32,
+                        "ext_pw_out_channel": 32,
+                        "depthwise_seperable_out_channel": 32,
+                    }
+                },
             )
         )
         self._check_returns_input_embeddings_features(model, "phi4mm")
@@ -3978,7 +3980,6 @@ class TestPhi4MM(unittest.TestCase):
     @staticmethod
     def _tiny_config():
         from mlx_vlm.models.phi4mm.config import (
-            AudioConfig,
             ModelConfig,
             TextConfig,
             VisionConfig,
@@ -4015,18 +4016,20 @@ class TestPhi4MM(unittest.TestCase):
             audio_token_index=200,
             vision_lora={"r": 4, "lora_alpha": 8},
             speech_lora={"r": 4, "lora_alpha": 8},
-            audio_processor={"config": {
-                "attention_dim": 32,
-                "attention_heads": 4,
-                "num_blocks": 2,
-                "linear_units": 64,
-                "input_size": 80,
-                "time_reduction": 8,
-                "kernel_size": 3,
-                "conv_channels": 32,
-                "ext_pw_out_channel": 32,
-                "depthwise_seperable_out_channel": 32,
-            }},
+            audio_processor={
+                "config": {
+                    "attention_dim": 32,
+                    "attention_heads": 4,
+                    "num_blocks": 2,
+                    "linear_units": 64,
+                    "input_size": 80,
+                    "time_reduction": 8,
+                    "kernel_size": 3,
+                    "conv_channels": 32,
+                    "ext_pw_out_channel": 32,
+                    "depthwise_seperable_out_channel": 32,
+                }
+            },
         )
 
     def test_phi4mm_sanitize_lora_keys(self):
@@ -4036,10 +4039,9 @@ class TestPhi4MM(unittest.TestCase):
         model = phi4mm.Model(config)
 
         hidden = config.hidden_size
-        qkv_size = (
-            config.num_attention_heads * (hidden // config.num_attention_heads)
-            + 2 * config.num_key_value_heads * (hidden // config.num_attention_heads)
-        )
+        qkv_size = config.num_attention_heads * (
+            hidden // config.num_attention_heads
+        ) + 2 * config.num_key_value_heads * (hidden // config.num_attention_heads)
         lora_r = 4
 
         weights = {
@@ -4092,19 +4094,17 @@ class TestPhi4MM(unittest.TestCase):
 
         # Language model layers should be quantized
         self.assertTrue(
-            predicate("language_model.model.layers.0.self_attn.qkv_proj", nn.Linear(4, 4))
+            predicate(
+                "language_model.model.layers.0.self_attn.qkv_proj", nn.Linear(4, 4)
+            )
         )
 
         # Multimodal modules should NOT be quantized
         self.assertFalse(
             predicate("audio_encoder.encoders.0.attn.linear_q", nn.Linear(4, 4))
         )
-        self.assertFalse(
-            predicate("audio_projection.speech.proj_0", nn.Linear(4, 4))
-        )
-        self.assertFalse(
-            predicate("mm_projector.0", nn.Linear(4, 4))
-        )
+        self.assertFalse(predicate("audio_projection.speech.proj_0", nn.Linear(4, 4)))
+        self.assertFalse(predicate("mm_projector.0", nn.Linear(4, 4)))
         self.assertFalse(
             predicate("vision_tower.vision_tower.encoder.layers.0", nn.Linear(4, 4))
         )
