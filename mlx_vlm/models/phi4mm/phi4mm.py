@@ -3,12 +3,10 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
-from ..base import InputEmbeddingsFeatures, LanguageModelOutput, create_attention_mask
-from ..cache import KVCache
+from ..base import InputEmbeddingsFeatures
 from .audio import AudioProjection, ConformerEncoder
-from .config import AudioConfig, ModelConfig, VisionConfig
+from .config import AudioConfig, ModelConfig
 from .language import LanguageModel
 from .vision import VisionTower
 
@@ -173,7 +171,9 @@ class Model(nn.Module):
 
                     # Count consecutive audio tokens
                     j = i
-                    while j < len(cur_input_ids) and cur_input_ids[j] == audio_token_index:
+                    while (
+                        j < len(cur_input_ids) and cur_input_ids[j] == audio_token_index
+                    ):
                         j += 1
                     num_audio_tokens = j - i
 
@@ -241,6 +241,7 @@ class Model(nn.Module):
 
     def apply_mm_projector(self, image_features):
         """Project vision features to language model hidden size."""
+
         def _project(feat):
             x = feat
             for layer in self.mm_projector:
@@ -444,19 +445,11 @@ class Model(nn.Module):
 
         for key, base_w in self._base_weights.items():
             merged = base_w
-            if (
-                has_vision
-                and key in self._vision_lora_a
-                and key in self._vision_lora_b
-            ):
+            if has_vision and key in self._vision_lora_a and key in self._vision_lora_b:
                 merged = merged + self._vision_lora_scale * (
                     self._vision_lora_b[key] @ self._vision_lora_a[key]
                 )
-            if (
-                has_speech
-                and key in self._speech_lora_a
-                and key in self._speech_lora_b
-            ):
+            if has_speech and key in self._speech_lora_a and key in self._speech_lora_b:
                 merged = merged + self._speech_lora_scale * (
                     self._speech_lora_b[key] @ self._speech_lora_a[key]
                 )
@@ -494,7 +487,9 @@ class Model(nn.Module):
         else:
             target = None  # text-only: base weights
 
-        current = getattr(self, "_active_lora", "vision")  # vision is default after load
+        current = getattr(
+            self, "_active_lora", "vision"
+        )  # vision is default after load
         if current == target:
             return
 
@@ -530,5 +525,3 @@ class Model(nn.Module):
             return True
 
         return predicate
-
-

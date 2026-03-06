@@ -861,7 +861,9 @@ def process_inputs(
         elif "audios" in parameters:
             args["audios"] = audio
         else:
-            raise ValueError(f"Processor {processor.__class__.__name__} does not support audio parameter")
+            raise ValueError(
+                f"Processor {processor.__class__.__name__} does not support audio parameter"
+            )
 
     return process_method(**args)
 
@@ -922,8 +924,10 @@ def prepare_inputs(
     **kwargs,
 ):
 
-    has_images = images is not None and (not hasattr(images, '__len__') or len(images) > 0)
-    has_audio = audio is not None and (not hasattr(audio, '__len__') or len(audio) > 0)
+    has_images = images is not None and (
+        not hasattr(images, "__len__") or len(images) > 0
+    )
+    has_audio = audio is not None and (not hasattr(audio, "__len__") or len(audio) > 0)
     if not has_images and not has_audio:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
@@ -1065,11 +1069,12 @@ def prepare_inputs(
             )
         else:
             feature_extractor = getattr(processor, "feature_extractor", None)
-            sr = getattr(feature_extractor, "sampling_rate", 16000) if feature_extractor is not None else 16000
-            audio = [
-                load_audio(audio_file, sr=sr)
-                for audio_file in audio
-            ]
+            sr = (
+                getattr(feature_extractor, "sampling_rate", 16000)
+                if feature_extractor is not None
+                else 16000
+            )
+            audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
             # Convert to (data, sr) tuples for processors that expect them
             audio = [(a, sr) if isinstance(a, np.ndarray) else a for a in audio]
 

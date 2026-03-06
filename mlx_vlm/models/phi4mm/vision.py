@@ -203,7 +203,9 @@ class SigLip2VisionModel(nn.Module):
         super().__init__()
         self.embeddings = VisionEmbeddings(config)
         self.encoder = Encoder(config)
-        self.post_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.post_layernorm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
 
     def __call__(
         self,

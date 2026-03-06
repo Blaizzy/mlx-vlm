@@ -64,9 +64,7 @@ def get_image_size_for_max_num_patches(
     return max_height_patches * patch_size, max_width_patches * patch_size
 
 
-def convert_image_to_patches(
-    image: np.ndarray, patch_size: int
-) -> np.ndarray:
+def convert_image_to_patches(image: np.ndarray, patch_size: int) -> np.ndarray:
     """Convert image (H, W, C) to patches (num_patches, patch_dim)."""
     H, W, C = image.shape
     h_patches = H // patch_size
@@ -171,9 +169,7 @@ class Phi4MMImageProcessor(BaseImageProcessor):
                 )
 
             # Resize
-            image = image.resize(
-                (target_w, target_h), Image.Resampling.BILINEAR
-            )
+            image = image.resize((target_w, target_h), Image.Resampling.BILINEAR)
 
             # Convert to float and normalize
             arr = np.array(image).astype(np.float32) / 255.0
@@ -282,10 +278,12 @@ class Phi4MMAudioFeatureExtractor:
         # Resample if needed
         if fs > 16000:
             import scipy.signal
+
             wav = scipy.signal.resample_poly(wav, 1, fs // 16000)
             fs = 16000
         elif 8000 < fs < 16000:
             import scipy.signal
+
             wav = scipy.signal.resample_poly(wav, 1, fs // 8000)
             fs = 8000
         elif fs < 8000:
@@ -293,6 +291,7 @@ class Phi4MMAudioFeatureExtractor:
 
         if fs == 8000:
             import scipy.signal
+
             wav = scipy.signal.resample_poly(wav, 2, 1)
             fs = 16000
 
@@ -307,7 +306,10 @@ class Phi4MMAudioFeatureExtractor:
 
         n_batch = (wav.shape[0] - win_length) // hop_length + 1
         y_frames = np.array(
-            [wav[s : s + win_length] for s in range(0, hop_length * n_batch, hop_length)],
+            [
+                wav[s : s + win_length]
+                for s in range(0, hop_length * n_batch, hop_length)
+            ],
             dtype=np.float32,
         )
 
@@ -418,9 +420,7 @@ def tokenizer_image_token(
         offset = 1
         input_ids.append(prompt_chunks[0][0])
 
-    for x in insert_separator(
-        prompt_chunks, [image_token_index] * (offset + 1)
-    ):
+    for x in insert_separator(prompt_chunks, [image_token_index] * (offset + 1)):
         input_ids.extend(x[offset:])
 
     return input_ids
@@ -433,6 +433,7 @@ def tokenizer_image_token(
 
 class _AudioProcessorStub:
     """Minimal stub when no audio processor is configured."""
+
     sampling_rate = 16000
 
 
@@ -464,7 +465,9 @@ class Phi4MMProcessor(ProcessorMixin):
     @property
     def feature_extractor(self):
         """Alias for audio_processor, used by the framework audio loading pipeline."""
-        return self._audio_proc if self._audio_proc is not None else _AudioProcessorStub()
+        return (
+            self._audio_proc if self._audio_proc is not None else _AudioProcessorStub()
+        )
 
     def __call__(
         self,
@@ -519,14 +522,8 @@ class Phi4MMProcessor(ProcessorMixin):
             # Replace numbered placeholders with internal tokens
             import re
 
-            texts = [
-                re.sub(r"<\|image_\d+\|>", DEFAULT_IMAGE_TOKEN, t)
-                for t in texts
-            ]
-            texts = [
-                re.sub(r"<\|audio_\d+\|>", DEFAULT_AUDIO_TOKEN, t)
-                for t in texts
-            ]
+            texts = [re.sub(r"<\|image_\d+\|>", DEFAULT_IMAGE_TOKEN, t) for t in texts]
+            texts = [re.sub(r"<\|audio_\d+\|>", DEFAULT_AUDIO_TOKEN, t) for t in texts]
 
             has_images = any(DEFAULT_IMAGE_TOKEN in t for t in texts)
             has_audio = any(DEFAULT_AUDIO_TOKEN in t for t in texts)
@@ -540,18 +537,14 @@ class Phi4MMProcessor(ProcessorMixin):
 
                 # If audio is also present, expand audio tokens
                 if has_audio and audio_inputs is not None:
-                    audio_size_iter = iter(
-                        audio_inputs["audio_embed_sizes"].tolist()
-                    )
+                    audio_size_iter = iter(audio_inputs["audio_embed_sizes"].tolist())
                     expanded_list = []
                     for ids in input_ids_list:
                         expanded_ids = []
                         for token_id in ids:
                             if token_id == AUDIO_TOKEN_INDEX:
                                 embed_size = int(next(audio_size_iter))
-                                expanded_ids.extend(
-                                    [AUDIO_TOKEN_INDEX] * embed_size
-                                )
+                                expanded_ids.extend([AUDIO_TOKEN_INDEX] * embed_size)
                             else:
                                 expanded_ids.append(token_id)
                         expanded_list.append(expanded_ids)
@@ -687,7 +680,7 @@ class Phi4MMProcessor(ProcessorMixin):
             crop_size = image_embd.get("crop_size", 448)
             pos_emb_size = crop_size // image_processor_kwargs.get("patch_size", 14)
             if "max_num_patches" not in image_processor_kwargs:
-                image_processor_kwargs["max_num_patches"] = pos_emb_size ** 2
+                image_processor_kwargs["max_num_patches"] = pos_emb_size**2
 
             # Audio processor
             audio_proc_config = config.get("audio_processor", {})

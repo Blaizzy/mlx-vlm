@@ -18,7 +18,6 @@ import numpy as np
 
 from .config import AudioConfig
 
-
 # =============================================================================
 # Basic Modules
 # =============================================================================
@@ -147,7 +146,9 @@ class DepthWiseSeparableConv1d(nn.Module):
     For depthwise: groups=input_dim, so each filter operates on 1 channel.
     """
 
-    def __init__(self, input_dim, out_channel, kernel_size, depthwise_multiplier=1, padding=0):
+    def __init__(
+        self, input_dim, out_channel, kernel_size, depthwise_multiplier=1, padding=0
+    ):
         super().__init__()
         self.padding = padding
         self.dw_conv = nn.Conv1d(
@@ -409,13 +410,19 @@ class DWPWConvPair(nn.Module):
     def __init__(self, channels, kernel_size, stride, padding):
         super().__init__()
         self.dw = nn.Conv2d(
-            channels, channels,
-            kernel_size=kernel_size, stride=stride, padding=padding,
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
             groups=channels,
         )
         self.pw = nn.Conv2d(
-            channels, channels,
-            kernel_size=1, stride=1, padding=0,
+            channels,
+            channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
         )
 
     def __call__(self, x):
@@ -437,7 +444,9 @@ class NemoConvSubsampling(nn.Module):
     MLX Conv2d expects: (B, H, W, C_in) and weight (C_out, kH, kW, C_in)
     """
 
-    def __init__(self, feat_in, feat_out, time_reduction=8, conv_channels=1024, causal=False):
+    def __init__(
+        self, feat_in, feat_out, time_reduction=8, conv_channels=1024, causal=False
+    ):
         super().__init__()
         self.time_reduction = time_reduction
         self.causal = causal
@@ -497,7 +506,9 @@ class NemoConvSubsampling(nn.Module):
         # Update mask
         if mask is not None:
             feature_lens = mask.sum(axis=1)
-            padding_length = mx.ceil(feature_lens / self.time_reduction).astype(mx.int32)
+            padding_length = mx.ceil(feature_lens / self.time_reduction).astype(
+                mx.int32
+            )
             max_audio_length = T_out
             indices = mx.arange(max_audio_length)[None, :]  # (1, T_out)
             pad_mask = indices < padding_length[:, None]  # (B, T_out)
@@ -530,9 +541,7 @@ class ConformerEncoderLayer(nn.Module):
             d_model, d_ffn, config.activation, config.bias_in_glu
         )
 
-        self.self_attn = MultiHeadedAttention(
-            config.attention_heads, d_model
-        )
+        self.self_attn = MultiHeadedAttention(config.attention_heads, d_model)
 
         self.conv = ConvModule(
             d_model,
@@ -565,7 +574,9 @@ class ConformerEncoderLayer(nn.Module):
         x = x + 0.5 * self.feed_forward_in(x)
         norm_x = self.layer_norm_att(x)
         x = x + self.self_attn(
-            norm_x, norm_x, norm_x,
+            norm_x,
+            norm_x,
+            norm_x,
             mask=mask,
             relative_attention_bias=relative_attention_bias,
         )
@@ -610,7 +621,9 @@ class ConformerEncoder(nn.Module):
             max_distance=config.t5_bias_max_distance,
         )
 
-        self.encoders = [ConformerEncoderLayer(config) for _ in range(config.num_blocks)]
+        self.encoders = [
+            ConformerEncoderLayer(config) for _ in range(config.num_blocks)
+        ]
 
     def __call__(
         self,
@@ -647,7 +660,9 @@ class ConformerEncoder(nn.Module):
                 chunk_pad_size = 0
 
             if chunk_pad_size > 0:
-                pad = mx.zeros((input_tensor.shape[0], chunk_pad_size, input_tensor.shape[2]))
+                pad = mx.zeros(
+                    (input_tensor.shape[0], chunk_pad_size, input_tensor.shape[2])
+                )
                 input_tensor = mx.concatenate([input_tensor, pad], axis=1)
 
             # Unfold: (B, T_padded, D) -> (B * num_chunks, max_seq_len, D)

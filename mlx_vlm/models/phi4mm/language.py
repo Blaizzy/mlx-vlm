@@ -140,9 +140,7 @@ class LanguageModel(nn.Module):
         super().__init__()
         self.model = TextModel(config)
         if not getattr(config, "tie_word_embeddings", True):
-            self.lm_head = nn.Linear(
-                config.hidden_size, config.vocab_size, bias=False
-            )
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     @property
     def layers(self):
@@ -150,9 +148,7 @@ class LanguageModel(nn.Module):
 
     @property
     def head_dim(self):
-        return (
-            self.model.config.hidden_size // self.model.config.num_attention_heads
-        )
+        return self.model.config.hidden_size // self.model.config.num_attention_heads
 
     @property
     def n_kv_heads(self):

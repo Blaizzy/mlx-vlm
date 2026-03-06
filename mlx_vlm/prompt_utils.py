@@ -345,9 +345,7 @@ class MessageFormatter:
             content = f"{prefix}{content}" if image_first else f"{content}{prefix}"
 
         if role == "user" and not skip_audio_token and num_audios > 0:
-            audio_prefix = "".join(
-                [f"<|audio_{i+1}|>" for i in range(num_audios)]
-            )
+            audio_prefix = "".join([f"<|audio_{i+1}|>" for i in range(num_audios)])
             content = f"{audio_prefix}{content}"
 
         return {"role": role, "content": content}
@@ -377,15 +375,11 @@ class MessageFormatter:
                     prefix_parts.append("<|image_1|>")
                 else:
                     prefix_parts.append(
-                        "".join(
-                            [f"<|image_{i+1}|>" for i in range(num_images)]
-                        )
+                        "".join([f"<|image_{i+1}|>" for i in range(num_images)])
                     )
             if not skip_audio_token and num_audios > 0:
                 prefix_parts.append(
-                    "".join(
-                        [f"<|audio_{i+1}|>" for i in range(num_audios)]
-                    )
+                    "".join([f"<|audio_{i+1}|>" for i in range(num_audios)])
                 )
             if prefix_parts:
                 content = f"{''.join(prefix_parts)}{content}"
