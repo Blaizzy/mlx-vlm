@@ -2225,6 +2225,94 @@ class TestModels(unittest.TestCase):
             vision_feature_layer=0,
         )
 
+    def test_phi4mm(self):
+        from mlx_vlm.models import phi4mm
+
+        config = phi4mm.ModelConfig(
+            text_config=phi4mm.TextConfig(
+                model_type="phi4mm",
+                max_position_embeddings=2048,
+            ),
+            vision_config=phi4mm.VisionConfig(
+                model_type="siglip2_vision_model",
+                hidden_size=32,
+                intermediate_size=64,
+                num_attention_heads=4,
+                num_hidden_layers=2,
+                patch_size=14,
+                image_size=28,
+                num_channels=3,
+                layer_norm_eps=1e-6,
+            ),
+            model_type="phi4mm",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            mm_hidden_size=32,
+            image_token_index=-200,
+            audio_token_index=200,
+            audio_processor={"config": {
+                "attention_dim": 32,
+                "attention_heads": 4,
+                "num_blocks": 2,
+                "linear_units": 64,
+                "input_size": 80,
+                "time_reduction": 8,
+                "kernel_size": 3,
+                "conv_channels": 32,
+                "ext_pw_out_channel": 32,
+                "depthwise_seperable_out_channel": 32,
+            }},
+        )
+        model = phi4mm.Model(config)
+
+        # Language model
+        self.assertEqual(model.model_type, config.model_type)
+        self.assertEqual(len(model.layers), config.num_hidden_layers)
+
+        batch_size = 1
+        for t in [mx.float32, mx.float16]:
+            model.update(tree_map(lambda p: p.astype(t), model.parameters()))
+
+            inputs = mx.array([[0, 1]])
+            outputs = model(inputs)
+            logits = outputs.logits
+            self.assertEqual(logits.shape, (batch_size, 2, config.vocab_size))
+            self.assertEqual(logits.dtype, t)
+
+        # Vision tower: SigLIP2 with NaFlex
+        # Input: (B, num_patches, patch_dim) where patch_dim = P*P*C
+        patch_size = config.vision_config.patch_size
+        num_channels = config.vision_config.num_channels
+        img_size = config.vision_config.image_size
+        patch_dim = patch_size * patch_size * num_channels
+        num_patches = (img_size // patch_size) ** 2
+        pixel_values = mx.random.uniform(
+            shape=(1, num_patches, patch_dim)
+        )
+        features = model.vision_tower(pixel_values)
+        self.assertEqual(features.shape[-1], config.vision_config.hidden_size)
+
+        # MM projector: projects vision features to LLM hidden size
+        projected = model.apply_mm_projector(features)
+        self.assertEqual(projected.shape[-1], config.hidden_size)
+
+        # Audio encoder: Conformer
+        # Input: (B, T, 80) mel spectrogram features
+        audio_input = mx.random.uniform(shape=(1, 100, 80))
+        audio_mask = mx.ones((1, 100))
+        encoded_audio, _ = model.audio_encoder(audio_input, audio_mask)
+        audio_config = getattr(config, "_audio_config")
+        self.assertEqual(encoded_audio.shape[-1], audio_config.attention_dim)
+
+        # Audio projection: projects audio features to LLM hidden size
+        audio_projected = model.audio_projection(encoded_audio, mode="speech")
+        self.assertEqual(audio_projected.shape[-1], config.hidden_size)
+
     def test_glm_ocr(self):
         from mlx_vlm.models import glm_ocr
 
@@ -3274,6 +3362,53 @@ class TestGetInputEmbeddings(unittest.TestCase):
         self.assertIsNotNone(result_bf16.inputs_embeds)
         self.assertEqual(result_bf16.inputs_embeds.dtype, mx.bfloat16)
 
+    def test_phi4mm_input_embeddings(self):
+        from mlx_vlm.models import phi4mm
+
+        model = phi4mm.Model(
+            phi4mm.ModelConfig(
+                text_config=phi4mm.TextConfig(
+                    model_type="phi4mm",
+                    max_position_embeddings=2048,
+                ),
+                vision_config=phi4mm.VisionConfig(
+                    model_type="siglip2_vision_model",
+                    hidden_size=32,
+                    intermediate_size=64,
+                    num_attention_heads=4,
+                    num_hidden_layers=2,
+                    patch_size=14,
+                    image_size=28,
+                    num_channels=3,
+                    layer_norm_eps=1e-6,
+                ),
+                model_type="phi4mm",
+                vocab_size=256,
+                hidden_size=64,
+                num_hidden_layers=2,
+                intermediate_size=128,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                rms_norm_eps=1e-5,
+                mm_hidden_size=32,
+                image_token_index=-200,
+                audio_token_index=200,
+                audio_processor={"config": {
+                    "attention_dim": 32,
+                    "attention_heads": 4,
+                    "num_blocks": 2,
+                    "linear_units": 64,
+                    "input_size": 80,
+                    "time_reduction": 8,
+                    "kernel_size": 3,
+                    "conv_channels": 32,
+                    "ext_pw_out_channel": 32,
+                    "depthwise_seperable_out_channel": 32,
+                }},
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "phi4mm")
+
     def test_qwen3_vl_moe_input_embeddings(self):
         from mlx_vlm.models import qwen3_vl_moe
 
@@ -3816,34 +3951,6 @@ class TestPhi4MM(unittest.TestCase):
                 "depthwise_seperable_out_channel": 32,
             }},
         )
-
-    def test_phi4mm(self):
-        from mlx_vlm.models import phi4mm
-
-        config = self._tiny_config()
-        model = phi4mm.Model(config)
-
-        # Language model test
-        self.assertEqual(model.model_type, "phi4mm")
-        self.assertEqual(len(model.layers), config.num_hidden_layers)
-
-        inputs = mx.array([[0, 1]])
-        outputs = model(inputs)
-        logits = outputs.logits
-        self.assertEqual(logits.shape, (1, 2, config.vocab_size))
-
-    def test_phi4mm_input_embeddings(self):
-        from mlx_vlm.models import phi4mm
-        from mlx_vlm.models.base import InputEmbeddingsFeatures
-
-        config = self._tiny_config()
-        model = phi4mm.Model(config)
-
-        # Text-only
-        input_ids = mx.array([[1, 2, 3, 4, 5]])
-        result = model.get_input_embeddings(input_ids=input_ids)
-        self.assertIsInstance(result, InputEmbeddingsFeatures)
-        self.assertIsNotNone(result.inputs_embeds)
 
     def test_phi4mm_sanitize_lora_keys(self):
         from mlx_vlm.models import phi4mm
