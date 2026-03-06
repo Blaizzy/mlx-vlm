@@ -9,95 +9,8 @@ from ..base import InputEmbeddingsFeatures, LanguageModelOutput, create_attentio
 from ..cache import KVCache
 from .audio import AudioProjection, ConformerEncoder
 from .config import AudioConfig, ModelConfig, VisionConfig
+from .language import LanguageModel
 from .vision import VisionTower
-
-
-class Attention(nn.Module):
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-
-        dim = config.hidden_size
-        self.n_heads = n_heads = config.num_attention_heads
-        self.n_kv_heads = n_kv_heads = config.num_key_value_heads
-        self.head_dim = head_dim = config.hidden_size // n_heads
-        self.scale = head_dim**-0.5
-
-        op_size = n_heads * head_dim + 2 * (n_kv_heads * head_dim)
-        self.qkv_proj = nn.Linear(dim, op_size, bias=False)
-        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
-
-        rope_dim = int(head_dim * config.partial_rotary_factor)
-        self.rope = nn.RoPE(
-            rope_dim,
-            traditional=config.rope_traditional,
-            base=config.rope_theta,
-        )
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[KVCache] = None,
-    ) -> mx.array:
-        B, L, _ = x.shape
-
-        qkv = self.qkv_proj(x)
-        query_pos = self.n_heads * self.head_dim
-        queries, keys, values = mx.split(
-            qkv, [query_pos, query_pos + self.n_kv_heads * self.head_dim], axis=-1
-        )
-
-        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-
-        if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
-            keys, values = cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
-
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
-        )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
-
-
-class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.gate_up_proj = nn.Linear(dim, 2 * hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-
-    def __call__(self, x) -> mx.array:
-        x = self.gate_up_proj(x)
-        gate, x = mx.split(x, 2, axis=-1)
-        return self.down_proj(nn.silu(gate) * x)
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.self_attn = Attention(config)
-        self.mlp = MLP(config.hidden_size, config.intermediate_size)
-        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[KVCache] = None,
-    ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
-        h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        return h + r
 
 
 def build_mm_projector(config: ModelConfig):
@@ -114,18 +27,16 @@ def build_mm_projector(config: ModelConfig):
     ]
 
 
-class Phi4MM(nn.Module):
-    """Phi4 backbone with vision tower, audio encoder, and projectors."""
-
+class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.model_type = config.model_type
         self.config = config
-        self.vocab_size = config.vocab_size
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = [
-            TransformerBlock(config=config) for _ in range(config.num_hidden_layers)
-        ]
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Language model (Phi-4 backbone + output head)
+        self.language_model = LanguageModel(config)
+
+        # Vision tower + projector
         self.vision_tower = VisionTower(config.vision_config)
         self.mm_projector = build_mm_projector(config)
 
@@ -136,39 +47,6 @@ class Phi4MM(nn.Module):
             audio_dim=audio_config.attention_dim,
             hidden_size=config.hidden_size,
         )
-
-    def __call__(
-        self,
-        inputs: mx.array,
-        inputs_embeds: Optional[mx.array] = None,
-        mask: Optional[mx.array] = None,
-        cache=None,
-    ):
-        if inputs_embeds is None:
-            h = self.embed_tokens(inputs)
-        else:
-            h = inputs_embeds
-
-        if cache is None:
-            cache = [None] * len(self.layers)
-
-        if mask is None:
-            mask = create_attention_mask(h, cache[0])
-
-        for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c)
-
-        return self.norm(h)
-
-
-class Model(nn.Module):
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.model_type = config.model_type
-        self.config = config
-        self.model = Phi4MM(config)
-        if not getattr(config, "tie_word_embeddings", True):
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(
         self,
@@ -185,14 +63,9 @@ class Model(nn.Module):
             )
             inputs_embeds = input_embeddings_features.inputs_embeds
 
-        out = self.model(inputs, inputs_embeds, mask=mask, cache=cache)
-
-        if hasattr(self, "lm_head"):
-            logits = self.lm_head(out)
-        else:
-            logits = self.model.embed_tokens.as_linear(out)
-
-        return LanguageModelOutput(logits=logits)
+        return self.language_model(
+            inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache
+        )
 
     def get_input_embeddings(
         self,
@@ -213,7 +86,7 @@ class Model(nn.Module):
 
         if not has_images and not has_audio:
             return InputEmbeddingsFeatures(
-                inputs_embeds=self.model.embed_tokens(input_ids)
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
             )
 
         # --- Process images ---
@@ -222,20 +95,20 @@ class Model(nn.Module):
             pixel_attention_mask = kwargs.get("pixel_attention_mask", None)
             spatial_shapes = kwargs.get("spatial_shapes", None)
 
-            image_features = self.model.vision_tower(
+            image_features = self.vision_tower(
                 pixel_values, pixel_attention_mask, spatial_shapes
             )
             if isinstance(image_features, list):
                 projected = []
                 for feat in image_features:
                     x = feat
-                    for layer in self.model.mm_projector:
+                    for layer in self.mm_projector:
                         x = layer(x)
                     projected.append(x)
                 image_features = projected
             else:
                 x = image_features
-                for layer in self.model.mm_projector:
+                for layer in self.mm_projector:
                     x = layer(x)
                 image_features = x
 
@@ -243,11 +116,11 @@ class Model(nn.Module):
         audio_features = None
         if has_audio:
             # Run through conformer encoder
-            encoded_audio, _ = self.model.audio_encoder(
+            encoded_audio, _ = self.audio_encoder(
                 input_audio_embeds, audio_attention_mask
             )
             # Project to LM hidden size (speech mode)
-            audio_features = self.model.audio_projection(encoded_audio, mode="speech")
+            audio_features = self.audio_projection(encoded_audio, mode="speech")
 
         # --- Build safe input_ids for embedding lookup ---
         image_token_index = self.config.image_token_index
@@ -262,7 +135,7 @@ class Model(nn.Module):
             safe_input_ids = mx.where(
                 safe_input_ids == audio_token_index, mx.array(0), safe_input_ids
             )
-        text_embeds = self.model.embed_tokens(safe_input_ids)
+        text_embeds = self.language_model.model.embed_tokens(safe_input_ids)
 
         # --- Merge multimodal features with text embeddings ---
         B = input_ids.shape[0]
@@ -364,23 +237,33 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.language_model.model.layers
 
     @property
     def head_dim(self):
-        return self.config.hidden_size // self.config.num_attention_heads
+        return self.language_model.head_dim
 
     @property
     def n_kv_heads(self):
-        return self.config.num_key_value_heads
-
-    @property
-    def language_model(self):
-        return self
+        return self.language_model.n_kv_heads
 
     @property
     def vision_model(self):
-        return self.model.vision_tower
+        return self.vision_tower
+
+    def _remap_llm_key(self, key):
+        """Remap checkpoint LLM key to the language_model structure.
+
+        model.layers.*       -> language_model.model.layers.*
+        model.embed_tokens.* -> language_model.model.embed_tokens.*
+        model.norm.*         -> language_model.model.norm.*
+        lm_head.*            -> language_model.lm_head.*
+        """
+        if key.startswith("model."):
+            return "language_model." + key
+        if key.startswith("lm_head."):
+            return "language_model." + key
+        return key
 
     def sanitize(self, weights):
         # Get LoRA configs
@@ -416,20 +299,20 @@ class Model(nn.Module):
             if "glb_GN" in k or "sub_GN" in k or "img_processor.head." in k:
                 continue
 
-            # Remap audio encoder weights
+            # Remap audio encoder weights (directly on Model now)
             if "embed_tokens_extend.audio_embed.encoder." in k:
                 new_key = k.replace(
                     "model.embed_tokens_extend.audio_embed.encoder.",
-                    "model.audio_encoder.",
+                    "audio_encoder.",
                 )
                 audio_weights[new_key] = v
                 continue
 
-            # Remap audio projection weights
+            # Remap audio projection weights (directly on Model now)
             if "embed_tokens_extend.audio_embed.audio_projection." in k:
                 new_key = k.replace(
                     "model.embed_tokens_extend.audio_embed.audio_projection.",
-                    "model.audio_projection.",
+                    "audio_projection.",
                 )
                 # Map sequential indices: speech.0 -> speech.proj_0, speech.2 -> speech.proj_2
                 new_key = re.sub(r"(speech|vision)\.0\.", r"\1.proj_0.", new_key)
@@ -437,49 +320,56 @@ class Model(nn.Module):
                 sanitized[new_key] = v
                 continue
 
-            # Remap vision tower keys
+            # Remap vision tower keys (directly on Model now)
             if "embed_tokens_extend.image_embed.img_processor." in k:
                 new_key = k.replace(
                     "model.embed_tokens_extend.image_embed.img_processor.",
-                    "model.vision_tower.vision_tower.",
+                    "vision_tower.vision_tower.",
                 )
                 sanitized[new_key] = v
                 continue
 
-            # Remap projector keys
+            # Remap projector keys (directly on Model now)
             if "embed_tokens_extend.image_embed.img_projection." in k:
                 new_key = k.replace(
                     "model.embed_tokens_extend.image_embed.img_projection.",
-                    "model.mm_projector.",
+                    "mm_projector.",
                 )
                 sanitized[new_key] = v
                 continue
 
-            # Handle LoRA weights
+            # Handle LoRA weights - remap base_key to language_model path
             if ".lora_A.vision." in k:
                 base_key = k.replace(".lora_A.vision.", ".")
+                base_key = self._remap_llm_key(base_key)
                 lora_a_vision[base_key] = v
                 continue
             if ".lora_B.vision." in k:
                 base_key = k.replace(".lora_B.vision.", ".")
+                base_key = self._remap_llm_key(base_key)
                 lora_b_vision[base_key] = v
                 continue
             if ".lora_A.speech." in k:
                 base_key = k.replace(".lora_A.speech.", ".")
+                base_key = self._remap_llm_key(base_key)
                 lora_a_speech[base_key] = v
                 continue
             if ".lora_B.speech." in k:
                 base_key = k.replace(".lora_B.speech.", ".")
+                base_key = self._remap_llm_key(base_key)
                 lora_b_speech[base_key] = v
                 continue
 
-            # Handle base_layer weights
+            # Handle base_layer weights - remap to language_model path
             if ".base_layer." in k:
                 new_key = k.replace(".base_layer.", ".")
+                new_key = self._remap_llm_key(new_key)
                 base_weights[new_key] = v
                 continue
 
-            sanitized[k] = v
+            # Regular LLM keys: remap model.* -> language_model.model.*
+            new_key = self._remap_llm_key(k)
+            sanitized[new_key] = v
 
         # Merge vision LoRA into base weights (default for inference)
         for key, base_w in base_weights.items():
@@ -492,8 +382,6 @@ class Model(nn.Module):
                 sanitized[key] = base_w
 
         # Store speech LoRA for runtime switching
-        # For now, we don't merge speech LoRA by default (vision is default mode)
-        # Speech LoRA can be applied on top when audio mode is needed
         self._speech_lora_a = lora_a_speech
         self._speech_lora_b = lora_b_speech
         self._speech_lora_scale = speech_lora_scale
@@ -505,10 +393,21 @@ class Model(nn.Module):
 
         # Sanitize audio encoder weights through audio encoder's sanitize
         if audio_weights:
-            audio_sanitized = self.model.audio_encoder.sanitize(audio_weights)
+            audio_sanitized = self.audio_encoder.sanitize(audio_weights)
             sanitized.update(audio_sanitized)
 
         return sanitized
+
+    def _set_weight_by_key(self, key, value):
+        """Set a model weight by its dot-separated key path."""
+        parts = key.split(".")
+        obj = self
+        for p in parts[:-1]:
+            if p.isdigit():
+                obj = obj[int(p)]
+            else:
+                obj = getattr(obj, p)
+        setattr(obj, parts[-1], value)
 
     def apply_speech_lora(self):
         """Switch LLM weights from vision LoRA to speech LoRA for audio inference."""
@@ -520,16 +419,7 @@ class Model(nn.Module):
                 lora_a = self._speech_lora_a[key]
                 lora_b = self._speech_lora_b[key]
                 merged = base_w + self._speech_lora_scale * (lora_b @ lora_a)
-
-                # Set the weight on the model
-                parts = key.split(".")
-                obj = self
-                for p in parts[:-1]:
-                    if p.isdigit():
-                        obj = obj[int(p)]
-                    else:
-                        obj = getattr(obj, p)
-                setattr(obj, parts[-1], merged)
+                self._set_weight_by_key(key, merged)
         self._active_lora = "speech"
 
     def apply_vision_lora(self):
@@ -542,15 +432,7 @@ class Model(nn.Module):
                 lora_a = self._vision_lora_a[key]
                 lora_b = self._vision_lora_b[key]
                 merged = base_w + self._vision_lora_scale * (lora_b @ lora_a)
-
-                parts = key.split(".")
-                obj = self
-                for p in parts[:-1]:
-                    if p.isdigit():
-                        obj = obj[int(p)]
-                    else:
-                        obj = getattr(obj, p)
-                setattr(obj, parts[-1], merged)
+                self._set_weight_by_key(key, merged)
         self._active_lora = "vision"
 
     def apply_both_loras(self):
@@ -578,15 +460,7 @@ class Model(nn.Module):
                 merged = merged + self._speech_lora_scale * (
                     self._speech_lora_b[key] @ self._speech_lora_a[key]
                 )
-
-            parts = key.split(".")
-            obj = self
-            for p in parts[:-1]:
-                if p.isdigit():
-                    obj = obj[int(p)]
-                else:
-                    obj = getattr(obj, p)
-            setattr(obj, parts[-1], merged)
+            self._set_weight_by_key(key, merged)
         self._active_lora = "both"
 
     def apply_base_weights(self):
@@ -595,14 +469,7 @@ class Model(nn.Module):
             return
 
         for key, base_w in self._base_weights.items():
-            parts = key.split(".")
-            obj = self
-            for p in parts[:-1]:
-                if p.isdigit():
-                    obj = obj[int(p)]
-                else:
-                    obj = getattr(obj, p)
-            setattr(obj, parts[-1], base_w)
+            self._set_weight_by_key(key, base_w)
         self._active_lora = None
 
     def set_modality(self, has_image: bool = False, has_audio: bool = False):
