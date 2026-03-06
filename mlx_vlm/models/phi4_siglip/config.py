@@ -6,10 +6,18 @@ from ..base import BaseModelConfig
 
 # Fields shared between ModelConfig (top-level) and TextConfig
 _TEXT_FIELDS = [
-    "vocab_size", "num_hidden_layers", "intermediate_size",
-    "num_attention_heads", "rms_norm_eps", "hidden_size",
-    "num_key_value_heads", "rope_theta", "rope_traditional",
-    "partial_rotary_factor", "rope_scaling", "model_type",
+    "vocab_size",
+    "num_hidden_layers",
+    "intermediate_size",
+    "num_attention_heads",
+    "rms_norm_eps",
+    "hidden_size",
+    "num_key_value_heads",
+    "rope_theta",
+    "rope_traditional",
+    "partial_rotary_factor",
+    "rope_scaling",
+    "model_type",
 ]
 
 

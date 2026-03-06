@@ -6,11 +6,10 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import InputEmbeddingsFeatures
+from . import processing_phi4_siglip  # noqa: F401
 from .config import ModelConfig, VisionConfig
 from .language import LanguageModel
 from .vision import VisionModel
-
-from . import processing_phi4_siglip  # noqa: F401
 
 IMAGE_TOKEN_INDEX = -200
 
@@ -19,13 +18,9 @@ class MultiModalProjector(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         hidden_size = config.text_config.hidden_size
-        self.linear_1 = nn.Linear(
-            config.mm_hidden_size, hidden_size, bias=True
-        )
+        self.linear_1 = nn.Linear(config.mm_hidden_size, hidden_size, bias=True)
         self.gelu = nn.GELU()
-        self.linear_2 = nn.Linear(
-            hidden_size, hidden_size, bias=True
-        )
+        self.linear_2 = nn.Linear(hidden_size, hidden_size, bias=True)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.linear_1(x)
@@ -109,9 +104,7 @@ class Model(nn.Module):
         return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
     @staticmethod
-    def _prepare_inputs_for_multimodal(
-        image_features_list, inputs_embeds, input_ids
-    ):
+    def _prepare_inputs_for_multimodal(image_features_list, inputs_embeds, input_ids):
         batch_size = input_ids.shape[0]
         new_embeds_list = []
         cur_image_idx = 0
@@ -159,7 +152,10 @@ class Model(nn.Module):
 
     @property
     def head_dim(self):
-        return self.config.text_config.hidden_size // self.config.text_config.num_attention_heads
+        return (
+            self.config.text_config.hidden_size
+            // self.config.text_config.num_attention_heads
+        )
 
     @property
     def n_kv_heads(self):
@@ -178,17 +174,13 @@ class Model(nn.Module):
                 continue
 
             new_key = k
-            new_key = re.sub(
-                r"mm_projector\.0\.", "mm_projector.linear_1.", new_key
-            )
-            new_key = re.sub(
-                r"mm_projector\.2\.", "mm_projector.linear_2.", new_key
-            )
+            new_key = re.sub(r"mm_projector\.0\.", "mm_projector.linear_1.", new_key)
+            new_key = re.sub(r"mm_projector\.2\.", "mm_projector.linear_2.", new_key)
 
             if new_key.startswith("model.vision_tower."):
-                new_key = new_key[len("model."):]
+                new_key = new_key[len("model.") :]
             elif new_key.startswith("model.mm_projector."):
-                new_key = new_key[len("model."):]
+                new_key = new_key[len("model.") :]
             elif new_key.startswith("model."):
                 new_key = "language_model." + new_key
             elif new_key.startswith("lm_head."):

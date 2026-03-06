@@ -2313,7 +2313,6 @@ class TestModels(unittest.TestCase):
         self.assertEqual(hidden_states.shape[0], expected_patches)
         self.assertEqual(hidden_states.shape[1], config.vision_config.out_hidden_size)
 
-
     def test_phi4_siglip(self):
         from mlx_vlm.models import phi4_siglip
 

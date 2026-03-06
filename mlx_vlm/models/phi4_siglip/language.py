@@ -162,9 +162,7 @@ class LanguageModel(nn.Module):
     @staticmethod
     def sanitize(weights):
         return {
-            k: v
-            for k, v in weights.items()
-            if "self_attn.rotary_emb.inv_freq" not in k
+            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
         }
 
     @property

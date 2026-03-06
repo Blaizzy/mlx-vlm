@@ -41,9 +41,7 @@ def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX
         offset = 1
         input_ids.append(prompt_chunks[0][0])
 
-    for x in insert_separator(
-        prompt_chunks, [image_token_index] * (offset + 1)
-    ):
+    for x in insert_separator(prompt_chunks, [image_token_index] * (offset + 1)):
         input_ids.extend(x[offset:])
 
     return input_ids
@@ -135,16 +133,12 @@ class Phi4SigLipProcessor:
                     for ids in input_ids_list:
                         pad_len = max_len - len(ids)
                         padded_ids.append(ids + [pad_token_id] * pad_len)
-                        attention_masks.append(
-                            [1] * len(ids) + [0] * pad_len
-                        )
+                        attention_masks.append([1] * len(ids) + [0] * pad_len)
                     data["input_ids"] = np.array(padded_ids)
                     data["attention_mask"] = np.array(attention_masks)
                 else:
                     data["input_ids"] = np.array([input_ids_list[0]])
-                    data["attention_mask"] = np.ones_like(
-                        data["input_ids"]
-                    )
+                    data["attention_mask"] = np.ones_like(data["input_ids"])
             else:
                 text_inputs = self.tokenizer(
                     text,
@@ -152,9 +146,7 @@ class Phi4SigLipProcessor:
                     return_tensors="np",
                 )
                 data["input_ids"] = np.array(text_inputs["input_ids"])
-                data["attention_mask"] = np.array(
-                    text_inputs["attention_mask"]
-                )
+                data["attention_mask"] = np.array(text_inputs["attention_mask"])
 
         return BatchFeature(data=data, tensor_type=return_tensors)
 
@@ -185,6 +177,7 @@ class Phi4SigLipProcessor:
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         import json
         from pathlib import Path
+
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(
@@ -203,9 +196,7 @@ class Phi4SigLipProcessor:
             try:
                 from huggingface_hub import hf_hub_download
 
-                cfg_path = hf_hub_download(
-                    pretrained_model_name_or_path, "config.json"
-                )
+                cfg_path = hf_hub_download(pretrained_model_name_or_path, "config.json")
                 with open(cfg_path) as f:
                     config = json.load(f)
             except Exception:
