@@ -122,7 +122,6 @@ class VisionEmbeddings(nn.Module):
         self.embed_dim = config.hidden_size
         self.patch_size = config.patch_size
 
-        # NaFlex: uses Linear instead of Conv2d for pre-patchified input
         self.patch_embedding = nn.Linear(
             input_dims=config.num_channels * self.patch_size * self.patch_size,
             output_dims=self.embed_dim,
@@ -147,7 +146,6 @@ class VisionEmbeddings(nn.Module):
             dtype=source_dtype,
         )
 
-        # (height, width, embed_dim) -> (1, embed_dim, height, width) for interpolation
         positional_embeddings = positional_embeddings.transpose(2, 0, 1)[None, :]
         for i in range(batch_size):
             height, width = spatial_shapes[i].tolist()

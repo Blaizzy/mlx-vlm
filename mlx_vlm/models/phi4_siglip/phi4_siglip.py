@@ -10,16 +10,12 @@ from .config import ModelConfig, VisionConfig
 from .language import LanguageModel
 from .vision import VisionModel
 
-# Import processor to register it with AutoProcessor
 from . import processing_phi4_siglip  # noqa: F401
 
-# Sentinel value used by the PyTorch model to mark image token positions
 IMAGE_TOKEN_INDEX = -200
 
 
 class MultiModalProjector(nn.Module):
-    """MLP 2x GELU projector: Linear -> GELU -> Linear"""
-
     def __init__(self, config: ModelConfig):
         super().__init__()
         hidden_size = config.text_config.hidden_size
@@ -39,8 +35,6 @@ class MultiModalProjector(nn.Module):
 
 
 class VisionTower(nn.Module):
-    """Wrapper matching model.vision_tower.vision_tower.* weight paths."""
-
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.vision_tower = VisionModel(config)
@@ -91,14 +85,12 @@ class Model(nn.Module):
         if pixel_values is None:
             return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
-        # Select vision feature layer (second to last hidden state)
         select_layer = -2
         encoder_outputs, _, _ = self.vision_tower(
             pixel_values, output_hidden_states=True, spatial_shapes=spatial_shapes
         )
         hidden_states = encoder_outputs[select_layer]
 
-        # Remove padding tokens using attention mask (NaFlex) and project
         image_features_list = []
         if pixel_attention_mask is not None:
             for img_idx in range(hidden_states.shape[0]):
@@ -112,7 +104,6 @@ class Model(nn.Module):
                 projected = self.mm_projector(feature)
                 image_features_list.append(projected)
 
-        # Merge: replace each IMAGE_TOKEN_INDEX with variable-length image features
         final_inputs_embeds = self._prepare_inputs_for_multimodal(
             image_features_list, inputs_embeds, inputs
         )
@@ -122,13 +113,6 @@ class Model(nn.Module):
     def _prepare_inputs_for_multimodal(
         image_features_list, inputs_embeds, input_ids
     ):
-        """
-        Replace IMAGE_TOKEN_INDEX positions with image features.
-
-        Each IMAGE_TOKEN_INDEX in input_ids maps to one entry in
-        image_features_list which may have many tokens (NaFlex variable length).
-        The output sequence will be longer than the input.
-        """
         batch_size = input_ids.shape[0]
         new_embeds_list = []
         cur_image_idx = 0
@@ -137,7 +121,6 @@ class Model(nn.Module):
             cur_input_ids = input_ids[b]
             cur_embeds = inputs_embeds[b]
 
-            # Find image token positions
             image_positions = np.where(np.array(cur_input_ids) == IMAGE_TOKEN_INDEX)[0]
             num_images = len(image_positions)
 
@@ -145,7 +128,6 @@ class Model(nn.Module):
                 new_embeds_list.append(cur_embeds)
                 continue
 
-            # Split embeddings around image token positions
             segments = []
             prev_pos = 0
             for i, pos in enumerate(image_positions):
@@ -156,7 +138,6 @@ class Model(nn.Module):
                 cur_image_idx += 1
                 prev_pos = pos + 1
 
-            # Remaining text after the last image token
             seq_len = int(cur_input_ids.shape[0])
             if prev_pos < seq_len:
                 segments.append(cur_embeds[prev_pos:])
@@ -194,14 +175,10 @@ class Model(nn.Module):
         for k, v in weights.items():
             if "position_ids" in k:
                 continue
-
-            # Skip vision pooling head weights (not used, model uses select_layer=-2)
             if "vision_model.head." in k:
                 continue
 
             new_key = k
-
-            # Remap projector keys from Sequential indices to named attributes
             new_key = re.sub(
                 r"mm_projector\.0\.", "mm_projector.linear_1.", new_key
             )
@@ -209,11 +186,6 @@ class Model(nn.Module):
                 r"mm_projector\.2\.", "mm_projector.linear_2.", new_key
             )
 
-            # Remap weight paths to match new structure:
-            # model.vision_tower.* -> vision_tower.*
-            # model.mm_projector.* -> mm_projector.*
-            # model.{embed_tokens,layers,norm}.* -> language_model.model.*
-            # lm_head.* -> language_model.lm_head.*
             if new_key.startswith("model.vision_tower."):
                 new_key = new_key[len("model."):]
             elif new_key.startswith("model.mm_projector."):
