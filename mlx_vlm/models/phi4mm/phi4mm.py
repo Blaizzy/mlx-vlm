@@ -479,6 +479,12 @@ class Model(nn.Module):
             has_image: Whether the input contains images.
             has_audio: Whether the input contains audio.
         """
+        # Skip if no LoRA weights available (e.g., quantized model with
+        # pre-merged weights). LoRA switching can't work with quantized
+        # weights, so just return.
+        if not getattr(self, "_base_weights", None):
+            return
+
         if has_image and has_audio:
             target = "both"
         elif has_audio:
@@ -500,4 +506,29 @@ class Model(nn.Module):
             self.apply_vision_lora()
         else:
             self.apply_base_weights()
+
+    @property
+    def quant_predicate(self):
+        # Pre-merge all LoRA variants before quantization since
+        # LoRA switching can't work with quantized weights
+        if getattr(self, "_base_weights", None):
+            self.apply_both_loras()
+            self._base_weights = {}
+            self._speech_lora_a = {}
+            self._speech_lora_b = {}
+            self._vision_lora_a = {}
+            self._vision_lora_b = {}
+
+        def predicate(path, module):
+            if (
+                "audio_encoder" in path
+                or "audio_projection" in path
+                or "mm_projector" in path
+                or "vision_tower" in path
+            ):
+                return False
+            return True
+
+        return predicate
+
 

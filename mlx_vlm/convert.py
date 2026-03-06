@@ -121,9 +121,13 @@ def convert(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
 
+    model_quant_predicate = getattr(model, "quant_predicate", None)
+
     def base_quant_predicate(path, module):
         if skip_multimodal_module(path):
             return False
+        if model_quant_predicate is not None:
+            return model_quant_predicate(path, module)
         return True
 
     if isinstance(quant_predicate, str):
