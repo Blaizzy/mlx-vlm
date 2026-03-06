@@ -98,19 +98,7 @@ class Model(nn.Module):
             image_features = self.vision_tower(
                 pixel_values, pixel_attention_mask, spatial_shapes
             )
-            if isinstance(image_features, list):
-                projected = []
-                for feat in image_features:
-                    x = feat
-                    for layer in self.mm_projector:
-                        x = layer(x)
-                    projected.append(x)
-                image_features = projected
-            else:
-                x = image_features
-                for layer in self.mm_projector:
-                    x = layer(x)
-                image_features = x
+            image_features = self.apply_mm_projector(image_features)
 
         # --- Process audio ---
         audio_features = None
@@ -250,6 +238,18 @@ class Model(nn.Module):
     @property
     def vision_model(self):
         return self.vision_tower
+
+    def apply_mm_projector(self, image_features):
+        """Project vision features to language model hidden size."""
+        def _project(feat):
+            x = feat
+            for layer in self.mm_projector:
+                x = layer(x)
+            return x
+
+        if isinstance(image_features, list):
+            return [_project(feat) for feat in image_features]
+        return _project(image_features)
 
     def _remap_llm_key(self, key):
         """Remap checkpoint LLM key to the language_model structure.
@@ -500,3 +500,4 @@ class Model(nn.Module):
             self.apply_vision_lora()
         else:
             self.apply_base_weights()
+
