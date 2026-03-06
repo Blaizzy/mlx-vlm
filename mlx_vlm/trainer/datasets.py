@@ -172,7 +172,9 @@ class PreferenceVisionDataset:
             or model_type.startswith("qwen")
             or model_type == "smolvlm"
         )
-        images_for_inputs = None if use_embedded_images else (images if images else None)
+        images_for_inputs = (
+            None if use_embedded_images else (images if images else None)
+        )
 
         result = {}
         for key in ("chosen", "rejected"):

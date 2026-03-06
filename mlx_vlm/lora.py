@@ -5,20 +5,17 @@ import logging
 import mlx.optimizers as optim
 from datasets import load_dataset
 
-from .trainer.sft_trainer import (
-    TrainingArgs,
-    train,
-)
-from .trainer.datasets import VisionDataset, PreferenceVisionDataset
+from .trainer.datasets import PreferenceVisionDataset, VisionDataset
 from .trainer.orpo_trainer import ORPOTrainingArgs, train_orpo
+from .trainer.sft_trainer import TrainingArgs, train
 from .trainer.utils import (
+    Colors,
     apply_lora_layers,
     find_all_linear_names,
     get_peft_model,
     not_supported_for_training,
-    unfreeze_modules,
-    Colors,
     print_trainable_parameters,
+    unfreeze_modules,
 )
 from .utils import load
 
@@ -354,8 +351,12 @@ if __name__ == "__main__":
     )
 
     # ORPO-specific arguments
-    parser.add_argument("--beta", type=float, default=0.1, help="ORPO beta (odds-ratio weight)")
-    parser.add_argument("--eps", type=float, default=1e-8, help="ORPO numerical stability epsilon")
+    parser.add_argument(
+        "--beta", type=float, default=0.1, help="ORPO beta (odds-ratio weight)"
+    )
+    parser.add_argument(
+        "--eps", type=float, default=1e-8, help="ORPO numerical stability epsilon"
+    )
 
     # Output arguments
     parser.add_argument("--output-path", type=str, default="adapters.safetensors")

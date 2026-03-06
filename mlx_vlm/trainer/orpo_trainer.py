@@ -2,8 +2,8 @@
 
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from functools import partial
+from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -12,14 +12,22 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_map
 from tqdm import tqdm
 
-from .utils import Colors, grad_checkpoint, save_adapter
 from .sft_trainer import TrainingArgs, _squeeze_leading_batch_dim
+from .utils import Colors, grad_checkpoint, save_adapter
 
 
 @dataclass
 class ORPOTrainingArgs(TrainingArgs):
-    beta: float = field(default=0.1, metadata={"help": "Exponential moving average parameter for reward normalization"})
-    eps: float = field(default=1e-8, metadata={"help": "Small constant for numerical stability in log calculations"})
+    beta: float = field(
+        default=0.1,
+        metadata={
+            "help": "Exponential moving average parameter for reward normalization"
+        },
+    )
+    eps: float = field(
+        default=1e-8,
+        metadata={"help": "Small constant for numerical stability in log calculations"},
+    )
 
 
 def get_logps(model, batch, train_on_completions=False, assistant_id=77091):
@@ -241,18 +249,24 @@ def evaluate_orpo(
             ),
         ),
         desc="Calculating loss...",
-        total=min(len(dataset) // batch_size, num_batches) if num_batches != -1 else len(dataset) // batch_size,
+        total=(
+            min(len(dataset) // batch_size, num_batches)
+            if num_batches != -1
+            else len(dataset) // batch_size
+        ),
     ):
         chosen_batch = batch["chosen"]
         rejected_batch = batch["rejected"]
 
         chosen_logps, chosen_logits_mean = get_logps(
-            model, chosen_batch,
+            model,
+            chosen_batch,
             train_on_completions=train_on_completions,
             assistant_id=assistant_id,
         )
         rejected_logps, rejected_logits_mean = get_logps(
-            model, rejected_batch,
+            model,
+            rejected_batch,
             train_on_completions=train_on_completions,
             assistant_id=assistant_id,
         )
@@ -279,12 +293,11 @@ def evaluate_orpo(
     return (total_loss / mx.maximum(total_tokens, 1)).item()
 
 
-
 def train_orpo(
     model,
     optimizer,
     train_dataset,
-    val_dataset = None,
+    val_dataset=None,
     args: TrainingArgs = TrainingArgs(),
     loss_fn=orpo_loss,
     train_on_completions=False,
@@ -296,7 +309,7 @@ def train_orpo(
     # Set memory limit if using Metal
     if mx.metal.is_available():
         mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
-    
+
     print(f"{Colors.HEADER}Starting training..., iterations: {args.iters}{Colors.ENDC}")
 
     # Initialize distributed training
@@ -307,26 +320,30 @@ def train_orpo(
         print(f"Node {rank} of {world_size}")
 
     if val_dataset is None and rank == 0:
-        print(f"{Colors.OKBLUE}No validation dataset provided — training will run without validation.{Colors.ENDC}")
-    
+        print(
+            f"{Colors.OKBLUE}No validation dataset provided — training will run without validation.{Colors.ENDC}"
+        )
+
     # Enable gradient checkpointing if requested
     if args.grad_checkpoint:
-        if hasattr(model, 'layers'):
+        if hasattr(model, "layers"):
             grad_checkpoint(model.layers[0])
-    
+
     # Compile the training step (like MLX-LM)
     state = [model.state, optimizer.state, mx.random.state]
-    
+
     @partial(mx.compile, inputs=state, outputs=state)
     def step(chosen_batch, rejected_batch):
         def loss_fn_wrapper():
             chosen_logps, chosen_logits_mean = get_logps(
-                model, chosen_batch,
+                model,
+                chosen_batch,
                 train_on_completions=train_on_completions,
                 assistant_id=assistant_id,
             )
             rejected_logps, rejected_logits_mean = get_logps(
-                model, rejected_batch,
+                model,
+                rejected_batch,
                 train_on_completions=train_on_completions,
                 assistant_id=assistant_id,
             )
@@ -345,10 +362,7 @@ def train_orpo(
 
         # Gradient clipping
         if args.grad_clip is not None:
-            grad = tree_map(
-                lambda g: mx.clip(g, -args.grad_clip, args.grad_clip),
-                grad
-            )
+            grad = tree_map(lambda g: mx.clip(g, -args.grad_clip, args.grad_clip), grad)
 
         # Average gradients for distributed training
         grad = average_gradients(grad)
@@ -357,7 +371,7 @@ def train_orpo(
         optimizer.update(model, grad)
 
         return lvalue, toks
-    
+
     # Training metrics
     model.train()
     losses = 0
@@ -365,7 +379,7 @@ def train_orpo(
     steps = 0
     trained_tokens = 0
     train_time = 0
-    
+
     # Main training loop
     for it, batch in zip(
         range(1, args.iters + 1),
@@ -381,7 +395,9 @@ def train_orpo(
         tic = time.perf_counter()
 
         # Validation (only if a validation dataset is provided)
-        if val_dataset is not None and (it == 1 or it % args.steps_per_eval == 0 or it == args.iters):
+        if val_dataset is not None and (
+            it == 1 or it % args.steps_per_eval == 0 or it == args.iters
+        ):
             tic_val = time.perf_counter()
             val_loss = evaluate_orpo(
                 model=model,
@@ -420,7 +436,11 @@ def train_orpo(
             train_loss = mx.distributed.all_sum(losses, stream=mx.cpu).item()
             train_loss /= steps * world_size
             n_tokens_total = mx.distributed.all_sum(n_tokens, stream=mx.cpu).item()
-            learning_rate = optimizer.learning_rate.item() if hasattr(optimizer.learning_rate, 'item') else args.learning_rate
+            learning_rate = (
+                optimizer.learning_rate.item()
+                if hasattr(optimizer.learning_rate, "item")
+                else args.learning_rate
+            )
             it_sec = args.steps_per_report / train_time
             tokens_sec = float(n_tokens_total) / train_time
             trained_tokens += n_tokens_total
@@ -455,8 +475,10 @@ def train_orpo(
                 f"{args.adapter_file} and {checkpoint}.{Colors.ENDC}",
                 flush=True,
             )
-    
+
     # Save final weights
     if rank == 0:
         save_adapter(model, args.adapter_file)
-        print(f"{Colors.OKGREEN}Saved final adapter weights to {args.adapter_file}.{Colors.ENDC}")
+        print(
+            f"{Colors.OKGREEN}Saved final adapter weights to {args.adapter_file}.{Colors.ENDC}"
+        )
