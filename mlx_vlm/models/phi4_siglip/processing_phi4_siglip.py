@@ -176,6 +176,11 @@ class Phi4SigLipProcessor:
         )
         return list(dict.fromkeys(tokenizer_names + image_names))
 
+    def save_pretrained(self, save_directory, **kwargs):
+        self.tokenizer.save_pretrained(save_directory, **kwargs)
+        if hasattr(self.image_processor, "save_pretrained"):
+            self.image_processor.save_pretrained(save_directory, **kwargs)
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         import json
