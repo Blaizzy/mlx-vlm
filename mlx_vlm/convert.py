@@ -181,6 +181,14 @@ def convert(
                 continue
             shutil.copy(file, mlx_path)
 
+    # Copy folders from the model path to the MLX path
+    for item in model_path.iterdir():
+        if item.is_dir():
+            dest = mlx_path / item.name
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(item, dest)
+
     processor.save_pretrained(mlx_path)
 
     save_config(config, config_path=mlx_path / "config.json")
