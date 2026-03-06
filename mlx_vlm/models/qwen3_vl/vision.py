@@ -3,6 +3,7 @@ from itertools import accumulate
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import ensure_fused_sdpa
 from .config import VisionConfig
 
 
@@ -126,8 +127,8 @@ class Attention(nn.Module):
     def __init__(self, dim: int, num_heads: int = 16) -> None:
         super().__init__()
         self.num_heads = num_heads
-        self.head_dim = head_dim = dim // num_heads
-        self.scale = head_dim**-0.5
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim**-0.5
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
 
@@ -153,10 +154,7 @@ class Attention(nn.Module):
 
         attn_outputs = []
         for q, k, v in zip(*splits):
-            output = mx.fast.scaled_dot_product_attention(
-                q, k, v, scale=self.scale, mask=None
-            )
-            attn_outputs.append(output)
+            attn_outputs.append(ensure_fused_sdpa(q, k, v, self.scale))
 
         output = mx.concatenate(attn_outputs, axis=2)
         output = output.transpose(0, 2, 1, 3).reshape(seq_length, -1)

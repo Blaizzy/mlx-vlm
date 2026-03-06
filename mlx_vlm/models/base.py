@@ -293,6 +293,17 @@ def chunked_attention(
 
     return mx.concatenate(outputs, axis=2)  # (B, n_heads, L, head_dim)
 
+@mx.compile
+def ensure_fused_sdpa(q, k, v, scale):
+    fused_dims = (64, 80, 128) # supported by MLX's fused SDPA kernel
+    d = q.shape[-1]
+    target = next((t for t in fused_dims if d <= t), d)
+    if target != d:
+        pad = [(0, 0)] * (q.ndim - 1) + [(0, target - d)]
+        q, k, v = mx.pad(q, pad), mx.pad(k, pad), mx.pad(v, pad)
+    return mx.fast.scaled_dot_product_attention(
+        q, k, v, scale=scale, mask=None
+    )[..., :d]
 
 def install_auto_processor_patch(target_model_types, processor_cls):
     """
