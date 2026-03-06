@@ -1,4 +1,4 @@
-from .datasets import VisionDataset, get_prompt
+from .datasets import PreferenceVisionDataset, VisionDataset, get_prompt
 from .lora import LoRaLayer, replace_lora_with_linear
 from .sft_trainer import TrainingArgs, save_adapter, train
 from .utils import (
