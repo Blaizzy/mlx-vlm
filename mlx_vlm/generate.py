@@ -34,6 +34,7 @@ DEFAULT_TEMPERATURE = 0.5
 DEFAULT_TOP_P = 1.0
 DEFAULT_SEED = 0
 DEFAULT_QUANTIZED_KV_START = 5000
+DEFAULT_PREFILL_STEP_SIZE = 2048
 
 
 def parse_arguments():
@@ -169,7 +170,7 @@ def parse_arguments():
     parser.add_argument(
         "--prefill-step-size",
         type=int,
-        default=None,
+        default=DEFAULT_PREFILL_STEP_SIZE,
         help="Number of tokens to process per prefill step. "
         "Lower values reduce peak memory usage but may be slower. "
         "Try 512 or 256 if you hit GPU memory errors during prefill.",
@@ -276,7 +277,7 @@ def generate_step(
     quantized_kv_start: int = 0,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
-    prefill_step_size: Optional[int] = 2048,
+    prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
