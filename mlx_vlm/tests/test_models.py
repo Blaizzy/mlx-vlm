@@ -2,6 +2,7 @@ import inspect
 import unittest
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx.utils import tree_map
 
 
@@ -3758,6 +3759,217 @@ class TestMiniCPMO(unittest.TestCase):
         sanitized = model.sanitize(weights)
         self.assertEqual(sanitized["audio_tower.conv1.weight"].shape, (8, 3, 80))
         self.assertEqual(sanitized["audio_tower.conv2.weight"].shape, (8, 3, 8))
+
+
+class TestPhi4MM(unittest.TestCase):
+
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models.phi4mm.config import (
+            AudioConfig,
+            ModelConfig,
+            TextConfig,
+            VisionConfig,
+        )
+
+        text_config = TextConfig(
+            model_type="phi4mm",
+            max_position_embeddings=2048,
+        )
+        vision_config = VisionConfig(
+            model_type="siglip2_vision_model",
+            hidden_size=32,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            patch_size=14,
+            image_size=28,
+            num_channels=3,
+            layer_norm_eps=1e-6,
+        )
+        return ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="phi4mm",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            mm_hidden_size=32,
+            image_token_index=-200,
+            audio_token_index=200,
+            vision_lora={"r": 4, "lora_alpha": 8},
+            speech_lora={"r": 4, "lora_alpha": 8},
+            audio_processor={"config": {
+                "attention_dim": 32,
+                "attention_heads": 4,
+                "num_blocks": 2,
+                "linear_units": 64,
+                "input_size": 80,
+                "time_reduction": 8,
+                "kernel_size": 3,
+                "conv_channels": 32,
+                "ext_pw_out_channel": 32,
+                "depthwise_seperable_out_channel": 32,
+            }},
+        )
+
+    def test_phi4mm(self):
+        from mlx_vlm.models import phi4mm
+
+        config = self._tiny_config()
+        model = phi4mm.Model(config)
+
+        # Language model test
+        self.assertEqual(model.model_type, "phi4mm")
+        self.assertEqual(len(model.layers), config.num_hidden_layers)
+
+        inputs = mx.array([[0, 1]])
+        outputs = model(inputs)
+        logits = outputs.logits
+        self.assertEqual(logits.shape, (1, 2, config.vocab_size))
+
+    def test_phi4mm_input_embeddings(self):
+        from mlx_vlm.models import phi4mm
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        config = self._tiny_config()
+        model = phi4mm.Model(config)
+
+        # Text-only
+        input_ids = mx.array([[1, 2, 3, 4, 5]])
+        result = model.get_input_embeddings(input_ids=input_ids)
+        self.assertIsInstance(result, InputEmbeddingsFeatures)
+        self.assertIsNotNone(result.inputs_embeds)
+
+    def test_phi4mm_sanitize_lora_keys(self):
+        from mlx_vlm.models import phi4mm
+
+        config = self._tiny_config()
+        model = phi4mm.Model(config)
+
+        hidden = config.hidden_size
+        qkv_size = (
+            config.num_attention_heads * (hidden // config.num_attention_heads)
+            + 2 * config.num_key_value_heads * (hidden // config.num_attention_heads)
+        )
+        lora_r = 4
+
+        weights = {
+            # Base layer weight
+            "model.layers.0.self_attn.qkv_proj.base_layer.weight": mx.zeros(
+                (qkv_size, hidden)
+            ),
+            # Vision LoRA
+            "model.layers.0.self_attn.qkv_proj.lora_A.vision.weight": mx.zeros(
+                (lora_r, hidden)
+            ),
+            "model.layers.0.self_attn.qkv_proj.lora_B.vision.weight": mx.zeros(
+                (qkv_size, lora_r)
+            ),
+            # Speech LoRA
+            "model.layers.0.self_attn.qkv_proj.lora_A.speech.weight": mx.zeros(
+                (lora_r, hidden)
+            ),
+            "model.layers.0.self_attn.qkv_proj.lora_B.speech.weight": mx.zeros(
+                (qkv_size, lora_r)
+            ),
+            # Embed tokens
+            "model.embed_tokens.weight": mx.zeros((config.vocab_size, hidden)),
+        }
+
+        sanitized = model.sanitize(weights)
+
+        # Base layer should be merged with vision LoRA by default
+        self.assertIn(
+            "language_model.model.layers.0.self_attn.qkv_proj.weight", sanitized
+        )
+        # LoRA keys should not appear in sanitized output
+        for k in sanitized:
+            self.assertNotIn("lora_A", k)
+            self.assertNotIn("lora_B", k)
+            self.assertNotIn("base_layer", k)
+
+        # Speech LoRA should be stored for runtime switching
+        self.assertTrue(len(model._speech_lora_a) > 0)
+        self.assertTrue(len(model._speech_lora_b) > 0)
+        self.assertTrue(len(model._base_weights) > 0)
+
+    def test_phi4mm_quant_predicate_skips_multimodal(self):
+        from mlx_vlm.models import phi4mm
+
+        config = self._tiny_config()
+        model = phi4mm.Model(config)
+
+        predicate = model.quant_predicate
+
+        # Language model layers should be quantized
+        self.assertTrue(
+            predicate("language_model.model.layers.0.self_attn.qkv_proj", nn.Linear(4, 4))
+        )
+
+        # Multimodal modules should NOT be quantized
+        self.assertFalse(
+            predicate("audio_encoder.encoders.0.attn.linear_q", nn.Linear(4, 4))
+        )
+        self.assertFalse(
+            predicate("audio_projection.speech.proj_0", nn.Linear(4, 4))
+        )
+        self.assertFalse(
+            predicate("mm_projector.0", nn.Linear(4, 4))
+        )
+        self.assertFalse(
+            predicate("vision_tower.vision_tower.encoder.layers.0", nn.Linear(4, 4))
+        )
+
+    def test_phi4mm_quant_predicate_clears_lora(self):
+        """Accessing quant_predicate should merge LoRAs and clear stored copies."""
+        from mlx_vlm.models import phi4mm
+
+        config = self._tiny_config()
+        model = phi4mm.Model(config)
+
+        hidden = config.hidden_size
+        head_dim = hidden // config.num_attention_heads
+        qkv_size = (
+            config.num_attention_heads * head_dim
+            + 2 * config.num_key_value_heads * head_dim
+        )
+        key = "language_model.model.layers.0.self_attn.qkv_proj.weight"
+        lora_r = 4
+
+        # Set up LoRA weights with correct shapes
+        model._base_weights = {key: mx.ones((qkv_size, hidden))}
+        model._speech_lora_a = {key: mx.zeros((lora_r, hidden))}
+        model._speech_lora_b = {key: mx.zeros((qkv_size, lora_r))}
+        model._speech_lora_scale = 1.0
+        model._vision_lora_a = {key: mx.zeros((lora_r, hidden))}
+        model._vision_lora_b = {key: mx.zeros((qkv_size, lora_r))}
+        model._vision_lora_scale = 1.0
+        model._active_lora = "vision"
+
+        # Accessing the property triggers merge and clears LoRA dicts
+        _ = model.quant_predicate
+
+        self.assertEqual(len(model._base_weights), 0)
+        self.assertEqual(len(model._speech_lora_a), 0)
+        self.assertEqual(len(model._speech_lora_b), 0)
+        self.assertEqual(len(model._vision_lora_a), 0)
+        self.assertEqual(len(model._vision_lora_b), 0)
+
+    def test_phi4mm_set_modality_skips_when_no_lora(self):
+        """set_modality should no-op when _base_weights is empty (quantized model)."""
+        from mlx_vlm.models import phi4mm
+
+        config = self._tiny_config()
+        model = phi4mm.Model(config)
+        model._base_weights = {}
+
+        # Should not raise even with modality flags set
+        model.set_modality(has_image=True, has_audio=True)
 
 
 if __name__ == "__main__":
