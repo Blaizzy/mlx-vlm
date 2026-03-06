@@ -516,21 +516,46 @@ class Phi4MMProcessor(ProcessorMixin):
             else:
                 texts = list(text)
 
-            # Replace audio placeholders like <|audio_1|> with <|endoftext11|>
+            # Replace numbered placeholders with internal tokens
             import re
+
             texts = [
-                re.sub(r"<\|audio_\d+\|>", DEFAULT_AUDIO_TOKEN, t) for t in texts
+                re.sub(r"<\|image_\d+\|>", DEFAULT_IMAGE_TOKEN, t)
+                for t in texts
+            ]
+            texts = [
+                re.sub(r"<\|audio_\d+\|>", DEFAULT_AUDIO_TOKEN, t)
+                for t in texts
             ]
 
             has_images = any(DEFAULT_IMAGE_TOKEN in t for t in texts)
             has_audio = any(DEFAULT_AUDIO_TOKEN in t for t in texts)
 
             if has_images and images is not None:
-                # Tokenize with image token handling
+                # Tokenize with image token handling (splits on <image>)
                 input_ids_list = []
                 for t in texts:
                     ids = tokenizer_image_token(t, self.tokenizer)
                     input_ids_list.append(ids)
+
+                # If audio is also present, expand audio tokens
+                if has_audio and audio_inputs is not None:
+                    audio_size_iter = iter(
+                        audio_inputs["audio_embed_sizes"].tolist()
+                    )
+                    expanded_list = []
+                    for ids in input_ids_list:
+                        expanded_ids = []
+                        for token_id in ids:
+                            if token_id == AUDIO_TOKEN_INDEX:
+                                embed_size = int(next(audio_size_iter))
+                                expanded_ids.extend(
+                                    [AUDIO_TOKEN_INDEX] * embed_size
+                                )
+                            else:
+                                expanded_ids.append(token_id)
+                        expanded_list.append(expanded_ids)
+                    input_ids_list = expanded_list
 
                 # Pad sequences
                 max_len = max(len(ids) for ids in input_ids_list)
@@ -546,7 +571,7 @@ class Phi4MMProcessor(ProcessorMixin):
                 input_ids = mx.array(padded_ids)
                 attention_mask = mx.array(attention_masks)
             elif has_audio and audio_inputs is not None:
-                # For audio, the <|endoftext11|> token needs to be expanded
+                # For audio-only, the <|endoftext11|> token needs to be expanded
                 # to audio_embed_size tokens in input_ids
                 input_ids_list = []
                 audio_size_iter = iter(audio_inputs["audio_embed_sizes"].tolist())

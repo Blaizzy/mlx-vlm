@@ -207,6 +207,10 @@ class Model(nn.Module):
         has_images = pixel_values is not None
         has_audio = input_audio_embeds is not None and input_audio_embeds.size > 0
 
+        # Auto-switch LoRA when multimodal inputs are provided
+        if has_images or has_audio:
+            self.set_modality(has_image=has_images, has_audio=has_audio)
+
         if not has_images and not has_audio:
             return InputEmbeddingsFeatures(
                 inputs_embeds=self.model.embed_tokens(input_ids)
@@ -497,6 +501,7 @@ class Model(nn.Module):
         self._vision_lora_b = lora_b_vision
         self._vision_lora_scale = vision_lora_scale
         self._base_weights = {k: v for k, v in base_weights.items()}
+        self._active_lora = "vision"  # Vision LoRA merged by default
 
         # Sanitize audio encoder weights through audio encoder's sanitize
         if audio_weights:
@@ -525,6 +530,7 @@ class Model(nn.Module):
                     else:
                         obj = getattr(obj, p)
                 setattr(obj, parts[-1], merged)
+        self._active_lora = "speech"
 
     def apply_vision_lora(self):
         """Switch LLM weights back to vision LoRA."""
@@ -545,3 +551,85 @@ class Model(nn.Module):
                     else:
                         obj = getattr(obj, p)
                 setattr(obj, parts[-1], merged)
+        self._active_lora = "vision"
+
+    def apply_both_loras(self):
+        """Apply both vision and speech LoRA deltas for multimodal inference."""
+        has_vision = hasattr(self, "_vision_lora_a") and self._vision_lora_a
+        has_speech = hasattr(self, "_speech_lora_a") and self._speech_lora_a
+        if not has_vision and not has_speech:
+            return
+
+        for key, base_w in self._base_weights.items():
+            merged = base_w
+            if (
+                has_vision
+                and key in self._vision_lora_a
+                and key in self._vision_lora_b
+            ):
+                merged = merged + self._vision_lora_scale * (
+                    self._vision_lora_b[key] @ self._vision_lora_a[key]
+                )
+            if (
+                has_speech
+                and key in self._speech_lora_a
+                and key in self._speech_lora_b
+            ):
+                merged = merged + self._speech_lora_scale * (
+                    self._speech_lora_b[key] @ self._speech_lora_a[key]
+                )
+
+            parts = key.split(".")
+            obj = self
+            for p in parts[:-1]:
+                if p.isdigit():
+                    obj = obj[int(p)]
+                else:
+                    obj = getattr(obj, p)
+            setattr(obj, parts[-1], merged)
+        self._active_lora = "both"
+
+    def apply_base_weights(self):
+        """Reset LLM weights to base (no LoRA) for text-only inference."""
+        if not hasattr(self, "_base_weights") or not self._base_weights:
+            return
+
+        for key, base_w in self._base_weights.items():
+            parts = key.split(".")
+            obj = self
+            for p in parts[:-1]:
+                if p.isdigit():
+                    obj = obj[int(p)]
+                else:
+                    obj = getattr(obj, p)
+            setattr(obj, parts[-1], base_w)
+        self._active_lora = None
+
+    def set_modality(self, has_image: bool = False, has_audio: bool = False):
+        """Automatically apply the correct LoRA based on input modality.
+
+        Args:
+            has_image: Whether the input contains images.
+            has_audio: Whether the input contains audio.
+        """
+        if has_image and has_audio:
+            target = "both"
+        elif has_audio:
+            target = "speech"
+        elif has_image:
+            target = "vision"
+        else:
+            target = None  # text-only: base weights
+
+        current = getattr(self, "_active_lora", "vision")  # vision is default after load
+        if current == target:
+            return
+
+        if target == "both":
+            self.apply_both_loras()
+        elif target == "speech":
+            self.apply_speech_lora()
+        elif target == "vision":
+            self.apply_vision_lora()
+        else:
+            self.apply_base_weights()

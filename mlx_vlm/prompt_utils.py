@@ -65,7 +65,7 @@ MODEL_CONFIG = {
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
     "bunny-llama": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "phi3_v": MessageFormat.NUMBERED_IMAGE_TOKENS,
-    "phi4mm": MessageFormat.IMAGE_TOKEN_NEWLINE,
+    "phi4mm": MessageFormat.NUMBERED_IMAGE_TOKENS,
     "multi_modality": MessageFormat.IMAGE_TOKEN,
     "deepseek_vl_v2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "deepseekocr_2": MessageFormat.IMAGE_TOKEN_NEWLINE,
@@ -343,6 +343,12 @@ class MessageFormatter:
             prefix = token * num_images
             content = f"{prefix}{content}" if image_first else f"{content}{prefix}"
 
+        if role == "user" and not skip_audio_token and num_audios > 0:
+            audio_prefix = "".join(
+                [f"<|audio_{i+1}|>" for i in range(num_audios)]
+            )
+            content = f"{audio_prefix}{content}"
+
         return {"role": role, "content": content}
 
     def _format_numbered_tokens(
@@ -355,17 +361,33 @@ class MessageFormatter:
         num_audios: int,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Format with numbered image tokens."""
+        """Format with numbered image/audio tokens.
+
+        Order follows Phi-4 convention: <|image_N|> before <|audio_N|>.
+        """
         content = prompt
 
-        if role == "user" and not skip_image_token and num_images > 0:
-            # phi3_v uses single token regardless of num_images
-            prefix = (
-                "<|image_1|>"
-                if self.model_name == "phi3_v"
-                else " ".join([f"<|image_{i+1}|>" for i in range(num_images)])
-            )
-            content = f"{prefix}{content}"
+        if role == "user":
+            # Build prefix: images first, then audio (matches HF model format)
+            prefix_parts = []
+            if not skip_image_token and num_images > 0:
+                # phi3_v uses single token regardless of num_images
+                if self.model_name == "phi3_v":
+                    prefix_parts.append("<|image_1|>")
+                else:
+                    prefix_parts.append(
+                        "".join(
+                            [f"<|image_{i+1}|>" for i in range(num_images)]
+                        )
+                    )
+            if not skip_audio_token and num_audios > 0:
+                prefix_parts.append(
+                    "".join(
+                        [f"<|audio_{i+1}|>" for i in range(num_audios)]
+                    )
+                )
+            if prefix_parts:
+                content = f"{''.join(prefix_parts)}{content}"
 
         return {"role": role, "content": content}
 
