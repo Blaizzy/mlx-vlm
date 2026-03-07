@@ -5,18 +5,16 @@ import logging
 import mlx.optimizers as optim
 from datasets import load_dataset
 
-from .trainer import (
-    Colors,
-    TrainingArgs,
-    VisionDataset,
-    print_trainable_parameters,
-    train,
-)
+from .trainer.datasets import PreferenceVisionDataset, VisionDataset
+from .trainer.orpo_trainer import ORPOTrainingArgs, train_orpo
+from .trainer.sft_trainer import TrainingArgs, train
 from .trainer.utils import (
+    Colors,
     apply_lora_layers,
     find_all_linear_names,
     get_peft_model,
     not_supported_for_training,
+    print_trainable_parameters,
     unfreeze_modules,
 )
 from .utils import load
@@ -210,18 +208,27 @@ def main(args):
 
     dataset = dataset.select(range(iters))
 
-    # Transform dataset to messages format (support custom prompt template)
-    dataset = transform_dataset_to_messages(
-        dataset, model_type, args.custom_prompt_format
-    )
+    # Transform dataset to messages format (SFT only; ORPO uses chosen/rejected directly)
+    if args.train_mode != "orpo":
+        dataset = transform_dataset_to_messages(
+            dataset, model_type, args.custom_prompt_format
+        )
 
     # Create training dataset
-    train_dataset = VisionDataset(
-        dataset,
-        config,
-        processor,
-        image_resize_shape=args.image_resize_shape,
-    )
+    if args.train_mode == "orpo":
+        train_dataset = PreferenceVisionDataset(
+            dataset,
+            config,
+            processor,
+            image_resize_shape=args.image_resize_shape,
+        )
+    else:
+        train_dataset = VisionDataset(
+            dataset,
+            config,
+            processor,
+            image_resize_shape=args.image_resize_shape,
+        )
 
     # Setup model for training
     model = setup_model_for_training(model, args, args.adapter_path)
@@ -231,34 +238,60 @@ def main(args):
     logger.info(f"{Colors.HEADER}Setting up optimizer{Colors.ENDC}")
     optimizer = optim.Adam(learning_rate=args.learning_rate)
 
-    # Create training arguments
-    training_args = TrainingArgs(
-        batch_size=args.batch_size,
-        iters=iters,
-        steps_per_report=args.steps_per_report,
-        steps_per_eval=args.steps_per_eval,
-        steps_per_save=args.steps_per_save,
-        val_batches=args.val_batches,
-        max_seq_length=args.max_seq_length,
-        adapter_file=args.output_path,
-        grad_checkpoint=args.grad_checkpoint,
-        learning_rate=args.learning_rate,
-        grad_clip=args.grad_clip,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        full_finetune=args.full_finetune,
-    )
-
     # Train model
-    logger.info(f"{Colors.HEADER}Training model{Colors.ENDC}")
-    train(
-        model=model,
-        optimizer=optimizer,
-        train_dataset=train_dataset,
-        val_dataset=None,
-        args=training_args,
-        train_on_completions=args.train_on_completions,
-        assistant_id=args.assistant_id,
-    )
+    logger.info(f"{Colors.HEADER}Training model ({args.train_mode}){Colors.ENDC}")
+    if args.train_mode == "orpo":
+        training_args = ORPOTrainingArgs(
+            batch_size=args.batch_size,
+            iters=iters,
+            steps_per_report=args.steps_per_report,
+            steps_per_eval=args.steps_per_eval,
+            steps_per_save=args.steps_per_save,
+            val_batches=args.val_batches,
+            max_seq_length=args.max_seq_length,
+            adapter_file=args.output_path,
+            grad_checkpoint=args.grad_checkpoint,
+            learning_rate=args.learning_rate,
+            grad_clip=args.grad_clip,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            full_finetune=args.full_finetune,
+            beta=args.beta,
+            eps=args.eps,
+        )
+        train_orpo(
+            model=model,
+            optimizer=optimizer,
+            train_dataset=train_dataset,
+            val_dataset=None,
+            args=training_args,
+            train_on_completions=args.train_on_completions,
+            assistant_id=args.assistant_id,
+        )
+    else:
+        training_args = TrainingArgs(
+            batch_size=args.batch_size,
+            iters=iters,
+            steps_per_report=args.steps_per_report,
+            steps_per_eval=args.steps_per_eval,
+            steps_per_save=args.steps_per_save,
+            val_batches=args.val_batches,
+            max_seq_length=args.max_seq_length,
+            adapter_file=args.output_path,
+            grad_checkpoint=args.grad_checkpoint,
+            learning_rate=args.learning_rate,
+            grad_clip=args.grad_clip,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            full_finetune=args.full_finetune,
+        )
+        train(
+            model=model,
+            optimizer=optimizer,
+            train_dataset=train_dataset,
+            val_dataset=None,
+            args=training_args,
+            train_on_completions=args.train_on_completions,
+            assistant_id=args.assistant_id,
+        )
 
     logger.info(
         f"{Colors.HEADER}Training completed! Model saved to {args.output_path}{Colors.ENDC}"
@@ -307,6 +340,23 @@ if __name__ == "__main__":
     parser.add_argument("--lora-alpha", type=float, default=16)
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
+
+    # Training mode
+    parser.add_argument(
+        "--train-mode",
+        type=str,
+        default="sft",
+        choices=["sft", "orpo"],
+        help="Training mode: 'sft' (default) or 'orpo'",
+    )
+
+    # ORPO-specific arguments
+    parser.add_argument(
+        "--beta", type=float, default=0.1, help="ORPO beta (odds-ratio weight)"
+    )
+    parser.add_argument(
+        "--eps", type=float, default=1e-8, help="ORPO numerical stability epsilon"
+    )
 
     # Output arguments
     parser.add_argument("--output-path", type=str, default="adapters.safetensors")

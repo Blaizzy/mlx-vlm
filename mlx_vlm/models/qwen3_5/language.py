@@ -667,7 +667,8 @@ class LanguageModel(nn.Module):
 
     @property
     def quant_predicate(self):
-        if self.config.num_experts <= 0:
+
+        if getattr(self.args, "num_experts", 0) <= 0:
             return None
 
         def predicate(path, _):

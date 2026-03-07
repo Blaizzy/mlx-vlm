@@ -1,4 +1,4 @@
-# Copyright © 2024 MLX-VLM
+# Copyright © 2026 MLX-VLM
 
 import time
 from dataclasses import dataclass, field
