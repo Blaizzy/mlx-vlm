@@ -1,5 +1,4 @@
 import argparse
-import asyncio
 import gc
 import importlib
 import json
@@ -819,7 +818,6 @@ async def responses_endpoint(request: Request):
 
                         # Send response.output_text.delta event
                         yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
-                        await asyncio.sleep(0.01)
 
                     # Send response.output_text.done event (to match the openai pipeline)
                     yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=full_text).model_dump_json()}\n\n"
@@ -1100,9 +1098,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                         )
 
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
-                        await asyncio.sleep(
-                            0.01
-                        )  # Small sleep to prevent blocking event loop entirely
 
                     if tool_parser_type is not None:
                         tool_calls = process_tool_calls(
