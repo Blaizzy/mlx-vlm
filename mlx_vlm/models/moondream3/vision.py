@@ -38,12 +38,8 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
-        self.fc1 = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=True
-        )
-        self.fc2 = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=True
-        )
+        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=True)
+        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=True)
         self.act = nn.GELU(approx="tanh")
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -99,12 +95,8 @@ class VisionEncoder(nn.Module):
 class VisionProjection(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
-        self.fc1 = nn.Linear(
-            2 * config.hidden_size, config.proj_inner_dim, bias=True
-        )
-        self.fc2 = nn.Linear(
-            config.proj_inner_dim, config.proj_out_dim, bias=True
-        )
+        self.fc1 = nn.Linear(2 * config.hidden_size, config.proj_inner_dim, bias=True)
+        self.fc2 = nn.Linear(config.proj_inner_dim, config.proj_out_dim, bias=True)
         self.act = nn.GELU(approx="tanh")
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -157,9 +149,7 @@ class VisionModel(nn.Module):
                 w_start = int(round(j * pool_w))
                 w_end = int(round((j + 1) * pool_w))
                 w_end = max(w_end, w_start + 1)
-                pooled[i, j] = full_grid[h_start:h_end, w_start:w_end].mean(
-                    axis=(0, 1)
-                )
+                pooled[i, j] = full_grid[h_start:h_end, w_start:w_end].mean(axis=(0, 1))
 
         return pooled.reshape(-1, D)
 
@@ -182,19 +172,13 @@ class VisionModel(nn.Module):
             global_feats = all_features[crop_idx]
 
             if nc > 1:
-                local_feats = [
-                    all_features[crop_idx + j] for j in range(1, nc)
-                ]
+                local_feats = [all_features[crop_idx + j] for j in range(1, nc)]
                 layout = crop_layouts[i] if crop_layouts else (1, nc - 1)
-                reconstructed = self._reconstruct_local_features(
-                    local_feats, layout
-                )
+                reconstructed = self._reconstruct_local_features(local_feats, layout)
             else:
                 reconstructed = global_feats
 
-            combined = mx.concatenate(
-                [global_feats, reconstructed], axis=-1
-            )
+            combined = mx.concatenate([global_feats, reconstructed], axis=-1)
             projected = self.proj_mlp(combined)
             batch_features.append(projected)
             crop_idx += nc

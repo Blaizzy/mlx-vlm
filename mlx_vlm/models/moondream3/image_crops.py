@@ -99,22 +99,54 @@ def create_crops(image, crop_size, max_crops, overlap_margin):
     for r in range(rows):
         for c in range(cols):
             # Source region in original image coordinates
-            src_y = r * (height - crop_size * height / (rows * effective_size + 2 * overlap_pixels)) if rows > 1 else 0
-            src_x = c * (width - crop_size * width / (cols * effective_size + 2 * overlap_pixels)) if cols > 1 else 0
+            src_y = (
+                r
+                * (
+                    height
+                    - crop_size * height / (rows * effective_size + 2 * overlap_pixels)
+                )
+                if rows > 1
+                else 0
+            )
+            src_x = (
+                c
+                * (
+                    width
+                    - crop_size * width / (cols * effective_size + 2 * overlap_pixels)
+                )
+                if cols > 1
+                else 0
+            )
 
             # Simpler approach: evenly distribute crops
             if rows > 1:
-                src_y = r * (height - crop_size * height / (rows * crop_size / crop_size)) / max(rows - 1, 1)
+                src_y = (
+                    r
+                    * (height - crop_size * height / (rows * crop_size / crop_size))
+                    / max(rows - 1, 1)
+                )
             else:
                 src_y = 0
             if cols > 1:
-                src_x = c * (width - crop_size * width / (cols * crop_size / crop_size)) / max(cols - 1, 1)
+                src_x = (
+                    c
+                    * (width - crop_size * width / (cols * crop_size / crop_size))
+                    / max(cols - 1, 1)
+                )
             else:
                 src_x = 0
 
             # Scale: map crop_size pixels to image region
-            scale_x = width / (cols * (crop_size - 2 * overlap_pixels) + 2 * overlap_pixels) if cols > 0 else 1
-            scale_y = height / (rows * (crop_size - 2 * overlap_pixels) + 2 * overlap_pixels) if rows > 0 else 1
+            scale_x = (
+                width / (cols * (crop_size - 2 * overlap_pixels) + 2 * overlap_pixels)
+                if cols > 0
+                else 1
+            )
+            scale_y = (
+                height / (rows * (crop_size - 2 * overlap_pixels) + 2 * overlap_pixels)
+                if rows > 0
+                else 1
+            )
             scale = max(scale_x, scale_y)
 
             crop_w = int(crop_size * scale)

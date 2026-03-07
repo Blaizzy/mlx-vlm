@@ -2502,9 +2502,7 @@ class TestModels(unittest.TestCase):
         # Vision encoder test
         batch_size = 1
         crop_size = vision_config.crop_size
-        pixel_values = mx.random.uniform(
-            shape=(batch_size, crop_size, crop_size, 3)
-        )
+        pixel_values = mx.random.uniform(shape=(batch_size, crop_size, crop_size, 3))
         features = model.vision.encoder(pixel_values)
         grid_size = crop_size // vision_config.patch_size
         num_patches = grid_size * grid_size
@@ -2530,9 +2528,7 @@ class TestModels(unittest.TestCase):
             num_crops=[1],
             crop_layouts=[(1, 1)],
         )
-        self.assertEqual(
-            outputs.logits.shape[-1], text_config.vocab_size
-        )
+        self.assertEqual(outputs.logits.shape[-1], text_config.vocab_size)
 
 
 class TestGetInputEmbeddings(unittest.TestCase):
@@ -3793,8 +3789,10 @@ class TestGetInputEmbeddings(unittest.TestCase):
         input_ids_vis = mx.zeros((1, 1 + num_patches + 2), dtype=mx.int32)
         pixel_values = mx.random.uniform(shape=(1, 28, 28, 3))
         result_vis = model.get_input_embeddings(
-            input_ids_vis, pixel_values=pixel_values,
-            num_crops=[1], crop_layouts=[(1, 1)],
+            input_ids_vis,
+            pixel_values=pixel_values,
+            num_crops=[1],
+            crop_layouts=[(1, 1)],
         )
         self.assertIsInstance(result_vis, InputEmbeddingsFeatures)
         self.assertIsNotNone(result_vis.inputs_embeds)

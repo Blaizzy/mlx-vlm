@@ -143,15 +143,10 @@ class Moondream3Processor:
                         formatted, add_special_tokens=False
                     )
                     input_ids = (
-                        [bos_id]
-                        + [0] * NUM_VISION_TOKENS
-                        + text_tokens
-                        + [ANSWER_ID]
+                        [bos_id] + [0] * NUM_VISION_TOKENS + text_tokens + [ANSWER_ID]
                     )
                 else:
-                    text_tokens = self.tokenizer.encode(
-                        t, add_special_tokens=False
-                    )
+                    text_tokens = self.tokenizer.encode(t, add_special_tokens=False)
                     if add_special_tokens:
                         input_ids = [bos_id] + text_tokens
                     else:

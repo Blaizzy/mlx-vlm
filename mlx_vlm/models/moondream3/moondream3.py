@@ -2,7 +2,6 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..base import InputEmbeddingsFeatures
 from . import processing_moondream3  # noqa: F401
@@ -92,9 +91,7 @@ class Model(nn.Module):
         if cache is not None:
             return None
 
-        causal = mx.triu(
-            mx.full((seq_len, seq_len), -mx.inf), k=1
-        )
+        causal = mx.triu(mx.full((seq_len, seq_len), -mx.inf), k=1)
         causal[:prefix_len, :prefix_len] = 0.0
 
         return causal.reshape(1, 1, seq_len, seq_len)
@@ -125,7 +122,7 @@ class Model(nn.Module):
             new_key = k
 
             if new_key.startswith("model."):
-                new_key = new_key[len("model."):]
+                new_key = new_key[len("model.") :]
 
             if new_key.startswith("region."):
                 continue
@@ -138,12 +135,12 @@ class Model(nn.Module):
             elif new_key.startswith("text.lm_head"):
                 pass
             elif new_key.startswith("text."):
-                new_key = "text.model." + new_key[len("text."):]
+                new_key = "text.model." + new_key[len("text.") :]
 
             if new_key.startswith("vision.") and not new_key.startswith(
                 "vision.proj_mlp"
             ):
-                new_key = "vision.encoder." + new_key[len("vision."):]
+                new_key = "vision.encoder." + new_key[len("vision.") :]
 
             sanitized[new_key] = v
 

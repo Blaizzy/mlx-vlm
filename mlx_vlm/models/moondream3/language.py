@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -72,16 +72,12 @@ class Attention(nn.Module):
 
         q_dim = self.n_heads * self.head_dim
         kv_dim = self.n_kv_heads * self.head_dim
-        queries, keys, values = mx.split(
-            qkv_out, [q_dim, q_dim + kv_dim], axis=-1
-        )
+        queries, keys, values = mx.split(qkv_out, [q_dim, q_dim + kv_dim], axis=-1)
 
         queries = queries.reshape(B, L, self.n_heads, self.head_dim).transpose(
             0, 2, 1, 3
         )
-        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(
-            0, 2, 1, 3
-        )
+        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(
             0, 2, 1, 3
         )
@@ -107,12 +103,8 @@ class Attention(nn.Module):
 class DenseMLP(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
-        self.fc1 = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=True
-        )
-        self.fc2 = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=True
-        )
+        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=True)
+        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=True)
         self.act = nn.GELU(approx="tanh")
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -152,9 +144,7 @@ class MoEMLP(nn.Module):
         ne = self.num_experts_per_tok
 
         gates = self.router(x)
-        inds = mx.stop_gradient(
-            mx.argpartition(-gates, kth=ne - 1, axis=-1)[..., :ne]
-        )
+        inds = mx.stop_gradient(mx.argpartition(-gates, kth=ne - 1, axis=-1)[..., :ne])
         scores = mx.softmax(
             mx.take_along_axis(gates, inds, axis=-1),
             axis=-1,
