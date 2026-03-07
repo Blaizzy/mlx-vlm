@@ -693,8 +693,6 @@ def save_config(
         json.dump(config, fid, indent=4)
 
 
-
-
 def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     """
     Helper function to load an image from either a URL, file path, data URI,
@@ -709,9 +707,7 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
             )
         if isinstance(image_source, str) and image_source.startswith("data:image/"):
             if "," not in image_source:
-                raise ValueError(
-                    "Invalid data URI format - missing comma separator"
-                )
+                raise ValueError("Invalid data URI format - missing comma separator")
             _, data = image_source.split(",", 1)
             image_source = BytesIO(base64.b64decode(data))
         if isinstance(image_source, str) and image_source.startswith(
