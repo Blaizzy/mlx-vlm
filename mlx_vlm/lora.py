@@ -208,7 +208,10 @@ def main(args):
     else:
         iters = args.iters
 
-    dataset = dataset.select(range(iters))
+    if iters <= 0:
+        raise ValueError(
+            "Computed iterations is 0. Increase dataset size, lower batch_size, or set --iters."
+        )
 
     # Transform dataset to messages format (support custom prompt template)
     dataset = transform_dataset_to_messages(
