@@ -181,7 +181,7 @@ class VisionModel(nn.Module):
 
         # Simple approach: use strided slicing + averaging via reshape when possible
         # For arbitrary sizes, use a loop-based approach
-        pooled = mx.zeros((grid_size, grid_size, D))
+        pooled = mx.zeros((grid_size, grid_size, D), dtype=full_grid.dtype)
         for i in range(grid_size):
             h_start = int(round(i * pool_h))
             h_end = int(round((i + 1) * pool_h))

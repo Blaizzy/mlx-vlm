@@ -52,6 +52,9 @@ class Model(nn.Module):
         num_crops = kwargs.get("num_crops", None)
         crop_layouts = kwargs.get("crop_layouts", None)
 
+        dtype = inputs_embeds.dtype
+        pixel_values = pixel_values.astype(dtype)
+
         # Process images through vision encoder
         image_features = self.vision(
             pixel_values,

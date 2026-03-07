@@ -1,4 +1,3 @@
-import math
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -40,18 +39,19 @@ class Tau(nn.Module):
 
         # Position-dependent component
         # tau_pos = 1 + (sigmoid(alpha * log(pos+1)) - 0.5)
-        log_pos = mx.log(positions.astype(mx.float32) + 1.0)  # (L,)
-        # alpha: (n_heads,), log_pos: (L,) -> (n_heads, L)
-        alpha_log_pos = self.alpha[:, None] * log_pos[None, :]
-        tau_pos = 1.0 + (mx.sigmoid(alpha_log_pos) - 0.5)  # (n_heads, L)
+        dtype = qkv_cat.dtype
+        log_pos = mx.log(positions + 1.0)  # (L,) int32 + float → float32
+        alpha_log_pos = self.alpha[:, None] * log_pos[None, :]  # (n_heads, L)
+        tau_pos = (1.0 + (mx.sigmoid(alpha_log_pos) - 0.5)).astype(
+            dtype
+        )  # (n_heads, L) cast once to model dtype
 
         # Combine: tok component (B, L, n_heads) + pos component (n_heads, L)
-        # tau_q/v: (B, n_heads, L)
-        dtype = qkv_cat.dtype
+        # All in model dtype — no further casts needed
         tau_q = tok_q.transpose(0, 2, 1) + tau_pos[None, :, :]  # (B, n_heads, L)
         tau_v = tok_v.transpose(0, 2, 1) + tau_pos[None, :, :]
 
-        return tau_q[..., None].astype(dtype), tau_v[..., None].astype(dtype)
+        return tau_q[..., None], tau_v[..., None]
 
 
 class Attention(nn.Module):
@@ -144,6 +144,23 @@ class DenseMLP(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         return self.fc2(self.act(self.fc1(x)))
 
+@mx.compile
+def _gather_sort(x, indices):
+    """Sort tokens by expert index for coalesced memory access."""
+    *_, M = indices.shape
+    indices = indices.flatten()
+    order = mx.argsort(indices)
+    inv_order = mx.argsort(order)
+    return x.flatten(0, -3)[order // M], indices[order], inv_order
+
+@mx.compile
+def _scatter_unsort(x, inv_order, shape=None):
+    """Restore original token order after sorted expert computation."""
+    x = x[inv_order]
+    if shape is not None:
+        x = mx.unflatten(x, 0, shape)
+    return x
+
 
 class MoEMLP(nn.Module):
     """Mixture of Experts MLP with GeGLU activation for layers >= moe_start_layer."""
@@ -162,44 +179,43 @@ class MoEMLP(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         ne = self.num_experts_per_tok
-        orig_shape = x.shape[:-1]  # batch dims (B, T) or (B,)
-        D = x.shape[-1]
-        x_2d = x.reshape(-1, D)  # (N, D)
-        N = x_2d.shape[0]
 
         # Route
-        gates = self.router(x_2d)  # (N, num_experts)
+        gates = self.router(x)  # (..., num_experts)
         inds = mx.stop_gradient(
             mx.argpartition(-gates, kth=ne - 1, axis=-1)[..., :ne]
-        )  # (N, ne)
+        )
         scores = mx.softmax(
-            mx.take_along_axis(gates, inds, axis=-1).astype(mx.float32),
+            mx.take_along_axis(gates, inds, axis=-1),
             axis=-1,
-        ).astype(x.dtype)  # (N, ne)
+            precise=True,
+        )
 
-        # Flatten to 1D indices for gather_mm (each token-expert pair)
-        flat_inds = inds.reshape(-1)  # (N*ne,)
-        x_rep = mx.repeat(x_2d, ne, axis=0)[:, None, :]  # (N*ne, 1, D)
+        # Prepare for SwitchLinear: add (1, 1) dims for gather_mm
+        x = mx.expand_dims(x, (-2, -3))
 
-        # fc1: weight stored (E, out, in), swapaxes for gather_mm (E, K=in, N=out)
-        fc1_w = self.fc1["weight"].swapaxes(-1, -2)  # (E, D, 2*inner)
-        h = mx.gather_mm(x_rep, fc1_w, rhs_indices=flat_inds)  # (N*ne, 1, 2*inner)
-        h = h.squeeze(1)  # (N*ne, 2*inner)
+        # Sort tokens by expert for coalesced memory access when batch is large
+        do_sort = inds.size >= 64
+        idx = inds
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, inds)
 
-        # GeGLU with +1 offset
+        # fc1 → GeGLU → fc2
+        h = self.fc1(x, idx, sorted_indices=do_sort)
         h1, g = mx.split(h, 2, axis=-1)
-        h = nn.gelu(h1) * (g + 1.0)  # (N*ne, inner)
+        h = nn.gelu(h1) * (g + 1.0)  # GeGLU with +1 offset
+        y = self.fc2(h, idx, sorted_indices=do_sort)
 
-        # fc2: each expert output through its corresponding expert
-        fc2_w = self.fc2["weight"].swapaxes(-1, -2)  # (E, inner, D)
-        y = mx.gather_mm(
-            h[:, None, :], fc2_w, rhs_indices=flat_inds
-        )  # (N*ne, 1, D)
-        y = y.squeeze(1).reshape(N, ne, D)  # (N, ne, D)
+        # Unsort and restore shape
+        if do_sort:
+            y = _scatter_unsort(y, inv_order, inds.shape)
+
+        y = y.squeeze(-2)
 
         # Weighted sum over experts
-        y = (y * scores[..., None]).sum(axis=-2)  # (N, D)
-        return y.reshape(*orig_shape, D)
+        y = (y * scores[..., None]).sum(axis=-2)
+        return y
 
 
 class DecoderBlock(nn.Module):
