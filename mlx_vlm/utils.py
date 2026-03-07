@@ -697,30 +697,38 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     """
     Helper function to load an image from either a URL or file.
     """
-    if (
-        isinstance(image_source, BytesIO)
-        or (isinstance(image_source, str) and image_source.startswith("data:image/"))
-        or Path(image_source).is_file()
-    ):
-        # for base64 encoded images
+    if isinstance(image_source, BytesIO):
         try:
-            if image_source.startswith("data:image/"):
-                import base64
-
-                if "," not in image_source:
-                    raise ValueError(
-                        "Invalid data URI format - missing comma separator"
-                    )
-
-                _, data = image_source.split(",", 1)
-                image_source = BytesIO(base64.b64decode(data))
-
+            image = Image.open(image_source)
+        except IOError as e:
+            raise ValueError(
+                f"Failed to load image from BytesIO with error: {e}"
+            ) from e
+    elif isinstance(image_source, Path) or (
+        isinstance(image_source, str) and not image_source.startswith(("http://", "https://", "data:image/"))
+    ):
+        try:
             image = Image.open(image_source)
         except IOError as e:
             raise ValueError(
                 f"Failed to load image from {image_source} with error: {e}"
             ) from e
-    elif image_source.startswith(("http://", "https://")):
+    elif isinstance(image_source, str) and image_source.startswith("data:image/"):
+        import base64
+
+        if "," not in image_source:
+            raise ValueError(
+                "Invalid data URI format - missing comma separator"
+            )
+
+        _, data = image_source.split(",", 1)
+        try:
+            image = Image.open(BytesIO(base64.b64decode(data)))
+        except IOError as e:
+            raise ValueError(
+                f"Failed to load image from data URI with error: {e}"
+            ) from e
+    elif isinstance(image_source, str) and image_source.startswith(("http://", "https://")):
         try:
             response = requests.get(image_source, stream=True, timeout=timeout)
             response.raise_for_status()
