@@ -7,6 +7,7 @@ import math
 import os
 import time
 from io import BytesIO
+from pathlib import Path
 from typing import List
 
 import cv2
@@ -114,6 +115,10 @@ def fetch_image(
     image_obj = None
     if isinstance(image, Image.Image):
         image_obj = image
+    elif isinstance(image, Path):
+        image_obj = Image.open(image)
+    elif not isinstance(image, str):
+        raise ValueError(f"Unsupported image type: {type(image).__name__}")
     elif image.startswith("http://") or image.startswith("https://"):
         response = requests.get(image, stream=True)
         image_obj = Image.open(BytesIO(response.content))
