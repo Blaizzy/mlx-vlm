@@ -55,21 +55,16 @@ class Model(nn.Module):
         dtype = inputs_embeds.dtype
         pixel_values = pixel_values.astype(dtype)
 
-        # Process images through vision encoder
         image_features = self.vision(
             pixel_values,
             num_crops=num_crops,
             crop_layouts=crop_layouts,
-        )  # (B, 729, text_dim)
+        )
 
-        # Build combined embeddings: [BOS] [vision_tokens] [text_tokens]
-        # The BOS token is at position 0, vision tokens follow
         B = inputs.shape[0]
-        bos_embed = inputs_embeds[:, :1, :]  # (B, 1, D)
+        bos_embed = inputs_embeds[:, :1, :]
 
-        # Find where text tokens start (after the image placeholder tokens)
-        # Vision tokens = 729 per image, preceded by BOS
-        num_vision_tokens = image_features.shape[1]  # 729
+        num_vision_tokens = image_features.shape[1]
         text_start = 1 + num_vision_tokens
 
         if inputs_embeds.shape[1] > text_start:
@@ -80,8 +75,6 @@ class Model(nn.Module):
         else:
             final_embeds = mx.concatenate([bos_embed, image_features], axis=1)
 
-        # Create prefix attention mask if needed
-        # First 730 tokens (1 BOS + 729 vision) get bidirectional attention
         prefix_len = 1 + num_vision_tokens
         seq_len = final_embeds.shape[1]
         attention_mask_4d = self._create_prefix_attention_mask(
@@ -96,23 +89,12 @@ class Model(nn.Module):
     def _create_prefix_attention_mask(
         self, seq_len: int, prefix_len: int, cache=None
     ) -> Optional[mx.array]:
-        """Create attention mask with bidirectional attention for prefix tokens.
-
-        Tokens 0..prefix_len-1 can attend to each other (bidirectional).
-        Tokens prefix_len+ use causal masking but can attend to prefix tokens.
-        """
         if cache is not None:
-            # During generation, we're past the prefix - use standard causal mask
             return None
 
-        # Build the mask: (1, 1, seq_len, seq_len)
-        # Start with causal mask
         causal = mx.triu(
             mx.full((seq_len, seq_len), -mx.inf), k=1
         )
-
-        # Make prefix tokens bidirectional: allow all prefix tokens to attend
-        # to each other (zero out the upper triangle in the prefix block)
         causal[:prefix_len, :prefix_len] = 0.0
 
         return causal.reshape(1, 1, seq_len, seq_len)
@@ -142,32 +124,22 @@ class Model(nn.Module):
         for k, v in weights.items():
             new_key = k
 
-            # Strip 'model.' prefix from original moondream weights
             if new_key.startswith("model."):
                 new_key = new_key[len("model."):]
 
-            # Skip region model weights (not needed for basic generation)
             if new_key.startswith("region."):
                 continue
 
-            # Skip position_ids
             if "position_ids" in new_key:
                 continue
 
-            # Handle text model key mapping
             if new_key == "text.wte":
-                # Raw embedding parameter -> nn.Embedding weight
                 new_key = "text.model.wte.weight"
             elif new_key.startswith("text.lm_head"):
-                # lm_head stays at text.lm_head level
                 pass
             elif new_key.startswith("text."):
-                # All other text keys go under text.model.*
                 new_key = "text.model." + new_key[len("text."):]
 
-            # Handle vision model key mapping
-            # vision.proj_mlp.* stays as vision.proj_mlp.*
-            # All other vision.* goes to vision.encoder.*
             if new_key.startswith("vision.") and not new_key.startswith(
                 "vision.proj_mlp"
             ):
