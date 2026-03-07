@@ -2445,6 +2445,91 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
+    def test_moondream3(self):
+        from mlx_vlm.models import moondream3
+
+        text_config = moondream3.TextConfig(
+            model_type="moondream3",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=16,
+            vocab_size=256,
+            rope_theta=1500000.0,
+            rope_dim=8,
+            rms_norm_eps=1e-5,
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+            moe_start_layer=2,
+            attention_bias=True,
+            prefix_attn=5,
+        )
+
+        vision_config = moondream3.VisionConfig(
+            model_type="moondream3_vision",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            patch_size=14,
+            crop_size=28,
+            in_channels=3,
+            proj_inner_dim=64,
+            proj_out_dim=64,
+            attention_bias=True,
+            layer_norm_eps=1e-6,
+        )
+
+        config = moondream3.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="moondream3",
+        )
+
+        model = moondream3.Model(config)
+
+        # Language model test
+        self.language_test_runner(
+            model.language_model,
+            text_config.model_type,
+            text_config.vocab_size,
+            text_config.num_hidden_layers,
+        )
+
+        # Vision encoder test
+        batch_size = 1
+        crop_size = vision_config.crop_size
+        pixel_values = mx.random.uniform(shape=(batch_size, crop_size, crop_size, 3))
+        features = model.vision.encoder(pixel_values)
+        grid_size = crop_size // vision_config.patch_size
+        num_patches = grid_size * grid_size
+        self.assertEqual(
+            features.shape, (batch_size, num_patches, vision_config.hidden_size)
+        )
+
+        # Vision projection: concat global+local -> project
+        combined = mx.concatenate([features, features], axis=-1)
+        projected = model.vision.proj_mlp(combined)
+        self.assertEqual(
+            projected.shape,
+            (batch_size, num_patches, vision_config.proj_out_dim),
+        )
+
+        # Full model forward with vision
+        # Input: BOS + num_patches placeholders + 2 text tokens
+        input_ids = mx.zeros((1, 1 + num_patches + 2), dtype=mx.int32)
+        input_ids[0, -2:] = mx.array([1, 2])
+        outputs = model(
+            input_ids,
+            pixel_values=pixel_values,
+            num_crops=[1],
+            crop_layouts=[(1, 1)],
+        )
+        self.assertEqual(outputs.logits.shape[-1], text_config.vocab_size)
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
@@ -3657,6 +3742,61 @@ class TestGetInputEmbeddings(unittest.TestCase):
         result = model.get_input_embeddings(input_ids)
         self.assertIsInstance(result, InputEmbeddingsFeatures)
         self.assertIsNotNone(result.inputs_embeds)
+
+    def test_moondream3_input_embeddings(self):
+        from mlx_vlm.models import moondream3
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        model = moondream3.Model(
+            moondream3.ModelConfig(
+                text_config=moondream3.TextConfig(
+                    model_type="moondream3",
+                    hidden_size=64,
+                    intermediate_size=128,
+                    num_hidden_layers=4,
+                    num_attention_heads=4,
+                    num_key_value_heads=4,
+                    head_dim=16,
+                    vocab_size=256,
+                    rope_dim=8,
+                    num_experts=4,
+                    num_experts_per_tok=2,
+                    moe_intermediate_size=32,
+                    moe_start_layer=2,
+                ),
+                vision_config=moondream3.VisionConfig(
+                    hidden_size=32,
+                    intermediate_size=64,
+                    num_hidden_layers=2,
+                    num_attention_heads=4,
+                    patch_size=14,
+                    crop_size=28,
+                    proj_inner_dim=64,
+                    proj_out_dim=64,
+                ),
+                model_type="moondream3",
+            )
+        )
+        # Text-only
+        input_ids = mx.array([[1, 2, 3, 4, 5]])
+        result = model.get_input_embeddings(input_ids)
+        self.assertIsInstance(result, InputEmbeddingsFeatures)
+        self.assertIsNotNone(result.inputs_embeds)
+        self.assertIsNone(result.attention_mask_4d)
+
+        # With vision: should return prefix attention mask
+        num_patches = (28 // 14) ** 2  # 4 patches
+        input_ids_vis = mx.zeros((1, 1 + num_patches + 2), dtype=mx.int32)
+        pixel_values = mx.random.uniform(shape=(1, 28, 28, 3))
+        result_vis = model.get_input_embeddings(
+            input_ids_vis,
+            pixel_values=pixel_values,
+            num_crops=[1],
+            crop_layouts=[(1, 1)],
+        )
+        self.assertIsInstance(result_vis, InputEmbeddingsFeatures)
+        self.assertIsNotNone(result_vis.inputs_embeds)
+        self.assertIsNotNone(result_vis.attention_mask_4d)
 
 
 class TestChunkedPrefillRoPE(unittest.TestCase):
