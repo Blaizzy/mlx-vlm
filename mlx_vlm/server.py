@@ -1,5 +1,4 @@
 import argparse
-import asyncio
 import gc
 import importlib
 import json
@@ -1099,7 +1098,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                         )
 
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
-                        await asyncio.sleep(0)
 
                     if tool_parser_type is not None:
                         tool_calls = process_tool_calls(
