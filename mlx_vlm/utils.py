@@ -693,58 +693,42 @@ def save_config(
         json.dump(config, fid, indent=4)
 
 
+
+
 def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     """
-    Helper function to load an image from either a URL or file.
+    Helper function to load an image from either a URL, file path, data URI,
+    or BytesIO object.
     """
-    if isinstance(image_source, BytesIO):
-        try:
-            image = Image.open(image_source)
-        except IOError as e:
-            raise ValueError(
-                f"Failed to load image from BytesIO with error: {e}"
-            ) from e
-    elif isinstance(image_source, Path) or (
-        isinstance(image_source, str) and not image_source.startswith(("http://", "https://", "data:image/"))
-    ):
-        try:
-            image = Image.open(image_source)
-        except IOError as e:
-            raise ValueError(
-                f"Failed to load image from {image_source} with error: {e}"
-            ) from e
-    elif isinstance(image_source, str) and image_source.startswith("data:image/"):
-        import base64
+    import base64
 
-        if "," not in image_source:
+    try:
+        if not isinstance(image_source, (str, Path, BytesIO)):
             raise ValueError(
-                "Invalid data URI format - missing comma separator"
+                f"Unsupported image source type: {type(image_source).__name__}"
             )
-
-        _, data = image_source.split(",", 1)
-        try:
-            image = Image.open(BytesIO(base64.b64decode(data)))
-        except IOError as e:
-            raise ValueError(
-                f"Failed to load image from data URI with error: {e}"
-            ) from e
-    elif isinstance(image_source, str) and image_source.startswith(("http://", "https://")):
-        try:
+        if isinstance(image_source, str) and image_source.startswith("data:image/"):
+            if "," not in image_source:
+                raise ValueError(
+                    "Invalid data URI format - missing comma separator"
+                )
+            _, data = image_source.split(",", 1)
+            image_source = BytesIO(base64.b64decode(data))
+        if isinstance(image_source, str) and image_source.startswith(
+            ("http://", "https://")
+        ):
             response = requests.get(image_source, stream=True, timeout=timeout)
             response.raise_for_status()
-            image = Image.open(response.raw)
-        except Exception as e:
-            raise ValueError(
-                f"Failed to load image from URL: {image_source} with error {e}"
-            ) from e
-    else:
-        raise ValueError(
-            f"The image {image_source} must be a valid URL or existing file."
-        )
+            image_source = response.raw
+
+        image = Image.open(image_source)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Failed to load image from {image_source}: {e}") from e
 
     image = ImageOps.exif_transpose(image)
-    image = image.convert("RGB")
-    return image
+    return image.convert("RGB")
 
 
 def resize_image(img, max_size):
@@ -808,7 +792,9 @@ def load_audio(
     """
     if isinstance(file, np.ndarray):
         return file
-    if file.startswith(("http://", "https://")):
+    if isinstance(file, Path):
+        file = str(file)
+    if isinstance(file, str) and file.startswith(("http://", "https://")):
         try:
             response = requests.get(file, stream=True, timeout=timeout)
             response.raise_for_status()
