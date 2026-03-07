@@ -1,3 +1,5 @@
+import base64
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -10,6 +12,7 @@ from mlx_vlm.utils import (
     StoppingCriteria,
     get_class_predicate,
     load,
+    load_image,
     prepare_inputs,
     process_inputs_with_fallback,
     sanitize_weights,
@@ -428,3 +431,79 @@ def test_load_passes_revision():
         assert model is model_mock
         assert processor is processor_mock
         mock_get_model_path.assert_called_with("repo", revision="abc")
+
+
+def _make_test_image_bytes():
+    """Create a small valid PNG in memory."""
+    from PIL import Image as PILImage
+
+    img = PILImage.new("RGB", (4, 4), color="red")
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+class TestLoadImage:
+    def test_bytesio_input(self):
+        buf = _make_test_image_bytes()
+        img = load_image(buf)
+        assert img.mode == "RGB"
+        assert img.size == (4, 4)
+
+    def test_path_input(self, tmp_path):
+        filepath = tmp_path / "test.png"
+        buf = _make_test_image_bytes()
+        filepath.write_bytes(buf.read())
+
+        img = load_image(filepath)
+        assert img.mode == "RGB"
+        assert img.size == (4, 4)
+
+    def test_string_filepath_input(self, tmp_path):
+        filepath = tmp_path / "test.png"
+        buf = _make_test_image_bytes()
+        filepath.write_bytes(buf.read())
+
+        img = load_image(str(filepath))
+        assert img.mode == "RGB"
+        assert img.size == (4, 4)
+
+    def test_data_uri_input(self):
+        buf = _make_test_image_bytes()
+        encoded = base64.b64encode(buf.read()).decode("utf-8")
+        data_uri = f"data:image/png;base64,{encoded}"
+
+        img = load_image(data_uri)
+        assert img.mode == "RGB"
+        assert img.size == (4, 4)
+
+    def test_data_uri_missing_comma_raises(self):
+        with pytest.raises(ValueError, match="missing comma separator"):
+            load_image("data:image/png;base64NOCOMMA")
+
+    def test_http_url_input(self):
+        buf = _make_test_image_bytes()
+        mock_response = MagicMock()
+        mock_response.raw = buf
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("mlx_vlm.utils.requests.get", return_value=mock_response):
+            img = load_image("https://example.com/image.png")
+            assert img.mode == "RGB"
+
+    def test_invalid_url_raises(self):
+        with patch(
+            "mlx_vlm.utils.requests.get",
+            side_effect=Exception("Connection error"),
+        ):
+            with pytest.raises(ValueError, match="Failed to load image from URL"):
+                load_image("https://example.com/nonexistent.png")
+
+    def test_nonexistent_file_raises(self):
+        with pytest.raises(ValueError, match="Failed to load image"):
+            load_image("/nonexistent/path/image.png")
+
+    def test_nonexistent_path_object_raises(self):
+        with pytest.raises(ValueError, match="Failed to load image"):
+            load_image(Path("/nonexistent/path/image.png"))
