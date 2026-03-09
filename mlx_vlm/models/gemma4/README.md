@@ -1,11 +1,12 @@
-# Gemma 4 (gemma-4-e2b-it / gemma-4-e4b-it)
+# Gemma 4 (gemma-4-e2b-it / gemma-4-e5b-it)
 
-Gemma 4 is a multimodal model from Google that supports text, image, and thinking (chain-of-thought reasoning).
+Gemma 4 is a multimodal model from Google that supports text, image, audio, and thinking (chain-of-thought reasoning).
 
 Capabilities:
 - **Text generation** — single and multi-turn conversations
 - **Thinking mode** — chain-of-thought reasoning with `--enable-thinking`
 - **Image understanding** — single and multi-image analysis
+- **Audio understanding** — speech transcription and audio analysis
 - **Function calling** — tool use with text, images, and thinking
 
 ## Model
@@ -56,6 +57,17 @@ python -m mlx_vlm.generate \
   --prompt "I want to do a car wash that is 50 meters away, should I walk or drive?" \
   --enable-thinking \
   --max-tokens 2000 \
+  --temperature 0
+```
+
+### Audio understanding
+
+```sh
+python -m mlx_vlm.generate \
+  --model google/gemma-4-e2b-it \
+  --audio path/to/audio.wav \
+  --prompt "Describe what you hear." \
+  --max-tokens 500 \
   --temperature 0
 ```
 
@@ -134,6 +146,30 @@ result = generate(
 print(result)
 ```
 
+### Audio understanding
+
+```python
+from mlx_vlm import load, generate
+from mlx_vlm.prompt_utils import apply_chat_template
+
+model, processor = load("google/gemma-4-e2b-it")
+
+prompt = apply_chat_template(
+    processor, model.config, "Describe what you hear.",
+    num_audios=1,
+)
+
+result = generate(
+    model=model,
+    processor=processor,
+    prompt=prompt,
+    audio=["path/to/audio.wav"],
+    max_tokens=500,
+    temperature=0.0,
+)
+print(result)
+```
+
 ### Thinking mode
 
 ```python
@@ -188,5 +224,6 @@ print(result)
 ## Notes
 
 - Thinking mode uses `<|channel>...<channel|>` delimiters to separate reasoning from the final answer.
-- The E2B model is lighter and works on machines with 16GB+ memory; E4B requires more.
-- Audio support is not yet implemented in this MLX port.
+- The E2B model is lighter and works on machines with 16GB+ memory; E5B requires more.
+- Audio uses a Conformer-based encoder with 128-bin mel spectrogram input (16kHz). Audio tokens are dynamically expanded based on duration (~40ms per token, up to 750 tokens).
+- Supported audio formats: WAV, MP3, FLAC, and other formats handled by `librosa`/`soundfile`.
