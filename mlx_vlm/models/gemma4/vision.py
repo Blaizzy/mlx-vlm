@@ -295,7 +295,7 @@ class VisionPooler(nn.Module):
         kernel_idxs = mx.floor(clamped.astype(mx.float32) / k).astype(mx.int32)
         kernel_idxs = kernel_idxs[..., 0] + (max_x // k) * kernel_idxs[..., 1]
         weights = one_hot(kernel_idxs, length).astype(mx.float32) / k_squared
-        output = mx.einsum("bLl,bLd->bld", weights, x)
+        output = mx.einsum("bLl,bLd->bld", weights, x).astype(x.dtype)
         mask = mx.logical_not(mx.all(weights == 0, axis=1))
         return output, mask
 
@@ -333,6 +333,7 @@ class VisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.config = config
+        self.model_type = config.model_type
         self.patch_size = config.patch_size
         self.pooling_kernel_size = config.pooling_kernel_size
         self.default_output_length = config.default_output_length

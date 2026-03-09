@@ -1978,11 +1978,28 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
-        # Custom vision test (VisionModel returns a plain tensor, not tuple)
-        # Vision encoder uses float32 RMSNorm upcasting, so only check shape
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            3,  # num_channels
+            (64, 64),
+            vision_feature_layer=0,
+            channel_first=True,
+        )
+
+        # Full model forward: text-only (no image)
+        input_ids = mx.array([[0, 1, 2, 3]])
+        output = model(input_ids)
+        self.assertEqual(output.logits.shape, (1, 4, config.text_config.vocab_size))
+
+        # Full model forward: text + image tokens
+        # 64x64 image, patch_size=16 => 4x4=16 patches, pooling_kernel_size=2 => 16/4=4 output tokens
+        img_id = config.image_token_id
+        input_ids_with_img = mx.array([[0, img_id, img_id, img_id, img_id, 1]])
         pixel_values = mx.random.uniform(shape=(1, 3, 64, 64))
-        hidden_states = model.vision_tower(pixel_values)
-        self.assertEqual(hidden_states.shape[-1], vision_config.hidden_size)
+        output = model(input_ids_with_img, pixel_values=pixel_values)
+        self.assertEqual(output.logits.shape, (1, 6, config.text_config.vocab_size))
 
     def test_deepseekocr(self):
         from mlx_vlm.models import deepseekocr
