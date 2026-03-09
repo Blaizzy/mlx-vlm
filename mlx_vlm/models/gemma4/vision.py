@@ -445,7 +445,8 @@ class VisionModel(nn.Module):
         # Build bidirectional attention mask [B, 1, L, L] for SDPA
         valid_mask = ~padding_positions  # True = valid
         attn_mask = mx.expand_dims(valid_mask, 1) * mx.expand_dims(valid_mask, 2)
-        attn_mask = mx.where(attn_mask, 0.0, -1e9).astype(inputs_embeds.dtype)
+        neg_inf = mx.array(float("-inf"), dtype=inputs_embeds.dtype)
+        attn_mask = mx.where(attn_mask, mx.array(0.0, dtype=inputs_embeds.dtype), neg_inf)
         attn_mask = mx.expand_dims(attn_mask, 1)  # [B, 1, L, L] for head broadcasting
 
         # Run transformer layers
