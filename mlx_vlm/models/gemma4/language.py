@@ -148,20 +148,17 @@ class Attention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        shared_kv: Optional[tuple] = None,
     ) -> mx.array:
         B, L, _ = x.shape
 
         queries = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
         queries = self.q_norm(queries)
 
-        if (
-            self.is_kv_shared_layer
-            and cache is not None
-            and hasattr(cache, "shared_kv")
-            and cache.shared_kv is not None
-        ):
-            keys, values = cache.shared_kv
-            offset = cache.offset
+        if self.is_kv_shared_layer and shared_kv is not None:
+            # Use K/V from the reference layer (already RoPE'd and transposed)
+            keys, values = shared_kv
+            offset = cache.offset if cache is not None else 0
         else:
             offset = cache.offset if cache is not None else 0
 
@@ -176,6 +173,10 @@ class Attention(nn.Module):
 
             if cache is not None:
                 keys, values = cache.update_and_fetch(keys, values)
+
+        # Store K/V for potential sharing with later layers
+        if self.store_full_length_kv:
+            self._last_kv = (keys, values)
 
         queries = queries.transpose(0, 2, 1, 3)
         queries = self.rope(queries, offset=offset)
@@ -241,11 +242,12 @@ class DecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         per_layer_input: Optional[mx.array] = None,
+        shared_kv: Optional[tuple] = None,
     ) -> mx.array:
         residual = x
 
         h = self.input_layernorm(x)
-        h = self.self_attn(h, mask, cache)
+        h = self.self_attn(h, mask, cache, shared_kv=shared_kv)
         h = self.post_attention_layernorm(h)
         h = residual + h
 
@@ -416,17 +418,18 @@ class Gemma4TextModel(nn.Module):
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             is_global = layer.layer_type == "full_attention"
 
-            # Set shared KV on cache if this is a shared layer
+            # Prepare shared KV for KV-shared layers
+            layer_shared_kv = None
             if (
                 layer.self_attn.is_kv_shared_layer
                 and layer.self_attn.kv_shared_layer_index is not None
             ):
                 ref_idx = layer.self_attn.kv_shared_layer_index
-                if ref_idx in shared_kv_store and c is not None:
-                    kv_state, ref_offset = shared_kv_store[ref_idx]
-                    c.shared_kv = kv_state
-                    # Sync offset so RoPE positions are correct for queries
-                    c.offset = ref_offset
+                if ref_idx in shared_kv_store:
+                    layer_shared_kv, ref_offset = shared_kv_store[ref_idx]
+                    # Sync cache offset so query RoPE positions are correct
+                    if c is not None:
+                        c.offset = ref_offset
 
             local_mask = mask
             if mask is None and is_global:
@@ -438,11 +441,16 @@ class Gemma4TextModel(nn.Module):
             if per_layer_inputs is not None:
                 per_layer_input = per_layer_inputs[:, :, i, :]
 
-            h = layer(h, local_mask, c, per_layer_input=per_layer_input)
+            h = layer(
+                h, local_mask, c,
+                per_layer_input=per_layer_input,
+                shared_kv=layer_shared_kv,
+            )
 
-            # Store KV and offset for sharing
-            if layer.self_attn.store_full_length_kv and c is not None:
-                shared_kv_store[i] = (c.state, c.offset)
+            # Store KV for sharing with later layers
+            if layer.self_attn.store_full_length_kv:
+                offset = c.offset if c is not None else 0
+                shared_kv_store[i] = (layer.self_attn._last_kv, offset)
 
         return self.norm(h)
 
