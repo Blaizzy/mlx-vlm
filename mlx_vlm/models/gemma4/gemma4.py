@@ -10,24 +10,10 @@ from .vision import VisionModel
 
 
 def masked_scatter(input_tensor, mask, source):
-    """MLX implementation of PyTorch's masked_scatter."""
-    mask = mask.astype(mx.bool_)
-
-    if not mask.any():
-        return mx.broadcast_to(input_tensor, mask.shape)
-
-    input_shape = mask.shape
-    result_flat = mx.broadcast_to(input_tensor, input_shape).flatten()
-    mask_flat = mask.flatten()
-    source_flat = source.flatten()
-
-    selection_mask = mx.cumsum(mask_flat.astype(mx.int32)) - 1
-    source_len = len(source_flat)
-    bounded_indices = selection_mask % source_len
-    selected_values = source_flat[bounded_indices]
-    result_flat = mx.where(mask_flat, selected_values, result_flat)
-
-    return result_flat.reshape(input_shape)
+    mask_flat = mask.flatten().astype(mx.int32)
+    indices = mx.cumsum(mask_flat) - 1
+    aligned = source.flatten()[indices % source.size]
+    return mx.where(mask_flat, aligned, input_tensor.flatten()).reshape(input_tensor.shape)
 
 
 class MultimodalEmbedder(nn.Module):
