@@ -484,7 +484,7 @@ class LanguageModel(nn.Module):
             if any(
                 s in k for s in ["input_max", "input_min", "output_max", "output_min"]
             ):
-                if "vision_tower" not in k:
+                if "vision_tower" not in k and "audio_tower" not in k:
                     continue
             sanitized[k] = v
         return sanitized

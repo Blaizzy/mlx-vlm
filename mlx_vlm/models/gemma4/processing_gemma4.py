@@ -203,7 +203,7 @@ class Gemma4ImageProcessor(BaseImageProcessor):
 
 
 class Gemma4Processor(ProcessorMixin):
-    """Combined processor for Gemma 4 (image + text)."""
+    """Combined processor for Gemma 4 (image + text + audio)."""
 
     attributes = ["image_processor", "tokenizer"]
     image_processor_class = "Gemma4ImageProcessor"
@@ -216,19 +216,30 @@ class Gemma4Processor(ProcessorMixin):
         tokenizer=None,
         chat_template=None,
         image_seq_length: int = 280,
+        audio_seq_length: int = 750,
         **kwargs,
     ):
+        feature_extractor = kwargs.pop("feature_extractor", None)
+
         if image_processor is None:
             image_processor = Gemma4ImageProcessor()
 
         self.image_seq_length = image_seq_length
+        self.audio_seq_length = audio_seq_length
+        self.audio_ms_per_token = kwargs.pop("audio_ms_per_token", 40)
         self.image_token_id = getattr(tokenizer, "image_token_id", None)
         self.boi_token = getattr(tokenizer, "boi_token", "")
         self.eoi_token = getattr(tokenizer, "eoi_token", "")
         self.image_token = getattr(tokenizer, "image_token", "")
+        self.audio_token = getattr(tokenizer, "audio_token", "")
+        self.boa_token = getattr(tokenizer, "boa_token", "")
+        self.eoa_token = getattr(tokenizer, "eoa_token", "")
 
         image_tokens_expanded = self.image_token * image_seq_length
         self.full_image_sequence = f"{self.boi_token}{image_tokens_expanded}{self.eoi_token}"
+
+        audio_tokens_expanded = self.audio_token * audio_seq_length
+        self.full_audio_sequence = f"{self.boa_token}{audio_tokens_expanded}{self.eoa_token}"
 
         super().__init__(
             image_processor=image_processor,
@@ -237,14 +248,24 @@ class Gemma4Processor(ProcessorMixin):
             **kwargs,
         )
 
+        self.feature_extractor = feature_extractor
+
+    def _compute_audio_num_tokens(self, audio_waveform, sampling_rate: int) -> int:
+        """Compute number of audio soft tokens from waveform duration."""
+        num_samples = len(audio_waveform)
+        duration_ms = num_samples / sampling_rate * 1000.0
+        num_tokens = math.ceil(duration_ms / self.audio_ms_per_token)
+        return min(num_tokens, self.audio_seq_length)
+
     def __call__(
         self,
         images: Optional[ImageInput] = None,
         text: Optional[Union[str, List[str]]] = None,
+        audio: Optional[List] = None,
         **kwargs,
     ) -> BatchFeature:
-        if text is None and images is None:
-            raise ValueError("Provide at least one of `text` or `images`.")
+        if text is None and images is None and audio is None:
+            raise ValueError("Provide at least one of `text`, `images`, or `audio`.")
 
         if isinstance(text, str):
             text = [text]
@@ -273,6 +294,50 @@ class Gemma4Processor(ProcessorMixin):
                     for prompt in text
                 ]
 
+        # Process audio
+        audio_inputs = {}
+        if audio is not None and self.feature_extractor is not None:
+            audio_arrays = []
+            sampling_rates = []
+            for a in audio:
+                if isinstance(a, tuple):
+                    audio_arrays.append(a[0])
+                    sampling_rates.append(a[1])
+                else:
+                    audio_arrays.append(a)
+                    sampling_rates.append(self.feature_extractor.sampling_rate)
+
+            # Expand audio tokens in text based on waveform duration
+            if text is not None and self.audio_token:
+                num_audio_tokens = [
+                    self._compute_audio_num_tokens(a, sr)
+                    for a, sr in zip(audio_arrays, sampling_rates)
+                ]
+                replacements = [
+                    (self.boa_token + self.audio_token * n + self.eoa_token)
+                    for n in num_audio_tokens
+                ]
+                replacements_iter = iter(replacements)
+                audio_pattern = re.escape(self.audio_token)
+                text = [
+                    re.sub(audio_pattern, lambda _: next(replacements_iter), prompt)
+                    for prompt in text
+                ]
+
+            result = self.feature_extractor(
+                audio_arrays,
+                sampling_rate=self.feature_extractor.sampling_rate,
+                return_attention_mask=True,
+            )
+            audio_inputs["input_features"] = result["input_features"]
+            if "input_features_mask" in result:
+                audio_inputs["input_features_mask"] = result["input_features_mask"]
+        elif audio is not None and text is not None and self.audio_token:
+            text = [
+                prompt.replace(self.audio_token, self.full_audio_sequence)
+                for prompt in text
+            ]
+
         return_tensors = kwargs.pop("return_tensors", None)
         add_special_tokens = kwargs.pop("add_special_tokens", True)
         text_inputs = {}
@@ -283,7 +348,10 @@ class Gemma4Processor(ProcessorMixin):
                 add_special_tokens=add_special_tokens,
             )
 
-        return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
+        return BatchFeature(
+            data={**text_inputs, **image_inputs, **audio_inputs},
+            tensor_type=return_tensors,
+        )
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)
@@ -311,8 +379,10 @@ class Gemma4Processor(ProcessorMixin):
             local_files_only=is_local,
         )
 
-        # Load image processor config from processor_config.json
+        # Load processor config
+        proc_config = {}
         ip_config = {}
+        fe_config = {}
         try:
             import json
 
@@ -329,10 +399,22 @@ class Gemma4Processor(ProcessorMixin):
                     proc_config = json.load(f)
                 ip_config = proc_config.get("image_processor", {})
                 ip_config.pop("image_processor_type", None)
+                fe_config = proc_config.get("feature_extractor", {})
+                fe_config.pop("feature_extractor_type", None)
         except Exception:
             pass
 
         image_processor = Gemma4ImageProcessor(**ip_config)
+
+        # Load audio feature extractor if config available
+        feature_extractor = None
+        if fe_config:
+            try:
+                from transformers import Gemma4AudioFeatureExtractor
+
+                feature_extractor = Gemma4AudioFeatureExtractor(**fe_config)
+            except (ImportError, Exception):
+                pass
 
         chat_template = getattr(tokenizer, "chat_template", None)
         if chat_template is None:
@@ -352,12 +434,17 @@ class Gemma4Processor(ProcessorMixin):
                 pass
 
         image_seq_length = ip_config.get("max_soft_tokens", 280)
+        audio_seq_length = proc_config.get("audio_seq_length", 750)
+        audio_ms_per_token = proc_config.get("audio_ms_per_token", 40)
 
         return cls(
             image_processor=image_processor,
             tokenizer=tokenizer,
             chat_template=chat_template,
             image_seq_length=image_seq_length,
+            audio_seq_length=audio_seq_length,
+            audio_ms_per_token=audio_ms_per_token,
+            feature_extractor=feature_extractor,
         )
 
 

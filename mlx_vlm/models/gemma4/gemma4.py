@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
+from .audio import AudioEncoder
 from .config import ModelConfig
 from .language import LanguageModel, RMSNormNoScale
 from .vision import VisionModel
@@ -49,20 +50,46 @@ class Model(nn.Module):
             eps=config.vision_config.rms_norm_eps,
         )
 
+        # Audio
+        if config.audio_config is not None:
+            self.audio_tower = AudioEncoder(config.audio_config)
+            audio_output_dim = (
+                config.audio_config.output_proj_dims
+                or config.audio_config.hidden_size
+            )
+            self.embed_audio = MultimodalEmbedder(
+                embedding_dim=audio_output_dim,
+                text_hidden_size=config.text_config.hidden_size,
+                eps=config.audio_config.rms_norm_eps,
+            )
+        else:
+            self.audio_tower = None
+            self.embed_audio = None
+
     def get_input_embeddings(
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        audio_features: Optional[mx.array] = None,
+        audio_mask: Optional[mx.array] = None,
+        input_features: Optional[mx.array] = None,
+        input_features_mask: Optional[mx.array] = None,
         **kwargs,
     ):
+        # Support both naming conventions
+        if input_features is not None and audio_features is None:
+            audio_features = input_features
+        if input_features_mask is not None and audio_mask is None:
+
+            audio_mask = ~input_features_mask.astype(mx.bool_)
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Compute per-layer inputs for text tokens only (exclude image/audio tokens)
         per_layer_inputs = None
         if self.language_model.model.hidden_size_per_layer_input:
-            image_mask = input_ids == self.config.image_token_id
-            audio_mask = input_ids == self.config.audio_token_id
-            text_mask = ~(image_mask | audio_mask)
+            image_mask_ids = input_ids == self.config.image_token_id
+            audio_mask_ids = input_ids == self.config.audio_token_id
+            text_mask = ~(image_mask_ids | audio_mask_ids)
             per_layer_inputs_tokens = mx.where(
                 text_mask, input_ids, mx.zeros_like(input_ids)
             )
@@ -70,24 +97,45 @@ class Model(nn.Module):
                 per_layer_inputs_tokens
             )
 
-        if pixel_values is None:
-            return InputEmbeddingsFeatures(
-                inputs_embeds=inputs_embeds, per_layer_inputs=per_layer_inputs
+        # Scatter vision features
+        if pixel_values is not None:
+            image_features = self.vision_tower(pixel_values)
+            image_features = self.embed_vision(image_features)
+            image_features = image_features.astype(inputs_embeds.dtype)
+
+            image_mask = input_ids == self.config.image_token_id
+            image_mask_expanded = mx.expand_dims(image_mask, -1)
+            image_mask_expanded = mx.broadcast_to(
+                image_mask_expanded, inputs_embeds.shape
             )
 
-        # Get vision features
-        image_features = self.vision_tower(pixel_values)
-        image_features = self.embed_vision(image_features)
-        image_features = image_features.astype(inputs_embeds.dtype)
+            inputs_embeds = masked_scatter(
+                inputs_embeds, image_mask_expanded, image_features
+            )
 
-        # Create image mask and scatter
-        image_mask = input_ids == self.config.image_token_id
-        image_mask_expanded = mx.expand_dims(image_mask, -1)
-        image_mask_expanded = mx.broadcast_to(image_mask_expanded, inputs_embeds.shape)
+        # Scatter audio features
+        if (
+            audio_features is not None
+            and self.audio_tower is not None
+            and self.embed_audio is not None
+        ):
+            if audio_mask is None:
+                audio_mask = mx.zeros(
+                    audio_features.shape[:2], dtype=mx.bool_
+                )
+            audio_encodings, _ = self.audio_tower(audio_features, audio_mask)
+            audio_encodings = self.embed_audio(audio_encodings)
+            audio_encodings = audio_encodings.astype(inputs_embeds.dtype)
 
-        inputs_embeds = masked_scatter(
-            inputs_embeds, image_mask_expanded, image_features
-        )
+            audio_token_mask = input_ids == self.config.audio_token_id
+            audio_mask_expanded = mx.expand_dims(audio_token_mask, -1)
+            audio_mask_expanded = mx.broadcast_to(
+                audio_mask_expanded, inputs_embeds.shape
+            )
+
+            inputs_embeds = masked_scatter(
+                inputs_embeds, audio_mask_expanded, audio_encodings
+            )
 
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds, per_layer_inputs=per_layer_inputs
@@ -118,17 +166,20 @@ class Model(nn.Module):
     def sanitize(self, weights):
         sanitized = {}
         for k, v in weights.items():
-            # Skip clipping parameters for non-vision weights (language model doesn't use them)
+            # Skip clipping parameters for non-encoder weights (language model doesn't use them)
             if any(
-                s in k for s in ["input_max", "input_min", "output_max", "output_min"]
+                s in k
+                for s in ["input_max", "input_min", "output_max", "output_min"]
             ):
-                if "vision_tower" not in k:
+                if "vision_tower" not in k and "audio_tower" not in k:
                     continue
             # Skip rotary embedding inv_freq
             if "rotary_emb.inv_freq" in k or "rotary_emb" in k:
                 continue
-            # Skip audio tower weights until audio encoder is implemented
-            if "audio_tower" in k or "embed_audio" in k:
+            # Skip audio weights if audio_config is None (no audio tower instantiated)
+            if self.audio_tower is None and (
+                "audio_tower" in k or "embed_audio" in k
+            ):
                 continue
             # Strip model. prefix
             if k.startswith("model."):
@@ -143,14 +194,16 @@ class Model(nn.Module):
                 rest = new_key[len("language_model.") :]
                 new_key = "language_model.model." + rest
 
-            # Handle Conv2d weight transposition for audio SSCP
+            # Handle Conv2d weight transposition for SSCP
+            # PyTorch [out, in, kH, kW] -> MLX [out, kH, kW, in]
             if (
                 "subsample_conv_projection" in new_key
                 and "conv.weight" in new_key
                 and v.ndim == 4
             ):
                 v = v.transpose(0, 2, 3, 1)
-            # Handle depthwise Conv1d for audio
+            # Handle depthwise Conv1d for audio conformer
+            # PyTorch [out, in, kW] -> MLX [out, kW, in]
             if "depthwise_conv1d.weight" in new_key and v.ndim == 3:
                 v = v.transpose(0, 2, 1)
 

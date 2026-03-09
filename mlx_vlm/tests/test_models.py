@@ -2000,6 +2000,41 @@ class TestModels(unittest.TestCase):
         output = model(input_ids_with_img, pixel_values=pixel_values)
         self.assertEqual(output.logits.shape, (1, 6, config.text_config.vocab_size))
 
+        # Full model forward: text + audio tokens
+        audio_config = gemma4.AudioConfig(
+            input_feat_size=16,
+            hidden_size=32,
+            conf_num_hidden_layers=2,
+            conf_num_attention_heads=2,
+            conf_conv_kernel_size=3,
+            conf_attention_chunk_size=4,
+            conf_attention_context_left=5,
+            conf_attention_context_right=0,
+            sscp_conv_channel_size=(8, 4),
+            output_proj_dims=32,
+        )
+        config_with_audio = gemma4.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            audio_config=audio_config,
+            model_type="gemma4",
+            vocab_size=64,
+            image_token_id=63,
+            audio_token_id=62,
+        )
+        model_audio = gemma4.Model(config_with_audio)
+        aud_id = config_with_audio.audio_token_id
+        input_ids_audio = mx.array([[0, aud_id, aud_id, aud_id, aud_id, 1]])
+        audio_features = mx.random.normal((1, 64, 16))
+        audio_mask = mx.zeros((1, 64), dtype=mx.bool_)
+        output = model_audio(
+            input_ids_audio, audio_features=audio_features, audio_mask=audio_mask
+        )
+        self.assertEqual(
+            output.logits.shape,
+            (1, 6, config_with_audio.text_config.vocab_size),
+        )
+
     def test_deepseekocr(self):
         from mlx_vlm.models import deepseekocr
 
