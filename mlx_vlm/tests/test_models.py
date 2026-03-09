@@ -1925,6 +1925,65 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
         )
 
+    def test_gemma4(self):
+        from mlx_vlm.models import gemma4
+
+        text_config = gemma4.TextConfig(
+            model_type="gemma4_text",
+            hidden_size=32,
+            num_hidden_layers=4,
+            intermediate_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            global_head_dim=16,
+            rms_norm_eps=1e-6,
+            vocab_size=64,
+            vocab_size_per_layer_input=64,
+            hidden_size_per_layer_input=8,
+            num_kv_shared_layers=0,
+            sliding_window=32,
+            sliding_window_pattern=3,
+            final_logit_softcapping=30.0,
+            query_pre_attn_scalar=16,
+        )
+        vision_config = gemma4.VisionConfig(
+            model_type="gemma4_vision",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=16,
+            rms_norm_eps=1e-6,
+            patch_size=16,
+            pooling_kernel_size=2,
+            default_output_length=4,
+            position_embedding_size=64,
+            use_clipped_linears=False,
+        )
+        config = gemma4.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="gemma4",
+            vocab_size=64,
+            image_token_id=63,
+        )
+        model = gemma4.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        # Custom vision test (VisionModel returns a plain tensor, not tuple)
+        # Vision encoder uses float32 RMSNorm upcasting, so only check shape
+        pixel_values = mx.random.uniform(shape=(1, 3, 64, 64))
+        hidden_states = model.vision_tower(pixel_values)
+        self.assertEqual(hidden_states.shape[-1], vision_config.hidden_size)
+
     def test_deepseekocr(self):
         from mlx_vlm.models import deepseekocr
 
@@ -3210,6 +3269,49 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "gemma3n")
+
+    def test_gemma4_input_embeddings(self):
+        from mlx_vlm.models import gemma4
+
+        model = gemma4.Model(
+            gemma4.ModelConfig(
+                text_config=gemma4.TextConfig(
+                    model_type="gemma4_text",
+                    hidden_size=16,
+                    num_hidden_layers=2,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    head_dim=8,
+                    global_head_dim=8,
+                    vocab_size=32,
+                    vocab_size_per_layer_input=32,
+                    hidden_size_per_layer_input=8,
+                    num_kv_shared_layers=0,
+                    sliding_window=32,
+                    sliding_window_pattern=1,
+                    query_pre_attn_scalar=8,
+                ),
+                vision_config=gemma4.VisionConfig(
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    head_dim=8,
+                    patch_size=16,
+                    pooling_kernel_size=2,
+                    default_output_length=4,
+                    position_embedding_size=64,
+                    use_clipped_linears=False,
+                ),
+                model_type="gemma4",
+                hidden_size=16,
+                vocab_size=32,
+                image_token_id=31,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "gemma4")
 
     def test_glm4v_input_embeddings(self):
         from mlx_vlm.models import glm4v
