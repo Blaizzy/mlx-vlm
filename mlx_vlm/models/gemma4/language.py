@@ -1,6 +1,5 @@
-import math
 from functools import partial
-from typing import Any, List, Optional
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -57,9 +56,13 @@ def logit_softcap(softcap, x):
 class MLP(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
-        first_kv_shared_layer_idx = config.num_hidden_layers - getattr(config, "num_kv_shared_layers", 0)
+        first_kv_shared_layer_idx = config.num_hidden_layers - getattr(
+            config, "num_kv_shared_layers", 0
+        )
         is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
-        use_double_wide = getattr(config, "use_double_wide_mlp", False) and is_kv_shared_layer
+        use_double_wide = (
+            getattr(config, "use_double_wide_mlp", False) and is_kv_shared_layer
+        )
         intermediate_size = config.intermediate_size * (2 if use_double_wide else 1)
 
         self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
@@ -81,7 +84,9 @@ class Attention(nn.Module):
         # Full attention layers use global_head_dim, sliding use head_dim
         self.head_dim = (
             config.global_head_dim
-            if self.layer_type == "full_attention" and hasattr(config, "global_head_dim") and config.global_head_dim
+            if self.layer_type == "full_attention"
+            and hasattr(config, "global_head_dim")
+            and config.global_head_dim
             else config.head_dim
         )
 
@@ -100,27 +105,37 @@ class Attention(nn.Module):
         self.v_norm = RMSNormNoScale(self.head_dim, eps=config.rms_norm_eps)
 
         # KV sharing
-        first_kv_shared_layer_idx = config.num_hidden_layers - getattr(config, "num_kv_shared_layers", 0)
+        first_kv_shared_layer_idx = config.num_hidden_layers - getattr(
+            config, "num_kv_shared_layers", 0
+        )
         self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
         if self.is_kv_shared_layer:
             prev_layers = config.layer_types[:first_kv_shared_layer_idx]
-            self.kv_shared_layer_index = len(prev_layers) - 1 - prev_layers[::-1].index(config.layer_types[layer_idx])
+            self.kv_shared_layer_index = (
+                len(prev_layers)
+                - 1
+                - prev_layers[::-1].index(config.layer_types[layer_idx])
+            )
         else:
             self.kv_shared_layer_index = None
 
         # Determine if this layer should store full-length KV for sharing
         if not self.is_kv_shared_layer:
             prev_layers = config.layer_types[:first_kv_shared_layer_idx]
-            self.store_full_length_kv = layer_idx == len(prev_layers) - 1 - prev_layers[::-1].index(
-                config.layer_types[layer_idx]
-            )
+            self.store_full_length_kv = layer_idx == len(prev_layers) - 1 - prev_layers[
+                ::-1
+            ].index(config.layer_types[layer_idx])
         else:
             self.store_full_length_kv = False
 
         # RoPE
-        rope_theta = config.rope_parameters.get("sliding_attention", {}).get("rope_theta", 10000.0)
+        rope_theta = config.rope_parameters.get("sliding_attention", {}).get(
+            "rope_theta", 10000.0
+        )
         if not self.is_sliding:
-            rope_theta = config.rope_parameters.get("full_attention", {}).get("rope_theta", 1000000.0)
+            rope_theta = config.rope_parameters.get("full_attention", {}).get(
+                "rope_theta", 1000000.0
+            )
 
         self.rope = nn.RoPE(
             self.head_dim,
@@ -139,7 +154,12 @@ class Attention(nn.Module):
         queries = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
         queries = self.q_norm(queries)
 
-        if self.is_kv_shared_layer and cache is not None and hasattr(cache, "shared_kv") and cache.shared_kv is not None:
+        if (
+            self.is_kv_shared_layer
+            and cache is not None
+            and hasattr(cache, "shared_kv")
+            and cache.shared_kv is not None
+        ):
             keys, values = cache.shared_kv
             offset = cache.offset
         else:
@@ -162,7 +182,7 @@ class Attention(nn.Module):
 
         if mask is not None and isinstance(mask, mx.array):
             if mask.shape[-1] != keys.shape[-2]:
-                mask = mask[..., -keys.shape[-2]:]
+                mask = mask[..., -keys.shape[-2] :]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
@@ -180,16 +200,30 @@ class DecoderLayer(nn.Module):
         self.self_attn = Attention(config, layer_idx)
         self.mlp = MLP(config, layer_idx)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_feedforward_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.pre_feedforward_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_feedforward_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
         # Per-layer input gating
-        self.hidden_size_per_layer_input = getattr(config, "hidden_size_per_layer_input", 0)
+        self.hidden_size_per_layer_input = getattr(
+            config, "hidden_size_per_layer_input", 0
+        )
         if self.hidden_size_per_layer_input:
-            self.per_layer_input_gate = nn.Linear(config.hidden_size, self.hidden_size_per_layer_input, bias=False)
-            self.per_layer_projection = nn.Linear(self.hidden_size_per_layer_input, config.hidden_size, bias=False)
-            self.post_per_layer_input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.per_layer_input_gate = nn.Linear(
+                config.hidden_size, self.hidden_size_per_layer_input, bias=False
+            )
+            self.per_layer_projection = nn.Linear(
+                self.hidden_size_per_layer_input, config.hidden_size, bias=False
+            )
+            self.post_per_layer_input_norm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
         else:
             self.per_layer_input_gate = None
             self.per_layer_projection = None
@@ -278,7 +312,7 @@ class Gemma4TextModel(nn.Module):
         self.num_hidden_layers = config.num_hidden_layers
 
         self.embed_tokens = ScaledEmbedding(
-            config.vocab_size, config.hidden_size, embed_scale=config.hidden_size ** 0.5
+            config.vocab_size, config.hidden_size, embed_scale=config.hidden_size**0.5
         )
         self.layers = [
             DecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)
@@ -291,13 +325,13 @@ class Gemma4TextModel(nn.Module):
             self.embed_tokens_per_layer = ScaledEmbedding(
                 config.vocab_size_per_layer_input,
                 config.num_hidden_layers * config.hidden_size_per_layer_input,
-                embed_scale=config.hidden_size_per_layer_input ** 0.5,
+                embed_scale=config.hidden_size_per_layer_input**0.5,
             )
-            self.per_layer_input_scale = 2.0 ** -0.5
+            self.per_layer_input_scale = 2.0**-0.5
             self.per_layer_model_projection = ScaledLinear(
                 config.hidden_size,
                 config.num_hidden_layers * config.hidden_size_per_layer_input,
-                scalar=config.hidden_size ** -0.5,
+                scalar=config.hidden_size**-0.5,
             )
             self.per_layer_projection_norm = RMSNormZeroShift(
                 config.hidden_size_per_layer_input, eps=config.rms_norm_eps
@@ -383,7 +417,10 @@ class Gemma4TextModel(nn.Module):
             is_global = layer.layer_type == "full_attention"
 
             # Set shared KV on cache if this is a shared layer
-            if layer.self_attn.is_kv_shared_layer and layer.self_attn.kv_shared_layer_index is not None:
+            if (
+                layer.self_attn.is_kv_shared_layer
+                and layer.self_attn.kv_shared_layer_index is not None
+            ):
                 ref_idx = layer.self_attn.kv_shared_layer_index
                 if ref_idx in shared_kv_store and c is not None:
                     kv_state, ref_offset = shared_kv_store[ref_idx]
@@ -444,7 +481,9 @@ class LanguageModel(nn.Module):
         for k, v in weights.items():
             if "self_attn.rotary_emb" in k:
                 continue
-            if any(s in k for s in ["input_max", "input_min", "output_max", "output_min"]):
+            if any(
+                s in k for s in ["input_max", "input_min", "output_max", "output_min"]
+            ):
                 if "vision_tower" not in k:
                     continue
             sanitized[k] = v

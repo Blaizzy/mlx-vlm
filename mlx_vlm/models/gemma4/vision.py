@@ -1,4 +1,3 @@
-import math
 from typing import Optional
 
 import mlx.core as mx
@@ -56,7 +55,7 @@ class VisionRMSNorm(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         x_float = x.astype(mx.float32)
-        var = mx.mean(x_float ** 2, axis=-1, keepdims=True)
+        var = mx.mean(x_float**2, axis=-1, keepdims=True)
         normed = x_float * mx.rsqrt(var + self.eps)
         result = normed * (1.0 + self.weight.astype(mx.float32))
         return result.astype(x.dtype)
@@ -74,7 +73,7 @@ class VisionRMSNormNoScale(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         x_float = x.astype(mx.float32)
-        var = mx.mean(x_float ** 2, axis=-1, keepdims=True)
+        var = mx.mean(x_float**2, axis=-1, keepdims=True)
         return (x_float * mx.rsqrt(var + self.eps)).astype(x.dtype)
 
 
@@ -133,9 +132,13 @@ def apply_multidimensional_rope(inputs, positions, base_frequency=100.0):
         x_part = inputs[..., d * channels_per_dim : (d + 1) * channels_per_dim]
 
         # Compute frequencies for this dimension
-        freq_exponents = (2.0 / channels_per_dim) * mx.arange(0, half_per_dim).astype(mx.float32)
+        freq_exponents = (2.0 / channels_per_dim) * mx.arange(0, half_per_dim).astype(
+            mx.float32
+        )
         timescale = mx.power(base_frequency, freq_exponents)
-        sinusoid_inp = positions[..., d : d + 1].astype(mx.float32) / timescale  # [B, L, half_per_dim]
+        sinusoid_inp = (
+            positions[..., d : d + 1].astype(mx.float32) / timescale
+        )  # [B, L, half_per_dim]
         cos_d = mx.cos(sinusoid_inp)
         sin_d = mx.sin(sinusoid_inp)
         # Duplicate: [B, L, half] -> [B, L, channels_per_dim]
@@ -158,19 +161,31 @@ class VisionAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
-        self.rope_base_frequency = config.rope_parameters["full_attention"]["rope_theta"]
+        self.rope_base_frequency = config.rope_parameters["full_attention"][
+            "rope_theta"
+        ]
 
-        self.q_proj = ClippableLinear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = ClippableLinear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = ClippableLinear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = ClippableLinear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.q_proj = ClippableLinear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=False
+        )
+        self.k_proj = ClippableLinear(
+            self.hidden_size, self.num_kv_heads * self.head_dim, bias=False
+        )
+        self.v_proj = ClippableLinear(
+            self.hidden_size, self.num_kv_heads * self.head_dim, bias=False
+        )
+        self.o_proj = ClippableLinear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        )
 
         self.q_norm = VisionRMSNorm(self.head_dim)
         self.k_norm = VisionRMSNorm(self.head_dim)
         # v_norm is parameter-free (no weights in checkpoint)
         self._v_norm = VisionRMSNormNoScale()
 
-    def __call__(self, x: mx.array, positions: mx.array, mask: Optional[mx.array] = None) -> mx.array:
+    def __call__(
+        self, x: mx.array, positions: mx.array, mask: Optional[mx.array] = None
+    ) -> mx.array:
         B, L, _ = x.shape
 
         q = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim)
@@ -204,9 +219,15 @@ class VisionAttention(nn.Module):
 class VisionMLP(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
-        self.gate_proj = ClippableLinear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = ClippableLinear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = ClippableLinear(config.intermediate_size, config.hidden_size, bias=False)
+        self.gate_proj = ClippableLinear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.up_proj = ClippableLinear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.down_proj = ClippableLinear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.down_proj(nn.gelu_approx(self.gate_proj(x)) * self.up_proj(x))
@@ -218,12 +239,20 @@ class VisionTransformerBlock(nn.Module):
         self.self_attn = VisionAttention(config)
         self.mlp = VisionMLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_feedforward_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.pre_feedforward_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_feedforward_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.layer_scalar = mx.array(1.0)
 
-    def __call__(self, x: mx.array, positions: mx.array, mask: Optional[mx.array] = None) -> mx.array:
+    def __call__(
+        self, x: mx.array, positions: mx.array, mask: Optional[mx.array] = None
+    ) -> mx.array:
         normed = self.input_layernorm(x)
         attn_out = self.self_attn(normed, positions, mask)
         attn_out = self.post_attention_layernorm(attn_out)
@@ -244,10 +273,16 @@ class VisionPatchEmbedder(nn.Module):
         self.hidden_size = config.hidden_size
         self.patch_size = config.patch_size
         self.position_embedding_size = config.position_embedding_size
-        self.input_proj = nn.Linear(3 * self.patch_size ** 2, self.hidden_size, bias=False)
-        self.position_embedding_table = mx.ones((2, self.position_embedding_size, self.hidden_size))
+        self.input_proj = nn.Linear(
+            3 * self.patch_size**2, self.hidden_size, bias=False
+        )
+        self.position_embedding_table = mx.ones(
+            (2, self.position_embedding_size, self.hidden_size)
+        )
 
-    def _position_embeddings(self, patch_positions: mx.array, padding_positions: mx.array) -> mx.array:
+    def _position_embeddings(
+        self, patch_positions: mx.array, padding_positions: mx.array
+    ) -> mx.array:
         oh = one_hot(patch_positions, self.position_embedding_size)
         # [B, num_patches, 2, pos_size] -> [B, 2, num_patches, pos_size]
         oh = oh.transpose(0, 2, 1, 3).astype(self.position_embedding_table.dtype)
@@ -272,9 +307,16 @@ class VisionPatchEmbedder(nn.Module):
         patches = 2 * (patches - 0.5)
         return self.input_proj(patches.astype(self.input_proj.weight.dtype))
 
-    def __call__(self, pixel_values: mx.array, patch_positions: mx.array, padding_positions: mx.array) -> mx.array:
+    def __call__(
+        self,
+        pixel_values: mx.array,
+        patch_positions: mx.array,
+        padding_positions: mx.array,
+    ) -> mx.array:
         hidden_states = self._patchify(pixel_values)
-        position_embeddings = self._position_embeddings(patch_positions, padding_positions)
+        position_embeddings = self._position_embeddings(
+            patch_positions, padding_positions
+        )
         return hidden_states + position_embeddings
 
 
@@ -283,12 +325,12 @@ class VisionPooler(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.default_output_length = config.default_output_length
-        self.root_hidden_size = self.hidden_size ** 0.5
+        self.root_hidden_size = self.hidden_size**0.5
 
     def _avg_pool_by_positions(self, x, patch_positions, length):
         input_seq_len = x.shape[1]
         k = int((input_seq_len // length) ** 0.5)
-        k_squared = k ** 2
+        k_squared = k**2
 
         clamped = mx.clip(patch_positions, 0, None)
         max_x = mx.max(clamped[..., 0], axis=-1, keepdims=True) + 1
@@ -299,12 +341,16 @@ class VisionPooler(nn.Module):
         mask = mx.logical_not(mx.all(weights == 0, axis=1))
         return output, mask
 
-    def __call__(self, hidden_states, patch_positions, padding_positions, output_length=None):
+    def __call__(
+        self, hidden_states, patch_positions, padding_positions, output_length=None
+    ):
         length = output_length or self.default_output_length
         if hidden_states.shape[1] == length:
             mask = padding_positions
         else:
-            hidden_states, mask = self._avg_pool_by_positions(hidden_states, patch_positions, length)
+            hidden_states, mask = self._avg_pool_by_positions(
+                hidden_states, patch_positions, length
+            )
         hidden_states = hidden_states * self.root_hidden_size
         return hidden_states, mask
 
@@ -314,9 +360,13 @@ class VisionTransformerModel(nn.Module):
 
     def __init__(self, config: VisionConfig):
         super().__init__()
-        self.layers = [VisionTransformerBlock(config) for _ in range(config.num_hidden_layers)]
+        self.layers = [
+            VisionTransformerBlock(config) for _ in range(config.num_hidden_layers)
+        ]
 
-    def __call__(self, hidden_states: mx.array, positions: mx.array, mask: mx.array) -> mx.array:
+    def __call__(
+        self, hidden_states: mx.array, positions: mx.array, mask: mx.array
+    ) -> mx.array:
         for layer in self.layers:
             hidden_states = layer(hidden_states, positions, mask)
         return hidden_states
@@ -337,7 +387,7 @@ class VisionModel(nn.Module):
         self.patch_size = config.patch_size
         self.pooling_kernel_size = config.pooling_kernel_size
         self.default_output_length = config.default_output_length
-        self.max_patches = self.default_output_length * self.pooling_kernel_size ** 2
+        self.max_patches = self.default_output_length * self.pooling_kernel_size**2
 
         self.patch_embedder = VisionPatchEmbedder(config)
         self.encoder = VisionTransformerModel(config)
@@ -387,7 +437,9 @@ class VisionModel(nn.Module):
         # Pad to max_patches
         num_padding = self.max_patches - num_real
         if num_padding > 0:
-            pad_embeds = mx.zeros((B, num_padding, inputs_embeds.shape[-1]), dtype=inputs_embeds.dtype)
+            pad_embeds = mx.zeros(
+                (B, num_padding, inputs_embeds.shape[-1]), dtype=inputs_embeds.dtype
+            )
             inputs_embeds = mx.concatenate([inputs_embeds, pad_embeds], axis=1)
 
         # Build bidirectional attention mask [B, 1, L, L] for SDPA
@@ -400,7 +452,9 @@ class VisionModel(nn.Module):
         hidden_states = self.encoder(inputs_embeds, patch_positions, attn_mask)
 
         # Pool
-        pooled, pool_mask = self.pooler(hidden_states, patch_positions, padding_positions)
+        pooled, pool_mask = self.pooler(
+            hidden_states, patch_positions, padding_positions
+        )
 
         # Strip padding tokens using mask multiplication (MLX lacks boolean indexing)
         # Multiply by mask to zero out padding, then use compact representation

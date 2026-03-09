@@ -1994,7 +1994,6 @@ class TestModels(unittest.TestCase):
         self.assertEqual(output.logits.shape, (1, 4, config.text_config.vocab_size))
 
         # Full model forward: text + image tokens
-        # 64x64 image, patch_size=16 => 4x4=16 patches, pooling_kernel_size=2 => 16/4=4 output tokens
         img_id = config.image_token_id
         input_ids_with_img = mx.array([[0, img_id, img_id, img_id, img_id, 1]])
         pixel_values = mx.random.uniform(shape=(1, 3, 64, 64))

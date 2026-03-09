@@ -35,7 +35,9 @@ class MultimodalEmbedder(nn.Module):
 
     def __init__(self, embedding_dim: int, text_hidden_size: int, eps: float = 1e-6):
         super().__init__()
-        self.embedding_projection = nn.Linear(embedding_dim, text_hidden_size, bias=False)
+        self.embedding_projection = nn.Linear(
+            embedding_dim, text_hidden_size, bias=False
+        )
         self.embedding_post_projection_norm = RMSNormNoScale(text_hidden_size, eps=eps)
 
     def __call__(self, inputs_embeds: mx.array) -> mx.array:
@@ -75,8 +77,12 @@ class Model(nn.Module):
             image_mask = input_ids == self.config.image_token_id
             audio_mask = input_ids == self.config.audio_token_id
             text_mask = ~(image_mask | audio_mask)
-            per_layer_inputs_tokens = mx.where(text_mask, input_ids, mx.zeros_like(input_ids))
-            per_layer_inputs = self.language_model.model.get_per_layer_inputs(per_layer_inputs_tokens)
+            per_layer_inputs_tokens = mx.where(
+                text_mask, input_ids, mx.zeros_like(input_ids)
+            )
+            per_layer_inputs = self.language_model.model.get_per_layer_inputs(
+                per_layer_inputs_tokens
+            )
 
         if pixel_values is None:
             return InputEmbeddingsFeatures(
@@ -93,7 +99,9 @@ class Model(nn.Module):
         image_mask_expanded = mx.expand_dims(image_mask, -1)
         image_mask_expanded = mx.broadcast_to(image_mask_expanded, inputs_embeds.shape)
 
-        inputs_embeds = masked_scatter(inputs_embeds, image_mask_expanded, image_features)
+        inputs_embeds = masked_scatter(
+            inputs_embeds, image_mask_expanded, image_features
+        )
 
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds, per_layer_inputs=per_layer_inputs
@@ -125,7 +133,9 @@ class Model(nn.Module):
         sanitized = {}
         for k, v in weights.items():
             # Skip clipping parameters for non-vision weights (language model doesn't use them)
-            if any(s in k for s in ["input_max", "input_min", "output_max", "output_min"]):
+            if any(
+                s in k for s in ["input_max", "input_min", "output_max", "output_min"]
+            ):
                 if "vision_tower" not in k:
                     continue
             # Skip rotary embedding inv_freq
@@ -136,7 +146,7 @@ class Model(nn.Module):
                 continue
             # Strip model. prefix
             if k.startswith("model."):
-                new_key = k[len("model."):]
+                new_key = k[len("model.") :]
             else:
                 new_key = k
 
@@ -144,11 +154,15 @@ class Model(nn.Module):
             # Weight keys: language_model.layers.0.xxx
             # Model paths: language_model.model.layers.0.xxx
             if new_key.startswith("language_model."):
-                rest = new_key[len("language_model."):]
+                rest = new_key[len("language_model.") :]
                 new_key = "language_model.model." + rest
 
             # Handle Conv2d weight transposition for audio SSCP
-            if "subsample_conv_projection" in new_key and "conv.weight" in new_key and v.ndim == 4:
+            if (
+                "subsample_conv_projection" in new_key
+                and "conv.weight" in new_key
+                and v.ndim == 4
+            ):
                 v = v.transpose(0, 2, 3, 1)
             # Handle depthwise Conv1d for audio
             if "depthwise_conv1d.weight" in new_key and v.ndim == 3:
