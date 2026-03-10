@@ -7,6 +7,7 @@ import re
 import time
 import traceback
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, List, Literal, Optional, Tuple, Union
 
@@ -67,7 +68,7 @@ def get_max_kv_size(model: str):
     max_kv_tokens = int(os.environ.get("MAX_KV_SIZE", 0))
     if max_kv_tokens == 0:
         return None
-    if get_quantized_kv_bits(model) != None:
+    if get_quantized_kv_bits(model) is not None:
         print(
             f"Model {model} uses QuantizedKVCache cache, can't set max KV size, use --kv-bits [bits] instead."
         )
@@ -79,10 +80,24 @@ def get_quantized_kv_start():
     return int(os.environ.get("QUANTIZED_KV_START", DEFAULT_QUANTIZED_KV_START))
 
 
+@asynccontextmanager
+async def lifespan(app):
+    # Startup
+    model_path = os.environ.get("PRELOAD_MODEL")
+    adapter_path = os.environ.get("PRELOAD_ADAPTER") or None
+    if model_path:
+        print(f"Preloading model: {model_path}")
+        get_cached_model(model_path, adapter_path)
+    yield
+    # Unload model on shutdown
+    unload_model_sync()
+
+
 app = FastAPI(
     title="MLX-VLM Inference API",
     description="API for using Vision Language Models (VLMs) and Omni Models (Vision, Audio and Video support) with MLX.",
     version=__version__,
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -1130,7 +1145,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     )
                     yield f"data: {chunk_data.model_dump_json()}\n\n"
 
-                    yield f"data: [DONE]\n\n"
+                    yield "data: [DONE]\n\n"
 
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
@@ -1299,13 +1314,23 @@ async def unload_model_endpoint():
 
     return {
         "status": "success",
-        "message": f"Model unloaded successfully",
+        "message": "Model unloaded successfully",
         "unloaded": unloaded_info,
     }
 
 
 def main():
     parser = argparse.ArgumentParser(description="MLX VLM Http Server.")
+    parser.add_argument(
+        "--model",
+        type=str,
+        help="Optional path to the MLX model weights, tokenizer, and config",
+    )
+    parser.add_argument(
+        "--adapter-path",
+        type=str,
+        help="Optional path for the trained adapter weights and config.",
+    )
     parser.add_argument(
         "--host",
         type=str,
@@ -1358,6 +1383,10 @@ def main():
     args = parser.parse_args()
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
+    if args.model:
+        os.environ["PRELOAD_MODEL"] = args.model
+    if args.adapter_path:
+        os.environ["PRELOAD_ADAPTER"] = args.adapter_path
     os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["KV_BITS"] = str(args.kv_bits)
     os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
@@ -1371,3 +1400,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
