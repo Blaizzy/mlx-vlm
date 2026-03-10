@@ -86,10 +86,13 @@ async def lifespan(app):
     model_path = os.environ.get("PRELOAD_MODEL")
     adapter_path = os.environ.get("PRELOAD_ADAPTER") or None
     if model_path:
-        print(f"Preloading model: {model_path}")
-        get_cached_model(model_path, adapter_path)
+        try:
+            print(f"Preloading model: {model_path}")
+            get_cached_model(model_path, adapter_path)
+        except Exception as e:
+            print(f"Failed to preload model: {e}")
+            print("Server will continue without a preloaded model.")
     yield
-    # Unload model on shutdown
     unload_model_sync()
 
 
@@ -1400,4 +1403,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
