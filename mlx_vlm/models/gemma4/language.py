@@ -129,13 +129,9 @@ class Attention(nn.Module):
             self.store_full_length_kv = False
 
         # RoPE
-        rope_theta = config.rope_parameters.get("sliding_attention", {}).get(
-            "rope_theta", 10000.0
-        )
-        if not self.is_sliding:
-            rope_theta = config.rope_parameters.get("full_attention", {}).get(
-                "rope_theta", 1000000.0
-            )
+        layer_key = "sliding_attention" if self.is_sliding else "full_attention"
+        rope_params = config.rope_parameters.get(layer_key, {})
+        rope_theta = rope_params.get("rope_theta", 10000.0)
 
         self.rope = nn.RoPE(
             self.head_dim,
@@ -441,6 +437,9 @@ class Gemma4TextModel(nn.Module):
             if per_layer_inputs is not None:
                 per_layer_input = per_layer_inputs[:, :, i, :]
 
+            # Capture pre-update offset for KV sharing (before update_and_fetch increments it)
+            pre_offset = c.offset if c is not None else 0
+
             h = layer(
                 h, local_mask, c,
                 per_layer_input=per_layer_input,
@@ -448,9 +447,9 @@ class Gemma4TextModel(nn.Module):
             )
 
             # Store KV for sharing with later layers
+            # Use pre-update offset so shared layers apply query RoPE at the correct positions
             if layer.self_attn.store_full_length_kv:
-                offset = c.offset if c is not None else 0
-                shared_kv_store[i] = (layer.self_attn._last_kv, offset)
+                shared_kv_store[i] = (layer.self_attn._last_kv, pre_offset)
 
         return self.norm(h)
 
