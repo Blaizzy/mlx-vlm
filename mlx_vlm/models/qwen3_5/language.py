@@ -179,7 +179,9 @@ class Qwen3_5Attention(nn.Module):
         cos, sin = self.rotary_emb(values, position_ids)
 
         if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., :kv_seq_len]
+            if isinstance(kv_seq_len, mx.array):
+                kv_seq_len = kv_seq_len.max().item()
+            mask = mask[..., : int(kv_seq_len)]
 
         queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
@@ -267,6 +269,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         if cache is not None and cache[0] is not None:
             conv_state = cache[0]
+            if conv_state.shape[0] != B:
+                conv_state = mx.zeros(
+                    (B, self.conv_kernel_size - 1, self.conv_dim),
+                    dtype=inputs.dtype,
+                )
         else:
             conv_state = mx.zeros(
                 (B, self.conv_kernel_size - 1, self.conv_dim),
@@ -274,7 +281,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
 
         if mask is not None:
-            mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
+            if mask.shape[0] != B:
+                mask = None
+            else:
+                mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
         if cache is not None:
             cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
@@ -290,6 +300,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         ]
 
         state = cache[1] if cache else None
+        if state is not None and state.shape[0] != B:
+            state = None
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
