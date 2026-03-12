@@ -25,15 +25,30 @@ class Model(Qwen3_5Model):
 
         for l in range(self.config.text_config.num_hidden_layers):
             prefix = f"model.language_model.layers.{l}.mlp"
-            # process gate_up_proj [num_experts, 2 * intermediate_size, hidden_size]
-            gate_up_weight = weights.pop(f"{prefix}.experts.gate_up_proj")
-            gate_weight, up_weights = mx.split(gate_up_weight, 2, axis=-2)
-            weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
-            weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_weights
-            # down_proj
-            weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                f"{prefix}.experts.down_proj"
-            )
+            combined_key = f"{prefix}.experts.gate_up_proj"
+            if combined_key in weights:
+                # pre-stacked format: gate_up_proj [num_experts, 2 * intermediate_size, hidden_size]
+                gate_up_weight = weights.pop(combined_key)
+                gate_weight, up_weights = mx.split(gate_up_weight, 2, axis=-2)
+                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
+                weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_weights
+                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
+                    f"{prefix}.experts.down_proj"
+                )
+            else:
+                # per-expert format: experts.{n}.gate_proj.weight, experts.{n}.up_proj.weight, etc.
+                # used by models such as llmfan46/Qwen3.5-35B-A3B-heretic-v2
+                n = 0
+                gate_list, up_list, down_list = [], [], []
+                while f"{prefix}.experts.{n}.gate_proj.weight" in weights:
+                    gate_list.append(weights.pop(f"{prefix}.experts.{n}.gate_proj.weight"))
+                    up_list.append(weights.pop(f"{prefix}.experts.{n}.up_proj.weight"))
+                    down_list.append(weights.pop(f"{prefix}.experts.{n}.down_proj.weight"))
+                    n += 1
+                if gate_list:
+                    weights[f"{prefix}.switch_mlp.gate_proj.weight"] = mx.stack(gate_list)
+                    weights[f"{prefix}.switch_mlp.up_proj.weight"] = mx.stack(up_list)
+                    weights[f"{prefix}.switch_mlp.down_proj.weight"] = mx.stack(down_list)
 
         norm_keys = (
             ".input_layernorm.weight",
