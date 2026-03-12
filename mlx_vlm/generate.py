@@ -395,7 +395,6 @@ def generate_step(
             return y, logprobs.squeeze(0)
 
     with mx.stream(generation_stream):
-
         # Get input embeddings (handles both multimodal and text-only)
         embedding_output = model.get_input_embeddings(
             input_ids, pixel_values, mask=mask, **kwargs
@@ -854,7 +853,6 @@ class Batch:
 
 
 class BatchGenerator:
-
     @dataclass
     class Response:
         uid: int
@@ -1299,7 +1297,6 @@ def _generate_batch(
     )
 
     with wired_limit(model, [generation_stream]):
-
         embedding_output = model.get_input_embeddings(
             input_ids, pixel_values, mask=mask, **data_kwargs
         )

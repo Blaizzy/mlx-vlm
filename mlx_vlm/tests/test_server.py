@@ -25,8 +25,12 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     )
 
     with (
-        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
-        patch.object(server, "apply_chat_template", return_value="prompt") as mock_template,
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
         patch.object(server, "generate", return_value=result) as mock_generate,
     ):
         response = client.post(
@@ -74,8 +78,12 @@ def test_chat_completions_endpoint_forwards_new_sampling_args(client):
     )
 
     with (
-        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
-        patch.object(server, "apply_chat_template", return_value="prompt") as mock_template,
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
         patch.object(server, "generate", return_value=result) as mock_generate,
     ):
         response = client.post(
