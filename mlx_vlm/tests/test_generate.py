@@ -1,4 +1,5 @@
 """Tests for batch generation functionality in mlx_vlm.generate module."""
+
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -1024,6 +1025,7 @@ class TestSamplerArgs:
             top_k=32,
         )
         mock_make_logits_processors.assert_called_once_with({3: -0.75}, 1.15, 20)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
