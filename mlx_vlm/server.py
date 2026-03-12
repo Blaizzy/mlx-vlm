@@ -305,6 +305,14 @@ class OpenAIRequest(FlexibleBaseModel):
         DEFAULT_TEMPERATURE, description="Temperature for sampling."
     )
     top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    top_k: Optional[int] = Field(None, description="Top-k sampling cutoff.")
+    min_p: Optional[float] = Field(None, description="Min-p sampling threshold.")
+    repetition_penalty: Optional[float] = Field(
+        None, description="Penalty applied to repeated tokens."
+    )
+    logit_bias: Optional[dict[int, float]] = Field(
+        None, description="Additive logit bias keyed by token id."
+    )
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
@@ -482,6 +490,14 @@ class VLMRequest(FlexibleBaseModel):
         DEFAULT_TEMPERATURE, description="Temperature for sampling."
     )
     top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    top_k: Optional[int] = Field(None, description="Top-k sampling cutoff.")
+    min_p: Optional[float] = Field(None, description="Min-p sampling threshold.")
+    repetition_penalty: Optional[float] = Field(
+        None, description="Penalty applied to repeated tokens."
+    )
+    logit_bias: Optional[dict[int, float]] = Field(
+        None, description="Additive logit bias keyed by token id."
+    )
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     resize_shape: Optional[Tuple[int, int]] = Field(
         None,
@@ -666,6 +682,14 @@ async def responses_endpoint(request: Request):
         model, processor, config = get_cached_model(openai_request.model)
 
         kwargs = {}
+        if openai_request.top_k is not None:
+            kwargs["top_k"] = openai_request.top_k
+        if openai_request.min_p is not None:
+            kwargs["min_p"] = openai_request.min_p
+        if openai_request.repetition_penalty is not None:
+            kwargs["repetition_penalty"] = openai_request.repetition_penalty
+        if openai_request.logit_bias is not None:
+            kwargs["logit_bias"] = openai_request.logit_bias
 
         chat_messages = []
         images = []
@@ -985,6 +1009,14 @@ async def chat_completions_endpoint(request: ChatRequest):
         model, processor, config = get_cached_model(request.model, request.adapter_path)
 
         kwargs = {}
+        if request.top_k is not None:
+            kwargs["top_k"] = request.top_k
+        if request.min_p is not None:
+            kwargs["min_p"] = request.min_p
+        if request.repetition_penalty is not None:
+            kwargs["repetition_penalty"] = request.repetition_penalty
+        if request.logit_bias is not None:
+            kwargs["logit_bias"] = request.logit_bias
 
         if request.resize_shape is not None:
             if len(request.resize_shape) not in [1, 2]:
