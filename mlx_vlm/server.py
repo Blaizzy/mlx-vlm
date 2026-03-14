@@ -578,6 +578,7 @@ def process_tool_calls(model_output: str, tool_module, tools):
         matches = re.findall(pattern, model_output)
         if matches:
             remaining = re.sub(pattern, " ", model_output).strip()
+            tool_call_index = 0
             for match in matches:
                 call = (
                     match.strip()
@@ -588,6 +589,7 @@ def process_tool_calls(model_output: str, tool_module, tools):
                     tool_call = tool_module.parse_tool_call(call, tools)
                     called_tool = {}
                     called_tool["type"] = "function"
+                    called_tool["index"] = tool_call_index
                     called_tool["id"] = str(uuid.uuid4())
                     called_tool["function"] = {}
                     called_tool["function"]["name"] = tool_call["name"].strip()
@@ -595,6 +597,7 @@ def process_tool_calls(model_output: str, tool_module, tools):
                         tool_call["arguments"], ensure_ascii=False
                     )
                     called_tools.append(called_tool)
+                    tool_call_index += 1
                 except:
                     print(f"Invalid tool call: {call}")
     return dict(calls=called_tools, remaining_text=remaining)
