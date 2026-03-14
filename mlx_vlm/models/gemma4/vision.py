@@ -216,10 +216,11 @@ class VisionAttention(nn.Module):
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        # Use optimized SDPA with scale=1.0 (Gemma4 vision uses no scaling)
-        attn_output = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=1.0, mask=mask
-        )
+        # Pad head_dim to fused SDPA-supported size (64, 80, 128) to avoid NaN
+        # from all-masked padding rows in non-fused fallback path
+        from ..base import ensure_fused_sdpa
+
+        attn_output = ensure_fused_sdpa(q, k, v, scale=1.0, mask=mask)
 
         # [B, H, L, D] -> [B, L, H*D]
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, L, -1)
