@@ -346,6 +346,9 @@ curl -X POST "http://localhost:8080/responses" \
 - `max_tokens`: Maximum tokens to generate
 - `temperature`: Sampling temperature
 - `top_p`: Top-p sampling parameter
+- `top_k`: Top-k sampling cutoff
+- `min_p`: Min-p sampling threshold
+- `repetition_penalty`: Penalty applied to repeated tokens
 - `stream`: Enable streaming responses
 
 

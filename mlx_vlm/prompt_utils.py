@@ -43,6 +43,7 @@ MODEL_CONFIG = {
     "qwen3_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "qwen3_omni_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "minicpmo": MessageFormat.IMAGE_TOKEN,
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -207,6 +208,7 @@ class MessageFormatter:
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
+            "qwen3_omni_moe",
         ] and kwargs.get("video"):
             return self._format_video_message(prompt, kwargs)
 

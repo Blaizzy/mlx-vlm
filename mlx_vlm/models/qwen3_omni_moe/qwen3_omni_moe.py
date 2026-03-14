@@ -103,6 +103,11 @@ class Model(nn.Module):
         return vision_output
 
     @property
+    def language_model(self):
+        """Expose thinker's language model for the generic generate path."""
+        return self.thinker.language_model
+
+    @property
     def layers(self):
         return self.thinker.language_model.layers
 

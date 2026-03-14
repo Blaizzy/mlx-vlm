@@ -236,6 +236,7 @@ class ModelConfig(BaseModelConfig):
     model_type: str = "qwen3_omni_moe"
     dtype: str = "bfloat16"
     enable_audio_output: bool = True
+    eos_token_id: int = 151645
     im_start_token_id: int = 151644
     im_end_token_id: int = 151645
     system_token_id: int = 8948
