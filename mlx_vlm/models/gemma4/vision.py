@@ -13,27 +13,37 @@ class ClippableLinear(nn.Module):
     Matches PyTorch's Gemma4ClippableLinear: clamp input, linear, clamp output.
     Clip bounds are stored as buffers in the checkpoint (scalar tensors).
     Initialized to ±inf so clamping is a no-op until real values are loaded.
+    When use_clipping=False, behaves as a standard nn.Linear (no clip params).
     """
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        use_clipping: bool = True,
+    ):
         super().__init__()
         self.weight = mx.zeros((out_features, in_features))
         if bias:
             self.bias = mx.zeros((out_features,))
         else:
             self.bias = None
-        # Initialize to ±inf (no-op clamp) - checkpoint values override these
-        self.input_min = mx.array(float("-inf"))
-        self.input_max = mx.array(float("inf"))
-        self.output_min = mx.array(float("-inf"))
-        self.output_max = mx.array(float("inf"))
+        self.use_clipping = use_clipping
+        if use_clipping:
+            self.input_min = mx.array(float("-inf"))
+            self.input_max = mx.array(float("inf"))
+            self.output_min = mx.array(float("-inf"))
+            self.output_max = mx.array(float("inf"))
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = mx.clip(x, self.input_min, self.input_max)
+        if self.use_clipping:
+            x = mx.clip(x, self.input_min, self.input_max)
         x = x @ self.weight.T
         if self.bias is not None:
             x = x + self.bias
-        x = mx.clip(x, self.output_min, self.output_max)
+        if self.use_clipping:
+            x = mx.clip(x, self.output_min, self.output_max)
         return x
 
 
@@ -165,17 +175,18 @@ class VisionAttention(nn.Module):
             "rope_theta"
         ]
 
+        clip = getattr(config, "use_clipped_linears", True)
         self.q_proj = ClippableLinear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=False
+            self.hidden_size, self.num_heads * self.head_dim, bias=False, use_clipping=clip
         )
         self.k_proj = ClippableLinear(
-            self.hidden_size, self.num_kv_heads * self.head_dim, bias=False
+            self.hidden_size, self.num_kv_heads * self.head_dim, bias=False, use_clipping=clip
         )
         self.v_proj = ClippableLinear(
-            self.hidden_size, self.num_kv_heads * self.head_dim, bias=False
+            self.hidden_size, self.num_kv_heads * self.head_dim, bias=False, use_clipping=clip
         )
         self.o_proj = ClippableLinear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=False
+            self.num_heads * self.head_dim, self.hidden_size, bias=False, use_clipping=clip
         )
 
         self.q_norm = VisionRMSNorm(self.head_dim)
@@ -219,14 +230,15 @@ class VisionAttention(nn.Module):
 class VisionMLP(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
+        clip = getattr(config, "use_clipped_linears", True)
         self.gate_proj = ClippableLinear(
-            config.hidden_size, config.intermediate_size, bias=False
+            config.hidden_size, config.intermediate_size, bias=False, use_clipping=clip
         )
         self.up_proj = ClippableLinear(
-            config.hidden_size, config.intermediate_size, bias=False
+            config.hidden_size, config.intermediate_size, bias=False, use_clipping=clip
         )
         self.down_proj = ClippableLinear(
-            config.intermediate_size, config.hidden_size, bias=False
+            config.intermediate_size, config.hidden_size, bias=False, use_clipping=clip
         )
 
     def __call__(self, x: mx.array) -> mx.array:

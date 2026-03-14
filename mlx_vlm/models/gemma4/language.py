@@ -104,6 +104,17 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.v_norm = RMSNormNoScale(self.head_dim, eps=config.rms_norm_eps)
 
+        # RoPE
+        layer_key = "sliding_attention" if self.is_sliding else "full_attention"
+        rope_params = config.rope_parameters.get(layer_key, {})
+        rope_theta = rope_params.get("rope_theta", 10000.0)
+
+        self.rope = nn.RoPE(
+            self.head_dim,
+            traditional=config.rope_traditional,
+            base=rope_theta,
+        )
+
         # KV sharing
         first_kv_shared_layer_idx = config.num_hidden_layers - getattr(
             config, "num_kv_shared_layers", 0
@@ -127,17 +138,6 @@ class Attention(nn.Module):
             ].index(config.layer_types[layer_idx])
         else:
             self.store_full_length_kv = False
-
-        # RoPE
-        layer_key = "sliding_attention" if self.is_sliding else "full_attention"
-        rope_params = config.rope_parameters.get(layer_key, {})
-        rope_theta = rope_params.get("rope_theta", 10000.0)
-
-        self.rope = nn.RoPE(
-            self.head_dim,
-            traditional=config.rope_traditional,
-            base=rope_theta,
-        )
 
     def __call__(
         self,
@@ -226,7 +226,7 @@ class DecoderLayer(nn.Module):
             self.per_layer_projection = None
             self.post_per_layer_input_norm = None
 
-        # Layer scalar for full attention layers
+        # Layer scalar for full attention layers (and potentially all layers in MoE models)
         if self.layer_type == "full_attention":
             self.layer_scalar = mx.ones((1,))
         else:
@@ -248,6 +248,7 @@ class DecoderLayer(nn.Module):
         h = residual + h
 
         residual = h
+
         h = self.pre_feedforward_layernorm(h)
         h = self.mlp(h)
         h = self.post_feedforward_layernorm(h)
