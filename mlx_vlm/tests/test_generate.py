@@ -976,5 +976,56 @@ class TestThinkingBudgetCriteria:
         assert criteria.budget_exceeded is False
 
 
+class TestSamplerArgs:
+    """Tests for sampler argument forwarding."""
+
+    @patch.object(generate_module.cache, "make_prompt_cache", return_value=[])
+    @patch.object(generate_module, "make_logits_processors", return_value=[])
+    @patch.object(generate_module, "make_sampler")
+    def test_generate_step_passes_sampling_and_logits_processor_args(
+        self,
+        mock_make_sampler,
+        mock_make_logits_processors,
+        _mock_prompt_cache,
+    ):
+        mock_make_sampler.return_value = lambda logprobs: mx.array([0])
+
+        model = MagicMock()
+        model.language_model.return_value = MagicMock(
+            logits=mx.zeros((1, 1, 4)),
+            cross_attention_states=None,
+            encoder_outputs=None,
+        )
+
+        embedding_output = MagicMock()
+        embedding_output.inputs_embeds = mx.zeros((1, 1, 4))
+        embedding_output.to_dict.return_value = {}
+        model.get_input_embeddings.return_value = embedding_output
+
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            max_tokens=1,
+            temperature=0.7,
+            top_p=0.9,
+            min_p=0.05,
+            top_k=32,
+            repetition_penalty=1.15,
+            logit_bias={3: -0.75},
+        )
+
+        next(gen)
+
+        mock_make_sampler.assert_called_once_with(
+            temp=0.7,
+            top_p=0.9,
+            min_p=0.05,
+            top_k=32,
+        )
+        mock_make_logits_processors.assert_called_once_with({3: -0.75}, 1.15, 20)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
