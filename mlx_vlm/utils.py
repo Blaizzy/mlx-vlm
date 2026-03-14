@@ -345,7 +345,7 @@ def update_module_configs(model_config, model_class, config, modules):
     """
     for config_name in modules:
         config_attr = f"{config_name}_config"
-        if hasattr(model_config, config_attr):
+        if hasattr(model_config, config_attr) and config.get(config_attr) is not None:
             config_class = getattr(model_class, f"{config_name.title()}Config")
             setattr(
                 model_config, config_attr, config_class.from_dict(config[config_attr])

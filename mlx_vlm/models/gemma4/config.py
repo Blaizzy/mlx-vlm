@@ -106,6 +106,7 @@ class TextConfig(BaseModelConfig):
     attn_logit_softcapping: Optional[float] = None
     final_logit_softcapping: float = 30.0
     use_double_wide_mlp: bool = True
+    enable_moe_block: bool = False
     use_second_mlp_block: bool = False
     num_experts: Optional[int] = None
     top_k_experts: Optional[int] = None

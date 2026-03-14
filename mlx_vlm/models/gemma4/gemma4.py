@@ -164,48 +164,68 @@ class Model(nn.Module):
         return logits
 
     def sanitize(self, weights):
+        import re
+
+        use_clipped = getattr(self.config.vision_config, "use_clipped_linears", True)
         sanitized = {}
         for k, v in weights.items():
-            # Skip clipping parameters for non-encoder weights (language model doesn't use them)
+            # Skip clipping parameters when not used
             if any(
                 s in k
                 for s in ["input_max", "input_min", "output_max", "output_min"]
             ):
+                if "vision_tower" in k and not use_clipped:
+                    continue
                 if "vision_tower" not in k and "audio_tower" not in k:
                     continue
-            # Skip rotary embedding inv_freq
             if "rotary_emb.inv_freq" in k or "rotary_emb" in k:
                 continue
-            # Skip audio weights if audio_config is None (no audio tower instantiated)
             if self.audio_tower is None and (
                 "audio_tower" in k or "embed_audio" in k
             ):
                 continue
-            # Strip model. prefix
+
             if k.startswith("model."):
-                new_key = k[len("model.") :]
+                new_key = k[len("model."):]
             else:
                 new_key = k
 
-            # Remap language_model.xxx -> language_model.model.xxx
-            # Weight keys: language_model.layers.0.xxx
-            # Model paths: language_model.model.layers.0.xxx
             if new_key.startswith("language_model."):
-                rest = new_key[len("language_model.") :]
+                rest = new_key[len("language_model."):]
                 new_key = "language_model.model." + rest
 
-            # Handle Conv2d weight transposition for SSCP
-            # PyTorch [out, in, kH, kW] -> MLX [out, kH, kW, in]
+            # Conv2d: PyTorch [out, in, kH, kW] -> MLX [out, kH, kW, in]
             if (
                 "subsample_conv_projection" in new_key
                 and "conv.weight" in new_key
                 and v.ndim == 4
             ):
                 v = v.transpose(0, 2, 3, 1)
-            # Handle depthwise Conv1d for audio conformer
-            # PyTorch [out, in, kW] -> MLX [out, kW, in]
+            # Conv1d: PyTorch [out, in, kW] -> MLX [out, kW, in]
             if "depthwise_conv1d.weight" in new_key and v.ndim == 3:
                 v = v.transpose(0, 2, 1)
+
+            # MoE: remap moe.{proj} -> moe.switch_glu.{proj}.weight and transpose
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                suffix = f".moe.{proj}"
+                if new_key.endswith(suffix):
+                    new_key = new_key.replace(
+                        f".moe.{proj}", f".moe.switch_glu.{proj}.weight"
+                    )
+                    v = v.swapaxes(-1, -2)
+                    break
+
+            # Drop layer_scalar for non-full-attention layers
+            if "layer_scalar" in new_key and "language_model" in new_key:
+                m = re.search(r"layers\.(\d+)\.layer_scalar", new_key)
+                if m:
+                    layer_idx = int(m.group(1))
+                    layer_types = self.config.text_config.layer_types
+                    if (
+                        layer_idx < len(layer_types)
+                        and layer_types[layer_idx] != "full_attention"
+                    ):
+                        continue
 
             sanitized[new_key] = v
         return sanitized

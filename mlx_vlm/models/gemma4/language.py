@@ -54,7 +54,7 @@ def logit_softcap(softcap, x):
 
 
 class MLP(nn.Module):
-    def __init__(self, config: TextConfig, layer_idx: int):
+    def __init__(self, config: TextConfig, layer_idx: int = 0):
         super().__init__()
         first_kv_shared_layer_idx = config.num_hidden_layers - getattr(
             config, "num_kv_shared_layers", 0
@@ -73,6 +73,75 @@ class MLP(nn.Module):
         return self.down_proj(nn.gelu_approx(self.gate_proj(x)) * self.up_proj(x))
 
 
+class Router(nn.Module):
+    """Expert router: norm -> scale -> project -> top-k -> renormalize."""
+
+    def __init__(self, config: TextConfig):
+        super().__init__()
+        self.config = config
+        self.norm = RMSNormNoScale(config.hidden_size, eps=config.rms_norm_eps)
+        self.proj = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.scale = mx.ones((config.hidden_size,))
+        self._root_size = config.hidden_size ** -0.5
+
+    def __call__(self, x: mx.array):
+        x = self.norm(x)
+        x = x * self._root_size
+        x = x * self.scale
+
+        expert_scores = self.proj(x)
+        router_probs = mx.softmax(expert_scores, axis=-1)
+
+        top_k_indices = mx.argpartition(
+            -expert_scores, kth=self.config.top_k_experts - 1, axis=-1
+        )[..., : self.config.top_k_experts]
+
+        top_k_weights = mx.take_along_axis(router_probs, top_k_indices, axis=-1)
+        top_k_weights = top_k_weights / mx.sum(
+            top_k_weights, axis=-1, keepdims=True
+        )
+        return top_k_indices, top_k_weights
+
+
+class GeGLU(nn.Module):
+    """GELU-gated linear unit activation for SwitchGLU."""
+
+    def __call__(self, x, gate):
+        return nn.gelu_approx(gate) * x
+
+
+class MoEBlock(nn.Module):
+    """Sparse MoE using mlx_lm SwitchGLU with gather_mm."""
+
+    def __init__(self, config: TextConfig):
+        super().__init__()
+        from mlx_lm.models.switch_layers import SwitchGLU
+
+        self.switch_glu = SwitchGLU(
+            input_dims=config.hidden_size,
+            hidden_dims=config.expert_intermediate_size,
+            num_experts=config.num_experts,
+            activation=GeGLU(),
+            bias=False,
+        )
+        self.per_expert_scale = mx.ones((config.num_experts,))
+
+    def __call__(
+        self, x: mx.array, top_k_indices: mx.array, top_k_weights: mx.array
+    ) -> mx.array:
+        B, S, H = x.shape
+        K = top_k_indices.shape[-1]
+
+        x_flat = x.reshape(B * S, H)
+        indices_flat = top_k_indices.reshape(B * S, K)
+
+        expert_out = self.switch_glu(x_flat, indices_flat)
+
+        expert_scales = self.per_expert_scale[indices_flat]
+        weights = (top_k_weights.reshape(B * S, K) * expert_scales)[..., None]
+        return (expert_out * weights).sum(axis=-2).reshape(B, S, H)
+
+
 class Attention(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
@@ -81,7 +150,6 @@ class Attention(nn.Module):
         self.layer_type = config.layer_types[layer_idx]
         self.is_sliding = self.layer_type == "sliding_attention"
 
-        # Full attention layers use global_head_dim, sliding use head_dim
         self.head_dim = (
             config.global_head_dim
             if self.layer_type == "full_attention"
@@ -92,12 +160,22 @@ class Attention(nn.Module):
 
         dim = config.hidden_size
         self.n_heads = config.num_attention_heads
-        self.n_kv_heads = config.num_key_value_heads
+
+        # K-eq-V for full attention layers (26B/31B models)
+        self.use_k_eq_v = (
+            getattr(config, "attention_k_eq_v", False) and not self.is_sliding
+        )
+        if self.use_k_eq_v and config.num_global_key_value_heads is not None:
+            self.n_kv_heads = config.num_global_key_value_heads
+        else:
+            self.n_kv_heads = config.num_key_value_heads
+
         self.scale = 1.0
 
         self.q_proj = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+        if not self.use_k_eq_v:
+            self.v_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, dim, bias=False)
 
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -115,7 +193,7 @@ class Attention(nn.Module):
             base=rope_theta,
         )
 
-        # KV sharing
+        # KV sharing (2B/4B models)
         first_kv_shared_layer_idx = config.num_hidden_layers - getattr(
             config, "num_kv_shared_layers", 0
         )
@@ -130,7 +208,6 @@ class Attention(nn.Module):
         else:
             self.kv_shared_layer_index = None
 
-        # Determine if this layer should store full-length KV for sharing
         if not self.is_kv_shared_layer:
             prev_layers = config.layer_types[:first_kv_shared_layer_idx]
             self.store_full_length_kv = layer_idx == len(prev_layers) - 1 - prev_layers[
@@ -152,25 +229,31 @@ class Attention(nn.Module):
         queries = self.q_norm(queries)
 
         if self.is_kv_shared_layer and shared_kv is not None:
-            # Use K/V from the reference layer (already RoPE'd and transposed)
             keys, values = shared_kv
             offset = cache.offset if cache is not None else 0
         else:
             offset = cache.offset if cache is not None else 0
 
             keys = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
-            keys = self.k_norm(keys)
-            keys = keys.transpose(0, 2, 1, 3)
-            keys = self.rope(keys, offset=offset)
 
-            values = self.v_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
+            # k_eq_v: values from raw k_proj (before k_norm)
+            if self.use_k_eq_v:
+                values = keys
+            else:
+                values = self.v_proj(x).reshape(
+                    B, L, self.n_kv_heads, self.head_dim
+                )
+
+            keys = self.k_norm(keys)
             values = self.v_norm(values)
             values = values.transpose(0, 2, 1, 3)
+
+            keys = keys.transpose(0, 2, 1, 3)
+            keys = self.rope(keys, offset=offset)
 
             if cache is not None:
                 keys, values = cache.update_and_fetch(keys, values)
 
-        # Store K/V for potential sharing with later layers
         if self.store_full_length_kv:
             self._last_kv = (keys, values)
 
@@ -207,7 +290,22 @@ class DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        # Per-layer input gating
+        # MoE (26B model)
+        self.enable_moe = getattr(config, "enable_moe_block", False)
+        if self.enable_moe:
+            self.router = Router(config)
+            self.moe = MoEBlock(config)
+            self.post_feedforward_layernorm_1 = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+            self.post_feedforward_layernorm_2 = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+            self.pre_feedforward_layernorm_2 = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+
+        # Per-layer input gating (2B/4B models)
         self.hidden_size_per_layer_input = getattr(
             config, "hidden_size_per_layer_input", 0
         )
@@ -226,7 +324,7 @@ class DecoderLayer(nn.Module):
             self.per_layer_projection = None
             self.post_per_layer_input_norm = None
 
-        # Layer scalar for full attention layers (and potentially all layers in MoE models)
+        # Layer scalar
         if self.layer_type == "full_attention":
             self.layer_scalar = mx.ones((1,))
         else:
@@ -249,8 +347,21 @@ class DecoderLayer(nn.Module):
 
         residual = h
 
-        h = self.pre_feedforward_layernorm(h)
-        h = self.mlp(h)
+        if self.enable_moe:
+            h1 = self.pre_feedforward_layernorm(h)
+            h1 = self.mlp(h1)
+            h1 = self.post_feedforward_layernorm_1(h1)
+
+            top_k_indices, top_k_weights = self.router(h)
+            h2 = self.pre_feedforward_layernorm_2(h)
+            h2 = self.moe(h2, top_k_indices, top_k_weights)
+            h2 = self.post_feedforward_layernorm_2(h2)
+
+            h = h1 + h2
+        else:
+            h = self.pre_feedforward_layernorm(h)
+            h = self.mlp(h)
+
         h = self.post_feedforward_layernorm(h)
         h = residual + h
 
@@ -318,7 +429,7 @@ class Gemma4TextModel(nn.Module):
         ]
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Per-layer input embeddings
+        # Per-layer input embeddings (2B/4B models)
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input:
             self.embed_tokens_per_layer = ScaledEmbedding(
@@ -359,7 +470,6 @@ class Gemma4TextModel(nn.Module):
             self.config.num_hidden_layers,
             self.hidden_size_per_layer_input,
         )
-        # RMSNorm with scale_shift=0.0
         per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
 
         if per_layer_inputs is None:
@@ -380,7 +490,6 @@ class Gemma4TextModel(nn.Module):
         else:
             h = inputs_embeds
 
-        # Compute per-layer inputs
         if self.hidden_size_per_layer_input:
             if inputs is not None and per_layer_inputs is None:
                 per_layer_inputs = self.get_per_layer_inputs(inputs)
@@ -390,7 +499,6 @@ class Gemma4TextModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        # Find a global attention cache and a sliding attention cache for mask creation
         global_cache_idx = None
         sliding_cache_idx = None
         for i, layer in enumerate(self.layers):
@@ -409,13 +517,11 @@ class Gemma4TextModel(nn.Module):
                 window_size=self.window_size,
             )
 
-        # Store shared KV references and offsets
         shared_kv_store = {}
 
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             is_global = layer.layer_type == "full_attention"
 
-            # Prepare shared KV for KV-shared layers
             layer_shared_kv = None
             if (
                 layer.self_attn.is_kv_shared_layer
@@ -424,7 +530,6 @@ class Gemma4TextModel(nn.Module):
                 ref_idx = layer.self_attn.kv_shared_layer_index
                 if ref_idx in shared_kv_store:
                     layer_shared_kv, ref_offset = shared_kv_store[ref_idx]
-                    # Sync cache offset so query RoPE positions are correct
                     if c is not None:
                         c.offset = ref_offset
 
@@ -438,7 +543,6 @@ class Gemma4TextModel(nn.Module):
             if per_layer_inputs is not None:
                 per_layer_input = per_layer_inputs[:, :, i, :]
 
-            # Capture pre-update offset for KV sharing (before update_and_fetch increments it)
             pre_offset = c.offset if c is not None else 0
 
             h = layer(
@@ -447,8 +551,6 @@ class Gemma4TextModel(nn.Module):
                 shared_kv=layer_shared_kv,
             )
 
-            # Store KV for sharing with later layers
-            # Use pre-update offset so shared layers apply query RoPE at the correct positions
             if layer.self_attn.store_full_length_kv:
                 shared_kv_store[i] = (layer.self_attn._last_kv, pre_offset)
 
