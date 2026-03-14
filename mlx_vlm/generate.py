@@ -269,6 +269,8 @@ def generate_step(
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
+    min_p: float = 0.0,
+    top_k: int = 0,
     logit_bias: Optional[Dict[int, float]] = None,
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
@@ -297,6 +299,9 @@ def generate_step(
           consider for repetition penalty. Default: ``20``.
         top_p (float, optional): Nucleus sampling, higher means model considers
           more less likely words.
+        min_p (float, optional): Minimum probability threshold relative to the
+          highest-probability token.
+        top_k (int, optional): Restrict sampling to the top-k tokens.
         logit_bias (dictionary, optional): Additive logit bias.
         prompt_cache (list, optional): Pre-existing KV cache for the prompt.
         max_kv_size (int, optional): Maximum KV cache size.
@@ -325,7 +330,12 @@ def generate_step(
     )
 
     if sampler is None:
-        sampler = make_sampler(temperature, top_p)
+        sampler = make_sampler(
+            temp=temperature,
+            top_p=top_p,
+            min_p=min_p,
+            top_k=top_k,
+        )
 
     processors = make_logits_processors(
         logit_bias, repetition_penalty, repetition_context_size
@@ -385,7 +395,6 @@ def generate_step(
             return y, logprobs.squeeze(0)
 
     with mx.stream(generation_stream):
-
         # Get input embeddings (handles both multimodal and text-only)
         embedding_output = model.get_input_embeddings(
             input_ids, pixel_values, mask=mask, **kwargs
@@ -844,7 +853,6 @@ class Batch:
 
 
 class BatchGenerator:
-
     @dataclass
     class Response:
         uid: int
@@ -1289,7 +1297,6 @@ def _generate_batch(
     )
 
     with wired_limit(model, [generation_stream]):
-
         embedding_output = model.get_input_embeddings(
             input_ids, pixel_values, mask=mask, **data_kwargs
         )
