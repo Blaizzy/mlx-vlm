@@ -182,3 +182,6 @@ class Model(nn.Module):
             sanitized_weights[key] = value
 
         return sanitized_weights
+
+    def shard(self, group: Optional[mx.distributed.Group] = None) -> None:
+        self.language_model.shard(group)
