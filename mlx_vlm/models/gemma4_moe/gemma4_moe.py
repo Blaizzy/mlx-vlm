@@ -118,6 +118,19 @@ class Model(nn.Module):
                 rest = new_key[len("language_model."):]
                 new_key = "language_model.model." + rest
 
+            # Remap MoE weights: moe.{gate,up,down}_proj -> moe.switch_glu.{gate,up,down}_proj.weight
+            # and transpose [E, in, out] -> [E, out, in] for SwitchLinear
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                suffix = f".moe.{proj}"
+                if new_key.endswith(suffix):
+                    new_key = new_key.replace(f".moe.{proj}", f".moe.switch_glu.{proj}.weight")
+                    v = v.swapaxes(-1, -2)
+                    break
+
+            # Remap per_expert_scale into MoE block
+            if ".moe.per_expert_scale" in new_key:
+                pass  # keep as-is, it's on MoEBlock directly
+
             # Drop layer_scalar for sliding attention layers
             if "layer_scalar" in new_key and "language_model" in new_key:
                 m = re.search(r"layers\.(\d+)\.layer_scalar", new_key)

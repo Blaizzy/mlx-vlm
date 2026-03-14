@@ -3,6 +3,7 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -87,18 +88,27 @@ class Router(nn.Module):
         return top_k_indices, top_k_weights
 
 
+class GeGLU(nn.Module):
+    """GELU-gated linear unit activation for SwitchGLU."""
+
+    def __call__(self, x, gate):
+        return nn.gelu_approx(gate) * x
+
+
 class MoEBlock(nn.Module):
-    """Sparse Mixture of Experts — only computes top-k expert MLPs."""
+    """Sparse MoE using mlx_lm SwitchGLU with gather_mm for efficient expert routing."""
 
     def __init__(self, config: TextConfig):
         super().__init__()
-        E = config.num_experts
-        H = config.hidden_size
-        I = config.expert_intermediate_size
-        self.gate_proj = mx.zeros((E, H, I))
-        self.up_proj = mx.zeros((E, H, I))
-        self.down_proj = mx.zeros((E, I, H))
-        self.per_expert_scale = mx.ones((E,))
+
+        self.switch_glu = SwitchGLU(
+            input_dims=config.hidden_size,
+            hidden_dims=config.expert_intermediate_size,
+            num_experts=config.num_experts,
+            activation=GeGLU(),
+            bias=False,
+        )
+        self.per_expert_scale = mx.ones((config.num_experts,))
 
     def __call__(
         self, x: mx.array, top_k_indices: mx.array, top_k_weights: mx.array
@@ -107,25 +117,16 @@ class MoEBlock(nn.Module):
         B, S, H = x.shape
         K = top_k_indices.shape[-1]
 
-        # Gather only the active expert weights
-        flat_idx = top_k_indices.reshape(-1)  # [B*S*K]
-        gate_w = self.gate_proj[flat_idx].reshape(B * S, K, -1, self.gate_proj.shape[-1])
-        up_w = self.up_proj[flat_idx].reshape(B * S, K, -1, self.up_proj.shape[-1])
-        down_w = self.down_proj[flat_idx].reshape(B * S, K, self.down_proj.shape[-2], -1)
-        expert_scales = self.per_expert_scale[flat_idx].reshape(B * S, K)
+        x_flat = x.reshape(B * S, H)
+        indices_flat = top_k_indices.reshape(B * S, K)
 
-        # x: [B*S, 1, 1, H] for broadcast matmul with [B*S, K, H, I]
-        x_flat = x.reshape(B * S, 1, 1, H)
+        # SwitchGLU with gather_mm: [B*S, H] -> [B*S, K, H]
+        expert_out = self.switch_glu(x_flat, indices_flat)  # [B*S, K, H]
 
-        # SwitchGLU: gelu(x @ gate) * (x @ up), then @ down
-        gate = (x_flat @ gate_w).squeeze(-2)  # [B*S, K, I]
-        up = (x_flat @ up_w).squeeze(-2)
-        activated = nn.gelu_approx(gate) * up
-        down = (activated[:, :, None, :] @ down_w).squeeze(-2)  # [B*S, K, H]
-
-        # Weighted sum: [B*S, K, H] * [B*S, K, 1] -> sum K -> [B*S, H]
+        # Per-expert scale and weighted sum
+        expert_scales = self.per_expert_scale[indices_flat]  # [B*S, K]
         weights = (top_k_weights.reshape(B * S, K) * expert_scales)[..., None]
-        return (down * weights).sum(axis=1).reshape(B, S, H)
+        return (expert_out * weights).sum(axis=-2).reshape(B, S, H)
 
 
 class Attention(nn.Module):
