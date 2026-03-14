@@ -11,12 +11,14 @@ Capabilities:
 
 ## Models
 
-| Model | Type | Params | Memory | Vision | Audio |
-|-------|------|--------|--------|--------|-------|
-| `google/gemma-4-e2b-it` | Dense | 2B | ~5 GB | Yes | Yes |
-| `google/gemma-4-e4b-it` | Dense | 4B | ~16 GB | Yes | Yes |
-| `google/gemma-4-26b-a4b-it` | MoE | 26B (4B active) | ~52 GB | Yes | No |
-| `google/gemma-4-31b-it` | Dense | 31B | ~63 GB | Yes | No |
+| Model | Type | Params | Memory | Vision | Audio | K-eq-V |
+|-------|------|--------|--------|--------|-------|--------|
+| `google/gemma-4-e2b-it` | Dense | 2B | ~5 GB | Yes | Yes | No |
+| `google/gemma-4-e4b-it` | Dense | 4B | ~16 GB | Yes | Yes | No |
+| `google/gemma-4-26b-a4b-it` | MoE | 26B (4B active) | ~52 GB | Yes | No | Yes |
+| `google/gemma-4-31b-it` | Dense | 31B | ~63 GB | Yes | No | Yes |
+
+> **K-eq-V**: Full attention layers reuse key projections as values (no separate `v_proj`), reducing parameters and memory while using `num_global_key_value_heads` for the KV dimension.
 
 ## Install
 
