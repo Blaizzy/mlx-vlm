@@ -2,6 +2,7 @@ import json
 import warnings
 
 import mlx.core as mx
+import numpy as np
 
 
 def get_prompt(model_type, processor, conversation):
@@ -104,27 +105,107 @@ class VisionDataset:
             or model_type == "smolvlm"
         )
 
-        inputs = prepare_inputs(
-            processor=self.processor,
-            images=None if use_embedded_images else (images if images else None),
-            audio=audio if audio else None,
-            prompts=prompts,
-            image_token_index=image_token_index,
-            resize_shape=self.image_resize_shape,
-        )
+        if use_embedded_images and images:
+            # For models that embed images inline (Qwen, Gemma, SmolVLM):
+            # 1. Tokenize text (contains raw image placeholder tokens)
+            # 2. Process images separately to get pixel_values
+            # 3. Expand placeholder tokens to match vision encoder output
+            from mlx_vlm.utils import process_image
 
-        return {
-            "pixel_values": inputs.get("pixel_values"),
-            "input_ids": inputs["input_ids"],
-            "attention_mask": inputs.get(
-                "attention_mask", mx.ones_like(inputs["input_ids"])
-            ),
-            **{
-                k: v
-                for k, v in inputs.items()
-                if k not in ["input_ids", "pixel_values", "attention_mask"]
-            },
-        }
+            tokenizer = getattr(self.processor, "tokenizer", self.processor)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+
+            encoded = tokenizer(
+                prompts,
+                padding=True,
+                return_tensors="np",
+                add_special_tokens=False,
+            )
+            input_ids = mx.array(encoded["input_ids"])
+            attention_mask = mx.array(encoded["attention_mask"])
+
+            # Squeeze batch dimension (iterate_batches expects 1D)
+            if input_ids.ndim == 2 and input_ids.shape[0] == 1:
+                input_ids = input_ids.squeeze(0)
+            if attention_mask.ndim == 2 and attention_mask.shape[0] == 1:
+                attention_mask = attention_mask.squeeze(0)
+
+            image_processor = getattr(self.processor, "image_processor", None)
+            processed_images = [
+                process_image(img, self.image_resize_shape, image_processor)
+                for img in images
+            ]
+
+            img_inputs = image_processor(images=processed_images, return_tensors="np")
+
+            result = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+            }
+
+            if "pixel_values" in img_inputs:
+                result["pixel_values"] = mx.array(img_inputs["pixel_values"])
+
+            if "image_grid_thw" in img_inputs:
+                thw = np.array(img_inputs["image_grid_thw"])
+                result["image_grid_thw"] = mx.array(thw)
+
+                # Expand image placeholder tokens to match vision encoder output.
+                # The vision encoder produces (prod(thw) // merge_size^2) features
+                # per image, but the tokenized text only has a few placeholder tokens.
+                vision_config = getattr(self.config, "vision_config", None)
+                if vision_config is None and isinstance(self.config, dict):
+                    vision_config = self.config.get("vision_config", {})
+                merge_size = getattr(vision_config, "spatial_merge_size", None)
+                if merge_size is None and isinstance(vision_config, dict):
+                    merge_size = vision_config.get("spatial_merge_size", 2)
+                if merge_size is None:
+                    merge_size = 2
+
+                n_features = 0
+                for row in thw:
+                    n_features += int(np.prod(row)) // (merge_size**2)
+
+                ids_np = np.array(input_ids.tolist()).flatten()
+                n_placeholder = int((ids_np == image_token_index).sum())
+
+                if n_placeholder > 0 and n_placeholder != n_features:
+                    new_ids = []
+                    expanded = False
+                    for tok in ids_np:
+                        if tok == image_token_index:
+                            if not expanded:
+                                new_ids.extend([image_token_index] * n_features)
+                                expanded = True
+                        else:
+                            new_ids.append(int(tok))
+                    result["input_ids"] = mx.array(new_ids)
+                    result["attention_mask"] = mx.ones(len(new_ids), dtype=mx.int32)
+
+            return result
+        else:
+            inputs = prepare_inputs(
+                processor=self.processor,
+                images=None if use_embedded_images else (images if images else None),
+                audio=audio if audio else None,
+                prompts=prompts,
+                image_token_index=image_token_index,
+                resize_shape=self.image_resize_shape,
+            )
+
+            return {
+                "pixel_values": inputs.get("pixel_values"),
+                "input_ids": inputs["input_ids"],
+                "attention_mask": inputs.get(
+                    "attention_mask", mx.ones_like(inputs["input_ids"])
+                ),
+                **{
+                    k: v
+                    for k, v in inputs.items()
+                    if k not in ["input_ids", "pixel_values", "attention_mask"]
+                },
+            }
 
 
 class PreferenceVisionDataset:
@@ -172,9 +253,9 @@ class PreferenceVisionDataset:
             or model_type.startswith("qwen")
             or model_type == "smolvlm"
         )
-        images_for_inputs = (
-            None if use_embedded_images else (images if images else None)
-        )
+        # Pass images for all models — embedded-image models need pixel_values
+        # for the vision encoder to produce actual features during training
+        images_for_inputs = images if images else None
 
         result = {}
         for key in ("chosen", "rejected"):
