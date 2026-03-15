@@ -79,56 +79,12 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
             except Exception as e:
                 raise ValueError(f"Failed to parse or fill custom prompt format: {e}")
 
-        # VLM-specific message formats (fallback)
-        vlm_message_model_prefixes = [
-            "gemma",
-            "qwen",
-            "smolvlm",
-            "mllama",
-            "mistral3",
-            "llama",
-        ]
-        if model_type and any(
-            model_type.startswith(prefix) for prefix in vlm_message_model_prefixes
-        ):
-            user_content = []
-            if img is not None:
-                user_content.append({"type": "image", "image": img})
-            user_content.append({"type": "text", "text": q})
-            return {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": user_content,
-                    },
-                    {"role": "assistant", "content": [{"type": "text", "text": a}]},
-                ]
-            }
-        elif model_type == "deepseek_vl_v2" and img is not None:
-            return {
-                "messages": [
-                    {
-                        "role": "<|User|>",
-                        "content": f"<image>\n<|ref|>{q}<|/ref|>.",
-                        "images": [img],
-                    },
-                    {"role": "<|Assistant|>", "content": a},
-                ]
-            }
-        else:
-            return {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": (
-                            f"<image>{q}"
-                            if img is not None and "<image>" not in str(q)
-                            else q
-                        ),
-                    },
-                    {"role": "assistant", "content": a},
-                ]
-            }
+        return {
+            "messages": [
+                {"role": "user", "content": q},
+                {"role": "assistant", "content": a},
+            ]
+        }
 
     return dataset.map(
         to_message,
@@ -179,6 +135,7 @@ def setup_model_for_training(model, args, adapter_path=None):
 
 
 def main(args):
+    args.output_path = args.output_path if args.output_path.endswith(".safetensors") else args.output_path + "/adapters.safetensors"
     # Load model and processor
     logger.info(f"{Colors.HEADER}Loading model from {args.model_path}{Colors.ENDC}")
     model, processor = load(
@@ -328,7 +285,7 @@ if __name__ == "__main__":
     parser.add_argument("--steps-per-report", type=int, default=10)
     parser.add_argument("--steps-per-eval", type=int, default=200)
     parser.add_argument("--steps-per-save", type=int, default=100)
-    parser.add_argument("--val-batches", type=int, default=25)
+    parser.add_argument("--val-batches", type=int, default=4)
     parser.add_argument("--max-seq-length", type=int, default=2048)
     parser.add_argument("--grad-checkpoint", action="store_true")
     parser.add_argument("--grad-clip", type=float, default=None)

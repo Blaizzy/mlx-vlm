@@ -3,28 +3,26 @@ import warnings
 
 import mlx.core as mx
 
+from ..prompt_utils import MODEL_CONFIG, apply_chat_template
 
-def get_prompt(model_type, processor, conversation):
-    if model_type == "paligemma":
-        return conversation
 
-    tokenizer = getattr(processor, "tokenizer", processor)
-    chat_template = getattr(tokenizer, "chat_template", None)
+NATIVE_PREPROCESS_MODELS = set(MODEL_CONFIG.keys())
 
-    apply_fn = (
-        tokenizer.apply_chat_template
-        if chat_template
-        else getattr(processor, "apply_chat_template", None)
-    )
 
-    if apply_fn is None:
-        raise ValueError("Processor/Tokenizer has no apply_chat_template method.")
-
-    return apply_fn(
-        conversation,
-        tokenize=False,
-        add_generation_prompt=False,
-    )
+def _ensure_mx_array(value):
+    """Convert tensor-like values to MLX arrays while preserving metadata."""
+    if isinstance(value, dict):
+        return {k: _ensure_mx_array(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_ensure_mx_array(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_ensure_mx_array(v) for v in value)
+    if value is None or isinstance(value, (str, bytes, bool, int, float, mx.array)):
+        return value
+    try:
+        return mx.array(value)
+    except Exception:
+        return value
 
 
 class VisionDataset:
@@ -52,7 +50,7 @@ class VisionDataset:
 
     def process(self, item):
         """Process a single item from the dataset"""
-        from mlx_vlm.utils import prepare_inputs
+        from mlx_vlm.utils import prepare_inputs, process_inputs_with_fallback
 
         # Handle images
         images = item.get("images", item.get("image", []))
@@ -69,8 +67,11 @@ class VisionDataset:
 
         model_type = self.config.get("model_type")
 
+        num_images = len(images)
+        num_audios = len(audio)
+
         prompts = []
-        # Format prompt based on model type
+        # Format prompt using apply_chat_template for consistency with inference
         if isinstance(conversations, list) and isinstance(conversations[0], list):
             for conversation in conversations:
                 if model_type == "pixtral":
@@ -80,16 +81,30 @@ class VisionDataset:
                             "Pixtral batch processing is not supported yet. Set batch size to 1."
                         )
 
-                prompt = get_prompt(model_type, self.processor, conversation)
+                prompt = apply_chat_template(
+                    self.processor,
+                    self.config,
+                    conversation,
+                    add_generation_prompt=False,
+                    num_images=num_images,
+                    num_audios=num_audios,
+                )
                 prompts.append(prompt)
 
         else:
             if model_type == "pixtral":
                 conversations = [json.loads(i) for i in conversations]
-            prompt = get_prompt(model_type, self.processor, conversations)
+            prompt = apply_chat_template(
+                self.processor,
+                self.config,
+                conversations,
+                add_generation_prompt=False,
+                num_images=num_images,
+                num_audios=num_audios,
+            )
             prompts.append(prompt)
 
-        # Prepare inputs
+        # Prepare inputs - always pass images so the processor computes pixel values
         image_token_index = self.config.get("image_token_index") or self.config.get(
             "image_token_id"
         )
@@ -98,20 +113,43 @@ class VisionDataset:
                 "Config must contain 'image_token_index' or 'image_token_id'"
             )
 
-        use_embedded_images = (
-            model_type.startswith("gemma")
-            or model_type.startswith("qwen")
-            or model_type == "smolvlm"
-        )
+        # Prefer native multimodal processor for known model families to keep
+        # image/audio placeholders and model-specific metadata aligned.
+        if model_type in NATIVE_PREPROCESS_MODELS:
+            try:
+                inputs = process_inputs_with_fallback(
+                    processor=self.processor,
+                    prompts=prompts,
+                    images=images if images else None,
+                    audio=audio if audio else None,
+                    add_special_tokens=False,
+                )
+                if "images" in inputs and "pixel_values" not in inputs:
+                    inputs["pixel_values"] = inputs.pop("images")
+            except Exception:
+                # Fall back to legacy preparation path when processor-native
+                # processing is unavailable for a specific model implementation.
+                inputs = prepare_inputs(
+                    processor=self.processor,
+                    images=images if images else None,
+                    audio=audio if audio else None,
+                    prompts=prompts,
+                    image_token_index=image_token_index,
+                    resize_shape=self.image_resize_shape,
+                )
+        else:
+            inputs = prepare_inputs(
+                processor=self.processor,
+                images=images if images else None,
+                audio=audio if audio else None,
+                prompts=prompts,
+                image_token_index=image_token_index,
+                resize_shape=self.image_resize_shape,
+            )
 
-        inputs = prepare_inputs(
-            processor=self.processor,
-            images=None if use_embedded_images else (images if images else None),
-            audio=audio if audio else None,
-            prompts=prompts,
-            image_token_index=image_token_index,
-            resize_shape=self.image_resize_shape,
-        )
+        # Native preprocessing may return torch tensors when it falls back from
+        # return_tensors="mlx"; normalize all tensor-like outputs.
+        inputs = {k: _ensure_mx_array(v) for k, v in inputs.items()}
 
         return {
             "pixel_values": inputs.get("pixel_values"),
@@ -151,13 +189,11 @@ class PreferenceVisionDataset:
         return self.process(self.dataset[idx])
 
     def process(self, item):
-        from mlx_vlm.utils import prepare_inputs
+        from mlx_vlm.utils import prepare_inputs, process_inputs_with_fallback
 
         images = item.get("images", item.get("image", []))
         if not isinstance(images, list):
             images = [images] if images else []
-
-        model_type = self.config.get("model_type")
 
         image_token_index = self.config.get("image_token_index") or self.config.get(
             "image_token_id"
@@ -167,31 +203,55 @@ class PreferenceVisionDataset:
                 "Config must contain 'image_token_index' or 'image_token_id'"
             )
 
-        use_embedded_images = (
-            model_type.startswith("gemma")
-            or model_type.startswith("qwen")
-            or model_type == "smolvlm"
-        )
-        images_for_inputs = (
-            None if use_embedded_images else (images if images else None)
-        )
+        num_images = len(images)
+
+        model_type = self.config.get("model_type")
 
         result = {}
         for key in ("chosen", "rejected"):
             sequence = item[key]
-            prompt = (
-                sequence
-                if isinstance(sequence, str)
-                else get_prompt(model_type, self.processor, sequence)
-            )
-            inputs = prepare_inputs(
-                processor=self.processor,
-                images=images_for_inputs,
-                audio=None,
-                prompts=[prompt],
-                image_token_index=image_token_index,
-                resize_shape=self.image_resize_shape,
-            )
+            if isinstance(sequence, str):
+                prompt = sequence
+            else:
+                prompt = apply_chat_template(
+                    self.processor,
+                    self.config,
+                    sequence,
+                    add_generation_prompt=False,
+                    num_images=num_images,
+                )
+            if model_type in NATIVE_PREPROCESS_MODELS:
+                try:
+                    inputs = process_inputs_with_fallback(
+                        processor=self.processor,
+                        prompts=[prompt],
+                        images=images if images else None,
+                        audio=None,
+                        add_special_tokens=False,
+                    )
+                    if "images" in inputs and "pixel_values" not in inputs:
+                        inputs["pixel_values"] = inputs.pop("images")
+                except Exception:
+                    inputs = prepare_inputs(
+                        processor=self.processor,
+                        images=images if images else None,
+                        audio=None,
+                        prompts=[prompt],
+                        image_token_index=image_token_index,
+                        resize_shape=self.image_resize_shape,
+                    )
+            else:
+                inputs = prepare_inputs(
+                    processor=self.processor,
+                    images=images if images else None,
+                    audio=None,
+                    prompts=[prompt],
+                    image_token_index=image_token_index,
+                    resize_shape=self.image_resize_shape,
+                )
+
+            inputs = {k: _ensure_mx_array(v) for k, v in inputs.items()}
+
             result[f"{key}_input_ids"] = inputs["input_ids"]
             result[f"{key}_attention_mask"] = inputs.get(
                 "attention_mask", mx.ones_like(inputs["input_ids"])
