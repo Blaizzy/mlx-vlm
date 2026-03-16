@@ -163,8 +163,6 @@ def main(args):
     else:
         iters = args.iters
 
-    dataset = dataset.select(range(iters))
-
     # Transform dataset to messages format (SFT only; ORPO uses chosen/rejected directly)
     if args.train_mode != "orpo":
         dataset = transform_dataset_to_messages(
