@@ -5,7 +5,6 @@ import mlx.core as mx
 
 from ..prompt_utils import MODEL_CONFIG, apply_chat_template
 
-
 NATIVE_PREPROCESS_MODELS = set(MODEL_CONFIG.keys())
 
 

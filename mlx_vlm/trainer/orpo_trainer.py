@@ -140,7 +140,10 @@ def _pad_and_collate(items, prefix, max_seq_length):
     pv_key = f"{prefix}_pixel_values"
 
     lengths = [
-        min(np.array(_squeeze_leading_batch_dim(x[id_key])).reshape(-1).shape[0], max_seq_length)
+        min(
+            np.array(_squeeze_leading_batch_dim(x[id_key])).reshape(-1).shape[0],
+            max_seq_length,
+        )
         for x in items
     ]
     max_len = min(max(lengths), max_seq_length)

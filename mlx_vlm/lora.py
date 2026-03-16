@@ -135,7 +135,11 @@ def setup_model_for_training(model, args, adapter_path=None):
 
 
 def main(args):
-    args.output_path = args.output_path if args.output_path.endswith(".safetensors") else args.output_path + "/adapters.safetensors"
+    args.output_path = (
+        args.output_path
+        if args.output_path.endswith(".safetensors")
+        else args.output_path + "/adapters.safetensors"
+    )
     # Load model and processor
     logger.info(f"{Colors.HEADER}Loading model from {args.model_path}{Colors.ENDC}")
     model, processor = load(
