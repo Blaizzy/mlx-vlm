@@ -1,10 +1,10 @@
 import argparse
 import codecs
-from collections.abc import Sequence
 import contextlib
 import functools
 import json
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
@@ -231,6 +231,7 @@ def normalize_resize_shape(
         raise ValueError("resize_shape must contain 1 or 2 integers")
 
     return (shape[0], shape[0]) if len(shape) == 1 else tuple(shape)
+
 
 # A stream on the default device just for generation
 generation_stream = mx.new_stream(mx.default_device())
