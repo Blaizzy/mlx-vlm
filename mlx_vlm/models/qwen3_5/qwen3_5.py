@@ -84,6 +84,76 @@ class Model(Qwen3VLModel):
             image_end_index=image_end_index,
         )
 
+    def get_partial_input_embeddings(
+        self,
+        input_ids: mx.array,
+        pixel_values: mx.array,
+        mask,
+        model_inputs: dict,
+        partial_depth: int,
+    ) -> mx.array:
+        """
+        Like get_input_embeddings but runs the vision tower only for images[partial_depth:].
+
+        Returns inputs_embeds for the full sequence. Positions belonging to already-cached
+        image blocks keep text embeddings — those tokens are not prefilled by the caller.
+        """
+        image_grid_thw = model_inputs.get("image_grid_thw")
+        video_grid_thw = model_inputs.get("video_grid_thw")
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+        if grid_thw is None:
+            raise ValueError(
+                "image_grid_thw / video_grid_thw not available in model_inputs"
+            )
+
+        # Patches consumed by already-cached images
+        thw = grid_thw.tolist()
+        n_cached_patches = sum(t * h * w for t, h, w in thw[:partial_depth])
+
+        # Vision tower for new images only
+        dtype = self.vision_tower.patch_embed.proj.weight.dtype
+        hidden_states_new, _ = self.vision_tower(
+            pixel_values[n_cached_patches:].astype(dtype), grid_thw[partial_depth:]
+        )
+
+        # Text embeddings for the full sequence
+        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+
+        # Find the start position of the first new image block (0-indexed: block partial_depth)
+        img_tok = self.config.image_token_index
+        vid_tok = self.config.video_token_index
+        flat = input_ids[0].tolist()
+        block, in_block, new_img_start = 0, False, len(flat)
+        for i, tok in enumerate(flat):
+            is_vis = tok == img_tok or tok == vid_tok
+            if is_vis and not in_block:
+                in_block = True
+                if block == partial_depth:
+                    new_img_start = i
+                    break
+            elif not is_vis and in_block:
+                in_block = False
+                block += 1
+
+        # Overwrite only new image token positions using masked_scatter
+        is_vis = (input_ids == img_tok) | (input_ids == vid_tok)
+        is_new = mx.arange(input_ids.shape[1]) >= new_img_start
+        new_img_mask = is_vis & is_new[None, :]
+        new_img_mask_3d = mx.broadcast_to(new_img_mask[..., None], inputs_embeds.shape)
+        inputs_embeds = masked_scatter(
+            inputs_embeds, new_img_mask_3d, hidden_states_new
+        )
+
+        # Pre-calculate position_ids for multi-modal RoPE chunked prefill
+        if image_grid_thw is not None or video_grid_thw is not None:
+            position_ids, rope_deltas = self.language_model.get_rope_index(
+                input_ids, image_grid_thw, video_grid_thw, mask
+            )
+            self.language_model._position_ids = position_ids
+            self.language_model._rope_deltas = rope_deltas
+
+        return inputs_embeds
+
     @staticmethod
     def merge_input_ids_with_image_features(
         image_features, inputs_embeds, input_ids, image_token_index, video_token_index
