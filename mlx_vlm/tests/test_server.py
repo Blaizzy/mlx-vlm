@@ -27,6 +27,17 @@ def test_chat_completions_endpoint_rejects_invalid_resize_shape(client, value):
     assert response.status_code == 422
 
 
+def test_chat_request_schema_allows_one_or_two_resize_shape_values():
+    resize_shape = server.ChatRequest.model_json_schema()["properties"]["resize_shape"]
+    lengths = {
+        (item["minItems"], item["maxItems"])
+        for item in resize_shape["anyOf"]
+        if item.get("type") == "array"
+    }
+
+    assert lengths == {(1, 1), (2, 2)}
+
+
 def test_responses_endpoint_forwards_new_sampling_args(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()

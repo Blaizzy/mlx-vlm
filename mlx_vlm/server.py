@@ -258,6 +258,8 @@ ResponseInputContentParam: TypeAlias = Union[
     ResponseInputAudioParam,
 ]
 
+ResizeShapeInput: TypeAlias = tuple[int] | tuple[int, int]
+
 ResponseInputMessageContentListParam: TypeAlias = List[ResponseInputContentParam]
 
 
@@ -542,9 +544,9 @@ class VLMRequest(GenerationParams, TemplateParams):
         description="Maximum number of tokens to generate.",
     )
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
-    resize_shape: Optional[Tuple[int, int]] = Field(
+    resize_shape: Optional[ResizeShapeInput] = Field(
         None,
-        description="Resize shape for the image. Provide one or two integers.",
+        description="Resize shape for the image. Provide one integer for a square resize or two integers for (height, width).",
     )
 
     @field_validator("resize_shape", mode="before")
