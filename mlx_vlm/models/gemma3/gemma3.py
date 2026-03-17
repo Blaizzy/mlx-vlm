@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from . import processing_gemma3  # noqa: F401
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel, RMSNorm
