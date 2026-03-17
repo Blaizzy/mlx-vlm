@@ -280,7 +280,7 @@ class Mistral4Model(nn.Module):
         # Llama-4 position-dependent attention scaling
         attn_scale = _get_llama_4_attn_scale(
             cache_offset,
-            cache_offset + inputs.shape[1],
+            cache_offset + h.shape[1],
             self.config.rope_parameters["llama_4_scaling_beta"],
             self.config.rope_parameters["original_max_position_embeddings"],
         ).astype(h.dtype)

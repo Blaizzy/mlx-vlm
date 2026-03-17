@@ -56,6 +56,9 @@ class TextConfig(BaseModelConfig):
         if self.use_qk_norm is None:
             self.use_qk_norm = self.model_type in ("qwen3",)
 
+        if self.rope_interleave:
+            self.rope_traditional = True
+
 
 @dataclass
 class ModelConfig(BaseModelConfig):
