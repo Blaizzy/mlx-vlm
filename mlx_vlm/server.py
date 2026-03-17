@@ -13,7 +13,7 @@ from typing import Any, List, Literal, Optional, Tuple, Union
 
 import mlx.core as mx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
@@ -691,7 +691,7 @@ class ModelsResponse(BaseModel):
 
 @app.post("/responses")
 @app.post("/v1/responses", include_in_schema=False)
-async def responses_endpoint(request: Request):
+async def responses_endpoint(openai_request: OpenAIRequest):
     """
     OpenAI-compatible endpoint for generating text based on a prompt and optional images.
 
@@ -745,9 +745,6 @@ async def responses_endpoint(request: Request):
             return {"model - error":str(e),"content":{}, "model":model}
 
     """
-
-    body = await request.json()
-    openai_request = OpenAIRequest(**body)
 
     try:
         # Get model, processor, config - loading if necessary
