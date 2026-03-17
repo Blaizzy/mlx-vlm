@@ -6,7 +6,6 @@ import json
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from numbers import Integral
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -217,20 +216,14 @@ def normalize_resize_shape(
 ) -> Optional[Tuple[int, int]]:
     if values is None:
         return None
-
-    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+    if not (
+        isinstance(values, Sequence)
+        and not isinstance(values, (str, bytes))
+        and len(values) in (1, 2)
+        and all(type(value) is int for value in values)
+    ):
         raise ValueError("resize_shape must contain 1 or 2 integers")
-
-    shape = []
-    for value in values:
-        if isinstance(value, bool) or not isinstance(value, Integral):
-            raise ValueError("resize_shape must contain 1 or 2 integers")
-        shape.append(int(value))
-
-    if len(shape) not in (1, 2):
-        raise ValueError("resize_shape must contain 1 or 2 integers")
-
-    return (shape[0], shape[0]) if len(shape) == 1 else tuple(shape)
+    return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
 # A stream on the default device just for generation
