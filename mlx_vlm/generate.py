@@ -206,7 +206,7 @@ def parse_arguments():
         "--thinking-end-token",
         type=str,
         default=DEFAULT_THINKING_END_TOKEN,
-        help="Token that marks the end of a thinking block (default: '</think>').",
+        help="Token that marks the end of a thinking block (default: %(default)s).",
     )
 
     return parser.parse_args()
@@ -319,13 +319,12 @@ def generate_step(
         model (nn.Module): The model to use for generation.
         pixel_values: The pixel values for vision models (optional).
         mask: The attention mask (optional).
-        max_tokens (int): Maximum number of tokens to generate. Default: ``256``.
+        max_tokens (int): Maximum number of tokens to generate.
         temperature (float): The temperature for sampling, if 0 the argmax is used.
-          Default: ``0``.
         repetition_penalty (float, optional): The penalty factor for repeating
           tokens.
         repetition_context_size (int, optional): The number of tokens to
-          consider for repetition penalty. Default: ``20``.
+          consider for repetition penalty.
         top_p (float, optional): Nucleus sampling, higher means model considers
           more less likely words.
         min_p (float, optional): Minimum probability threshold relative to the
@@ -335,16 +334,16 @@ def generate_step(
         prompt_cache (list, optional): Pre-existing KV cache for the prompt.
         max_kv_size (int, optional): Maximum KV cache size.
         kv_bits (int, optional): Number of bits for KV cache quantization.
-        kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
-        quantized_kv_start (int): Start index for quantized KV cache. Default: ``5000``.
+        kv_group_size (int): Group size for KV cache quantization.
+        quantized_kv_start (int): Start index for quantized KV cache.
         sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
-          token from a vector of log probabilities. Default: ``None``.
+          token from a vector of log probabilities.
         logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
           A list of functions that take tokens and logits and return the processed
-          logits. Default: ``None``.
+          logits.
         prefill_step_size (int): Number of tokens to process per prefill step.
           Chunked prefill processes prompts in smaller chunks to reduce peak
-          memory usage. Default: ``2048``.
+          memory usage.
 
     Yields:
         Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
@@ -1128,11 +1127,9 @@ def batch_generate(
        max_tokens (Union[int, List[int]]): Maximum number of output tokens. This
           can be per prompt if a list is provided.
        verbose (bool): If ``True``, print tokens and timing information.
-          Default: ``False``.
        group_by_shape (bool): If ``True``, group same-shaped images for efficient
-          batch processing. Default: ``True``.
+          batch processing.
        track_image_sizes (bool): If ``True``, track and return original image sizes.
-          Default: ``True``.
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
 

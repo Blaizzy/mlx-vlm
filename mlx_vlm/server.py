@@ -38,6 +38,9 @@ from .prompt_utils import apply_chat_template
 from .utils import load
 from .version import __version__
 
+DEFAULT_SERVER_HOST = "0.0.0.0"
+DEFAULT_SERVER_PORT = 8080
+
 
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
@@ -216,7 +219,7 @@ class ResponseInputImageParam(TypedDict, total=False):
     )
     """The detail level of the image to be sent to the model.
 
-    One of `high`, `low`, or `auto`. Defaults to `auto`.
+    One of `high`, `low`, or `auto`.
     """
     type: Required[
         Literal["input_image"]
@@ -1362,14 +1365,14 @@ def main():
     parser.add_argument(
         "--host",
         type=str,
-        default="0.0.0.0",
-        help="Host for the HTTP server (default:0.0.0.0)",
+        default=DEFAULT_SERVER_HOST,
+        help="Host for the HTTP server (default: %(default)s)",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=8080,
-        help="Port for the HTTP server (default: 8080)",
+        default=DEFAULT_SERVER_PORT,
+        help="Port for the HTTP server (default: %(default)s)",
     )
     parser.add_argument(
         "--trust-remote-code",
