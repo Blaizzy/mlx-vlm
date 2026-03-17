@@ -1,10 +1,12 @@
 import argparse
 import codecs
+from collections.abc import Sequence
 import contextlib
 import functools
 import json
 import time
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -30,9 +32,16 @@ DEFAULT_IMAGE = None
 DEFAULT_AUDIO = None
 DEFAULT_PROMPT = "What are these?"
 DEFAULT_MAX_TOKENS = 256
-DEFAULT_TEMPERATURE = 0.5
+DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_SEED = 0
+DEFAULT_TOP_K = 0
+DEFAULT_MIN_P = 0.0
+DEFAULT_REPETITION_CONTEXT_SIZE = 20
+DEFAULT_KV_GROUP_SIZE = 64
+DEFAULT_COMPLETION_BATCH_SIZE = 32
+DEFAULT_PREFILL_BATCH_SIZE = 8
+DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 
@@ -123,7 +132,7 @@ def parse_arguments():
     parser.add_argument(
         "--kv-group-size",
         type=int,
-        default=64,
+        default=DEFAULT_KV_GROUP_SIZE,
         help="Group size for the KV cache.",
     )
     parser.add_argument(
@@ -196,12 +205,32 @@ def parse_arguments():
     parser.add_argument(
         "--thinking-end-token",
         type=str,
-        default="</think>",
+        default=DEFAULT_THINKING_END_TOKEN,
         help="Token that marks the end of a thinking block (default: '</think>').",
     )
 
     return parser.parse_args()
 
+
+def normalize_resize_shape(
+    values: Optional[Sequence[int]],
+) -> Optional[Tuple[int, int]]:
+    if values is None:
+        return None
+
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise ValueError("resize_shape must contain 1 or 2 integers")
+
+    shape = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise ValueError("resize_shape must contain 1 or 2 integers")
+        shape.append(int(value))
+
+    if len(shape) not in (1, 2):
+        raise ValueError("resize_shape must contain 1 or 2 integers")
+
+    return (shape[0], shape[0]) if len(shape) == 1 else tuple(shape)
 
 # A stream on the default device just for generation
 generation_stream = mx.new_stream(mx.default_device())
@@ -264,19 +293,19 @@ def generate_step(
     pixel_values,
     mask,
     *,
-    max_tokens: int = 256,
-    temperature: float = 0.0,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    temperature: float = DEFAULT_TEMPERATURE,
     repetition_penalty: Optional[float] = None,
-    repetition_context_size: Optional[int] = 20,
-    top_p: float = 1.0,
-    min_p: float = 0.0,
-    top_k: int = 0,
+    repetition_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
+    top_p: float = DEFAULT_TOP_P,
+    min_p: float = DEFAULT_MIN_P,
+    top_k: int = DEFAULT_TOP_K,
     logit_bias: Optional[Dict[int, float]] = None,
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
     kv_bits: Optional[int] = None,
-    kv_group_size: int = 64,
-    quantized_kv_start: int = 0,
+    kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
+    quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
@@ -307,7 +336,7 @@ def generate_step(
         max_kv_size (int, optional): Maximum KV cache size.
         kv_bits (int, optional): Number of bits for KV cache quantization.
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
-        quantized_kv_start (int): Start index for quantized KV cache. Default: ``0``.
+        quantized_kv_start (int): Start index for quantized KV cache. Default: ``5000``.
         sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
           token from a vector of log probabilities. Default: ``None``.
         logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
@@ -486,7 +515,7 @@ def stream_generate(
 
     # Set up thinking budget criteria if requested
     thinking_budget = kwargs.pop("thinking_budget", None)
-    thinking_end_token = kwargs.pop("thinking_end_token", "</think>")
+    thinking_end_token = kwargs.pop("thinking_end_token", DEFAULT_THINKING_END_TOKEN)
     thinking_start_token = kwargs.pop("thinking_start_token", None)
     enable_thinking = kwargs.pop("enable_thinking", False)
 
@@ -504,7 +533,7 @@ def stream_generate(
         else True
     )
 
-    resize_shape = kwargs.pop("resize_shape", None)
+    resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
     image_token_index = getattr(model.config, "image_token_index", None)
 
     if kwargs.get("input_ids", None) is not None:
@@ -864,12 +893,12 @@ class BatchGenerator:
         self,
         model,
         processor,
-        max_tokens: int = 128,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         stop_tokens: Optional[set] = None,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
-        completion_batch_size: int = 32,
-        prefill_batch_size: int = 8,
-        prefill_step_size: Optional[int] = 2048,
+        completion_batch_size: int = DEFAULT_COMPLETION_BATCH_SIZE,
+        prefill_batch_size: int = DEFAULT_PREFILL_BATCH_SIZE,
+        prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
         prompt_cache=None,
     ):
         self.model = model
@@ -1264,7 +1293,7 @@ def _generate_batch(
         else True
     )
 
-    resize_shape = kwargs.pop("resize_shape", None)
+    resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
     image_token_index = getattr(model.config, "image_token_index", None)
 
     inputs = prepare_inputs(
@@ -1347,17 +1376,6 @@ def main():
         **chat_template_kwargs,
     )
 
-    kwargs = {}
-
-    if args.resize_shape is not None:
-        if len(args.resize_shape) not in [1, 2]:
-            raise ValueError("Resize shape must be 1 or 2 integers")
-        kwargs["resize_shape"] = (
-            (args.resize_shape[0],) * 2
-            if len(args.resize_shape) == 1
-            else tuple(args.resize_shape)
-        )
-
     if args.eos_tokens is not None:
         eos_tokens = []
         for token in args.eos_tokens:
@@ -1366,7 +1384,9 @@ def main():
                 eos_tokens.append(decoded_token)
             except (UnicodeDecodeError, UnicodeError):
                 eos_tokens.append(token)
-        kwargs["eos_tokens"] = eos_tokens
+        kwargs = {"eos_tokens": eos_tokens}
+    else:
+        kwargs = {}
 
     if args.skip_special_tokens:
         kwargs["skip_special_tokens"] = args.skip_special_tokens
@@ -1400,6 +1420,8 @@ def main():
                 "temperature": args.temperature,
                 **kwargs,
             }
+            if args.resize_shape is not None:
+                stream_kwargs["resize_shape"] = args.resize_shape
             if args.prefill_step_size is not None:
                 stream_kwargs["prefill_step_size"] = args.prefill_step_size
 
@@ -1421,15 +1443,17 @@ def main():
         gen_kwargs = {
             "image": args.image,
             "audio": args.audio,
-            "temperature": args.temperature,
-            "max_tokens": args.max_tokens,
             "verbose": args.verbose,
             "max_kv_size": args.max_kv_size,
             "kv_bits": args.kv_bits,
             "kv_group_size": args.kv_group_size,
             "quantized_kv_start": args.quantized_kv_start,
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
             **kwargs,
         }
+        if args.resize_shape is not None:
+            gen_kwargs["resize_shape"] = args.resize_shape
         if args.prefill_step_size is not None:
             gen_kwargs["prefill_step_size"] = args.prefill_step_size
 
