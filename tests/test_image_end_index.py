@@ -1,8 +1,10 @@
 """
-Unit tests for image_end_index computation in qwen3_5.get_input_embeddings.
+Unit tests for qwen3_5 image token boundary computations.
 
-Tests the core logic: given input_ids with image/video tokens at known positions,
-image_end_index should point to the first non-visual token after the image block.
+Covers two functions:
+- image_end_index: end of the last image block (used by get_input_embeddings)
+- new_img_start: start of the first *new* image block at partial_depth
+  (used by get_partial_input_embeddings for partial image KV cache)
 """
 
 import mlx.core as mx
@@ -94,6 +96,89 @@ def test_realistic_prompt_layout():
     assert compute_image_end_index(ids, IMAGE_TOKEN, VIDEO_TOKEN) == 266
 
 
+# ---------------------------------------------------------------------------
+# new_img_start — start of the first new image block at partial_depth
+# Extracted from qwen3_5.get_partial_input_embeddings — the logic under test.
+# ---------------------------------------------------------------------------
+
+
+def compute_new_img_start(
+    input_ids, image_token_index, video_token_index, partial_depth
+):
+    """Extracted from qwen3_5.get_partial_input_embeddings — the logic under test."""
+    flat = input_ids[0].tolist()
+    block, in_block, new_img_start = 0, False, len(flat)
+    for i, tok in enumerate(flat):
+        is_vis = tok == image_token_index or tok == video_token_index
+        if is_vis and not in_block:
+            in_block = True
+            if block == partial_depth:
+                new_img_start = i
+                break
+        elif not is_vis and in_block:
+            in_block = False
+            block += 1
+    return new_img_start
+
+
+def test_partial_depth_0_single_image():
+    # [text, img, img, text]  partial_depth=0 → new_img_start=1 (first image block)
+    ids = mx.array([[TEXT_TOKEN, IMAGE_TOKEN, IMAGE_TOKEN, TEXT_TOKEN]])
+    assert compute_new_img_start(ids, IMAGE_TOKEN, VIDEO_TOKEN, 0) == 1
+
+
+def test_partial_depth_1_two_images():
+    # [img×3, text×2, img×2, text]  partial_depth=1 → new_img_start=5 (second block)
+    ids = mx.array(
+        [[IMAGE_TOKEN] * 3 + [TEXT_TOKEN] * 2 + [IMAGE_TOKEN] * 2 + [TEXT_TOKEN]]
+    )
+    assert compute_new_img_start(ids, IMAGE_TOKEN, VIDEO_TOKEN, 1) == 5
+
+
+def test_partial_depth_2_three_images():
+    # [img×2, text, img×2, text, img×3]  partial_depth=2 → new_img_start=7 (third block)
+    ids = mx.array(
+        [
+            [IMAGE_TOKEN] * 2
+            + [TEXT_TOKEN]
+            + [IMAGE_TOKEN] * 2
+            + [TEXT_TOKEN]
+            + [IMAGE_TOKEN] * 3
+        ]
+    )
+    assert compute_new_img_start(ids, IMAGE_TOKEN, VIDEO_TOKEN, 2) == 6
+
+
+def test_partial_depth_equals_last_block():
+    # partial_depth points to the very last block
+    ids = mx.array([[TEXT_TOKEN, IMAGE_TOKEN, TEXT_TOKEN, IMAGE_TOKEN, IMAGE_TOKEN]])
+    assert compute_new_img_start(ids, IMAGE_TOKEN, VIDEO_TOKEN, 1) == 3
+
+
+def test_partial_depth_out_of_range_returns_len():
+    # partial_depth beyond number of blocks → returns len(flat) (no new block found)
+    ids = mx.array([[TEXT_TOKEN, IMAGE_TOKEN, TEXT_TOKEN]])
+    result = compute_new_img_start(ids, IMAGE_TOKEN, VIDEO_TOKEN, 5)
+    assert result == len(ids[0].tolist())
+
+
+def test_partial_depth_with_video_tokens():
+    # [vid×2, text, vid×2]  partial_depth=1 → new_img_start=3
+    ids = mx.array([[VIDEO_TOKEN, VIDEO_TOKEN, TEXT_TOKEN, VIDEO_TOKEN, VIDEO_TOKEN]])
+    assert compute_new_img_start(ids, IMAGE_TOKEN, VIDEO_TOKEN, 1) == 3
+
+
+def test_partial_depth_realistic_layout():
+    system = [TEXT_TOKEN] * 5
+    img1 = [IMAGE_TOKEN] * 256
+    mid_text = [TEXT_TOKEN] * 10
+    img2 = [IMAGE_TOKEN] * 128
+    suffix = [TEXT_TOKEN] * 5
+    ids = mx.array([system + img1 + mid_text + img2 + suffix])
+    # partial_depth=1 → start of img2 block = 5 + 256 + 10 = 271
+    assert compute_new_img_start(ids, IMAGE_TOKEN, VIDEO_TOKEN, 1) == 271
+
+
 if __name__ == "__main__":
     import sys
 
@@ -106,6 +191,13 @@ if __name__ == "__main__":
         test_mixed_image_and_video_tokens,
         test_no_image_tokens_returns_none,
         test_realistic_prompt_layout,
+        test_partial_depth_0_single_image,
+        test_partial_depth_1_two_images,
+        test_partial_depth_2_three_images,
+        test_partial_depth_equals_last_block,
+        test_partial_depth_out_of_range_returns_len,
+        test_partial_depth_with_video_tokens,
+        test_partial_depth_realistic_layout,
     ]
     failed = 0
     for t in tests:
