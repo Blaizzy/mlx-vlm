@@ -1,6 +1,7 @@
 import mlx.core as mx
 import numpy as np
 
+from . import processing_smolvlm  # noqa: F401
 from ..idefics3 import Model as Idefics3Model
 
 
