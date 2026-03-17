@@ -2530,6 +2530,75 @@ class TestModels(unittest.TestCase):
         )
         self.assertEqual(outputs.logits.shape[-1], text_config.vocab_size)
 
+    def test_mistral4(self):
+        from mlx_vlm.models import mistral3
+
+        text_config = mistral3.TextConfig(
+            model_type="mistral4",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=256,
+            max_position_embeddings=1024,
+            rope_traditional=False,
+            rope_parameters={
+                "rope_theta": 1000000.0,
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "llama_4_scaling_beta": 0.1,
+                "original_max_position_embeddings": 512,
+            },
+            tie_word_embeddings=False,
+            attention_bias=False,
+            q_lora_rank=32,
+            kv_lora_rank=16,
+            qk_rope_head_dim=8,
+            qk_nope_head_dim=8,
+            v_head_dim=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            moe_intermediate_size=64,
+            first_k_dense_replace=0,
+        )
+
+        vision_config = mistral3.VisionConfig(
+            model_type="pixtral",
+            hidden_size=1024,
+            num_hidden_layers=2,
+            intermediate_size=4096,
+            num_attention_heads=16,
+            image_size=336,
+            patch_size=14,
+            num_channels=3,
+        )
+
+        config = mistral3.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="mistral3",
+        )
+
+        model = mistral3.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""

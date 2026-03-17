@@ -10,17 +10,9 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
+from ..mistral4.language import Mistral4Model, _get_llama_4_attn_scale
 from ..pixtral.language import Mistral
 from .config import TextConfig
-
-
-def _get_llama_4_attn_scale(
-    start: int, stop: int, beta: float, max_position_embeddings: int
-):
-    scaling = 1 + beta * mx.log(
-        1 + mx.floor(mx.arange(start, stop) / max_position_embeddings)
-    )
-    return scaling[:, None]
 
 
 class Attention(nn.Module):
@@ -192,7 +184,7 @@ class Ministral3(nn.Module):
 
         attn_scale = _get_llama_4_attn_scale(
             cache_offset,
-            cache_offset + inputs.shape[1],
+            cache_offset + h.shape[1],
             self.config.rope_parameters["llama_4_scaling_beta"],
             self.config.rope_parameters["original_max_position_embeddings"],
         ).astype(h.dtype)
@@ -211,6 +203,8 @@ class LanguageModel(nn.Module):
         self.model_type = config.model_type
         if self.model_type == "ministral3":
             self.model = Ministral3(config)
+        elif self.model_type == "mistral4":
+            self.model = Mistral4Model(config)
         else:
             self.model = Mistral(config)
 
@@ -252,13 +246,67 @@ class LanguageModel(nn.Module):
                 new_weights[k] = v
         weights = new_weights
 
+        # Mistral4: split fused expert gate_up_proj and rename expert weights
+        if self.model_type == "mistral4" and self.config.n_routed_experts:
+            for l in range(self.config.num_hidden_layers):
+                prefix = f"language_model.model.layers.{l}.mlp"
+
+                # Split fused gate_up_proj: (n_experts, 2*intermediate, hidden)
+                # -> gate_proj: (n_experts, intermediate, hidden)
+                # -> up_proj: (n_experts, intermediate, hidden)
+                fused_key = f"{prefix}.experts.gate_up_proj"
+                if fused_key in weights:
+                    gate_up = weights.pop(fused_key)
+                    gate_proj, up_proj = mx.split(gate_up, 2, axis=1)
+                    weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_proj
+                    weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_proj
+
+                # Rename down_proj: (n_experts, hidden, intermediate)
+                down_key = f"{prefix}.experts.down_proj"
+                if down_key in weights:
+                    weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
+                        down_key
+                    )
+
         return weights
 
     @property
     def layers(self):
         return self.model.layers
 
+    @property
+    def head_dim(self):
+        if self.model_type == "mistral4":
+            return (
+                self.config.qk_nope_head_dim + self.config.qk_rope_head_dim,
+                self.config.v_head_dim,
+            )
+        return (
+            self.config.head_dim
+            or self.config.hidden_size // self.config.num_attention_heads
+        )
+
+    @property
+    def n_kv_heads(self):
+        return self.config.num_key_value_heads
+
+    @property
+    def quant_predicate(self):
+        if self.model_type != "mistral4" or not getattr(
+            self.config, "n_routed_experts", 0
+        ):
+            return None
+
+        def predicate(path, _):
+            if path.endswith("mlp.gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
+
     def make_cache(self):
+        if self.model_type == "mistral4":
+            return [KVCache() for _ in self.layers]
         return [
             (
                 RotatingKVCache(max_size=self.model.sliding_window)
