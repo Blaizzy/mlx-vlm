@@ -118,6 +118,9 @@ class FlexibleBaseModel(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
+    def dump_kwargs(self, *fields: str) -> dict[str, Any]:
+        return self.model_dump(include=set(fields), exclude_none=True)
+
 
 def load_model_resources(model_path: str, adapter_path: Optional[str]):
     """
@@ -308,19 +311,14 @@ class GenerationParams(FlexibleBaseModel):
     )
 
     def shared_generation_kwargs(self) -> dict[str, Any]:
-        kwargs = {
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-        }
-        if self.top_k is not None:
-            kwargs["top_k"] = self.top_k
-        if self.min_p is not None:
-            kwargs["min_p"] = self.min_p
-        if self.repetition_penalty is not None:
-            kwargs["repetition_penalty"] = self.repetition_penalty
-        if self.logit_bias is not None:
-            kwargs["logit_bias"] = self.logit_bias
-        return kwargs
+        return self.dump_kwargs(
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "repetition_penalty",
+            "logit_bias",
+        )
 
 
 class TemplateParams(FlexibleBaseModel):
@@ -342,16 +340,12 @@ class TemplateParams(FlexibleBaseModel):
     )
 
     def template_kwargs(self) -> dict[str, Any]:
-        kwargs = {}
-        if self.enable_thinking is not None:
-            kwargs["enable_thinking"] = self.enable_thinking
-        if self.thinking_budget is not None:
-            kwargs["thinking_budget"] = self.thinking_budget
-        if self.thinking_start_token is not None:
-            kwargs["thinking_start_token"] = self.thinking_start_token
-        if self.thinking_end_token is not None:
-            kwargs["thinking_end_token"] = self.thinking_end_token
-        return kwargs
+        return self.dump_kwargs(
+            "enable_thinking",
+            "thinking_budget",
+            "thinking_start_token",
+            "thinking_end_token",
+        )
 
 
 class OpenAIRequest(GenerationParams, TemplateParams):
@@ -373,10 +367,9 @@ class OpenAIRequest(GenerationParams, TemplateParams):
     )
 
     def generation_kwargs(self) -> dict[str, Any]:
-        return {
-            "max_tokens": self.max_output_tokens,
-            **self.shared_generation_kwargs(),
-        }
+        kwargs = self.dump_kwargs("max_output_tokens")
+        kwargs["max_tokens"] = kwargs.pop("max_output_tokens")
+        return {**kwargs, **self.shared_generation_kwargs()}
 
 
 class OpenAIUsage(BaseModel):
@@ -560,13 +553,10 @@ class VLMRequest(GenerationParams, TemplateParams):
         return normalize_resize_shape(value)
 
     def generation_kwargs(self) -> dict[str, Any]:
-        kwargs = {
-            "max_tokens": self.max_tokens,
+        return {
+            **self.dump_kwargs("max_tokens", "resize_shape"),
             **self.shared_generation_kwargs(),
         }
-        if self.resize_shape is not None:
-            kwargs["resize_shape"] = self.resize_shape
-        return kwargs
 
 
 class GenerationRequest(VLMRequest):
