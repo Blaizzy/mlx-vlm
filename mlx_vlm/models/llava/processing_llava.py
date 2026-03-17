@@ -133,9 +133,7 @@ class LlavaProcessor(ProcessorMixin):
             prompt_strings, **kwargs, return_tensors=None
         )
 
-        return BatchFeature(
-            data={**text_inputs, **image_inputs}, tensor_type=return_tensors
-        )
+        return BatchFeature(data={**text_inputs, **image_inputs})
 
     def batch_decode(self, *args, **kwargs):
         """Forward to tokenizer's batch_decode."""

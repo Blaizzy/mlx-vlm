@@ -163,9 +163,7 @@ class Gemma3Processor(ProcessorMixin):
             mm_token_type_ids[array_ids == self.image_token_id] = 1
             text_inputs["token_type_ids"] = mm_token_type_ids.tolist()
 
-        return BatchFeature(
-            data={**text_inputs, **image_inputs}, tensor_type=return_tensors
-        )
+        return BatchFeature(data={**text_inputs, **image_inputs})
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)

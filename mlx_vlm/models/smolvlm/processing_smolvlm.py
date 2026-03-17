@@ -211,7 +211,7 @@ class SmolVLMProcessor(ProcessorMixin):
             text_inputs = self.tokenizer(text, **kwargs)
             inputs.update(text_inputs)
 
-        return BatchFeature(inputs, tensor_type=return_tensors)
+        return BatchFeature(data=inputs)
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)

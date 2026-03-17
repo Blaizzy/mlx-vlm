@@ -294,7 +294,7 @@ class Idefics3Processor(ProcessorMixin):
             text_inputs = self.tokenizer(text=text, **kwargs)
             inputs.update(text_inputs)
 
-        return BatchFeature(data=inputs, tensor_type=return_tensors)
+        return BatchFeature(data=inputs)
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)

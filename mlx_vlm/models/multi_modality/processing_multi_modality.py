@@ -76,7 +76,7 @@ class MultiModalityProcessor(ProcessorMixin):
                 "pixel_values"
             ]
 
-        return BatchFeature(data=data, tensor_type=return_tensors)
+        return BatchFeature(data=data)
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)

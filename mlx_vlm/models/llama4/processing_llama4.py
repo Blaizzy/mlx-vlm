@@ -140,9 +140,7 @@ class Llama4Processor(ProcessorMixin):
         return_tensors = kwargs.pop("return_tensors", None)
         text_inputs = self.tokenizer(text, **kwargs)
 
-        return BatchFeature(
-            data={**text_inputs, **image_inputs}, tensor_type=return_tensors
-        )
+        return BatchFeature(data={**text_inputs, **image_inputs})
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)

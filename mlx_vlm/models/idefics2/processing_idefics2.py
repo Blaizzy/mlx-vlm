@@ -175,7 +175,7 @@ class Idefics2Processor(ProcessorMixin):
             image_inputs = self.image_processor(images)
             inputs.update(image_inputs)
 
-        return BatchFeature(inputs, tensor_type=return_tensors)
+        return BatchFeature(data=inputs)
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)

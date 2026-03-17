@@ -139,8 +139,7 @@ class Gemma3nProcessor(ProcessorMixin):
         text_inputs["token_type_ids"] = token_type_ids.tolist()
 
         return BatchFeature(
-            data={**text_inputs, **image_inputs, **audio_inputs},
-            tensor_type=return_tensors,
+            data={**text_inputs, **image_inputs, **audio_inputs}
         )
 
     def batch_decode(self, *args, **kwargs):

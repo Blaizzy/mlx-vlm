@@ -149,7 +149,6 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
                 **videos_inputs,
                 **audio_inputs,
             },
-            tensor_type=return_tensors,
         )
 
     def replace_multimodal_special_tokens(

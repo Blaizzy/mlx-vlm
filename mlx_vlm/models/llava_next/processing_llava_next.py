@@ -149,9 +149,7 @@ class LlavaNextProcessor(ProcessorMixin):
 
         text_inputs = self.tokenizer(prompt_strings, **kwargs)
 
-        return BatchFeature(
-            data={**text_inputs, **image_inputs}, tensor_type=return_tensors
-        )
+        return BatchFeature(data={**text_inputs, **image_inputs})
 
     def _get_number_of_features(
         self, orig_height: int, orig_width: int, height: int, width: int

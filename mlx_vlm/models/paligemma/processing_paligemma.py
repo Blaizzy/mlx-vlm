@@ -258,7 +258,7 @@ class PaliGemmaProcessor(ProcessorMixin):
             labels[np.array(inputs["token_type_ids"]) == 0] = -100
             return_data.update({"labels": labels.tolist()})
 
-        return BatchFeature(data=return_data, tensor_type=return_tensors)
+        return BatchFeature(data=return_data)
 
     def batch_decode(self, *args, **kwargs):
         """Forward to tokenizer's batch_decode."""

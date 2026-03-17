@@ -114,8 +114,7 @@ class Qwen2VLProcessor(ProcessorMixin):
         text_inputs = self.tokenizer(text, **kwargs)
 
         return BatchFeature(
-            data={**text_inputs, **image_inputs, **videos_inputs},
-            tensor_type=return_tensors,
+            data={**text_inputs, **image_inputs, **videos_inputs}
         )
 
     def batch_decode(self, *args, **kwargs):

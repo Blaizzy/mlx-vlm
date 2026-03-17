@@ -147,8 +147,7 @@ class Qwen3VLProcessor(ProcessorMixin):
             text_inputs["mm_token_type_ids"] = mm_token_type_ids.tolist()
 
         return BatchFeature(
-            data={**text_inputs, **image_inputs, **videos_inputs},
-            tensor_type=return_tensors,
+            data={**text_inputs, **image_inputs, **videos_inputs}
         )
 
     def batch_decode(self, *args, **kwargs):
