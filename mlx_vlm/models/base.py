@@ -34,6 +34,8 @@ class InputEmbeddingsFeatures:
     full_text_row_masked_out_mask: Optional[mx.array] = None
     decoder_inputs_embeds: Optional[mx.array] = None
     attention_mask: Optional[mx.array] = None  # For encoder-decoder models
+    # Engine metadata — not a model kwarg, excluded from to_dict()
+    image_end_index: Optional[int] = None
 
     def to_dict(self):
         return {

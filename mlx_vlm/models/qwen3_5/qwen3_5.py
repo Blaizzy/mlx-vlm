@@ -48,6 +48,20 @@ class Model(Qwen3VLModel):
         # Get the ouptut hidden states from the vision model
         hidden_states, _ = self.vision_tower(pixel_values, grid_thw)
 
+        # Find the visual token boundary before merging (input_ids is still intact here).
+        # mx.where() doesn't support the single-argument (nonzero) form, so use
+        # (arange * mask).max() to locate the last image/video token position.
+        flat_ids = input_ids.reshape(-1)
+        image_mask = (flat_ids == self.config.image_token_index) | (
+            flat_ids == self.config.video_token_index
+        )
+        has_image = bool(image_mask.any().item())
+        if has_image:
+            last_pos = int((mx.arange(flat_ids.shape[0]) * image_mask).max().item())
+            image_end_index = last_pos + 1
+        else:
+            image_end_index = None
+
         # Insert special image tokens in the input_ids
         inputs_embeds, _ = self.merge_input_ids_with_image_features(
             hidden_states,
@@ -67,6 +81,7 @@ class Model(Qwen3VLModel):
 
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds,
+            image_end_index=image_end_index,
         )
 
     @staticmethod
