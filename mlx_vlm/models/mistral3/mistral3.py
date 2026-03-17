@@ -3,6 +3,7 @@ from typing import List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from . import processing_mistral3  # noqa: F401
 from ..base import InputEmbeddingsFeatures
 from ..pixtral import VisionModel
 from .config import ModelConfig
