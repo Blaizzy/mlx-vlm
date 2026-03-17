@@ -4361,6 +4361,5 @@ class TestPhi4MM(unittest.TestCase):
         model.set_modality(has_image=True, has_audio=True)
 
 
-
 if __name__ == "__main__":
     unittest.main()

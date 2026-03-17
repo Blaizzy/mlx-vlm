@@ -281,7 +281,10 @@ class LanguageModel(nn.Module):
                 self.config.qk_nope_head_dim + self.config.qk_rope_head_dim,
                 self.config.v_head_dim,
             )
-        return self.config.head_dim or self.config.hidden_size // self.config.num_attention_heads
+        return (
+            self.config.head_dim
+            or self.config.hidden_size // self.config.num_attention_heads
+        )
 
     @property
     def n_kv_heads(self):

@@ -5,11 +5,7 @@ import mlx.nn as nn
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
 
-from ..base import (
-    create_attention_mask,
-    scaled_dot_product_attention,
-)
-from ..cache import KVCache
+from ..base import create_attention_mask, scaled_dot_product_attention
 
 
 def _get_llama_4_attn_scale(
@@ -105,9 +101,7 @@ class Mistral4Attention(nn.Module):
 
         # KV projection: compressed representation + rope component
         compressed_kv = self.kv_a_proj_with_mqa(x)
-        compressed_kv, k_pe = mx.split(
-            compressed_kv, [self.kv_lora_rank], axis=-1
-        )
+        compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
 
         # k_pe is single-head (MQA for rope), will be expanded later
         k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
@@ -174,9 +168,7 @@ class Mistral4MoE(nn.Module):
         )
 
         if config.n_shared_experts is not None and config.n_shared_experts > 0:
-            shared_intermediate = (
-                config.moe_intermediate_size * config.n_shared_experts
-            )
+            shared_intermediate = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = Mistral4MLP(
                 config, intermediate_size=shared_intermediate
             )
