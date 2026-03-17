@@ -18,14 +18,32 @@ class TextConfig(BaseModelConfig):
     max_position_embeddings: Optional[int] = None
     num_key_value_heads: Optional[int] = None
     rope_theta: float = None
-    rope_parameters: Optional[Dict[str, Union[float, str]]] = None  # For Ministral3
+    rope_parameters: Optional[Dict[str, Union[float, str]]] = None
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    tie_word_embeddings: bool = True
+    tie_word_embeddings: bool = False
     layer_types: Optional[List[str]] = None
     sliding_window: Optional[int] = None
     use_qk_norm: bool = False
-    tie_word_embeddings: bool = False
+    attention_bias: bool = False
+    # MLA (Multi-Latent Attention) parameters
+    q_lora_rank: Optional[int] = None
+    kv_lora_rank: Optional[int] = None
+    qk_rope_head_dim: Optional[int] = None
+    qk_nope_head_dim: Optional[int] = None
+    qk_head_dim: Optional[int] = None
+    v_head_dim: Optional[int] = None
+    rope_interleave: bool = False
+    # MoE parameters
+    n_routed_experts: Optional[int] = None
+    n_shared_experts: Optional[int] = None
+    num_experts_per_tok: Optional[int] = None
+    moe_intermediate_size: Optional[int] = None
+    n_group: int = 1
+    topk_group: int = 1
+    norm_topk_prob: bool = True
+    routed_scaling_factor: float = 1.0
+    first_k_dense_replace: int = 0
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -37,6 +55,9 @@ class TextConfig(BaseModelConfig):
         # Auto-detect QK norm for Qwen3-based models if not explicitly set
         if self.use_qk_norm is None:
             self.use_qk_norm = self.model_type in ("qwen3",)
+
+        if self.rope_interleave:
+            self.rope_traditional = True
 
 
 @dataclass
