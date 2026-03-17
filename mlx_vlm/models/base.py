@@ -6,12 +6,31 @@ from typing import Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx_lm.models.base import (
     create_attention_mask,
     create_ssm_mask,
     scaled_dot_product_attention,
 )
 from PIL import Image
+
+
+def to_mlx(data: dict) -> dict:
+    """Convert all array-like values in a processor output dict to mx.array."""
+    result = {}
+    for key, value in data.items():
+        if value is None or isinstance(value, mx.array):
+            result[key] = value
+        elif isinstance(value, np.ndarray):
+            result[key] = mx.array(value)
+        elif isinstance(value, list):
+            try:
+                result[key] = mx.array(np.array(value))
+            except (ValueError, TypeError):
+                result[key] = value
+        else:
+            result[key] = value
+    return result
 
 
 @dataclass

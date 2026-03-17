@@ -1,16 +1,3 @@
-# Copyright 2024 The HuggingFace Inc. team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """
 Processor class for LLaVa-NeXT.
 """
@@ -23,6 +10,7 @@ from transformers.image_utils import ImageInput, get_image_size, to_numpy_array
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
+from ..base import to_mlx
 
 class LlavaNextProcessor(ProcessorMixin):
     r"""
@@ -149,7 +137,7 @@ class LlavaNextProcessor(ProcessorMixin):
 
         text_inputs = self.tokenizer(prompt_strings, **kwargs)
 
-        return BatchFeature(data={**text_inputs, **image_inputs})
+        return BatchFeature(data=to_mlx({**text_inputs, **image_inputs}))
 
     def _get_number_of_features(
         self, orig_height: int, orig_width: int, height: int, width: int

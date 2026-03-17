@@ -15,6 +15,8 @@ from transformers.image_utils import ImageInput, is_valid_image, load_image
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import AddedToken, PreTokenizedInput, TextInput
 
+from ..base import to_mlx
+
 
 def is_url(val) -> bool:
     return isinstance(val, str) and val.startswith("http")
@@ -87,7 +89,6 @@ def get_image_prompt_string(
         image_token,
         global_img_token,
     )
-
 
 class Idefics3Processor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
@@ -294,7 +295,7 @@ class Idefics3Processor(ProcessorMixin):
             text_inputs = self.tokenizer(text=text, **kwargs)
             inputs.update(text_inputs)
 
-        return BatchFeature(data=inputs)
+        return BatchFeature(data=to_mlx(inputs))
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)

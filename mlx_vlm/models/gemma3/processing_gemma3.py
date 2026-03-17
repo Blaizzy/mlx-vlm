@@ -14,6 +14,7 @@ from transformers.image_utils import ImageInput, make_nested_list_of_images
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
+from ..base import to_mlx
 
 class Gemma3Processor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
@@ -163,7 +164,7 @@ class Gemma3Processor(ProcessorMixin):
             mm_token_type_ids[array_ids == self.image_token_id] = 1
             text_inputs["token_type_ids"] = mm_token_type_ids.tolist()
 
-        return BatchFeature(data={**text_inputs, **image_inputs})
+        return BatchFeature(data=to_mlx({**text_inputs, **image_inputs}))
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)

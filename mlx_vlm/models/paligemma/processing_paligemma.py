@@ -1,16 +1,3 @@
-# Copyright 2024 The HuggingFace Inc. team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """
 Processor class for PaliGemma.
 """
@@ -27,6 +14,8 @@ from transformers.tokenization_utils_base import (
     PreTokenizedInput,
     TextInput,
 )
+
+from ..base import to_mlx
 
 
 logger = logging.getLogger(__name__)
@@ -76,7 +65,6 @@ def build_string_from_input(
         num_images (`int`): Number of images in the prompt.
     """
     return f"{image_token * image_seq_len * num_images}{bos_token}{prompt}\n"
-
 
 class PaliGemmaProcessor(ProcessorMixin):
     r"""
@@ -258,7 +246,7 @@ class PaliGemmaProcessor(ProcessorMixin):
             labels[np.array(inputs["token_type_ids"]) == 0] = -100
             return_data.update({"labels": labels.tolist()})
 
-        return BatchFeature(data=return_data)
+        return BatchFeature(data=to_mlx(return_data))
 
     def batch_decode(self, *args, **kwargs):
         """Forward to tokenizer's batch_decode."""

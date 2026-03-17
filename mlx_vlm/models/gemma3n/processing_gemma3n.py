@@ -13,6 +13,7 @@ from transformers.image_utils import ImageInput, make_nested_list_of_images
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
+from ..base import to_mlx
 
 class Gemma3nProcessor(ProcessorMixin):
     attributes = ["feature_extractor", "image_processor", "tokenizer"]
@@ -127,19 +128,18 @@ class Gemma3nProcessor(ProcessorMixin):
                 for prompt in text
             ]
 
-        return_tensors = kwargs.pop("return_tensors", None)
-        text_inputs = self.tokenizer(text=text, return_tensors="np", **kwargs)
+        kwargs.pop("return_tensors", None)
+        text_inputs = self.tokenizer(text=text, **kwargs)
 
         # Add token type ids manually
-        array_ids = text_inputs["input_ids"]
+        array_ids = np.array(text_inputs["input_ids"])
         token_type_ids = np.zeros_like(array_ids)
         token_type_ids[array_ids == self.image_token_id] = 1
         token_type_ids[array_ids == self.audio_token_id] = 3
-        text_inputs = {k: v.tolist() for k, v in text_inputs.items()}
         text_inputs["token_type_ids"] = token_type_ids.tolist()
 
         return BatchFeature(
-            data={**text_inputs, **image_inputs, **audio_inputs}
+            data=to_mlx({**text_inputs, **image_inputs, **audio_inputs})
         )
 
     def batch_decode(self, *args, **kwargs):

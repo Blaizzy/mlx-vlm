@@ -9,10 +9,13 @@ import re
 from itertools import accumulate
 from typing import List, Optional, Union
 
+import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput, is_valid_image, load_image
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import AddedToken, PreTokenizedInput, TextInput
+
+from ..base import to_mlx
 
 
 def is_url(val) -> bool:
@@ -21,7 +24,6 @@ def is_url(val) -> bool:
 
 def is_image_or_image_url(elem):
     return is_url(elem) or is_valid_image(elem)
-
 
 class Idefics2Processor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
@@ -175,7 +177,7 @@ class Idefics2Processor(ProcessorMixin):
             image_inputs = self.image_processor(images)
             inputs.update(image_inputs)
 
-        return BatchFeature(data=inputs)
+        return BatchFeature(data=to_mlx(inputs))
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)

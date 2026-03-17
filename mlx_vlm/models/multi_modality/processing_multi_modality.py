@@ -7,11 +7,13 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/de
 
 from typing import List, Optional, Union
 
+import numpy as np
 from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
+from ..base import to_mlx
 
 class MultiModalityProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
@@ -76,7 +78,7 @@ class MultiModalityProcessor(ProcessorMixin):
                 "pixel_values"
             ]
 
-        return BatchFeature(data=data)
+        return BatchFeature(data=to_mlx(data))
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)

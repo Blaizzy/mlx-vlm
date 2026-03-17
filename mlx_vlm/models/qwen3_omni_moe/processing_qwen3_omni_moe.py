@@ -14,6 +14,8 @@ from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import TextInput
 
+from ..base import to_mlx
+
 
 def _get_feat_extract_output_lengths(input_lengths):
     """
@@ -25,7 +27,6 @@ def _get_feat_extract_output_lengths(input_lengths):
         ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
     )
     return output_lengths
-
 
 class Qwen3OmniMoeProcessor(ProcessorMixin):
     attributes = [
@@ -143,12 +144,12 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
         texts_inputs = self.tokenizer(text, **kwargs)
 
         return BatchFeature(
-            data={
+            data=to_mlx({
                 **texts_inputs,
                 **images_inputs,
                 **videos_inputs,
                 **audio_inputs,
-            },
+            }),
         )
 
     def replace_multimodal_special_tokens(

@@ -13,6 +13,8 @@ from transformers.image_utils import ImageInput, make_nested_list_of_images
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
+from ..base import to_mlx
+
 
 def get_cross_attention_token_mask(input_ids, image_token_id):
     """
@@ -98,7 +100,6 @@ def build_string_from_input(prompt, bos_token, image_token):
         num_image_tokens_on_start += 1
 
     return f"{image_token * num_image_tokens_on_start}{bos_token}{prompt}"
-
 
 class MllamaProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
@@ -213,7 +214,7 @@ class MllamaProcessor(ProcessorMixin):
             )
             data["cross_attention_mask"] = cross_attention_mask
 
-        return BatchFeature(data=data)
+        return BatchFeature(data=to_mlx(data))
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)

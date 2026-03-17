@@ -13,6 +13,7 @@ from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
+from ..base import to_mlx
 
 class Qwen2VLProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
@@ -114,7 +115,7 @@ class Qwen2VLProcessor(ProcessorMixin):
         text_inputs = self.tokenizer(text, **kwargs)
 
         return BatchFeature(
-            data={**text_inputs, **image_inputs, **videos_inputs}
+            data=to_mlx({**text_inputs, **image_inputs, **videos_inputs})
         )
 
     def batch_decode(self, *args, **kwargs):

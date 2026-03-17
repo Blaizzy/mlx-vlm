@@ -7,10 +7,13 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/pi
 
 from typing import List, Optional, Union
 
+import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput, is_valid_image, load_image
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
+
+from ..base import to_mlx
 
 
 def is_url(val) -> bool:
@@ -19,7 +22,6 @@ def is_url(val) -> bool:
 
 def is_image_or_image_url(elem):
     return is_url(elem) or is_valid_image(elem)
-
 
 class PixtralProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
@@ -141,7 +143,7 @@ class PixtralProcessor(ProcessorMixin):
         else:
             data = image_inputs
 
-        return BatchFeature(data=data)
+        return BatchFeature(data=to_mlx(data))
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)

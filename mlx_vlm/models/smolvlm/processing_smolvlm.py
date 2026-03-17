@@ -7,10 +7,13 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/sm
 
 from typing import List, Optional, Union
 
+import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput, make_nested_list_of_images
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
+
+from ..base import to_mlx
 
 
 def _prompt_split_image(
@@ -76,7 +79,6 @@ def get_image_prompt_string(
         image_token,
         global_image_token,
     )
-
 
 class SmolVLMProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
@@ -211,7 +213,7 @@ class SmolVLMProcessor(ProcessorMixin):
             text_inputs = self.tokenizer(text, **kwargs)
             inputs.update(text_inputs)
 
-        return BatchFeature(data=inputs)
+        return BatchFeature(data=to_mlx(inputs))
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)
