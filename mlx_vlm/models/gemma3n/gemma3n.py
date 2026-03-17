@@ -3,6 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from . import processing_gemma3n  # noqa: F401
 from ..base import InputEmbeddingsFeatures
 from .audio import AudioModel
 from .config import ModelConfig, TextConfig
