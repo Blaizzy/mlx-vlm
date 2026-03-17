@@ -3,6 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from . import processing_paligemma  # noqa: F401
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
