@@ -1373,6 +1373,8 @@ def main():
         **chat_template_kwargs,
     )
 
+    kwargs = {}
+
     if args.eos_tokens is not None:
         eos_tokens = []
         for token in args.eos_tokens:
@@ -1381,9 +1383,7 @@ def main():
                 eos_tokens.append(decoded_token)
             except (UnicodeDecodeError, UnicodeError):
                 eos_tokens.append(token)
-        kwargs = {"eos_tokens": eos_tokens}
-    else:
-        kwargs = {}
+        kwargs["eos_tokens"] = eos_tokens
 
     if args.skip_special_tokens:
         kwargs["skip_special_tokens"] = args.skip_special_tokens
@@ -1440,13 +1440,13 @@ def main():
         gen_kwargs = {
             "image": args.image,
             "audio": args.audio,
+            "temperature": args.temperature,
+            "max_tokens": args.max_tokens,
             "verbose": args.verbose,
             "max_kv_size": args.max_kv_size,
             "kv_bits": args.kv_bits,
             "kv_group_size": args.kv_group_size,
             "quantized_kv_start": args.quantized_kv_start,
-            "max_tokens": args.max_tokens,
-            "temperature": args.temperature,
             **kwargs,
         }
         if args.resize_shape is not None:
