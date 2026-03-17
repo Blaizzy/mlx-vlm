@@ -9,7 +9,7 @@ import traceback
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, List, Literal, Optional, Tuple, Union
+from typing import Any, List, Literal, Optional, Union
 
 import mlx.core as mx
 import uvicorn
