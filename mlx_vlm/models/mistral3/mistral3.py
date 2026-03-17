@@ -442,5 +442,9 @@ class Model(nn.Module):
         return new_weights
 
     @property
+    def quant_predicate(self):
+        return self.language_model.quant_predicate
+
+    @property
     def layers(self):
         return self.language_model.model.layers

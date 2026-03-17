@@ -287,6 +287,20 @@ class LanguageModel(nn.Module):
     def n_kv_heads(self):
         return self.config.num_key_value_heads
 
+    @property
+    def quant_predicate(self):
+        if self.model_type != "mistral4" or not getattr(
+            self.config, "n_routed_experts", 0
+        ):
+            return None
+
+        def predicate(path, _):
+            if path.endswith("mlp.gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
+
     def make_cache(self):
         if self.model_type == "mistral4":
             return [KVCache() for _ in self.layers]
