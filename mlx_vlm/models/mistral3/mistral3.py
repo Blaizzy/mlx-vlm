@@ -401,12 +401,12 @@ class Model(nn.Module):
 
             # Handle different scale_inv shapes:
             # - Scalar (0-dim): per-tensor scaling
-            # - 2D: block-wise scaling
+            # - 2D: block-wise scaling for 2D weights
             if scale_inv.ndim == 0:
                 # Per-tensor scaling (scalar)
                 return (weight * scale_inv).astype(dtype)
-            else:
-                # Block-wise scaling
+            elif weight.ndim == 2:
+                # 2D block-wise scaling
                 bs = 128  # block size
                 m, n = weight.shape
                 pad_bottom = (-m) % bs
@@ -420,6 +420,9 @@ class Model(nn.Module):
                     m + pad_bottom, n + pad_side
                 )
                 return weight[:m, :n].astype(dtype)
+            else:
+                # 3D+ tensors (e.g., fused expert weights): broadcast multiply
+                return (weight * scale_inv).astype(dtype)
 
         # Transform keys first
         weights = {transform_key(k): v for k, v in weights.items()}
