@@ -801,9 +801,9 @@ def read_audio(file) -> tuple:
             use_ffmpeg = True
 
     if use_ffmpeg:
+        import json as _json
         import shutil
         import subprocess
-        import json as _json
 
         ffmpeg_path = shutil.which("ffmpeg")
         ffprobe_path = shutil.which("ffprobe")
@@ -822,14 +822,34 @@ def read_audio(file) -> tuple:
         # Get info via ffprobe
         if ffprobe_path and input_data is not None:
             probe = subprocess.run(
-                [ffprobe_path, "-v", "quiet", "-print_format", "json",
-                 "-show_streams", "-select_streams", "a:0", "-i", "pipe:0"],
-                input=input_data, capture_output=True,
+                [
+                    ffprobe_path,
+                    "-v",
+                    "quiet",
+                    "-print_format",
+                    "json",
+                    "-show_streams",
+                    "-select_streams",
+                    "a:0",
+                    "-i",
+                    "pipe:0",
+                ],
+                input=input_data,
+                capture_output=True,
             )
         elif ffprobe_path:
             probe = subprocess.run(
-                [ffprobe_path, "-v", "quiet", "-print_format", "json",
-                 "-show_streams", "-select_streams", "a:0", str(file)],
+                [
+                    ffprobe_path,
+                    "-v",
+                    "quiet",
+                    "-print_format",
+                    "json",
+                    "-show_streams",
+                    "-select_streams",
+                    "a:0",
+                    str(file),
+                ],
                 capture_output=True,
             )
         else:
@@ -862,7 +882,9 @@ def read_audio(file) -> tuple:
         if isinstance(file, (str, Path)):
             info = miniaudio.get_file_info(str(file))
             decoded = miniaudio.decode_file(
-                str(file), nchannels=info.nchannels, sample_rate=info.sample_rate,
+                str(file),
+                nchannels=info.nchannels,
+                sample_rate=info.sample_rate,
             )
         elif isinstance(file, _io.BytesIO):
             file.seek(0)
@@ -877,7 +899,9 @@ def read_audio(file) -> tuple:
             else:
                 info = miniaudio.vorbis_get_info(data)
             decoded = miniaudio.decode(
-                data, nchannels=info.nchannels, sample_rate=info.sample_rate,
+                data,
+                nchannels=info.nchannels,
+                sample_rate=info.sample_rate,
             )
         else:
             raise TypeError(f"Unsupported file type: {type(file)}")
