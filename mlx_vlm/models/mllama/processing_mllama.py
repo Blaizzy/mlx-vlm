@@ -32,9 +32,7 @@ def get_cross_attention_token_mask(input_ids, image_token_id):
 
     vision_masks = [
         [loc1, loc2]
-        for loc1, loc2 in zip(
-            image_token_locations[:-1], image_token_locations[1:]
-        )
+        for loc1, loc2 in zip(image_token_locations[:-1], image_token_locations[1:])
     ]
 
     # last image will attend to all subsequent text
@@ -60,9 +58,11 @@ def convert_sparse_cross_attention_mask_to_dense(
     Convert the cross attention mask indices to a cross attention mask 4D array.
     """
     batch_size = len(cross_attention_token_mask)
-    max_num_images = max(
-        len(masks) for masks in cross_attention_token_mask
-    ) if cross_attention_token_mask else 0
+    max_num_images = (
+        max(len(masks) for masks in cross_attention_token_mask)
+        if cross_attention_token_mask
+        else 0
+    )
 
     cross_attention_mask = np.zeros(
         shape=(batch_size, length, max_num_images, max_num_tiles),
@@ -96,10 +96,11 @@ def build_string_from_input(prompt, bos_token, image_token):
 
     num_image_tokens_on_start = 0
     while prompt.startswith(image_token):
-        prompt = prompt[len(image_token):]
+        prompt = prompt[len(image_token) :]
         num_image_tokens_on_start += 1
 
     return f"{image_token * num_image_tokens_on_start}{bos_token}{prompt}"
+
 
 class MllamaProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
@@ -152,9 +153,7 @@ class MllamaProcessor(ProcessorMixin):
                 )
             n_images_in_text = [t.count(self.image_token) for t in text]
             text = [
-                build_string_from_input(
-                    text_item, self.bos_token, self.image_token
-                )
+                build_string_from_input(text_item, self.bos_token, self.image_token)
                 for text_item in text
             ]
             encoding = self.tokenizer(text, **kwargs)
@@ -208,9 +207,7 @@ class MllamaProcessor(ProcessorMixin):
                 cross_attention_token_mask,
                 num_tiles=num_tiles,
                 max_num_tiles=self.image_processor.max_image_tiles,
-                length=max(
-                    len(input_ids) for input_ids in encoding["input_ids"]
-                ),
+                length=max(len(input_ids) for input_ids in encoding["input_ids"]),
             )
             data["cross_attention_mask"] = cross_attention_mask
 

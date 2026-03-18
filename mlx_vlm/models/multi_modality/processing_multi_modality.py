@@ -7,13 +7,13 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/de
 
 from typing import List, Optional, Union
 
-import numpy as np
 from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..base import to_mlx
+
 
 class MultiModalityProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
@@ -32,9 +32,7 @@ class MultiModalityProcessor(ProcessorMixin):
         self.image_token = getattr(tokenizer, "image_token", "<image>")
         self.num_image_tokens = num_image_tokens
 
-        super().__init__(
-            image_processor, tokenizer, chat_template=chat_template
-        )
+        super().__init__(image_processor, tokenizer, chat_template=chat_template)
 
     def __call__(
         self,
@@ -74,9 +72,7 @@ class MultiModalityProcessor(ProcessorMixin):
         data = self.tokenizer(prompt_strings, **kwargs)
 
         if images is not None:
-            data["pixel_values"] = self.image_processor(images)[
-                "pixel_values"
-            ]
+            data["pixel_values"] = self.image_processor(images)["pixel_values"]
 
         return BatchFeature(data=to_mlx(data))
 
@@ -90,11 +86,7 @@ class MultiModalityProcessor(ProcessorMixin):
     def model_input_names(self):
         tokenizer_input_names = self.tokenizer.model_input_names
         image_processor_input_names = self.image_processor.model_input_names
-        return list(
-            dict.fromkeys(
-                tokenizer_input_names + image_processor_input_names
-            )
-        )
+        return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
 
 
 __all__ = ["MultiModalityProcessor"]

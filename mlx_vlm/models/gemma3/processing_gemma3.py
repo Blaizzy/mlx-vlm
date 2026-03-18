@@ -16,6 +16,7 @@ from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..base import to_mlx
 
+
 class Gemma3Processor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     valid_kwargs = ["chat_template", "image_seq_length"]
@@ -91,8 +92,7 @@ class Gemma3Processor(ProcessorMixin):
             # Create empty text to be replaced with placeholders
             if not text:
                 text = [
-                    " ".join([self.boi_token] * len(imgs))
-                    for imgs in batched_images
+                    " ".join([self.boi_token] * len(imgs)) for imgs in batched_images
                 ]
 
             if len(batched_images) != len(text):
@@ -113,13 +113,9 @@ class Gemma3Processor(ProcessorMixin):
                         for imgs in batched_images
                     ]
                 else:
-                    batch_num_crops = [
-                        [0] * len(imgs) for imgs in batched_images
-                    ]
+                    batch_num_crops = [[0] * len(imgs) for imgs in batched_images]
             else:
-                batch_num_crops = [
-                    [0] * len(imgs) for imgs in batched_images
-                ]
+                batch_num_crops = [[0] * len(imgs) for imgs in batched_images]
 
             for batch_idx, (prompt, imgs, crops) in enumerate(
                 zip(text, batched_images, batch_num_crops)

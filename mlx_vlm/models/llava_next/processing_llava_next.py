@@ -2,8 +2,6 @@
 Processor class for LLaVa-NeXT.
 """
 
-import numpy as np
-
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import select_best_resolution
 from transformers.image_utils import ImageInput, get_image_size, to_numpy_array
@@ -11,6 +9,7 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..base import to_mlx
+
 
 class LlavaNextProcessor(ProcessorMixin):
     r"""
@@ -64,10 +63,9 @@ class LlavaNextProcessor(ProcessorMixin):
     def __call__(
         self,
         images: ImageInput = None,
-        text: TextInput
-        | PreTokenizedInput
-        | list[TextInput]
-        | list[PreTokenizedInput] = None,
+        text: (
+            TextInput | PreTokenizedInput | list[TextInput] | list[PreTokenizedInput]
+        ) = None,
         **kwargs,
     ) -> BatchFeature:
         """

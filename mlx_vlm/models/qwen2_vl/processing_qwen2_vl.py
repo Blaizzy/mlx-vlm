@@ -7,13 +7,13 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/qw
 
 from typing import List, Optional, Union
 
-import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..base import to_mlx
+
 
 class Qwen2VLProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
@@ -80,13 +80,11 @@ class Qwen2VLProcessor(ProcessorMixin):
 
         text = text.copy()
         if images is not None:
-            merge_length = self.image_processor.merge_size ** 2
+            merge_length = self.image_processor.merge_size**2
             index = 0
             for i in range(len(text)):
                 while self.image_token in text[i]:
-                    num_image_tokens = (
-                        image_grid_thw[index].prod() // merge_length
-                    )
+                    num_image_tokens = image_grid_thw[index].prod() // merge_length
                     text[i] = text[i].replace(
                         self.image_token,
                         "<|placeholder|>" * num_image_tokens,
@@ -96,13 +94,11 @@ class Qwen2VLProcessor(ProcessorMixin):
                 text[i] = text[i].replace("<|placeholder|>", self.image_token)
 
         if videos is not None:
-            merge_length = self.image_processor.merge_size ** 2
+            merge_length = self.image_processor.merge_size**2
             index = 0
             for i in range(len(text)):
                 while self.video_token in text[i]:
-                    num_video_tokens = (
-                        video_grid_thw[index].prod() // merge_length
-                    )
+                    num_video_tokens = video_grid_thw[index].prod() // merge_length
                     text[i] = text[i].replace(
                         self.video_token,
                         "<|placeholder|>" * num_video_tokens,
@@ -128,11 +124,7 @@ class Qwen2VLProcessor(ProcessorMixin):
     def model_input_names(self):
         tokenizer_input_names = self.tokenizer.model_input_names
         image_processor_input_names = self.image_processor.model_input_names
-        return list(
-            dict.fromkeys(
-                tokenizer_input_names + image_processor_input_names
-            )
-        )
+        return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
 
 
 __all__ = ["Qwen2VLProcessor"]

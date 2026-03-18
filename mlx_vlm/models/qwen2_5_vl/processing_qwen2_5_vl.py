@@ -15,6 +15,7 @@ from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..base import to_mlx
 
+
 class Qwen2_5_VLProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     valid_kwargs = ["chat_template"]
@@ -80,13 +81,11 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
 
         text = text.copy()
         if images is not None:
-            merge_length = self.image_processor.merge_size ** 2
+            merge_length = self.image_processor.merge_size**2
             index = 0
             for i in range(len(text)):
                 while self.image_token in text[i]:
-                    num_image_tokens = (
-                        image_grid_thw[index].prod() // merge_length
-                    )
+                    num_image_tokens = image_grid_thw[index].prod() // merge_length
                     text[i] = text[i].replace(
                         self.image_token,
                         "<|placeholder|>" * num_image_tokens,
@@ -96,13 +95,11 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
                 text[i] = text[i].replace("<|placeholder|>", self.image_token)
 
         if videos is not None:
-            merge_length = self.image_processor.merge_size ** 2
+            merge_length = self.image_processor.merge_size**2
             index = 0
             for i in range(len(text)):
                 while self.video_token in text[i]:
-                    num_video_tokens = (
-                        video_grid_thw[index].prod() // merge_length
-                    )
+                    num_video_tokens = video_grid_thw[index].prod() // merge_length
                     text[i] = text[i].replace(
                         self.video_token,
                         "<|placeholder|>" * num_video_tokens,

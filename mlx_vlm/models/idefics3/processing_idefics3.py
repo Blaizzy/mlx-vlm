@@ -9,11 +9,14 @@ import re
 from itertools import accumulate
 from typing import List, Optional, Union
 
-import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput, is_valid_image, load_image
 from transformers.processing_utils import ProcessorMixin
-from transformers.tokenization_utils_base import AddedToken, PreTokenizedInput, TextInput
+from transformers.tokenization_utils_base import (
+    AddedToken,
+    PreTokenizedInput,
+    TextInput,
+)
 
 from ..base import to_mlx
 
@@ -90,6 +93,7 @@ def get_image_prompt_string(
         global_img_token,
     )
 
+
 class Idefics3Processor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     valid_kwargs = ["chat_template", "image_seq_len"]
@@ -107,9 +111,7 @@ class Idefics3Processor(ProcessorMixin):
         self.fake_image_token = AddedToken(
             "<fake_token_around_image>", normalized=False, special=True
         ).content
-        self.image_token = AddedToken(
-            "<image>", normalized=False, special=True
-        ).content
+        self.image_token = AddedToken("<image>", normalized=False, special=True).content
         self.end_of_utterance_token = AddedToken(
             "<end_of_utterance>", normalized=False, special=True
         ).content
@@ -177,31 +179,21 @@ class Idefics3Processor(ProcessorMixin):
                 raise ValueError(
                     "Invalid input text. Please provide a string, or a list of strings"
                 )
-            n_images_in_text = [
-                sample.count(self.image_token) for sample in text
-            ]
+            n_images_in_text = [sample.count(self.image_token) for sample in text]
 
         if images is not None:
             if is_image_or_image_url(images):
                 images = [[images]]
-            elif isinstance(images, (list, tuple)) and is_image_or_image_url(
-                images[0]
-            ):
+            elif isinstance(images, (list, tuple)) and is_image_or_image_url(images[0]):
                 if text is not None:
                     if sum(n_images_in_text) != len(images):
                         raise ValueError(
                             f"The total number of {self.image_token} tokens in the prompts should be the same as the number of images passed."
                             f" Found {sum(n_images_in_text)} {self.image_token} tokens and {len(images)} images."
                         )
-                    cumsum_images_in_text = [0] + list(
-                        accumulate(n_images_in_text)
-                    )
+                    cumsum_images_in_text = [0] + list(accumulate(n_images_in_text))
                     images = [
-                        images[
-                            cumsum_images_in_text[i] : cumsum_images_in_text[
-                                i + 1
-                            ]
-                        ]
+                        images[cumsum_images_in_text[i] : cumsum_images_in_text[i + 1]]
                         for i in range(len(n_images_in_text))
                     ]
                 else:
@@ -238,17 +230,11 @@ class Idefics3Processor(ProcessorMixin):
 
                 image_rows = inputs.pop(
                     "rows",
-                    [
-                        [0] * n_images
-                        for n_images in n_images_in_text
-                    ],
+                    [[0] * n_images for n_images in n_images_in_text],
                 )
                 image_cols = inputs.pop(
                     "cols",
-                    [
-                        [0] * n_images
-                        for n_images in n_images_in_text
-                    ],
+                    [[0] * n_images for n_images in n_images_in_text],
                 )
 
                 fake_image_token = self.fake_image_token
@@ -278,9 +264,7 @@ class Idefics3Processor(ProcessorMixin):
                         )
 
                     sample = split_sample[0]
-                    for i, image_prompt_string in enumerate(
-                        image_prompt_strings
-                    ):
+                    for i, image_prompt_string in enumerate(image_prompt_strings):
                         sample += image_prompt_string + split_sample[i + 1]
                     prompt_strings.append(sample)
 
@@ -307,11 +291,7 @@ class Idefics3Processor(ProcessorMixin):
     def model_input_names(self):
         tokenizer_input_names = self.tokenizer.model_input_names
         image_processor_input_names = self.image_processor.model_input_names
-        return list(
-            dict.fromkeys(
-                tokenizer_input_names + image_processor_input_names
-            )
-        )
+        return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
 
 
 __all__ = ["Idefics3Processor"]

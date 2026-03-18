@@ -3,9 +3,9 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..qwen3_vl import processing_qwen3_vl  # noqa: F401
 from ..base import InputEmbeddingsFeatures
 from ..qwen3_vl import Model as Qwen3VLModel
+from ..qwen3_vl import processing_qwen3_vl  # noqa: F401
 from ..qwen3_vl.qwen3_vl import masked_scatter
 from .config import ModelConfig
 from .language import LanguageModel

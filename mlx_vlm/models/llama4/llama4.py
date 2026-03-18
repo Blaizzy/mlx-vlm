@@ -3,8 +3,8 @@ from typing import List, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from . import processing_llama4  # noqa: F401
 from ..base import InputEmbeddingsFeatures
+from . import processing_llama4  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import Llama4MultiModalProjector, VisionModel

@@ -3,8 +3,8 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from . import processing_qwen2_vl  # noqa: F401
 from ..base import InputEmbeddingsFeatures
+from . import processing_qwen2_vl  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel

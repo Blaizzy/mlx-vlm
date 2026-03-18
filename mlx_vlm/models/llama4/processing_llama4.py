@@ -7,13 +7,13 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/ll
 
 from typing import List, Optional, Union
 
-import numpy as np
 from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import ImageInput, make_flat_list_of_images
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..base import to_mlx
+
 
 class Llama4Processor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
@@ -37,11 +37,9 @@ class Llama4Processor(ProcessorMixin):
         chat_template=None,
         **kwargs,
     ):
-        super().__init__(
-            image_processor, tokenizer, chat_template=chat_template
-        )
+        super().__init__(image_processor, tokenizer, chat_template=chat_template)
 
-        self.downsample_ratio = int(round(1.0 / (pixel_shuffle_ratio ** 2)))
+        self.downsample_ratio = int(round(1.0 / (pixel_shuffle_ratio**2)))
         self.patch_size = patch_size
 
         self.fake_image_token = fake_image_token
@@ -154,11 +152,7 @@ class Llama4Processor(ProcessorMixin):
     def model_input_names(self):
         tokenizer_input_names = self.tokenizer.model_input_names
         image_processor_input_names = self.image_processor.model_input_names
-        return list(
-            dict.fromkeys(
-                tokenizer_input_names + image_processor_input_names
-            )
-        )
+        return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
 
 
 __all__ = ["Llama4Processor"]

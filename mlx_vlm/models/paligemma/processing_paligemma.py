@@ -5,7 +5,6 @@ Processor class for PaliGemma.
 import logging
 
 import numpy as np
-
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput, is_valid_image
 from transformers.processing_utils import ProcessorMixin
@@ -16,7 +15,6 @@ from transformers.tokenization_utils_base import (
 )
 
 from ..base import to_mlx
-
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +38,7 @@ def _is_str_or_image(elem):
     return isinstance(elem, (str)) or is_image_or_image_url(elem)
 
 
-def build_string_from_input(
-    prompt, bos_token, image_seq_len, image_token, num_images
-):
+def build_string_from_input(prompt, bos_token, image_seq_len, image_token, num_images):
     """
     Builds a string from the input prompt and image tokens.
 
@@ -65,6 +61,7 @@ def build_string_from_input(
         num_images (`int`): Number of images in the prompt.
     """
     return f"{image_token * image_seq_len * num_images}{bos_token}{prompt}\n"
+
 
 class PaliGemmaProcessor(ProcessorMixin):
     r"""
@@ -115,10 +112,9 @@ class PaliGemmaProcessor(ProcessorMixin):
     def __call__(
         self,
         images: ImageInput = None,
-        text: TextInput
-        | PreTokenizedInput
-        | list[TextInput]
-        | list[PreTokenizedInput] = None,
+        text: (
+            TextInput | PreTokenizedInput | list[TextInput] | list[PreTokenizedInput]
+        ) = None,
         **kwargs,
     ) -> BatchFeature:
         """

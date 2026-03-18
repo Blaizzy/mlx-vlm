@@ -15,6 +15,7 @@ from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..base import to_mlx
 
+
 class AyaVisionProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     valid_kwargs = [
@@ -116,21 +117,15 @@ class AyaVisionProcessor(ProcessorMixin):
                 if k in ("crop_to_patches",):
                     images_kwargs[k] = kwargs.pop(k)
 
-            image_inputs = self.image_processor(
-                images=images, **images_kwargs
-            )
+            image_inputs = self.image_processor(images=images, **images_kwargs)
             num_patches = image_inputs.pop("num_patches")
             image_index = 0
             processed_text = []
             for prompt in text:
                 new_prompt = prompt
                 while "<image>" in new_prompt:
-                    image_tokens = self._prompt_split_image(
-                        num_patches[image_index]
-                    )
-                    new_prompt = new_prompt.replace(
-                        "<image>", image_tokens, 1
-                    )
+                    image_tokens = self._prompt_split_image(num_patches[image_index])
+                    new_prompt = new_prompt.replace("<image>", image_tokens, 1)
                     image_index += 1
                 processed_text.append(new_prompt)
 
@@ -163,11 +158,7 @@ class AyaVisionProcessor(ProcessorMixin):
     def model_input_names(self):
         tokenizer_input_names = self.tokenizer.model_input_names
         image_processor_input_names = self.image_processor.model_input_names
-        return list(
-            dict.fromkeys(
-                tokenizer_input_names + image_processor_input_names
-            )
-        )
+        return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
 
 
 __all__ = ["AyaVisionProcessor"]

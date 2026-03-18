@@ -6,7 +6,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/qw
 """
 
 import re
-from typing import List, Optional, Union
+from typing import Optional
 
 import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
@@ -27,6 +27,7 @@ def _get_feat_extract_output_lengths(input_lengths):
         ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
     )
     return output_lengths
+
 
 class Qwen3OmniMoeProcessor(ProcessorMixin):
     attributes = [
@@ -93,9 +94,7 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
             audio_inputs["feature_attention_mask"] = audio_inputs.pop(
                 "attention_mask", None
             )
-            audio_inputs["input_features"] = audio_inputs.pop(
-                "input_features", None
-            )
+            audio_inputs["input_features"] = audio_inputs.pop("input_features", None)
             audio_lengths = iter(
                 _get_feat_extract_output_lengths(
                     audio_inputs["feature_attention_mask"].sum(-1)
@@ -118,9 +117,7 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
                 self.video_processor.temporal_patch_size / fps
             ] * len(videos_inputs.get("video_grid_thw", []))
             video_grid_thw = iter(videos_inputs["video_grid_thw"])
-            video_second_per_grid = iter(
-                videos_inputs["video_second_per_grid"]
-            )
+            video_second_per_grid = iter(videos_inputs["video_second_per_grid"])
         else:
             videos_inputs = {}
             video_grid_thw = iter([])
@@ -144,12 +141,14 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
         texts_inputs = self.tokenizer(text, **kwargs)
 
         return BatchFeature(
-            data=to_mlx({
-                **texts_inputs,
-                **images_inputs,
-                **videos_inputs,
-                **audio_inputs,
-            }),
+            data=to_mlx(
+                {
+                    **texts_inputs,
+                    **images_inputs,
+                    **videos_inputs,
+                    **audio_inputs,
+                }
+            ),
         )
 
     def replace_multimodal_special_tokens(
@@ -163,8 +162,8 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
         position_id_per_seconds,
         seconds_per_chunk,
     ):
-        merge_length_image = self.image_processor.merge_size ** 2
-        merge_length_video = self.video_processor.merge_size ** 2
+        merge_length_image = self.image_processor.merge_size**2
+        merge_length_video = self.video_processor.merge_size**2
 
         processed_text = []
         for sample in text:
@@ -193,9 +192,7 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
                         1,
                     )
                 elif special_token == self.image_token:
-                    image_seq_length = (
-                        next(image_grid_thw).prod() // merge_length_image
-                    )
+                    image_seq_length = next(image_grid_thw).prod() // merge_length_image
                     sample = sample.replace(
                         self.image_token,
                         "<|image_placeholder|>" * image_seq_length,
@@ -215,16 +212,14 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
                         audio_token_indices = np.arange(next(audio_lengths))
                         curr_video_grid_thw = next(video_grid_thw)
                         height = (
-                            curr_video_grid_thw[1]
-                            // self.video_processor.merge_size
+                            curr_video_grid_thw[1] // self.video_processor.merge_size
                         )
                         width = (
-                            curr_video_grid_thw[2]
-                            // self.video_processor.merge_size
+                            curr_video_grid_thw[2] // self.video_processor.merge_size
                         )
-                        video_token_indices = np.arange(
-                            curr_video_grid_thw[0]
-                        ).reshape(-1, 1, 1)
+                        video_token_indices = np.arange(curr_video_grid_thw[0]).reshape(
+                            -1, 1, 1
+                        )
                         video_token_indices = np.broadcast_to(
                             video_token_indices,
                             (video_token_indices.shape[0], height, width),

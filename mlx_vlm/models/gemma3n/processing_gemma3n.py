@@ -15,6 +15,7 @@ from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..base import to_mlx
 
+
 class Gemma3nProcessor(ProcessorMixin):
     attributes = ["feature_extractor", "image_processor", "tokenizer"]
     valid_kwargs = ["chat_template", "audio_seq_length", "image_seq_length"]
@@ -85,7 +86,12 @@ class Gemma3nProcessor(ProcessorMixin):
         if audio is not None:
             audio_kwargs = {}
             for k in list(kwargs.keys()):
-                if k in ("sampling_rate", "padding", "truncation", "return_attention_mask"):
+                if k in (
+                    "sampling_rate",
+                    "padding",
+                    "truncation",
+                    "return_attention_mask",
+                ):
                     audio_kwargs[k] = kwargs.pop(k)
             audio_inputs = self.feature_extractor(audio, **audio_kwargs)
 
@@ -113,8 +119,7 @@ class Gemma3nProcessor(ProcessorMixin):
 
             if not text:
                 text = [
-                    " ".join([self.image_token] * len(imgs))
-                    for imgs in batched_images
+                    " ".join([self.image_token] * len(imgs)) for imgs in batched_images
                 ]
 
             if len(batched_images) != len(text):

@@ -9,11 +9,14 @@ import re
 from itertools import accumulate
 from typing import List, Optional, Union
 
-import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput, is_valid_image, load_image
 from transformers.processing_utils import ProcessorMixin
-from transformers.tokenization_utils_base import AddedToken, PreTokenizedInput, TextInput
+from transformers.tokenization_utils_base import (
+    AddedToken,
+    PreTokenizedInput,
+    TextInput,
+)
 
 from ..base import to_mlx
 
@@ -24,6 +27,7 @@ def is_url(val) -> bool:
 
 def is_image_or_image_url(elem):
     return is_url(elem) or is_valid_image(elem)
+
 
 class Idefics2Processor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
@@ -53,9 +57,7 @@ class Idefics2Processor(ProcessorMixin):
                 ]
             }
             tokenizer.add_special_tokens(tokens_to_add)
-            self.image_token_id = tokenizer.convert_tokens_to_ids(
-                self.image_token
-            )
+            self.image_token_id = tokenizer.convert_tokens_to_ids(self.image_token)
         else:
             self.fake_image_token = tokenizer.image_boundary_token
             self.image_token = tokenizer.image_token
@@ -69,9 +71,7 @@ class Idefics2Processor(ProcessorMixin):
         )
         self.image_seq_len = image_seq_len
 
-        super().__init__(
-            image_processor, tokenizer, chat_template=chat_template
-        )
+        super().__init__(image_processor, tokenizer, chat_template=chat_template)
 
     def __call__(
         self,
@@ -122,9 +122,7 @@ class Idefics2Processor(ProcessorMixin):
                     f"{fake_image_token}{fake_image_token}",
                     f"{fake_image_token}",
                 )
-                sample = closing_fake_pattern.sub(
-                    f"{fake_image_token} ", sample
-                )
+                sample = closing_fake_pattern.sub(f"{fake_image_token} ", sample)
                 prompt_strings.append(sample)
 
             text_inputs = self.tokenizer(prompt_strings, **kwargs)
@@ -133,24 +131,16 @@ class Idefics2Processor(ProcessorMixin):
         if images is not None:
             if is_image_or_image_url(images):
                 images = [[images]]
-            elif isinstance(images, (list, tuple)) and is_image_or_image_url(
-                images[0]
-            ):
+            elif isinstance(images, (list, tuple)) and is_image_or_image_url(images[0]):
                 if text is not None:
                     if sum(n_images_in_text) != len(images):
                         raise ValueError(
                             f"The total number of {image_token} tokens in the prompts should be the same as the number of images passed."
                             f" Found {sum(n_images_in_text)} {image_token} tokens and {len(images)} images."
                         )
-                    cumsum_images_in_text = [0] + list(
-                        accumulate(n_images_in_text)
-                    )
+                    cumsum_images_in_text = [0] + list(accumulate(n_images_in_text))
                     images = [
-                        images[
-                            cumsum_images_in_text[i] : cumsum_images_in_text[
-                                i + 1
-                            ]
-                        ]
+                        images[cumsum_images_in_text[i] : cumsum_images_in_text[i + 1]]
                         for i in range(len(n_images_in_text))
                     ]
                 else:
@@ -189,11 +179,7 @@ class Idefics2Processor(ProcessorMixin):
     def model_input_names(self):
         tokenizer_input_names = self.tokenizer.model_input_names
         image_processor_input_names = self.image_processor.model_input_names
-        return list(
-            dict.fromkeys(
-                tokenizer_input_names + image_processor_input_names
-            )
-        )
+        return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
 
 
 __all__ = ["Idefics2Processor"]

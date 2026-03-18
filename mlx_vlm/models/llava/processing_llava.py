@@ -2,14 +2,13 @@
 Processor class for Llava.
 """
 
-import numpy as np
-
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput, get_image_size, to_numpy_array
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..base import to_mlx
+
 
 class LlavaProcessor(ProcessorMixin):
     r"""
@@ -52,16 +51,17 @@ class LlavaProcessor(ProcessorMixin):
         self.image_token = (
             tokenizer.image_token if hasattr(tokenizer, "image_token") else image_token
         )
-        self.image_token_id = tokenizer.encode(self.image_token, add_special_tokens=False)[0]
+        self.image_token_id = tokenizer.encode(
+            self.image_token, add_special_tokens=False
+        )[0]
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
 
     def __call__(
         self,
         images: ImageInput = None,
-        text: TextInput
-        | PreTokenizedInput
-        | list[TextInput]
-        | list[PreTokenizedInput] = None,
+        text: (
+            TextInput | PreTokenizedInput | list[TextInput] | list[PreTokenizedInput]
+        ) = None,
         **kwargs,
     ) -> BatchFeature:
         """
@@ -117,9 +117,7 @@ class LlavaProcessor(ProcessorMixin):
                 )
                 prompt_strings.append(sample)
 
-        text_inputs = self.tokenizer(
-            prompt_strings, **kwargs, return_tensors=None
-        )
+        text_inputs = self.tokenizer(prompt_strings, **kwargs, return_tensors=None)
 
         return BatchFeature(data=to_mlx({**text_inputs, **image_inputs}))
 

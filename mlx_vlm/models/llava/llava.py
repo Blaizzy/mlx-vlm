@@ -4,8 +4,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from . import processing_llava  # noqa: F401
 from ..base import InputEmbeddingsFeatures
+from . import processing_llava  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel

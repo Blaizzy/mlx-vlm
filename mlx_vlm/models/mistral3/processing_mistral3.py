@@ -7,7 +7,6 @@ Adapted from HuggingFace Transformers.
 
 from typing import List, Optional, Union
 
-import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput, is_valid_image, load_image
 from transformers.processing_utils import ProcessorMixin
@@ -22,6 +21,7 @@ def is_url(val) -> bool:
 
 def is_image_or_image_url(elem):
     return is_url(elem) or is_valid_image(elem)
+
 
 class Mistral3Processor(ProcessorMixin):
     """Mistral3 processor, based on PixtralProcessor."""
@@ -52,9 +52,7 @@ class Mistral3Processor(ProcessorMixin):
         self.image_break_token_id = tokenizer.convert_tokens_to_ids(
             self.image_break_token
         )
-        self.image_end_token_id = tokenizer.convert_tokens_to_ids(
-            self.image_end_token
-        )
+        self.image_end_token_id = tokenizer.convert_tokens_to_ids(self.image_end_token)
 
         super().__init__(
             image_processor, tokenizer, chat_template=chat_template, **kwargs
@@ -87,9 +85,7 @@ class Mistral3Processor(ProcessorMixin):
         if images is not None:
             if is_image_or_image_url(images):
                 images = [[images]]
-            elif isinstance(images, (list, tuple)) and is_image_or_image_url(
-                images[0]
-            ):
+            elif isinstance(images, (list, tuple)) and is_image_or_image_url(images[0]):
                 images = [images]
 
             images = [
@@ -114,12 +110,8 @@ class Mistral3Processor(ProcessorMixin):
                         for img_idx in range(len(parts) - 1):
                             if img_idx < len(sample_sizes):
                                 h, w = sample_sizes[img_idx]
-                                num_h = h // (
-                                    self.patch_size * self.spatial_merge_size
-                                )
-                                num_w = w // (
-                                    self.patch_size * self.spatial_merge_size
-                                )
+                                num_h = h // (self.patch_size * self.spatial_merge_size)
+                                num_w = w // (self.patch_size * self.spatial_merge_size)
                                 img_tokens = ""
                                 for row in range(num_h):
                                     img_tokens += self.image_token * num_w
@@ -157,9 +149,7 @@ class Mistral3Processor(ProcessorMixin):
         image_processor_input_names = self.image_processor.model_input_names
         return list(
             dict.fromkeys(
-                tokenizer_input_names
-                + image_processor_input_names
-                + ["image_sizes"]
+                tokenizer_input_names + image_processor_input_names + ["image_sizes"]
             )
         )
 

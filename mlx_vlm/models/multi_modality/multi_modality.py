@@ -7,8 +7,8 @@ from PIL import Image
 from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import to_numpy_array
 
-from . import processing_multi_modality  # noqa: F401
 from ..base import BaseImageProcessor, InputEmbeddingsFeatures, expand2square
+from . import processing_multi_modality  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel

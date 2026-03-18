@@ -3,9 +3,9 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from . import processing_mllama  # noqa: F401
 from ..base import InputEmbeddingsFeatures
 from ..cache import KVCache
+from . import processing_mllama  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel

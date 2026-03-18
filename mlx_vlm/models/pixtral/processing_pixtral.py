@@ -7,7 +7,6 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/pi
 
 from typing import List, Optional, Union
 
-import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput, is_valid_image, load_image
 from transformers.processing_utils import ProcessorMixin
@@ -22,6 +21,7 @@ def is_url(val) -> bool:
 
 def is_image_or_image_url(elem):
     return is_url(elem) or is_valid_image(elem)
+
 
 class PixtralProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
@@ -50,9 +50,7 @@ class PixtralProcessor(ProcessorMixin):
         self.image_break_token_id = tokenizer.convert_tokens_to_ids(
             self.image_break_token
         )
-        self.image_end_token_id = tokenizer.convert_tokens_to_ids(
-            self.image_end_token
-        )
+        self.image_end_token_id = tokenizer.convert_tokens_to_ids(self.image_end_token)
 
         super().__init__(
             image_processor, tokenizer, chat_template=chat_template, **kwargs
@@ -85,9 +83,7 @@ class PixtralProcessor(ProcessorMixin):
         if images is not None:
             if is_image_or_image_url(images):
                 images = [[images]]
-            elif isinstance(images, (list, tuple)) and is_image_or_image_url(
-                images[0]
-            ):
+            elif isinstance(images, (list, tuple)) and is_image_or_image_url(images[0]):
                 images = [images]
 
             # Load images if URLs
@@ -104,25 +100,25 @@ class PixtralProcessor(ProcessorMixin):
                 prompt_strings = []
                 for batch_idx, sample in enumerate(text):
                     if self.image_token in sample:
-                        sample_images = images[batch_idx] if batch_idx < len(images) else []
-                        sample_sizes = image_sizes[batch_idx] if batch_idx < len(image_sizes) else []
+                        sample_images = (
+                            images[batch_idx] if batch_idx < len(images) else []
+                        )
+                        sample_sizes = (
+                            image_sizes[batch_idx]
+                            if batch_idx < len(image_sizes)
+                            else []
+                        )
                         parts = sample.split(self.image_token)
                         new_sample = parts[0]
                         for img_idx in range(len(parts) - 1):
                             if img_idx < len(sample_sizes):
                                 h, w = sample_sizes[img_idx]
-                                num_h = h // (
-                                    self.patch_size * self.spatial_merge_size
-                                )
-                                num_w = w // (
-                                    self.patch_size * self.spatial_merge_size
-                                )
+                                num_h = h // (self.patch_size * self.spatial_merge_size)
+                                num_w = w // (self.patch_size * self.spatial_merge_size)
                                 # Build image token grid
                                 img_tokens = ""
                                 for row in range(num_h):
-                                    img_tokens += (
-                                        self.image_token * num_w
-                                    )
+                                    img_tokens += self.image_token * num_w
                                     if row < num_h - 1:
                                         img_tokens += self.image_break_token
                                 img_tokens += self.image_end_token
@@ -157,9 +153,7 @@ class PixtralProcessor(ProcessorMixin):
         image_processor_input_names = self.image_processor.model_input_names
         return list(
             dict.fromkeys(
-                tokenizer_input_names
-                + image_processor_input_names
-                + ["image_sizes"]
+                tokenizer_input_names + image_processor_input_names + ["image_sizes"]
             )
         )
 

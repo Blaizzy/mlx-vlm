@@ -7,7 +7,6 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/sm
 
 from typing import List, Optional, Union
 
-import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput, make_nested_list_of_images
 from transformers.processing_utils import ProcessorMixin
@@ -80,6 +79,7 @@ def get_image_prompt_string(
         global_image_token,
     )
 
+
 class SmolVLMProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     valid_kwargs = ["chat_template", "image_seq_len"]
@@ -114,9 +114,7 @@ class SmolVLMProcessor(ProcessorMixin):
 
     def expand_text_with_image_tokens(self, text, image_rows, image_cols):
         prompt_strings = []
-        for sample, sample_rows, sample_cols in zip(
-            text, image_rows, image_cols
-        ):
+        for sample, sample_rows, sample_cols in zip(text, image_rows, image_cols):
             image_prompt_strings = []
             for n_rows, n_cols in zip(sample_rows, sample_cols):
                 image_prompt_string = get_image_prompt_string(
@@ -131,9 +129,7 @@ class SmolVLMProcessor(ProcessorMixin):
 
             split_sample = sample.split(self.image_token)
             if len(split_sample) == 0:
-                raise ValueError(
-                    "The image token should be present in the text."
-                )
+                raise ValueError("The image token should be present in the text.")
 
             sample = split_sample[0]
             for i, image_prompt_string in enumerate(image_prompt_strings):
@@ -144,7 +140,9 @@ class SmolVLMProcessor(ProcessorMixin):
 
     def __call__(
         self,
-        images: Optional[Union[ImageInput, List[ImageInput], List[List[ImageInput]]]] = None,
+        images: Optional[
+            Union[ImageInput, List[ImageInput], List[List[ImageInput]]]
+        ] = None,
         text: Optional[
             Union[
                 TextInput,
@@ -157,9 +155,7 @@ class SmolVLMProcessor(ProcessorMixin):
         **kwargs,
     ) -> BatchFeature:
         if text is None and images is None and videos is None:
-            raise ValueError(
-                "You must provide one of `text`, `images` or `videos`."
-            )
+            raise ValueError("You must provide one of `text`, `images` or `videos`.")
 
         if text is not None:
             if isinstance(text, str):
@@ -187,22 +183,16 @@ class SmolVLMProcessor(ProcessorMixin):
             inputs.update(vision_inputs)
 
             if text is not None:
-                n_images_in_text = [
-                    sample.count(self.image_token) for sample in text
-                ]
+                n_images_in_text = [sample.count(self.image_token) for sample in text]
                 n_images_in_images = [len(sublist) for sublist in images]
                 if n_images_in_images != n_images_in_text:
                     raise ValueError(
                         f"The number of images in the text {n_images_in_text} and images {n_images_in_images} should be the same."
                     )
                 if image_rows is None:
-                    image_rows = [
-                        [0] * n_images for n_images in n_images_in_text
-                    ]
+                    image_rows = [[0] * n_images for n_images in n_images_in_text]
                 if image_cols is None:
-                    image_cols = [
-                        [0] * n_images for n_images in n_images_in_text
-                    ]
+                    image_cols = [[0] * n_images for n_images in n_images_in_text]
                 text = self.expand_text_with_image_tokens(
                     text, image_rows=image_rows, image_cols=image_cols
                 )
@@ -225,11 +215,7 @@ class SmolVLMProcessor(ProcessorMixin):
     def model_input_names(self):
         tokenizer_input_names = self.tokenizer.model_input_names
         image_processor_input_names = self.image_processor.model_input_names
-        return list(
-            dict.fromkeys(
-                tokenizer_input_names + image_processor_input_names
-            )
-        )
+        return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
 
 
 __all__ = ["SmolVLMProcessor"]

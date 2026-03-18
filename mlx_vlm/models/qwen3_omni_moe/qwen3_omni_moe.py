@@ -4,11 +4,11 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from . import processing_qwen3_omni_moe  # noqa: F401
 from mlx_vlm.models.qwen3_omni_moe.code2wav import Code2WavModel
 from mlx_vlm.models.qwen3_omni_moe.talker import Talker
 from mlx_vlm.models.qwen3_omni_moe.thinker import Thinker
 
+from . import processing_qwen3_omni_moe  # noqa: F401
 from .config import ModelConfig
 
 
