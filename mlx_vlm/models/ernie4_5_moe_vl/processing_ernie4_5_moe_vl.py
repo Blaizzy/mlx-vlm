@@ -9,7 +9,6 @@ import mlx.core as mx
 import numpy as np
 import sentencepiece as spm
 from PIL import Image
-from transformers import AutoImageProcessor, AutoProcessor
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import (
     BaseImageProcessor as HFBaseImageProcessor,
@@ -677,10 +676,6 @@ class Ernie4_5_VLProcessor(ProcessorMixin):
         )
 
 
-MODEL_TYPE = "ernie4_5_moe_vl"
+from ..base import install_auto_processor_patch
 
-try:
-    AutoImageProcessor.register(MODEL_TYPE, slow_image_processor_class=ImageProcessor)
-    AutoProcessor.register(MODEL_TYPE, Ernie4_5_VLProcessor)
-except Exception as e:
-    raise Exception(f"Error registering {MODEL_TYPE} processor: {e}")
+install_auto_processor_patch("ernie4_5_moe_vl", Ernie4_5_VLProcessor)

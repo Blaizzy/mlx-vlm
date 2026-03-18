@@ -605,3 +605,7 @@ __all__ = [
     "smart_resize",
     "split_image_into_patch_blocks",
 ]
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("hunyuan_vl", HunYuanVLProcessor)
