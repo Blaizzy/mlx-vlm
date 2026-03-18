@@ -652,8 +652,45 @@ class TestMultiModalityProcessor(_ProcessorTestBase, unittest.TestCase):
         return {"text": ["<image> Cats"], "images": [_make_image()]}
 
 
-class TestErnie4_5VLProcessor(unittest.TestCase):
+class TestErnie4_5VLProcessor(_ProcessorTestBase, unittest.TestCase):
     """Test ERNIE 4.5 VL processor components."""
+
+    def _make_processor(self):
+        from mlx_vlm.models.ernie4_5_moe_vl.processing_ernie4_5_moe_vl import (
+            Ernie4_5_VLProcessor,
+        )
+
+        p = Ernie4_5_VLProcessor.__new__(Ernie4_5_VLProcessor)
+        p.spatial_conv_size = 2
+        p.temporal_conv_size = 2
+
+        p.image_processor = type(
+            "IP",
+            (),
+            {
+                "model_input_names": ["pixel_values"],
+                "__call__": lambda self, images, **kw: {
+                    "pixel_values": np.random.randn(1, 3, 224, 224).astype(
+                        np.float32
+                    ),
+                    "image_grid_thw": np.array([[1, 16, 16]], dtype=np.int64),
+                },
+            },
+        )()
+
+        tok = _mock_tokenizer()
+        tok.encode = lambda text, **kw: list(range(10))
+        tok.pad_token_id = 0
+        p.tokenizer = tok
+        return p
+
+    def _image_call_args(self):
+        return {
+            "text": [
+                "<|IMAGE_START|><|image@placeholder|><|IMAGE_END|>Describe"
+            ],
+            "images": [_make_image()],
+        }
 
     def test_helper_functions(self):
         from mlx_vlm.models.ernie4_5_moe_vl.processing_ernie4_5_moe_vl import (

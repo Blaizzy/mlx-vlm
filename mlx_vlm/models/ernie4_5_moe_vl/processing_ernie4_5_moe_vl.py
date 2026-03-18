@@ -588,22 +588,10 @@ class Ernie4_5_VLProcessor(ProcessorMixin):
                 padded_input_ids.append(padded_ids)
                 attention_masks.append(mask)
 
-            if images is None:
-                if len(padded_input_ids) == 1:
-                    text_inputs = {
-                        "input_ids": padded_input_ids[0],
-                        "attention_mask": attention_masks[0],
-                    }
-                else:
-                    text_inputs = {
-                        "input_ids": padded_input_ids,
-                        "attention_mask": attention_masks,
-                    }
-            else:
-                text_inputs = {
-                    "input_ids": mx.array(padded_input_ids),
-                    "attention_mask": mx.array(attention_masks),
-                }
+            text_inputs = {
+                "input_ids": mx.array(padded_input_ids),
+                "attention_mask": mx.array(attention_masks),
+            }
         else:
             text_inputs = {}
 
