@@ -3,11 +3,7 @@ from typing import List, Optional, Union
 import mlx.core as mx
 import numpy as np
 from PIL import Image
-from transformers import (
-    AutoTokenizer,
-    BatchFeature,
-    ProcessorMixin,
-)
+from transformers import AutoTokenizer, BatchFeature, ProcessorMixin
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.utils import logging
 
@@ -416,7 +412,6 @@ class InternVLChatProcessor(ProcessorMixin):
             patch_size=patch_size,
             downsample_ratio=downsample_ratio,
         )
-
 
 
 from ..base import install_auto_processor_patch
