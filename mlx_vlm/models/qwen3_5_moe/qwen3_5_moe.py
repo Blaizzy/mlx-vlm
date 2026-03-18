@@ -1,6 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..qwen3_vl import processing_qwen3_vl  # noqa: F401
 from ..qwen3_5 import Model as Qwen3_5Model
 from .config import ModelConfig
 from .language import LanguageModel

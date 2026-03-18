@@ -3,6 +3,7 @@ from functools import partial, reduce
 from typing import Optional, Tuple
 
 import mlx.core as mx
+from ..llava import processing_llava  # noqa: F401
 import mlx.nn as nn
 from PIL import Image
 from transformers.image_transforms import (
