@@ -45,5 +45,8 @@ dependencies = {file = ["requirements.txt"]}
 
 [project.optional-dependencies]
 ui = ["gradio>=5.19.0"]
+trainer = ["datasets>=2.19.1"]
+server = ["fastapi>=0.95.1", "uvicorn"]
+audio = ["soundfile>=0.13.1"]
 cuda = ["mlx-cuda"]
 cpu = ["mlx-cpu"]
