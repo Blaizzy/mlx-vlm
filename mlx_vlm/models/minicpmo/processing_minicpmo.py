@@ -112,7 +112,7 @@ def _load_local_qwen2_tokenizer(
 
 
 class MiniCPMOImageProcessor(HFBaseImageProcessor):
-    """Minimal image processor for MiniCPM-o image inference without torch."""
+    """Minimal image processor for MiniCPM-o image inference"""
 
     model_input_names = ["pixel_values", "image_sizes", "tgt_sizes"]
 

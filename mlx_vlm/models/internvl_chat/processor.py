@@ -296,7 +296,7 @@ class InternVLChatProcessor(ProcessorMixin):
         padding: Union[bool, str] = True,
         truncation: bool = True,
         max_length: Optional[int] = None,
-        return_tensors: Optional[str] = "pt",  # Default to PyTorch tensors
+        return_tensors: Optional[str] = "mlx",
         **kwargs,
     ):
         processed_inputs = {}

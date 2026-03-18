@@ -312,7 +312,7 @@ class KimiVLImageProcessor(BaseImageProcessor):
 
 class KimiVLProcessor(ProcessorMixin):
     """
-    MLX-based processor for KimiVL that doesn't require torch/torchvision.
+    MLX-based processor for KimiVL
 
     Constructs a KimiVL processor which wraps a KimiVL image processor and a tokenizer
     into a single processor.

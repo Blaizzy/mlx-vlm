@@ -1,8 +1,5 @@
 """
 MLX-based Molmo Processor.
-
-This module provides an MLX-native processor for Molmo models that doesn't
-require torch, torchvision, or tensorflow.
 """
 
 import json
@@ -67,7 +64,7 @@ def resize_and_pad(
     image_mean: Tuple[float, ...] = OPENAI_CLIP_MEAN,
     image_std: Tuple[float, ...] = OPENAI_CLIP_STD,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Resize and pad image using PIL (no torch/tensorflow)."""
+    """Resize and pad image using PIL"""
     desired_height, desired_width = desired_output_size
     height, width = image.shape[:2]
 

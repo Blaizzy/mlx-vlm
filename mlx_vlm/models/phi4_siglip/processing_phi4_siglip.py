@@ -75,7 +75,7 @@ class Phi4SigLipProcessor:
                 images = [images]
 
             # Use the image processor (Siglip2ImageProcessor or similar)
-            # Request numpy return to avoid PyTorch dependency
+            # Request numpy return to avoid MLX dependency
             image_outputs = self.image_processor(images, return_tensors="np")
 
             # Extract and convert outputs
