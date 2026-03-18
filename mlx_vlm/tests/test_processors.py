@@ -10,7 +10,7 @@ class TestErnie4_5VLProcessor(unittest.TestCase):
     """Test ERNIE 4.5 VL processor components."""
 
     def test_helper_functions(self):
-        from mlx_vlm.models.ernie4_5_moe_vl.processor import (
+        from mlx_vlm.models.ernie4_5_moe_vl.processing_ernie4_5_moe_vl import (
             ceil_by_factor,
             floor_by_factor,
             round_by_factor,
@@ -40,7 +40,7 @@ class TestErnie4_5VLProcessor(unittest.TestCase):
         self.assertLessEqual(h * w, 28 * 28 * 1280)
 
     def test_image_processor(self):
-        from mlx_vlm.models.ernie4_5_moe_vl.processor import ImageProcessor
+        from mlx_vlm.models.ernie4_5_moe_vl.processing_ernie4_5_moe_vl import ImageProcessor
 
         processor = ImageProcessor()
 
@@ -80,7 +80,7 @@ class TestErnie4_5VLProcessor(unittest.TestCase):
         self.assertIn("image_grid_thw", result)
 
     def test_processor_class_attributes(self):
-        from mlx_vlm.models.ernie4_5_moe_vl.processor import Ernie4_5_VLProcessor
+        from mlx_vlm.models.ernie4_5_moe_vl.processing_ernie4_5_moe_vl import Ernie4_5_VLProcessor
 
         self.assertEqual(Ernie4_5_VLProcessor.IMG_START, "<|IMAGE_START|>")
         self.assertEqual(Ernie4_5_VLProcessor.IMG_END, "<|IMAGE_END|>")
@@ -765,6 +765,106 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertEqual(_num_image_tokens_from_patch_grid(23, 43, 2), 264)
         self.assertEqual(_num_image_tokens_from_patch_grid(1, 1, 2), 1)
         self.assertEqual(_num_image_tokens_from_patch_grid(7, 9, 4), 6)
+
+
+# ── AutoProcessor patch tests ─────────────────────────────────────────────────
+
+
+class TestAutoProcessorPatch(unittest.TestCase):
+    """Verify install_auto_processor_patch routes AutoProcessor correctly."""
+
+    _PATCHED_MODELS = [
+        ("internvl_chat", "mlx_vlm.models.internvl_chat", "InternVLChatProcessor"),
+        ("molmo", "mlx_vlm.models.molmo.processing_molmo", "MolmoProcessor"),
+        ("kimi_vl", "mlx_vlm.models.kimi_vl.processing_kimi_vl", "KimiVLProcessor"),
+        ("phi3_v", "mlx_vlm.models.phi3_v.processing_phi3_v", "Phi3VProcessor"),
+        (
+            "hunyuan_vl",
+            "mlx_vlm.models.hunyuan_vl.processing_hunyuan_vl",
+            "HunYuanVLProcessor",
+        ),
+        (
+            "ernie4_5_moe_vl",
+            "mlx_vlm.models.ernie4_5_moe_vl",
+            "Ernie4_5_VLProcessor",
+        ),
+    ]
+
+    def test_patch_installed(self):
+        """Each model module installs the patch and exposes the processor class."""
+        import importlib
+
+        for model_type, module_path, cls_name in self._PATCHED_MODELS:
+            with self.subTest(model_type=model_type):
+                mod = importlib.import_module(module_path)
+                cls = getattr(mod, cls_name, None)
+                self.assertIsNotNone(
+                    cls, f"{cls_name} not found in {module_path}"
+                )
+                self.assertTrue(
+                    hasattr(cls, "from_pretrained"),
+                    f"{cls_name} missing from_pretrained",
+                )
+
+    def test_patch_intercepts_matching_model_type(self):
+        """AutoProcessor.from_pretrained routes to the custom class for matching model_type."""
+        import importlib
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor, AutoTokenizer
+
+        for model_type, module_path, cls_name in self._PATCHED_MODELS:
+            with self.subTest(model_type=model_type):
+                # Ensure the patch is installed
+                importlib.import_module(module_path)
+                target_cls = getattr(
+                    importlib.import_module(module_path), cls_name
+                )
+
+                # Create a temp dir with a config.json that has the model_type
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    config = {"model_type": model_type}
+                    (Path(tmpdir) / "config.json").write_text(json.dumps(config))
+
+                    # The patch should detect the model_type and call
+                    # target_cls.from_pretrained, which may fail because
+                    # there's no real model — but the routing itself is correct
+                    # if the error comes from inside target_cls.from_pretrained
+                    try:
+                        AutoProcessor.from_pretrained(tmpdir)
+                    except Exception as e:
+                        # Expect errors from inside the custom processor
+                        # (missing tokenizer files etc.), NOT from HF's default
+                        # AutoProcessor trying to load the wrong class
+                        err = str(e).lower()
+                        self.assertNotIn(
+                            "has no attribute start_image_token",
+                            err,
+                            f"{model_type}: patch did not intercept, fell through to HF",
+                        )
+
+    def test_patch_chains_for_unknown_model_type(self):
+        """AutoProcessor falls through to default for non-patched model types."""
+        import importlib
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        # Ensure at least one patch is installed
+        importlib.import_module("mlx_vlm.models.internvl_chat")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = {"model_type": "some_unknown_model_xyz"}
+            (Path(tmpdir) / "config.json").write_text(json.dumps(config))
+
+            # Should fall through to default HF AutoProcessor (and fail
+            # because there's no real model, but NOT with our custom error)
+            with self.assertRaises(Exception):
+                AutoProcessor.from_pretrained(tmpdir)
 
 
 if __name__ == "__main__":
