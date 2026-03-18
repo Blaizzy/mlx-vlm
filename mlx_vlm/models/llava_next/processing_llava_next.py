@@ -215,3 +215,7 @@ class LlavaNextProcessor(ProcessorMixin):
 
 
 __all__ = ["LlavaNextProcessor"]
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("llava_next", LlavaNextProcessor)

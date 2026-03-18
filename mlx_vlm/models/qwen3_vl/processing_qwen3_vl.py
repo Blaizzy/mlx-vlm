@@ -168,3 +168,7 @@ class Qwen3VLProcessor(ProcessorMixin):
 
 
 __all__ = ["Qwen3VLProcessor"]
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("qwen3_vl", Qwen3VLProcessor)

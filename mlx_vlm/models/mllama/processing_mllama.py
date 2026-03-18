@@ -234,3 +234,7 @@ class MllamaProcessor(ProcessorMixin):
 
 
 __all__ = ["MllamaProcessor"]
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("mllama", MllamaProcessor)

@@ -227,3 +227,7 @@ __all__ = ["Glm46VMoEProcessor"]
 
 # Alias for backwards compatibility
 Glm4VMoEProcessor = Glm46VMoEProcessor
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("glm4v_moe", Glm46VMoEProcessor)

@@ -263,3 +263,7 @@ class PaliGemmaProcessor(ProcessorMixin):
 
 
 __all__ = ["PaliGemmaProcessor"]
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("paligemma", PaliGemmaProcessor)

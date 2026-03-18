@@ -156,3 +156,7 @@ class Llama4Processor(ProcessorMixin):
 
 
 __all__ = ["Llama4Processor"]
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("llama4", Llama4Processor)

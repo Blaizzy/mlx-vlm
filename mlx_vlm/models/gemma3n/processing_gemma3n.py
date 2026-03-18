@@ -169,3 +169,7 @@ class Gemma3nProcessor(ProcessorMixin):
 
 
 __all__ = ["Gemma3nProcessor"]
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("gemma3n", Gemma3nProcessor)

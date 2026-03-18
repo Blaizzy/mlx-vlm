@@ -155,3 +155,7 @@ class Mistral3Processor(ProcessorMixin):
 
 
 __all__ = ["Mistral3Processor"]
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("mistral3", Mistral3Processor)

@@ -143,3 +143,7 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
 
 
 __all__ = ["Qwen2_5_VLProcessor"]
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("qwen2_5_vl", Qwen2_5_VLProcessor)

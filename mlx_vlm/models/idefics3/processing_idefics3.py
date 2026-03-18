@@ -295,3 +295,7 @@ class Idefics3Processor(ProcessorMixin):
 
 
 __all__ = ["Idefics3Processor"]
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("idefics3", Idefics3Processor)

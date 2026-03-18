@@ -159,3 +159,7 @@ class PixtralProcessor(ProcessorMixin):
 
 
 __all__ = ["PixtralProcessor"]
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("pixtral", PixtralProcessor)
