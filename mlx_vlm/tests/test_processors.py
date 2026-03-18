@@ -90,138 +90,49 @@ class TestErnie4_5VLProcessor(unittest.TestCase):
 # ── Shared mocks ──────────────────────────────────────────────────────────────
 
 
-class _MockTokenizer:
-    model_input_names = ["input_ids", "attention_mask"]
-    bos_token = "<bos>"; eos_token = "<eos>"; pad_token = "<pad>"; pad_token_id = 0
-    image_token = "<image>"; image_token_id = 100
-    boi_token = "<boi>"; eoi_token = "<eoi>"
-    audio_token = "<audio>"; audio_token_id = 101; boa_token = "<boa>"; eoa_token = "<eoa>"
-    video_token = "<video>"; video_token_id = 102
-
-    def convert_tokens_to_ids(self, t):
-        return [0] * len(t) if isinstance(t, list) else 0
-
-    def __call__(self, text, text_pair=None, return_token_type_ids=False, **kw):
-        if isinstance(text, str):
-            text = [text]
-        r = {
-            "input_ids": [list(range(10)) for _ in text],
-            "attention_mask": [[1] * 10 for _ in text],
-        }
-        if return_token_type_ids:
-            r["token_type_ids"] = [[0] * 10 for _ in text]
-        return r
-
-    def add_special_tokens(self, d): pass
-    def encode(self, text, **kw): return list(range(10))
-
-    @property
-    def init_kwargs(self): return {}
-
-    def batch_decode(self, ids, **kw): return ["decoded"] * len(ids)
-    def decode(self, ids, **kw): return "decoded"
-
-
-class _QwenTokenizer(_MockTokenizer):
-    image_token = "<|image_pad|>"; image_token_id = 100
-    video_token = "<|video_pad|>"; video_token_id = 102
-    vision_start_token = "<|vs|>"; vision_end_token = "<|ve|>"
-    vision_start_token_id = 200; vision_end_token_id = 201
-
-
-class _MllamaTokenizer(_MockTokenizer):
-    image_token = "<|image|>"; image_token_id = 128256; bos_token = "<bos>"
-
-    def __call__(self, text, **kw):
-        if isinstance(text, str):
-            text = [text]
-        ids = []
-        for t in text:
-            toks = []; i = 0
-            while i < len(t):
-                if t[i:].startswith("<|image|>"):
-                    toks.append(128256); i += 9
-                elif t[i] == " ":
-                    i += 1
-                else:
-                    w = ""
-                    while i < len(t) and t[i] != " " and not t[i:].startswith("<|image|>"):
-                        w += t[i]; i += 1
-                    toks.append(hash(w) % 30000)
-            ids.append(toks)
-        ml = max(len(x) for x in ids)
-        return {
-            "input_ids": [x + [0] * (ml - len(x)) for x in ids],
-            "attention_mask": [[1] * len(x) + [0] * (ml - len(x)) for x in ids],
-        }
-
-
 def _make_image():
     return Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
 
 
-def _pv():
-    return np.random.randn(1, 3, 224, 224).astype(np.float32)
+def _mock_tokenizer(**overrides):
+    """Create a mock tokenizer. Pass overrides to replace any default attribute."""
+    defaults = dict(
+        model_input_names=["input_ids", "attention_mask"],
+        bos_token="<bos>", eos_token="<eos>", pad_token="<pad>", pad_token_id=0,
+        image_token="<image>", image_token_id=100,
+        boi_token="<boi>", eoi_token="<eoi>",
+        audio_token="<audio>", audio_token_id=101, boa_token="<boa>", eoa_token="<eoa>",
+        video_token="<video>", video_token_id=102,
+    )
+    defaults.update(overrides)
+    tok = type("MockTok", (), {
+        **defaults,
+        "convert_tokens_to_ids": lambda self, t: [0] * len(t) if isinstance(t, list) else 0,
+        "__call__": lambda self, text, text_pair=None, return_token_type_ids=False, **kw: (
+            (lambda t: {
+                "input_ids": [list(range(10)) for _ in t],
+                "attention_mask": [[1] * 10 for _ in t],
+                **({"token_type_ids": [[0] * 10 for _ in t]} if return_token_type_ids else {}),
+            })(t=[text] if isinstance(text, str) else text)
+        ),
+        "add_special_tokens": lambda self, d: None,
+        "encode": lambda self, text, **kw: list(range(10)),
+        "init_kwargs": property(lambda self: {}),
+        "batch_decode": lambda self, ids, **kw: ["decoded"] * len(ids),
+        "decode": lambda self, ids, **kw: "decoded",
+    })()
+    return tok
 
 
-class _IP:
-    model_input_names = ["pixel_values"]; merge_size = 2
-    do_image_splitting = False; max_image_tiles = 4
-    def __call__(self, images=None, **kw): return {"pixel_values": _pv()}
-    def fetch_images(self, images): return [images] if not isinstance(images, list) else images
-
-
-class _IPGrid(_IP):
-    model_input_names = ["pixel_values", "image_grid_thw"]
-    def __call__(self, images=None, **kw):
-        return {**super().__call__(), "image_grid_thw": np.array([[1, 16, 16]], dtype=np.int64)}
-
-
-class _IPCrops(_IP):
-    def __call__(self, images=None, **kw):
-        return {**super().__call__(), "num_crops": [0]}
-
-
-class _IPRowCol(_IP):
-    def __call__(self, images=None, **kw):
-        return {**super().__call__(), "rows": [[0]], "cols": [[0]]}
-
-
-class _IPSizes(_IP):
-    def __call__(self, images=None, **kw):
-        return {**super().__call__(), "image_sizes": [[(224, 224)]]}
-
-
-class _IPPatches(_IP):
-    def __call__(self, images=None, **kw):
-        return {**super().__call__(), "num_patches": [1]}
-
-
-class _IPAspect(_IP):
-    def __call__(self, images=None, **kw):
-        return {**super().__call__(), "aspect_ratios": [(1, 1)]}
-
-
-class _IPTiles(_IP):
-    max_image_tiles = 4
-    def __call__(self, images=None, max_image_tiles=4, **kw):
-        n = sum(len(b) for b in images) if isinstance(images[0], list) else 1
-        return {
-            "pixel_values": np.random.randn(n, 4, 3, 560, 560).astype(np.float32),
-            "num_tiles": [[2]] * n,
-            "aspect_ratio_ids": np.array([[1]] * n),
-            "aspect_ratio_mask": np.ones((n, 4), dtype=np.int64),
-        }
-
-
-class _IPNeXT(_IP):
-    image_grid_pinpoints = [[224, 224], [224, 448], [448, 224], [448, 448]]
-    size = {"height": 224, "width": 224}
-    def __call__(self, images=None, **kw):
-        return {
-            "pixel_values": np.random.randn(1, 5, 3, 224, 224).astype(np.float32),
-            "image_sizes": [(224, 224)],
-        }
+def _mock_ip(**extra):
+    """Create a mock image processor. Pass extra fields to include in output."""
+    pv = np.random.randn(1, 3, 224, 224).astype(np.float32)
+    attrs = dict(model_input_names=["pixel_values"], merge_size=2, do_image_splitting=False, max_image_tiles=4)
+    return type("MockIP", (), {
+        **attrs,
+        "__call__": lambda self, images=None, **kw: {"pixel_values": pv, **extra},
+        "fetch_images": lambda self, images: [images] if not isinstance(images, list) else images,
+    })()
 
 
 # ── Base class with shared test_with_image / test_text_only ───────────────────
@@ -277,7 +188,7 @@ class TestLlavaProcessor(_ProcessorTestBase, unittest.TestCase):
         p = LlavaProcessor.__new__(LlavaProcessor)
         p.image_token = "<image>"; p.patch_size = 14
         p.vision_feature_select_strategy = "default"; p.num_additional_image_tokens = 1
-        p.image_processor = _IP(); p.tokenizer = _MockTokenizer()
+        p.image_processor = _mock_ip(); p.tokenizer = _mock_tokenizer()
         return p
 
     def _image_call_args(self):
@@ -290,7 +201,18 @@ class TestLlavaNextProcessor(_ProcessorTestBase, unittest.TestCase):
         p = LlavaNextProcessor.__new__(LlavaNextProcessor)
         p.image_token = "<image>"; p.patch_size = 14
         p.vision_feature_select_strategy = "default"; p.num_additional_image_tokens = 1
-        p.image_processor = _IPNeXT(); p.tokenizer = _MockTokenizer()
+        # LLaVA-NeXT needs pixel_values with shape (B, patches, C, H, W) and image_sizes
+        p.image_processor = type("IP", (), {
+            "model_input_names": ["pixel_values"],
+            "image_grid_pinpoints": [[224, 224], [224, 448], [448, 224], [448, 448]],
+            "size": {"height": 224, "width": 224},
+            "__call__": lambda self, images=None, **kw: {
+                "pixel_values": np.random.randn(1, 5, 3, 224, 224).astype(np.float32),
+                "image_sizes": [(224, 224)],
+            },
+            "fetch_images": lambda self, i: [i] if not isinstance(i, list) else i,
+        })()
+        p.tokenizer = _mock_tokenizer()
         return p
 
     def _image_call_args(self):
@@ -302,7 +224,7 @@ class TestPaliGemmaProcessor(_ProcessorTestBase, unittest.TestCase):
         from mlx_vlm.models.paligemma.processing_paligemma import PaliGemmaProcessor
         p = PaliGemmaProcessor.__new__(PaliGemmaProcessor)
         p.image_token = "<image>"; p.image_seq_length = 4; p.bos_token = "<bos>"
-        p.image_processor = _IP(); p.tokenizer = _MockTokenizer()
+        p.image_processor = _mock_ip(); p.tokenizer = _mock_tokenizer()
         return p
 
     def _image_call_args(self):
@@ -319,7 +241,7 @@ class TestGemma3Processor(_ProcessorTestBase, unittest.TestCase):
         p.image_seq_length = 4; p.image_token_id = 100; p.boi_token = "<boi>"
         p.image_token = "<image>"
         p.full_image_sequence = "\n\n<boi>" + "<image>" * 4 + "<eoi>\n\n"
-        p.image_processor = _IPCrops(); p.tokenizer = _MockTokenizer()
+        p.image_processor = _mock_ip(num_crops=[0]); p.tokenizer = _mock_tokenizer()
         return p
 
     def _image_call_args(self):
@@ -336,7 +258,7 @@ class TestGemma3nProcessor(_ProcessorTestBase, unittest.TestCase):
         p.audio_seq_length = 4; p.audio_token_id = 101; p.boa_token = "<boa>"
         p.audio_token = "<audio>"
         p.full_audio_sequence = "\n\n<boa>" + "<audio>" * 4 + "<eoa>\n\n"
-        p.image_processor = _IPCrops(); p.tokenizer = _MockTokenizer()
+        p.image_processor = _mock_ip(num_crops=[0]); p.tokenizer = _mock_tokenizer()
         return p
 
     def _image_call_args(self):
@@ -350,7 +272,7 @@ class TestSmolVLMProcessor(_ProcessorTestBase, unittest.TestCase):
         p.fake_image_token = "<fake_token_around_image>"; p.image_token = "<image>"
         p.image_token_id = 100; p.end_of_utterance_token = "<end_of_utterance>"
         p.global_image_token = "<global-img>"; p.image_seq_len = 4; p.video_token = "<video>"
-        p.image_processor = _IPRowCol(); p.tokenizer = _MockTokenizer()
+        p.image_processor = _mock_ip(rows=[[0]], cols=[[0]]); p.tokenizer = _mock_tokenizer()
         return p
 
     def _image_call_args(self):
@@ -363,7 +285,47 @@ class TestMllamaProcessor(_ProcessorTestBase, unittest.TestCase):
         p = MllamaProcessor.__new__(MllamaProcessor)
         p.image_token = "<|image|>"; p.image_token_id = 128256
         p.python_token = "<|python_tag|>"; p.python_token_id = 0; p.bos_token = "<bos>"
-        p.image_processor = _IPTiles(); p.tokenizer = _MllamaTokenizer()
+        p.image_processor = type("IP", (), {
+            "model_input_names": ["pixel_values"], "max_image_tiles": 4,
+            "__call__": lambda self, images=None, max_image_tiles=4, **kw: {
+                "pixel_values": np.random.randn(1, 4, 3, 560, 560).astype(np.float32),
+                "num_tiles": [[2]],
+                "aspect_ratio_ids": np.array([[1]]),
+                "aspect_ratio_mask": np.ones((1, 4), dtype=np.int64),
+            },
+            "fetch_images": lambda self, i: [i] if not isinstance(i, list) else i,
+        })()
+        # Mllama tokenizer must emit 128256 for <|image|> so n_images_in_ids matches
+        def _mllama_tok(text, **kw):
+            if isinstance(text, str): text = [text]
+            ids = []
+            for t in text:
+                toks = []; i = 0
+                while i < len(t):
+                    if t[i:].startswith("<|image|>"):
+                        toks.append(128256); i += 9
+                    elif t[i] == " ": i += 1
+                    else:
+                        w = ""
+                        while i < len(t) and t[i] != " " and not t[i:].startswith("<|image|>"):
+                            w += t[i]; i += 1
+                        toks.append(hash(w) % 30000)
+                ids.append(toks)
+            ml = max(len(x) for x in ids)
+            return {
+                "input_ids": [x + [0]*(ml-len(x)) for x in ids],
+                "attention_mask": [[1]*len(x) + [0]*(ml-len(x)) for x in ids],
+            }
+        p.tokenizer = type("MllamaTok", (), {
+            "model_input_names": ["input_ids", "attention_mask"],
+            "bos_token": "<bos>", "image_token": "<|image|>", "image_token_id": 128256,
+            "convert_tokens_to_ids": lambda self, t: 128256 if t == "<|image|>" else 0,
+            "__call__": lambda self, text, **kw: _mllama_tok(text, **kw),
+            "add_special_tokens": lambda self, d: None,
+            "init_kwargs": property(lambda self: {}),
+            "batch_decode": lambda self, ids, **kw: ["decoded"] * len(ids),
+            "decode": lambda self, ids, **kw: "decoded",
+        })()
         return p
 
     def _image_call_args(self):
@@ -405,7 +367,8 @@ class TestQwen2VLProcessor(_ProcessorTestBase, unittest.TestCase):
         p = Qwen2VLProcessor.__new__(Qwen2VLProcessor)
         p.image_token = "<|image_pad|>"; p.video_token = "<|video_pad|>"
         p.image_token_id = 100; p.video_token_id = 102
-        p.image_processor = _IPGrid(); p.tokenizer = _QwenTokenizer()
+        p.image_processor = _mock_ip(image_grid_thw=np.array([[1, 16, 16]], dtype=np.int64))
+        p.tokenizer = _mock_tokenizer(image_token="<|image_pad|>", video_token="<|video_pad|>")
         return p
 
     def _image_call_args(self):
@@ -418,7 +381,8 @@ class TestQwen2_5VLProcessor(_ProcessorTestBase, unittest.TestCase):
         p = Qwen2_5_VLProcessor.__new__(Qwen2_5_VLProcessor)
         p.image_token = "<|image_pad|>"; p.video_token = "<|video_pad|>"
         p.image_token_id = 100; p.video_token_id = 102
-        p.image_processor = _IPGrid(); p.tokenizer = _QwenTokenizer()
+        p.image_processor = _mock_ip(image_grid_thw=np.array([[1, 16, 16]], dtype=np.int64))
+        p.tokenizer = _mock_tokenizer(image_token="<|image_pad|>", video_token="<|video_pad|>")
         return p
 
     def _image_call_args(self):
@@ -433,7 +397,8 @@ class TestQwen3VLProcessor(_ProcessorTestBase, unittest.TestCase):
         p.image_token_id = 100; p.video_token_id = 102
         p.vision_start_token = "<|vs|>"; p.vision_end_token = "<|ve|>"
         p.vision_start_token_id = 200; p.vision_end_token_id = 201
-        p.image_processor = _IPGrid(); p.tokenizer = _QwenTokenizer()
+        p.image_processor = _mock_ip(image_grid_thw=np.array([[1, 16, 16]], dtype=np.int64))
+        p.tokenizer = _mock_tokenizer(image_token="<|image_pad|>", video_token="<|video_pad|>")
         return p
 
     def _image_call_args(self):
@@ -443,17 +408,16 @@ class TestQwen3VLProcessor(_ProcessorTestBase, unittest.TestCase):
 class TestQwen3OmniMoeProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
         from mlx_vlm.models.qwen3_omni_moe.processing_qwen3_omni_moe import Qwen3OmniMoeProcessor
-
-        class OmniTok(_MockTokenizer):
-            image_token = "<|image|>"; audio_token = "<|audio|>"; video_token = "<|video|>"
-            vision_bos_token = "<|vb|>"; vision_eos_token = "<|ve|>"
-            audio_bos_token = "<|ab|>"; audio_eos_token = "<|ae|>"
-
         p = Qwen3OmniMoeProcessor.__new__(Qwen3OmniMoeProcessor)
         p.image_token = "<|image|>"; p.audio_token = "<|audio|>"; p.video_token = "<|video|>"
         p.vision_bos_token = "<|vb|>"; p.vision_eos_token = "<|ve|>"
         p.audio_bos_token = "<|ab|>"; p.audio_eos_token = "<|ae|>"
-        p.tokenizer = OmniTok(); p.image_processor = _IPGrid()
+        p.tokenizer = _mock_tokenizer(
+            image_token="<|image|>", audio_token="<|audio|>", video_token="<|video|>",
+            vision_bos_token="<|vb|>", vision_eos_token="<|ve|>",
+            audio_bos_token="<|ab|>", audio_eos_token="<|ae|>",
+        )
+        p.image_processor = _mock_ip(image_grid_thw=np.array([[1, 16, 16]], dtype=np.int64))
         p.video_processor = type("VP", (), {"model_input_names": [], "merge_size": 2})()
         p.feature_extractor = type("FE", (), {"model_input_names": []})()
         return p
@@ -471,8 +435,8 @@ class TestIdefics2Processor(_ProcessorTestBase, unittest.TestCase):
         p = Idefics2Processor.__new__(Idefics2Processor)
         p.fake_image_token = "<fake_token_around_image>"; p.image_token = "<image>"
         p.image_token_id = 100; p.image_seq_len = 4
-        p.image_processor = _IP(); p.tokenizer = _MockTokenizer()
-        p.image_processor.do_image_splitting = False
+        ip = _mock_ip(); ip.do_image_splitting = False
+        p.image_processor = ip; p.tokenizer = _mock_tokenizer()
         return p
 
     def _image_call_args(self):
@@ -488,7 +452,7 @@ class TestIdefics3Processor(_ProcessorTestBase, unittest.TestCase):
         p.global_image_token_id = 107; p.global_image_tag = "<global-img>"
         p.image_seq_len = 4; p.end_of_utterance_token = "<end_of_utterance>"
         p._regex_to_remove_extra_special_tokens = None
-        p.image_processor = _IPRowCol(); p.tokenizer = _MockTokenizer()
+        p.image_processor = _mock_ip(rows=[[0]], cols=[[0]]); p.tokenizer = _mock_tokenizer()
         return p
 
     def _image_call_args(self):
@@ -513,7 +477,7 @@ class TestAyaVisionProcessor(_ProcessorTestBase, unittest.TestCase):
         p.img_patch_token = "<|IP|>"; p.img_line_break_token = "<|LB|>"
         p.tile_token = "TILE"; p.tile_global_token = "TG"
         p.image_token_id = 0; p.image_ids = [0] * 5
-        p.image_processor = _IPPatches(); p.tokenizer = _MockTokenizer()
+        p.image_processor = _mock_ip(num_patches=[1]); p.tokenizer = _mock_tokenizer()
         return p
 
     def _image_call_args(self):
@@ -528,7 +492,7 @@ class TestLlama4Processor(_ProcessorTestBase, unittest.TestCase):
         p.fake_image_token = "<|image|>"; p.image_token = "<|image|>"; p.image_token_id = 100
         p.start_of_img_token = "<|is|>"; p.end_of_img_token = "<|ie|>"
         p.img_patch_token = "<|p|>"; p.tile_token = "<|tx|>"; p.tile_global_token = "<|ty|>"
-        p.image_processor = _IPAspect(); p.tokenizer = _MockTokenizer()
+        p.image_processor = _mock_ip(aspect_ratios=[(1, 1)]); p.tokenizer = _mock_tokenizer()
         return p
 
     def _image_call_args(self):
@@ -542,7 +506,7 @@ class TestPixtralProcessor(_ProcessorTestBase, unittest.TestCase):
         p.patch_size = 16; p.spatial_merge_size = 1; p.image_token = "[IMG]"
         p.image_break_token = "[IMG_BREAK]"; p.image_end_token = "[IMG_END]"
         p.image_token_id = 100; p.image_break_token_id = 103; p.image_end_token_id = 104
-        p.image_processor = _IPSizes(); p.tokenizer = _MockTokenizer()
+        p.image_processor = _mock_ip(image_sizes=[[(224, 224)]]); p.tokenizer = _mock_tokenizer()
         return p
 
     def _image_call_args(self):
@@ -556,7 +520,7 @@ class TestMistral3Processor(_ProcessorTestBase, unittest.TestCase):
         p.patch_size = 16; p.spatial_merge_size = 1; p.image_token = "[IMG]"
         p.image_break_token = "[IMG_BREAK]"; p.image_end_token = "[IMG_END]"
         p.image_token_id = 100; p.image_break_token_id = 103; p.image_end_token_id = 104
-        p.image_processor = _IPSizes(); p.tokenizer = _MockTokenizer()
+        p.image_processor = _mock_ip(image_sizes=[[(224, 224)]]); p.tokenizer = _mock_tokenizer()
         return p
 
     def _image_call_args(self):
@@ -568,7 +532,7 @@ class TestMultiModalityProcessor(_ProcessorTestBase, unittest.TestCase):
         from mlx_vlm.models.multi_modality.processing_multi_modality import MultiModalityProcessor
         p = MultiModalityProcessor.__new__(MultiModalityProcessor)
         p.image_token = "<image>"; p.num_image_tokens = 4
-        p.image_processor = _IP(); p.tokenizer = _MockTokenizer()
+        p.image_processor = _mock_ip(); p.tokenizer = _mock_tokenizer()
         return p
 
     def _image_call_args(self):
