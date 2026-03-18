@@ -770,83 +770,82 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
 # ── AutoProcessor patch tests ─────────────────────────────────────────────────
 
 
-class TestAutoProcessorPatch(unittest.TestCase):
-    """Verify install_auto_processor_patch routes AutoProcessor correctly."""
+def _assert_patch_intercepts(test_case, model_type, module_path, cls_name):
+    """Verify the patch routes AutoProcessor to the custom processor class."""
+    import importlib
+    import json
+    import tempfile
+    from pathlib import Path
 
-    _PATCHED_MODELS = [
-        ("internvl_chat", "mlx_vlm.models.internvl_chat", "InternVLChatProcessor"),
-        ("molmo", "mlx_vlm.models.molmo.processing_molmo", "MolmoProcessor"),
-        ("kimi_vl", "mlx_vlm.models.kimi_vl.processing_kimi_vl", "KimiVLProcessor"),
-        ("phi3_v", "mlx_vlm.models.phi3_v.processing_phi3_v", "Phi3VProcessor"),
-        (
+    from transformers import AutoProcessor
+
+    mod = importlib.import_module(module_path)
+    cls = getattr(mod, cls_name, None)
+    test_case.assertIsNotNone(cls, f"{cls_name} not found in {module_path}")
+    test_case.assertTrue(hasattr(cls, "from_pretrained"))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        (Path(tmpdir) / "config.json").write_text(
+            json.dumps({"model_type": model_type})
+        )
+        try:
+            AutoProcessor.from_pretrained(tmpdir)
+        except Exception as e:
+            err = str(e).lower()
+            test_case.assertNotIn(
+                "has no attribute start_image_token",
+                err,
+                f"{model_type}: patch did not intercept, fell through to HF",
+            )
+
+
+class TestInternVLChatPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self, "internvl_chat", "mlx_vlm.models.internvl_chat", "InternVLChatProcessor"
+        )
+
+
+class TestMolmoPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self, "molmo", "mlx_vlm.models.molmo.processing_molmo", "MolmoProcessor"
+        )
+
+
+class TestKimiVLPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self, "kimi_vl", "mlx_vlm.models.kimi_vl.processing_kimi_vl", "KimiVLProcessor"
+        )
+
+
+class TestPhi3VPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self, "phi3_v", "mlx_vlm.models.phi3_v.processing_phi3_v", "Phi3VProcessor"
+        )
+
+
+class TestHunYuanVLPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
             "hunyuan_vl",
             "mlx_vlm.models.hunyuan_vl.processing_hunyuan_vl",
             "HunYuanVLProcessor",
-        ),
-        (
-            "ernie4_5_moe_vl",
-            "mlx_vlm.models.ernie4_5_moe_vl",
-            "Ernie4_5_VLProcessor",
-        ),
-    ]
+        )
 
-    def test_patch_installed(self):
-        """Each model module installs the patch and exposes the processor class."""
-        import importlib
 
-        for model_type, module_path, cls_name in self._PATCHED_MODELS:
-            with self.subTest(model_type=model_type):
-                mod = importlib.import_module(module_path)
-                cls = getattr(mod, cls_name, None)
-                self.assertIsNotNone(
-                    cls, f"{cls_name} not found in {module_path}"
-                )
-                self.assertTrue(
-                    hasattr(cls, "from_pretrained"),
-                    f"{cls_name} missing from_pretrained",
-                )
+class TestErnie4_5VLPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self, "ernie4_5_moe_vl", "mlx_vlm.models.ernie4_5_moe_vl", "Ernie4_5_VLProcessor"
+        )
 
-    def test_patch_intercepts_matching_model_type(self):
-        """AutoProcessor.from_pretrained routes to the custom class for matching model_type."""
-        import importlib
-        import json
-        import tempfile
-        from pathlib import Path
 
-        from transformers import AutoProcessor, AutoTokenizer
-
-        for model_type, module_path, cls_name in self._PATCHED_MODELS:
-            with self.subTest(model_type=model_type):
-                # Ensure the patch is installed
-                importlib.import_module(module_path)
-                target_cls = getattr(
-                    importlib.import_module(module_path), cls_name
-                )
-
-                # Create a temp dir with a config.json that has the model_type
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    config = {"model_type": model_type}
-                    (Path(tmpdir) / "config.json").write_text(json.dumps(config))
-
-                    # The patch should detect the model_type and call
-                    # target_cls.from_pretrained, which may fail because
-                    # there's no real model — but the routing itself is correct
-                    # if the error comes from inside target_cls.from_pretrained
-                    try:
-                        AutoProcessor.from_pretrained(tmpdir)
-                    except Exception as e:
-                        # Expect errors from inside the custom processor
-                        # (missing tokenizer files etc.), NOT from HF's default
-                        # AutoProcessor trying to load the wrong class
-                        err = str(e).lower()
-                        self.assertNotIn(
-                            "has no attribute start_image_token",
-                            err,
-                            f"{model_type}: patch did not intercept, fell through to HF",
-                        )
-
-    def test_patch_chains_for_unknown_model_type(self):
-        """AutoProcessor falls through to default for non-patched model types."""
+class TestPatchChainsForUnknownModelType(unittest.TestCase):
+    def test_falls_through(self):
         import importlib
         import json
         import tempfile
@@ -854,15 +853,12 @@ class TestAutoProcessorPatch(unittest.TestCase):
 
         from transformers import AutoProcessor
 
-        # Ensure at least one patch is installed
         importlib.import_module("mlx_vlm.models.internvl_chat")
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            config = {"model_type": "some_unknown_model_xyz"}
-            (Path(tmpdir) / "config.json").write_text(json.dumps(config))
-
-            # Should fall through to default HF AutoProcessor (and fail
-            # because there's no real model, but NOT with our custom error)
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps({"model_type": "some_unknown_model_xyz"})
+            )
             with self.assertRaises(Exception):
                 AutoProcessor.from_pretrained(tmpdir)
 
