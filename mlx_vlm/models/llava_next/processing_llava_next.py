@@ -60,6 +60,24 @@ class LlavaNextProcessor(ProcessorMixin):
         )
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        from transformers import AutoImageProcessor, AutoTokenizer
+
+        kwargs.pop("use_fast", None)
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path, **kwargs
+        )
+        try:
+            image_processor = AutoImageProcessor.from_pretrained(
+                pretrained_model_name_or_path, use_fast=False, **kwargs
+            )
+        except ValueError:
+            image_processor = AutoImageProcessor.from_pretrained(
+                pretrained_model_name_or_path, **kwargs
+            )
+        return cls(image_processor=image_processor, tokenizer=tokenizer)
+
     def __call__(
         self,
         images: ImageInput = None,
@@ -87,8 +105,9 @@ class LlavaNextProcessor(ProcessorMixin):
         if images is None and text is None:
             raise ValueError("You have to specify at least images or text.")
 
-        # Pop common kwargs
+        # Pop common kwargs that shouldn't be forwarded to sub-processors
         return_tensors = kwargs.pop("return_tensors", None)
+        kwargs.pop("padding", None)
         do_pad = kwargs.pop("do_pad", True)
 
         if images is not None:

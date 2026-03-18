@@ -51,6 +51,24 @@ class Llama4Processor(ProcessorMixin):
         self.tile_token = tile_x_separator_token
         self.tile_global_token = tile_y_separator_token
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        from transformers import AutoImageProcessor, AutoTokenizer
+
+        kwargs.pop("use_fast", None)
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path, **kwargs
+        )
+        try:
+            image_processor = AutoImageProcessor.from_pretrained(
+                pretrained_model_name_or_path, use_fast=False, **kwargs
+            )
+        except ValueError:
+            image_processor = AutoImageProcessor.from_pretrained(
+                pretrained_model_name_or_path, **kwargs
+            )
+        return cls(image_processor=image_processor, tokenizer=tokenizer)
+
     def _prompt_split_image(self, aspect_ratio, num_patches_per_chunk):
         """Create a structured string representation of image tokens."""
         img_string = "<|image_start|>"
@@ -81,6 +99,9 @@ class Llama4Processor(ProcessorMixin):
         ] = None,
         **kwargs,
     ) -> BatchFeature:
+        kwargs.pop("padding", None)
+        kwargs.pop("return_tensors", None)
+
         if text is None:
             raise ValueError("You have to specify text.")
 
