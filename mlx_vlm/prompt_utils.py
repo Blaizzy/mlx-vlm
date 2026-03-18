@@ -490,7 +490,8 @@ def get_chat_template(
 
         if isinstance(content, list):
             parts = []
-            multimodal_markers = {image_token, "<audio>", "<video>"}
+            audio_marker = kwargs.get("audio_token", "<audio>")
+            multimodal_markers = {image_token, audio_marker, "<audio>", "<video>"}
             for item in content:
                 if isinstance(item, dict):
                     item_type = item.get("type", "")

@@ -1169,8 +1169,6 @@ def prepare_inputs(
                 else 16000
             )
             audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
-            # Convert to (data, sr) tuples for processors that expect them
-            audio = [(a, sr) if isinstance(a, np.ndarray) else a for a in audio]
 
     model_inputs = {}
 
