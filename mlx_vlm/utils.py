@@ -880,23 +880,6 @@ def process_inputs_with_fallback(
             **kwargs,
         )
     except Exception as e:
-        # Fallback to PyTorch tensors if MLX fails
-        if return_tensors != "pt":
-            try:
-                return process_inputs(
-                    processor,
-                    prompts=prompts,
-                    images=images,
-                    audio=audio,
-                    add_special_tokens=add_special_tokens,
-                    return_tensors="pt",
-                    **kwargs,
-                )
-            except Exception as fallback_error:
-                raise ValueError(
-                    f"Failed to process inputs with error: {fallback_error}"
-                ) from fallback_error
-
         raise ValueError(f"Failed to process inputs with error: {e}")
 
 
