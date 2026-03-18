@@ -218,3 +218,7 @@ class Glm46VProcessor(ProcessorMixin):
 
 
 __all__ = ["Glm46VProcessor"]
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("glm4v", Glm46VProcessor)

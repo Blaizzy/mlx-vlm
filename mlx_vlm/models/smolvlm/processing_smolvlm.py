@@ -219,3 +219,7 @@ class SmolVLMProcessor(ProcessorMixin):
 
 
 __all__ = ["SmolVLMProcessor"]
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("smolvlm", SmolVLMProcessor)

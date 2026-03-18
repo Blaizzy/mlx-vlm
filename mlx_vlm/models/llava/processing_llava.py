@@ -137,3 +137,7 @@ class LlavaProcessor(ProcessorMixin):
 
 
 __all__ = ["LlavaProcessor"]
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("llava", LlavaProcessor)
