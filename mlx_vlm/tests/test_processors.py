@@ -10,7 +10,6 @@ class TestErnie4_5VLProcessor(unittest.TestCase):
     """Test ERNIE 4.5 VL processor components."""
 
     def test_helper_functions(self):
-        """Test helper functions for ERNIE 4.5 VL processor."""
         from mlx_vlm.models.ernie4_5_moe_vl.processor import (
             ceil_by_factor,
             floor_by_factor,
@@ -18,53 +17,43 @@ class TestErnie4_5VLProcessor(unittest.TestCase):
             smart_resize,
         )
 
-        # round_by_factor
         self.assertEqual(round_by_factor(100, 28), 112)
         self.assertEqual(round_by_factor(56, 28), 56)
         self.assertEqual(round_by_factor(42, 28), 56)
 
-        # ceil_by_factor
         self.assertEqual(ceil_by_factor(100, 28), 112)
         self.assertEqual(ceil_by_factor(56, 28), 56)
         self.assertEqual(ceil_by_factor(57, 28), 84)
 
-        # floor_by_factor
         self.assertEqual(floor_by_factor(100, 28), 84)
         self.assertEqual(floor_by_factor(56, 28), 56)
         self.assertEqual(floor_by_factor(55, 28), 28)
 
-        # smart_resize maintains factor
         h, w = smart_resize(224, 224, factor=28)
         self.assertEqual(h % 28, 0)
         self.assertEqual(w % 28, 0)
 
-        # smart_resize respects min_pixels
         h, w = smart_resize(10, 10, factor=28, min_pixels=56 * 56)
         self.assertGreaterEqual(h * w, 56 * 56)
 
-        # smart_resize respects max_pixels
         h, w = smart_resize(10000, 10000, factor=28, max_pixels=28 * 28 * 1280)
         self.assertLessEqual(h * w, 28 * 28 * 1280)
 
     def test_image_processor(self):
-        """Test ImageProcessor for ERNIE 4.5 VL model."""
         from mlx_vlm.models.ernie4_5_moe_vl.processor import ImageProcessor
 
         processor = ImageProcessor()
 
-        # Initialization
         self.assertEqual(processor.patch_size, 14)
         self.assertEqual(processor.merge_size, 2)
         self.assertEqual(processor.factor, 28)
 
-        # get_smart_resize
         (resized_h, resized_w), (grid_h, grid_w) = processor.get_smart_resize(224, 224)
         self.assertEqual(resized_h % 28, 0)
         self.assertEqual(resized_w % 28, 0)
         self.assertEqual(grid_h, resized_h // 14)
         self.assertEqual(grid_w, resized_w // 14)
 
-        # preprocess single image
         image = Image.new("RGB", (224, 224), color="red")
         result = processor.preprocess(image)
         self.assertIn("pixel_values", result)
@@ -72,7 +61,6 @@ class TestErnie4_5VLProcessor(unittest.TestCase):
         self.assertEqual(result["image_grid_thw"].shape[0], 1)
         self.assertEqual(result["image_grid_thw"][0, 0], 1)
 
-        # preprocess multiple images
         images = [
             Image.new("RGB", (224, 224), color="red"),
             Image.new("RGB", (448, 448), color="blue"),
@@ -82,29 +70,525 @@ class TestErnie4_5VLProcessor(unittest.TestCase):
         self.assertIn("image_grid_thw", result)
         self.assertEqual(result["image_grid_thw"].shape[0], 2)
 
-        # extract patches shape
         img_array = np.random.rand(3, 224, 224).astype(np.float32)
-        grid_h, grid_w = 16, 16
-        patches = processor._extract_patches(img_array, grid_h, grid_w)
-        expected_num_patches = (grid_h // 2) * (grid_w // 2) * 4
-        expected_patch_dim = 3 * 14 * 14
-        self.assertEqual(patches.shape, (expected_num_patches, expected_patch_dim))
+        patches = processor._extract_patches(img_array, 16, 16)
+        self.assertEqual(patches.shape, ((16 // 2) * (16 // 2) * 4, 3 * 14 * 14))
 
-        # callable interface
         image = Image.new("RGB", (224, 224), color="red")
         result = processor(images=image)
         self.assertIn("pixel_values", result)
         self.assertIn("image_grid_thw", result)
 
     def test_processor_class_attributes(self):
-        """Test Ernie4_5_VLProcessor class attributes."""
         from mlx_vlm.models.ernie4_5_moe_vl.processor import Ernie4_5_VLProcessor
 
         self.assertEqual(Ernie4_5_VLProcessor.IMG_START, "<|IMAGE_START|>")
         self.assertEqual(Ernie4_5_VLProcessor.IMG_END, "<|IMAGE_END|>")
-        self.assertEqual(
-            Ernie4_5_VLProcessor.IMAGE_PLACEHOLDER, "<|IMAGE_PLACEHOLDER|>"
+        self.assertEqual(Ernie4_5_VLProcessor.IMAGE_PLACEHOLDER, "<|IMAGE_PLACEHOLDER|>")
+
+
+# ── Shared mocks ──────────────────────────────────────────────────────────────
+
+
+class _MockTokenizer:
+    model_input_names = ["input_ids", "attention_mask"]
+    bos_token = "<bos>"; eos_token = "<eos>"; pad_token = "<pad>"; pad_token_id = 0
+    image_token = "<image>"; image_token_id = 100
+    boi_token = "<boi>"; eoi_token = "<eoi>"
+    audio_token = "<audio>"; audio_token_id = 101; boa_token = "<boa>"; eoa_token = "<eoa>"
+    video_token = "<video>"; video_token_id = 102
+
+    def convert_tokens_to_ids(self, t):
+        return [0] * len(t) if isinstance(t, list) else 0
+
+    def __call__(self, text, text_pair=None, return_token_type_ids=False, **kw):
+        if isinstance(text, str):
+            text = [text]
+        r = {
+            "input_ids": [list(range(10)) for _ in text],
+            "attention_mask": [[1] * 10 for _ in text],
+        }
+        if return_token_type_ids:
+            r["token_type_ids"] = [[0] * 10 for _ in text]
+        return r
+
+    def add_special_tokens(self, d): pass
+    def encode(self, text, **kw): return list(range(10))
+
+    @property
+    def init_kwargs(self): return {}
+
+    def batch_decode(self, ids, **kw): return ["decoded"] * len(ids)
+    def decode(self, ids, **kw): return "decoded"
+
+
+class _QwenTokenizer(_MockTokenizer):
+    image_token = "<|image_pad|>"; image_token_id = 100
+    video_token = "<|video_pad|>"; video_token_id = 102
+    vision_start_token = "<|vs|>"; vision_end_token = "<|ve|>"
+    vision_start_token_id = 200; vision_end_token_id = 201
+
+
+class _MllamaTokenizer(_MockTokenizer):
+    image_token = "<|image|>"; image_token_id = 128256; bos_token = "<bos>"
+
+    def __call__(self, text, **kw):
+        if isinstance(text, str):
+            text = [text]
+        ids = []
+        for t in text:
+            toks = []; i = 0
+            while i < len(t):
+                if t[i:].startswith("<|image|>"):
+                    toks.append(128256); i += 9
+                elif t[i] == " ":
+                    i += 1
+                else:
+                    w = ""
+                    while i < len(t) and t[i] != " " and not t[i:].startswith("<|image|>"):
+                        w += t[i]; i += 1
+                    toks.append(hash(w) % 30000)
+            ids.append(toks)
+        ml = max(len(x) for x in ids)
+        return {
+            "input_ids": [x + [0] * (ml - len(x)) for x in ids],
+            "attention_mask": [[1] * len(x) + [0] * (ml - len(x)) for x in ids],
+        }
+
+
+def _make_image():
+    return Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
+
+
+def _pv():
+    return np.random.randn(1, 3, 224, 224).astype(np.float32)
+
+
+class _IP:
+    model_input_names = ["pixel_values"]; merge_size = 2
+    do_image_splitting = False; max_image_tiles = 4
+    def __call__(self, images=None, **kw): return {"pixel_values": _pv()}
+    def fetch_images(self, images): return [images] if not isinstance(images, list) else images
+
+
+class _IPGrid(_IP):
+    model_input_names = ["pixel_values", "image_grid_thw"]
+    def __call__(self, images=None, **kw):
+        return {**super().__call__(), "image_grid_thw": np.array([[1, 16, 16]], dtype=np.int64)}
+
+
+class _IPCrops(_IP):
+    def __call__(self, images=None, **kw):
+        return {**super().__call__(), "num_crops": [0]}
+
+
+class _IPRowCol(_IP):
+    def __call__(self, images=None, **kw):
+        return {**super().__call__(), "rows": [[0]], "cols": [[0]]}
+
+
+class _IPSizes(_IP):
+    def __call__(self, images=None, **kw):
+        return {**super().__call__(), "image_sizes": [[(224, 224)]]}
+
+
+class _IPPatches(_IP):
+    def __call__(self, images=None, **kw):
+        return {**super().__call__(), "num_patches": [1]}
+
+
+class _IPAspect(_IP):
+    def __call__(self, images=None, **kw):
+        return {**super().__call__(), "aspect_ratios": [(1, 1)]}
+
+
+class _IPTiles(_IP):
+    max_image_tiles = 4
+    def __call__(self, images=None, max_image_tiles=4, **kw):
+        n = sum(len(b) for b in images) if isinstance(images[0], list) else 1
+        return {
+            "pixel_values": np.random.randn(n, 4, 3, 560, 560).astype(np.float32),
+            "num_tiles": [[2]] * n,
+            "aspect_ratio_ids": np.array([[1]] * n),
+            "aspect_ratio_mask": np.ones((n, 4), dtype=np.int64),
+        }
+
+
+class _IPNeXT(_IP):
+    image_grid_pinpoints = [[224, 224], [224, 448], [448, 224], [448, 448]]
+    size = {"height": 224, "width": 224}
+    def __call__(self, images=None, **kw):
+        return {
+            "pixel_values": np.random.randn(1, 5, 3, 224, 224).astype(np.float32),
+            "image_sizes": [(224, 224)],
+        }
+
+
+# ── Base class with shared test_with_image / test_text_only ───────────────────
+
+
+class _ProcessorTestBase:
+    """
+    Mixin for processor tests. Not a TestCase itself so pytest won't collect it.
+
+    Subclasses must also inherit unittest.TestCase and define:
+      - _make_processor() -> processor instance
+      - _image_call_args() -> dict of kwargs for __call__ with image
+      - _text_call_args()  -> dict of kwargs for __call__ text-only (or None to skip)
+    """
+
+    def _make_processor(self):
+        raise NotImplementedError
+
+    def _image_call_args(self):
+        raise NotImplementedError
+
+    def _text_call_args(self):
+        return {"text": ["Hello world"]}
+
+    def _assert_all_mx(self, result):
+        import mlx.core as mx
+        for key, value in result.items():
+            if value is not None:
+                self.assertIsInstance(
+                    value, mx.array,
+                    f"{key}: expected mx.array, got {type(value).__name__}",
+                )
+
+    def test_with_image(self):
+        result = self._make_processor()(**self._image_call_args())
+        self._assert_all_mx(result)
+        self.assertIn("pixel_values", result)
+
+    def test_text_only(self):
+        args = self._text_call_args()
+        if args is None:
+            self.skipTest("Processor requires images")
+        result = self._make_processor()(**args)
+        self._assert_all_mx(result)
+
+
+# ── Per-model test classes ────────────────────────────────────────────────────
+
+
+class TestLlavaProcessor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.llava.processing_llava import LlavaProcessor
+        p = LlavaProcessor.__new__(LlavaProcessor)
+        p.image_token = "<image>"; p.patch_size = 14
+        p.vision_feature_select_strategy = "default"; p.num_additional_image_tokens = 1
+        p.image_processor = _IP(); p.tokenizer = _MockTokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["<image> Describe"], "images": [_make_image()]}
+
+
+class TestLlavaNextProcessor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.llava_next.processing_llava_next import LlavaNextProcessor
+        p = LlavaNextProcessor.__new__(LlavaNextProcessor)
+        p.image_token = "<image>"; p.patch_size = 14
+        p.vision_feature_select_strategy = "default"; p.num_additional_image_tokens = 1
+        p.image_processor = _IPNeXT(); p.tokenizer = _MockTokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["<image> Describe"], "images": [_make_image()]}
+
+
+class TestPaliGemmaProcessor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.paligemma.processing_paligemma import PaliGemmaProcessor
+        p = PaliGemmaProcessor.__new__(PaliGemmaProcessor)
+        p.image_token = "<image>"; p.image_seq_length = 4; p.bos_token = "<bos>"
+        p.image_processor = _IP(); p.tokenizer = _MockTokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": "describe", "images": [_make_image()]}
+
+    def _text_call_args(self):
+        return None  # PaliGemma requires images
+
+
+class TestGemma3Processor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.gemma3.processing_gemma3 import Gemma3Processor
+        p = Gemma3Processor.__new__(Gemma3Processor)
+        p.image_seq_length = 4; p.image_token_id = 100; p.boi_token = "<boi>"
+        p.image_token = "<image>"
+        p.full_image_sequence = "\n\n<boi>" + "<image>" * 4 + "<eoi>\n\n"
+        p.image_processor = _IPCrops(); p.tokenizer = _MockTokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["<boi> Cats"], "images": [_make_image()]}
+
+
+class TestGemma3nProcessor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.gemma3n.processing_gemma3n import Gemma3nProcessor
+        p = Gemma3nProcessor.__new__(Gemma3nProcessor)
+        p.image_seq_length = 4; p.image_token_id = 100; p.boi_token = "<boi>"
+        p.image_token = "<image>"
+        p.full_image_sequence = "\n\n<boi>" + "<image>" * 4 + "<eoi>\n\n"
+        p.audio_seq_length = 4; p.audio_token_id = 101; p.boa_token = "<boa>"
+        p.audio_token = "<audio>"
+        p.full_audio_sequence = "\n\n<boa>" + "<audio>" * 4 + "<eoa>\n\n"
+        p.image_processor = _IPCrops(); p.tokenizer = _MockTokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["<image> Cats"], "images": [_make_image()]}
+
+
+class TestSmolVLMProcessor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.smolvlm.processing_smolvlm import SmolVLMProcessor
+        p = SmolVLMProcessor.__new__(SmolVLMProcessor)
+        p.fake_image_token = "<fake_token_around_image>"; p.image_token = "<image>"
+        p.image_token_id = 100; p.end_of_utterance_token = "<end_of_utterance>"
+        p.global_image_token = "<global-img>"; p.image_seq_len = 4; p.video_token = "<video>"
+        p.image_processor = _IPRowCol(); p.tokenizer = _MockTokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["<image> Describe"], "images": [[_make_image()]]}
+
+
+class TestMllamaProcessor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.mllama.processing_mllama import MllamaProcessor
+        p = MllamaProcessor.__new__(MllamaProcessor)
+        p.image_token = "<|image|>"; p.image_token_id = 128256
+        p.python_token = "<|python_tag|>"; p.python_token_id = 0; p.bos_token = "<bos>"
+        p.image_processor = _IPTiles(); p.tokenizer = _MllamaTokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["<|image|>Describe"], "images": [[_make_image()]]}
+
+    def test_with_image(self):
+        result = self._make_processor()(**self._image_call_args())
+        self._assert_all_mx(result)
+        self.assertIn("pixel_values", result)
+        self.assertIn("cross_attention_mask", result)
+
+    def test_cross_attention_mask_helpers(self):
+        from mlx_vlm.models.mllama.processing_mllama import (
+            get_cross_attention_token_mask,
+            convert_sparse_cross_attention_mask_to_dense,
         )
+        ids = [1, 2, 128256, 3, 4, 128256, 5, 6]
+        mask = get_cross_attention_token_mask(ids, 128256)
+        self.assertEqual(len(mask), 2)
+        self.assertEqual(mask[0], [2, 5])
+        self.assertEqual(mask[1], [5, 8])
+        self.assertEqual(get_cross_attention_token_mask([1, 2, 3], 128256), [])
+
+        dense = convert_sparse_cross_attention_mask_to_dense([mask], [[2, 3]], 4, 8)
+        self.assertEqual(dense.shape, (1, 8, 2, 4))
+        self.assertEqual(dense[0, 2, 0, 0], 1)
+        self.assertEqual(dense[0, 0, 0, 0], 0)
+
+    def test_build_string_from_input(self):
+        from mlx_vlm.models.mllama.processing_mllama import build_string_from_input
+        self.assertEqual(build_string_from_input("Hello", "<bos>", "<|image|>"), "<bos>Hello")
+        self.assertEqual(build_string_from_input("<|image|>Hello", "<bos>", "<|image|>"), "<|image|><bos>Hello")
+        self.assertEqual(build_string_from_input("<bos>Hello", "<bos>", "<|image|>"), "<bos>Hello")
+
+
+class TestQwen2VLProcessor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.qwen2_vl.processing_qwen2_vl import Qwen2VLProcessor
+        p = Qwen2VLProcessor.__new__(Qwen2VLProcessor)
+        p.image_token = "<|image_pad|>"; p.video_token = "<|video_pad|>"
+        p.image_token_id = 100; p.video_token_id = 102
+        p.image_processor = _IPGrid(); p.tokenizer = _QwenTokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["<|image_pad|> Describe"], "images": [_make_image()]}
+
+
+class TestQwen2_5VLProcessor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
+        p = Qwen2_5_VLProcessor.__new__(Qwen2_5_VLProcessor)
+        p.image_token = "<|image_pad|>"; p.video_token = "<|video_pad|>"
+        p.image_token_id = 100; p.video_token_id = 102
+        p.image_processor = _IPGrid(); p.tokenizer = _QwenTokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["<|image_pad|> Describe"], "images": [_make_image()]}
+
+
+class TestQwen3VLProcessor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+        p = Qwen3VLProcessor.__new__(Qwen3VLProcessor)
+        p.image_token = "<|image_pad|>"; p.video_token = "<|video_pad|>"
+        p.image_token_id = 100; p.video_token_id = 102
+        p.vision_start_token = "<|vs|>"; p.vision_end_token = "<|ve|>"
+        p.vision_start_token_id = 200; p.vision_end_token_id = 201
+        p.image_processor = _IPGrid(); p.tokenizer = _QwenTokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["<|image_pad|> Describe"], "images": [_make_image()]}
+
+
+class TestQwen3OmniMoeProcessor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.qwen3_omni_moe.processing_qwen3_omni_moe import Qwen3OmniMoeProcessor
+
+        class OmniTok(_MockTokenizer):
+            image_token = "<|image|>"; audio_token = "<|audio|>"; video_token = "<|video|>"
+            vision_bos_token = "<|vb|>"; vision_eos_token = "<|ve|>"
+            audio_bos_token = "<|ab|>"; audio_eos_token = "<|ae|>"
+
+        p = Qwen3OmniMoeProcessor.__new__(Qwen3OmniMoeProcessor)
+        p.image_token = "<|image|>"; p.audio_token = "<|audio|>"; p.video_token = "<|video|>"
+        p.vision_bos_token = "<|vb|>"; p.vision_eos_token = "<|ve|>"
+        p.audio_bos_token = "<|ab|>"; p.audio_eos_token = "<|ae|>"
+        p.tokenizer = OmniTok(); p.image_processor = _IPGrid()
+        p.video_processor = type("VP", (), {"model_input_names": [], "merge_size": 2})()
+        p.feature_extractor = type("FE", (), {"model_input_names": []})()
+        return p
+
+    def _image_call_args(self):
+        return {"text": "<|image|>Describe", "images": [_make_image()]}
+
+    def _text_call_args(self):
+        return {"text": "Hello world"}
+
+
+class TestIdefics2Processor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.idefics2.processing_idefics2 import Idefics2Processor
+        p = Idefics2Processor.__new__(Idefics2Processor)
+        p.fake_image_token = "<fake_token_around_image>"; p.image_token = "<image>"
+        p.image_token_id = 100; p.image_seq_len = 4
+        p.image_processor = _IP(); p.tokenizer = _MockTokenizer()
+        p.image_processor.do_image_splitting = False
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["<image> What are these?"], "images": [[_make_image()]]}
+
+
+class TestIdefics3Processor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.idefics3.processing_idefics3 import Idefics3Processor
+        p = Idefics3Processor.__new__(Idefics3Processor)
+        p.fake_image_token = "<fake_token_around_image>"; p.image_token = "<image>"
+        p.image_token_id = 100; p.fake_image_token_id = 105
+        p.global_image_token_id = 107; p.global_image_tag = "<global-img>"
+        p.image_seq_len = 4; p.end_of_utterance_token = "<end_of_utterance>"
+        p._regex_to_remove_extra_special_tokens = None
+        p.image_processor = _IPRowCol(); p.tokenizer = _MockTokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["<image> What are these?"], "images": [[_make_image()]]}
+
+    def test_image_prompt_string(self):
+        from mlx_vlm.models.idefics3.processing_idefics3 import get_image_prompt_string
+        result = get_image_prompt_string(0, 0, 4, "<F>", "<I>", "<G>")
+        self.assertIn("<I>" * 4, result)
+        self.assertIn("<G>", result)
+        result = get_image_prompt_string(2, 2, 4, "<F>", "<I>", "<G>")
+        self.assertIn("<row_1_col_1>", result)
+        self.assertIn("<row_2_col_2>", result)
+
+
+class TestAyaVisionProcessor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.aya_vision.processing_aya_vision import AyaVisionProcessor
+        p = AyaVisionProcessor.__new__(AyaVisionProcessor)
+        p.image_token = "<image>"; p.patch_size = 28; p.img_size = 364
+        p.start_of_img_token = "<|SI|>"; p.end_of_img_token = "<|EI|>"
+        p.img_patch_token = "<|IP|>"; p.img_line_break_token = "<|LB|>"
+        p.tile_token = "TILE"; p.tile_global_token = "TG"
+        p.image_token_id = 0; p.image_ids = [0] * 5
+        p.image_processor = _IPPatches(); p.tokenizer = _MockTokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["<image> Cats"], "images": [_make_image()]}
+
+
+class TestLlama4Processor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.llama4.processing_llama4 import Llama4Processor
+        p = Llama4Processor.__new__(Llama4Processor)
+        p.downsample_ratio = 4; p.patch_size = 14
+        p.fake_image_token = "<|image|>"; p.image_token = "<|image|>"; p.image_token_id = 100
+        p.start_of_img_token = "<|is|>"; p.end_of_img_token = "<|ie|>"
+        p.img_patch_token = "<|p|>"; p.tile_token = "<|tx|>"; p.tile_global_token = "<|ty|>"
+        p.image_processor = _IPAspect(); p.tokenizer = _MockTokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["<|image|>Describe"], "images": [_make_image()]}
+
+
+class TestPixtralProcessor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.pixtral.processing_pixtral import PixtralProcessor
+        p = PixtralProcessor.__new__(PixtralProcessor)
+        p.patch_size = 16; p.spatial_merge_size = 1; p.image_token = "[IMG]"
+        p.image_break_token = "[IMG_BREAK]"; p.image_end_token = "[IMG_END]"
+        p.image_token_id = 100; p.image_break_token_id = 103; p.image_end_token_id = 104
+        p.image_processor = _IPSizes(); p.tokenizer = _MockTokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["[IMG]Describe"], "images": [[_make_image()]]}
+
+
+class TestMistral3Processor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.mistral3.processing_mistral3 import Mistral3Processor
+        p = Mistral3Processor.__new__(Mistral3Processor)
+        p.patch_size = 16; p.spatial_merge_size = 1; p.image_token = "[IMG]"
+        p.image_break_token = "[IMG_BREAK]"; p.image_end_token = "[IMG_END]"
+        p.image_token_id = 100; p.image_break_token_id = 103; p.image_end_token_id = 104
+        p.image_processor = _IPSizes(); p.tokenizer = _MockTokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["[IMG]Describe"], "images": [[_make_image()]]}
+
+
+class TestMultiModalityProcessor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.multi_modality.processing_multi_modality import MultiModalityProcessor
+        p = MultiModalityProcessor.__new__(MultiModalityProcessor)
+        p.image_token = "<image>"; p.num_image_tokens = 4
+        p.image_processor = _IP(); p.tokenizer = _MockTokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["<image> Cats"], "images": [_make_image()]}
+
+
+class TestToMlxHelper(unittest.TestCase):
+    def test_converts_lists_and_numpy(self):
+        import mlx.core as mx
+        from mlx_vlm.models.base import to_mlx
+        result = to_mlx({
+            "ids": [[1, 2, 3]],
+            "pv": np.zeros((1, 3, 4, 4)),
+            "none_val": None,
+            "str_val": "hello",
+        })
+        self.assertIsInstance(result["ids"], mx.array)
+        self.assertIsInstance(result["pv"], mx.array)
+        self.assertIsNone(result["none_val"])
+        self.assertEqual(result["str_val"], "hello")
 
 
 class TestLfm2VlProcessorPatch(unittest.TestCase):
@@ -113,15 +597,9 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
             _num_image_tokens_from_patch_grid,
         )
 
-        # Even patch grids: rows/cols divisible by factor
         self.assertEqual(_num_image_tokens_from_patch_grid(16, 16, 2), 64)
-
-        # Odd patch grids: PixelUnshuffleBlock pads to next multiple of factor
-        # before downsampling, so we need ceil(rows/f)*ceil(cols/f).
         self.assertEqual(_num_image_tokens_from_patch_grid(23, 43, 2), 264)
         self.assertEqual(_num_image_tokens_from_patch_grid(1, 1, 2), 1)
-
-        # Different factor
         self.assertEqual(_num_image_tokens_from_patch_grid(7, 9, 4), 6)
 
 
