@@ -2,8 +2,6 @@ from enum import Enum
 from functools import partial
 from typing import Any, Dict, List, Union
 
-from pydantic import BaseModel
-
 
 class MessageFormat(Enum):
     """Enum for different message format types."""
@@ -129,6 +127,15 @@ def extract_text_from_content(content: Any) -> str:
 
     # Fallback: convert to string (shouldn't happen in normal usage)
     return str(content) if content else ""
+
+
+def _get_role_content(item: Any) -> Union[tuple[str, Any], None]:
+    """Return (role, content) for a message-like item (dict or object with .role/.content), else None."""
+    if isinstance(item, dict):
+        return item.get("role", "user"), item.get("content")
+    if hasattr(item, "role") and hasattr(item, "content"):
+        return getattr(item, "role", "user"), getattr(item, "content", "")
+    return None
 
 
 class MessageBuilder:
@@ -694,17 +701,9 @@ def apply_chat_template(
                         **kwargs,
                     )
                 )
-            elif isinstance(p, dict) or isinstance(p, BaseModel):
-                role = "user"
-                content = ""
-                if isinstance(p, dict):
-                    role = p.get("role", "user")
-                    content = p.get("content")
-                else:
-                    role = p.role
-                    content = p.content
+            elif (role_content := _get_role_content(p)) is not None:
+                role, content = role_content
                 # Handle multimodal content: extract only text, skip image/audio URLs
-                # This prevents base64 image data from being tokenized as text
                 content = extract_text_from_content(content)
                 is_first = i == 0 or (i == 1 and role not in ["system", "assistant"])
                 messages.append(
