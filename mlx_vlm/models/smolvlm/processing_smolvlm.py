@@ -218,6 +218,19 @@ class SmolVLMProcessor(ProcessorMixin):
         return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
 
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        from transformers import AutoImageProcessor, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path, **kwargs
+        )
+        image_processor = AutoImageProcessor.from_pretrained(
+            pretrained_model_name_or_path, use_fast=False, **kwargs
+        )
+        return cls(image_processor=image_processor, tokenizer=tokenizer)
+
+
 __all__ = ["SmolVLMProcessor"]
 
 from ..base import install_auto_processor_patch
