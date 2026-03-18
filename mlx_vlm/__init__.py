@@ -1,5 +1,8 @@
 import os
 
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+
 from .convert import convert
 from .generate import (
     BatchResponse,
@@ -12,5 +15,3 @@ from .generate import (
 from .prompt_utils import apply_chat_template, get_message_json
 from .utils import load, prepare_inputs, process_image
 from .version import __version__
-
-os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
