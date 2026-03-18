@@ -217,7 +217,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     model_class, _ = get_model_and_args(config=config)
 
     # Initialize text and vision configs if not present
-    config.setdefault("text_config", {})
+    config.setdefault("text_config", config.pop("llm_config", {}))
     config.setdefault("vision_config", {})
     config.setdefault("audio_config", {})
 
