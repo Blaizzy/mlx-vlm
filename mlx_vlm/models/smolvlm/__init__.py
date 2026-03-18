@@ -2,3 +2,4 @@
 from ..idefics3 import LanguageModel, VisionModel
 from .config import ModelConfig, TextConfig, VisionConfig
 from .smolvlm import Model
+import mlx_vlm.models.smolvlm.processing_smolvlm  # noqa: F401 (installs processor patch)
