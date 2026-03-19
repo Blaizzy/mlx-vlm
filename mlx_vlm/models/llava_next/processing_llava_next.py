@@ -8,7 +8,7 @@ from transformers.image_utils import ImageInput, get_image_size, to_numpy_array
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
-from ..base import to_mlx
+from ..base import load_chat_template, to_mlx
 
 
 class LlavaNextProcessor(ProcessorMixin):
@@ -71,6 +71,7 @@ class LlavaNextProcessor(ProcessorMixin):
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
         try:
             image_processor = AutoImageProcessor.from_pretrained(
                 pretrained_model_name_or_path, use_fast=False, **kwargs

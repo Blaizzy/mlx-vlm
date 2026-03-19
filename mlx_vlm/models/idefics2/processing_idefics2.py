@@ -18,7 +18,7 @@ from transformers.tokenization_utils_base import (
     TextInput,
 )
 
-from ..base import to_mlx
+from ..base import load_chat_template, to_mlx
 
 
 def is_url(val) -> bool:
@@ -193,6 +193,7 @@ class Idefics2Processor(ProcessorMixin):
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
 
         proc_cfg_path = (
             Path(pretrained_model_name_or_path) / "processor_config.json"

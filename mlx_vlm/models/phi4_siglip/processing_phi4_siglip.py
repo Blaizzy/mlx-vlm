@@ -183,6 +183,8 @@ class Phi4SigLipProcessor:
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
+from ..base import load_chat_template
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
 
         # Load config to determine vision tower and create image processor
         model_path = Path(pretrained_model_name_or_path)

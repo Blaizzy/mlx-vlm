@@ -7,7 +7,7 @@ from transformers.image_utils import ImageInput, get_image_size, to_numpy_array
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
-from ..base import to_mlx
+from ..base import load_chat_template, to_mlx
 
 
 class LlavaProcessor(ProcessorMixin):
@@ -147,6 +147,7 @@ class LlavaProcessor(ProcessorMixin):
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
 
         proc_cfg_path = (
             Path(pretrained_model_name_or_path) / "processor_config.json"

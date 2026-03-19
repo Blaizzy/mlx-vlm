@@ -15,6 +15,24 @@ from mlx_lm.models.base import (
 from PIL import Image
 
 
+def load_chat_template(tokenizer, model_path):
+    """Apply a chat template from the model directory to *tokenizer*."""
+    import json
+    from pathlib import Path
+
+    model_dir = Path(model_path)
+    chat_template_json = model_dir / "chat_template.json"
+    chat_template_jinja = model_dir / "chat_template.jinja"
+
+    if chat_template_json.exists():
+        template_data = json.loads(chat_template_json.read_text())
+        tokenizer.chat_template = template_data["chat_template"]
+    elif chat_template_jinja.exists():
+        tokenizer.chat_template = chat_template_jinja.read_text()
+
+    return tokenizer
+
+
 def to_mlx(data: dict) -> dict:
     """Convert all array-like values in a processor output dict to mx.array."""
     result = {}

@@ -210,6 +210,8 @@ class Glm46VProcessor(ProcessorMixin):
             trust_remote_code=trust_remote_code,
             **kwargs,
         )
+        from ..base import load_chat_template
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
 
         # Read processor_config.json for correct init kwargs
         proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"

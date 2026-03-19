@@ -150,13 +150,16 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
         from transformers import AutoImageProcessor, AutoTokenizer
 
         kwargs.pop("use_fast", None)
+        model_path = Path(pretrained_model_name_or_path)
+
+        from ..base import load_chat_template
+
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
+        load_chat_template(tokenizer, model_path)
 
-        proc_cfg_path = (
-            Path(pretrained_model_name_or_path) / "processor_config.json"
-        )
+        proc_cfg_path = model_path / "processor_config.json"
         ip_overrides = {}
         if proc_cfg_path.exists():
             with open(proc_cfg_path) as f:
@@ -176,9 +179,7 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
             image_processor = AutoImageProcessor.from_pretrained(
                 pretrained_model_name_or_path, **ip_overrides, **kwargs,
             )
-        return cls(
-            image_processor=image_processor, tokenizer=tokenizer,
-        )
+        return cls(image_processor=image_processor, tokenizer=tokenizer)
 
 
 __all__ = ["Qwen2_5_VLProcessor"]

@@ -15,7 +15,7 @@ from transformers.image_utils import ImageInput, make_flat_list_of_images
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
-from ..base import to_mlx
+from ..base import load_chat_template, to_mlx
 
 # Supported aspect ratios for Llama4 tiling
 POSSIBLE_RESOLUTIONS = [
@@ -169,6 +169,7 @@ class Llama4Processor(ProcessorMixin):
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
 
         pp_cfg = Path(pretrained_model_name_or_path) / "preprocessor_config.json"
         ip_kwargs = {}

@@ -376,6 +376,8 @@ class InternVLChatProcessor(ProcessorMixin):
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
+        from ..base import load_chat_template
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
 
         # Load model config to get image processing parameters
         config_path = Path(pretrained_model_name_or_path) / "config.json"

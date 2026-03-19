@@ -59,6 +59,8 @@ class Moondream3Processor:
                 pretrained_model_name_or_path,
                 **tokenizer_kwargs,
             )
+from ..base import load_chat_template
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
         except Exception:
             tokenizer = AutoTokenizer.from_pretrained(
                 TOKENIZER_REPO,

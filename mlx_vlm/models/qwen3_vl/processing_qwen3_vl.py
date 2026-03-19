@@ -13,7 +13,7 @@ from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
-from ..base import to_mlx
+from ..base import load_chat_template, to_mlx
 
 
 class Qwen3VLProcessor(ProcessorMixin):
@@ -178,6 +178,7 @@ class Qwen3VLProcessor(ProcessorMixin):
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
 
         # Read processor_config.json for correct init kwargs
         proc_cfg_path = (
