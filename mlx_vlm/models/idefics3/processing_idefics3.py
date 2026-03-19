@@ -145,16 +145,29 @@ class Idefics3Processor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        from transformers import AutoImageProcessor, AutoTokenizer
-        kwargs.pop("use_fast", None)
+        import json
+        from pathlib import Path
 
+        from transformers import AutoImageProcessor, AutoTokenizer
+
+        kwargs.pop("use_fast", None)
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
         image_processor = AutoImageProcessor.from_pretrained(
             pretrained_model_name_or_path, use_fast=False, **kwargs
         )
-        return cls(image_processor=image_processor, tokenizer=tokenizer)
+        # Read image_seq_len from processor_config.json if available
+        init_kwargs = {}
+        proc_cfg = Path(pretrained_model_name_or_path) / "processor_config.json"
+        if proc_cfg.exists():
+            with open(proc_cfg) as f:
+                cfg = json.load(f)
+            if "image_seq_len" in cfg:
+                init_kwargs["image_seq_len"] = cfg["image_seq_len"]
+        return cls(
+            image_processor=image_processor, tokenizer=tokenizer, **init_kwargs
+        )
 
     def __call__(
         self,
