@@ -644,8 +644,9 @@ class Ernie4_5_VLProcessor(ProcessorMixin):
             return self.tokenizer.encode(rendered)
         return rendered
 
-    @staticmethod
-    def from_pretrained(pretrained_model_name_or_path, **kwargs):
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        import json
         from pathlib import Path
 
         if not Path(pretrained_model_name_or_path).exists():
@@ -659,8 +660,18 @@ class Ernie4_5_VLProcessor(ProcessorMixin):
         tokenizer = Ernie4_5_VLTokenizer.from_pretrained(pretrained_model_name_or_path)
         image_processor = ImageProcessor()
 
-        return Ernie4_5_VLProcessor(
-            image_processor=image_processor, tokenizer=tokenizer
+        # Read processor_config.json for correct init kwargs
+        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
+        proc_kwargs = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+            for k in ("spatial_conv_size", "temporal_conv_size"):
+                if k in proc_cfg:
+                    proc_kwargs[k] = proc_cfg[k]
+
+        return cls(
+            image_processor=image_processor, tokenizer=tokenizer, **proc_kwargs
         )
 
 

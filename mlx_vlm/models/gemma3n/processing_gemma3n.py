@@ -168,6 +168,58 @@ class Gemma3nProcessor(ProcessorMixin):
         )
 
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        import json
+        from pathlib import Path
+
+        from transformers import AutoFeatureExtractor, AutoImageProcessor, AutoTokenizer
+
+        kwargs.pop("use_fast", None)
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path, **kwargs
+        )
+
+        proc_cfg_path = (
+            Path(pretrained_model_name_or_path) / "processor_config.json"
+        )
+        proc_kwargs = {}
+        ip_overrides = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+            for k in ("audio_seq_length", "image_seq_length"):
+                if k in proc_cfg:
+                    proc_kwargs[k] = proc_cfg[k]
+            ip_cfg = proc_cfg.get("image_processor", {})
+            if "patch_size" in ip_cfg:
+                ip_overrides["patch_size"] = ip_cfg["patch_size"]
+            if "size" in ip_cfg:
+                ip_overrides["size"] = ip_cfg["size"]
+
+        try:
+            feature_extractor = AutoFeatureExtractor.from_pretrained(
+                pretrained_model_name_or_path, **kwargs,
+            )
+        except (ValueError, OSError):
+            feature_extractor = None
+
+        try:
+            image_processor = AutoImageProcessor.from_pretrained(
+                pretrained_model_name_or_path, use_fast=False,
+                **ip_overrides, **kwargs,
+            )
+        except ValueError:
+            image_processor = AutoImageProcessor.from_pretrained(
+                pretrained_model_name_or_path, **ip_overrides, **kwargs,
+            )
+        return cls(
+            feature_extractor=feature_extractor,
+            image_processor=image_processor, tokenizer=tokenizer,
+            **proc_kwargs,
+        )
+
+
 __all__ = ["Gemma3nProcessor"]
 
 from ..base import install_auto_processor_patch

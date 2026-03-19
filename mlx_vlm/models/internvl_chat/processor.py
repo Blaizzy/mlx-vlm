@@ -368,8 +368,8 @@ class InternVLChatProcessor(ProcessorMixin):
     def save_pretrained(self, save_directory, **kwargs):
         pass
 
-    @staticmethod
-    def from_pretrained(pretrained_model_name_or_path, **kwargs):
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         import json
         from pathlib import Path
 
@@ -399,18 +399,34 @@ class InternVLChatProcessor(ProcessorMixin):
             min_dynamic_patch = config.get("min_dynamic_patch", 1)
             use_thumbnail = config.get("use_thumbnail", True)
 
+        # Read processor_config.json for correct init kwargs
+        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
+        proc_kwargs = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+            for k in ("num_image_token", "image_size", "patch_size", "downsample_ratio"):
+                if k in proc_cfg:
+                    proc_kwargs[k] = proc_cfg[k]
+
+        # proc_kwargs override config.json values if present
+        image_size = proc_kwargs.pop("image_size", image_size)
+        patch_size = proc_kwargs.pop("patch_size", patch_size)
+        downsample_ratio = proc_kwargs.pop("downsample_ratio", downsample_ratio)
+
         image_processor = InternVLImageProcessor(
             size=image_size,
             dynamic_max_num=max_dynamic_patch,
             dynamic_min_num=min_dynamic_patch,
             dynamic_use_thumbnail=use_thumbnail,
         )
-        return InternVLChatProcessor(
+        return cls(
             image_processor=image_processor,
             tokenizer=tokenizer,
             image_size=image_size,
             patch_size=patch_size,
             downsample_ratio=downsample_ratio,
+            **proc_kwargs,
         )
 
 

@@ -536,6 +536,53 @@ class DeepseekVLV2Processor(ProcessorMixin):
         return prepare
 
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        import json
+        from pathlib import Path
+
+        from transformers import AutoTokenizer
+
+        kwargs.pop("use_fast", None)
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path, **kwargs
+        )
+
+        proc_cfg_path = (
+            Path(pretrained_model_name_or_path) / "processor_config.json"
+        )
+        proc_kwargs = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+            for k in (
+                "candidate_resolutions",
+                "patch_size",
+                "downsample_ratio",
+                "image_mean",
+                "image_std",
+                "normalize",
+                "image_token",
+                "pad_token",
+                "add_special_token",
+                "sft_format",
+                "mask_prompt",
+                "ignore_id",
+            ):
+                if k in proc_cfg:
+                    proc_kwargs[k] = proc_cfg[k]
+            # Convert candidate_resolutions from list of lists to tuple of tuples
+            if "candidate_resolutions" in proc_kwargs:
+                proc_kwargs["candidate_resolutions"] = tuple(
+                    tuple(r) for r in proc_kwargs["candidate_resolutions"]
+                )
+
+        return cls(
+            tokenizer=tokenizer,
+            **proc_kwargs,
+        )
+
+
 from ..base import install_auto_processor_patch
 
 install_auto_processor_patch("deepseek_vl_v2", DeepseekVLV2Processor)

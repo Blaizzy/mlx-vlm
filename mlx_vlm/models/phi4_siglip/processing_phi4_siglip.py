@@ -215,6 +215,13 @@ class Phi4SigLipProcessor:
             else:
                 patch_size = 16
 
+        # Read processor_config.json for correct init kwargs
+        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
+        proc_kwargs = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+
         # Create NaFlex-compatible image processor
         if "naflex" in vision_tower_name.lower():
             try:
@@ -245,7 +252,7 @@ class Phi4SigLipProcessor:
                 size={"height": img_size, "width": img_size}
             )
 
-        return cls(image_processor=image_processor, tokenizer=tokenizer)
+        return cls(image_processor=image_processor, tokenizer=tokenizer, **proc_kwargs)
 
 
 # Register processor patch so AutoProcessor returns our custom processor

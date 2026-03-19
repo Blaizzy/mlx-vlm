@@ -79,6 +79,21 @@ class Moondream3Processor:
                 max_crops = vc.get("max_crops", max_crops)
                 overlap_margin = vc.get("overlap_margin", overlap_margin)
 
+        # Read processor_config.json for correct init kwargs
+        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
+        proc_kwargs = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+            for k in ("crop_size", "max_crops", "overlap_margin"):
+                if k in proc_cfg:
+                    proc_kwargs[k] = proc_cfg[k]
+
+        # proc_kwargs override config.json values if present
+        crop_size = proc_kwargs.pop("crop_size", crop_size)
+        max_crops = proc_kwargs.pop("max_crops", max_crops)
+        overlap_margin = proc_kwargs.pop("overlap_margin", overlap_margin)
+
         return cls(
             tokenizer=tokenizer,
             crop_size=crop_size,
