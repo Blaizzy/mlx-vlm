@@ -504,6 +504,16 @@ class KimiVLProcessor(ProcessorMixin):
             local_files_only=is_local,
         )
 
+        # Read processor_config.json for correct init kwargs
+        proc_cfg_path = model_path / "processor_config.json"
+        proc_kwargs = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+            for k in ("chat_template",):
+                if k in proc_cfg:
+                    proc_kwargs[k] = proc_cfg[k]
+
         # Load image processor config and create our processor
         image_processor_config = {}
         try:
@@ -534,7 +544,9 @@ class KimiVLProcessor(ProcessorMixin):
         image_processor = KimiVLImageProcessor(**image_processor_config)
 
         # Load chat template from jinja file if not already set on tokenizer
-        chat_template = getattr(tokenizer, "chat_template", None)
+        chat_template = proc_kwargs.pop("chat_template", None)
+        if chat_template is None:
+            chat_template = getattr(tokenizer, "chat_template", None)
         if chat_template is None:
             try:
                 if is_local:
@@ -556,6 +568,7 @@ class KimiVLProcessor(ProcessorMixin):
             image_processor=image_processor,
             tokenizer=tokenizer,
             chat_template=chat_template,
+            **proc_kwargs,
         )
 
 

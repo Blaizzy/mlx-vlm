@@ -219,6 +219,9 @@ class SmolVLMProcessor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        import json
+        from pathlib import Path
+
         from transformers import AutoImageProcessor, AutoTokenizer
 
         kwargs.pop("use_fast", None)
@@ -226,10 +229,33 @@ class SmolVLMProcessor(ProcessorMixin):
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
-        image_processor = AutoImageProcessor.from_pretrained(
-            pretrained_model_name_or_path, use_fast=False, **kwargs
+
+        # Read processor_config.json for correct init kwargs
+        proc_cfg_path = (
+            Path(pretrained_model_name_or_path) / "processor_config.json"
         )
-        return cls(image_processor=image_processor, tokenizer=tokenizer)
+        proc_kwargs = {}
+        ip_overrides = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+            for k in ("image_seq_len",):
+                if k in proc_cfg:
+                    proc_kwargs[k] = proc_cfg[k]
+            ip_cfg = proc_cfg.get("image_processor", {})
+            if "patch_size" in ip_cfg:
+                ip_overrides["patch_size"] = ip_cfg["patch_size"]
+            if "size" in ip_cfg:
+                ip_overrides["size"] = ip_cfg["size"]
+
+        image_processor = AutoImageProcessor.from_pretrained(
+            pretrained_model_name_or_path, use_fast=False,
+            **ip_overrides, **kwargs,
+        )
+        return cls(
+            image_processor=image_processor, tokenizer=tokenizer,
+            **proc_kwargs,
+        )
 
 
 __all__ = ["SmolVLMProcessor"]
