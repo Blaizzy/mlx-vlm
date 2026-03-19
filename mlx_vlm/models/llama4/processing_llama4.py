@@ -5,14 +5,121 @@ Adapted from HuggingFace Transformers:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama4/processing_llama4.py
 """
 
+import math
 from typing import List, Optional, Union
 
-from transformers.image_processing_utils import BatchFeature
+import numpy as np
+from PIL import Image
+from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 from transformers.image_utils import ImageInput, make_flat_list_of_images
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..base import to_mlx
+
+# Supported aspect ratios for Llama4 tiling
+POSSIBLE_RESOLUTIONS = [
+    (1, 1), (1, 2), (1, 3), (1, 4), (2, 1), (2, 2), (3, 1), (4, 1),
+]
+
+
+class Llama4ImageProcessor(BaseImageProcessor):
+    """Minimal image processor for Llama4 (replaces torchvision-dependent fast processor)."""
+
+    model_input_names = ["pixel_values"]
+
+    def __init__(
+        self,
+        size=336,
+        max_patches=16,
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.size = size
+        self.max_patches = max_patches
+        self.image_mean = np.array(image_mean, dtype=np.float32)
+        self.image_std = np.array(image_std, dtype=np.float32)
+
+    def _get_best_resolution(self, image_width, image_height):
+        best = (1, 1)
+        best_fit = float("inf")
+        for h, w in POSSIBLE_RESOLUTIONS:
+            if h * w > self.max_patches:
+                continue
+            scale = min(w * self.size / image_width, h * self.size / image_height)
+            fit = abs(image_width * scale - w * self.size) + abs(
+                image_height * scale - h * self.size
+            )
+            if fit < best_fit:
+                best_fit = fit
+                best = (h, w)
+        return best
+
+    def _split_into_tiles(self, image, aspect_ratio):
+        ratio_h, ratio_w = aspect_ratio
+        target_w = ratio_w * self.size
+        target_h = ratio_h * self.size
+        image = image.resize((target_w, target_h), Image.BICUBIC)
+        tiles = []
+        for i in range(ratio_h):
+            for j in range(ratio_w):
+                box = (
+                    j * self.size,
+                    i * self.size,
+                    (j + 1) * self.size,
+                    (i + 1) * self.size,
+                )
+                tiles.append(image.crop(box))
+        return tiles
+
+    def _preprocess_single(self, image):
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        # Normalize: rescale to [0,1] then normalize
+        arr = np.array(image).astype(np.float32) / 255.0
+        arr = (arr - self.image_mean) / self.image_std
+        # HWC -> CHW
+        return arr.transpose(2, 0, 1)
+
+    def preprocess(self, images, **kwargs):
+        if not isinstance(images, list):
+            images = [images]
+
+        all_pixel_values = []
+        aspect_ratios = []
+
+        for img in images:
+            if not isinstance(img, Image.Image):
+                img = Image.fromarray(np.uint8(img))
+            ar = self._get_best_resolution(img.width, img.height)
+            aspect_ratios.append(ar)
+            tiles = self._split_into_tiles(img, ar)
+            for tile in tiles:
+                all_pixel_values.append(self._preprocess_single(tile))
+
+        pixel_values = np.stack(all_pixel_values)
+        return {
+            "pixel_values": pixel_values,
+            "aspect_ratios": aspect_ratios,
+        }
+
+    def fetch_images(self, images):
+        """Normalize images input to a flat list of PIL Images."""
+        if isinstance(images, Image.Image):
+            return [images]
+        if isinstance(images, (list, tuple)):
+            result = []
+            for img in images:
+                if isinstance(img, Image.Image):
+                    result.append(img)
+                elif isinstance(img, (list, tuple)):
+                    result.extend(img)
+                else:
+                    result.append(img)
+            return result
+        return [images]
 
 
 class Llama4Processor(ProcessorMixin):
@@ -53,20 +160,28 @@ class Llama4Processor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        from transformers import AutoImageProcessor, AutoTokenizer
+        import json
+        from pathlib import Path
+
+        from transformers import AutoTokenizer
 
         kwargs.pop("use_fast", None)
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
-        try:
-            image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path, use_fast=False, **kwargs
-            )
-        except ValueError:
-            image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path, **kwargs
-            )
+
+        pp_cfg = Path(pretrained_model_name_or_path) / "preprocessor_config.json"
+        ip_kwargs = {}
+        if pp_cfg.exists():
+            with open(pp_cfg) as f:
+                cfg = json.load(f)
+            size = cfg.get("size", {})
+            ip_kwargs["size"] = size.get("height", 336) if isinstance(size, dict) else size
+            ip_kwargs["max_patches"] = cfg.get("max_patches", 16)
+            ip_kwargs["image_mean"] = cfg.get("image_mean", (0.5, 0.5, 0.5))
+            ip_kwargs["image_std"] = cfg.get("image_std", (0.5, 0.5, 0.5))
+
+        image_processor = Llama4ImageProcessor(**ip_kwargs)
         return cls(image_processor=image_processor, tokenizer=tokenizer)
 
     def _prompt_split_image(self, aspect_ratio, num_patches_per_chunk):
