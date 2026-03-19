@@ -154,6 +154,25 @@ class Mistral3Processor(ProcessorMixin):
         )
 
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        from transformers import AutoImageProcessor, AutoTokenizer
+
+        kwargs.pop("use_fast", None)
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path, **kwargs
+        )
+        try:
+            image_processor = AutoImageProcessor.from_pretrained(
+                pretrained_model_name_or_path, use_fast=False, **kwargs
+            )
+        except ValueError:
+            image_processor = AutoImageProcessor.from_pretrained(
+                pretrained_model_name_or_path, **kwargs
+            )
+        return cls(image_processor=image_processor, tokenizer=tokenizer)
+
+
 __all__ = ["Mistral3Processor"]
 
 from ..base import install_auto_processor_patch

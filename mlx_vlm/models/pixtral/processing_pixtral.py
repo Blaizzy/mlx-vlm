@@ -108,6 +108,10 @@ class PixtralProcessor(ProcessorMixin):
                             if batch_idx < len(image_sizes)
                             else []
                         )
+                        # Normalize: slow processor returns [(h,w)] flat,
+                        # ensure it's a list of tuples
+                        if sample_sizes and not isinstance(sample_sizes[0], (list, tuple)):
+                            sample_sizes = [sample_sizes]
                         parts = sample.split(self.image_token)
                         new_sample = parts[0]
                         for img_idx in range(len(parts) - 1):
@@ -156,6 +160,24 @@ class PixtralProcessor(ProcessorMixin):
                 tokenizer_input_names + image_processor_input_names + ["image_sizes"]
             )
         )
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        from transformers import AutoImageProcessor, AutoTokenizer
+
+        kwargs.pop("use_fast", None)
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path, **kwargs
+        )
+        try:
+            image_processor = AutoImageProcessor.from_pretrained(
+                pretrained_model_name_or_path, use_fast=False, **kwargs
+            )
+        except ValueError:
+            image_processor = AutoImageProcessor.from_pretrained(
+                pretrained_model_name_or_path, **kwargs
+            )
+        return cls(image_processor=image_processor, tokenizer=tokenizer)
 
 
 __all__ = ["PixtralProcessor"]
