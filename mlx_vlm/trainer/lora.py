@@ -31,19 +31,22 @@ class LoRaLayer(nn.Module):
             shape=(input_dims, rank),
         )
         self.B = mx.zeros((rank, output_dims))
+        self.rank = rank
         self.alpha = alpha
 
     def __call__(self, x):
         y = self.original_layer(x)
         lora_update = (self.dropout(x) @ self.A) @ self.B
-        return y + (self.alpha * lora_update).astype(x.dtype)
+        scaling = self.alpha / self.rank
+        return y + (scaling * lora_update).astype(x.dtype)
 
 
 def replace_lora_with_linear(model):
     for i, layer in enumerate(model.layers):
         if isinstance(layer, LoRaLayer):
             # Compute the final merged weight
-            lora_update = layer.alpha * (layer.A @ layer.B)
+            scaling = layer.alpha / layer.rank
+            lora_update = scaling * (layer.A @ layer.B)
             updated_weight = layer.original_layer.weight + lora_update
             use_bias = layer.original_layer.bias is not None
 

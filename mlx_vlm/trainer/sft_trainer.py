@@ -111,10 +111,10 @@ def vision_language_loss_fn(
     else:
         weight_mask = None
 
-    input_ids = input_ids[:, :-1]
-    attention_mask = attention_mask[:, :-1]
-
-    lengths = mx.sum(attention_mask, axis=1)
+    # Keep full sequence for model forward so multimodal position metadata
+    # (e.g. image_grid_thw) stays aligned with input_ids/attention_mask.
+    # Compute next-token loss by shifting logits/labels after forward.
+    lengths = mx.sum(attention_mask, axis=1) - 1
 
     labels = batch["input_ids"][:, 1:]
 
@@ -126,6 +126,7 @@ def vision_language_loss_fn(
 
     outputs = model(input_ids, pixel_values, attention_mask, **kwargs)
     logits = outputs.logits.astype(mx.float32)
+    logits = logits[:, :-1, :]
 
     def align_logits_with_labels(logits, labels):
         if logits.shape[1] < labels.shape[1]:
@@ -138,7 +139,7 @@ def vision_language_loss_fn(
 
     logits = align_logits_with_labels(logits, labels)
 
-    seq_len = input_ids.shape[1]
+    seq_len = labels.shape[1]
     lengths = mx.minimum(lengths, seq_len)
     length_mask = mx.arange(seq_len)[None, :] < lengths[:, None]
 
@@ -178,7 +179,10 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
         )
         for b in order:
             items = [dataset[idx] for idx in batch_indices[b]]
-            lengths = [min(len(x["input_ids"]), max_seq_length) for x in items]
+            lengths = [
+                min(np.array(x["input_ids"]).reshape(-1).shape[0], max_seq_length)
+                for x in items
+            ]
 
             max_len = min(max(lengths), max_seq_length)
             pad_to = 32
