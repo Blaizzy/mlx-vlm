@@ -56,7 +56,7 @@ MODEL_CONFIG = {
     "llama4": MessageFormat.LIST_WITH_IMAGE,
     "smolvlm": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "llava": MessageFormat.LIST_WITH_IMAGE,
-    "llava_next": MessageFormat.LIST_WITH_IMAGE,
+    "llava_next": MessageFormat.IMAGE_TOKEN,
     "mllama": MessageFormat.LIST_WITH_IMAGE,
     "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "molmo2": MessageFormat.LIST_WITH_IMAGE_FIRST,

@@ -62,6 +62,9 @@ class LlavaNextProcessor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        import json
+        from pathlib import Path
+
         from transformers import AutoImageProcessor, AutoTokenizer
 
         kwargs.pop("use_fast", None)
@@ -76,7 +79,24 @@ class LlavaNextProcessor(ProcessorMixin):
             image_processor = AutoImageProcessor.from_pretrained(
                 pretrained_model_name_or_path, **kwargs
             )
-        return cls(image_processor=image_processor, tokenizer=tokenizer)
+
+        # Read processor_config.json for patch_size, vision_feature_select_strategy
+        proc_kwargs = {}
+        proc_cfg_path = (
+            Path(pretrained_model_name_or_path) / "processor_config.json"
+        )
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+            for k in ("patch_size", "vision_feature_select_strategy",
+                       "image_token", "num_additional_image_tokens"):
+                if k in proc_cfg:
+                    proc_kwargs[k] = proc_cfg[k]
+
+        return cls(
+            image_processor=image_processor, tokenizer=tokenizer,
+            **proc_kwargs,
+        )
 
     def __call__(
         self,
