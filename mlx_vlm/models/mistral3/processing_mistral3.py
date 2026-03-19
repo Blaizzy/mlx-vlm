@@ -105,6 +105,10 @@ class Mistral3Processor(ProcessorMixin):
                             if batch_idx < len(image_sizes)
                             else []
                         )
+                        # Normalize: slow processor returns [(h,w)] flat,
+                        # ensure it's a list of tuples
+                        if sample_sizes and not isinstance(sample_sizes[0], (list, tuple)):
+                            sample_sizes = [sample_sizes]
                         parts = sample.split(self.image_token)
                         new_sample = parts[0]
                         for img_idx in range(len(parts) - 1):
@@ -156,21 +160,49 @@ class Mistral3Processor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        import json
+        from pathlib import Path
+
         from transformers import AutoImageProcessor, AutoTokenizer
 
         kwargs.pop("use_fast", None)
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
+
+        # Read processor_config.json for correct patch_size, spatial_merge_size, etc.
+        proc_cfg_path = (
+            Path(pretrained_model_name_or_path) / "processor_config.json"
+        )
+        proc_kwargs = {}
+        ip_overrides = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+            for k in ("patch_size", "spatial_merge_size", "image_token",
+                       "image_break_token", "image_end_token"):
+                if k in proc_cfg:
+                    proc_kwargs[k] = proc_cfg[k]
+            # Image processor config (patch_size, size, etc.)
+            ip_cfg = proc_cfg.get("image_processor", {})
+            if "patch_size" in ip_cfg:
+                ip_overrides["patch_size"] = ip_cfg["patch_size"]
+            if "size" in ip_cfg:
+                ip_overrides["size"] = ip_cfg["size"]
+
         try:
             image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path, use_fast=False, **kwargs
+                pretrained_model_name_or_path, use_fast=False,
+                **ip_overrides, **kwargs,
             )
         except ValueError:
             image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path, **kwargs
+                pretrained_model_name_or_path, **ip_overrides, **kwargs,
             )
-        return cls(image_processor=image_processor, tokenizer=tokenizer)
+        return cls(
+            image_processor=image_processor, tokenizer=tokenizer,
+            **proc_kwargs,
+        )
 
 
 __all__ = ["Mistral3Processor"]
