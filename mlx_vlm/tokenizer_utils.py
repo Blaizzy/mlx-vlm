@@ -229,7 +229,7 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         if self._byte_decoder[v[0]] == 32:
             current_text = bytearray(
                 self._byte_decoder[c] for c in self._unflushed
-            ).decode("utf-8")
+            ).decode("utf-8", errors="replace")
             if self.text or not self.trim_space:
                 self.text += current_text
             else:
