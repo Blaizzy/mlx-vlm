@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_vlm.trainer.datasets import VisionDataset
+from mlx_vlm.trainer.datasets import PreferenceVisionDataset, VisionDataset, get_prompt
 from mlx_vlm.trainer.sft_trainer import TrainingArgs, train
 
 
@@ -72,6 +72,82 @@ class TestDataset(unittest.TestCase):
         self.assertEqual(len(dataset), len(self.mock_hf_dataset))
         self.assertEqual(dataset.config, self.mock_config)
         self.assertEqual(dataset.processor, self.mock_processor)
+
+    def test_get_prompt_prefers_processor_apply_chat_template(self):
+        tokenizer = MagicMock()
+        tokenizer.chat_template = "{{ messages }}"
+        tokenizer.apply_chat_template = MagicMock(return_value="tokenizer-template")
+
+        processor = MagicMock()
+        processor.tokenizer = tokenizer
+        processor.apply_chat_template = MagicMock(return_value="processor-template")
+
+        prompt = get_prompt(
+            "qwen2_5_vl",
+            processor,
+            [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        )
+
+        self.assertEqual(prompt, "processor-template")
+        processor.apply_chat_template.assert_called_once()
+        tokenizer.apply_chat_template.assert_not_called()
+
+    @patch("mlx_vlm.trainer.datasets.get_prompt")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    def test_qwen_dataset_forwards_images_to_prepare_inputs(
+        self, mock_prepare_inputs, mock_get_prompt
+    ):
+        config = {"model_type": "qwen2_5_vl", "image_token_index": 151655}
+        dataset = VisionDataset(
+            self.mock_hf_dataset,
+            config,
+            self.mock_processor,
+        )
+
+        self.mock_hf_dataset.__getitem__.return_value = {
+            "images": ["image1.jpg"],
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        mock_get_prompt.return_value = "Mocked prompt"
+        mock_prepare_inputs.return_value = {
+            "input_ids": mx.array([1, 2, 3]),
+            "pixel_values": mx.array([[0.1, 0.2, 0.3]]),
+            "attention_mask": mx.array([1, 1, 1]),
+        }
+
+        _ = dataset[0]
+
+        call_kwargs = mock_prepare_inputs.call_args[1]
+        self.assertEqual(call_kwargs["images"], ["image1.jpg"])
+
+    @patch("mlx_vlm.utils.prepare_inputs")
+    def test_qwen_preference_dataset_forwards_images_to_prepare_inputs(
+        self, mock_prepare_inputs
+    ):
+        config = {"model_type": "qwen2_5_vl", "image_token_index": 151655}
+        dataset = PreferenceVisionDataset(
+            self.mock_hf_dataset,
+            config,
+            self.mock_processor,
+        )
+
+        self.mock_hf_dataset.__getitem__.return_value = {
+            "images": ["image1.jpg"],
+            "chosen": [{"role": "user", "content": "A"}],
+            "rejected": [{"role": "user", "content": "B"}],
+        }
+        self.mock_processor.apply_chat_template.return_value = "Mocked prompt"
+        mock_prepare_inputs.return_value = {
+            "input_ids": mx.array([1, 2, 3]),
+            "pixel_values": mx.array([[0.1, 0.2, 0.3]]),
+            "attention_mask": mx.array([1, 1, 1]),
+        }
+
+        _ = dataset[0]
+
+        self.assertEqual(mock_prepare_inputs.call_count, 2)
+        for call in mock_prepare_inputs.call_args_list:
+            self.assertEqual(call[1]["images"], ["image1.jpg"])
 
 
 class TestTrainer(unittest.TestCase):
