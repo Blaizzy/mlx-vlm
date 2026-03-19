@@ -98,9 +98,7 @@ class VisionDataset:
                 "Config must contain 'image_token_index' or 'image_token_id'"
             )
 
-        use_embedded_images = (
-            model_type.startswith("gemma") or model_type == "smolvlm"
-        )
+        use_embedded_images = model_type.startswith("gemma") or model_type == "smolvlm"
 
         inputs = prepare_inputs(
             processor=self.processor,
@@ -165,9 +163,7 @@ class PreferenceVisionDataset:
                 "Config must contain 'image_token_index' or 'image_token_id'"
             )
 
-        use_embedded_images = (
-            model_type.startswith("gemma") or model_type == "smolvlm"
-        )
+        use_embedded_images = model_type.startswith("gemma") or model_type == "smolvlm"
         images_for_inputs = (
             None if use_embedded_images else (images if images else None)
         )
