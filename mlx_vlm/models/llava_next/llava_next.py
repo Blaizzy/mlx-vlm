@@ -88,6 +88,8 @@ class Model(nn.Module):
             image_newline = mx.array(self.image_newline)
             image_features = mx.concatenate([image_features, image_newline], axis=0)
 
+        image_features = image_features.astype(inputs_embeds.dtype)
+
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self._merge_input_ids_with_image_features(
             image_features, inputs_embeds, input_ids
