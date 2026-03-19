@@ -535,6 +535,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
 
         return prepare
 
+
 from ..base import install_auto_processor_patch
 
 install_auto_processor_patch("deepseek_vl_v2", DeepseekVLV2Processor)

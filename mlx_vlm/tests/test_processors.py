@@ -5,7 +5,6 @@ import unittest
 import numpy as np
 from PIL import Image
 
-
 # ── Shared mocks ──────────────────────────────────────────────────────────────
 
 
@@ -670,9 +669,7 @@ class TestErnie4_5VLProcessor(_ProcessorTestBase, unittest.TestCase):
             {
                 "model_input_names": ["pixel_values"],
                 "__call__": lambda self, images, **kw: {
-                    "pixel_values": np.random.randn(1, 3, 224, 224).astype(
-                        np.float32
-                    ),
+                    "pixel_values": np.random.randn(1, 3, 224, 224).astype(np.float32),
                     "image_grid_thw": np.array([[1, 16, 16]], dtype=np.int64),
                 },
             },
@@ -686,9 +683,7 @@ class TestErnie4_5VLProcessor(_ProcessorTestBase, unittest.TestCase):
 
     def _image_call_args(self):
         return {
-            "text": [
-                "<|IMAGE_START|><|image@placeholder|><|IMAGE_END|>Describe"
-            ],
+            "text": ["<|IMAGE_START|><|image@placeholder|><|IMAGE_END|>Describe"],
             "images": [_make_image()],
         }
 
@@ -733,9 +728,7 @@ class TestErnie4_5VLProcessor(_ProcessorTestBase, unittest.TestCase):
         self.assertEqual(processor.merge_size, 2)
         self.assertEqual(processor.factor, 28)
 
-        (resized_h, resized_w), (grid_h, grid_w) = processor.get_smart_resize(
-            224, 224
-        )
+        (resized_h, resized_w), (grid_h, grid_w) = processor.get_smart_resize(224, 224)
         self.assertEqual(resized_h % 28, 0)
         self.assertEqual(resized_w % 28, 0)
         self.assertEqual(grid_h, resized_h // 14)
@@ -759,9 +752,7 @@ class TestErnie4_5VLProcessor(_ProcessorTestBase, unittest.TestCase):
 
         img_array = np.random.rand(3, 224, 224).astype(np.float32)
         patches = processor._extract_patches(img_array, 16, 16)
-        self.assertEqual(
-            patches.shape, ((16 // 2) * (16 // 2) * 4, 3 * 14 * 14)
-        )
+        self.assertEqual(patches.shape, ((16 // 2) * (16 // 2) * 4, 3 * 14 * 14))
 
         image = Image.new("RGB", (224, 224), color="red")
         result = processor(images=image)
@@ -847,7 +838,10 @@ def _assert_patch_intercepts(test_case, model_type, module_path, cls_name):
 class TestInternVLChatPatch(unittest.TestCase):
     def test_patch_intercepts(self):
         _assert_patch_intercepts(
-            self, "internvl_chat", "mlx_vlm.models.internvl_chat", "InternVLChatProcessor"
+            self,
+            "internvl_chat",
+            "mlx_vlm.models.internvl_chat",
+            "InternVLChatProcessor",
         )
 
 
@@ -861,7 +855,10 @@ class TestMolmoPatch(unittest.TestCase):
 class TestKimiVLPatch(unittest.TestCase):
     def test_patch_intercepts(self):
         _assert_patch_intercepts(
-            self, "kimi_vl", "mlx_vlm.models.kimi_vl.processing_kimi_vl", "KimiVLProcessor"
+            self,
+            "kimi_vl",
+            "mlx_vlm.models.kimi_vl.processing_kimi_vl",
+            "KimiVLProcessor",
         )
 
 
@@ -885,7 +882,10 @@ class TestHunYuanVLPatch(unittest.TestCase):
 class TestErnie4_5VLPatch(unittest.TestCase):
     def test_patch_intercepts(self):
         _assert_patch_intercepts(
-            self, "ernie4_5_moe_vl", "mlx_vlm.models.ernie4_5_moe_vl", "Ernie4_5_VLProcessor"
+            self,
+            "ernie4_5_moe_vl",
+            "mlx_vlm.models.ernie4_5_moe_vl",
+            "Ernie4_5_VLProcessor",
         )
 
 

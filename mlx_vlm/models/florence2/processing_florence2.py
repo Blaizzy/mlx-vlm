@@ -102,9 +102,7 @@ def _from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
     from transformers import AutoImageProcessor, AutoTokenizer
 
     kwargs.pop("use_fast", None)
-    tokenizer = AutoTokenizer.from_pretrained(
-        pretrained_model_name_or_path, **kwargs
-    )
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
     image_processor = AutoImageProcessor.from_pretrained(
         pretrained_model_name_or_path, use_fast=False, **kwargs
     )

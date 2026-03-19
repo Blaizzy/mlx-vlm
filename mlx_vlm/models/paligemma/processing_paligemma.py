@@ -112,6 +112,7 @@ class PaliGemmaProcessor(ProcessorMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         from transformers import AutoImageProcessor, AutoTokenizer
+
         kwargs.pop("use_fast", None)
 
         tokenizer = AutoTokenizer.from_pretrained(

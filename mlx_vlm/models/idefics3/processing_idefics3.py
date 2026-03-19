@@ -165,9 +165,7 @@ class Idefics3Processor(ProcessorMixin):
                 cfg = json.load(f)
             if "image_seq_len" in cfg:
                 init_kwargs["image_seq_len"] = cfg["image_seq_len"]
-        return cls(
-            image_processor=image_processor, tokenizer=tokenizer, **init_kwargs
-        )
+        return cls(image_processor=image_processor, tokenizer=tokenizer, **init_kwargs)
 
     def __call__(
         self,

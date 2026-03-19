@@ -217,10 +217,10 @@ class SmolVLMProcessor(ProcessorMixin):
         image_processor_input_names = self.image_processor.model_input_names
         return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
 
-
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         from transformers import AutoImageProcessor, AutoTokenizer
+
         kwargs.pop("use_fast", None)
 
         tokenizer = AutoTokenizer.from_pretrained(
