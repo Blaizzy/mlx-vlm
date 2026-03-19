@@ -54,7 +54,7 @@ def replace_lora_with_linear(model):
 
             # Create a new Linear layer with the updated parameters
             new_linear_layer = nn.Linear(
-                updated_weight.size(1), updated_weight.size(0), bias=use_bias
+                updated_weight.shape[1], updated_weight.shape[0], bias=use_bias
             )
 
             new_linear_layer.weight = updated_weight
