@@ -9,13 +9,13 @@ def get_prompt(model_type, processor, conversation):
         return conversation
 
     tokenizer = getattr(processor, "tokenizer", processor)
-    chat_template = getattr(tokenizer, "chat_template", None)
-
-    apply_fn = (
-        tokenizer.apply_chat_template
-        if chat_template
-        else getattr(processor, "apply_chat_template", None)
-    )
+    # Prefer processor-level chat template for multimodal models (e.g. Qwen VL)
+    # because tokenizer-level apply_chat_template can fail when message content
+    # is a list of {type: image/text, ...} chunks.
+    apply_fn = getattr(processor, "apply_chat_template", None)
+    if apply_fn is None:
+        chat_template = getattr(tokenizer, "chat_template", None)
+        apply_fn = tokenizer.apply_chat_template if chat_template else None
 
     if apply_fn is None:
         raise ValueError("Processor/Tokenizer has no apply_chat_template method.")
@@ -99,9 +99,7 @@ class VisionDataset:
             )
 
         use_embedded_images = (
-            model_type.startswith("gemma")
-            or model_type.startswith("qwen")
-            or model_type == "smolvlm"
+            model_type.startswith("gemma") or model_type == "smolvlm"
         )
 
         inputs = prepare_inputs(
@@ -168,9 +166,7 @@ class PreferenceVisionDataset:
             )
 
         use_embedded_images = (
-            model_type.startswith("gemma")
-            or model_type.startswith("qwen")
-            or model_type == "smolvlm"
+            model_type.startswith("gemma") or model_type == "smolvlm"
         )
         images_for_inputs = (
             None if use_embedded_images else (images if images else None)
