@@ -736,6 +736,8 @@ def resize_image(img, max_size):
 def process_image(img, resize_shape, image_processor):
     if isinstance(img, str):
         img = load_image(img)
+    if hasattr(img, "mode") and img.mode != "RGB":
+        img = img.convert("RGB")
     if resize_shape is not None and not isinstance(image_processor, BaseImageProcessor):
         img = resize_image(img, resize_shape)
     return img

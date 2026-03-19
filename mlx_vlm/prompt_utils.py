@@ -381,13 +381,9 @@ class MessageFormatter:
             # Build prefix: images first, then audio (matches HF model format)
             prefix_parts = []
             if not skip_image_token and num_images > 0:
-                # phi3_v uses single token regardless of num_images
-                if self.model_name == "phi3_v":
-                    prefix_parts.append("<|image_1|>")
-                else:
-                    prefix_parts.append(
-                        "".join([f"<|image_{i+1}|>" for i in range(num_images)])
-                    )
+                prefix_parts.append(
+                    "".join([f"<|image_{i+1}|>" for i in range(num_images)])
+                )
             if not skip_audio_token and num_audios > 0:
                 prefix_parts.append(
                     "".join([f"<|audio_{i+1}|>" for i in range(num_audios)])
