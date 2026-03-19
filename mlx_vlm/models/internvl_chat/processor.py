@@ -249,10 +249,15 @@ class InternVLImageProcessor(BaseImageProcessor):
 
             processed_images_batch.append(pixel_values)
 
-        # At this point, processed_images_batch contains a list of mx arrays,
-        # each array corresponding to an input image with stacked blocks.
+        # Track per-image tile counts for multi-image token insertion
+        num_patches_list = [pv.shape[0] for pv in processed_images_batch]
 
-        data = {"pixel_values": mx.array(processed_images_batch)}
+        # Concatenate all tiles: (total_tiles, C, H, W) → (1, total_tiles, C, H, W)
+        pixel_values = mx.concatenate(processed_images_batch, axis=0)
+        data = {
+            "pixel_values": mx.expand_dims(pixel_values, axis=0),
+            "num_patches_list": num_patches_list,
+        }
         return BatchFeature(data=data, tensor_type=None)
 
 
@@ -310,9 +315,6 @@ class InternVLChatProcessor(ProcessorMixin):
             if isinstance(text, str):
                 text = [text]
 
-            if len(text) == 1 and images is not None and len(images) > 1:
-                raise ValueError("Multi-image inference is not supported.")
-
         if images is not None:
             image_features = self.image_processor.preprocess(
                 images, return_tensors=return_tensors, **kwargs
@@ -322,20 +324,37 @@ class InternVLChatProcessor(ProcessorMixin):
         if text is not None:
             queries = []
 
-            for idx in range(len(images)):
-                question = text[idx]
+            num_patches_list = image_features.pop("num_patches_list", [])
 
-                if images is not None and "<image>" not in question:
-                    question = "<image>\n" + question
+            if images is not None and len(text) == 1 and len(images) >= 1:
+                # Single prompt with one or more images
+                question = text[0]
+                n_placeholders = question.count("<image>")
+                if n_placeholders < len(images):
+                    question = "<image>\n" * (len(images) - n_placeholders) + question
 
-                num_patches = image_features["pixel_values"][idx].shape[0]
-                image_tokens = (
-                    IMG_START_TOKEN
-                    + IMG_CONTEXT_TOKEN * self.num_image_token * num_patches
-                    + IMG_END_TOKEN
-                )
-                question = question.replace("<image>", image_tokens, 1)
+                for idx in range(len(images)):
+                    np_count = num_patches_list[idx] if idx < len(num_patches_list) else 1
+                    image_tokens = (
+                        IMG_START_TOKEN
+                        + IMG_CONTEXT_TOKEN * self.num_image_token * np_count
+                        + IMG_END_TOKEN
+                    )
+                    question = question.replace("<image>", image_tokens, 1)
                 queries.append(question)
+            else:
+                for idx in range(len(images)):
+                    question = text[idx]
+                    if images is not None and "<image>" not in question:
+                        question = "<image>\n" + question
+                    np_count = num_patches_list[idx] if idx < len(num_patches_list) else 1
+                    image_tokens = (
+                        IMG_START_TOKEN
+                        + IMG_CONTEXT_TOKEN * self.num_image_token * np_count
+                        + IMG_END_TOKEN
+                    )
+                    question = question.replace("<image>", image_tokens, 1)
+                    queries.append(question)
 
             self.tokenizer.padding_side = "left"
             text_inputs = self.tokenizer(
