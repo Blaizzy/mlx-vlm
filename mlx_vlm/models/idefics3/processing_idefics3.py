@@ -237,8 +237,8 @@ class Idefics3Processor(ProcessorMixin):
                 for sample in images
             ]
 
-            # Separate image kwargs
-            images_kwargs = {}
+            # Separate image kwargs — always request row/col info for tiling
+            images_kwargs = {"return_row_col_info": True}
             for k in list(kwargs.keys()):
                 if k in ("return_row_col_info",):
                     images_kwargs[k] = kwargs.pop(k)
