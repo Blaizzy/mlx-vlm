@@ -5,7 +5,6 @@ Adapted from HuggingFace Transformers:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama4/processing_llama4.py
 """
 
-import math
 from typing import List, Optional, Union
 
 import numpy as np
@@ -19,7 +18,14 @@ from ..base import load_chat_template, to_mlx
 
 # Supported aspect ratios for Llama4 tiling
 POSSIBLE_RESOLUTIONS = [
-    (1, 1), (1, 2), (1, 3), (1, 4), (2, 1), (2, 2), (3, 1), (4, 1),
+    (1, 1),
+    (1, 2),
+    (1, 3),
+    (1, 4),
+    (2, 1),
+    (2, 2),
+    (3, 1),
+    (4, 1),
 ]
 
 
@@ -177,7 +183,9 @@ class Llama4Processor(ProcessorMixin):
             with open(pp_cfg) as f:
                 cfg = json.load(f)
             size = cfg.get("size", {})
-            ip_kwargs["size"] = size.get("height", 336) if isinstance(size, dict) else size
+            ip_kwargs["size"] = (
+                size.get("height", 336) if isinstance(size, dict) else size
+            )
             ip_kwargs["max_patches"] = cfg.get("max_patches", 16)
             ip_kwargs["image_mean"] = cfg.get("image_mean", (0.5, 0.5, 0.5))
             ip_kwargs["image_std"] = cfg.get("image_std", (0.5, 0.5, 0.5))

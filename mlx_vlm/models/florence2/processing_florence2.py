@@ -107,9 +107,7 @@ def _from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
     kwargs.pop("use_fast", None)
     tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
 
-    proc_cfg_path = (
-        Path(pretrained_model_name_or_path) / "processor_config.json"
-    )
+    proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
     ip_overrides = {}
     if proc_cfg_path.exists():
         with open(proc_cfg_path) as f:
@@ -122,12 +120,16 @@ def _from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
 
     try:
         image_processor = AutoImageProcessor.from_pretrained(
-            pretrained_model_name_or_path, use_fast=False,
-            **ip_overrides, **kwargs,
+            pretrained_model_name_or_path,
+            use_fast=False,
+            **ip_overrides,
+            **kwargs,
         )
     except ValueError:
         image_processor = AutoImageProcessor.from_pretrained(
-            pretrained_model_name_or_path, **ip_overrides, **kwargs,
+            pretrained_model_name_or_path,
+            **ip_overrides,
+            **kwargs,
         )
     return cls(image_processor=image_processor, tokenizer=tokenizer)
 

@@ -695,11 +695,7 @@ class Phi4MMProcessor(ProcessorMixin):
             pass
 
         # Read processor_config.json for correct init kwargs
-        proc_cfg_path = (
-            model_path / "processor_config.json"
-            if is_local
-            else None
-        )
+        proc_cfg_path = model_path / "processor_config.json" if is_local else None
         proc_kwargs = {}
         if proc_cfg_path is not None and proc_cfg_path.exists():
             with open(proc_cfg_path) as f:

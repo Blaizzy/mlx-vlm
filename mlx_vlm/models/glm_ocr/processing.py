@@ -196,6 +196,7 @@ class GlmOcrProcessor(ProcessorMixin):
             **kwargs,
         )
         from ..base import load_chat_template
+
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
         # Read processor_config.json for correct init kwargs
@@ -218,7 +219,12 @@ class GlmOcrProcessor(ProcessorMixin):
             **kwargs,
         )
 
-        return cls(image_processor=image_processor, tokenizer=tokenizer, **proc_kwargs, **kwargs)
+        return cls(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            **proc_kwargs,
+            **kwargs,
+        )
 
 
 __all__ = ["GlmOcrProcessor"]

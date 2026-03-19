@@ -723,6 +723,7 @@ class MiniCPMOProcessor(ProcessorMixin):
                 **hf_kwargs,
             )
 from ..base import load_chat_template
+
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
         audio_processor = WhisperFeatureExtractor.from_pretrained(

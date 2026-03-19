@@ -167,7 +167,6 @@ class Gemma3nProcessor(ProcessorMixin):
             + audio_processor_input_names
         )
 
-
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         import json
@@ -181,9 +180,7 @@ class Gemma3nProcessor(ProcessorMixin):
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
-        proc_cfg_path = (
-            Path(pretrained_model_name_or_path) / "processor_config.json"
-        )
+        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
         proc_kwargs = {}
         ip_overrides = {}
         if proc_cfg_path.exists():
@@ -200,23 +197,29 @@ class Gemma3nProcessor(ProcessorMixin):
 
         try:
             feature_extractor = AutoFeatureExtractor.from_pretrained(
-                pretrained_model_name_or_path, **kwargs,
+                pretrained_model_name_or_path,
+                **kwargs,
             )
         except (ValueError, OSError):
             feature_extractor = None
 
         try:
             image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path, use_fast=False,
-                **ip_overrides, **kwargs,
+                pretrained_model_name_or_path,
+                use_fast=False,
+                **ip_overrides,
+                **kwargs,
             )
         except ValueError:
             image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path, **ip_overrides, **kwargs,
+                pretrained_model_name_or_path,
+                **ip_overrides,
+                **kwargs,
             )
         return cls(
             feature_extractor=feature_extractor,
-            image_processor=image_processor, tokenizer=tokenizer,
+            image_processor=image_processor,
+            tokenizer=tokenizer,
             **proc_kwargs,
         )
 

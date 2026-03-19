@@ -529,6 +529,7 @@ class HunYuanVLProcessor(ProcessorMixin):
             **kwargs,
         )
         from ..base import load_chat_template
+
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
         # Read processor_config.json for correct init kwargs
@@ -539,7 +540,12 @@ class HunYuanVLProcessor(ProcessorMixin):
                 proc_cfg = json.load(f)
 
         image_processor = HunYuanVLImageProcessor(**kwargs)
-        return cls(image_processor=image_processor, tokenizer=tokenizer, **proc_kwargs, **kwargs)
+        return cls(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            **proc_kwargs,
+            **kwargs,
+        )
 
 
 def split_image_into_patch_blocks(

@@ -334,7 +334,9 @@ class InternVLChatProcessor(ProcessorMixin):
                     question = "<image>\n" * (len(images) - n_placeholders) + question
 
                 for idx in range(len(images)):
-                    np_count = num_patches_list[idx] if idx < len(num_patches_list) else 1
+                    np_count = (
+                        num_patches_list[idx] if idx < len(num_patches_list) else 1
+                    )
                     image_tokens = (
                         IMG_START_TOKEN
                         + IMG_CONTEXT_TOKEN * self.num_image_token * np_count
@@ -347,7 +349,9 @@ class InternVLChatProcessor(ProcessorMixin):
                     question = text[idx]
                     if images is not None and "<image>" not in question:
                         question = "<image>\n" + question
-                    np_count = num_patches_list[idx] if idx < len(num_patches_list) else 1
+                    np_count = (
+                        num_patches_list[idx] if idx < len(num_patches_list) else 1
+                    )
                     image_tokens = (
                         IMG_START_TOKEN
                         + IMG_CONTEXT_TOKEN * self.num_image_token * np_count
@@ -396,6 +400,7 @@ class InternVLChatProcessor(ProcessorMixin):
             pretrained_model_name_or_path, **kwargs
         )
         from ..base import load_chat_template
+
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
         # Load model config to get image processing parameters
@@ -426,7 +431,12 @@ class InternVLChatProcessor(ProcessorMixin):
         if proc_cfg_path.exists():
             with open(proc_cfg_path) as f:
                 proc_cfg = json.load(f)
-            for k in ("num_image_token", "image_size", "patch_size", "downsample_ratio"):
+            for k in (
+                "num_image_token",
+                "image_size",
+                "patch_size",
+                "downsample_ratio",
+            ):
                 if k in proc_cfg:
                     proc_kwargs[k] = proc_cfg[k]
 

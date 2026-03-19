@@ -166,7 +166,6 @@ class Qwen3VLProcessor(ProcessorMixin):
             )
         )
 
-
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         import json
@@ -181,9 +180,7 @@ class Qwen3VLProcessor(ProcessorMixin):
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
         # Read processor_config.json for correct init kwargs
-        proc_cfg_path = (
-            Path(pretrained_model_name_or_path) / "processor_config.json"
-        )
+        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
         proc_kwargs = {}
         ip_overrides = {}
         if proc_cfg_path.exists():
@@ -200,15 +197,20 @@ class Qwen3VLProcessor(ProcessorMixin):
 
         try:
             image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path, use_fast=False,
-                **ip_overrides, **kwargs,
+                pretrained_model_name_or_path,
+                use_fast=False,
+                **ip_overrides,
+                **kwargs,
             )
         except ValueError:
             image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path, **ip_overrides, **kwargs,
+                pretrained_model_name_or_path,
+                **ip_overrides,
+                **kwargs,
             )
         return cls(
-            image_processor=image_processor, tokenizer=tokenizer,
+            image_processor=image_processor,
+            tokenizer=tokenizer,
             **proc_kwargs,
         )
 

@@ -670,9 +670,7 @@ class Ernie4_5_VLProcessor(ProcessorMixin):
                 if k in proc_cfg:
                     proc_kwargs[k] = proc_cfg[k]
 
-        return cls(
-            image_processor=image_processor, tokenizer=tokenizer, **proc_kwargs
-        )
+        return cls(image_processor=image_processor, tokenizer=tokenizer, **proc_kwargs)
 
 
 from ..base import install_auto_processor_patch

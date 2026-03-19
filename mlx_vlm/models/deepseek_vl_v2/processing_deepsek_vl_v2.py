@@ -535,7 +535,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
 
         return prepare
 
-
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         import json
@@ -548,11 +547,10 @@ class DeepseekVLV2Processor(ProcessorMixin):
             pretrained_model_name_or_path, **kwargs
         )
         from ..base import load_chat_template
+
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
-        proc_cfg_path = (
-            Path(pretrained_model_name_or_path) / "processor_config.json"
-        )
+        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
         proc_kwargs = {}
         if proc_cfg_path.exists():
             with open(proc_cfg_path) as f:
