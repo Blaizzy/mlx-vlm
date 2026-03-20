@@ -504,7 +504,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
         """
 
         Args:
-            prompt (str): the formatted prompt;
+            prompt (str or List[str]): the formatted prompt(s);
             conversations (List[Dict]): conversations with a list of messages;
             images (List[ImageType]): the list of images;
             apply_sft_format (bool): if prompt is not None, then apply the SFT format to prompt;
@@ -521,6 +521,24 @@ class DeepseekVLV2Processor(ProcessorMixin):
                 - image_id (int): the id of the image token
                 - num_image_tokens (List[int]): the number of image tokens
         """
+
+        # Handle batch inputs: text is a list of prompts, images is a list of images
+        if isinstance(text, list):
+            if images is None:
+                images = [None] * len(text)
+            samples = []
+            for t, img in zip(text, images):
+                img_list = [img] if img is not None else []
+                samples.append(
+                    self.process_one(
+                        prompt=t,
+                        images=img_list,
+                        apply_sft_format=apply_sft_format,
+                        inference_mode=inference_mode,
+                        system_prompt=system_prompt,
+                    )
+                )
+            return self.batchify(samples)
 
         prepare = self.process_one(
             prompt=text,

@@ -147,7 +147,7 @@ class Model(nn.Module):
             inputs_embeds=input_embeddings_features.inputs_embeds,
             mask=mask,
             cache=cache,
-            image_grid_thw=image_grid_thw,
+            image_grid_thw=kwargs.get("image_grid_thw", None),
         )
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:

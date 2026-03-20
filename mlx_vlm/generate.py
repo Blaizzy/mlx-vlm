@@ -759,6 +759,10 @@ def _make_cache(model, left_padding):
     def to_batch_cache(c):
         if isinstance(c, cache.KVCache):
             return cache.BatchKVCache(left_padding)
+        elif isinstance(c, cache.ChunkedKVCache):
+            return cache.BatchKVCache(left_padding)
+        elif isinstance(c, cache.SimpleKVCache):
+            return cache.BatchKVCache(left_padding)
         elif isinstance(c, cache.ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
@@ -767,7 +771,9 @@ def _make_cache(model, left_padding):
                 raise ValueError("RotatingKVCache with keep tokens is not supported.")
             return cache.BatchRotatingKVCache(c.max_size, left_padding)
         elif isinstance(c, cache.CacheList):
-            return cache.BatchCacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
+            return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
+        elif isinstance(c, tuple):
+            return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c))
         else:
             raise ValueError(f"{type(c)} does not yet support batching")
 
