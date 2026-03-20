@@ -85,7 +85,10 @@ class Attention(nn.Module):
                 offset_scalar = offset_scalar.max().item()
             attn_scales = (
                 mx.log(
-                    mx.floor(mx.arange(offset_scalar + 1, offset_scalar + L + 1) / self.floor_scale)
+                    mx.floor(
+                        mx.arange(offset_scalar + 1, offset_scalar + L + 1)
+                        / self.floor_scale
+                    )
                     + 1.0
                 )
                 * self.attn_scale

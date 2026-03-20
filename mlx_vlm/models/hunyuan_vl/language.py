@@ -204,7 +204,9 @@ class Attention(nn.Module):
             offset = cache.offset
             # Handle array-valued offset from BatchKVCache
             if isinstance(offset, mx.array):
-                offset_scalar = (offset.max().item() if offset.ndim > 0 else offset.item())
+                offset_scalar = (
+                    offset.max().item() if offset.ndim > 0 else offset.item()
+                )
             else:
                 offset_scalar = int(offset)
             kv_seq_len += offset_scalar
