@@ -922,11 +922,14 @@ class BatchGenerator:
         left_padding = [max_length - l for l in lengths]
         inputs = _left_pad_prompts(inputs, max_length=max_length)
 
-        prompt_cache = (
-            _make_cache(self.model, left_padding)
-            if self.prompt_cache is None
-            else self.prompt_cache
-        )
+        if self.prompt_cache is not None:
+            prompt_cache = self.prompt_cache
+        elif len(uids) == 1 and max(left_padding) == 0:
+            # Single prompt with no padding: use standard caches to avoid
+            # numerical divergence from batch cache wrappers.
+            prompt_cache = cache.make_prompt_cache(self.model)
+        else:
+            prompt_cache = _make_cache(self.model, left_padding)
 
         # Slice batch data in kwargs to match current batch size
         batch_size = len(uids)
