@@ -477,7 +477,9 @@ class Model(nn.Module):
         # (connector output can exceed float16 max 65504).
         # Keep float32 — the LM layers will handle the dtype internally.
         x_flat = x.reshape(-1, dim).astype(mx.float32)
-        x_flat = x_flat.at[image_indices].add(image_features.reshape(-1, dim).astype(mx.float32))
+        x_flat = x_flat.at[image_indices].add(
+            image_features.reshape(-1, dim).astype(mx.float32)
+        )
         x = x_flat.reshape(x.shape)
 
         # Build subpatch keys from ViT features (not from transformer output)
@@ -957,9 +959,7 @@ class Model(nn.Module):
                 new_k = "lm.model." + new_k[len("transformer.") :]
 
             # ViT: vit.transformer.resblocks -> vision_model.resblocks
-            new_k = new_k.replace(
-                "vit.transformer.resblocks", "vision_model.resblocks"
-            )
+            new_k = new_k.replace("vit.transformer.resblocks", "vision_model.resblocks")
             # ViT: vit.* -> vision_model.* (remaining keys)
             if new_k.startswith("vit."):
                 new_k = "vision_model." + new_k[len("vit.") :]
