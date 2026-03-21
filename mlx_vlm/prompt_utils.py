@@ -2,8 +2,6 @@ from enum import Enum
 from functools import partial
 from typing import Any, Dict, List, Union
 
-from pydantic import BaseModel
-
 
 class MessageFormat(Enum):
     """Enum for different message format types."""
@@ -129,6 +127,15 @@ def extract_text_from_content(content: Any) -> str:
 
     # Fallback: convert to string (shouldn't happen in normal usage)
     return str(content) if content else ""
+
+
+def _get_role_content(item: Any) -> Union[tuple[str, Any], None]:
+    """Return (role, content) for a message-like item (dict or object with .role/.content), else None."""
+    if isinstance(item, dict):
+        return item.get("role", "user"), item.get("content")
+    if hasattr(item, "role") and hasattr(item, "content"):
+        return getattr(item, "role", "user"), getattr(item, "content", "")
+    return None
 
 
 class MessageBuilder:
@@ -374,13 +381,9 @@ class MessageFormatter:
             # Build prefix: images first, then audio (matches HF model format)
             prefix_parts = []
             if not skip_image_token and num_images > 0:
-                # phi3_v uses single token regardless of num_images
-                if self.model_name == "phi3_v":
-                    prefix_parts.append("<|image_1|>")
-                else:
-                    prefix_parts.append(
-                        "".join([f"<|image_{i+1}|>" for i in range(num_images)])
-                    )
+                prefix_parts.append(
+                    "".join([f"<|image_{i+1}|>" for i in range(num_images)])
+                )
             if not skip_audio_token and num_audios > 0:
                 prefix_parts.append(
                     "".join([f"<|audio_{i+1}|>" for i in range(num_audios)])
@@ -483,7 +486,8 @@ def get_chat_template(
 
         if isinstance(content, list):
             parts = []
-            multimodal_markers = {image_token, "<audio>", "<video>"}
+            audio_marker = kwargs.get("audio_token", "<audio>")
+            multimodal_markers = {image_token, audio_marker, "<audio>", "<video>"}
             for item in content:
                 if isinstance(item, dict):
                     item_type = item.get("type", "")
@@ -694,17 +698,9 @@ def apply_chat_template(
                         **kwargs,
                     )
                 )
-            elif isinstance(p, dict) or isinstance(p, BaseModel):
-                role = "user"
-                content = ""
-                if isinstance(p, dict):
-                    role = p.get("role", "user")
-                    content = p.get("content")
-                else:
-                    role = p.role
-                    content = p.content
+            elif (role_content := _get_role_content(p)) is not None:
+                role, content = role_content
                 # Handle multimodal content: extract only text, skip image/audio URLs
-                # This prevents base64 image data from being tokenized as text
                 content = extract_text_from_content(content)
                 is_first = i == 0 or (i == 1 and role not in ["system", "assistant"])
                 messages.append(

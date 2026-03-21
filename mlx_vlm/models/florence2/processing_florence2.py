@@ -96,4 +96,44 @@ def _patched_init(self, image_processor=None, tokenizer=None, **kwargs):
 
 Florence2Processor.__init__ = _patched_init
 
+
+@classmethod
+def _from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+    import json
+    from pathlib import Path
+
+    from transformers import AutoImageProcessor, AutoTokenizer
+
+    kwargs.pop("use_fast", None)
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
+
+    proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
+    ip_overrides = {}
+    if proc_cfg_path.exists():
+        with open(proc_cfg_path) as f:
+            proc_cfg = json.load(f)
+        ip_cfg = proc_cfg.get("image_processor", {})
+        if "patch_size" in ip_cfg:
+            ip_overrides["patch_size"] = ip_cfg["patch_size"]
+        if "size" in ip_cfg:
+            ip_overrides["size"] = ip_cfg["size"]
+
+    try:
+        image_processor = AutoImageProcessor.from_pretrained(
+            pretrained_model_name_or_path,
+            use_fast=False,
+            **ip_overrides,
+            **kwargs,
+        )
+    except ValueError:
+        image_processor = AutoImageProcessor.from_pretrained(
+            pretrained_model_name_or_path,
+            **ip_overrides,
+            **kwargs,
+        )
+    return cls(image_processor=image_processor, tokenizer=tokenizer)
+
+
+Florence2Processor.from_pretrained = _from_pretrained
+
 install_auto_processor_patch("florence2", Florence2Processor)

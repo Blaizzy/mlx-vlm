@@ -9,7 +9,6 @@ import mlx.core as mx
 import numpy as np
 import sentencepiece as spm
 from PIL import Image
-from transformers import AutoImageProcessor, AutoProcessor
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import (
     BaseImageProcessor as HFBaseImageProcessor,
@@ -589,22 +588,10 @@ class Ernie4_5_VLProcessor(ProcessorMixin):
                 padded_input_ids.append(padded_ids)
                 attention_masks.append(mask)
 
-            if images is None:
-                if len(padded_input_ids) == 1:
-                    text_inputs = {
-                        "input_ids": padded_input_ids[0],
-                        "attention_mask": attention_masks[0],
-                    }
-                else:
-                    text_inputs = {
-                        "input_ids": padded_input_ids,
-                        "attention_mask": attention_masks,
-                    }
-            else:
-                text_inputs = {
-                    "input_ids": mx.array(padded_input_ids),
-                    "attention_mask": mx.array(attention_masks),
-                }
+            text_inputs = {
+                "input_ids": mx.array(padded_input_ids),
+                "attention_mask": mx.array(attention_masks),
+            }
         else:
             text_inputs = {}
 
@@ -657,8 +644,9 @@ class Ernie4_5_VLProcessor(ProcessorMixin):
             return self.tokenizer.encode(rendered)
         return rendered
 
-    @staticmethod
-    def from_pretrained(pretrained_model_name_or_path, **kwargs):
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        import json
         from pathlib import Path
 
         if not Path(pretrained_model_name_or_path).exists():
@@ -672,15 +660,19 @@ class Ernie4_5_VLProcessor(ProcessorMixin):
         tokenizer = Ernie4_5_VLTokenizer.from_pretrained(pretrained_model_name_or_path)
         image_processor = ImageProcessor()
 
-        return Ernie4_5_VLProcessor(
-            image_processor=image_processor, tokenizer=tokenizer
-        )
+        # Read processor_config.json for correct init kwargs
+        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
+        proc_kwargs = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+            for k in ("spatial_conv_size", "temporal_conv_size"):
+                if k in proc_cfg:
+                    proc_kwargs[k] = proc_cfg[k]
+
+        return cls(image_processor=image_processor, tokenizer=tokenizer, **proc_kwargs)
 
 
-MODEL_TYPE = "ernie4_5_moe_vl"
+from ..base import install_auto_processor_patch
 
-try:
-    AutoImageProcessor.register(MODEL_TYPE, slow_image_processor_class=ImageProcessor)
-    AutoProcessor.register(MODEL_TYPE, Ernie4_5_VLProcessor)
-except Exception as e:
-    raise Exception(f"Error registering {MODEL_TYPE} processor: {e}")
+install_auto_processor_patch("ernie4_5_moe_vl", Ernie4_5_VLProcessor)

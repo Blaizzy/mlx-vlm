@@ -183,6 +183,9 @@ class GlmOcrProcessor(ProcessorMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         """Load processor from pretrained model path."""
+        import json
+        from pathlib import Path
+
         from transformers import AutoImageProcessor, AutoTokenizer
 
         trust_remote_code = kwargs.pop("trust_remote_code", True)
@@ -192,14 +195,36 @@ class GlmOcrProcessor(ProcessorMixin):
             trust_remote_code=trust_remote_code,
             **kwargs,
         )
+        from ..base import load_chat_template
+
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
+
+        # Read processor_config.json for correct init kwargs
+        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
+        proc_kwargs = {}
+        ip_overrides = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+            ip_cfg = proc_cfg.get("image_processor", {})
+            if "patch_size" in ip_cfg:
+                ip_overrides["patch_size"] = ip_cfg["patch_size"]
+            if "size" in ip_cfg:
+                ip_overrides["size"] = ip_cfg["size"]
 
         image_processor = AutoImageProcessor.from_pretrained(
             pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
+            **ip_overrides,
             **kwargs,
         )
 
-        return cls(image_processor=image_processor, tokenizer=tokenizer, **kwargs)
+        return cls(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            **proc_kwargs,
+            **kwargs,
+        )
 
 
 __all__ = ["GlmOcrProcessor"]

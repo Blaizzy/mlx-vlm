@@ -202,15 +202,15 @@ class VisionEmbeddings(nn.Module):
         Resize positional embeddings to image-specific size and pad to a fixed size.
 
         Args:
-            positional_embeddings (`torch.Tensor`):
+            positional_embeddings (`mx.array`):
                 Position embeddings of shape (height, width, embed_dim)
-            spatial_shapes (`torch.LongTensor`):
+            spatial_shapes (`mx.array`):
                 Spatial shapes of shape (batch_size, 2) to resize the positional embeddings to
             max_length (`int`):
                 Maximum length of the positional embeddings to pad resized positional embeddings to
 
         Returns:
-            `torch.Tensor`: Embeddings of shape (batch_size, max_length, embed_dim)
+            `mx.array`: Embeddings of shape (batch_size, max_length, embed_dim)
         """
         batch_size = spatial_shapes.shape[0]
         embed_dim = positional_embeddings.shape[-1]

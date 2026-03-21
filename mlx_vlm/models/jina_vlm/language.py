@@ -36,6 +36,9 @@ class RoPE(nn.Module):
 
     def __call__(self, x: mx.array, offset: int = 0) -> mx.array:
         seq_len = x.shape[2]
+        # Handle array-valued offset from BatchKVCache
+        if isinstance(offset, mx.array):
+            offset = offset.max().item()
         positions = mx.arange(offset, offset + seq_len).astype(mx.float32)
         freqs = positions[:, None] * self._inv_freq[None, :]
         emb = mx.concatenate([freqs, freqs], axis=-1)
