@@ -81,12 +81,11 @@ class Model(nn.Module):
 
         # Add a newline token to the image features
         if self.image_newline is not None:
-            self.image_newline = np.array(self.image_newline)[None, None, :]
-            self.image_newline = np.broadcast_to(
-                self.image_newline, image_features.shape
+            newline = np.array(self.image_newline)[None, None, :]
+            newline = np.broadcast_to(newline, image_features.shape)
+            image_features = mx.concatenate(
+                [image_features, mx.array(newline)], axis=0
             )
-            image_newline = mx.array(self.image_newline)
-            image_features = mx.concatenate([image_features, image_newline], axis=0)
 
         image_features = image_features.astype(inputs_embeds.dtype)
 

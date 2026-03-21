@@ -60,8 +60,8 @@ class Model(nn.Module):
             cross_attention_states = self.multi_modal_projector(
                 cross_attention_states
             ).reshape(
+                input_ids.shape[0],
                 -1,
-                cross_attention_states.shape[-2],
                 self.config.text_config.hidden_size,
             )
 
@@ -124,8 +124,8 @@ class Model(nn.Module):
             cross_attention_states = self.multi_modal_projector(
                 cross_attention_states
             ).reshape(
+                input_ids.shape[0],
                 -1,
-                cross_attention_states.shape[-2],
                 self.config.text_config.hidden_size,
             )
 
