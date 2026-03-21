@@ -51,13 +51,20 @@ class Gemma3nProcessor(ProcessorMixin):
             f"\n\n{tokenizer.boi_token}{image_tokens_expanded}{tokenizer.eoi_token}\n\n"
         )
 
-        super().__init__(
-            feature_extractor=feature_extractor,
-            image_processor=image_processor,
-            tokenizer=tokenizer,
-            chat_template=chat_template,
-            **kwargs,
-        )
+        if feature_extractor is None:
+            self.feature_extractor = None
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+            if chat_template is not None:
+                self.chat_template = chat_template
+        else:
+            super().__init__(
+                feature_extractor=feature_extractor,
+                image_processor=image_processor,
+                tokenizer=tokenizer,
+                chat_template=chat_template,
+                **kwargs,
+            )
 
     def __call__(
         self,
@@ -200,7 +207,7 @@ class Gemma3nProcessor(ProcessorMixin):
                 pretrained_model_name_or_path,
                 **kwargs,
             )
-        except (ValueError, OSError):
+        except (ValueError, OSError, ModuleNotFoundError):
             feature_extractor = None
 
         try:
