@@ -1,20 +1,20 @@
 import math
 import re
 from copy import deepcopy
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
-from .config import AdapterConfig, ModelConfig, TextConfig, VisionConfig
+from .config import AdapterConfig, ModelConfig, VisionConfig
 from .language import LanguageModel
 from .vision import VisionModel, ViTMultiHeadDotProductAttention
 
-
-EXTRACT_POINT_TRIPLE = re.compile(r"<POINT_(\d+)> ?<POINT_(\d+)> ?<POINT_(\d+)> ?([0-9]+)")
+EXTRACT_POINT_TRIPLE = re.compile(
+    r"<POINT_(\d+)> ?<POINT_(\d+)> ?<POINT_(\d+)> ?([0-9]+)"
+)
 
 
 def get_subpatch_ids(output_text, pooling, no_more_points_class):
@@ -31,11 +31,15 @@ def get_subpatch_ids(output_text, pooling, no_more_points_class):
         yield vit_patch_id, location_id, example_id
 
 
-def extract_image_points(output_text, pooling, mappings, no_more_points_class, location, image_sizes):
+def extract_image_points(
+    output_text, pooling, mappings, no_more_points_class, location, image_sizes
+):
     if len(mappings) != len(image_sizes):
         raise ValueError("Mapping and image sizes must have the same length")
     extracted_points = []
-    for vit_patch_id, location_id, example_id in get_subpatch_ids(output_text, pooling, no_more_points_class):
+    for vit_patch_id, location_id, example_id in get_subpatch_ids(
+        output_text, pooling, no_more_points_class
+    ):
         for image_ix, (mapping, (w, h)) in enumerate(zip(mappings, image_sizes)):
             patch_coords = np.argwhere(mapping == int(vit_patch_id))
             if len(patch_coords) == 1:
@@ -48,18 +52,22 @@ def extract_image_points(output_text, pooling, mappings, no_more_points_class, l
                 else:
                     p_x += 0.5
                     p_y += 0.5
-                extracted_points.append([
-                    example_id,
-                    image_ix,
-                    (p_x / mapping.shape[1]) * w,
-                    (p_y / mapping.shape[0]) * h,
-                ])
+                extracted_points.append(
+                    [
+                        example_id,
+                        image_ix,
+                        (p_x / mapping.shape[1]) * w,
+                        (p_y / mapping.shape[0]) * h,
+                    ]
+                )
                 break
     return extracted_points
 
 
 class ImageProjectorMLP(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, hidden_act: str):
+    def __init__(
+        self, input_dim: int, hidden_dim: int, output_dim: int, hidden_act: str
+    ):
         super().__init__()
         self.w1 = nn.Linear(input_dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, output_dim, bias=False)
@@ -85,16 +93,16 @@ class MolmoPointPadWithLearnedVector(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         B = x.shape[0]
-        vector = mx.broadcast_to(self.vector[None, None, :], (B, 1, self.vector.shape[0]))
+        vector = mx.broadcast_to(
+            self.vector[None, None, :], (B, 1, self.vector.shape[0])
+        )
         return mx.concatenate([x, vector], axis=1)
 
 
 class MolmoPointPatchRope(nn.Module):
     def __init__(self, theta: float, dim: int):
         super().__init__()
-        self._inv_freq = 1.0 / (
-            theta ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim)
-        )
+        self._inv_freq = 1.0 / (theta ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim))
 
     def rotate_half(self, x: mx.array) -> mx.array:
         B, hs = x.shape
@@ -137,7 +145,9 @@ class MolmoPointConnector(nn.Module):
             out_layer=False,
         )
         if config.positional_embeddings:
-            self.positional_embeddings = AddPosEmbed(pool_dim, config.positional_embeddings)
+            self.positional_embeddings = AddPosEmbed(
+                pool_dim, config.positional_embeddings
+            )
         else:
             self.positional_embeddings = None
 
@@ -166,7 +176,9 @@ class PointPredictor(nn.Module):
         self.config = config
         llm_dim = config.text_config.hidden_size
         patch_embed_dim = config.patch_embed_dim
-        vit_dim = config.vision_config.hidden_size * len(config.adapter_config.vit_layers)
+        vit_dim = config.vision_config.hidden_size * len(
+            config.adapter_config.vit_layers
+        )
 
         if config.layer_norm_x:
             self.x_norm = nn.RMSNorm(llm_dim, eps=config.text_config.layer_norm_eps)
@@ -174,7 +186,9 @@ class PointPredictor(nn.Module):
             self.x_norm = None
 
         if config.token_prediction_rotary == "one_d":
-            theta = config.token_prediction_rotary_theta or config.text_config.rope_theta
+            theta = (
+                config.token_prediction_rotary_theta or config.text_config.rope_theta
+            )
             self.patch_rotary = MolmoPointPatchRope(theta, patch_embed_dim)
         else:
             self.patch_rotary = None
@@ -192,7 +206,9 @@ class PointPredictor(nn.Module):
 
 
 class GeneratedTokenBounds:
-    def __init__(self, vocab_size, n_patches, n_subpatches, n_locations, no_more_points_class):
+    def __init__(
+        self, vocab_size, n_patches, n_subpatches, n_locations, no_more_points_class
+    ):
         self.n_locations = n_locations
         self.n_patches = n_patches
         self.n_subpatches = n_subpatches
@@ -213,7 +229,13 @@ class GeneratedTokenBounds:
 class MolmoPointLogitProcessor:
     """Enforce valid point token generation order in MLX."""
 
-    def __init__(self, bounds: GeneratedTokenBounds, prevent_repeats, force_patch_sorted, force_subpatch_sorted):
+    def __init__(
+        self,
+        bounds: GeneratedTokenBounds,
+        prevent_repeats,
+        force_patch_sorted,
+        force_subpatch_sorted,
+    ):
         self.bounds = bounds
         self.prevent_repeats = prevent_repeats
         self.force_patch_sorted = force_patch_sorted
@@ -251,13 +273,13 @@ class MolmoPointLogitProcessor:
                 last_subpatch = tok
 
         if no_more_points:
-            mask[b.patch_start:b.location_end] = NEG_INF
+            mask[b.patch_start : b.location_end] = NEG_INF
         elif last_token < b.patch_start or last_token >= b.subpatch_end:
             # Can generate text or a patch, but not subpatch/location
-            mask[b.subpatch_start:b.location_end] = NEG_INF
+            mask[b.subpatch_start : b.location_end] = NEG_INF
             if self.force_patch_sorted and last_patch is not None:
                 # Patches must be in sorted order
-                mask[b.patch_start:last_patch] = NEG_INF
+                mask[b.patch_start : last_patch] = NEG_INF
             if (
                 self.prevent_repeats
                 and self.force_subpatch_sorted
@@ -270,17 +292,21 @@ class MolmoPointLogitProcessor:
                     mask[last_patch] = NEG_INF
         elif b.patch_start <= last_token < b.patch_end:
             # After a patch, must select a subpatch
-            mask[:b.subpatch_start] = NEG_INF
-            mask[b.subpatch_end:] = NEG_INF
-            if self.force_subpatch_sorted and last_patch == last_token and last_subpatch is not None:
+            mask[: b.subpatch_start] = NEG_INF
+            mask[b.subpatch_end :] = NEG_INF
+            if (
+                self.force_subpatch_sorted
+                and last_patch == last_token
+                and last_subpatch is not None
+            ):
                 if self.prevent_repeats:
-                    mask[b.subpatch_start:last_subpatch + 1] = NEG_INF
+                    mask[b.subpatch_start : last_subpatch + 1] = NEG_INF
                 else:
-                    mask[b.subpatch_start:last_subpatch] = NEG_INF
+                    mask[b.subpatch_start : last_subpatch] = NEG_INF
         elif b.n_locations and b.subpatch_start <= last_token < b.subpatch_end:
             # After a subpatch, must select a location
-            mask[:b.location_start] = NEG_INF
-            mask[b.location_end:] = NEG_INF
+            mask[: b.location_start] = NEG_INF
+            mask[b.location_end :] = NEG_INF
 
         return mx.array(mask)
 
@@ -334,7 +360,10 @@ class Model(nn.Module):
 
     def _build_token_bounds(self, token_pooling):
         n_patches, n_subpatches = token_pooling.shape[-2:]
-        total_vocab = self.config.text_config.vocab_size + self.config.text_config.additional_vocab_size
+        total_vocab = (
+            self.config.text_config.vocab_size
+            + self.config.text_config.additional_vocab_size
+        )
         return GeneratedTokenBounds(
             vocab_size=total_vocab,
             n_patches=n_patches,
@@ -348,7 +377,8 @@ class Model(nn.Module):
             bounds=self._token_bounds,
             prevent_repeats=self.config.mask_repeats in ["all", "inference"],
             force_patch_sorted=self.config.mask_patches in ["always", "inference"],
-            force_subpatch_sorted=self.config.mask_subpatches in ["always", "inference"],
+            force_subpatch_sorted=self.config.mask_subpatches
+            in ["always", "inference"],
         )
 
     def get_input_embeddings(
@@ -385,8 +415,10 @@ class Model(nn.Module):
         dim = x.shape[-1]
 
         # Process images through ViT
-        is_indexable_image_token = (input_ids == self.config.image_patch_id)
-        is_non_indexable_image_token = (input_ids == self.config.image_non_indexable_patch_id)
+        is_indexable_image_token = input_ids == self.config.image_patch_id
+        is_non_indexable_image_token = (
+            input_ids == self.config.image_non_indexable_patch_id
+        )
         is_image_token = is_indexable_image_token | is_non_indexable_image_token
 
         B, T, N, D = images.shape
@@ -406,20 +438,29 @@ class Model(nn.Module):
         # Gather: vit_features[batch, clamped_pooling]
         batch_idx = mx.arange(batch_size)[:, None, None]
         vit_features_gathered = vit_features[batch_idx, clamped_pooling]
-        vit_features_gathered = vit_features_gathered * (token_pooling >= 0).astype(vit_features_gathered.dtype)[:, :, :, None]
+        vit_features_gathered = (
+            vit_features_gathered
+            * (token_pooling >= 0).astype(vit_features_gathered.dtype)[:, :, :, None]
+        )
         vit_features_mask = token_pooling >= 0
 
         # Build sparse features for connector
         # Use numpy ONLY for bool mask -> int index conversion (tiny, no data copy)
-        image_features_mask = mx.any(vit_features_mask, axis=-1)  # (B, n_pooled_patches)
+        image_features_mask = mx.any(
+            vit_features_mask, axis=-1
+        )  # (B, n_pooled_patches)
 
         flat_mask_np = np.array(image_features_mask.reshape(-1))
         valid_indices_np = np.where(flat_mask_np)[0]
         valid_indices = mx.array(valid_indices_np.astype(np.int32))
 
-        vit_features_flat = vit_features_gathered.reshape(-1, token_pooling.shape[-1], vit_feature_dim)
+        vit_features_flat = vit_features_gathered.reshape(
+            -1, token_pooling.shape[-1], vit_feature_dim
+        )
         vit_features_sparse = vit_features_flat[valid_indices]
-        vit_mask_sparse = vit_features_mask.reshape(-1, token_pooling.shape[-1])[valid_indices]
+        vit_mask_sparse = vit_features_mask.reshape(-1, token_pooling.shape[-1])[
+            valid_indices
+        ]
 
         # Apply connector
         image_features = self.connector(vit_features_sparse, vit_mask_sparse)
@@ -439,7 +480,9 @@ class Model(nn.Module):
 
         # Count image tokens per batch for offset computation
         n_image_per_batch = is_image_token.sum(axis=-1).astype(mx.int32)
-        offsets = mx.concatenate([mx.array([0]), mx.cumsum(n_image_per_batch[:-1], axis=0)])
+        offsets = mx.concatenate(
+            [mx.array([0]), mx.cumsum(n_image_per_batch[:-1], axis=0)]
+        )
 
         # Compute indexable/non-indexable masks for later patch key building
         is_indexable_flat = is_indexable_image_token.reshape(-1).astype(mx.int32)
@@ -466,7 +509,9 @@ class Model(nn.Module):
 
         return InputEmbeddingsFeatures(inputs_embeds=x)
 
-    def _build_batched_images(self, input_ids, pixel_values, image_token_pooling, image_grids, image_num_crops):
+    def _build_batched_images(
+        self, input_ids, pixel_values, image_token_pooling, image_grids, image_num_crops
+    ):
         """Build batched images and token pooling from inputs."""
         batch_size = input_ids.shape[0]
 
@@ -493,7 +538,7 @@ class Model(nn.Module):
         index_offsets_per_example = []
         for c in counts_list:
             c = int(c)
-            per_img_crops = image_num_crops[offset:offset + c]
+            per_img_crops = image_num_crops[offset : offset + c]
             crops_per_example.append(int(per_img_crops.sum().item()))
             patches_per_img = per_img_crops * n_patches
             idx_offsets = [0]
@@ -506,16 +551,20 @@ class Model(nn.Module):
         img_offset = 0
         for c in counts_list:
             c = int(c)
-            num_pooled_per_example.append(int(num_pooled_per_image[img_offset:img_offset + c].sum().item()))
+            num_pooled_per_example.append(
+                int(num_pooled_per_image[img_offset : img_offset + c].sum().item())
+            )
             img_offset += c
 
         M = max(crops_per_example)
-        images = mx.full((batch_size, M, n_patches, pixels_per_patch), -1, dtype=pixel_values.dtype)
+        images = mx.full(
+            (batch_size, M, n_patches, pixels_per_patch), -1, dtype=pixel_values.dtype
+        )
         offset_crop = 0
         for i in range(batch_size):
             num = crops_per_example[i]
             images = images.at[i, :num].add(
-                pixel_values[offset_crop:offset_crop + num] - images[i, :num]
+                pixel_values[offset_crop : offset_crop + num] - images[i, :num]
             )
             offset_crop += num
 
@@ -527,17 +576,17 @@ class Model(nn.Module):
         for i, c in enumerate(counts_list):
             c = int(c)
             n_pooled = num_pooled_per_example[i]
-            cur = image_token_pooling[patch_offset:patch_offset + n_pooled]
+            cur = image_token_pooling[patch_offset : patch_offset + n_pooled]
 
             # Apply per-image offsets
-            per_img_pooled = num_pooled_per_image[img_off:img_off + c]
+            per_img_pooled = num_pooled_per_image[img_off : img_off + c]
             idx_offsets = index_offsets_per_example[i]
             sub_offset = 0
             for j in range(c):
                 idx_off = idx_offsets[j]
                 n = int(per_img_pooled[j].item())
-                cur_slice = cur[sub_offset:sub_offset + n]
-                cur = cur.at[sub_offset:sub_offset + n].add(
+                cur_slice = cur[sub_offset : sub_offset + n]
+                cur = cur.at[sub_offset : sub_offset + n].add(
                     mx.where(cur_slice >= 0, idx_off, 0)
                 )
                 sub_offset += n
@@ -564,7 +613,11 @@ class Model(nn.Module):
         During prefill: pixel_values are processed, inputs_embeds contain image features.
         During generation: input_ids are token IDs (possibly in extended vocab range).
         """
-        is_generating = (self._image_cache is not None) and (inputs_embeds is None) and (input_ids is not None)
+        is_generating = (
+            (self._image_cache is not None)
+            and (inputs_embeds is None)
+            and (input_ids is not None)
+        )
 
         if is_generating:
             # Autoregressive generation with image cache
@@ -580,7 +633,10 @@ class Model(nn.Module):
         the pre-LN hidden state (matching the original torch implementation).
         """
         h, pre_ln_h = self.lm.model(
-            input_ids, inputs_embeds=inputs_embeds, mask=mask, cache=cache,
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            mask=mask,
+            cache=cache,
             return_pre_ln=True,
         )
         logits = self.lm.lm_head(h)
@@ -598,7 +654,11 @@ class Model(nn.Module):
             is_indexable_flat = ic["is_indexable_flat"]
 
             # Compute patch keys from the HIDDEN STATE (not embeddings)
-            x_norm = pp.x_norm(pre_ln_h) if pp.x_norm is not None else pre_ln_h / math.sqrt(dim)
+            x_norm = (
+                pp.x_norm(pre_ln_h)
+                if pp.x_norm is not None
+                else pre_ln_h / math.sqrt(dim)
+            )
             x_norm_flat = x_norm.reshape(-1, dim)
             patch_k_flat = pp.patch_k(x_norm_flat[image_indices])
 
@@ -614,7 +674,9 @@ class Model(nn.Module):
                 image_pos_ids = None
 
             # Build patch_k tensor via scatter
-            patch_k = mx.zeros((batch_size * n_pooled, patch_k_flat.shape[-1]), dtype=pre_ln_h.dtype)
+            patch_k = mx.zeros(
+                (batch_size * n_pooled, patch_k_flat.shape[-1]), dtype=pre_ln_h.dtype
+            )
             patch_k = patch_k.at[valid_indices].add(patch_k_flat.astype(pre_ln_h.dtype))
             patch_k = patch_k.reshape(batch_size, n_pooled, -1)
 
@@ -659,17 +721,27 @@ class Model(nn.Module):
         input_ids_i32 = input_ids.astype(mx.int32)
 
         # Decode extended tokens back to original special token IDs
-        is_patch = (input_ids_i32 >= bounds.patch_start) & (input_ids_i32 < bounds.patch_end_without_no_more_points)
-        is_no_more_points = (input_ids_i32 == bounds.no_more_points_token_id)
-        is_subpatch = (input_ids_i32 >= bounds.subpatch_start) & (input_ids_i32 < bounds.subpatch_end)
-        is_location = (input_ids_i32 >= bounds.location_start) & (input_ids_i32 < bounds.location_end)
+        is_patch = (input_ids_i32 >= bounds.patch_start) & (
+            input_ids_i32 < bounds.patch_end_without_no_more_points
+        )
+        is_no_more_points = input_ids_i32 == bounds.no_more_points_token_id
+        is_subpatch = (input_ids_i32 >= bounds.subpatch_start) & (
+            input_ids_i32 < bounds.subpatch_end
+        )
+        is_location = (input_ids_i32 >= bounds.location_start) & (
+            input_ids_i32 < bounds.location_end
+        )
 
         input_patch_ids = mx.where(is_patch, input_ids_i32 - bounds.patch_start, -1)
-        input_subpatch_ids = mx.where(is_subpatch, input_ids_i32 - bounds.subpatch_start, -1)
+        input_subpatch_ids = mx.where(
+            is_subpatch, input_ids_i32 - bounds.subpatch_start, -1
+        )
 
         # Map extended tokens back to original special token IDs for embedding
         decoded_ids = input_ids_i32
-        decoded_ids = mx.where(is_patch | is_no_more_points, self.config.patch_token_id, decoded_ids)
+        decoded_ids = mx.where(
+            is_patch | is_no_more_points, self.config.patch_token_id, decoded_ids
+        )
         decoded_ids = mx.where(is_subpatch, self.config.subpatch_token_id, decoded_ids)
         decoded_ids = mx.where(is_location, self.config.location_token_id, decoded_ids)
 
@@ -683,9 +755,13 @@ class Model(nn.Module):
             offsets = ic["image_token_offsets"]
             for b in range(batch_size):
                 pid = int(input_patch_ids[b, 0].item())
-                if pid >= 0 and pid < bounds.patch_end_without_no_more_points - bounds.patch_start:
+                if (
+                    pid >= 0
+                    and pid
+                    < bounds.patch_end_without_no_more_points - bounds.patch_start
+                ):
                     flat_idx = pid + int(offsets[b].item())
-                    feat = img_features.reshape(-1, dim)[flat_idx:flat_idx + 1]
+                    feat = img_features.reshape(-1, dim)[flat_idx : flat_idx + 1]
                     x = x.at[b, 0].add(feat[0])
 
         # Embed subpatch tokens with ViT features (all mx ops, no numpy)
@@ -705,7 +781,7 @@ class Model(nn.Module):
                 if spid >= 0 and self._last_predicted_patch_id is not None:
                     lpid = int(self._last_predicted_patch_id[b].item())
                     flat_pid = lpid + int(offsets[b].item())
-                    vit_to_embed = vit_sparse[flat_pid, spid:spid + 1]
+                    vit_to_embed = vit_sparse[flat_pid, spid : spid + 1]
                     embedded = self.build_vit_embedding(vit_to_embed)
                     # Replace embedding in-place using mx scatter
                     zeros = mx.zeros_like(x[b, 0:1])
@@ -713,14 +789,19 @@ class Model(nn.Module):
 
         # Run through transformer
         h, pre_ln_h = self.lm.model(
-            inputs_embeds=x, mask=mask, cache=cache, return_pre_ln=True,
+            inputs_embeds=x,
+            mask=mask,
+            cache=cache,
+            return_pre_ln=True,
         )
 
         # Compute standard logits
         logits = self.lm.lm_head(h)
 
         # Point predictor
-        x_norm = pp.x_norm(pre_ln_h) if pp.x_norm is not None else pre_ln_h / math.sqrt(dim)
+        x_norm = (
+            pp.x_norm(pre_ln_h) if pp.x_norm is not None else pre_ln_h / math.sqrt(dim)
+        )
 
         # Patch logits
         image_q = pp.patch_q(x_norm)
@@ -728,10 +809,14 @@ class Model(nn.Module):
             pos_ids = ic["image_pos_ids"]
             batch_idx = mx.arange(batch_size)
             lpid = self._last_predicted_patch_id
-            rotate_by = pos_ids[batch_idx, mx.clip(lpid.squeeze(-1), 0, pos_ids.shape[1] - 1)]
+            rotate_by = pos_ids[
+                batch_idx, mx.clip(lpid.squeeze(-1), 0, pos_ids.shape[1] - 1)
+            ]
             rotate_by = mx.where(lpid.squeeze(-1) >= 0, rotate_by, 0)
             image_q_flat = image_q.reshape(-1, image_q.shape[-1])
-            image_q_flat = pp.patch_rotary(image_q_flat, mx.clip(rotate_by, a_min=0, a_max=None))
+            image_q_flat = pp.patch_rotary(
+                image_q_flat, mx.clip(rotate_by, a_min=0, a_max=None)
+            )
             image_q = image_q_flat.reshape(batch_size, -1, image_q.shape[-1])
 
         dots = image_q @ ic["patch_k"].transpose(0, 2, 1)
@@ -742,8 +827,12 @@ class Model(nn.Module):
 
         # Replace patch_token_id logit in main logits with argmax patch score
         B, S, V = logits.shape
-        patch_token_logits = logits[:, :, self.config.patch_token_id:self.config.patch_token_id + 1]
-        logits = logits.at[:, :, self.config.patch_token_id].add(-100000.0 - logits[:, :, self.config.patch_token_id])
+        patch_token_logits = logits[
+            :, :, self.config.patch_token_id : self.config.patch_token_id + 1
+        ]
+        logits = logits.at[:, :, self.config.patch_token_id].add(
+            -100000.0 - logits[:, :, self.config.patch_token_id]
+        )
 
         n_patches = patch_logits.shape[-1]
         # Vectorized: place patch_token_logits at the argmax patch position
@@ -751,25 +840,39 @@ class Model(nn.Module):
         argmax_patch_logits = mx.full((B, S, n_patches), -100000.0, dtype=logits.dtype)
         # Manual one_hot: compare indices to selected_patches
         indices = mx.arange(n_patches)[None, None, :]  # (1, 1, n_patches)
-        is_selected = (indices == selected_patches[:, :, None])  # (B, S, n_patches)
-        argmax_patch_logits = mx.where(is_selected, patch_token_logits, argmax_patch_logits)
+        is_selected = indices == selected_patches[:, :, None]  # (B, S, n_patches)
+        argmax_patch_logits = mx.where(
+            is_selected, patch_token_logits, argmax_patch_logits
+        )
 
         # Subpatch logits
         n_subpatches = ic["token_pooling"].shape[-1]
         subpatch_logits = mx.full((B, S, n_subpatches), -100000.0, dtype=logits.dtype)
         if any_patch:
-            subpatch_point_q = pp.subpatch_q(x_norm.squeeze(1) if S == 1 else x_norm[:, -1:].squeeze(1))
+            subpatch_point_q = pp.subpatch_q(
+                x_norm.squeeze(1) if S == 1 else x_norm[:, -1:].squeeze(1)
+            )
             batch_idx = mx.arange(batch_size)
-            spk = ic["subpatch_k"][batch_idx, mx.clip(input_patch_ids.squeeze(1), 0, ic["subpatch_k"].shape[1] - 1)]
+            spk = ic["subpatch_k"][
+                batch_idx,
+                mx.clip(input_patch_ids.squeeze(1), 0, ic["subpatch_k"].shape[1] - 1),
+            ]
             sp_logits = mx.sum(subpatch_point_q[:, None, :] * spk, axis=-1)
             if self.config.norm_logits:
                 sp_logits = sp_logits / math.sqrt(ic["patch_k"].shape[-1])
-            sp_mask = ic["vit_features_mask"][batch_idx, mx.clip(input_patch_ids.squeeze(1), 0, ic["vit_features_mask"].shape[1] - 1)]
+            sp_mask = ic["vit_features_mask"][
+                batch_idx,
+                mx.clip(
+                    input_patch_ids.squeeze(1), 0, ic["vit_features_mask"].shape[1] - 1
+                ),
+            ]
             sp_logits = mx.where(sp_mask, sp_logits, -100000.0)
             subpatch_logits = sp_logits[:, None, :]
 
         # Suppress subpatch_token_id in main logits
-        logits = logits.at[:, :, self.config.subpatch_token_id].add(-100000.0 - logits[:, :, self.config.subpatch_token_id])
+        logits = logits.at[:, :, self.config.subpatch_token_id].add(
+            -100000.0 - logits[:, :, self.config.subpatch_token_id]
+        )
 
         # Location logits
         location_logits = mx.full((B, S, 9), -100000.0, dtype=logits.dtype)
@@ -778,10 +881,14 @@ class Model(nn.Module):
             location_logits = pp.subpatch_loc_k(pre_ln_h)
 
         # Suppress location_token_id in main logits
-        logits = logits.at[:, :, self.config.location_token_id].add(-100000.0 - logits[:, :, self.config.location_token_id])
+        logits = logits.at[:, :, self.config.location_token_id].add(
+            -100000.0 - logits[:, :, self.config.location_token_id]
+        )
 
         # Concatenate extended logits
-        logits = mx.concatenate([logits, argmax_patch_logits, subpatch_logits, location_logits], axis=-1)
+        logits = mx.concatenate(
+            [logits, argmax_patch_logits, subpatch_logits, location_logits], axis=-1
+        )
 
         # Apply logit processor (uses numpy mask, no mx.eval sync)
         if self._generated_ids_list:
@@ -790,13 +897,19 @@ class Model(nn.Module):
             lp_mask = processor(self._generated_ids_list, last_tok, logits.shape[-1])
             # Add mask to last position logits
             last_logits = logits[:, -1, :] + lp_mask
-            logits = mx.concatenate([logits[:, :-1, :], last_logits[:, None, :]], axis=1)
+            logits = mx.concatenate(
+                [logits[:, :-1, :], last_logits[:, None, :]], axis=1
+            )
 
         # Update last_predicted_patch_id
         if mx.any(input_patch_ids >= 0).item():
             self._last_predicted_patch_id = mx.where(
                 input_patch_ids == -1,
-                self._last_predicted_patch_id if self._last_predicted_patch_id is not None else mx.array([[-1]] * batch_size),
+                (
+                    self._last_predicted_patch_id
+                    if self._last_predicted_patch_id is not None
+                    else mx.array([[-1]] * batch_size)
+                ),
                 input_patch_ids,
             )
 
@@ -826,7 +939,7 @@ class Model(nn.Module):
             new_k = k
 
             if new_k.startswith("model."):
-                new_k = new_k[len("model."):]
+                new_k = new_k[len("model.") :]
 
             # lm_head -> lm.lm_head
             if new_k.startswith("lm_head."):
@@ -834,7 +947,7 @@ class Model(nn.Module):
 
             # LLM transformer -> lm.model
             if new_k.startswith("transformer."):
-                new_k = "lm.model." + new_k[len("transformer."):]
+                new_k = "lm.model." + new_k[len("transformer.") :]
 
             # ViT: transformer.resblocks -> resblocks
             new_k = new_k.replace("vit.transformer.resblocks", "vit.resblocks")

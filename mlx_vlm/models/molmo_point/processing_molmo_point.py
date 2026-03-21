@@ -1,8 +1,6 @@
 """Processor for MolmoPoint - no torch dependency."""
 
-from typing import List, Optional, Union
 
-import mlx.core as mx
 import numpy as np
 
 from ..base import install_auto_processor_patch, load_chat_template, to_mlx
@@ -35,9 +33,15 @@ class MolmoPointProcessor:
         self.image_processor = None  # Not a BaseImageProcessor
         # Defaults from processor_config.json
         self.image_use_col_tokens = kwargs.get("image_use_col_tokens", True)
-        self.use_single_crop_col_tokens = kwargs.get("use_single_crop_col_tokens", False)
-        self.use_single_crop_start_token = kwargs.get("use_single_crop_start_token", True)
-        self.use_low_res_token_for_global_crops = kwargs.get("use_low_res_token_for_global_crops", True)
+        self.use_single_crop_col_tokens = kwargs.get(
+            "use_single_crop_col_tokens", False
+        )
+        self.use_single_crop_start_token = kwargs.get(
+            "use_single_crop_start_token", True
+        )
+        self.use_low_res_token_for_global_crops = kwargs.get(
+            "use_low_res_token_for_global_crops", True
+        )
 
         self.image_token_ids = [
             tokenizer.convert_tokens_to_ids(token) for token in IMAGE_TOKENS
@@ -146,9 +150,15 @@ class MolmoPointProcessor:
                     input_ids = input_ids[None, :]
                     attention_mask = attention_mask[None, :]
                 first_valid = (attention_mask == 1).argmax(axis=-1)
-                if not np.all(input_ids[np.arange(input_ids.shape[0]), first_valid] == bos):
+                if not np.all(
+                    input_ids[np.arange(input_ids.shape[0]), first_valid] == bos
+                ):
                     B, S = input_ids.shape
-                    new_ids = np.full((B, S + 1), self.tokenizer.pad_token_id or 0, dtype=input_ids.dtype)
+                    new_ids = np.full(
+                        (B, S + 1),
+                        self.tokenizer.pad_token_id or 0,
+                        dtype=input_ids.dtype,
+                    )
                     new_mask = np.zeros((B, S + 1), dtype=attention_mask.dtype)
                     for b in range(B):
                         fv = int(first_valid[b])

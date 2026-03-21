@@ -1,4 +1,5 @@
 """Image processor for MolmoPoint - no torch dependency."""
+
 import numpy as np
 from PIL import Image
 
@@ -29,7 +30,9 @@ def resize_image(image, desired_output_size):
         arr = arr.astype(np.float32) / 255.0
 
     # Use the shared bilinear interpolation (HWC format, no antialias)
-    resized = resize_bilinear(arr, (int(h), int(w)), align_corners=False, antialias=False)
+    resized = resize_bilinear(
+        arr, (int(h), int(w)), align_corners=False, antialias=False
+    )
     resized = np.array(resized)
 
     if is_uint8:
@@ -60,20 +63,29 @@ def select_tiling(h, w, patch_size, max_num_crops):
     return candidate_tilings[ix]
 
 
-def build_resized_image(image, base_image_input_size, image_mean, image_std, image_patch_size):
+def build_resized_image(
+    image, base_image_input_size, image_mean, image_std, image_patch_size
+):
     resized = resize_image(image, base_image_input_size)
     resized = normalize_image(resized, image_mean, image_std)
     if len(resized.shape) == 3:
         resized = np.expand_dims(resized, 0)
     crop_patch_w = base_image_input_size[1] // image_patch_size
     crop_patch_h = base_image_input_size[0] // image_patch_size
-    resize_idx = np.arange(crop_patch_w * crop_patch_h).reshape([crop_patch_h, crop_patch_w])
+    resize_idx = np.arange(crop_patch_w * crop_patch_h).reshape(
+        [crop_patch_h, crop_patch_w]
+    )
     return resized, resize_idx
 
 
 def build_overlapping_crops(
-    image, max_crops, overlap_margins, base_image_input_size,
-    image_mean, image_std, image_patch_size,
+    image,
+    max_crops,
+    overlap_margins,
+    base_image_input_size,
+    image_mean,
+    image_std,
+    image_patch_size,
 ):
     crop_size = base_image_input_size[0]
     assert base_image_input_size[0] == base_image_input_size[1]
@@ -111,7 +123,9 @@ def build_overlapping_crops(
         for j in range(tiling[1]):
             x0 = j * crop_window_size
             crop_arr[on_crop] = src[y0 : y0 + crop_size, x0 : x0 + crop_size]
-            patch_idx = np.arange(crop_patch_w * crop_patch_h).reshape(crop_patch_h, crop_patch_w)
+            patch_idx = np.arange(crop_patch_w * crop_patch_h).reshape(
+                crop_patch_h, crop_patch_w
+            )
             patch_idx += on_crop * crop_patch_h * crop_patch_w
 
             if i != 0:
@@ -142,17 +156,25 @@ def batch_pixels_to_patches(array, patch_size):
         n_crops, h, w = array.shape
         h_patches = h // patch_size
         w_patches = w // patch_size
-        array = np.reshape(array, [n_crops, h_patches, patch_size, w_patches, patch_size])
+        array = np.reshape(
+            array, [n_crops, h_patches, patch_size, w_patches, patch_size]
+        )
         array = np.transpose(array, [0, 1, 3, 2, 4])
-        array = np.reshape(array, [n_crops, h_patches * w_patches, patch_size * patch_size])
+        array = np.reshape(
+            array, [n_crops, h_patches * w_patches, patch_size * patch_size]
+        )
         return array
     else:
         n_crops, h, w, c = array.shape
         h_patches = h // patch_size
         w_patches = w // patch_size
-        array = np.reshape(array, [n_crops, h_patches, patch_size, w_patches, patch_size, c])
+        array = np.reshape(
+            array, [n_crops, h_patches, patch_size, w_patches, patch_size, c]
+        )
         array = np.transpose(array, [0, 1, 3, 2, 4, 5])
-        array = np.reshape(array, [n_crops, h_patches * w_patches, patch_size * patch_size * c])
+        array = np.reshape(
+            array, [n_crops, h_patches * w_patches, patch_size * patch_size * c]
+        )
         return array
 
 
@@ -176,8 +198,15 @@ def arange_for_pooling(idx_arr, pool_h, pool_w):
 
 
 def image_to_patches_and_grids(
-    image, max_crops, overlap_margins, base_image_input_size,
-    image_mean, image_std, image_patch_size, image_pooling_w, image_pooling_h,
+    image,
+    max_crops,
+    overlap_margins,
+    base_image_input_size,
+    image_mean,
+    image_std,
+    image_patch_size,
+    image_pooling_w,
+    image_pooling_h,
 ):
     if isinstance(base_image_input_size, int):
         base_image_input_size = (base_image_input_size, base_image_input_size)
@@ -188,15 +217,24 @@ def image_to_patches_and_grids(
     crop_patch_h = base_image_input_size[0] // image_patch_size
 
     crop_arr, patch_idx_arr = build_overlapping_crops(
-        image, max_crops, overlap_margins, base_image_input_size,
-        image_mean, image_std, image_patch_size,
+        image,
+        max_crops,
+        overlap_margins,
+        base_image_input_size,
+        image_mean,
+        image_std,
+        image_patch_size,
     )
     pooling_idx = arange_for_pooling(patch_idx_arr, pooling_h, pooling_w)
     h, w = pooling_idx.shape[:2]
     pooling_idx = pooling_idx.reshape([-1, pooling_h * pooling_w])
 
     resized, resize_idx = build_resized_image(
-        image, base_image_input_size, image_mean, image_std, image_patch_size,
+        image,
+        base_image_input_size,
+        image_mean,
+        image_std,
+        image_patch_size,
     )
     patch_idx_arr += crop_patch_h * crop_patch_w
     crop_arr = np.concatenate([resized, crop_arr], 0)
@@ -261,9 +299,15 @@ def preprocess_images(
 
     for image in np_images:
         image_grid, crops, pooled_idx, patch_mapping = image_to_patches_and_grids(
-            image, max_crops, overlap_margins, base_image_input_size,
-            image_mean, image_std, image_patch_size,
-            image_pooling_w, image_pooling_h,
+            image,
+            max_crops,
+            overlap_margins,
+            base_image_input_size,
+            image_mean,
+            image_std,
+            image_patch_size,
+            image_pooling_w,
+            image_pooling_h,
         )
         batch_grids.append(image_grid)
         batch_crops.append(crops)
@@ -291,7 +335,11 @@ def preprocess_images(
 
     if return_pointing_metadata:
         result["_pointing_metadata"] = {
-            "token_pooling": np.concatenate(absolute_token_pooling, 0) if absolute_token_pooling else None,
+            "token_pooling": (
+                np.concatenate(absolute_token_pooling, 0)
+                if absolute_token_pooling
+                else None
+            ),
             "subpatch_mapping": patch_mappings,
             "image_sizes": [(img.shape[1], img.shape[0]) for img in np_images],
         }

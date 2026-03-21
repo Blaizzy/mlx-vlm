@@ -1,4 +1,5 @@
 """Utilities for extracting and visualizing MolmoPoint predictions."""
+
 import re
 from typing import List, Optional, Tuple
 
@@ -43,7 +44,9 @@ def extract_points_from_text(
         example_id = int(match.group(4))
 
         subpatch_id = subpatch_num - n_patches
-        location_id = location_num - n_patches - n_subpatches if patch_location else None
+        location_id = (
+            location_num - n_patches - n_subpatches if patch_location else None
+        )
         vit_patch_id = pooling[patch_id, subpatch_id]
 
         for image_ix, (mapping, (w, h)) in enumerate(zip(mappings, image_sizes)):
@@ -58,12 +61,14 @@ def extract_points_from_text(
                 else:
                     p_x += 0.5
                     p_y += 0.5
-                extracted_points.append((
-                    example_id,
-                    image_ix,
-                    (p_x / mapping.shape[1]) * w,
-                    (p_y / mapping.shape[0]) * h,
-                ))
+                extracted_points.append(
+                    (
+                        example_id,
+                        image_ix,
+                        (p_x / mapping.shape[1]) * w,
+                        (p_y / mapping.shape[0]) * h,
+                    )
+                )
                 break
 
     return extracted_points

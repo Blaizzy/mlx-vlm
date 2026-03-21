@@ -40,8 +40,12 @@ class ViTMultiHeadDotProductAttention(nn.Module):
 
         input_dim = input_dim or hidden_size
         self.wq = nn.Linear(input_dim, self.num_heads * self.head_dim, bias=True)
-        self.wk = nn.Linear(input_dim, self.num_key_value_heads * self.head_dim, bias=True)
-        self.wv = nn.Linear(input_dim, self.num_key_value_heads * self.head_dim, bias=True)
+        self.wk = nn.Linear(
+            input_dim, self.num_key_value_heads * self.head_dim, bias=True
+        )
+        self.wv = nn.Linear(
+            input_dim, self.num_key_value_heads * self.head_dim, bias=True
+        )
         if out_layer:
             self.wo = nn.Linear(self.num_heads * self.head_dim, self.hidden_size)
         else:
@@ -84,7 +88,9 @@ class ViTMultiHeadDotProductAttention(nn.Module):
         if attn_mask is not None:
             attn_weights = attn_weights + mx.where(attn_mask, 0.0, -1e9)
 
-        attn_weights = mx.softmax(attn_weights.astype(mx.float32), axis=-1).astype(xq.dtype)
+        attn_weights = mx.softmax(attn_weights.astype(mx.float32), axis=-1).astype(
+            xq.dtype
+        )
         attn_output = attn_weights @ xv
 
         # Back to (B, L, heads, head_dim)
@@ -108,7 +114,9 @@ class Molmo2VisionBlock(nn.Module):
         self.feed_forward = ViTMLP(
             config.hidden_size, config.intermediate_size, config.hidden_act
         )
-        self.attention_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.attention_norm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
         self.ffn_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -123,15 +131,15 @@ class VisionModel(nn.Module):
         self.config = config
         self.num_prefix_tokens = 0
 
-        self.positional_embedding = mx.zeros(
-            (config.image_num_pos, config.hidden_size)
-        )
+        self.positional_embedding = mx.zeros((config.image_num_pos, config.hidden_size))
         self.patch_embedding = nn.Linear(
             config.image_patch_size * config.image_patch_size * 3,
             config.hidden_size,
             bias=True,
         )
-        self.resblocks = [Molmo2VisionBlock(config) for _ in range(config.num_hidden_layers)]
+        self.resblocks = [
+            Molmo2VisionBlock(config) for _ in range(config.num_hidden_layers)
+        ]
 
     def add_pos_emb(self, x: mx.array, patch_num) -> mx.array:
         pos_emb = self.positional_embedding
