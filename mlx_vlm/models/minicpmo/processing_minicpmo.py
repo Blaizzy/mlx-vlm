@@ -17,7 +17,7 @@ from transformers.image_processing_utils import (
 )
 from transformers.processing_utils import ProcessorMixin
 
-from ..base import install_auto_processor_patch
+from ..base import install_auto_processor_patch, load_chat_template
 
 
 def _load_json(path: Path) -> Dict:
@@ -112,7 +112,7 @@ def _load_local_qwen2_tokenizer(
 
 
 class MiniCPMOImageProcessor(HFBaseImageProcessor):
-    """Minimal image processor for MiniCPM-o image inference without torch."""
+    """Minimal image processor for MiniCPM-o image inference"""
 
     model_input_names = ["pixel_values", "image_sizes", "tgt_sizes"]
 
@@ -722,6 +722,8 @@ class MiniCPMOProcessor(ProcessorMixin):
                 use_fast=use_fast,
                 **hf_kwargs,
             )
+
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
 
         audio_processor = WhisperFeatureExtractor.from_pretrained(
             pretrained_model_name_or_path, **hf_kwargs

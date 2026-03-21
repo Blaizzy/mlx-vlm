@@ -12,7 +12,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import requests
-import soundfile as sf
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
@@ -218,7 +217,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     model_class, _ = get_model_and_args(config=config)
 
     # Initialize text and vision configs if not present
-    config.setdefault("text_config", {})
+    config.setdefault("text_config", config.pop("llm_config", {}))
     config.setdefault("vision_config", {})
     config.setdefault("audio_config", {})
 
@@ -737,6 +736,8 @@ def resize_image(img, max_size):
 def process_image(img, resize_shape, image_processor):
     if isinstance(img, str):
         img = load_image(img)
+    if hasattr(img, "mode") and img.mode != "RGB":
+        img = img.convert("RGB")
     if resize_shape is not None and not isinstance(image_processor, BaseImageProcessor):
         img = resize_image(img, resize_shape)
     return img
@@ -778,6 +779,151 @@ def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarra
     return resampled
 
 
+def read_audio(file) -> tuple:
+    """Read an audio file using miniaudio (or ffmpeg for m4a/aac/ogg/opus).
+
+    Returns (samples_float32, sample_rate) where samples is always 2D (samples, channels).
+    """
+    import io as _io
+
+    if isinstance(file, bytes):
+        file = _io.BytesIO(file)
+
+    # Check if ffmpeg is needed for certain formats
+    use_ffmpeg = False
+    if isinstance(file, (str, Path)):
+        ext = Path(file).suffix.lstrip(".").lower()
+        if ext in ("m4a", "aac", "ogg", "opus"):
+            use_ffmpeg = True
+    elif isinstance(file, _io.BytesIO):
+        pos = file.tell()
+        header = file.read(12)
+        file.seek(pos)
+        if header[4:8] == b"ftyp" or header[:4] == b"OggS":
+            use_ffmpeg = True
+
+    if use_ffmpeg:
+        import json as _json
+        import shutil
+        import subprocess
+
+        ffmpeg_path = shutil.which("ffmpeg")
+        ffprobe_path = shutil.which("ffprobe")
+        if ffmpeg_path is None:
+            raise RuntimeError(
+                "ffmpeg not found. Install it: brew install ffmpeg (macOS) "
+                "or sudo apt install ffmpeg (Linux)"
+            )
+
+        if isinstance(file, _io.BytesIO):
+            file.seek(0)
+            input_data = file.read()
+        else:
+            input_data = None
+
+        # Get info via ffprobe
+        if ffprobe_path and input_data is not None:
+            probe = subprocess.run(
+                [
+                    ffprobe_path,
+                    "-v",
+                    "quiet",
+                    "-print_format",
+                    "json",
+                    "-show_streams",
+                    "-select_streams",
+                    "a:0",
+                    "-i",
+                    "pipe:0",
+                ],
+                input=input_data,
+                capture_output=True,
+            )
+        elif ffprobe_path:
+            probe = subprocess.run(
+                [
+                    ffprobe_path,
+                    "-v",
+                    "quiet",
+                    "-print_format",
+                    "json",
+                    "-show_streams",
+                    "-select_streams",
+                    "a:0",
+                    str(file),
+                ],
+                capture_output=True,
+            )
+        else:
+            probe = None
+
+        sample_rate, nchannels = 44100, 1
+        if probe and probe.returncode == 0:
+            info = _json.loads(probe.stdout)
+            if info.get("streams"):
+                stream = info["streams"][0]
+                sample_rate = int(stream.get("sample_rate", 44100))
+                nchannels = int(stream.get("channels", 1))
+
+        # Decode via ffmpeg to raw PCM s16le
+        cmd = [ffmpeg_path, "-v", "quiet"]
+        if input_data is not None:
+            cmd += ["-i", "pipe:0"]
+        else:
+            cmd += ["-i", str(file)]
+        cmd += ["-f", "s16le", "-acodec", "pcm_s16le", "-ac", str(nchannels), "pipe:1"]
+
+        result = subprocess.run(cmd, input=input_data, capture_output=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg decoding failed: {result.stderr.decode()}")
+
+        samples = np.frombuffer(result.stdout, dtype=np.int16)
+    else:
+        import miniaudio
+
+        if isinstance(file, (str, Path)):
+            info = miniaudio.get_file_info(str(file))
+            decoded = miniaudio.decode_file(
+                str(file),
+                nchannels=info.nchannels,
+                sample_rate=info.sample_rate,
+            )
+        elif isinstance(file, _io.BytesIO):
+            file.seek(0)
+            data = file.read()
+            # Detect format from magic bytes
+            if data[:4] == b"RIFF":
+                info = miniaudio.wav_get_info(data)
+            elif data[:3] == b"ID3" or data[:2] in (b"\xff\xfb", b"\xff\xfa"):
+                info = miniaudio.mp3_get_info(data)
+            elif data[:4] == b"fLaC":
+                info = miniaudio.flac_get_info(data)
+            else:
+                info = miniaudio.vorbis_get_info(data)
+            decoded = miniaudio.decode(
+                data,
+                nchannels=info.nchannels,
+                sample_rate=info.sample_rate,
+            )
+        else:
+            raise TypeError(f"Unsupported file type: {type(file)}")
+
+        sample_rate = decoded.sample_rate
+        nchannels = decoded.nchannels
+        samples = np.array(decoded.samples, dtype=np.int16)
+
+    # Reshape multi-channel and convert to float32
+    if nchannels > 1:
+        samples = samples.reshape(-1, nchannels)
+    audio = samples.astype(np.float32) / 32768.0
+
+    # Ensure always 2D
+    if audio.ndim == 1:
+        audio = audio[:, np.newaxis]
+
+    return audio, sample_rate
+
+
 def load_audio(
     file,
     sr: int,
@@ -794,13 +940,13 @@ def load_audio(
         try:
             response = requests.get(file, stream=True, timeout=timeout)
             response.raise_for_status()
-            audio, sample_rate = sf.read(BytesIO(response.content), always_2d=True)
+            audio, sample_rate = read_audio(BytesIO(response.content))
         except Exception as e:
             raise ValueError(
                 f"Failed to load audio from URL: {file} with error {e}"
             ) from e
     else:
-        audio, sample_rate = sf.read(file, always_2d=True)
+        audio, sample_rate = read_audio(file)
 
     if sample_rate != sr:
         audio = resample_audio(audio, sample_rate, sr)
@@ -880,23 +1026,6 @@ def process_inputs_with_fallback(
             **kwargs,
         )
     except Exception as e:
-        # Fallback to PyTorch tensors if MLX fails
-        if return_tensors != "pt":
-            try:
-                return process_inputs(
-                    processor,
-                    prompts=prompts,
-                    images=images,
-                    audio=audio,
-                    add_special_tokens=add_special_tokens,
-                    return_tensors="pt",
-                    **kwargs,
-                )
-            except Exception as fallback_error:
-                raise ValueError(
-                    f"Failed to process inputs with error: {fallback_error}"
-                ) from fallback_error
-
         raise ValueError(f"Failed to process inputs with error: {e}")
 
 
@@ -1066,8 +1195,6 @@ def prepare_inputs(
                 else 16000
             )
             audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
-            # Convert to (data, sr) tuples for processors that expect them
-            audio = [(a, sr) if isinstance(a, np.ndarray) else a for a in audio]
 
     model_inputs = {}
 

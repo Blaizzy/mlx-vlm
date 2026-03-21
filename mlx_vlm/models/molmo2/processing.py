@@ -440,7 +440,7 @@ class Molmo2ImageProcessor(BaseImageProcessor):
 
         if images is not None and not valid_images(images):
             raise ValueError(
-                "Invalid image type. Must be of type PIL.Image.Image, numpy.ndarray, "
+                "Invalid image type. Must be of type PIL.Image.Image, mx.array, numpy.ndarray, "
                 "torch.Tensor, tf.Tensor or jax.ndarray."
             )
 

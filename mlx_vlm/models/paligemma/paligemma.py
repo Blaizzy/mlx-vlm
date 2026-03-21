@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
+from . import processing_paligemma  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel

@@ -5,6 +5,7 @@ import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
 from ..pixtral import VisionModel
+from . import processing_mistral3  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 

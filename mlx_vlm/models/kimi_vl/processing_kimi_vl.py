@@ -312,7 +312,7 @@ class KimiVLImageProcessor(BaseImageProcessor):
 
 class KimiVLProcessor(ProcessorMixin):
     """
-    MLX-based processor for KimiVL that doesn't require torch/torchvision.
+    MLX-based processor for KimiVL
 
     Constructs a KimiVL processor which wraps a KimiVL image processor and a tokenizer
     into a single processor.
@@ -504,6 +504,16 @@ class KimiVLProcessor(ProcessorMixin):
             local_files_only=is_local,
         )
 
+        # Read processor_config.json for correct init kwargs
+        proc_cfg_path = model_path / "processor_config.json"
+        proc_kwargs = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+            for k in ("chat_template",):
+                if k in proc_cfg:
+                    proc_kwargs[k] = proc_cfg[k]
+
         # Load image processor config and create our processor
         image_processor_config = {}
         try:
@@ -534,7 +544,9 @@ class KimiVLProcessor(ProcessorMixin):
         image_processor = KimiVLImageProcessor(**image_processor_config)
 
         # Load chat template from jinja file if not already set on tokenizer
-        chat_template = getattr(tokenizer, "chat_template", None)
+        chat_template = proc_kwargs.pop("chat_template", None)
+        if chat_template is None:
+            chat_template = getattr(tokenizer, "chat_template", None)
         if chat_template is None:
             try:
                 if is_local:
@@ -556,45 +568,10 @@ class KimiVLProcessor(ProcessorMixin):
             image_processor=image_processor,
             tokenizer=tokenizer,
             chat_template=chat_template,
+            **proc_kwargs,
         )
 
 
-from transformers import AutoProcessor
+from ..base import install_auto_processor_patch
 
-_original_auto_processor_from_pretrained = AutoProcessor.from_pretrained
-
-
-@classmethod
-def _patched_auto_processor_from_pretrained(
-    cls, pretrained_model_name_or_path, **kwargs
-):
-    """Patched from_pretrained that returns KimiVLProcessor for kimi_vl models."""
-    from huggingface_hub import hf_hub_download
-
-    model_path = Path(pretrained_model_name_or_path)
-    is_local = model_path.exists() and model_path.is_dir()
-
-    # Check if this is a kimi_vl model
-    is_kimi_vl = False
-    try:
-        if is_local:
-            config_path = model_path / "config.json"
-        else:
-            config_path = Path(
-                hf_hub_download(pretrained_model_name_or_path, "config.json")
-            )
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-        is_kimi_vl = config.get("model_type", "").lower() == "kimi_vl"
-    except Exception:
-        pass
-
-    if is_kimi_vl:
-        return KimiVLProcessor.from_pretrained(pretrained_model_name_or_path, **kwargs)
-
-    return _original_auto_processor_from_pretrained.__func__(
-        cls, pretrained_model_name_or_path, **kwargs
-    )
-
-
-AutoProcessor.from_pretrained = _patched_auto_processor_from_pretrained
+install_auto_processor_patch("kimi_vl", KimiVLProcessor)

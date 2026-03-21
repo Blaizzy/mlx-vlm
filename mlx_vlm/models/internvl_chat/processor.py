@@ -3,13 +3,7 @@ from typing import List, Optional, Union
 import mlx.core as mx
 import numpy as np
 from PIL import Image
-from transformers import (
-    AutoImageProcessor,
-    AutoProcessor,
-    AutoTokenizer,
-    BatchFeature,
-    ProcessorMixin,
-)
+from transformers import AutoTokenizer, BatchFeature, ProcessorMixin
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.utils import logging
 
@@ -255,10 +249,15 @@ class InternVLImageProcessor(BaseImageProcessor):
 
             processed_images_batch.append(pixel_values)
 
-        # At this point, processed_images_batch contains a list of mx arrays,
-        # each array corresponding to an input image with stacked blocks.
+        # Track per-image tile counts for multi-image token insertion
+        num_patches_list = [pv.shape[0] for pv in processed_images_batch]
 
-        data = {"pixel_values": mx.array(processed_images_batch)}
+        # Concatenate all tiles: (total_tiles, C, H, W) → (1, total_tiles, C, H, W)
+        pixel_values = mx.concatenate(processed_images_batch, axis=0)
+        data = {
+            "pixel_values": mx.expand_dims(pixel_values, axis=0),
+            "num_patches_list": num_patches_list,
+        }
         return BatchFeature(data=data, tensor_type=None)
 
 
@@ -275,19 +274,31 @@ class InternVLChatProcessor(ProcessorMixin):
         image_processor=None,
         tokenizer=None,
         chat_template=chat_template,
+        num_image_token=None,
+        image_size=448,
+        patch_size=14,
+        downsample_ratio=0.5,
         **kwargs,
     ):
         if image_processor is None:
             image_processor = InternVLImageProcessor(**kwargs)
         if isinstance(tokenizer, str):
-            # Defaulting to the likely repo ID found earlier
             tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer, trust_remote_code=True, **kwargs
             )
 
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
 
-        self.num_image_token = int((448 // 14) ** 2 * (0.5**2))
+        if num_image_token is not None:
+            self.num_image_token = num_image_token
+        else:
+            self.num_image_token = int(
+                (image_size // patch_size) ** 2 * (downsample_ratio**2)
+            )
+
+        self.img_context_token_id = self.tokenizer.convert_tokens_to_ids(
+            IMG_CONTEXT_TOKEN
+        )
 
     def __call__(
         self,
@@ -296,16 +307,13 @@ class InternVLChatProcessor(ProcessorMixin):
         padding: Union[bool, str] = True,
         truncation: bool = True,
         max_length: Optional[int] = None,
-        return_tensors: Optional[str] = "pt",  # Default to PyTorch tensors
+        return_tensors: Optional[str] = "mlx",
         **kwargs,
     ):
         processed_inputs = {}
         if text is not None:
             if isinstance(text, str):
                 text = [text]
-
-            if len(text) == 1 and images is not None and len(images) > 1:
-                raise ValueError("Multi-image inference is not supported.")
 
         if images is not None:
             image_features = self.image_processor.preprocess(
@@ -316,20 +324,41 @@ class InternVLChatProcessor(ProcessorMixin):
         if text is not None:
             queries = []
 
-            for idx in range(len(images)):
-                question = text[idx]
+            num_patches_list = image_features.pop("num_patches_list", [])
 
-                if images is not None and "<image>" not in question:
-                    question = "<image>\n" + question
+            if images is not None and len(text) == 1 and len(images) >= 1:
+                # Single prompt with one or more images
+                question = text[0]
+                n_placeholders = question.count("<image>")
+                if n_placeholders < len(images):
+                    question = "<image>\n" * (len(images) - n_placeholders) + question
 
-                num_patches = image_features["pixel_values"][idx].shape[0]
-                image_tokens = (
-                    IMG_START_TOKEN
-                    + IMG_CONTEXT_TOKEN * self.num_image_token * num_patches
-                    + IMG_END_TOKEN
-                )
-                question = question.replace("<image>", image_tokens, 1)
+                for idx in range(len(images)):
+                    np_count = (
+                        num_patches_list[idx] if idx < len(num_patches_list) else 1
+                    )
+                    image_tokens = (
+                        IMG_START_TOKEN
+                        + IMG_CONTEXT_TOKEN * self.num_image_token * np_count
+                        + IMG_END_TOKEN
+                    )
+                    question = question.replace("<image>", image_tokens, 1)
                 queries.append(question)
+            else:
+                for idx in range(len(images)):
+                    question = text[idx]
+                    if images is not None and "<image>" not in question:
+                        question = "<image>\n" + question
+                    np_count = (
+                        num_patches_list[idx] if idx < len(num_patches_list) else 1
+                    )
+                    image_tokens = (
+                        IMG_START_TOKEN
+                        + IMG_CONTEXT_TOKEN * self.num_image_token * np_count
+                        + IMG_END_TOKEN
+                    )
+                    question = question.replace("<image>", image_tokens, 1)
+                    queries.append(question)
 
             self.tokenizer.padding_side = "left"
             text_inputs = self.tokenizer(
@@ -341,6 +370,9 @@ class InternVLChatProcessor(ProcessorMixin):
                 **kwargs,
             )
             processed_inputs.update(text_inputs)  # 'input_ids', 'attention_mask'
+
+        # Include the image context token id so the model can find image positions
+        processed_inputs["image_token_index"] = self.img_context_token_id
 
         return processed_inputs
 
@@ -359,37 +391,76 @@ class InternVLChatProcessor(ProcessorMixin):
     def save_pretrained(self, save_directory, **kwargs):
         pass
 
-    @staticmethod
-    def from_pretrained(pretrained_model_name_or_path, **kwargs):
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        import json
+        from pathlib import Path
+
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
-        image_processor = InternVLImageProcessor(**kwargs)
-        return InternVLChatProcessor(
-            image_processor=image_processor, tokenizer=tokenizer
+        from ..base import load_chat_template
+
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
+
+        # Load model config to get image processing parameters
+        config_path = Path(pretrained_model_name_or_path) / "config.json"
+        image_size = 448
+        patch_size = 14
+        downsample_ratio = 0.5
+        max_dynamic_patch = 12
+        min_dynamic_patch = 1
+        use_thumbnail = True
+
+        if config_path.exists():
+            with open(config_path) as f:
+                config = json.load(f)
+            image_size = config.get(
+                "force_image_size",
+                config.get("vision_config", {}).get("image_size", 448),
+            )
+            patch_size = config.get("vision_config", {}).get("patch_size", 14)
+            downsample_ratio = config.get("downsample_ratio", 0.5)
+            max_dynamic_patch = config.get("max_dynamic_patch", 12)
+            min_dynamic_patch = config.get("min_dynamic_patch", 1)
+            use_thumbnail = config.get("use_thumbnail", True)
+
+        # Read processor_config.json for correct init kwargs
+        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
+        proc_kwargs = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+            for k in (
+                "num_image_token",
+                "image_size",
+                "patch_size",
+                "downsample_ratio",
+            ):
+                if k in proc_cfg:
+                    proc_kwargs[k] = proc_cfg[k]
+
+        # proc_kwargs override config.json values if present
+        image_size = proc_kwargs.pop("image_size", image_size)
+        patch_size = proc_kwargs.pop("patch_size", patch_size)
+        downsample_ratio = proc_kwargs.pop("downsample_ratio", downsample_ratio)
+
+        image_processor = InternVLImageProcessor(
+            size=image_size,
+            dynamic_max_num=max_dynamic_patch,
+            dynamic_min_num=min_dynamic_patch,
+            dynamic_use_thumbnail=use_thumbnail,
+        )
+        return cls(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            image_size=image_size,
+            patch_size=patch_size,
+            downsample_ratio=downsample_ratio,
+            **proc_kwargs,
         )
 
-    # Need save_pretrained and from_pretrained
-    # save_pretrained should save both tokenizer and image_processor configs/files
-    # from_pretrained should load both
 
-    # Example:
-    # def save_pretrained(self, save_directory, **kwargs):
-    #     self.tokenizer.save_pretrained(save_directory, **kwargs)
-    #     self.image_processor.save_pretrained(save_directory, **kwargs)
+from ..base import install_auto_processor_patch
 
-    # def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-    #     tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
-    #     image_processor = InternVLImageProcessor.from_pretrained(pretrained_model_name_or_path, **kwargs)
-    #     return cls(image_processor=image_processor, tokenizer=tokenizer)
-
-
-# Registration
-MODEL_TYPE = "internvl_chat"  # Verify this from the model's config.json
-
-AutoImageProcessor.register(
-    MODEL_TYPE, slow_image_processor_class=InternVLImageProcessor
-)
-AutoProcessor.register(MODEL_TYPE, InternVLChatProcessor)
-
-logger.info(f"Registered custom processor classes for model type '{MODEL_TYPE}'.")
+install_auto_processor_patch("internvl_chat", InternVLChatProcessor)

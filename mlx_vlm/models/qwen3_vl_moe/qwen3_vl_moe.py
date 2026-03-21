@@ -5,6 +5,7 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import InputEmbeddingsFeatures
+from ..qwen3_vl import processing_qwen3_vl  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel

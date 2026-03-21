@@ -781,6 +781,10 @@ def _make_cache(model, left_padding):
     def to_batch_cache(c):
         if isinstance(c, cache.KVCache):
             return cache.BatchKVCache(left_padding)
+        elif isinstance(c, cache.ChunkedKVCache):
+            return cache.BatchKVCache(left_padding)
+        elif isinstance(c, cache.SimpleKVCache):
+            return cache.BatchKVCache(left_padding)
         elif isinstance(c, cache.ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
@@ -789,7 +793,9 @@ def _make_cache(model, left_padding):
                 raise ValueError("RotatingKVCache with keep tokens is not supported.")
             return cache.BatchRotatingKVCache(c.max_size, left_padding)
         elif isinstance(c, cache.CacheList):
-            return cache.BatchCacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
+            return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
+        elif isinstance(c, tuple):
+            return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c))
         else:
             raise ValueError(f"{type(c)} does not yet support batching")
 
@@ -938,11 +944,14 @@ class BatchGenerator:
         left_padding = [max_length - l for l in lengths]
         inputs = _left_pad_prompts(inputs, max_length=max_length)
 
-        prompt_cache = (
-            _make_cache(self.model, left_padding)
-            if self.prompt_cache is None
-            else self.prompt_cache
-        )
+        if self.prompt_cache is not None:
+            prompt_cache = self.prompt_cache
+        elif len(uids) == 1 and max(left_padding) == 0:
+            # Single prompt with no padding: use standard caches to avoid
+            # numerical divergence from batch cache wrappers.
+            prompt_cache = cache.make_prompt_cache(self.model)
+        else:
+            prompt_cache = _make_cache(self.model, left_padding)
 
         # Slice batch data in kwargs to match current batch size
         batch_size = len(uids)
@@ -1083,8 +1092,7 @@ class BatchGenerator:
         return responses
 
     def next(self, **kwargs):
-        with mx.stream(generation_stream):
-            return self._next(**kwargs)
+        return self._next(**kwargs)
 
 
 def batch_generate(
@@ -1330,7 +1338,14 @@ def _generate_batch(
                 if r.finish_reason != "stop":
                     results[r.uid].append(r.token)
 
-    texts = [tokenizer.decode(results[uid]) for uid in uids]
+    detokenizer = processor.detokenizer
+    texts = []
+    for uid in uids:
+        detokenizer.reset()
+        for t in results[uid]:
+            detokenizer.add_token(t)
+        detokenizer.finalize()
+        texts.append(detokenizer.text)
     return texts, gen.stats()
 
 

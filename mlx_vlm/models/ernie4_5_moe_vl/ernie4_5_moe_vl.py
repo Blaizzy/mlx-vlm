@@ -10,7 +10,11 @@ from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
-from .processor import Ernie4_5_VLProcessor, Ernie4_5_VLTokenizer, ImageProcessor
+from .processing_ernie4_5_moe_vl import (
+    Ernie4_5_VLProcessor,
+    Ernie4_5_VLTokenizer,
+    ImageProcessor,
+)
 from .vision import VisionModel
 
 # Register custom processor classes for ernie4_5_moe_vl model type

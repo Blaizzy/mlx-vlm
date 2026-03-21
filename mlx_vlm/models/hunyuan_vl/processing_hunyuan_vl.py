@@ -518,6 +518,9 @@ class HunYuanVLProcessor(ProcessorMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         """Load processor from pretrained model path."""
+        import json
+        from pathlib import Path
+
         trust_remote_code = kwargs.pop("trust_remote_code", True)
 
         tokenizer = AutoTokenizer.from_pretrained(
@@ -525,8 +528,24 @@ class HunYuanVLProcessor(ProcessorMixin):
             trust_remote_code=trust_remote_code,
             **kwargs,
         )
+        from ..base import load_chat_template
+
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
+
+        # Read processor_config.json for correct init kwargs
+        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
+        proc_kwargs = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+
         image_processor = HunYuanVLImageProcessor(**kwargs)
-        return cls(image_processor=image_processor, tokenizer=tokenizer, **kwargs)
+        return cls(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            **proc_kwargs,
+            **kwargs,
+        )
 
 
 def split_image_into_patch_blocks(
@@ -605,3 +624,7 @@ __all__ = [
     "smart_resize",
     "split_image_into_patch_blocks",
 ]
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("hunyuan_vl", HunYuanVLProcessor)
