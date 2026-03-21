@@ -61,7 +61,7 @@ class Florence2Attention(nn.Module):
 
         if is_cross_attention and cache is not None and cache.keys is not None:
             # Cross-attention with cached keys/values - reuse them
-            if hasattr(cache, 'state'):
+            if hasattr(cache, "state"):
                 state = cache.state
                 k, v = state[0], state[1]
             else:
