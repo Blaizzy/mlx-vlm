@@ -240,11 +240,11 @@ class MolmoPointLogitProcessor:
         skip = 2 if b.n_locations else 1
         last_patch = None
         last_subpatch = None
-        no_more_points = False
+        # Check ALL tokens for no_more_points (not subject to skip)
+        no_more_points = any(tok == b.no_more_points_token_id for tok in ids)
+        # Only scan history up to skip for patch/subpatch tracking
         for i in range(len(ids) - skip):
             tok = ids[i]
-            if tok == b.no_more_points_token_id:
-                no_more_points = True
             if b.patch_start <= tok < b.patch_end:
                 last_patch = tok
             elif b.subpatch_start <= tok < b.subpatch_end:
@@ -253,10 +253,23 @@ class MolmoPointLogitProcessor:
         if no_more_points:
             mask[b.patch_start:b.location_end] = NEG_INF
         elif last_token < b.patch_start or last_token >= b.subpatch_end:
+            # Can generate text or a patch, but not subpatch/location
             mask[b.subpatch_start:b.location_end] = NEG_INF
             if self.force_patch_sorted and last_patch is not None:
+                # Patches must be in sorted order
                 mask[b.patch_start:last_patch] = NEG_INF
+            if (
+                self.prevent_repeats
+                and self.force_subpatch_sorted
+                and last_subpatch is not None
+                and last_subpatch == (b.subpatch_end - 1)
+            ):
+                # Last subpatch was at max — selecting same patch would force
+                # a repeat since sorted order has no room for a new subpatch
+                if last_patch is not None:
+                    mask[last_patch] = NEG_INF
         elif b.patch_start <= last_token < b.patch_end:
+            # After a patch, must select a subpatch
             mask[:b.subpatch_start] = NEG_INF
             mask[b.subpatch_end:] = NEG_INF
             if self.force_subpatch_sorted and last_patch == last_token and last_subpatch is not None:
@@ -265,6 +278,7 @@ class MolmoPointLogitProcessor:
                 else:
                     mask[b.subpatch_start:last_subpatch] = NEG_INF
         elif b.n_locations and b.subpatch_start <= last_token < b.subpatch_end:
+            # After a subpatch, must select a location
             mask[:b.location_start] = NEG_INF
             mask[b.location_end:] = NEG_INF
 
@@ -419,66 +433,33 @@ class Model(nn.Module):
         x_flat = x_flat.at[image_indices].add(image_features.reshape(-1, dim))
         x = x_flat.reshape(x.shape)
 
-        # Build point predictor keys (cache for generation)
+        # Build subpatch keys from ViT features (not from transformer output)
         pp = self.point_predictor
-        x_norm = pp.x_norm(x) if pp.x_norm is not None else x / math.sqrt(dim)
-
-        # Build patch keys from image token hidden states
-        x_norm_flat = x_norm.reshape(-1, dim)
-        patch_k_flat = pp.patch_k(x_norm_flat[image_indices])
-
-        if pp.patch_rotary is not None:
-            # Compute position IDs for image tokens
-            is_indexable_flat = is_indexable_image_token.reshape(-1).astype(mx.int32)
-            image_token_cumsum = mx.cumsum(is_indexable_flat, axis=0) - 1
-            image_pos_ids_flat = image_token_cumsum[image_indices]
-            patch_k_flat = pp.patch_rotary(patch_k_flat, image_pos_ids_flat)
-
-            # Build position IDs tensor for queries during generation (scatter)
-            n_pooled = token_pooling.shape[1]
-            image_pos_ids = mx.zeros((batch_size * n_pooled,), dtype=mx.int32)
-            image_pos_ids = image_pos_ids.at[valid_indices].add(image_pos_ids_flat)
-            image_pos_ids = image_pos_ids.reshape(batch_size, n_pooled)
-        else:
-            image_pos_ids = None
-
-        # Build patch_k tensor [batch, n_image_tokens, embed_dim] (scatter)
-        n_pooled = token_pooling.shape[1]
-        patch_k = mx.zeros((batch_size * n_pooled, patch_k_flat.shape[-1]), dtype=x.dtype)
-        patch_k = patch_k.at[valid_indices].add(patch_k_flat.astype(x.dtype))
-        patch_k = patch_k.reshape(batch_size, n_pooled, -1)
-
-        # Build patch_k_mask: only indexable image tokens are valid (scatter)
-        is_indexable_at_image = is_indexable_flat[image_indices]
-        patch_k_mask = mx.zeros((batch_size * n_pooled,), dtype=mx.int32)
-        patch_k_mask = patch_k_mask.at[valid_indices].add(is_indexable_at_image)
-        patch_k_mask = patch_k_mask.reshape(batch_size, n_pooled).astype(mx.bool_)
-
-        if self.config.no_more_points_class:
-            patch_k = pp.add_no_point_class_embed(patch_k)
-            patch_k_mask = mx.concatenate(
-                [patch_k_mask, mx.ones((batch_size, 1), dtype=mx.bool_)], axis=1
-            )
-
-        # Build subpatch keys
         subpatch_k = pp.subpatch_k(vit_features_gathered)
 
         # Count image tokens per batch for offset computation
         n_image_per_batch = is_image_token.sum(axis=-1).astype(mx.int32)
         offsets = mx.concatenate([mx.array([0]), mx.cumsum(n_image_per_batch[:-1], axis=0)])
 
-        # Store image cache
+        # Compute indexable/non-indexable masks for later patch key building
+        is_indexable_flat = is_indexable_image_token.reshape(-1).astype(mx.int32)
+
+        # Store partial image cache — patch keys will be built in _prefill_forward
+        # after the transformer runs (they need the hidden state, not embeddings)
         self._image_cache = {
-            "patch_k": patch_k,
-            "patch_k_mask": patch_k_mask,
             "subpatch_k": subpatch_k,
             "token_pooling": token_pooling,
             "vit_features": vit_features_gathered,
             "vit_features_mask": vit_features_mask,
             "image_features_mask": image_features_mask,
-            "image_pos_ids": image_pos_ids,
             "image_features": image_features,
             "image_token_offsets": offsets,
+            # Indices needed for building patch keys after transformer
+            "image_indices": image_indices,
+            "valid_indices": valid_indices,
+            "is_indexable_flat": is_indexable_flat,
+            "is_image_token": is_image_token,
+            "is_indexable_image_token": is_indexable_image_token,
         }
 
         self._token_bounds = self._build_token_bounds(token_pooling)
@@ -593,17 +574,67 @@ class Model(nn.Module):
             return self._prefill_forward(input_ids, inputs_embeds, mask, cache)
 
     def _prefill_forward(self, input_ids, inputs_embeds, mask, cache):
-        """Standard forward pass for prefill."""
+        """Standard forward pass for prefill.
+
+        After the transformer runs, build point predictor patch keys from
+        the pre-LN hidden state (matching the original torch implementation).
+        """
         h, pre_ln_h = self.lm.model(
             input_ids, inputs_embeds=inputs_embeds, mask=mask, cache=cache,
             return_pre_ln=True,
         )
         logits = self.lm.lm_head(h)
 
-        # During prefill with images, build point predictor cache but don't use it yet
-        if self._image_cache is not None:
-            # Point predictor keys are already built in get_input_embeddings
-            # Extend logits with dummy point logits for the prefill
+        # Build point predictor cache from transformer hidden states
+        if self._image_cache is not None and "patch_k" not in self._image_cache:
+            ic = self._image_cache
+            pp = self.point_predictor
+            dim = self.config.text_config.hidden_size
+            batch_size = pre_ln_h.shape[0]
+            n_pooled = ic["token_pooling"].shape[1]
+
+            image_indices = ic["image_indices"]
+            valid_indices = ic["valid_indices"]
+            is_indexable_flat = ic["is_indexable_flat"]
+
+            # Compute patch keys from the HIDDEN STATE (not embeddings)
+            x_norm = pp.x_norm(pre_ln_h) if pp.x_norm is not None else pre_ln_h / math.sqrt(dim)
+            x_norm_flat = x_norm.reshape(-1, dim)
+            patch_k_flat = pp.patch_k(x_norm_flat[image_indices])
+
+            if pp.patch_rotary is not None:
+                image_token_cumsum = mx.cumsum(is_indexable_flat, axis=0) - 1
+                image_pos_ids_flat = image_token_cumsum[image_indices]
+                patch_k_flat = pp.patch_rotary(patch_k_flat, image_pos_ids_flat)
+
+                image_pos_ids = mx.zeros((batch_size * n_pooled,), dtype=mx.int32)
+                image_pos_ids = image_pos_ids.at[valid_indices].add(image_pos_ids_flat)
+                image_pos_ids = image_pos_ids.reshape(batch_size, n_pooled)
+            else:
+                image_pos_ids = None
+
+            # Build patch_k tensor via scatter
+            patch_k = mx.zeros((batch_size * n_pooled, patch_k_flat.shape[-1]), dtype=pre_ln_h.dtype)
+            patch_k = patch_k.at[valid_indices].add(patch_k_flat.astype(pre_ln_h.dtype))
+            patch_k = patch_k.reshape(batch_size, n_pooled, -1)
+
+            # Build patch_k_mask
+            is_indexable_at_image = is_indexable_flat[image_indices]
+            patch_k_mask = mx.zeros((batch_size * n_pooled,), dtype=mx.int32)
+            patch_k_mask = patch_k_mask.at[valid_indices].add(is_indexable_at_image)
+            patch_k_mask = patch_k_mask.reshape(batch_size, n_pooled).astype(mx.bool_)
+
+            if self.config.no_more_points_class:
+                patch_k = pp.add_no_point_class_embed(patch_k)
+                patch_k_mask = mx.concatenate(
+                    [patch_k_mask, mx.ones((batch_size, 1), dtype=mx.bool_)], axis=1
+                )
+
+            ic["patch_k"] = patch_k
+            ic["patch_k_mask"] = patch_k_mask
+            ic["image_pos_ids"] = image_pos_ids
+
+            # Extend logits with dummy point logits for the prefill step
             B, S, V = logits.shape
             bounds = self._token_bounds
             total_extra = bounds.location_end - bounds.patch_start
@@ -756,8 +787,10 @@ class Model(nn.Module):
         if self._generated_ids_list:
             processor = self._build_logit_processor()
             last_tok = self._generated_ids_list[-1]
-            mask = processor(self._generated_ids_list, last_tok, logits.shape[-1])
-            logits = logits.at[:, -1, :].add(mask[None, :])
+            lp_mask = processor(self._generated_ids_list, last_tok, logits.shape[-1])
+            # Add mask to last position logits
+            last_logits = logits[:, -1, :] + lp_mask
+            logits = mx.concatenate([logits[:, :-1, :], last_logits[:, None, :]], axis=1)
 
         # Update last_predicted_patch_id
         if mx.any(input_patch_ids >= 0).item():

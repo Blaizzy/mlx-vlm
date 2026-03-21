@@ -1,9 +1,10 @@
 """Image processor for MolmoPoint - no torch dependency."""
+import cv2
 import numpy as np
 from PIL import Image
 
-IMAGENET_STANDARD_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STANDARD_STD = [0.229, 0.224, 0.225]
+SIGLIP_MEAN = [0.5, 0.5, 0.5]
+SIGLIP_STD = [0.5, 0.5, 0.5]
 
 
 def normalize_image(image, image_mean, image_std):
@@ -13,19 +14,82 @@ def normalize_image(image, image_mean, image_std):
     return image
 
 
-def resize_image(image, desired_output_size):
-    """Resize image using PIL (replaces torchvision.transforms.Resize)."""
-    if isinstance(image, np.ndarray):
-        if image.dtype == np.uint8:
-            pil_img = Image.fromarray(image)
-        else:
-            pil_img = Image.fromarray((image * 255).clip(0, 255).astype(np.uint8))
+def _bilinear_resize_numpy(image, out_h, out_w):
+    """Bilinear resize matching torchvision's upsample_bilinear2d (align_corners=False).
+
+    This is the exact algorithm used by PyTorch/torchvision Resize with
+    interpolation=BILINEAR and antialias=False on uint8 tensors.
+    """
+    in_h, in_w = image.shape[:2]
+    has_channels = image.ndim == 3
+
+    # Compute source coordinates (align_corners=False → half-pixel offset)
+    scale_h = in_h / out_h
+    scale_w = in_w / out_w
+
+    out_y = np.arange(out_h, dtype=np.float32)
+    out_x = np.arange(out_w, dtype=np.float32)
+
+    # Map output pixel centers to input coordinates
+    src_y = (out_y + 0.5) * scale_h - 0.5
+    src_x = (out_x + 0.5) * scale_w - 0.5
+
+    # Don't clip src coords — clamp only the integer indices (matches torch)
+    y0 = np.clip(np.floor(src_y).astype(np.int32), 0, in_h - 1)
+    x0 = np.clip(np.floor(src_x).astype(np.int32), 0, in_w - 1)
+    y1 = np.clip(y0 + 1, 0, in_h - 1)
+    x1 = np.clip(x0 + 1, 0, in_w - 1)
+
+    fy = np.clip(src_y - y0, 0, 1).astype(np.float32)
+    fx = np.clip(src_x - x0, 0, 1).astype(np.float32)
+
+    if has_channels:
+        img = image.astype(np.float32)
+        # Gather corners
+        top_left = img[y0[:, None], x0[None, :]]      # (out_h, out_w, C)
+        top_right = img[y0[:, None], x1[None, :]]
+        bot_left = img[y1[:, None], x0[None, :]]
+        bot_right = img[y1[:, None], x1[None, :]]
+
+        fy = fy[:, None, None]
+        fx = fx[None, :, None]
     else:
-        pil_img = image
+        img = image.astype(np.float32)
+        top_left = img[y0[:, None], x0[None, :]]
+        top_right = img[y0[:, None], x1[None, :]]
+        bot_left = img[y1[:, None], x0[None, :]]
+        bot_right = img[y1[:, None], x1[None, :]]
+
+        fy = fy[:, None]
+        fx = fx[None, :]
+
+    result = (
+        top_left * (1 - fy) * (1 - fx)
+        + top_right * (1 - fy) * fx
+        + bot_left * fy * (1 - fx)
+        + bot_right * fy * fx
+    )
+    return result
+
+
+def resize_image(image, desired_output_size):
+    """Resize image matching torchvision.transforms.Resize(antialias=False)."""
+    if isinstance(image, np.ndarray):
+        arr = image
+    else:
+        arr = np.array(image)
 
     h, w = desired_output_size
-    resized = pil_img.resize((w, h), Image.Resampling.BILINEAR)
-    resized = np.array(resized).astype(np.float32) / 255.0
+    is_uint8 = arr.dtype == np.uint8
+
+    resized = _bilinear_resize_numpy(arr, h, w)
+
+    if is_uint8:
+        resized = np.clip(resized, 0, 255)
+        resized = resized.astype(np.float32) / 255.0
+    else:
+        resized = np.clip(resized, 0.0, 1.0).astype(np.float32)
+
     return resized
 
 
@@ -225,9 +289,9 @@ def preprocess_images(
 ):
     """Process a list of PIL images for MolmoPoint."""
     if image_mean is None:
-        image_mean = IMAGENET_STANDARD_MEAN
+        image_mean = SIGLIP_MEAN
     if image_std is None:
-        image_std = IMAGENET_STANDARD_STD
+        image_std = SIGLIP_STD
 
     image_pooling_h, image_pooling_w = pooling_size
 

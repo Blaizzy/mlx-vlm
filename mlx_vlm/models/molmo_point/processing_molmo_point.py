@@ -19,10 +19,10 @@ IMAGE_PROMPT = "<|image|>"
 
 IMAGE_TOKENS = [
     IMAGE_PATCH_TOKEN,
+    IMAGE_LOW_RES_TOKEN,
     IM_COL_TOKEN,
     IM_START_TOKEN,
     LOW_RES_IMAGE_START_TOKEN,
-    IMAGE_LOW_RES_TOKEN,
     IM_END_TOKEN,
 ]
 
@@ -33,9 +33,11 @@ class MolmoPointProcessor:
     def __init__(self, tokenizer, **kwargs):
         self.tokenizer = tokenizer
         self.image_processor = None  # Not a BaseImageProcessor
+        # Defaults from processor_config.json
         self.image_use_col_tokens = kwargs.get("image_use_col_tokens", True)
-        self.use_single_crop_col_tokens = kwargs.get("use_single_crop_col_tokens", None)
+        self.use_single_crop_col_tokens = kwargs.get("use_single_crop_col_tokens", False)
         self.use_single_crop_start_token = kwargs.get("use_single_crop_start_token", True)
+        self.use_low_res_token_for_global_crops = kwargs.get("use_low_res_token_for_global_crops", True)
 
         self.image_token_ids = [
             tokenizer.convert_tokens_to_ids(token) for token in IMAGE_TOKENS
@@ -64,7 +66,10 @@ class MolmoPointProcessor:
             np.tile(per_row, [height]),
             [IM_END_TOKEN],
         ]
-        per_row = np.full(resized_w, IMAGE_PATCH_TOKEN)
+        if self.use_low_res_token_for_global_crops:
+            per_row = np.full(resized_w, IMAGE_LOW_RES_TOKEN)
+        else:
+            per_row = np.full(resized_w, IMAGE_PATCH_TOKEN)
         use_single_crop_col_tokens = (
             self.image_use_col_tokens
             if self.use_single_crop_col_tokens is None
@@ -97,10 +102,10 @@ class MolmoPointProcessor:
             if not isinstance(images, list):
                 images = [images]
 
-            # Process images
+            # Process images (settings from preprocessor_config.json)
             img_result = preprocess_images(
                 images,
-                max_crops=8,
+                max_crops=24,
                 overlap_margins=[4, 4],
                 base_image_input_size=(378, 378),
                 image_patch_size=14,
