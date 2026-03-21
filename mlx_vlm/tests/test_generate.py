@@ -1,6 +1,8 @@
 """Tests for batch generation functionality in mlx_vlm.generate module."""
 
 import sys
+from argparse import Namespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
@@ -14,6 +16,7 @@ from mlx_vlm.generate import (
     BatchStats,
     GenerationResult,
     _left_pad_prompts,
+    normalize_resize_shape,
 )
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
@@ -1025,6 +1028,75 @@ class TestSamplerArgs:
             top_k=32,
         )
         mock_make_logits_processors.assert_called_once_with({3: -0.75}, 1.15, 20)
+
+
+def test_normalize_resize_shape_expands_single_value():
+    assert normalize_resize_shape([224]) == (224, 224)
+
+
+def test_normalize_resize_shape_accepts_two_values():
+    assert normalize_resize_shape((224, 448)) == (224, 448)
+
+
+@pytest.mark.parametrize("value", [224, "22", [1.5], [True], [1, 2, 3]])
+def test_normalize_resize_shape_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="resize_shape must contain 1 or 2 integers"):
+        normalize_resize_shape(value)
+
+
+def test_generate_cli_smoke(capsys):
+    import importlib
+
+    generate_module = importlib.import_module("mlx_vlm.generate")
+
+    args = Namespace(
+        model="demo",
+        adapter_path=None,
+        image=["image.png"],
+        audio=None,
+        resize_shape=[224],
+        prompt=["Describe this image."],
+        system=None,
+        max_tokens=12,
+        temperature=0.7,
+        chat=False,
+        verbose=False,
+        eos_tokens=None,
+        max_kv_size=None,
+        kv_bits=None,
+        kv_group_size=64,
+        quantized_kv_start=512,
+        skip_special_tokens=False,
+        force_download=False,
+        revision="main",
+        trust_remote_code=False,
+        quantize_activations=False,
+        processor_kwargs={},
+        prefill_step_size=128,
+        enable_thinking=False,
+        thinking_budget=None,
+        thinking_start_token=None,
+        thinking_end_token="</think>",
+    )
+    model = SimpleNamespace(config=SimpleNamespace(model_type="demo"))
+    processor = SimpleNamespace()
+
+    with (
+        patch.object(generate_module, "parse_arguments", return_value=args),
+        patch.object(generate_module, "load", return_value=(model, processor)),
+        patch.object(generate_module, "apply_chat_template", return_value="prompt"),
+        patch.object(
+            generate_module,
+            "generate",
+            return_value=SimpleNamespace(text="done"),
+        ) as mock_generate,
+    ):
+        generate_module.main()
+
+    assert mock_generate.call_args.kwargs["max_tokens"] == 12
+    assert mock_generate.call_args.kwargs["temperature"] == pytest.approx(0.7)
+    assert mock_generate.call_args.kwargs["prefill_step_size"] == 128
+    assert capsys.readouterr().out.strip() == "done"
 
 
 if __name__ == "__main__":
