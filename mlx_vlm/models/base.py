@@ -402,7 +402,7 @@ def install_auto_processor_patch(target_model_types, processor_cls):
             # On any failure, fall back to previous behavior
             pass
 
-        # Chain to the prior from_pretrained 
+        # Chain to the prior from_pretrained
         return previous_from_pretrained.__func__(
             cls, pretrained_model_name_or_path, **kwargs
         )
