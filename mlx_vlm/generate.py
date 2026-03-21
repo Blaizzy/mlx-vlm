@@ -1070,8 +1070,7 @@ class BatchGenerator:
         return responses
 
     def next(self, **kwargs):
-        with mx.stream(generation_stream):
-            return self._next(**kwargs)
+        return self._next(**kwargs)
 
 
 def batch_generate(
