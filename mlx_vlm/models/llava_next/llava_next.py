@@ -83,9 +83,7 @@ class Model(nn.Module):
         if self.image_newline is not None:
             newline = np.array(self.image_newline)[None, None, :]
             newline = np.broadcast_to(newline, image_features.shape)
-            image_features = mx.concatenate(
-                [image_features, mx.array(newline)], axis=0
-            )
+            image_features = mx.concatenate([image_features, mx.array(newline)], axis=0)
 
         image_features = image_features.astype(inputs_embeds.dtype)
 
