@@ -1318,7 +1318,6 @@ def _generate_batch(
                 if r.finish_reason != "stop":
                     results[r.uid].append(r.token)
 
-
     detokenizer = processor.detokenizer
     texts = []
     for uid in uids:
