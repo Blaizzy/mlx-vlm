@@ -10,12 +10,7 @@ import numpy as np
 
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
 from .config import AdapterConfig, ModelConfig, TextConfig, VisionConfig
-from .language import (
-    LanguageModel,
-    Molmo2Embedding,
-    Molmo2RMSNorm,
-    TextModel,
-)
+from .language import LanguageModel
 from .vision import VisionModel, ViTMultiHeadDotProductAttention
 
 
@@ -174,7 +169,7 @@ class PointPredictor(nn.Module):
         vit_dim = config.vision_config.hidden_size * len(config.adapter_config.vit_layers)
 
         if config.layer_norm_x:
-            self.x_norm = Molmo2RMSNorm(llm_dim, eps=config.text_config.layer_norm_eps)
+            self.x_norm = nn.RMSNorm(llm_dim, eps=config.text_config.layer_norm_eps)
         else:
             self.x_norm = None
 
@@ -215,17 +210,6 @@ class GeneratedTokenBounds:
         self.location_end = self.subpatch_end + n_locations
 
 
-class ExtendedLmHead(nn.Module):
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.output_embeddings = mx.zeros((config.vocab_size, config.hidden_size))
-        self.new_output_embeddings = mx.zeros((128, config.hidden_size))
-
-    def __call__(self, hidden_states: mx.array) -> mx.array:
-        lm_head = mx.concatenate([self.output_embeddings, self.new_output_embeddings], axis=0)
-        return hidden_states @ lm_head.T
-
-
 class MolmoPointLogitProcessor:
     """Enforce valid point token generation order in MLX."""
 
@@ -235,52 +219,56 @@ class MolmoPointLogitProcessor:
         self.force_patch_sorted = force_patch_sorted
         self.force_subpatch_sorted = force_subpatch_sorted
 
-    def __call__(self, input_ids_list, scores):
+    def __call__(self, generated_ids_np, last_token_int, vocab_size):
+        """Build a logit mask. Uses numpy (no mx.eval sync).
+
+        Args:
+            generated_ids_np: list of int token ids generated so far
+            last_token_int: int, the last generated token
+            vocab_size: int, extended vocabulary size
+
+        Returns:
+            mx.array of shape (vocab_size,) with -1e9 at invalid positions
+        """
         b = self.bounds
-        NEG_INF = -1e9
+        NEG_INF = np.float32(-1e9)
+        mask = np.zeros(vocab_size, dtype=np.float32)
 
-        for batch in range(scores.shape[0]):
-            ids = input_ids_list[batch]
-            last_token = int(ids[-1])
+        last_token = last_token_int
+        ids = generated_ids_np
 
-            # Find complete patches/subpatches (excluding the last 1 or 2)
-            skip = 2 if b.n_locations else 1
-            complete_patches = []
-            complete_subpatches = []
-            for i in range(len(ids) - skip):
-                tok = int(ids[i])
-                if b.patch_start <= tok < b.patch_end:
-                    complete_patches.append(tok)
-                elif b.subpatch_start <= tok < b.subpatch_end:
-                    complete_subpatches.append(tok)
+        skip = 2 if b.n_locations else 1
+        last_patch = None
+        last_subpatch = None
+        no_more_points = False
+        for i in range(len(ids) - skip):
+            tok = ids[i]
+            if tok == b.no_more_points_token_id:
+                no_more_points = True
+            if b.patch_start <= tok < b.patch_end:
+                last_patch = tok
+            elif b.subpatch_start <= tok < b.subpatch_end:
+                last_subpatch = tok
 
-            last_patch = complete_patches[-1] if complete_patches else None
-            last_subpatch = complete_subpatches[-1] if complete_subpatches else None
-            no_more_points = any(int(ids[i]) == b.no_more_points_token_id for i in range(len(ids)))
+        if no_more_points:
+            mask[b.patch_start:b.location_end] = NEG_INF
+        elif last_token < b.patch_start or last_token >= b.subpatch_end:
+            mask[b.subpatch_start:b.location_end] = NEG_INF
+            if self.force_patch_sorted and last_patch is not None:
+                mask[b.patch_start:last_patch] = NEG_INF
+        elif b.patch_start <= last_token < b.patch_end:
+            mask[:b.subpatch_start] = NEG_INF
+            mask[b.subpatch_end:] = NEG_INF
+            if self.force_subpatch_sorted and last_patch == last_token and last_subpatch is not None:
+                if self.prevent_repeats:
+                    mask[b.subpatch_start:last_subpatch + 1] = NEG_INF
+                else:
+                    mask[b.subpatch_start:last_subpatch] = NEG_INF
+        elif b.n_locations and b.subpatch_start <= last_token < b.subpatch_end:
+            mask[:b.location_start] = NEG_INF
+            mask[b.location_end:] = NEG_INF
 
-            mask = mx.zeros_like(scores[batch])
-
-            if no_more_points:
-                mask = mask.at[b.patch_start:b.location_end].add(NEG_INF)
-            elif last_token < b.patch_start or last_token >= b.subpatch_end:
-                mask = mask.at[b.subpatch_start:b.location_end].add(NEG_INF)
-                if self.force_patch_sorted and last_patch is not None:
-                    mask = mask.at[b.patch_start:last_patch].add(NEG_INF)
-            elif b.patch_start <= last_token < b.patch_end:
-                mask = mask.at[:b.subpatch_start].add(NEG_INF)
-                mask = mask.at[b.subpatch_end:].add(NEG_INF)
-                if self.force_subpatch_sorted and last_patch == last_token and last_subpatch is not None:
-                    if self.prevent_repeats:
-                        mask = mask.at[b.subpatch_start:last_subpatch + 1].add(NEG_INF)
-                    else:
-                        mask = mask.at[b.subpatch_start:last_subpatch].add(NEG_INF)
-            elif b.n_locations and b.subpatch_start <= last_token < b.subpatch_end:
-                mask = mask.at[:b.location_start].add(NEG_INF)
-                mask = mask.at[b.location_end:].add(NEG_INF)
-
-            scores = scores.at[batch].add(mask)
-
-        return scores
+        return mx.array(mask)
 
 
 class Model(nn.Module):
@@ -319,16 +307,15 @@ class Model(nn.Module):
         # Point predictor
         self.point_predictor = PointPredictor(config)
 
-        # Language model (text_backbone to avoid name conflict with language_model property)
-        self.text_backbone = LanguageModel(config.text_config, config)
-
-        # LM head
-        self.lm_head = ExtendedLmHead(config)
+        # Language model (stored as `lm` so the `language_model` property can
+        # return `self` and route generate_step through Model.__call__ for
+        # point prediction support)
+        self.lm = LanguageModel(config.text_config, config)
 
         # Image cache (set during prefill, used during generation)
         self._image_cache = None
         self._token_bounds = None
-        self._generated_ids = []
+        self._generated_ids_list = []  # plain Python list of ints for logit processor
         self._last_predicted_patch_id = None
 
     def _build_token_bounds(self, token_pooling):
@@ -363,13 +350,13 @@ class Model(nn.Module):
         token_type_ids = kwargs.get("token_type_ids", None)
 
         if pixel_values is None:
-            inputs_embeds = self.text_backbone.model.wte(input_ids)
+            inputs_embeds = self.lm.model.wte(input_ids)
             return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
         # Reset image cache for new inference
         self._image_cache = None
         self._token_bounds = None
-        self._generated_ids = []
+        self._generated_ids_list = []
         self._last_predicted_patch_id = None
 
         # Build batched images
@@ -379,7 +366,7 @@ class Model(nn.Module):
 
         # Mark IDs that should not be -1
         safe_ids = mx.where(input_ids != -1, input_ids, 0)
-        x = self.text_backbone.model.wte(safe_ids)
+        x = self.lm.model.wte(safe_ids)
         batch_size = x.shape[0]
         dim = x.shape[-1]
 
@@ -408,10 +395,10 @@ class Model(nn.Module):
         vit_features_gathered = vit_features_gathered * (token_pooling >= 0).astype(vit_features_gathered.dtype)[:, :, :, None]
         vit_features_mask = token_pooling >= 0
 
-        # Build sparse features for connector using numpy for indexing
+        # Build sparse features for connector
+        # Use numpy ONLY for bool mask -> int index conversion (tiny, no data copy)
         image_features_mask = mx.any(vit_features_mask, axis=-1)  # (B, n_pooled_patches)
 
-        # Use numpy for complex indexing operations
         flat_mask_np = np.array(image_features_mask.reshape(-1))
         valid_indices_np = np.where(flat_mask_np)[0]
         valid_indices = mx.array(valid_indices_np.astype(np.int32))
@@ -423,16 +410,14 @@ class Model(nn.Module):
         # Apply connector
         image_features = self.connector(vit_features_sparse, vit_mask_sparse)
 
-        # Add image features to embeddings at image token positions
+        # Add image features to embeddings at image token positions (all mx ops)
         flat_is_image_np = np.array(is_image_token.reshape(-1))
         image_indices_np = np.where(flat_is_image_np)[0]
         image_indices = mx.array(image_indices_np.astype(np.int32))
 
-        # Use numpy scatter for adding image features
-        x_np = np.array(x.reshape(-1, dim))
-        img_feat_np = np.array(image_features.reshape(-1, dim))
-        x_np[image_indices_np] += img_feat_np
-        x = mx.array(x_np).reshape(x.shape)
+        x_flat = x.reshape(-1, dim)
+        x_flat = x_flat.at[image_indices].add(image_features.reshape(-1, dim))
+        x = x_flat.reshape(x.shape)
 
         # Build point predictor keys (cache for generation)
         pp = self.point_predictor
@@ -444,32 +429,30 @@ class Model(nn.Module):
 
         if pp.patch_rotary is not None:
             # Compute position IDs for image tokens
-            is_indexable_np = np.array(is_indexable_image_token.reshape(-1))
-            image_token_cumsum = np.cumsum(is_indexable_np.astype(np.int32)) - 1
-            image_pos_ids_flat = mx.array(image_token_cumsum[image_indices_np].astype(np.int32))
+            is_indexable_flat = is_indexable_image_token.reshape(-1).astype(mx.int32)
+            image_token_cumsum = mx.cumsum(is_indexable_flat, axis=0) - 1
+            image_pos_ids_flat = image_token_cumsum[image_indices]
             patch_k_flat = pp.patch_rotary(patch_k_flat, image_pos_ids_flat)
 
-            # Build position IDs tensor for queries during generation
+            # Build position IDs tensor for queries during generation (scatter)
             n_pooled = token_pooling.shape[1]
-            image_pos_ids_np = np.zeros((batch_size, n_pooled), dtype=np.int32)
-            image_pos_ids_flat_np = np.array(image_pos_ids_flat)
-            image_pos_ids_np.reshape(-1)[valid_indices_np] = image_pos_ids_flat_np
-            image_pos_ids = mx.array(image_pos_ids_np)
+            image_pos_ids = mx.zeros((batch_size * n_pooled,), dtype=mx.int32)
+            image_pos_ids = image_pos_ids.at[valid_indices].add(image_pos_ids_flat)
+            image_pos_ids = image_pos_ids.reshape(batch_size, n_pooled)
         else:
             image_pos_ids = None
 
-        # Build patch_k tensor [batch, n_image_tokens, embed_dim]
+        # Build patch_k tensor [batch, n_image_tokens, embed_dim] (scatter)
         n_pooled = token_pooling.shape[1]
-        patch_k_np = np.zeros((batch_size * n_pooled, int(patch_k_flat.shape[-1])), dtype=np.float32)
-        patch_k_flat_np = np.array(patch_k_flat)
-        patch_k_np[valid_indices_np] = patch_k_flat_np
-        patch_k = mx.array(patch_k_np.reshape(batch_size, n_pooled, -1))
+        patch_k = mx.zeros((batch_size * n_pooled, patch_k_flat.shape[-1]), dtype=x.dtype)
+        patch_k = patch_k.at[valid_indices].add(patch_k_flat.astype(x.dtype))
+        patch_k = patch_k.reshape(batch_size, n_pooled, -1)
 
-        # Build patch_k_mask: only indexable image tokens are valid
-        patch_k_mask_np = np.zeros((batch_size * n_pooled,), dtype=bool)
-        is_indexable_at_image_np = is_indexable_np[image_indices_np]
-        patch_k_mask_np[valid_indices_np] = is_indexable_at_image_np.astype(bool)
-        patch_k_mask = mx.array(patch_k_mask_np.reshape(batch_size, n_pooled))
+        # Build patch_k_mask: only indexable image tokens are valid (scatter)
+        is_indexable_at_image = is_indexable_flat[image_indices]
+        patch_k_mask = mx.zeros((batch_size * n_pooled,), dtype=mx.int32)
+        patch_k_mask = patch_k_mask.at[valid_indices].add(is_indexable_at_image)
+        patch_k_mask = patch_k_mask.reshape(batch_size, n_pooled).astype(mx.bool_)
 
         if self.config.no_more_points_class:
             patch_k = pp.add_no_point_class_embed(patch_k)
@@ -611,10 +594,11 @@ class Model(nn.Module):
 
     def _prefill_forward(self, input_ids, inputs_embeds, mask, cache):
         """Standard forward pass for prefill."""
-        h, pre_ln_h = self.text_backbone.model(
-            input_ids=input_ids, inputs_embeds=inputs_embeds, mask=mask, cache=cache
+        h, pre_ln_h = self.lm.model(
+            input_ids, inputs_embeds=inputs_embeds, mask=mask, cache=cache,
+            return_pre_ln=True,
         )
-        logits = self.lm_head(h)
+        logits = self.lm.lm_head(h)
 
         # During prefill with images, build point predictor cache but don't use it yet
         if self._image_cache is not None:
@@ -636,8 +620,9 @@ class Model(nn.Module):
         dim = self.config.text_config.hidden_size
         batch_size = input_ids.shape[0]
 
-        # Track generated IDs for logit processor
-        self._generated_ids.append(input_ids)
+        # Track generated IDs as plain Python ints (no mx.eval sync)
+        for i in range(input_ids.shape[1]):
+            self._generated_ids_list.append(int(input_ids[0, i].item()))
 
         # Cast input_ids to int32 to avoid uint32 overflow issues
         input_ids_i32 = input_ids.astype(mx.int32)
@@ -658,7 +643,7 @@ class Model(nn.Module):
         decoded_ids = mx.where(is_location, self.config.location_token_id, decoded_ids)
 
         # Embed the tokens
-        x = self.text_backbone.model.wte(decoded_ids)
+        x = self.lm.model.wte(decoded_ids)
 
         # Add image features for patch tokens
         any_patch = mx.any(is_patch).item()
@@ -672,7 +657,7 @@ class Model(nn.Module):
                     feat = img_features.reshape(-1, dim)[flat_idx:flat_idx + 1]
                     x = x.at[b, 0].add(feat[0])
 
-        # Embed subpatch tokens with ViT features
+        # Embed subpatch tokens with ViT features (all mx ops, no numpy)
         any_subpatch = mx.any(is_subpatch).item()
         if any_subpatch:
             vit_features = ic["vit_features"]
@@ -691,17 +676,17 @@ class Model(nn.Module):
                     flat_pid = lpid + int(offsets[b].item())
                     vit_to_embed = vit_sparse[flat_pid, spid:spid + 1]
                     embedded = self.build_vit_embedding(vit_to_embed)
-                    x_np = np.array(x)
-                    x_np[b, 0] = np.array(embedded[0])
-                    x = mx.array(x_np)
+                    # Replace embedding in-place using mx scatter
+                    zeros = mx.zeros_like(x[b, 0:1])
+                    x = x.at[b, 0:1].add(embedded - x[b, 0:1])
 
         # Run through transformer
-        h, pre_ln_h = self.text_backbone.model(
-            inputs_embeds=x, mask=mask, cache=cache
+        h, pre_ln_h = self.lm.model(
+            inputs_embeds=x, mask=mask, cache=cache, return_pre_ln=True,
         )
 
         # Compute standard logits
-        logits = self.lm_head(h)
+        logits = self.lm.lm_head(h)
 
         # Point predictor
         x_norm = pp.x_norm(pre_ln_h) if pp.x_norm is not None else pre_ln_h / math.sqrt(dim)
@@ -730,14 +715,13 @@ class Model(nn.Module):
         logits = logits.at[:, :, self.config.patch_token_id].add(-100000.0 - logits[:, :, self.config.patch_token_id])
 
         n_patches = patch_logits.shape[-1]
+        # Vectorized: place patch_token_logits at the argmax patch position
+        selected_patches = mx.argmax(patch_logits, axis=-1)  # (B, S)
         argmax_patch_logits = mx.full((B, S, n_patches), -100000.0, dtype=logits.dtype)
-        selected_patches = mx.argmax(patch_logits, axis=-1)
-        for b_i in range(B):
-            for s_i in range(S):
-                sp = int(selected_patches[b_i, s_i].item())
-                argmax_patch_logits = argmax_patch_logits.at[b_i, s_i, sp].add(
-                    float(patch_token_logits[b_i, s_i, 0].item()) - (-100000.0)
-                )
+        # Manual one_hot: compare indices to selected_patches
+        indices = mx.arange(n_patches)[None, None, :]  # (1, 1, n_patches)
+        is_selected = (indices == selected_patches[:, :, None])  # (B, S, n_patches)
+        argmax_patch_logits = mx.where(is_selected, patch_token_logits, argmax_patch_logits)
 
         # Subpatch logits
         n_subpatches = ic["token_pooling"].shape[-1]
@@ -768,14 +752,12 @@ class Model(nn.Module):
         # Concatenate extended logits
         logits = mx.concatenate([logits, argmax_patch_logits, subpatch_logits, location_logits], axis=-1)
 
-        # Apply logit processor
-        if len(self._generated_ids) > 0:
-            all_ids = mx.concatenate(self._generated_ids, axis=1)
+        # Apply logit processor (uses numpy mask, no mx.eval sync)
+        if self._generated_ids_list:
             processor = self._build_logit_processor()
-            # Apply to last position logits
-            last_logits = logits[:, -1:, :]
-            processed = processor(all_ids.tolist(), last_logits.squeeze(1))
-            logits = logits.at[:, -1, :].add(processed - logits[:, -1, :])
+            last_tok = self._generated_ids_list[-1]
+            mask = processor(self._generated_ids_list, last_tok, logits.shape[-1])
+            logits = logits.at[:, -1, :].add(mask[None, :])
 
         # Update last_predicted_patch_id
         if mx.any(input_patch_ids >= 0).item():
@@ -789,12 +771,13 @@ class Model(nn.Module):
 
     @property
     def language_model(self):
-        """Return self so generate_step routes all calls through Model.__call__."""
+        """Return self so generate_step routes through Model.__call__
+        which includes point prediction logic."""
         return self
 
     @property
     def layers(self):
-        return self.text_backbone.model.blocks
+        return self.lm.layers
 
     @property
     def head_dim(self):
@@ -812,9 +795,13 @@ class Model(nn.Module):
             if new_k.startswith("model."):
                 new_k = new_k[len("model."):]
 
-            # LLM transformer -> text_backbone.model
+            # lm_head -> lm.lm_head
+            if new_k.startswith("lm_head."):
+                new_k = "lm." + new_k
+
+            # LLM transformer -> lm.model
             if new_k.startswith("transformer."):
-                new_k = "text_backbone.model." + new_k[len("transformer."):]
+                new_k = "lm.model." + new_k[len("transformer."):]
 
             # ViT: transformer.resblocks -> resblocks
             new_k = new_k.replace("vit.transformer.resblocks", "vit.resblocks")
