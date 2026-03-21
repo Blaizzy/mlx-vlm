@@ -17,7 +17,7 @@ from transformers.image_processing_utils import (
 )
 from transformers.processing_utils import ProcessorMixin
 
-from ..base import install_auto_processor_patch
+from ..base import install_auto_processor_patch, load_chat_template
 
 
 def _load_json(path: Path) -> Dict:
@@ -722,7 +722,6 @@ class MiniCPMOProcessor(ProcessorMixin):
                 use_fast=use_fast,
                 **hf_kwargs,
             )
-from ..base import load_chat_template
 
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 

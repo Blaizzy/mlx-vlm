@@ -9,7 +9,7 @@ from typing import List, Optional, Union
 
 import numpy as np
 
-from ..base import install_auto_processor_patch
+from ..base import install_auto_processor_patch, load_chat_template
 from .image_crops import create_crops
 
 # Moondream3 uses a custom tokenizer from this repo
@@ -59,14 +59,12 @@ class Moondream3Processor:
                 pretrained_model_name_or_path,
                 **tokenizer_kwargs,
             )
-from ..base import load_chat_template
-
-        load_chat_template(tokenizer, pretrained_model_name_or_path)
         except Exception:
             tokenizer = AutoTokenizer.from_pretrained(
                 TOKENIZER_REPO,
                 **tokenizer_kwargs,
             )
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
 
         # Read config for crop parameters
         config_path = Path(pretrained_model_name_or_path) / "config.json"

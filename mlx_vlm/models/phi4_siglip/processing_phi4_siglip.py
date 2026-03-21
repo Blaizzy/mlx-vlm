@@ -12,7 +12,7 @@ PyTorch tensors. This patch ensures:
 import numpy as np
 from transformers import AutoProcessor
 
-from ..base import install_auto_processor_patch
+from ..base import install_auto_processor_patch, load_chat_template
 
 IMAGE_TOKEN_INDEX = -200
 DEFAULT_IMAGE_TOKEN = "<image>"
@@ -183,8 +183,6 @@ class Phi4SigLipProcessor:
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
-from ..base import load_chat_template
-
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
         # Load config to determine vision tower and create image processor
