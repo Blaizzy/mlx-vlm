@@ -1,6 +1,5 @@
 """Processor for MolmoPoint - no torch dependency."""
 
-
 import numpy as np
 
 from ..base import install_auto_processor_patch, load_chat_template, to_mlx
