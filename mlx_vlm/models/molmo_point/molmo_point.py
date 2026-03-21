@@ -332,9 +332,9 @@ class Model(nn.Module):
         if last_layer_needed < vit_config.num_hidden_layers:
             truncated_config = deepcopy(vit_config)
             truncated_config.num_hidden_layers = last_layer_needed
-            self.vit = VisionModel(truncated_config)
+            self.vision_model = VisionModel(truncated_config)
         else:
-            self.vit = VisionModel(vit_config)
+            self.vision_model = VisionModel(vit_config)
 
         # Connector
         self.connector = MolmoPointConnector(adapter_config, vit_config)
@@ -423,7 +423,10 @@ class Model(nn.Module):
 
         B, T, N, D = images.shape
         images_flat = images.reshape(B * T, N, D)
-        vit_image_features = self.vit(images_flat)
+        # Cast to vision model dtype (critical for quantized models)
+        vit_dtype = self.vision_model.patch_embedding.weight.dtype
+        images_flat = images_flat.astype(vit_dtype)
+        vit_image_features = self.vision_model(images_flat)
 
         features = []
         for layer_idx in self._vit_layers:
@@ -470,8 +473,11 @@ class Model(nn.Module):
         image_indices_np = np.where(flat_is_image_np)[0]
         image_indices = mx.array(image_indices_np.astype(np.int32))
 
-        x_flat = x.reshape(-1, dim)
-        x_flat = x_flat.at[image_indices].add(image_features.reshape(-1, dim))
+        # Add image features in float32 to avoid float16 overflow
+        # (connector output can exceed float16 max 65504).
+        # Keep float32 — the LM layers will handle the dtype internally.
+        x_flat = x.reshape(-1, dim).astype(mx.float32)
+        x_flat = x_flat.at[image_indices].add(image_features.reshape(-1, dim).astype(mx.float32))
         x = x_flat.reshape(x.shape)
 
         # Build subpatch keys from ViT features (not from transformer output)
@@ -938,6 +944,7 @@ class Model(nn.Module):
         for k, v in weights.items():
             new_k = k
 
+            # HF checkpoint keys start with "model."
             if new_k.startswith("model."):
                 new_k = new_k[len("model.") :]
 
@@ -949,8 +956,17 @@ class Model(nn.Module):
             if new_k.startswith("transformer."):
                 new_k = "lm.model." + new_k[len("transformer.") :]
 
-            # ViT: transformer.resblocks -> resblocks
-            new_k = new_k.replace("vit.transformer.resblocks", "vit.resblocks")
+            # ViT: vit.transformer.resblocks -> vision_model.resblocks
+            new_k = new_k.replace(
+                "vit.transformer.resblocks", "vision_model.resblocks"
+            )
+            # ViT: vit.* -> vision_model.* (remaining keys)
+            if new_k.startswith("vit."):
+                new_k = "vision_model." + new_k[len("vit.") :]
+
+            # Cast float32 weights to float16 (HF checkpoint is float32)
+            if v.dtype == mx.float32:
+                v = v.astype(mx.float16)
 
             sanitized[new_k] = v
         return sanitized
