@@ -46,6 +46,10 @@ class MolmoPointProcessor:
             tokenizer.convert_tokens_to_ids(token) for token in IMAGE_TOKENS
         ]
 
+    def save_pretrained(self, save_directory):
+        """Save the tokenizer to the given directory."""
+        self.tokenizer.save_pretrained(save_directory)
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         from transformers import AutoTokenizer
