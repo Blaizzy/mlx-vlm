@@ -410,6 +410,49 @@ def load(
     return model, processor
 
 
+def sharded_load(
+    repo,
+    tensor_group: Optional[mx.distributed.Group] = None,
+):
+    # Get model path with everything but weight safetensors
+    model_path = get_model_path(repo)
+
+    # Lazy load model to figure out what type of sharding we can do and which
+    # weights we need to download.
+    model = load_model(model_path, lazy=True, strict=False)
+    config = model.config.to_dict()
+
+    has_tensor_parallel = hasattr(model, "shard")
+
+    if tensor_group is not None and not has_tensor_parallel:
+        raise ValueError(
+            "The model does not support tensor parallelism but a tensor_group was provided"
+        )
+
+    if tensor_group is None:
+        if has_tensor_parallel:
+            tensor_group = mx.distributed.init()
+
+    processor = load_processor(
+        model_path, True, eos_token_ids=config.get("eos_token_id", None)
+    )
+
+    image_processor = load_image_processor(model_path)
+    if image_processor is not None:
+        processor.image_processor = image_processor
+
+    if tensor_group is not None:
+        model.shard(tensor_group)
+
+    mx.eval(model.parameters())
+    model.eval()
+
+    # Synchronize processes to avoid timeout
+    mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
+
+    return model, processor
+
+
 def load_config(model_path: Union[str, Path], **kwargs) -> dict:
     """Load model configuration from a path or Hugging Face repo.
 
