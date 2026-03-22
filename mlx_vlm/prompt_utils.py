@@ -684,16 +684,26 @@ def apply_chat_template(
             )
         )
     elif isinstance(prompt, list):
-        # List of prompts
+        # List of prompts.
+        # Image/audio tokens must go into the last user message, not the first,
+        # so that multi-turn conversations with images work correctly.
+        last_user_idx = None
+        if num_images > 0 or num_audios > 0:
+            for i, p in enumerate(prompt):
+                if isinstance(p, str):
+                    last_user_idx = i
+                elif (rc := _get_role_content(p)) is not None and rc[0] == "user":
+                    last_user_idx = i
+
         for i, p in enumerate(prompt):
             if isinstance(p, str):
-                is_first = i == 0
+                is_target = last_user_idx is None or i == last_user_idx
                 messages.append(
                     get_message_json(
                         model_type,
                         p,
-                        skip_image_token=not is_first,
-                        skip_audio_token=not is_first,
+                        skip_image_token=not is_target,
+                        skip_audio_token=not is_target,
                         num_images=num_images,
                         num_audios=num_audios,
                         **kwargs,
@@ -703,16 +713,16 @@ def apply_chat_template(
                 role, content = role_content
                 # Handle multimodal content: extract only text, skip image/audio URLs
                 content = extract_text_from_content(content)
-                is_first = i == 0 or (i == 1 and role not in ["system", "assistant"])
+                is_target = (i == last_user_idx) if last_user_idx is not None else (
+                    i == 0 or (i == 1 and role not in ["system", "assistant"])
+                )
                 messages.append(
                     get_message_json(
                         model_type,
                         content,
                         role,
-                        skip_image_token=not is_first
-                        or role in ["system", "assistant"],
-                        skip_audio_token=not is_first
-                        or role in ["system", "assistant"],
+                        skip_image_token=not is_target or role in ["system", "assistant"],
+                        skip_audio_token=not is_target or role in ["system", "assistant"],
                         num_images=num_images,
                         num_audios=num_audios,
                         **kwargs,
