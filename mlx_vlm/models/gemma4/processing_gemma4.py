@@ -253,7 +253,7 @@ class Gemma4Processor(ProcessorMixin):
         # Precompute fallback full sequences
         image_tokens_expanded = self.image_token * image_seq_length
         self.full_image_sequence = (
-            f"\n\n{self.boi_token}{image_tokens_expanded}{self.eoi_token}\n\n"
+            f"{self.boi_token}{image_tokens_expanded}{self.eoi_token}"
         )
 
         if self.audio_token and self.boa_token and self.eoa_token:
@@ -322,11 +322,7 @@ class Gemma4Processor(ProcessorMixin):
                 # re.sub never re-scans replaced text, so it is safe even though the
                 # replacement strings themselves contain image_token.
                 replacements = [
-                    (
-                        f"\n\n{self.boi_token}"
-                        + self.image_token * n
-                        + f"{self.eoi_token}\n\n"
-                    )
+                    f"{self.boi_token}{self.image_token * n}{self.eoi_token}"
                     for n in num_soft_tokens
                 ]
                 replacements_iter = iter(replacements)
