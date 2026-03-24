@@ -1,25 +1,30 @@
+"""
+Processor class for Gemma4.
+
+Adapted from HuggingFace Transformers:
+https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/processing_gemma4.py
+"""
+
 import math
 import re
-from pathlib import Path
 from typing import List, Optional, Union
 
 import numpy as np
-from transformers import AutoTokenizer
 from transformers.feature_extraction_utils import BatchFeature
-from transformers.image_processing_utils import BaseImageProcessor
+from transformers.image_processing_utils import BaseImageProcessor as HFBaseImageProcessor
 from transformers.image_utils import (
     ChannelDimension,
     ImageInput,
     PILImageResampling,
     infer_channel_dimension_format,
-    is_scaled_image,
     make_list_of_images,
     to_numpy_array,
     valid_images,
 )
 from transformers.processing_utils import ProcessorMixin
+from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
-from ..base import install_auto_processor_patch
+from ..base import load_chat_template, to_mlx
 
 _SUPPORTED_SOFT_TOKENS = (70, 140, 280, 560, 1120)
 
@@ -34,17 +39,6 @@ def _convert_to_rgb(image):
     return image.convert("RGB")
 
 
-def _resize(image, size, resample, data_format=None):
-    from PIL import Image
-
-    if isinstance(image, np.ndarray):
-        h, w = size
-        pil_img = Image.fromarray(image.astype(np.uint8) if image.dtype != np.uint8 else image)
-        pil_img = pil_img.resize((w, h), resample=resample)
-        return np.array(pil_img)
-    return image
-
-
 def _to_channel_first(image, input_format):
     if input_format == ChannelDimension.FIRST:
         return image
@@ -53,10 +47,11 @@ def _to_channel_first(image, input_format):
     return image
 
 
-class Gemma4ImageProcessor(BaseImageProcessor):
+class Gemma4ImageProcessor(HFBaseImageProcessor):
     """Image processor for Gemma 4.
 
     Aspect-ratio preserving resize, rescale to [0,1], output as channels-first.
+    Patchification is handled by the model, not the image processor.
     """
 
     model_input_names = ["pixel_values"]
@@ -91,13 +86,21 @@ class Gemma4ImageProcessor(BaseImageProcessor):
         self.max_soft_tokens = max_soft_tokens
         self.pooling_kernel_size = pooling_kernel_size
 
-    def aspect_ratio_preserving_resize(self, image, patch_size, max_patches, pooling_kernel_size, input_data_format):
+    def aspect_ratio_preserving_resize(
+        self, image, patch_size, max_patches, pooling_kernel_size, input_data_format
+    ):
+        """Resize image preserving aspect ratio so it fits within the patch budget.
+
+        Target dimensions are the largest that:
+        1) Produce at most `max_patches` patches when patchified with `patch_size`
+        2) Have height and width divisible by `pooling_kernel_size * patch_size`
+        """
         if input_data_format == ChannelDimension.FIRST:
             height, width = image.shape[1], image.shape[2]
         else:
             height, width = image.shape[0], image.shape[1]
 
-        target_px = max_patches * (patch_size ** 2)
+        target_px = max_patches * (patch_size**2)
         factor = math.sqrt(target_px / (height * width))
         side_mult = pooling_kernel_size * patch_size
 
@@ -107,13 +110,17 @@ class Gemma4ImageProcessor(BaseImageProcessor):
         if target_height == 0 and target_width == 0:
             raise ValueError("Attempting to resize to a 0 x 0 image.")
 
-        max_side_length = (max_patches // pooling_kernel_size ** 2) * side_mult
+        max_side_length = (max_patches // pooling_kernel_size**2) * side_mult
         if target_height == 0:
             target_height = side_mult
-            target_width = min(int(math.floor(width / height)) * side_mult, max_side_length)
+            target_width = min(
+                int(math.floor(width / height)) * side_mult, max_side_length
+            )
         elif target_width == 0:
             target_width = side_mult
-            target_height = min(int(math.floor(height / width)) * side_mult, max_side_length)
+            target_height = min(
+                int(math.floor(height / width)) * side_mult, max_side_length
+            )
 
         if target_height == height and target_width == width:
             return image
@@ -129,7 +136,9 @@ class Gemma4ImageProcessor(BaseImageProcessor):
             img_arr = (img_arr * 255).clip(0, 255).astype(np.uint8)
 
         pil_img = Image.fromarray(img_arr)
-        pil_img = pil_img.resize((target_width, target_height), resample=Image.BICUBIC)
+        pil_img = pil_img.resize(
+            (target_width, target_height), resample=Image.BICUBIC
+        )
         result = np.array(pil_img)
 
         if input_data_format == ChannelDimension.FIRST:
@@ -137,18 +146,14 @@ class Gemma4ImageProcessor(BaseImageProcessor):
 
         return result
 
-    def preprocess(
-        self,
-        images: ImageInput,
-        return_tensors: Optional[str] = None,
-        **kwargs,
-    ):
+    def preprocess(self, images: ImageInput, **kwargs):
         patch_size = kwargs.get("patch_size", self.patch_size)
         max_soft_tokens = kwargs.get("max_soft_tokens", self.max_soft_tokens)
-        pooling_kernel_size = kwargs.get("pooling_kernel_size", self.pooling_kernel_size)
-        max_patches = max_soft_tokens * pooling_kernel_size ** 2
+        pooling_kernel_size = kwargs.get(
+            "pooling_kernel_size", self.pooling_kernel_size
+        )
+        max_patches = max_soft_tokens * pooling_kernel_size**2
 
-        images = self.fetch_images(images)
         images = make_list_of_images(images)
 
         if not valid_images(images):
@@ -167,7 +172,11 @@ class Gemma4ImageProcessor(BaseImageProcessor):
 
             if self.do_resize:
                 image = self.aspect_ratio_preserving_resize(
-                    image, patch_size, max_patches, pooling_kernel_size, input_data_format
+                    image,
+                    patch_size,
+                    max_patches,
+                    pooling_kernel_size,
+                    input_data_format,
                 )
 
             if self.do_rescale:
@@ -186,17 +195,18 @@ class Gemma4ImageProcessor(BaseImageProcessor):
 
             h, w = image.shape[-2], image.shape[-1]
             num_patches = (h // patch_size) * (w // patch_size)
-            num_soft_tokens_per_image.append(num_patches // (pooling_kernel_size ** 2))
+            num_soft_tokens_per_image.append(
+                num_patches // (pooling_kernel_size**2)
+            )
 
+        # Different-shaped images can't be stacked; return as a list
         shapes = {img.shape for img in processed}
         if len(shapes) > 1:
             data = {"pixel_values": processed}
         else:
             data = {"pixel_values": np.stack(processed)}
 
-        result = BatchFeature(data=data, tensor_type=return_tensors)
-        result["num_soft_tokens_per_image"] = num_soft_tokens_per_image
-        return result
+        return data, num_soft_tokens_per_image
 
     def __call__(self, images, **kwargs):
         return self.preprocess(images, **kwargs)
@@ -208,7 +218,7 @@ class Gemma4Processor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     image_processor_class = "Gemma4ImageProcessor"
     tokenizer_class = "AutoTokenizer"
-    valid_kwargs = ["chat_template"]
+    valid_kwargs = ["chat_template", "image_seq_length", "audio_seq_length"]
 
     def __init__(
         self,
@@ -227,19 +237,32 @@ class Gemma4Processor(ProcessorMixin):
         self.image_seq_length = image_seq_length
         self.audio_seq_length = audio_seq_length
         self.audio_ms_per_token = kwargs.pop("audio_ms_per_token", 40)
+
+        # Image token attributes
         self.image_token_id = getattr(tokenizer, "image_token_id", None)
         self.boi_token = getattr(tokenizer, "boi_token", "")
         self.eoi_token = getattr(tokenizer, "eoi_token", "")
         self.image_token = getattr(tokenizer, "image_token", "")
+
+        # Audio token attributes
+        self.audio_token_id = getattr(tokenizer, "audio_token_id", None)
         self.audio_token = getattr(tokenizer, "audio_token", "")
         self.boa_token = getattr(tokenizer, "boa_token", "")
         self.eoa_token = getattr(tokenizer, "eoa_token", "")
 
+        # Precompute fallback full sequences
         image_tokens_expanded = self.image_token * image_seq_length
-        self.full_image_sequence = f"{self.boi_token}{image_tokens_expanded}{self.eoi_token}"
+        self.full_image_sequence = (
+            f"\n\n{self.boi_token}{image_tokens_expanded}{self.eoi_token}\n\n"
+        )
 
-        audio_tokens_expanded = self.audio_token * audio_seq_length
-        self.full_audio_sequence = f"{self.boa_token}{audio_tokens_expanded}{self.eoa_token}"
+        if self.audio_token and self.boa_token and self.eoa_token:
+            audio_tokens_expanded = self.audio_token * audio_seq_length
+            self.full_audio_sequence = (
+                f"{self.boa_token}{audio_tokens_expanded}{self.eoa_token}"
+            )
+        else:
+            self.full_audio_sequence = None
 
         super().__init__(
             image_processor=image_processor,
@@ -251,7 +274,10 @@ class Gemma4Processor(ProcessorMixin):
         self.feature_extractor = feature_extractor
 
     def _compute_audio_num_tokens(self, audio_waveform, sampling_rate: int) -> int:
-        """Compute number of audio soft tokens from waveform duration."""
+        """Compute number of audio soft tokens from waveform duration.
+
+        Uses ceil(audio_duration_ms / audio_ms_per_token) capped at audio_seq_length.
+        """
         num_samples = len(audio_waveform)
         duration_ms = num_samples / sampling_rate * 1000.0
         num_tokens = math.ceil(duration_ms / self.audio_ms_per_token)
@@ -260,26 +286,47 @@ class Gemma4Processor(ProcessorMixin):
     def __call__(
         self,
         images: Optional[ImageInput] = None,
-        text: Optional[Union[str, List[str]]] = None,
+        text: Optional[
+            Union[
+                TextInput,
+                PreTokenizedInput,
+                List[TextInput],
+                List[PreTokenizedInput],
+            ]
+        ] = None,
         audio: Optional[List] = None,
         **kwargs,
     ) -> BatchFeature:
         if text is None and images is None and audio is None:
             raise ValueError("Provide at least one of `text`, `images`, or `audio`.")
 
+        # Pop return_tensors - we handle conversion ourselves via to_mlx()
+        kwargs.pop("return_tensors", None)
+
         if isinstance(text, str):
             text = [text]
+        elif text is not None and not isinstance(text, list):
+            raise TypeError(
+                "Invalid input text. Please provide a string, or a list of strings"
+            )
 
+        # ── Process images ──────────────────────────────────────────────
         image_inputs = {}
         if images is not None:
             images = self.image_processor.fetch_images(images)
-            image_inputs = self.image_processor(images)
-
-            num_soft_tokens = image_inputs.pop("num_soft_tokens_per_image", None)
+            image_data, num_soft_tokens = self.image_processor(images)
+            image_inputs = image_data
 
             if text is not None and num_soft_tokens is not None:
+                # Expand each image_token placeholder to the per-image soft token count.
+                # re.sub never re-scans replaced text, so it is safe even though the
+                # replacement strings themselves contain image_token.
                 replacements = [
-                    (f"\n\n{self.boi_token}" + self.image_token * n + f"{self.eoi_token}\n\n")
+                    (
+                        f"\n\n{self.boi_token}"
+                        + self.image_token * n
+                        + f"{self.eoi_token}\n\n"
+                    )
                     for n in num_soft_tokens
                 ]
                 replacements_iter = iter(replacements)
@@ -289,12 +336,13 @@ class Gemma4Processor(ProcessorMixin):
                     for prompt in text
                 ]
             elif text is not None:
+                # Fallback: use fixed image_seq_length
                 text = [
                     prompt.replace(self.image_token, self.full_image_sequence)
                     for prompt in text
                 ]
 
-        # Process audio
+        # ── Process audio ───────────────────────────────────────────────
         audio_inputs = {}
         if audio is not None and self.feature_extractor is not None:
             audio_arrays = []
@@ -320,7 +368,9 @@ class Gemma4Processor(ProcessorMixin):
                 replacements_iter = iter(replacements)
                 audio_pattern = re.escape(self.audio_token)
                 text = [
-                    re.sub(audio_pattern, lambda _: next(replacements_iter), prompt)
+                    re.sub(
+                        audio_pattern, lambda _: next(replacements_iter), prompt
+                    )
                     for prompt in text
                 ]
 
@@ -332,25 +382,37 @@ class Gemma4Processor(ProcessorMixin):
             audio_inputs["input_features"] = result["input_features"]
             if "input_features_mask" in result:
                 audio_inputs["input_features_mask"] = result["input_features_mask"]
-        elif audio is not None and text is not None and self.audio_token:
+
+        elif (
+            audio is not None
+            and text is not None
+            and self.audio_token
+            and self.full_audio_sequence
+        ):
+            # No feature extractor available - use fixed audio_seq_length
             text = [
                 prompt.replace(self.audio_token, self.full_audio_sequence)
                 for prompt in text
             ]
 
-        return_tensors = kwargs.pop("return_tensors", None)
-        add_special_tokens = kwargs.pop("add_special_tokens", True)
-        text_inputs = {}
-        if text is not None:
-            text_inputs = self.tokenizer(
-                text,
-                return_tensors=return_tensors,
-                add_special_tokens=add_special_tokens,
-            )
+        # ── Tokenize text ───────────────────────────────────────────────
+        # Pop return_mm_token_type_ids before passing remaining kwargs to tokenizer
+        return_mm_token_type_ids = kwargs.pop("return_mm_token_type_ids", False)
+        text_inputs = self.tokenizer(text=text, **kwargs)
 
+        # Generate multimodal token type IDs
+        if return_mm_token_type_ids:
+            array_ids = np.array(text_inputs["input_ids"])
+            mm_token_type_ids = np.zeros_like(array_ids)
+            if self.image_token_id is not None:
+                mm_token_type_ids[array_ids == self.image_token_id] = 1
+            if self.audio_token_id is not None:
+                mm_token_type_ids[array_ids == self.audio_token_id] = 2
+            text_inputs["token_type_ids"] = mm_token_type_ids.tolist()
+
+        # Merge all inputs and convert to MLX arrays
         return BatchFeature(
-            data={**text_inputs, **image_inputs, **audio_inputs},
-            tensor_type=return_tensors,
+            data=to_mlx({**text_inputs, **image_inputs, **audio_inputs})
         )
 
     def batch_decode(self, *args, **kwargs):
@@ -361,12 +423,18 @@ class Gemma4Processor(ProcessorMixin):
 
     @property
     def model_input_names(self):
-        names = list(self.tokenizer.model_input_names)
-        names.extend(self.image_processor.model_input_names)
-        return list(dict.fromkeys(names))
+        tokenizer_input_names = self.tokenizer.model_input_names + ["token_type_ids"]
+        image_processor_input_names = self.image_processor.model_input_names
+        all_names = list(tokenizer_input_names + image_processor_input_names)
+        return list(dict.fromkeys(all_names))
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        import json
+        from pathlib import Path
+
+        from transformers import AutoTokenizer
+
         kwargs.pop("trust_remote_code", None)
         kwargs.pop("use_fast", None)
 
@@ -378,31 +446,85 @@ class Gemma4Processor(ProcessorMixin):
             trust_remote_code=True,
             local_files_only=is_local,
         )
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
 
-        # Load processor config
+        # Load processor config (contains image_processor and feature_extractor settings)
         proc_config = {}
         ip_config = {}
         fe_config = {}
-        try:
-            import json
 
-            if is_local:
-                config_path = model_path / "processor_config.json"
-            else:
+        def _load_json(path):
+            if path.exists():
+                with open(path) as f:
+                    return json.load(f)
+            return None
+
+        if is_local:
+            # Try processor_config.json first, then preprocessor_config.json
+            cfg = _load_json(model_path / "processor_config.json")
+            if cfg is None:
+                cfg = _load_json(model_path / "preprocessor_config.json")
+            if cfg is not None:
+                proc_config = cfg
+        else:
+            try:
                 from huggingface_hub import hf_hub_download
 
-                config_path = Path(
-                    hf_hub_download(pretrained_model_name_or_path, "processor_config.json")
+                try:
+                    config_path = Path(
+                        hf_hub_download(
+                            pretrained_model_name_or_path, "processor_config.json"
+                        )
+                    )
+                    proc_config = json.loads(config_path.read_text())
+                except Exception:
+                    try:
+                        config_path = Path(
+                            hf_hub_download(
+                                pretrained_model_name_or_path,
+                                "preprocessor_config.json",
+                            )
+                        )
+                        proc_config = json.loads(config_path.read_text())
+                    except Exception:
+                        pass
+            except ImportError:
+                pass
+
+        # Extract image processor config
+        if "image_processor" in proc_config and isinstance(
+            proc_config["image_processor"], dict
+        ):
+            ip_config = proc_config["image_processor"]
+            ip_config.pop("image_processor_type", None)
+        elif "image_processor_type" not in proc_config and any(
+            k in proc_config
+            for k in ("patch_size", "max_soft_tokens", "pooling_kernel_size")
+        ):
+            # Config is flat (preprocessor_config.json format)
+            ip_config = {
+                k: proc_config[k]
+                for k in (
+                    "patch_size",
+                    "max_soft_tokens",
+                    "pooling_kernel_size",
+                    "do_resize",
+                    "do_rescale",
+                    "do_normalize",
+                    "rescale_factor",
+                    "image_mean",
+                    "image_std",
+                    "size",
                 )
-            if config_path.exists():
-                with open(config_path) as f:
-                    proc_config = json.load(f)
-                ip_config = proc_config.get("image_processor", {})
-                ip_config.pop("image_processor_type", None)
-                fe_config = proc_config.get("feature_extractor", {})
-                fe_config.pop("feature_extractor_type", None)
-        except Exception:
-            pass
+                if k in proc_config
+            }
+
+        # Extract feature extractor config
+        if "feature_extractor" in proc_config and isinstance(
+            proc_config["feature_extractor"], dict
+        ):
+            fe_config = proc_config["feature_extractor"]
+            fe_config.pop("feature_extractor_type", None)
 
         image_processor = Gemma4ImageProcessor(**ip_config)
 
@@ -410,28 +532,16 @@ class Gemma4Processor(ProcessorMixin):
         feature_extractor = None
         if fe_config:
             try:
-                from transformers import Gemma4AudioFeatureExtractor
+                from .audio_feature_extractor import Gemma4AudioFeatureExtractor
 
                 feature_extractor = Gemma4AudioFeatureExtractor(**fe_config)
-            except (ImportError, Exception):
-                pass
+            except ImportError:
+                try:
+                    from transformers import Gemma4AudioFeatureExtractor
 
-        chat_template = getattr(tokenizer, "chat_template", None)
-        if chat_template is None:
-            try:
-                if is_local:
-                    jinja_path = model_path / "chat_template.jinja"
-                else:
-                    from huggingface_hub import hf_hub_download
-
-                    jinja_path = Path(
-                        hf_hub_download(pretrained_model_name_or_path, "chat_template.jinja")
-                    )
-                if jinja_path.exists():
-                    chat_template = jinja_path.read_text(encoding="utf-8")
-                    tokenizer.chat_template = chat_template
-            except Exception:
-                pass
+                    feature_extractor = Gemma4AudioFeatureExtractor(**fe_config)
+                except (ImportError, Exception):
+                    pass
 
         image_seq_length = ip_config.get("max_soft_tokens", 280)
         audio_seq_length = proc_config.get("audio_seq_length", 750)
@@ -440,7 +550,6 @@ class Gemma4Processor(ProcessorMixin):
         return cls(
             image_processor=image_processor,
             tokenizer=tokenizer,
-            chat_template=chat_template,
             image_seq_length=image_seq_length,
             audio_seq_length=audio_seq_length,
             audio_ms_per_token=audio_ms_per_token,
@@ -448,5 +557,8 @@ class Gemma4Processor(ProcessorMixin):
         )
 
 
-# Register with AutoProcessor
+__all__ = ["Gemma4ImageProcessor", "Gemma4Processor"]
+
+from ..base import install_auto_processor_patch
+
 install_auto_processor_patch("gemma4", Gemma4Processor)

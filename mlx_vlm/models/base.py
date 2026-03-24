@@ -54,6 +54,8 @@ class InputEmbeddingsFeatures:
 class BaseModelConfig:
     @classmethod
     def from_dict(cls, params):
+        if not params:
+            return cls()
         return cls(
             **{
                 k: v
