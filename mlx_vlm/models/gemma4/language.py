@@ -182,13 +182,15 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.v_norm = RMSNormNoScale(self.head_dim, eps=config.rms_norm_eps)
 
-        # RoPE
+        # RoPE (with partial rotation support)
         layer_key = "sliding_attention" if self.is_sliding else "full_attention"
         rope_params = config.rope_parameters.get(layer_key, {})
         rope_theta = rope_params.get("rope_theta", 10000.0)
+        partial_rotary_factor = rope_params.get("partial_rotary_factor", 1.0)
+        rope_dims = int(self.head_dim * partial_rotary_factor)
 
         self.rope = nn.RoPE(
-            self.head_dim,
+            rope_dims,
             traditional=config.rope_traditional,
             base=rope_theta,
         )

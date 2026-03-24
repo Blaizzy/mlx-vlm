@@ -261,7 +261,10 @@ class VisionTransformerBlock(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.layer_scalar = mx.array(1.0)
+        if getattr(config, "use_clipped_linears", True):
+            self.layer_scalar = mx.array(1.0)
+        else:
+            self.layer_scalar = None
 
     def __call__(
         self, x: mx.array, positions: mx.array, mask: Optional[mx.array] = None
@@ -276,7 +279,8 @@ class VisionTransformerBlock(nn.Module):
         ffw_out = self.post_feedforward_layernorm(ffw_out)
         out = h + ffw_out
 
-        out = out * self.layer_scalar
+        if self.layer_scalar is not None:
+            out = out * self.layer_scalar
         return out
 
 
