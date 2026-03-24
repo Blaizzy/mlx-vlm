@@ -177,16 +177,28 @@ class VisionAttention(nn.Module):
 
         clip = getattr(config, "use_clipped_linears", True)
         self.q_proj = ClippableLinear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=False, use_clipping=clip
+            self.hidden_size,
+            self.num_heads * self.head_dim,
+            bias=False,
+            use_clipping=clip,
         )
         self.k_proj = ClippableLinear(
-            self.hidden_size, self.num_kv_heads * self.head_dim, bias=False, use_clipping=clip
+            self.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            bias=False,
+            use_clipping=clip,
         )
         self.v_proj = ClippableLinear(
-            self.hidden_size, self.num_kv_heads * self.head_dim, bias=False, use_clipping=clip
+            self.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            bias=False,
+            use_clipping=clip,
         )
         self.o_proj = ClippableLinear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=False, use_clipping=clip
+            self.num_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+            use_clipping=clip,
         )
 
         self.q_norm = VisionRMSNorm(self.head_dim)
@@ -455,7 +467,9 @@ class VisionModel(nn.Module):
         valid_mask = ~padding_positions  # True = valid
         attn_mask = mx.expand_dims(valid_mask, 1) * mx.expand_dims(valid_mask, 2)
         neg_inf = mx.array(float("-inf"), dtype=inputs_embeds.dtype)
-        attn_mask = mx.where(attn_mask, mx.array(0.0, dtype=inputs_embeds.dtype), neg_inf)
+        attn_mask = mx.where(
+            attn_mask, mx.array(0.0, dtype=inputs_embeds.dtype), neg_inf
+        )
         attn_mask = mx.expand_dims(attn_mask, 1)  # [B, 1, L, L] for head broadcasting
 
         # Run transformer layers

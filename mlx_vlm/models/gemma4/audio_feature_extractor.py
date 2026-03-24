@@ -156,10 +156,7 @@ class Gemma4AudioFeatureExtractor:
         # Hanning window (non-zero at endpoints)
         arg = math.pi * 2.0 / self.frame_length
         window = 0.5 - (
-            0.5
-            * np.cos(
-                arg * (np.arange(self.frame_length, dtype=np.float32) + 0.5)
-            )
+            0.5 * np.cos(arg * (np.arange(self.frame_length, dtype=np.float32) + 0.5))
         )
         self.window = window.astype(np.float32)
 
@@ -193,9 +190,7 @@ class Gemma4AudioFeatureExtractor:
             self.per_bin_mean = None
 
         if per_bin_stddev is not None:
-            self.per_bin_stddev = np.array(per_bin_stddev).reshape(
-                1, 1, feature_size
-            )
+            self.per_bin_stddev = np.array(per_bin_stddev).reshape(1, 1, feature_size)
         else:
             self.per_bin_stddev = None
 
@@ -207,9 +202,9 @@ class Gemma4AudioFeatureExtractor:
             waveform = np.expand_dims(waveform, axis=0)
 
         if self.dither > 0.0:
-            waveform = waveform + self.dither * np.random.randn(
-                *waveform.shape
-            ).astype(waveform.dtype)
+            waveform = waveform + self.dither * np.random.randn(*waveform.shape).astype(
+                waveform.dtype
+            )
 
         if self.input_scale_factor != 1.0:
             waveform = waveform * self.input_scale_factor
@@ -225,9 +220,7 @@ class Gemma4AudioFeatureExtractor:
 
         if self.preemphasis > 0.0:
             if self.preemphasis_htk_flavor:
-                first_in_frame = frames_to_process[..., :1] * (
-                    1.0 - self.preemphasis
-                )
+                first_in_frame = frames_to_process[..., :1] * (1.0 - self.preemphasis)
                 rest_in_frame = (
                     frames_to_process[..., 1:-1]
                     - self.preemphasis * frames_to_process[..., :-2]
@@ -281,9 +274,7 @@ class Gemma4AudioFeatureExtractor:
             if len(w) < target_length:
                 pad_width = target_length - len(w)
                 mask[len(w) :] = 0
-                w = np.pad(
-                    w, (0, pad_width), constant_values=self.padding_value
-                )
+                w = np.pad(w, (0, pad_width), constant_values=self.padding_value)
             padded.append(w)
             masks.append(mask)
 
@@ -291,9 +282,7 @@ class Gemma4AudioFeatureExtractor:
 
     def __call__(
         self,
-        raw_speech: Union[
-            np.ndarray, list, list[np.ndarray], list[list[float]]
-        ],
+        raw_speech: Union[np.ndarray, list, list[np.ndarray], list[list[float]]],
         padding: Union[bool, str] = "longest",
         max_length: Optional[int] = 480_000,
         truncation: bool = True,
@@ -328,7 +317,9 @@ class Gemma4AudioFeatureExtractor:
                 raw_speech = np.asarray(raw_speech, dtype=np.float32)
             raw_speech = [raw_speech.flatten()]
         else:
-            raw_speech = [np.asarray(rs, dtype=np.float32).flatten() for rs in raw_speech]
+            raw_speech = [
+                np.asarray(rs, dtype=np.float32).flatten() for rs in raw_speech
+            ]
 
         # Truncate if needed
         if truncation and max_length is not None:

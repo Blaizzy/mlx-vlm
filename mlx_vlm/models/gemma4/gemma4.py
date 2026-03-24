@@ -14,7 +14,9 @@ def masked_scatter(input_tensor, mask, source):
     mask_flat = mask.flatten().astype(mx.int32)
     indices = mx.cumsum(mask_flat) - 1
     aligned = source.flatten()[indices % source.size]
-    return mx.where(mask_flat, aligned, input_tensor.flatten()).reshape(input_tensor.shape)
+    return mx.where(mask_flat, aligned, input_tensor.flatten()).reshape(
+        input_tensor.shape
+    )
 
 
 class MultimodalEmbedder(nn.Module):
@@ -54,8 +56,7 @@ class Model(nn.Module):
         if config.audio_config is not None:
             self.audio_tower = AudioEncoder(config.audio_config)
             audio_output_dim = (
-                config.audio_config.output_proj_dims
-                or config.audio_config.hidden_size
+                config.audio_config.output_proj_dims or config.audio_config.hidden_size
             )
             self.embed_audio = MultimodalEmbedder(
                 embedding_dim=audio_output_dim,
@@ -120,9 +121,7 @@ class Model(nn.Module):
             and self.embed_audio is not None
         ):
             if audio_mask is None:
-                audio_mask = mx.zeros(
-                    audio_features.shape[:2], dtype=mx.bool_
-                )
+                audio_mask = mx.zeros(audio_features.shape[:2], dtype=mx.bool_)
             audio_encodings, _ = self.audio_tower(audio_features, audio_mask)
             audio_encodings = self.embed_audio(audio_encodings)
             audio_encodings = audio_encodings.astype(inputs_embeds.dtype)
@@ -164,15 +163,14 @@ class Model(nn.Module):
         return logits
 
     def sanitize(self, weights):
-        import re
+        pass
 
         use_clipped = getattr(self.config.vision_config, "use_clipped_linears", True)
         sanitized = {}
         for k, v in weights.items():
             # Skip clipping parameters when not used
             if any(
-                s in k
-                for s in ["input_max", "input_min", "output_max", "output_min"]
+                s in k for s in ["input_max", "input_min", "output_max", "output_min"]
             ):
                 if "vision_tower" in k and not use_clipped:
                     continue
@@ -180,18 +178,16 @@ class Model(nn.Module):
                     continue
             if "rotary_emb.inv_freq" in k or "rotary_emb" in k:
                 continue
-            if self.audio_tower is None and (
-                "audio_tower" in k or "embed_audio" in k
-            ):
+            if self.audio_tower is None and ("audio_tower" in k or "embed_audio" in k):
                 continue
 
             if k.startswith("model."):
-                new_key = k[len("model."):]
+                new_key = k[len("model.") :]
             else:
                 new_key = k
 
             if new_key.startswith("language_model."):
-                rest = new_key[len("language_model."):]
+                rest = new_key[len("language_model.") :]
                 new_key = "language_model.model." + rest
 
             # Conv2d: PyTorch [out, in, kH, kW] -> MLX [out, kH, kW, in]

@@ -8,7 +8,6 @@ Architecture:
 """
 
 import math
-from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -134,7 +133,9 @@ class SubSampleConvProjection(nn.Module):
             f_out_dims.append(f_out)
             current_f = f_out
 
-        self.conv_0 = SSCPConvBlock(config, idx=0, input_freq_dim=config.input_feat_size)
+        self.conv_0 = SSCPConvBlock(
+            config, idx=0, input_freq_dim=config.input_feat_size
+        )
         self.conv_1 = SSCPConvBlock(config, idx=1, input_freq_dim=f_out_dims[0])
 
         final_c_out = config.sscp_conv_channel_size[-1]
@@ -216,15 +217,11 @@ class AudioRelativePositionEmbedding(nn.Module):
         )
         self._inv_timescales = inv_timescales.reshape(1, 1, num_timescales)
 
-    def _get_timing_signal(
-        self, position: mx.array, dtype: mx.Dtype
-    ) -> mx.array:
+    def _get_timing_signal(self, position: mx.array, dtype: mx.Dtype) -> mx.array:
         # position: [1, F_span]
         position = position.astype(mx.float32)[..., None]  # [1, F_span, 1]
         scaled_time = position * self._inv_timescales  # [1, F_span, channels//2]
-        signal = mx.concatenate(
-            [mx.sin(scaled_time), mx.cos(scaled_time)], axis=-1
-        )
+        signal = mx.concatenate([mx.sin(scaled_time), mx.cos(scaled_time)], axis=-1)
         return signal.astype(dtype)  # [1, F_span, channels]
 
     def _relative_shift(
@@ -239,9 +236,7 @@ class AudioRelativePositionEmbedding(nn.Module):
     ) -> mx.array:
         # term_bd: [B, N, U, W, F_span] -> [B, N, U, W, C]
         pad_amount = (context_size + 1) - max_span_plus_1
-        term_bd = mx.pad(
-            term_bd, [(0, 0), (0, 0), (0, 0), (0, 0), (0, pad_amount)]
-        )
+        term_bd = mx.pad(term_bd, [(0, 0), (0, 0), (0, 0), (0, 0), (0, pad_amount)])
         # [B, N, U, W*(C+1)]
         term_bd = term_bd.reshape(
             batch_size,
@@ -293,9 +288,7 @@ class AudioRelativePositionEmbedding(nn.Module):
         )  # [B, N, U, W, F_span]
 
         # Relative shift
-        term_bd = self._relative_shift(
-            term_bd, B, N, U, W, C, max_span_plus_1
-        )
+        term_bd = self._relative_shift(term_bd, B, N, U, W, C, max_span_plus_1)
 
         return term_ac + term_bd  # [B, N, U, W, C]
 
@@ -424,9 +417,7 @@ class AudioAttention(nn.Module):
         context = mx.einsum("bnuwc,bucnh->buwnh", probs, value_blocks)
 
         # Reshape back: [B, U*W, N, H] and trim to original length
-        context = context.reshape(
-            B, U * self.chunk_size, self.num_heads, self.head_dim
-        )
+        context = context.reshape(B, U * self.chunk_size, self.num_heads, self.head_dim)
         context = context[:, :T]
 
         return context  # [B, T, N, H]
@@ -573,7 +564,9 @@ class AudioEncoder(nn.Module):
         self.config = config
 
         self.subsample_conv_projection = SubSampleConvProjection(config)
-        self.conformer = [ConformerBlock(config) for _ in range(config.conf_num_hidden_layers)]
+        self.conformer = [
+            ConformerBlock(config) for _ in range(config.conf_num_hidden_layers)
+        ]
 
         if config.output_proj_dims is not None:
             self.output_proj = nn.Linear(
@@ -596,17 +589,13 @@ class AudioEncoder(nn.Module):
         lower_causal = mx.tril(mx.ones((context_size, chunk_size))).T
 
         # Upper causal: tril(ones(chunk_size, context_size), k=upper_diagonal)
-        upper_causal = mx.tril(
-            mx.ones((chunk_size, context_size)), k=upper_diagonal
-        )
+        upper_causal = mx.tril(mx.ones((chunk_size, context_size)), k=upper_diagonal)
 
         # Combined mask (element-wise AND via multiplication of binary masks)
         mask = (lower_causal * upper_causal).astype(mx.bool_)
         return mask  # [chunk_size, context_size]
 
-    def __call__(
-        self, audio_mel: mx.array, audio_mel_mask: mx.array
-    ) -> tuple:
+    def __call__(self, audio_mel: mx.array, audio_mel_mask: mx.array) -> tuple:
         """
         Args:
             audio_mel: [B, T, mel_bins] mel spectrogram features
@@ -643,8 +632,6 @@ class AudioEncoder(nn.Module):
             current_mask = current_mask[:, :target_len]
 
         # Zero out padding positions
-        audio_encodings = mx.where(
-            current_mask[:, :, None], 0.0, audio_encodings
-        )
+        audio_encodings = mx.where(current_mask[:, :, None], 0.0, audio_encodings)
 
         return audio_encodings, current_mask

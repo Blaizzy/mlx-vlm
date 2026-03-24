@@ -82,7 +82,7 @@ class Router(nn.Module):
         self.norm = RMSNormNoScale(config.hidden_size, eps=config.rms_norm_eps)
         self.proj = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.scale = mx.ones((config.hidden_size,))
-        self._root_size = config.hidden_size ** -0.5
+        self._root_size = config.hidden_size**-0.5
 
     def __call__(self, x: mx.array):
         x = self.norm(x)
@@ -97,9 +97,7 @@ class Router(nn.Module):
         )[..., : self.config.top_k_experts]
 
         top_k_weights = mx.take_along_axis(router_probs, top_k_indices, axis=-1)
-        top_k_weights = top_k_weights / mx.sum(
-            top_k_weights, axis=-1, keepdims=True
-        )
+        top_k_weights = top_k_weights / mx.sum(top_k_weights, axis=-1, keepdims=True)
         return top_k_indices, top_k_weights
 
 
@@ -242,9 +240,7 @@ class Attention(nn.Module):
             if self.use_k_eq_v:
                 values = keys
             else:
-                values = self.v_proj(x).reshape(
-                    B, L, self.n_kv_heads, self.head_dim
-                )
+                values = self.v_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
 
             keys = self.k_norm(keys)
             values = self.v_norm(values)
@@ -545,7 +541,9 @@ class Gemma4TextModel(nn.Module):
             pre_offset = c.offset if c is not None else 0
 
             h = layer(
-                h, local_mask, c,
+                h,
+                local_mask,
+                c,
                 per_layer_input=per_layer_input,
                 shared_kv=layer_shared_kv,
             )

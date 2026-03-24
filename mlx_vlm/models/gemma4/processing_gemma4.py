@@ -11,7 +11,9 @@ from typing import List, Optional, Union
 
 import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
-from transformers.image_processing_utils import BaseImageProcessor as HFBaseImageProcessor
+from transformers.image_processing_utils import (
+    BaseImageProcessor as HFBaseImageProcessor,
+)
 from transformers.image_utils import (
     ChannelDimension,
     ImageInput,
@@ -136,9 +138,7 @@ class Gemma4ImageProcessor(HFBaseImageProcessor):
             img_arr = (img_arr * 255).clip(0, 255).astype(np.uint8)
 
         pil_img = Image.fromarray(img_arr)
-        pil_img = pil_img.resize(
-            (target_width, target_height), resample=Image.BICUBIC
-        )
+        pil_img = pil_img.resize((target_width, target_height), resample=Image.BICUBIC)
         result = np.array(pil_img)
 
         if input_data_format == ChannelDimension.FIRST:
@@ -195,9 +195,7 @@ class Gemma4ImageProcessor(HFBaseImageProcessor):
 
             h, w = image.shape[-2], image.shape[-1]
             num_patches = (h // patch_size) * (w // patch_size)
-            num_soft_tokens_per_image.append(
-                num_patches // (pooling_kernel_size**2)
-            )
+            num_soft_tokens_per_image.append(num_patches // (pooling_kernel_size**2))
 
         # Different-shaped images can't be stacked; return as a list
         shapes = {img.shape for img in processed}
@@ -364,9 +362,7 @@ class Gemma4Processor(ProcessorMixin):
                 replacements_iter = iter(replacements)
                 audio_pattern = re.escape(self.audio_token)
                 text = [
-                    re.sub(
-                        audio_pattern, lambda _: next(replacements_iter), prompt
-                    )
+                    re.sub(audio_pattern, lambda _: next(replacements_iter), prompt)
                     for prompt in text
                 ]
 
