@@ -215,18 +215,6 @@ class Model(nn.Module):
                     v = v.swapaxes(-1, -2)
                     break
 
-            # Drop layer_scalar for non-full-attention layers
-            if "layer_scalar" in new_key and "language_model" in new_key:
-                m = re.search(r"layers\.(\d+)\.layer_scalar", new_key)
-                if m:
-                    layer_idx = int(m.group(1))
-                    layer_types = self.config.text_config.layer_types
-                    if (
-                        layer_idx < len(layer_types)
-                        and layer_types[layer_idx] != "full_attention"
-                    ):
-                        continue
-
             sanitized[new_key] = v
         return sanitized
 

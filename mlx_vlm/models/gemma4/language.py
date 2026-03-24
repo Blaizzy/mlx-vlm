@@ -326,11 +326,8 @@ class DecoderLayer(nn.Module):
             self.per_layer_projection = None
             self.post_per_layer_input_norm = None
 
-        # Layer scalar
-        if self.layer_type == "full_attention":
-            self.layer_scalar = mx.ones((1,))
-        else:
-            self.layer_scalar = None
+        # Layer scalar (all text layers)
+        self.layer_scalar = mx.ones((1,))
 
     def __call__(
         self,
