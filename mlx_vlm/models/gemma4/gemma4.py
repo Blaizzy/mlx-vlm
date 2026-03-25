@@ -163,8 +163,6 @@ class Model(nn.Module):
         return logits
 
     def sanitize(self, weights):
-        pass
-
         use_clipped = getattr(self.config.vision_config, "use_clipped_linears", True)
         sanitized = {}
         for k, v in weights.items():
@@ -201,15 +199,21 @@ class Model(nn.Module):
             if "depthwise_conv1d.weight" in new_key and v.ndim == 3:
                 v = v.transpose(0, 2, 1)
 
-            # MoE: remap moe.{proj} -> moe.switch_glu.{proj}.weight and transpose
-            for proj in ("gate_proj", "up_proj", "down_proj"):
-                suffix = f".moe.{proj}"
-                if new_key.endswith(suffix):
-                    new_key = new_key.replace(
-                        f".moe.{proj}", f".moe.switch_glu.{proj}.weight"
-                    )
-                    v = v.swapaxes(-1, -2)
-                    break
+            # MoE: remap moe.{proj} -> moe.switch_glu.{proj}.weight
+            # handle fused gate_up_proj
+            if new_key.endswith(".moe.down_proj"):
+                new_key = new_key.replace(
+                    ".moe.down_proj", ".moe.switch_glu.down_proj.weight"
+                )
+            if new_key.endswith(".moe.gate_up_proj"):
+                gate_key = new_key.replace("gate_up_proj", "switch_glu.gate_proj.weight")
+                up_key = new_key.replace("gate_up_proj", "switch_glu.up_proj.weight")
+
+                v = v.swapaxes(-1, -2)
+                mid_dim = v.shape[-1] // 2
+                sanitized[gate_key] = v[..., :mid_dim].swapaxes(-1, -2)
+                sanitized[up_key] = v[..., mid_dim:].swapaxes(-1, -2)
+                continue
 
             sanitized[new_key] = v
         return sanitized
