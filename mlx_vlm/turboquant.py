@@ -12,6 +12,494 @@ DEFAULT_TURBOQUANT_SEED = 0
 _EPS = 1e-6
 
 
+def _metal_available() -> bool:
+    return hasattr(mx, "metal") and mx.metal.is_available()
+
+
+@lru_cache(maxsize=None)
+def _mse_score_kernel():
+    if not _metal_available():
+        return None
+
+    source = r"""
+        auto lane = thread_position_in_grid.x;
+        auto repeat_idx = thread_position_in_grid.y;
+        auto n = thread_position_in_grid.z;
+
+        auto token_count = norms_shape[2];
+        auto kv_heads = norms_shape[1];
+        auto repeat_count = q_rot_shape[2];
+        if (repeat_idx >= repeat_count) {
+            return;
+        }
+
+        auto b = n / (kv_heads * token_count);
+        auto rem = n % (kv_heads * token_count);
+        auto h = rem / token_count;
+        auto t = rem % token_count;
+
+        auto q_ptr = q_rot + ((b * kv_heads + h) * repeat_count + repeat_idx) * Dim;
+        auto packed_ptr = packed + ((b * kv_heads + h) * token_count + t) * PackedWidth;
+
+        float acc = 0.0f;
+        for (int d = lane; d < Dim; d += 32) {
+            int bit_offset = d * Bits;
+            int word_idx = bit_offset / 32;
+            int offset = bit_offset % 32;
+            uint value = packed_ptr[word_idx] >> offset;
+            int spill = offset + Bits - 32;
+            if (spill > 0) {
+                value |= packed_ptr[word_idx + 1] << (Bits - spill);
+            }
+            value &= ((1u << Bits) - 1u);
+            acc += static_cast<float>(q_ptr[d]) * codebook[value];
+        }
+
+        acc = simd_sum(acc);
+        if (thread_index_in_simdgroup == 0) {
+            out[((b * kv_heads + h) * repeat_count + repeat_idx) * token_count + t] =
+                acc * static_cast<float>(norms[(b * kv_heads + h) * token_count + t]);
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="turboquant_mse_score",
+        input_names=["q_rot", "norms", "packed", "codebook"],
+        output_names=["out"],
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _pack_lowbit_kernel():
+    if not _metal_available():
+        return None
+
+    source = r"""
+        auto word = thread_position_in_grid.x;
+        auto row = thread_position_in_grid.y;
+
+        if (row >= values_shape[0] || word >= PackedWidth) {
+            return;
+        }
+
+        auto values_ptr = values + row * Length;
+        uint packed_word = 0u;
+        int start = max(0, (int(word) * 32 - (Bits - 1)) / Bits);
+        int end = min(Length, ((int(word) + 1) * 32 + (Bits - 1)) / Bits);
+
+        for (int idx = start; idx < end; ++idx) {
+            int bit_offset = idx * Bits;
+            int word_idx = bit_offset / 32;
+            int offset = bit_offset % 32;
+            uint value = values_ptr[idx] & ((1u << Bits) - 1u);
+            if (word_idx == word) {
+                packed_word |= value << offset;
+            }
+            if (word_idx + 1 == word) {
+                int spill = offset + Bits - 32;
+                if (spill > 0) {
+                    packed_word |= value >> (Bits - spill);
+                }
+            }
+        }
+
+        out[row * PackedWidth + word] = packed_word;
+    """
+    return mx.fast.metal_kernel(
+        name="turboquant_pack_lowbit",
+        input_names=["values"],
+        output_names=["out"],
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _unpack_lowbit_kernel():
+    if not _metal_available():
+        return None
+
+    source = r"""
+        auto idx = thread_position_in_grid.x;
+        auto row = thread_position_in_grid.y;
+
+        if (row >= packed_shape[0] || idx >= Length) {
+            return;
+        }
+
+        auto packed_ptr = packed + row * PackedWidth;
+        int bit_offset = idx * Bits;
+        int word_idx = bit_offset / 32;
+        int offset = bit_offset % 32;
+        uint value = packed_ptr[word_idx] >> offset;
+        int spill = offset + Bits - 32;
+        if (spill > 0) {
+            value |= packed_ptr[word_idx + 1] << (Bits - spill);
+        }
+        out[row * Length + idx] = value & ((1u << Bits) - 1u);
+    """
+    return mx.fast.metal_kernel(
+        name="turboquant_unpack_lowbit",
+        input_names=["packed"],
+        output_names=["out"],
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _qjl_score_kernel():
+    if not _metal_available():
+        return None
+
+    source = r"""
+        auto lane = thread_position_in_grid.x;
+        auto repeat_idx = thread_position_in_grid.y;
+        auto n = thread_position_in_grid.z;
+
+        auto token_count = norms_shape[2];
+        auto kv_heads = norms_shape[1];
+        auto repeat_count = q_proj_shape[2];
+        if (repeat_idx >= repeat_count) {
+            return;
+        }
+
+        auto b = n / (kv_heads * token_count);
+        auto rem = n % (kv_heads * token_count);
+        auto h = rem / token_count;
+        auto t = rem % token_count;
+
+        auto q_ptr = q_proj + ((b * kv_heads + h) * repeat_count + repeat_idx) * Dim;
+        auto packed_ptr = signs + ((b * kv_heads + h) * token_count + t) * PackedWidth;
+
+        float acc = 0.0f;
+        for (int d = lane; d < Dim; d += 32) {
+            int word_idx = d / 32;
+            int offset = d % 32;
+            uint bit = (packed_ptr[word_idx] >> offset) & 1u;
+            float sign = bit ? 1.0f : -1.0f;
+            acc += static_cast<float>(q_ptr[d]) * sign;
+        }
+
+        acc = simd_sum(acc);
+        if (thread_index_in_simdgroup == 0) {
+            auto idx = (b * kv_heads + h) * token_count + t;
+            out[((b * kv_heads + h) * repeat_count + repeat_idx) * token_count + t] =
+                acc
+                * static_cast<float>(norms[idx])
+                * static_cast<float>(residual_norms[idx])
+                * scale[0];
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="turboquant_qjl_score",
+        input_names=["q_proj", "norms", "residual_norms", "signs", "scale"],
+        output_names=["out"],
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _prod_score_kernel():
+    if not _metal_available():
+        return None
+
+    source = r"""
+        auto lane = thread_position_in_grid.x;
+        auto repeat_idx = thread_position_in_grid.y;
+        auto n = thread_position_in_grid.z;
+
+        auto token_count = norms_shape[2];
+        auto kv_heads = norms_shape[1];
+        auto repeat_count = q_rot_shape[2];
+        if (repeat_idx >= repeat_count) {
+            return;
+        }
+
+        auto b = n / (kv_heads * token_count);
+        auto rem = n % (kv_heads * token_count);
+        auto h = rem / token_count;
+        auto t = rem % token_count;
+
+        auto q_rot_ptr = q_rot + ((b * kv_heads + h) * repeat_count + repeat_idx) * Dim;
+        auto q_proj_ptr = q_proj + ((b * kv_heads + h) * repeat_count + repeat_idx) * Dim;
+        auto mse_ptr = mse_packed + ((b * kv_heads + h) * token_count + t) * MsePackedWidth;
+        auto sign_ptr = signs + ((b * kv_heads + h) * token_count + t) * SignPackedWidth;
+
+        float mse_acc = 0.0f;
+        float qjl_acc = 0.0f;
+        for (int d = lane; d < Dim; d += 32) {
+            int bit_offset = d * MseBits;
+            int word_idx = bit_offset / 32;
+            int offset = bit_offset % 32;
+            uint value = mse_ptr[word_idx] >> offset;
+            int spill = offset + MseBits - 32;
+            if (spill > 0) {
+                value |= mse_ptr[word_idx + 1] << (MseBits - spill);
+            }
+            value &= ((1u << MseBits) - 1u);
+            mse_acc += static_cast<float>(q_rot_ptr[d]) * codebook[value];
+
+            int sign_word = d / 32;
+            int sign_offset = d % 32;
+            uint bit = (sign_ptr[sign_word] >> sign_offset) & 1u;
+            float sign = bit ? 1.0f : -1.0f;
+            qjl_acc += static_cast<float>(q_proj_ptr[d]) * sign;
+        }
+
+        mse_acc = simd_sum(mse_acc);
+        qjl_acc = simd_sum(qjl_acc);
+        if (thread_index_in_simdgroup == 0) {
+            auto idx = (b * kv_heads + h) * token_count + t;
+            out[((b * kv_heads + h) * repeat_count + repeat_idx) * token_count + t] =
+                static_cast<float>(norms[idx]) * (
+                    mse_acc
+                    + scale[0] * static_cast<float>(residual_norms[idx]) * qjl_acc
+                );
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="turboquant_prod_score",
+        input_names=[
+            "q_rot",
+            "q_proj",
+            "norms",
+            "residual_norms",
+            "mse_packed",
+            "signs",
+            "codebook",
+            "scale",
+        ],
+        output_names=["out"],
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _mse_weighted_rot_kernel():
+    if not _metal_available():
+        return None
+
+    source = r"""
+        auto lane = thread_position_in_grid.x;
+        auto dim_idx = thread_position_in_grid.y;
+        auto n = thread_position_in_grid.z;
+
+        if (dim_idx >= Dim) {
+            return;
+        }
+
+        auto token_count = norms_shape[2];
+        auto kv_heads = norms_shape[1];
+        auto repeat_count = weights_shape[2];
+        auto b = n / (kv_heads * repeat_count);
+        auto rem = n % (kv_heads * repeat_count);
+        auto h = rem / repeat_count;
+        auto repeat_idx = rem % repeat_count;
+
+        auto weights_ptr = weights + ((b * kv_heads + h) * repeat_count + repeat_idx) * token_count;
+        auto norms_ptr = norms + (b * kv_heads + h) * token_count;
+        auto packed_ptr = packed + ((b * kv_heads + h) * token_count) * PackedWidth;
+
+        float acc = 0.0f;
+        for (int t = lane; t < token_count; t += 32) {
+            auto token_ptr = packed_ptr + t * PackedWidth;
+            int bit_offset = dim_idx * Bits;
+            int word_idx = bit_offset / 32;
+            int offset = bit_offset % 32;
+            uint value = token_ptr[word_idx] >> offset;
+            int spill = offset + Bits - 32;
+            if (spill > 0) {
+                value |= token_ptr[word_idx + 1] << (Bits - spill);
+            }
+            value &= ((1u << Bits) - 1u);
+            acc += static_cast<float>(weights_ptr[t])
+                * static_cast<float>(norms_ptr[t])
+                * codebook[value];
+        }
+
+        acc = simd_sum(acc);
+        if (thread_index_in_simdgroup == 0) {
+            out[((b * kv_heads + h) * repeat_count + repeat_idx) * Dim + dim_idx] = acc;
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="turboquant_mse_weighted_rot",
+        input_names=["weights", "norms", "packed", "codebook"],
+        output_names=["out"],
+        source=source,
+    )
+
+
+def _metal_mse_score(
+    q_rot: mx.array,
+    state: TurboQuantMSEState,
+    bits: int,
+    codebook: mx.array,
+) -> Optional[mx.array]:
+    if (
+        bits <= 0
+        or not _metal_available()
+        or q_rot.ndim != 4
+        or state.norms.shape[2] == 0
+    ):
+        return None
+
+    kernel = _mse_score_kernel()
+    if kernel is None:
+        return None
+
+    B, H, R, D = q_rot.shape
+    T = state.norms.shape[2]
+    scores = kernel(
+        inputs=[
+            q_rot.astype(mx.float32),
+            state.norms.astype(mx.float32),
+            state.indices.astype(mx.uint32),
+            codebook.astype(mx.float32),
+        ],
+        template=[
+            ("Dim", D),
+            ("Bits", bits),
+            ("PackedWidth", state.indices.shape[-1]),
+        ],
+        grid=(32, R, B * H * T),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(B, H, R, T)],
+        output_dtypes=[mx.float32],
+    )[0]
+    return mx.expand_dims(scores, axis=3)
+
+
+def _metal_qjl_score(
+    q_proj: mx.array,
+    state: TurboQuantProdState,
+    scale: mx.array,
+) -> Optional[mx.array]:
+    if not _metal_available() or q_proj.ndim != 4 or state.norms.shape[2] == 0:
+        return None
+
+    kernel = _qjl_score_kernel()
+    if kernel is None:
+        return None
+
+    B, H, R, D = q_proj.shape
+    T = state.norms.shape[2]
+    scores = kernel(
+        inputs=[
+            q_proj.astype(mx.float32),
+            state.norms.astype(mx.float32),
+            state.residual_norms.astype(mx.float32),
+            state.qjl_signs.astype(mx.uint32),
+            scale.astype(mx.float32),
+        ],
+        template=[
+            ("Dim", D),
+            ("PackedWidth", state.qjl_signs.shape[-1]),
+        ],
+        grid=(32, R, B * H * T),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(B, H, R, T)],
+        output_dtypes=[mx.float32],
+    )[0]
+    return mx.expand_dims(scores, axis=3)
+
+
+def _metal_prod_score(
+    q_rot: mx.array,
+    q_proj: mx.array,
+    state: TurboQuantProdState,
+    mse_bits: int,
+    codebook: mx.array,
+    scale: mx.array,
+) -> Optional[mx.array]:
+    if (
+        mse_bits <= 0
+        or not _metal_available()
+        or q_rot.ndim != 4
+        or q_proj.ndim != 4
+        or state.norms.shape[2] == 0
+    ):
+        return None
+
+    kernel = _prod_score_kernel()
+    if kernel is None:
+        return None
+
+    B, H, R, D = q_rot.shape
+    T = state.norms.shape[2]
+    scores = kernel(
+        inputs=[
+            q_rot.astype(mx.float32),
+            q_proj.astype(mx.float32),
+            state.norms.astype(mx.float32),
+            state.residual_norms.astype(mx.float32),
+            state.mse_indices.astype(mx.uint32),
+            state.qjl_signs.astype(mx.uint32),
+            codebook.astype(mx.float32),
+            scale.astype(mx.float32),
+        ],
+        template=[
+            ("Dim", D),
+            ("MseBits", mse_bits),
+            ("MsePackedWidth", state.mse_indices.shape[-1]),
+            ("SignPackedWidth", state.qjl_signs.shape[-1]),
+        ],
+        grid=(32, R, B * H * T),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(B, H, R, T)],
+        output_dtypes=[mx.float32],
+    )[0]
+    return mx.expand_dims(scores, axis=3)
+
+
+def _metal_mse_weighted_sum(
+    weights: mx.array,
+    state: TurboQuantMSEState,
+    bits: int,
+    codebook: mx.array,
+    rotation: mx.array,
+) -> Optional[mx.array]:
+    if (
+        bits <= 0
+        or not _metal_available()
+        or weights.ndim != 5
+        or weights.shape[-2] != 1
+        or state.norms.shape[2] == 0
+    ):
+        return None
+
+    kernel = _mse_weighted_rot_kernel()
+    if kernel is None:
+        return None
+
+    weights_2d = weights.astype(mx.float32).reshape(
+        weights.shape[0],
+        weights.shape[1],
+        weights.shape[2],
+        weights.shape[-1],
+    )
+    B, H, R, T = weights_2d.shape
+    D = rotation.shape[0]
+    weighted_rot = kernel(
+        inputs=[
+            weights_2d,
+            state.norms.astype(mx.float32),
+            state.indices.astype(mx.uint32),
+            codebook.astype(mx.float32),
+        ],
+        template=[
+            ("Dim", D),
+            ("Bits", bits),
+            ("PackedWidth", state.indices.shape[-1]),
+        ],
+        grid=(32, D, B * H * R),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(B, H, R, D)],
+        output_dtypes=[mx.float32],
+    )[0]
+    output = mx.matmul(weighted_rot, rotation.astype(mx.float32))
+    return mx.expand_dims(output, axis=3)
+
+
 class TurboQuantMSEState(NamedTuple):
     norms: mx.array
     indices: mx.array
@@ -141,6 +629,23 @@ def _pack_lowbit(values: mx.array, bits: int) -> mx.array:
     length = values.shape[-1]
     packed_width = _packed_width(length, bits)
     flat = values.reshape((-1, length))
+
+    kernel = _pack_lowbit_kernel()
+    if kernel is not None:
+        packed = kernel(
+            inputs=[flat],
+            template=[
+                ("Bits", bits),
+                ("Length", length),
+                ("PackedWidth", packed_width),
+            ],
+            grid=(packed_width, flat.shape[0], 1),
+            threadgroup=(1, 1, 1),
+            output_shapes=[(flat.shape[0], packed_width)],
+            output_dtypes=[mx.uint32],
+        )[0]
+        return packed.reshape((*values.shape[:-1], packed_width))
+
     packed = mx.zeros((flat.shape[0], packed_width), dtype=mx.uint32)
 
     for idx in range(length):
@@ -161,6 +666,23 @@ def _unpack_lowbit(packed: mx.array, bits: int, length: int) -> mx.array:
 
     packed = packed.astype(mx.uint32)
     flat = packed.reshape((-1, packed.shape[-1]))
+
+    kernel = _unpack_lowbit_kernel()
+    if kernel is not None:
+        unpacked = kernel(
+            inputs=[flat],
+            template=[
+                ("Bits", bits),
+                ("Length", length),
+                ("PackedWidth", flat.shape[-1]),
+            ],
+            grid=(length, flat.shape[0], 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(flat.shape[0], length)],
+            output_dtypes=[mx.uint32],
+        )[0]
+        return unpacked.reshape((*packed.shape[:-1], length))
+
     unpacked = mx.zeros((flat.shape[0], length), dtype=mx.uint32)
     mask = (1 << bits) - 1
 
@@ -218,6 +740,29 @@ def _slice_state(state, end: int):
         return TurboQuantSplitState(
             _slice_state(state.low, end),
             _slice_state(state.high, end),
+        )
+    raise TypeError(f"Unsupported TurboQuant state type: {type(state)!r}")
+
+
+def _slice_state_range(state, start: int, end: int):
+    if state is None:
+        return None
+    if isinstance(state, TurboQuantMSEState):
+        return TurboQuantMSEState(
+            state.norms[..., start:end],
+            state.indices[..., start:end, :],
+        )
+    if isinstance(state, TurboQuantProdState):
+        return TurboQuantProdState(
+            state.norms[..., start:end],
+            state.mse_indices[..., start:end, :],
+            state.residual_norms[..., start:end],
+            state.qjl_signs[..., start:end, :],
+        )
+    if isinstance(state, TurboQuantSplitState):
+        return TurboQuantSplitState(
+            _slice_state_range(state.low, start, end),
+            _slice_state_range(state.high, start, end),
         )
     raise TypeError(f"Unsupported TurboQuant state type: {type(state)!r}")
 
@@ -288,6 +833,57 @@ class _TurboQuantMSECodec:
         unit_vectors = self._dequantize_unit(state.indices)
         return state.norms[..., None].astype(unit_vectors.dtype) * unit_vectors
 
+    def prepare_queries(self, queries: mx.array) -> mx.array:
+        return mx.matmul(queries.astype(mx.float32), self.rotation_t)
+
+    def score_prepared(
+        self, prepared_queries: mx.array, state: TurboQuantMSEState
+    ) -> mx.array:
+        if prepared_queries.shape[-2] == 1:
+            fast_scores = _metal_mse_score(
+                prepared_queries.reshape(
+                    prepared_queries.shape[0],
+                    prepared_queries.shape[1],
+                    prepared_queries.shape[2],
+                    prepared_queries.shape[-1],
+                ),
+                state,
+                self.bits,
+                self.codebook,
+            )
+            if fast_scores is not None:
+                return fast_scores
+
+        indices = _unpack_lowbit(state.indices, self.bits, self.dim).astype(mx.int32)
+        rotated = mx.take(self.codebook, indices, axis=0)
+        dots = mx.einsum("bhmld,bhtd->bhmlt", prepared_queries, rotated)
+        return dots * state.norms.astype(mx.float32)[:, :, None, None, :]
+
+    def score(self, queries: mx.array, state: TurboQuantMSEState) -> mx.array:
+        return self.score_prepared(self.prepare_queries(queries), state)
+
+    def weighted_sum(self, weights: mx.array, state: TurboQuantMSEState) -> mx.array:
+        if weights.shape[-2] == 1:
+            fast_output = _metal_mse_weighted_sum(
+                weights,
+                state,
+                self.bits,
+                self.codebook,
+                self.rotation,
+            )
+            if fast_output is not None:
+                return fast_output
+
+        indices = _unpack_lowbit(state.indices, self.bits, self.dim).astype(mx.int32)
+        rotated = mx.take(self.codebook, indices, axis=0)
+        weighted_rot = mx.einsum(
+            "bhmlt,bht,bhtd->bhmld",
+            weights,
+            state.norms.astype(mx.float32),
+            rotated,
+        )
+        return mx.matmul(weighted_rot, self.rotation)
+
 
 class _TurboQuantProdCodec:
     def __init__(self, dim: int, bits: int, seed: int):
@@ -299,6 +895,7 @@ class _TurboQuantProdCodec:
             self.projection.transpose() if dim > 0 else self.projection
         )
         self.scale = math.sqrt(math.pi / 2) / dim if dim > 0 else 0.0
+        self.scale_array = mx.array([self.scale], dtype=mx.float32)
 
     def quantize(self, vectors: mx.array) -> TurboQuantProdState:
         norms = mx.linalg.norm(vectors.astype(mx.float32), axis=-1)
@@ -331,6 +928,88 @@ class _TurboQuantProdCodec:
             mx.float32
         ) * mx.matmul(signs, self.projection)
         return state.norms[..., None].astype(mx.float32) * (mse_unit + qjl_unit)
+
+    def prepare_queries(self, queries: mx.array) -> tuple[mx.array, mx.array]:
+        queries = queries.astype(mx.float32)
+        return (
+            mx.matmul(queries, self.mse_codec.rotation_t),
+            mx.matmul(queries, self.projection_t),
+        )
+
+    def score_prepared(
+        self,
+        prepared_queries: tuple[mx.array, mx.array],
+        state: TurboQuantProdState,
+    ) -> mx.array:
+        mse_queries, proj_queries = prepared_queries
+        if proj_queries.shape[-2] == 1:
+            fast_scores = _metal_prod_score(
+                mse_queries.reshape(
+                    mse_queries.shape[0],
+                    mse_queries.shape[1],
+                    mse_queries.shape[2],
+                    mse_queries.shape[-1],
+                ),
+                proj_queries.reshape(
+                    proj_queries.shape[0],
+                    proj_queries.shape[1],
+                    proj_queries.shape[2],
+                    proj_queries.shape[-1],
+                ),
+                state,
+                self.mse_codec.bits,
+                self.mse_codec.codebook,
+                self.scale_array,
+            )
+            if fast_scores is not None:
+                return fast_scores
+
+        if self.mse_codec.bits > 0:
+            mse_score = self.mse_codec.score_prepared(
+                mse_queries,
+                TurboQuantMSEState(state.norms, state.mse_indices),
+            )
+        else:
+            mse_score = mx.zeros(
+                (
+                    proj_queries.shape[0],
+                    proj_queries.shape[1],
+                    proj_queries.shape[2],
+                    proj_queries.shape[3],
+                    state.norms.shape[2],
+                ),
+                dtype=mx.float32,
+            )
+
+        if proj_queries.shape[-2] == 1:
+            fast_qjl = _metal_qjl_score(
+                proj_queries.reshape(
+                    proj_queries.shape[0],
+                    proj_queries.shape[1],
+                    proj_queries.shape[2],
+                    proj_queries.shape[-1],
+                ),
+                state,
+                self.scale_array,
+            )
+            if fast_qjl is not None:
+                return mse_score + fast_qjl
+
+        sign_bits = _unpack_lowbit(state.qjl_signs, 1, self.dim).astype(mx.float32)
+        signs = sign_bits * 2.0 - 1.0
+        qjl_score = self.scale * state.residual_norms.astype(mx.float32)[
+            :, :, None, None, :
+        ] * mx.einsum(
+            "bhmld,bhtd->bhmlt",
+            proj_queries,
+            signs,
+        )
+
+        norms = state.norms.astype(mx.float32)[:, :, None, None, :]
+        return mse_score + norms * qjl_score
+
+    def score(self, queries: mx.array, state: TurboQuantProdState) -> mx.array:
+        return self.score_prepared(self.prepare_queries(queries), state)
 
 
 def _select_outlier_indices(tensor: mx.array, avg_bits: float) -> tuple[np.ndarray, np.ndarray]:
@@ -384,6 +1063,33 @@ class _SplitCodec:
         merged = mx.concatenate([low_tensor, high_tensor], axis=-1)
         return mx.take(merged, self.restore_order, axis=-1)
 
+    def prepare_queries(self, queries: mx.array):
+        low_tensor = mx.take(queries, self.low_idx, axis=-1)
+        high_tensor = mx.take(queries, self.high_idx, axis=-1)
+        return (
+            self.low_codec.prepare_queries(low_tensor),
+            self.high_codec.prepare_queries(high_tensor),
+        )
+
+    def score_prepared(self, prepared_queries, state: TurboQuantSplitState) -> mx.array:
+        low_queries, high_queries = prepared_queries
+        return self.low_codec.score_prepared(
+            low_queries,
+            state.low,
+        ) + self.high_codec.score_prepared(
+            high_queries,
+            state.high,
+        )
+
+    def score(self, queries: mx.array, state: TurboQuantSplitState) -> mx.array:
+        return self.score_prepared(self.prepare_queries(queries), state)
+
+    def weighted_sum(self, weights: mx.array, state: TurboQuantSplitState) -> mx.array:
+        low_tensor = self.low_codec.weighted_sum(weights, state.low)
+        high_tensor = self.high_codec.weighted_sum(weights, state.high)
+        merged = mx.concatenate([low_tensor, high_tensor], axis=-1)
+        return mx.take(merged, self.restore_order, axis=-1)
+
 
 def _build_codec(tensor: mx.array, bits: float, mode: str, seed: int):
     bits = _validate_bits(bits)
@@ -394,6 +1100,10 @@ def _build_codec(tensor: mx.array, bits: float, mode: str, seed: int):
 
 
 class TurboQuantKVCache(_BaseCache):
+    decode_key_chunk_size = 65536
+    prefill_key_chunk_size = 512
+    prefill_query_block_size = 16
+
     def __init__(self, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED):
         self.bits = _validate_bits(bits)
         self.seed = seed
@@ -441,6 +1151,205 @@ class TurboQuantKVCache(_BaseCache):
         keys = self.key_codec.dequantize(keys_state).astype(mx.float32)
         values = self.value_codec.dequantize(values_state).astype(mx.float32)
         return keys, values
+
+    def _apply_attention_mask(
+        self,
+        scores: mx.array,
+        mask: Optional[mx.array],
+        q_start: int,
+        q_end: int,
+        k_start: int,
+        k_end: int,
+        total_queries: int,
+        total_tokens: int,
+    ) -> mx.array:
+        if mask is None:
+            return scores
+        if isinstance(mask, str):
+            if mask == "causal":
+                past_tokens = total_tokens - total_queries
+                q_idx = mx.arange(past_tokens + q_start, past_tokens + q_end)
+                k_idx = mx.arange(k_start, k_end)
+                causal_mask = q_idx[:, None] >= k_idx[None, :]
+                causal_mask = causal_mask[None, None, None, :, :]
+                return mx.where(causal_mask, scores, mx.finfo(scores.dtype).min)
+            raise ValueError(f"Unsupported TurboQuant attention mask: {mask}")
+
+        mask_chunk = mask[..., q_start:q_end, k_start:k_end]
+        if mask_chunk.ndim == scores.ndim - 1:
+            mask_chunk = mx.expand_dims(mask_chunk, axis=2)
+
+        if mask_chunk.dtype == mx.bool_:
+            return mx.where(mask_chunk, scores, mx.finfo(scores.dtype).min)
+        return scores + mask_chunk
+
+    def quantized_attention(
+        self,
+        queries: mx.array,
+        keys_state=None,
+        values_state=None,
+        scale: float = 1.0,
+        mask: Optional[mx.array] = None,
+    ) -> mx.array:
+        keys_state = self.keys if keys_state is None else keys_state
+        values_state = self.values if values_state is None else values_state
+
+        B, n_q_heads, L, D = queries.shape
+        n_kv_heads = keys_state.low.norms.shape[1] if isinstance(
+            keys_state, TurboQuantSplitState
+        ) else keys_state.norms.shape[1]
+        n_repeats = n_q_heads // n_kv_heads
+
+        grouped_queries = (queries.astype(mx.float32) * scale).reshape(
+            B,
+            n_kv_heads,
+            n_repeats,
+            L,
+            D,
+        )
+
+        value_dim = self.value_codec.dim
+        total_tokens = _state_length(keys_state)
+        key_chunk_size = (
+            self.decode_key_chunk_size if L == 1 else self.prefill_key_chunk_size
+        )
+        query_block_size = 1 if L == 1 else self.prefill_query_block_size
+
+        outputs = []
+        for q_start in range(0, L, query_block_size):
+            q_end = min(L, q_start + query_block_size)
+            q_block = grouped_queries[..., q_start:q_end, :]
+            prepared_queries = self.key_codec.prepare_queries(q_block)
+
+            output = mx.zeros(
+                (B, n_kv_heads, n_repeats, q_end - q_start, value_dim),
+                dtype=mx.float32,
+            )
+            normalizer = mx.zeros(
+                (B, n_kv_heads, n_repeats, q_end - q_start),
+                dtype=mx.float32,
+            )
+            max_score = mx.full(
+                (B, n_kv_heads, n_repeats, q_end - q_start),
+                -float("inf"),
+                dtype=mx.float32,
+            )
+
+            for k_start in range(0, total_tokens, key_chunk_size):
+                k_end = min(total_tokens, k_start + key_chunk_size)
+                key_chunk = _slice_state_range(keys_state, k_start, k_end)
+                value_chunk = _slice_state_range(values_state, k_start, k_end)
+
+                scores = self.key_codec.score_prepared(prepared_queries, key_chunk)
+                scores = self._apply_attention_mask(
+                    scores,
+                    mask,
+                    q_start,
+                    q_end,
+                    k_start,
+                    k_end,
+                    L,
+                    total_tokens,
+                )
+
+                chunk_max = mx.max(scores, axis=-1)
+                new_max = mx.maximum(max_score, chunk_max)
+                prev_scale = mx.exp(max_score - new_max)
+                weights = mx.exp(scores - new_max[..., None])
+
+                output = (
+                    output * prev_scale[..., None]
+                    + self.value_codec.weighted_sum(weights, value_chunk)
+                )
+                normalizer = normalizer * prev_scale + mx.sum(weights, axis=-1)
+                max_score = new_max
+                mx.eval(output, normalizer, max_score)
+
+            outputs.append(output / mx.maximum(normalizer[..., None], _EPS))
+            mx.eval(outputs[-1])
+
+        output = mx.concatenate(outputs, axis=3)
+        output = output.reshape(B, n_q_heads, L, value_dim)
+        return output.astype(queries.dtype)
+
+    def decode_attention(
+        self,
+        queries: mx.array,
+        keys_state=None,
+        values_state=None,
+        scale: float = 1.0,
+        mask: Optional[mx.array] = None,
+    ) -> mx.array:
+        keys_state = self.keys if keys_state is None else keys_state
+        values_state = self.values if values_state is None else values_state
+
+        if queries.shape[-2] != 1:
+            raise ValueError("TurboQuant decode attention expects a single query token.")
+
+        B, n_q_heads, L, D = queries.shape
+        n_kv_heads = keys_state.low.norms.shape[1] if isinstance(
+            keys_state, TurboQuantSplitState
+        ) else keys_state.norms.shape[1]
+        n_repeats = n_q_heads // n_kv_heads
+
+        grouped_queries = (queries.astype(mx.float32) * scale).reshape(
+            B,
+            n_kv_heads,
+            n_repeats,
+            L,
+            D,
+        )
+        prepared_queries = self.key_codec.prepare_queries(grouped_queries)
+
+        value_dim = self.value_codec.dim
+        total_tokens = _state_length(keys_state)
+        if total_tokens <= self.decode_key_chunk_size and mask in (None, "causal"):
+            scores = self.key_codec.score_prepared(prepared_queries, keys_state)
+            weights = mx.softmax(scores, axis=-1)
+            output = self.value_codec.weighted_sum(weights, values_state)
+            output = output.reshape(B, n_q_heads, L, value_dim)
+            return output.astype(queries.dtype)
+
+        output = mx.zeros((B, n_kv_heads, n_repeats, L, value_dim), dtype=mx.float32)
+        normalizer = mx.zeros((B, n_kv_heads, n_repeats, L), dtype=mx.float32)
+        max_score = mx.full(
+            (B, n_kv_heads, n_repeats, L),
+            -float("inf"),
+            dtype=mx.float32,
+        )
+
+        for k_start in range(0, total_tokens, self.decode_key_chunk_size):
+            k_end = min(total_tokens, k_start + self.decode_key_chunk_size)
+            key_chunk = _slice_state_range(keys_state, k_start, k_end)
+            value_chunk = _slice_state_range(values_state, k_start, k_end)
+
+            scores = self.key_codec.score_prepared(prepared_queries, key_chunk)
+            scores = self._apply_attention_mask(
+                scores,
+                mask,
+                0,
+                L,
+                k_start,
+                k_end,
+                L,
+                total_tokens,
+            )
+
+            chunk_max = mx.max(scores, axis=-1)
+            new_max = mx.maximum(max_score, chunk_max)
+            prev_scale = mx.exp(max_score - new_max)
+            weights = mx.exp(scores - new_max[..., None])
+
+            output = (
+                output * prev_scale[..., None]
+                + self.value_codec.weighted_sum(weights, value_chunk)
+            )
+            normalizer = normalizer * prev_scale + mx.sum(weights, axis=-1)
+            max_score = new_max
+
+        output = output / mx.maximum(normalizer[..., None], _EPS)
+        output = output.reshape(B, n_q_heads, L, value_dim)
+        return output.astype(queries.dtype)
 
     def size(self):
         return self.offset

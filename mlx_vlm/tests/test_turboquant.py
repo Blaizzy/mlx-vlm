@@ -159,3 +159,130 @@ def test_turboquant_cache_preserves_attention_shape_and_compresses_memory():
     assert quantized.shape == reference.shape
     assert turbo_cache.nbytes < fp_cache.nbytes
     assert diff < 0.35
+
+
+def test_turboquant_decode_attention_matches_dequantized_attention():
+    keys = mx.random.normal((1, 2, 16, 32))
+    values = mx.random.normal((1, 2, 16, 32))
+    queries = mx.random.normal((1, 4, 1, 32))
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(keys, values)
+    turbo_cache = TurboQuantKVCache.from_cache(fp_cache, bits=3.5)
+    turbo_keys, turbo_values = turbo_cache.state
+    dequantized_keys, dequantized_values = turbo_cache.dequantize(
+        turbo_keys,
+        turbo_values,
+    )
+
+    reference = mx.fast.scaled_dot_product_attention(
+        queries,
+        dequantized_keys.astype(queries.dtype),
+        dequantized_values.astype(queries.dtype),
+        scale=32**-0.5,
+        mask=None,
+    )
+    quantized = scaled_dot_product_attention(
+        queries,
+        turbo_keys,
+        turbo_values,
+        turbo_cache,
+        scale=32**-0.5,
+        mask=None,
+    )
+
+    diff = mx.max(mx.abs(reference - quantized)).item()
+    assert quantized.shape == reference.shape
+    assert diff < 1e-4
+
+
+def test_turboquant_decode_attention_skips_full_dequantize():
+    keys = mx.random.normal((1, 2, 8, 32))
+    values = mx.random.normal((1, 2, 8, 32))
+    queries = mx.random.normal((1, 4, 1, 32))
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(keys, values)
+    turbo_cache = TurboQuantKVCache.from_cache(fp_cache, bits=3.5)
+    turbo_keys, turbo_values = turbo_cache.state
+
+    def fail(*args, **kwargs):
+        raise AssertionError("decode_attention should not call full dequantize")
+
+    turbo_cache.dequantize = fail
+    output = scaled_dot_product_attention(
+        queries,
+        turbo_keys,
+        turbo_values,
+        turbo_cache,
+        scale=32**-0.5,
+        mask=None,
+    )
+
+    assert output.shape == queries.shape
+
+
+def test_turboquant_decode_attention_metal_fast_path_skips_unpack(monkeypatch):
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+
+    import mlx_vlm.turboquant as turboquant
+
+    keys = mx.random.normal((1, 2, 8, 32))
+    values = mx.random.normal((1, 2, 8, 32))
+    queries = mx.random.normal((1, 4, 1, 32))
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(keys, values)
+    turbo_cache = TurboQuantKVCache.from_cache(fp_cache, bits=3.5)
+    turbo_keys, turbo_values = turbo_cache.state
+
+    def fail(*args, **kwargs):
+        raise AssertionError("decode metal fast path should not unpack low-bit state")
+
+    monkeypatch.setattr(turboquant, "_unpack_lowbit", fail)
+    output = scaled_dot_product_attention(
+        queries,
+        turbo_keys,
+        turbo_values,
+        turbo_cache,
+        scale=32**-0.5,
+        mask=None,
+    )
+
+    assert output.shape == queries.shape
+
+
+def test_turboquant_prefill_attention_matches_dequantized_attention():
+    keys = mx.random.normal((1, 2, 12, 32))
+    values = mx.random.normal((1, 2, 12, 32))
+    queries = mx.random.normal((1, 4, 4, 32))
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(keys, values)
+    turbo_cache = TurboQuantKVCache.from_cache(fp_cache, bits=3.5)
+    turbo_keys, turbo_values = turbo_cache.state
+    dequantized_keys, dequantized_values = turbo_cache.dequantize(
+        turbo_keys,
+        turbo_values,
+    )
+
+    reference = mx.fast.scaled_dot_product_attention(
+        queries,
+        dequantized_keys.astype(queries.dtype),
+        dequantized_values.astype(queries.dtype),
+        scale=32**-0.5,
+        mask="causal",
+    )
+    quantized = scaled_dot_product_attention(
+        queries,
+        turbo_keys,
+        turbo_values,
+        turbo_cache,
+        scale=32**-0.5,
+        mask="causal",
+    )
+
+    diff = mx.max(mx.abs(reference - quantized)).item()
+    assert quantized.shape == reference.shape
+    assert diff < 1e-4
