@@ -253,6 +253,29 @@ def test_turboquant_decode_attention_metal_fast_path_skips_unpack(monkeypatch):
     assert output.shape == queries.shape
 
 
+def test_turboquant_decode_attention_4bit_uses_paper_prod_key_codec():
+    keys = mx.random.normal((1, 2, 8, 32))
+    values = mx.random.normal((1, 2, 8, 32))
+    queries = mx.random.normal((1, 4, 1, 32))
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(keys, values)
+    turbo_cache = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    turbo_keys, turbo_values = turbo_cache.state
+
+    assert type(turbo_cache.key_codec).__name__ == "_TurboQuantProdCodec"
+    output = scaled_dot_product_attention(
+        queries,
+        turbo_keys,
+        turbo_values,
+        turbo_cache,
+        scale=32**-0.5,
+        mask=None,
+    )
+
+    assert output.shape == queries.shape
+
+
 def test_turboquant_decode_attention_integer_fast_path_skips_prepare(monkeypatch):
     if not mx.metal.is_available():
         pytest.skip("Metal kernels are unavailable on this host")
@@ -267,9 +290,7 @@ def test_turboquant_decode_attention_integer_fast_path_skips_prepare(monkeypatch
     turbo_keys, turbo_values = turbo_cache.state
 
     def fail(*args, **kwargs):
-        raise AssertionError(
-            "integer TurboQuant decode fast path should bypass prepare_queries"
-        )
+        raise AssertionError("integer TurboQuant decode fast path should bypass prepare_queries")
 
     monkeypatch.setattr(turbo_cache.key_codec, "prepare_queries", fail)
     output = scaled_dot_product_attention(
@@ -282,6 +303,50 @@ def test_turboquant_decode_attention_integer_fast_path_skips_prepare(monkeypatch
     )
 
     assert output.shape == queries.shape
+
+
+def test_turboquant_decode_attention_fast_path_skips_softmax(monkeypatch):
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+
+    import mlx_vlm.turboquant as turboquant
+
+    keys = mx.random.normal((1, 2, 8, 32))
+    values = mx.random.normal((1, 2, 8, 32))
+    queries = mx.random.normal((1, 4, 1, 32))
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(keys, values)
+    turbo_cache = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    turbo_keys, turbo_values = turbo_cache.state
+
+    def fail(*args, **kwargs):
+        raise AssertionError("TurboQuant decode fast path should bypass mx.softmax")
+
+    monkeypatch.setattr(turboquant.mx, "softmax", fail)
+    output = scaled_dot_product_attention(
+        queries,
+        turbo_keys,
+        turbo_values,
+        turbo_cache,
+        scale=32**-0.5,
+        mask=None,
+    )
+
+    assert output.shape == queries.shape
+
+
+def test_turboquant_prod_quantize_skips_mse_dequantize(monkeypatch):
+    codec = _TurboQuantProdCodec(32, 4, seed=0)
+    vectors = mx.random.normal((1, 2, 8, 32))
+
+    def fail(*args, **kwargs):
+        raise AssertionError("Product quantization should not dequantize MSE state")
+
+    monkeypatch.setattr(codec.mse_codec, "_dequantize_unit", fail)
+    state = codec.quantize(vectors)
+
+    assert state.mse_indices.shape[:3] == (1, 2, 8)
 
 
 def test_turboquant_prefill_attention_matches_dequantized_attention():

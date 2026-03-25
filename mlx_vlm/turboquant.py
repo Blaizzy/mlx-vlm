@@ -10,6 +10,7 @@ from mlx_lm.models.cache import _BaseCache, create_attention_mask
 
 DEFAULT_TURBOQUANT_SEED = 0
 _EPS = 1e-6
+_POLAR_MAX_LEVELS = 4
 
 
 def _metal_available() -> bool:
@@ -579,6 +580,284 @@ def _prod_score_repeat_kernel(repeat_count: int):
 
 
 @lru_cache(maxsize=None)
+def _polar_prod_score_kernel(level_bits: tuple[int, ...]):
+    if not _metal_available() or len(level_bits) == 0:
+        return None
+
+    input_names = ["q_rot", "norms", "radii"]
+    for level in range(len(level_bits)):
+        input_names.append(f"angles_{level + 1}")
+    for level in range(len(level_bits)):
+        input_names.append(f"cos_{level + 1}")
+        input_names.append(f"sin_{level + 1}")
+
+    lines = [
+        "        auto lane = thread_position_in_grid.x;",
+        "        auto repeat_idx = thread_position_in_grid.y;",
+        "        auto n = thread_position_in_grid.z;",
+        "",
+        "        auto token_count = norms_shape[2];",
+        "        auto kv_heads = norms_shape[1];",
+        "        auto repeat_count = q_rot_shape[2];",
+        "        if (repeat_idx >= repeat_count) {",
+        "            return;",
+        "        }",
+        "",
+        "        auto b = n / (kv_heads * token_count);",
+        "        auto rem = n % (kv_heads * token_count);",
+        "        auto h = rem / token_count;",
+        "        auto t = rem % token_count;",
+        "",
+        "        auto q_ptr = q_rot + ((b * kv_heads + h) * repeat_count + repeat_idx) * Dim;",
+        "        auto radii_ptr = radii + ((b * kv_heads + h) * token_count + t) * BlockCount;",
+        "",
+        "        float acc = 0.0f;",
+        "        for (int d = lane; d < Dim; d += 32) {",
+        "            int block_idx = d >> Levels;",
+        "            float coeff = static_cast<float>(radii_ptr[block_idx]);",
+        "",
+    ]
+
+    for level, bits in enumerate(level_bits, start=1):
+        mask = (1 << bits) - 1
+        lines += [
+            f"            auto angle_ptr_{level} = angles_{level} + ((b * kv_heads + h) * token_count + t) * PackedWidth{level};",
+            f"            int angle_idx_{level} = d >> {level};",
+            f"            int bit_offset_{level} = angle_idx_{level} * {bits};",
+            f"            int word_idx_{level} = bit_offset_{level} / 32;",
+            f"            int offset_{level} = bit_offset_{level} % 32;",
+            f"            uint value_{level} = angle_ptr_{level}[word_idx_{level}] >> offset_{level};",
+            f"            int spill_{level} = offset_{level} + {bits} - 32;",
+            f"            if (spill_{level} > 0) {{",
+            f"                value_{level} |= angle_ptr_{level}[word_idx_{level} + 1] << ({bits} - spill_{level});",
+            "            }",
+            f"            value_{level} &= {mask}u;",
+            f"            bool use_sin_{level} = ((d >> {level - 1}) & 1) != 0;",
+            f"            coeff *= use_sin_{level} ? static_cast<float>(sin_{level}[value_{level}]) : static_cast<float>(cos_{level}[value_{level}]);",
+            "",
+        ]
+
+    lines += [
+        "            acc += static_cast<float>(q_ptr[d]) * coeff;",
+        "        }",
+        "",
+        "        acc = simd_sum(acc);",
+        "        if (thread_index_in_simdgroup == 0) {",
+        "            auto idx = (b * kv_heads + h) * token_count + t;",
+        "            out[((b * kv_heads + h) * repeat_count + repeat_idx) * token_count + t] =",
+        "                acc * static_cast<float>(norms[idx]);",
+        "        }",
+    ]
+
+    return mx.fast.metal_kernel(
+        name="turboquant_polar_prod_score_" + "_".join(str(bit) for bit in level_bits),
+        input_names=input_names,
+        output_names=["out"],
+        source="\n".join(lines),
+    )
+
+
+@lru_cache(maxsize=None)
+def _polar_turbo_score_repeat_kernel(
+    level_bits: tuple[int, ...], repeat_count: int
+):
+    if (
+        not _metal_available()
+        or len(level_bits) != 4
+        or repeat_count <= 0
+    ):
+        return None
+
+    bits1, bits2, bits3, bits4 = level_bits
+    mask1 = (1 << bits1) - 1
+    mask2 = (1 << bits2) - 1
+    mask3 = (1 << bits3) - 1
+    mask4 = (1 << bits4) - 1
+
+    input_names = ["q_rot", "q_proj", "norms", "radii"]
+    for level in range(4):
+        input_names.append(f"angles_{level + 1}")
+    input_names.extend(["residual_norms", "signs", "scale"])
+    for level in range(4):
+        input_names.append(f"cos_{level + 1}")
+        input_names.append(f"sin_{level + 1}")
+
+    lines = [
+        "        auto lane = thread_position_in_grid.x;",
+        "        auto n = thread_position_in_grid.z;",
+        "",
+        "        auto token_count = norms_shape[2];",
+        "        auto kv_heads = norms_shape[1];",
+        "",
+        "        auto b = n / (kv_heads * token_count);",
+        "        auto rem = n % (kv_heads * token_count);",
+        "        auto h = rem / token_count;",
+        "        auto t = rem % token_count;",
+        "",
+        "        auto q_rot_base = q_rot + ((b * kv_heads + h) * RepeatCount) * Dim;",
+        "        auto q_proj_base = q_proj + ((b * kv_heads + h) * RepeatCount) * Dim;",
+        "        auto radii_ptr = radii + ((b * kv_heads + h) * token_count + t) * BlockCount;",
+        "        auto angle1_ptr = angles_1 + ((b * kv_heads + h) * token_count + t) * PackedWidth1;",
+        "        auto angle2_ptr = angles_2 + ((b * kv_heads + h) * token_count + t) * PackedWidth2;",
+        "        auto angle3_ptr = angles_3 + ((b * kv_heads + h) * token_count + t) * PackedWidth3;",
+        "        auto angle4_ptr = angles_4 + ((b * kv_heads + h) * token_count + t) * PackedWidth4;",
+        "        auto sign_ptr = signs + ((b * kv_heads + h) * token_count + t) * SignPackedWidth;",
+        "",
+        "        auto idx = (b * kv_heads + h) * token_count + t;",
+        "        float norm = static_cast<float>(norms[idx]);",
+        "        float residual_norm = static_cast<float>(residual_norms[idx]);",
+        "",
+    ]
+    for r in range(repeat_count):
+        lines.append(f"        threadgroup float level1_{r}[Dim / 2];")
+        lines.append(f"        threadgroup float level2_{r}[Dim / 4];")
+        lines.append(f"        threadgroup float level3_{r}[Dim / 8];")
+        lines.append(f"        threadgroup float level4_{r}[BlockCount];")
+    lines += [""]
+    for r in range(repeat_count):
+        lines.append(f"        float qjl_acc_{r} = 0.0f;")
+    lines += [
+        "",
+        "        for (int pair_idx = lane; pair_idx < Dim / 2; pair_idx += 32) {",
+        f"            int bit_offset_1 = pair_idx * {bits1};",
+        "            int word_idx_1 = bit_offset_1 / 32;",
+        "            int offset_1 = bit_offset_1 % 32;",
+        "            uint value_1 = angle1_ptr[word_idx_1] >> offset_1;",
+        f"            int spill_1 = offset_1 + {bits1} - 32;",
+        "            if (spill_1 > 0) {",
+        f"                value_1 |= angle1_ptr[word_idx_1 + 1] << ({bits1} - spill_1);",
+        "            }",
+        f"            value_1 &= {mask1}u;",
+        "            float cos_1_val = static_cast<float>(cos_1[value_1]);",
+        "            float sin_1_val = static_cast<float>(sin_1[value_1]);",
+        "            int d0 = pair_idx << 1;",
+        "            int d1 = d0 + 1;",
+        "",
+    ]
+    for r in range(repeat_count):
+        lines.append(
+            f"            level1_{r}[pair_idx] = static_cast<float>(q_rot_base[{r} * Dim + d0]) * cos_1_val + static_cast<float>(q_rot_base[{r} * Dim + d1]) * sin_1_val;"
+        )
+    lines += [
+        "        }",
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+        "",
+        "        for (int pair_idx = lane; pair_idx < Dim / 4; pair_idx += 32) {",
+        f"            int bit_offset_2 = pair_idx * {bits2};",
+        "            int word_idx_2 = bit_offset_2 / 32;",
+        "            int offset_2 = bit_offset_2 % 32;",
+        "            uint value_2 = angle2_ptr[word_idx_2] >> offset_2;",
+        f"            int spill_2 = offset_2 + {bits2} - 32;",
+        "            if (spill_2 > 0) {",
+        f"                value_2 |= angle2_ptr[word_idx_2 + 1] << ({bits2} - spill_2);",
+        "            }",
+        f"            value_2 &= {mask2}u;",
+        "            float cos_2_val = static_cast<float>(cos_2[value_2]);",
+        "            float sin_2_val = static_cast<float>(sin_2[value_2]);",
+        "            int child = pair_idx << 1;",
+        "",
+    ]
+    for r in range(repeat_count):
+        lines.append(
+            f"            level2_{r}[pair_idx] = level1_{r}[child] * cos_2_val + level1_{r}[child + 1] * sin_2_val;"
+        )
+    lines += [
+        "        }",
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+        "",
+        "        for (int pair_idx = lane; pair_idx < Dim / 8; pair_idx += 32) {",
+        f"            int bit_offset_3 = pair_idx * {bits3};",
+        "            int word_idx_3 = bit_offset_3 / 32;",
+        "            int offset_3 = bit_offset_3 % 32;",
+        "            uint value_3 = angle3_ptr[word_idx_3] >> offset_3;",
+        f"            int spill_3 = offset_3 + {bits3} - 32;",
+        "            if (spill_3 > 0) {",
+        f"                value_3 |= angle3_ptr[word_idx_3 + 1] << ({bits3} - spill_3);",
+        "            }",
+        f"            value_3 &= {mask3}u;",
+        "            float cos_3_val = static_cast<float>(cos_3[value_3]);",
+        "            float sin_3_val = static_cast<float>(sin_3[value_3]);",
+        "            int child = pair_idx << 1;",
+        "",
+    ]
+    for r in range(repeat_count):
+        lines.append(
+            f"            level3_{r}[pair_idx] = level2_{r}[child] * cos_3_val + level2_{r}[child + 1] * sin_3_val;"
+        )
+    lines += [
+        "        }",
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+        "",
+        "        for (int pair_idx = lane; pair_idx < BlockCount; pair_idx += 32) {",
+        f"            int bit_offset_4 = pair_idx * {bits4};",
+        "            int word_idx_4 = bit_offset_4 / 32;",
+        "            int offset_4 = bit_offset_4 % 32;",
+        "            uint value_4 = angle4_ptr[word_idx_4] >> offset_4;",
+        f"            int spill_4 = offset_4 + {bits4} - 32;",
+        "            if (spill_4 > 0) {",
+        f"                value_4 |= angle4_ptr[word_idx_4 + 1] << ({bits4} - spill_4);",
+        "            }",
+        f"            value_4 &= {mask4}u;",
+        "            float cos_4_val = static_cast<float>(cos_4[value_4]);",
+        "            float sin_4_val = static_cast<float>(sin_4[value_4]);",
+        "            int child = pair_idx << 1;",
+        "",
+    ]
+    for r in range(repeat_count):
+        lines.append(
+            f"            level4_{r}[pair_idx] = level3_{r}[child] * cos_4_val + level3_{r}[child + 1] * sin_4_val;"
+        )
+    lines += [
+        "        }",
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+        "",
+        "        for (int d = lane; d < Dim; d += 32) {",
+        "            int sign_word = d / 32;",
+        "            int sign_offset = d % 32;",
+        "            uint bit = (sign_ptr[sign_word] >> sign_offset) & 1u;",
+        "            float sign = bit ? 1.0f : -1.0f;",
+        "",
+    ]
+    for r in range(repeat_count):
+        lines.append(
+            f"            qjl_acc_{r} += static_cast<float>(q_proj_base[{r} * Dim + d]) * sign;"
+        )
+    lines += [
+        "        }",
+        "",
+    ]
+    for r in range(repeat_count):
+        lines.append(
+            f"        float polar_acc_{r} = lane < BlockCount ? static_cast<float>(radii_ptr[lane]) * level4_{r}[lane] : 0.0f;"
+        )
+        lines.append(f"        float polar_sum_{r} = simd_sum(polar_acc_{r});")
+        lines.append(f"        float qjl_sum_{r} = simd_sum(qjl_acc_{r});")
+    lines += [
+        "",
+        "        if (thread_index_in_simdgroup == 0) {",
+    ]
+    for r in range(repeat_count):
+        lines.append(
+            f"            out[((b * kv_heads + h) * RepeatCount + {r}) * token_count + t] ="
+        )
+        lines.append(
+            f"                norm * (polar_sum_{r} + scale[0] * residual_norm * qjl_sum_{r});"
+        )
+    lines += [
+        "        }",
+    ]
+
+    return mx.fast.metal_kernel(
+        name="turboquant_polar_turbo_score_"
+        + "_".join(str(bit) for bit in level_bits)
+        + f"_repeat_{repeat_count}",
+        input_names=input_names,
+        output_names=["out"],
+        source="\n".join(lines),
+    )
+
+
+@lru_cache(maxsize=None)
 def _mse_weighted_rot_repeat_kernel(repeat_count: int):
     if not _metal_available() or repeat_count <= 1:
         return None
@@ -750,6 +1029,97 @@ def _mse_scores_weighted_rot_repeat_kernel(repeat_count: int):
     )
 
 
+@lru_cache(maxsize=None)
+def _mse_scores_weighted_rot_sum_repeat_kernel(repeat_count: int):
+    if not _metal_available() or repeat_count <= 1:
+        return None
+
+    lines = [
+        "        auto lane = thread_position_in_grid.x;",
+        "        auto dim_idx = thread_position_in_grid.y;",
+        "        auto n = thread_position_in_grid.z;",
+        "",
+        "        if (dim_idx >= Dim) {",
+        "            return;",
+        "        }",
+        "",
+        "        auto token_count = norms_shape[2];",
+        "        auto kv_heads = norms_shape[1];",
+        "        auto repeat_count = scores_shape[2];",
+        "        auto b = n / kv_heads;",
+        "        auto h = n % kv_heads;",
+        "",
+        "        auto scores_base = scores + ((b * kv_heads + h) * repeat_count) * token_count;",
+        "        auto norms_ptr = norms + (b * kv_heads + h) * token_count;",
+        "        auto packed_ptr = packed + ((b * kv_heads + h) * token_count) * PackedWidth;",
+        "",
+        "        int bit_offset = dim_idx * Bits;",
+        "        int word_idx = bit_offset / 32;",
+        "        int offset = bit_offset % 32;",
+        "",
+    ]
+    for r in range(repeat_count):
+        lines.append(f"        float max_{r} = -INFINITY;")
+    lines += [
+        "",
+        "        for (int t = lane; t < token_count; t += 32) {",
+    ]
+    for r in range(repeat_count):
+        lines.append(
+            f"            max_{r} = max(max_{r}, static_cast<float>(scores_base[{r} * token_count + t]));"
+        )
+    lines += [
+        "        }",
+        "",
+    ]
+    for r in range(repeat_count):
+        lines.append(f"        float max_score_{r} = simd_max(max_{r});")
+        lines.append(f"        float acc_{r} = 0.0f;")
+    lines += [
+        "",
+        "        for (int t = lane; t < token_count; t += 32) {",
+        "            auto token_ptr = packed_ptr + t * PackedWidth;",
+        "            uint value = token_ptr[word_idx] >> offset;",
+        "            int spill = offset + Bits - 32;",
+        "            if (spill > 0) {",
+        "                value |= token_ptr[word_idx + 1] << (Bits - spill);",
+        "            }",
+        "            value &= ((1u << Bits) - 1u);",
+        "            float code = codebook[value];",
+        "            float norm = static_cast<float>(norms_ptr[t]);",
+    ]
+    for r in range(repeat_count):
+        lines.append(
+            f"            float weight_{r} = exp(static_cast<float>(scores_base[{r} * token_count + t]) - max_score_{r});"
+        )
+        lines.append(f"            acc_{r} += weight_{r} * norm * code;")
+    lines += [
+        "        }",
+        "",
+    ]
+    for r in range(repeat_count):
+        lines.append(f"        float acc_sum_{r} = simd_sum(acc_{r});")
+    lines += [
+        "",
+        "        if (thread_index_in_simdgroup == 0) {",
+    ]
+    for r in range(repeat_count):
+        lines.append(
+            f"            out[((b * kv_heads + h) * repeat_count + {r}) * Dim + dim_idx] = acc_sum_{r};"
+        )
+    lines += [
+        "        }",
+    ]
+
+    source = "\n".join(lines)
+    return mx.fast.metal_kernel(
+        name=f"turboquant_mse_scores_weighted_rot_sum_repeat_{repeat_count}",
+        input_names=["scores", "norms", "packed", "codebook"],
+        output_names=["out"],
+        source=source,
+    )
+
+
 def _metal_mse_score(
     q_rot: mx.array,
     state: TurboQuantMSEState,
@@ -772,10 +1142,10 @@ def _metal_mse_score(
     T = state.norms.shape[2]
     scores = kernel(
         inputs=[
-            q_rot.astype(mx.float32),
-            state.norms.astype(mx.float32),
+            q_rot,
+            state.norms,
             state.indices.astype(mx.uint32),
-            codebook.astype(mx.float32),
+            codebook,
         ],
         template=[
             ("Dim", D),
@@ -806,11 +1176,11 @@ def _metal_qjl_score(
     T = state.norms.shape[2]
     scores = kernel(
         inputs=[
-            q_proj.astype(mx.float32),
-            state.norms.astype(mx.float32),
-            state.residual_norms.astype(mx.float32),
+            q_proj,
+            state.norms,
+            state.residual_norms,
             state.qjl_signs.astype(mx.uint32),
-            scale.astype(mx.float32),
+            scale,
         ],
         template=[
             ("Dim", D),
@@ -848,14 +1218,14 @@ def _metal_prod_score(
         if kernel is not None:
             scores = kernel(
                 inputs=[
-                    q_rot.astype(mx.float32),
-                    q_proj.astype(mx.float32),
-                    state.norms.astype(mx.float32),
-                    state.residual_norms.astype(mx.float32),
+                    q_rot,
+                    q_proj,
+                    state.norms,
+                    state.residual_norms,
                     state.mse_indices.astype(mx.uint32),
                     state.qjl_signs.astype(mx.uint32),
-                    codebook.astype(mx.float32),
-                    scale.astype(mx.float32),
+                    codebook,
+                    scale,
                 ],
                 template=[
                     ("Dim", D),
@@ -877,14 +1247,14 @@ def _metal_prod_score(
 
     scores = kernel(
         inputs=[
-            q_rot.astype(mx.float32),
-            q_proj.astype(mx.float32),
-            state.norms.astype(mx.float32),
-            state.residual_norms.astype(mx.float32),
+            q_rot,
+            q_proj,
+            state.norms,
+            state.residual_norms,
             state.mse_indices.astype(mx.uint32),
             state.qjl_signs.astype(mx.uint32),
-            codebook.astype(mx.float32),
-            scale.astype(mx.float32),
+            codebook,
+            scale,
         ],
         template=[
             ("Dim", D),
@@ -893,6 +1263,107 @@ def _metal_prod_score(
             ("SignPackedWidth", state.qjl_signs.shape[-1]),
         ],
         grid=(32, R, B * H * T),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(B, H, R, T)],
+        output_dtypes=[mx.float32],
+    )[0]
+    return mx.expand_dims(scores, axis=3)
+
+
+def _metal_polar_prod_score(
+    q_rot: mx.array,
+    state: TurboQuantPolarProdState,
+    level_bits: tuple[int, ...],
+    cos_tables: tuple[mx.array, ...],
+    sin_tables: tuple[mx.array, ...],
+) -> Optional[mx.array]:
+    if (
+        not _metal_available()
+        or q_rot.ndim != 4
+        or state.norms.shape[2] == 0
+        or len(level_bits) == 0
+    ):
+        return None
+
+    kernel = _polar_prod_score_kernel(level_bits)
+    if kernel is None:
+        return None
+
+    B, H, R, D = q_rot.shape
+    T = state.norms.shape[2]
+    levels = len(level_bits)
+    inputs = [q_rot, state.norms, state.polar_state.radii]
+    inputs.extend(level.astype(mx.uint32) for level in state.polar_state.level_indices)
+    for cos_table, sin_table in zip(cos_tables, sin_tables):
+        inputs.extend([cos_table, sin_table])
+
+    template = [("Dim", D), ("Levels", levels), ("BlockCount", state.polar_state.radii.shape[-1])]
+    for level_idx, level in enumerate(state.polar_state.level_indices, start=1):
+        template.append((f"PackedWidth{level_idx}", level.shape[-1]))
+
+    scores = kernel(
+        inputs=inputs,
+        template=template,
+        grid=(32, R, B * H * T),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(B, H, R, T)],
+        output_dtypes=[mx.float32],
+    )[0]
+    return mx.expand_dims(scores, axis=3)
+
+
+def _metal_polar_turbo_score(
+    q_rot: mx.array,
+    q_proj: mx.array,
+    state: TurboQuantPolarProdState,
+    level_bits: tuple[int, ...],
+    cos_tables: tuple[mx.array, ...],
+    sin_tables: tuple[mx.array, ...],
+    scale: mx.array,
+) -> Optional[mx.array]:
+    if (
+        not _metal_available()
+        or q_rot.ndim != 4
+        or q_proj.ndim != 4
+        or q_rot.shape != q_proj.shape
+        or state.norms.shape[2] == 0
+        or len(level_bits) == 0
+    ):
+        return None
+
+    B, H, R, D = q_rot.shape
+    T = state.norms.shape[2]
+    levels = len(level_bits)
+    kernel = _polar_turbo_score_repeat_kernel(level_bits, R)
+    if kernel is None:
+        return None
+
+    inputs = [q_rot, q_proj, state.norms, state.polar_state.radii]
+    inputs.extend(level.astype(mx.uint32) for level in state.polar_state.level_indices)
+    inputs.extend(
+        [
+            state.residual_norms,
+            state.qjl_signs.astype(mx.uint32),
+            scale,
+        ]
+    )
+    for cos_table, sin_table in zip(cos_tables, sin_tables):
+        inputs.extend([cos_table, sin_table])
+
+    template = [
+        ("Dim", D),
+        ("Levels", levels),
+        ("RepeatCount", R),
+        ("BlockCount", state.polar_state.radii.shape[-1]),
+        ("SignPackedWidth", state.qjl_signs.shape[-1]),
+    ]
+    for level_idx, level in enumerate(state.polar_state.level_indices, start=1):
+        template.append((f"PackedWidth{level_idx}", level.shape[-1]))
+
+    scores = kernel(
+        inputs=inputs,
+        template=template,
+        grid=(32, 1, B * H * T),
         threadgroup=(32, 1, 1),
         output_shapes=[(B, H, R, T)],
         output_dtypes=[mx.float32],
@@ -916,7 +1387,7 @@ def _metal_mse_weighted_sum(
     ):
         return None
 
-    weights_2d = weights.astype(mx.float32).reshape(
+    weights_2d = weights.reshape(
         weights.shape[0],
         weights.shape[1],
         weights.shape[2],
@@ -930,9 +1401,9 @@ def _metal_mse_weighted_sum(
             weighted_rot = kernel(
                 inputs=[
                     weights_2d,
-                    state.norms.astype(mx.float32),
+                    state.norms,
                     state.indices.astype(mx.uint32),
-                    codebook.astype(mx.float32),
+                    codebook,
                 ],
                 template=[
                     ("Dim", D),
@@ -945,7 +1416,7 @@ def _metal_mse_weighted_sum(
                 output_shapes=[(B, H, R, D)],
                 output_dtypes=[mx.float32],
             )[0]
-            output = mx.matmul(weighted_rot, rotation.astype(mx.float32))
+            output = mx.matmul(weighted_rot, rotation)
             return mx.expand_dims(output, axis=3)
 
     kernel = _mse_weighted_rot_kernel()
@@ -955,9 +1426,9 @@ def _metal_mse_weighted_sum(
     weighted_rot = kernel(
         inputs=[
             weights_2d,
-            state.norms.astype(mx.float32),
+            state.norms,
             state.indices.astype(mx.uint32),
-            codebook.astype(mx.float32),
+            codebook,
         ],
         template=[
             ("Dim", D),
@@ -969,7 +1440,7 @@ def _metal_mse_weighted_sum(
         output_shapes=[(B, H, R, D)],
         output_dtypes=[mx.float32],
     )[0]
-    output = mx.matmul(weighted_rot, rotation.astype(mx.float32))
+    output = mx.matmul(weighted_rot, rotation)
     return mx.expand_dims(output, axis=3)
 
 
@@ -989,7 +1460,7 @@ def _metal_mse_weighted_sum_from_scores(
     ):
         return None
 
-    scores_2d = scores.astype(mx.float32).reshape(
+    scores_2d = scores.reshape(
         scores.shape[0],
         scores.shape[1],
         scores.shape[2],
@@ -1007,9 +1478,9 @@ def _metal_mse_weighted_sum_from_scores(
     weighted_rot = kernel(
         inputs=[
             scores_2d,
-            state.norms.astype(mx.float32),
+            state.norms,
             state.indices.astype(mx.uint32),
-            codebook.astype(mx.float32),
+            codebook,
         ],
         template=[
             ("Dim", D),
@@ -1021,7 +1492,59 @@ def _metal_mse_weighted_sum_from_scores(
         output_shapes=[(B, H, R, D)],
         output_dtypes=[mx.float32],
     )[0]
-    output = mx.matmul(weighted_rot, rotation.astype(mx.float32))
+    output = mx.matmul(weighted_rot, rotation)
+    return mx.expand_dims(output, axis=3)
+
+
+def _metal_mse_weighted_sum_sum_from_scores(
+    scores: mx.array,
+    state: TurboQuantMSEState,
+    bits: int,
+    codebook: mx.array,
+    rotation: mx.array,
+) -> Optional[mx.array]:
+    if (
+        bits <= 0
+        or not _metal_available()
+        or scores.ndim != 5
+        or scores.shape[-2] != 1
+        or state.norms.shape[2] == 0
+    ):
+        return None
+
+    scores_2d = scores.reshape(
+        scores.shape[0],
+        scores.shape[1],
+        scores.shape[2],
+        scores.shape[-1],
+    )
+    B, H, R, T = scores_2d.shape
+    if R <= 1:
+        return None
+
+    kernel = _mse_scores_weighted_rot_sum_repeat_kernel(R)
+    if kernel is None:
+        return None
+
+    D = rotation.shape[0]
+    weighted_rot = kernel(
+        inputs=[
+            scores_2d,
+            state.norms,
+            state.indices.astype(mx.uint32),
+            codebook,
+        ],
+        template=[
+            ("Dim", D),
+            ("Bits", bits),
+            ("PackedWidth", state.indices.shape[-1]),
+        ],
+        grid=(32, D, B * H),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(B, H, R, D)],
+        output_dtypes=[mx.float32],
+    )[0]
+    output = mx.matmul(weighted_rot, rotation)
     return mx.expand_dims(output, axis=3)
 
 
@@ -1038,16 +1561,16 @@ def _compiled_integer_decode_kernel(bits: int):
         key_qjl_signs: mx.array,
         value_norms: mx.array,
         value_indices: mx.array,
-        key_rotation_t: mx.array,
-        key_projection_t: mx.array,
+        key_query_transform_t: mx.array,
         key_codebook: mx.array,
         key_scale: mx.array,
         value_codebook: mx.array,
         value_rotation: mx.array,
     ) -> mx.array:
-        queries_f32 = grouped_queries.astype(mx.float32)
-        q_rot = mx.matmul(queries_f32, key_rotation_t)
-        q_proj = mx.matmul(queries_f32, key_projection_t)
+        query_transformed = mx.matmul(grouped_queries, key_query_transform_t)
+        dim = grouped_queries.shape[-1]
+        q_rot = query_transformed[..., :dim]
+        q_proj = query_transformed[..., dim:]
         scores = _metal_prod_score(
             q_rot.reshape(q_rot.shape[0], q_rot.shape[1], q_rot.shape[2], q_rot.shape[-1]),
             q_proj.reshape(
@@ -1063,9 +1586,8 @@ def _compiled_integer_decode_kernel(bits: int):
             key_codebook,
             key_scale,
         )
-        weights = mx.softmax(scores, axis=-1)
-        return _metal_mse_weighted_sum(
-            weights,
+        return _metal_mse_weighted_sum_from_scores(
+            scores,
             TurboQuantMSEState(value_norms, value_indices),
             bits,
             value_codebook,
@@ -1083,6 +1605,18 @@ class TurboQuantMSEState(NamedTuple):
 class TurboQuantProdState(NamedTuple):
     norms: mx.array
     mse_indices: mx.array
+    residual_norms: mx.array
+    qjl_signs: mx.array
+
+
+class TurboQuantPolarState(NamedTuple):
+    radii: mx.array
+    level_indices: tuple[mx.array, ...]
+
+
+class TurboQuantPolarProdState(NamedTuple):
+    norms: mx.array
+    polar_state: TurboQuantPolarState
     residual_norms: mx.array
     qjl_signs: mx.array
 
@@ -1111,6 +1645,25 @@ def turboquant_enabled(bits: Optional[float], scheme: Optional[str] = None) -> b
         return True
     bits = float(bits)
     return not math.isclose(bits, round(bits), abs_tol=1e-6)
+
+
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _polar_levels(dim: int) -> int:
+    if dim <= 1:
+        return 0
+    return min(_POLAR_MAX_LEVELS, int(math.log2(dim)))
+
+
+def _polar_level_bits(dim: int, bits: int) -> tuple[int, ...]:
+    if bits != 4:
+        raise ValueError(f"PolarQuant key codec currently expects 4 bits, got {bits}.")
+    levels = _polar_levels(dim)
+    if levels == 0:
+        return ()
+    return (4,) + (2,) * (levels - 1)
 
 
 @lru_cache(maxsize=None)
@@ -1190,6 +1743,60 @@ def _codebook(dim: int, bits: int) -> mx.array:
     return mx.array(centroids.astype(np.float32))
 
 
+def _polar_angle_pdf(grid: np.ndarray, level: int) -> np.ndarray:
+    if level <= 1:
+        pdf = np.ones_like(grid)
+    else:
+        exponent = (1 << (level - 1)) - 1
+        pdf = np.power(np.clip(np.sin(2.0 * grid), 0.0, None), exponent)
+    pdf_sum = pdf.sum()
+    if pdf_sum == 0:
+        return np.full_like(grid, 1.0 / len(grid))
+    return pdf / pdf_sum
+
+
+@lru_cache(maxsize=None)
+def _polar_angle_codebook(level: int, bits: int) -> mx.array:
+    if bits <= 0:
+        return mx.zeros((0,), dtype=mx.float32)
+
+    level_count = 1 << bits
+    if level <= 1:
+        step = (2.0 * math.pi) / level_count
+        centroids = np.arange(level_count, dtype=np.float32) * step + step / 2.0
+        return mx.array(centroids.astype(np.float32))
+
+    grid = np.linspace(1e-6, math.pi / 2 - 1e-6, 32768, dtype=np.float32)
+    weights = _polar_angle_pdf(grid, level)
+    cdf = np.cumsum(weights)
+    quantiles = (np.arange(level_count, dtype=np.float32) + 0.5) / level_count
+    centroids = np.interp(quantiles, cdf, grid).astype(np.float32)
+
+    for _ in range(100):
+        boundaries = np.empty(level_count + 1, dtype=np.float32)
+        boundaries[0] = 0.0
+        boundaries[-1] = math.pi / 2
+        boundaries[1:-1] = 0.5 * (centroids[:-1] + centroids[1:])
+        new_centroids = centroids.copy()
+        for i in range(level_count):
+            if i == level_count - 1:
+                mask = (grid >= boundaries[i]) & (grid <= boundaries[i + 1])
+            else:
+                mask = (grid >= boundaries[i]) & (grid < boundaries[i + 1])
+            bucket_weights = weights[mask]
+            if bucket_weights.size == 0:
+                continue
+            total_weight = bucket_weights.sum()
+            if total_weight > 0:
+                new_centroids[i] = np.sum(bucket_weights * grid[mask]) / total_weight
+        if np.max(np.abs(new_centroids - centroids)) < 1e-6:
+            centroids = new_centroids
+            break
+        centroids = new_centroids
+
+    return mx.array(centroids.astype(np.float32))
+
+
 def _packed_width(length: int, bits: int) -> int:
     if length == 0 or bits == 0:
         return 0
@@ -1215,7 +1822,7 @@ def _pack_lowbit(values: mx.array, bits: int) -> mx.array:
                 ("PackedWidth", packed_width),
             ],
             grid=(packed_width, flat.shape[0], 1),
-            threadgroup=(1, 1, 1),
+            threadgroup=(min(32, packed_width), 1, 1),
             output_shapes=[(flat.shape[0], packed_width)],
             output_dtypes=[mx.uint32],
         )[0]
@@ -1291,6 +1898,21 @@ def _concat_state(lhs, rhs):
             mx.concatenate([lhs.residual_norms, rhs.residual_norms], axis=2),
             mx.concatenate([lhs.qjl_signs, rhs.qjl_signs], axis=2),
         )
+    if isinstance(lhs, TurboQuantPolarState):
+        return TurboQuantPolarState(
+            mx.concatenate([lhs.radii, rhs.radii], axis=2),
+            tuple(
+                mx.concatenate([lhs_idx, rhs_idx], axis=2)
+                for lhs_idx, rhs_idx in zip(lhs.level_indices, rhs.level_indices)
+            ),
+        )
+    if isinstance(lhs, TurboQuantPolarProdState):
+        return TurboQuantPolarProdState(
+            mx.concatenate([lhs.norms, rhs.norms], axis=2),
+            _concat_state(lhs.polar_state, rhs.polar_state),
+            mx.concatenate([lhs.residual_norms, rhs.residual_norms], axis=2),
+            mx.concatenate([lhs.qjl_signs, rhs.qjl_signs], axis=2),
+        )
     if isinstance(lhs, TurboQuantSplitState):
         return TurboQuantSplitState(
             _concat_state(lhs.low, rhs.low),
@@ -1308,6 +1930,18 @@ def _slice_state(state, end: int):
         return TurboQuantProdState(
             state.norms[..., :end],
             state.mse_indices[..., :end, :],
+            state.residual_norms[..., :end],
+            state.qjl_signs[..., :end, :],
+        )
+    if isinstance(state, TurboQuantPolarState):
+        return TurboQuantPolarState(
+            state.radii[..., :end, :],
+            tuple(level[..., :end, :] for level in state.level_indices),
+        )
+    if isinstance(state, TurboQuantPolarProdState):
+        return TurboQuantPolarProdState(
+            state.norms[..., :end],
+            _slice_state(state.polar_state, end),
             state.residual_norms[..., :end],
             state.qjl_signs[..., :end, :],
         )
@@ -1331,6 +1965,18 @@ def _slice_state_range(state, start: int, end: int):
         return TurboQuantProdState(
             state.norms[..., start:end],
             state.mse_indices[..., start:end, :],
+            state.residual_norms[..., start:end],
+            state.qjl_signs[..., start:end, :],
+        )
+    if isinstance(state, TurboQuantPolarState):
+        return TurboQuantPolarState(
+            state.radii[..., start:end, :],
+            tuple(level[..., start:end, :] for level in state.level_indices),
+        )
+    if isinstance(state, TurboQuantPolarProdState):
+        return TurboQuantPolarProdState(
+            state.norms[..., start:end],
+            _slice_state_range(state.polar_state, start, end),
             state.residual_norms[..., start:end],
             state.qjl_signs[..., start:end, :],
         )
@@ -1363,6 +2009,10 @@ def _state_length(state) -> int:
         return state.norms.shape[2]
     if isinstance(state, TurboQuantProdState):
         return state.norms.shape[2]
+    if isinstance(state, TurboQuantPolarState):
+        return state.radii.shape[2]
+    if isinstance(state, TurboQuantPolarProdState):
+        return state.norms.shape[2]
     raise TypeError(f"Unsupported TurboQuant state type: {type(state)!r}")
 
 
@@ -1391,6 +2041,33 @@ def _allocate_state_like(state, length: int):
                 dtype=state.qjl_signs.dtype,
             ),
         )
+    if isinstance(state, TurboQuantPolarState):
+        return TurboQuantPolarState(
+            mx.zeros(
+                (*state.radii.shape[:2], length, state.radii.shape[-1]),
+                dtype=state.radii.dtype,
+            ),
+            tuple(
+                mx.zeros(
+                    (*level.shape[:2], length, level.shape[-1]),
+                    dtype=level.dtype,
+                )
+                for level in state.level_indices
+            ),
+        )
+    if isinstance(state, TurboQuantPolarProdState):
+        return TurboQuantPolarProdState(
+            mx.zeros((*state.norms.shape[:2], length), dtype=state.norms.dtype),
+            _allocate_state_like(state.polar_state, length),
+            mx.zeros(
+                (*state.residual_norms.shape[:2], length),
+                dtype=state.residual_norms.dtype,
+            ),
+            mx.zeros(
+                (*state.qjl_signs.shape[:2], length, state.qjl_signs.shape[-1]),
+                dtype=state.qjl_signs.dtype,
+            ),
+        )
     if isinstance(state, TurboQuantSplitState):
         return TurboQuantSplitState(
             _allocate_state_like(state.low, length),
@@ -1410,6 +2087,17 @@ def _write_state(dst, src, start: int):
     if isinstance(dst, TurboQuantProdState):
         dst.norms[..., start:end] = src.norms
         dst.mse_indices[..., start:end, :] = src.mse_indices
+        dst.residual_norms[..., start:end] = src.residual_norms
+        dst.qjl_signs[..., start:end, :] = src.qjl_signs
+        return
+    if isinstance(dst, TurboQuantPolarState):
+        dst.radii[..., start:end, :] = src.radii
+        for dst_level, src_level in zip(dst.level_indices, src.level_indices):
+            dst_level[..., start:end, :] = src_level
+        return
+    if isinstance(dst, TurboQuantPolarProdState):
+        dst.norms[..., start:end] = src.norms
+        _write_state(dst.polar_state, src.polar_state, start)
         dst.residual_norms[..., start:end] = src.residual_norms
         dst.qjl_signs[..., start:end, :] = src.qjl_signs
         return
@@ -1442,14 +2130,25 @@ class _TurboQuantMSECodec:
         self.rotation_t = self.rotation.transpose() if dim > 0 else self.rotation
         self.codebook = _codebook(dim, bits)
 
-    def _quantize_unit(self, unit_vectors: mx.array) -> mx.array:
+    def _quantize_unit_with_estimate(
+        self, unit_vectors: mx.array
+    ) -> tuple[mx.array, mx.array]:
         if self.bits == 0:
-            return mx.zeros((*unit_vectors.shape[:-1], 0), dtype=mx.uint32)
+            return (
+                mx.zeros((*unit_vectors.shape[:-1], 0), dtype=mx.uint32),
+                mx.zeros(unit_vectors.shape, dtype=mx.float32),
+            )
 
-        rotated = mx.matmul(unit_vectors.astype(mx.float32), self.rotation_t)
+        rotated = mx.matmul(unit_vectors, self.rotation_t)
         distances = mx.abs(rotated[..., None] - self.codebook)
         indices = mx.argmin(distances, axis=-1).astype(mx.uint32)
-        return _pack_lowbit(indices, self.bits)
+        packed = _pack_lowbit(indices, self.bits)
+        estimated_rotated = mx.take(self.codebook, indices, axis=0)
+        return packed, mx.matmul(estimated_rotated, self.rotation)
+
+    def _quantize_unit(self, unit_vectors: mx.array) -> mx.array:
+        packed, _ = self._quantize_unit_with_estimate(unit_vectors)
+        return packed
 
     def _dequantize_unit(self, packed_indices: mx.array) -> mx.array:
         if self.bits == 0:
@@ -1460,11 +2159,12 @@ class _TurboQuantMSECodec:
         return mx.matmul(rotated, self.rotation)
 
     def quantize(self, vectors: mx.array) -> TurboQuantMSEState:
-        norms = mx.linalg.norm(vectors.astype(mx.float32), axis=-1)
+        vectors_f32 = vectors.astype(mx.float32)
+        norms = mx.linalg.norm(vectors_f32, axis=-1)
         safe_norms = mx.maximum(norms[..., None], _EPS)
         unit_vectors = mx.where(
             norms[..., None] > 0,
-            vectors.astype(mx.float32) / safe_norms,
+            vectors_f32 / safe_norms,
             mx.zeros(vectors.shape, dtype=mx.float32),
         )
         return TurboQuantMSEState(
@@ -1477,7 +2177,7 @@ class _TurboQuantMSECodec:
         return state.norms[..., None].astype(unit_vectors.dtype) * unit_vectors
 
     def prepare_queries(self, queries: mx.array) -> mx.array:
-        return mx.matmul(queries.astype(mx.float32), self.rotation_t)
+        return mx.matmul(queries, self.rotation_t)
 
     def score_prepared(
         self, prepared_queries: mx.array, state: TurboQuantMSEState
@@ -1541,6 +2241,244 @@ class _TurboQuantMSECodec:
             return fast_output
         return self.weighted_sum(mx.softmax(scores, axis=-1), state)
 
+    def weighted_sum_stats_from_scores(
+        self, scores: mx.array, state: TurboQuantMSEState
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        max_scores = mx.max(scores, axis=-1)
+        fast_output = _metal_mse_weighted_sum_sum_from_scores(
+            scores,
+            state,
+            self.bits,
+            self.codebook,
+            self.rotation,
+        )
+        if fast_output is not None:
+            denom = mx.sum(mx.exp(scores - max_scores[..., None]), axis=-1)
+            return fast_output, denom, max_scores
+
+        weights = mx.exp(scores - max_scores[..., None])
+        output = self.weighted_sum(weights, state)
+        denom = mx.sum(weights, axis=-1)
+        return output, denom, max_scores
+
+
+class _PolarQuantUnitCodec:
+    def __init__(self, dim: int, bits: int, seed: int):
+        if not _is_power_of_two(dim):
+            raise ValueError(f"PolarQuant requires a power-of-two dimension, got {dim}.")
+        self.dim = dim
+        self.bits = bits
+        self.level_bits = _polar_level_bits(dim, bits)
+        self.levels = len(self.level_bits)
+        self.rotation = _rotation_matrix(dim, seed)
+        self.rotation_t = self.rotation.transpose() if dim > 0 else self.rotation
+        self.angle_codebooks = tuple(
+            _polar_angle_codebook(level, level_bits)
+            for level, level_bits in enumerate(self.level_bits, start=1)
+        )
+        self.cos_tables = tuple(mx.cos(codebook) for codebook in self.angle_codebooks)
+        self.sin_tables = tuple(mx.sin(codebook) for codebook in self.angle_codebooks)
+
+    def _quantize_level(self, angles: mx.array, level: int) -> mx.array:
+        codebook = self.angle_codebooks[level - 1]
+        diffs = mx.abs(angles[..., None] - codebook)
+        if level == 1:
+            diffs = mx.minimum(diffs, (2.0 * math.pi) - diffs)
+        return mx.argmin(diffs, axis=-1).astype(mx.uint32)
+
+    def _dequantize_preconditioned(self, state: TurboQuantPolarState) -> mx.array:
+        radii = state.radii.astype(mx.float32)
+        for bits, indices_packed, cos_table, sin_table in zip(
+            reversed(self.level_bits),
+            reversed(state.level_indices),
+            reversed(self.cos_tables),
+            reversed(self.sin_tables),
+        ):
+            angle_count = radii.shape[-1]
+            indices = _unpack_lowbit(indices_packed, bits, angle_count).astype(mx.int32)
+            cosines = mx.take(cos_table, indices, axis=0)
+            sines = mx.take(sin_table, indices, axis=0)
+            radii = mx.stack([radii * cosines, radii * sines], axis=-1).reshape(
+                (*radii.shape[:-1], radii.shape[-1] * 2)
+            )
+        return radii
+
+    def quantize_unit_with_estimate(
+        self, unit_vectors: mx.array, storage_dtype
+    ) -> tuple[TurboQuantPolarState, mx.array]:
+        preconditioned = mx.matmul(unit_vectors, self.rotation_t)
+        radii = preconditioned
+        packed_levels = []
+        for level, bits in enumerate(self.level_bits, start=1):
+            pairs = radii.reshape((*radii.shape[:-1], radii.shape[-1] // 2, 2))
+            angles = mx.arctan2(pairs[..., 1], pairs[..., 0])
+            if level == 1:
+                angles = mx.where(angles < 0, angles + 2.0 * math.pi, angles)
+            indices = self._quantize_level(angles, level)
+            packed_levels.append(_pack_lowbit(indices, bits))
+            radii = mx.linalg.norm(pairs, axis=-1)
+
+        state = TurboQuantPolarState(
+            radii.astype(storage_dtype),
+            tuple(packed_levels),
+        )
+        approx_preconditioned = self._dequantize_preconditioned(state)
+        approx_unit = mx.matmul(approx_preconditioned, self.rotation)
+        return state, approx_unit
+
+    def dequantize_unit(self, state: TurboQuantPolarState) -> mx.array:
+        return mx.matmul(self._dequantize_preconditioned(state), self.rotation)
+
+    def score_prepared(
+        self, prepared_queries: mx.array, state: TurboQuantPolarState, norms: mx.array
+    ) -> mx.array:
+        if prepared_queries.shape[-2] == 1:
+            fast_scores = _metal_polar_prod_score(
+                prepared_queries.reshape(
+                    prepared_queries.shape[0],
+                    prepared_queries.shape[1],
+                    prepared_queries.shape[2],
+                    prepared_queries.shape[-1],
+                ),
+                TurboQuantPolarProdState(
+                    norms,
+                    state,
+                    mx.zeros_like(norms),
+                    mx.zeros((*norms.shape, 0), dtype=mx.uint32),
+                ),
+                self.level_bits,
+                self.cos_tables,
+                self.sin_tables,
+            )
+            if fast_scores is not None:
+                return fast_scores
+
+        approx_preconditioned = self._dequantize_preconditioned(state)
+        dots = mx.einsum("bhmld,bhtd->bhmlt", prepared_queries, approx_preconditioned)
+        return dots * norms.astype(mx.float32)[:, :, None, None, :]
+
+
+class _TurboQuantPolarProdCodec:
+    def __init__(self, dim: int, bits: int, seed: int):
+        self.dim = dim
+        self.bits = bits
+        self.polar_codec = _PolarQuantUnitCodec(dim, bits, seed)
+        self.projection = _projection_matrix(dim, seed + 1)
+        self.projection_t = (
+            self.projection.transpose() if dim > 0 else self.projection
+        )
+        self.query_transform_t = (
+            mx.concatenate([self.polar_codec.rotation_t, self.projection_t], axis=-1)
+            if dim > 0
+            else mx.zeros((0, 0), dtype=mx.float32)
+        )
+        self.scale = math.sqrt(math.pi / 2) / dim if dim > 0 else 0.0
+        self.scale_array = mx.array([self.scale], dtype=mx.float32)
+
+    def quantize(self, vectors: mx.array) -> TurboQuantPolarProdState:
+        vectors_f32 = vectors.astype(mx.float32)
+        norms = mx.linalg.norm(vectors_f32, axis=-1)
+        safe_norms = mx.maximum(norms[..., None], _EPS)
+        unit_vectors = mx.where(
+            norms[..., None] > 0,
+            vectors_f32 / safe_norms,
+            mx.zeros(vectors.shape, dtype=mx.float32),
+        )
+
+        polar_state, approx_unit = self.polar_codec.quantize_unit_with_estimate(
+            unit_vectors,
+            storage_dtype=vectors.dtype,
+        )
+        residual = unit_vectors - approx_unit
+        residual_norms = mx.linalg.norm(residual, axis=-1)
+        projected = mx.matmul(residual, self.projection_t)
+        signs = mx.where(projected >= 0, 1, 0).astype(mx.uint32)
+
+        return TurboQuantPolarProdState(
+            norms.astype(vectors.dtype),
+            polar_state,
+            residual_norms.astype(vectors.dtype),
+            _pack_lowbit(signs, 1),
+        )
+
+    def dequantize(self, state: TurboQuantPolarProdState) -> mx.array:
+        polar_unit = self.polar_codec.dequantize_unit(state.polar_state)
+        sign_bits = _unpack_lowbit(state.qjl_signs, 1, self.dim).astype(mx.float32)
+        signs = sign_bits * 2.0 - 1.0
+        qjl_unit = self.scale * state.residual_norms[..., None].astype(
+            mx.float32
+        ) * mx.matmul(signs, self.projection)
+        return state.norms[..., None].astype(mx.float32) * (polar_unit + qjl_unit)
+
+    def prepare_queries(self, queries: mx.array) -> tuple[mx.array, mx.array]:
+        transformed = mx.matmul(queries, self.query_transform_t)
+        return transformed[..., : self.dim], transformed[..., self.dim :]
+
+    def score_prepared(
+        self,
+        prepared_queries: tuple[mx.array, mx.array],
+        state: TurboQuantPolarProdState,
+    ) -> mx.array:
+        polar_queries, proj_queries = prepared_queries
+        if proj_queries.shape[-2] == 1:
+            fast_scores = _metal_polar_turbo_score(
+                polar_queries.reshape(
+                    polar_queries.shape[0],
+                    polar_queries.shape[1],
+                    polar_queries.shape[2],
+                    polar_queries.shape[-1],
+                ),
+                proj_queries.reshape(
+                    proj_queries.shape[0],
+                    proj_queries.shape[1],
+                    proj_queries.shape[2],
+                    proj_queries.shape[-1],
+                ),
+                state,
+                self.polar_codec.level_bits,
+                self.polar_codec.cos_tables,
+                self.polar_codec.sin_tables,
+                self.scale_array,
+            )
+            if fast_scores is not None:
+                return fast_scores
+
+        polar_score = self.polar_codec.score_prepared(
+            polar_queries,
+            state.polar_state,
+            state.norms,
+        )
+
+        if proj_queries.shape[-2] == 1:
+            fast_qjl = _metal_qjl_score(
+                proj_queries.reshape(
+                    proj_queries.shape[0],
+                    proj_queries.shape[1],
+                    proj_queries.shape[2],
+                    proj_queries.shape[-1],
+                ),
+                state,
+                self.scale_array,
+            )
+            if fast_qjl is not None:
+                return polar_score + fast_qjl
+
+        sign_bits = _unpack_lowbit(state.qjl_signs, 1, self.dim).astype(mx.float32)
+        signs = sign_bits * 2.0 - 1.0
+        qjl_score = self.scale * state.residual_norms.astype(mx.float32)[
+            :, :, None, None, :
+        ] * mx.einsum(
+            "bhmld,bhtd->bhmlt",
+            proj_queries,
+            signs,
+        )
+
+        norms = state.norms.astype(mx.float32)[:, :, None, None, :]
+        return polar_score + norms * qjl_score
+
+    def score(self, queries: mx.array, state: TurboQuantPolarProdState) -> mx.array:
+        return self.score_prepared(self.prepare_queries(queries), state)
+
 
 class _TurboQuantProdCodec:
     def __init__(self, dim: int, bits: int, seed: int):
@@ -1551,20 +2489,27 @@ class _TurboQuantProdCodec:
         self.projection_t = (
             self.projection.transpose() if dim > 0 else self.projection
         )
+        self.query_transform_t = (
+            mx.concatenate([self.mse_codec.rotation_t, self.projection_t], axis=-1)
+            if dim > 0
+            else mx.zeros((0, 0), dtype=mx.float32)
+        )
         self.scale = math.sqrt(math.pi / 2) / dim if dim > 0 else 0.0
         self.scale_array = mx.array([self.scale], dtype=mx.float32)
 
     def quantize(self, vectors: mx.array) -> TurboQuantProdState:
-        norms = mx.linalg.norm(vectors.astype(mx.float32), axis=-1)
+        vectors_f32 = vectors.astype(mx.float32)
+        norms = mx.linalg.norm(vectors_f32, axis=-1)
         safe_norms = mx.maximum(norms[..., None], _EPS)
         unit_vectors = mx.where(
             norms[..., None] > 0,
-            vectors.astype(mx.float32) / safe_norms,
+            vectors_f32 / safe_norms,
             mx.zeros(vectors.shape, dtype=mx.float32),
         )
 
-        mse_indices = self.mse_codec._quantize_unit(unit_vectors)
-        mse_unit = self.mse_codec._dequantize_unit(mse_indices)
+        mse_indices, mse_unit = self.mse_codec._quantize_unit_with_estimate(
+            unit_vectors
+        )
         residual = unit_vectors - mse_unit
         residual_norms = mx.linalg.norm(residual, axis=-1)
         projected = mx.matmul(residual, self.projection_t)
@@ -1587,11 +2532,8 @@ class _TurboQuantProdCodec:
         return state.norms[..., None].astype(mx.float32) * (mse_unit + qjl_unit)
 
     def prepare_queries(self, queries: mx.array) -> tuple[mx.array, mx.array]:
-        queries = queries.astype(mx.float32)
-        return (
-            mx.matmul(queries, self.mse_codec.rotation_t),
-            mx.matmul(queries, self.projection_t),
-        )
+        transformed = mx.matmul(queries, self.query_transform_t)
+        return transformed[..., : self.dim], transformed[..., self.dim :]
 
     def score_prepared(
         self,
@@ -1755,6 +2697,18 @@ class _SplitCodec:
         merged = mx.concatenate([low_tensor, high_tensor], axis=-1)
         return mx.take(merged, self.restore_order, axis=-1)
 
+    def weighted_sum_stats_from_scores(
+        self, scores: mx.array, state: TurboQuantSplitState
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        low_tensor, denom, max_scores = self.low_codec.weighted_sum_stats_from_scores(
+            scores, state.low
+        )
+        high_tensor, _, _ = self.high_codec.weighted_sum_stats_from_scores(
+            scores, state.high
+        )
+        merged = mx.concatenate([low_tensor, high_tensor], axis=-1)
+        return mx.take(merged, self.restore_order, axis=-1), denom, max_scores
+
 
 def _build_codec(tensor: mx.array, bits: float, mode: str, seed: int):
     bits = _validate_bits(bits)
@@ -1874,7 +2828,7 @@ class TurboQuantKVCache(_BaseCache):
         ) else keys_state.norms.shape[1]
         n_repeats = n_q_heads // n_kv_heads
 
-        grouped_queries = (queries.astype(mx.float32) * scale).reshape(
+        grouped_queries = (queries * scale).reshape(
             B,
             n_kv_heads,
             n_repeats,
@@ -1926,16 +2880,18 @@ class TurboQuantKVCache(_BaseCache):
                     total_tokens,
                 )
 
-                chunk_max = mx.max(scores, axis=-1)
+                chunk_output, chunk_denom, chunk_max = (
+                    self.value_codec.weighted_sum_stats_from_scores(scores, value_chunk)
+                )
                 new_max = mx.maximum(max_score, chunk_max)
                 prev_scale = mx.exp(max_score - new_max)
-                weights = mx.exp(scores - new_max[..., None])
+                chunk_scale = mx.exp(chunk_max - new_max)
 
                 output = (
                     output * prev_scale[..., None]
-                    + self.value_codec.weighted_sum(weights, value_chunk)
+                    + chunk_output * chunk_scale[..., None]
                 )
-                normalizer = normalizer * prev_scale + mx.sum(weights, axis=-1)
+                normalizer = normalizer * prev_scale + chunk_denom * chunk_scale
                 max_score = new_max
                 mx.eval(output, normalizer, max_score)
 
@@ -1976,8 +2932,7 @@ class TurboQuantKVCache(_BaseCache):
             keys_state.qjl_signs,
             values_state.norms,
             values_state.indices,
-            self.key_codec.mse_codec.rotation_t,
-            self.key_codec.projection_t,
+            self.key_codec.query_transform_t,
             self.key_codec.mse_codec.codebook,
             self.key_codec.scale_array,
             self.value_codec.codebook,
@@ -2004,7 +2959,7 @@ class TurboQuantKVCache(_BaseCache):
         ) else keys_state.norms.shape[1]
         n_repeats = n_q_heads // n_kv_heads
 
-        grouped_queries = (queries.astype(mx.float32) * scale).reshape(
+        grouped_queries = (queries * scale).reshape(
             B,
             n_kv_heads,
             n_repeats,
@@ -2026,8 +2981,7 @@ class TurboQuantKVCache(_BaseCache):
 
             prepared_queries = self.key_codec.prepare_queries(grouped_queries)
             scores = self.key_codec.score_prepared(prepared_queries, keys_state)
-            weights = mx.softmax(scores, axis=-1)
-            output = self.value_codec.weighted_sum(weights, values_state)
+            output = self.value_codec.weighted_sum_from_scores(scores, values_state)
             output = output.reshape(B, n_q_heads, L, value_dim)
             return output.astype(queries.dtype)
 
@@ -2058,16 +3012,18 @@ class TurboQuantKVCache(_BaseCache):
                 total_tokens,
             )
 
-            chunk_max = mx.max(scores, axis=-1)
+            chunk_output, chunk_denom, chunk_max = (
+                self.value_codec.weighted_sum_stats_from_scores(scores, value_chunk)
+            )
             new_max = mx.maximum(max_score, chunk_max)
             prev_scale = mx.exp(max_score - new_max)
-            weights = mx.exp(scores - new_max[..., None])
+            chunk_scale = mx.exp(chunk_max - new_max)
 
             output = (
                 output * prev_scale[..., None]
-                + self.value_codec.weighted_sum(weights, value_chunk)
+                + chunk_output * chunk_scale[..., None]
             )
-            normalizer = normalizer * prev_scale + mx.sum(weights, axis=-1)
+            normalizer = normalizer * prev_scale + chunk_denom * chunk_scale
             max_score = new_max
 
         output = output / mx.maximum(normalizer[..., None], _EPS)
