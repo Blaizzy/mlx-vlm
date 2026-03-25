@@ -546,6 +546,7 @@ class Gemma4Processor(ProcessorMixin):
             audio_seq_length=audio_seq_length,
             audio_ms_per_token=audio_ms_per_token,
             feature_extractor=feature_extractor,
+            chat_template=tokenizer.chat_template,
         )
 
 
