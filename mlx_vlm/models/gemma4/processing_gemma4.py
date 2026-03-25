@@ -19,7 +19,7 @@ from transformers.image_utils import (
     ImageInput,
     PILImageResampling,
     infer_channel_dimension_format,
-    make_list_of_images,
+    make_flat_list_of_images,
     to_numpy_array,
     valid_images,
 )
@@ -154,7 +154,7 @@ class Gemma4ImageProcessor(HFBaseImageProcessor):
         )
         max_patches = max_soft_tokens * pooling_kernel_size**2
 
-        images = make_list_of_images(images)
+        images = make_flat_list_of_images(images)
 
         if not valid_images(images):
             raise ValueError("Invalid image type.")
