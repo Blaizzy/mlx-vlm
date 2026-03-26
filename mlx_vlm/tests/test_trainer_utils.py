@@ -91,6 +91,16 @@ class TestLoRaScaling(unittest.TestCase):
             lora_contribution[0, 0].item(), expected_per_element, places=1
         )
 
+    def test_b_zero_init_gives_no_lora_contribution(self):
+        """When B is zeros (default init), output should equal base linear."""
+        linear = nn.Linear(4, 4)
+        lora = LoRaLayer(linear, rank=8, alpha=16.0, dropout=0.0)
+        # B is already zeros from __init__, don't override it
+        x = mx.ones((1, 4))
+        base_output = linear(x)
+        lora_output = lora(x)
+        self.assertTrue(mx.allclose(base_output, lora_output).item())
+
     def test_default_alpha_rank_gives_2x(self):
         """Default alpha=16, rank=8 should give 2x scaling, not 16x."""
         linear = nn.Linear(8, 8)
