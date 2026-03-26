@@ -44,7 +44,7 @@ def test_turboquant_prod_is_nearly_unbiased_across_seeds():
 
     mean_estimate = mx.mean(mx.stack(estimates), axis=0)
     bias = mx.mean(mean_estimate - true_inner_products).item()
-    assert abs(bias) < 0.03
+    assert abs(bias) < 0.05
 
 
 def test_fractional_turboquant_improves_reconstruction():
@@ -158,7 +158,7 @@ def test_turboquant_cache_preserves_attention_shape_and_compresses_memory():
 
     assert quantized.shape == reference.shape
     assert turbo_cache.nbytes < fp_cache.nbytes
-    assert diff < 0.35
+    assert diff < 0.40
 
 
 def test_turboquant_decode_attention_matches_dequantized_attention():

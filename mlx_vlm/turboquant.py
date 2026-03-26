@@ -1377,6 +1377,7 @@ def _metal_mse_weighted_sum(
     bits: int,
     codebook: mx.array,
     rotation: mx.array,
+    unrotate_fn=None,
 ) -> Optional[mx.array]:
     if (
         bits <= 0
@@ -1416,7 +1417,7 @@ def _metal_mse_weighted_sum(
                 output_shapes=[(B, H, R, D)],
                 output_dtypes=[mx.float32],
             )[0]
-            output = mx.matmul(weighted_rot, rotation)
+            output = unrotate_fn(weighted_rot) if unrotate_fn else mx.matmul(weighted_rot, rotation)
             return mx.expand_dims(output, axis=3)
 
     kernel = _mse_weighted_rot_kernel()
@@ -1440,7 +1441,7 @@ def _metal_mse_weighted_sum(
         output_shapes=[(B, H, R, D)],
         output_dtypes=[mx.float32],
     )[0]
-    output = mx.matmul(weighted_rot, rotation)
+    output = unrotate_fn(weighted_rot) if unrotate_fn else mx.matmul(weighted_rot, rotation)
     return mx.expand_dims(output, axis=3)
 
 
@@ -1450,6 +1451,7 @@ def _metal_mse_weighted_sum_from_scores(
     bits: int,
     codebook: mx.array,
     rotation: mx.array,
+    unrotate_fn=None,
 ) -> Optional[mx.array]:
     if (
         bits <= 0
@@ -1492,7 +1494,7 @@ def _metal_mse_weighted_sum_from_scores(
         output_shapes=[(B, H, R, D)],
         output_dtypes=[mx.float32],
     )[0]
-    output = mx.matmul(weighted_rot, rotation)
+    output = unrotate_fn(weighted_rot) if unrotate_fn else mx.matmul(weighted_rot, rotation)
     return mx.expand_dims(output, axis=3)
 
 
@@ -1502,6 +1504,7 @@ def _metal_mse_weighted_sum_sum_from_scores(
     bits: int,
     codebook: mx.array,
     rotation: mx.array,
+    unrotate_fn=None,
 ) -> Optional[mx.array]:
     if (
         bits <= 0
@@ -1544,7 +1547,7 @@ def _metal_mse_weighted_sum_sum_from_scores(
         output_shapes=[(B, H, R, D)],
         output_dtypes=[mx.float32],
     )[0]
-    output = mx.matmul(weighted_rot, rotation)
+    output = unrotate_fn(weighted_rot) if unrotate_fn else mx.matmul(weighted_rot, rotation)
     return mx.expand_dims(output, axis=3)
 
 
@@ -1678,6 +1681,208 @@ def _rotation_matrix(dim: int, seed: int) -> mx.array:
     q, r = np.linalg.qr(matrix)
     q *= np.sign(np.diag(r))
     return mx.array(q.astype(np.float32))
+
+
+@lru_cache(maxsize=None)
+def _random_signs(dim: int, seed: int) -> mx.array:
+    """Generate random +1/-1 sign flips for randomized Hadamard transform."""
+    rng = np.random.default_rng(seed)
+    signs = rng.choice([-1.0, 1.0], size=(dim,)).astype(np.float32)
+    return mx.array(signs)
+
+
+def _hadamard_transform(x: mx.array) -> mx.array:
+    """Pure Walsh-Hadamard transform (without signs), normalized by 1/sqrt(dim).
+
+    H is symmetric and self-inverse when normalized: (H/sqrt(d))² = I.
+    """
+    dim = x.shape[-1]
+    h = 1
+    while h < dim:
+        shape = x.shape[:-1] + (dim // (2 * h), 2, h)
+        x = x.reshape(shape)
+        even = x[..., 0, :]
+        odd = x[..., 1, :]
+        x_sum = even + odd
+        x_diff = even - odd
+        x = mx.concatenate([mx.expand_dims(x_sum, -2),
+                            mx.expand_dims(x_diff, -2)], axis=-2)
+        x = x.reshape(x.shape[:-3] + (dim,))
+        h *= 2
+    return x / math.sqrt(dim)
+
+
+def _fast_walsh_hadamard_forward(x: mx.array, signs: mx.array) -> mx.array:
+    """Forward randomized Hadamard: H · D · x / sqrt(d).
+
+    Where D = diag(signs) and H = Walsh-Hadamard matrix.
+    """
+    return _hadamard_transform(x * signs)
+
+
+def _fast_walsh_hadamard_inverse(x: mx.array, signs: mx.array) -> mx.array:
+    """Inverse randomized Hadamard: D · H · x / sqrt(d).
+
+    Since H is symmetric and H/sqrt(d) is its own inverse, and D² = I,
+    the inverse of H·D/sqrt(d) is D·H/sqrt(d).
+    """
+    return _hadamard_transform(x) * signs
+
+
+@lru_cache(maxsize=None)
+def _wht_forward_metal_kernel():
+    """Metal kernel for forward WHT: H · D · x / sqrt(d)."""
+    if not _metal_available():
+        return None
+
+    source = r"""
+        auto tid = thread_position_in_grid.x;
+        auto row = thread_position_in_grid.y;
+
+        if (row >= x_shape[0] || tid >= Dim) {
+            return;
+        }
+
+        auto x_ptr = x + row * Dim;
+        auto signs_ptr = signs;
+        auto out_ptr = out + row * Dim;
+
+        // Apply sign flips BEFORE Hadamard (forward: H · D · x)
+        float val = static_cast<float>(x_ptr[tid]) * static_cast<float>(signs_ptr[tid]);
+
+        threadgroup float shared[1024];
+        shared[tid] = val;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Butterfly stages
+        for (int h = 1; h < Dim; h *= 2) {
+            int idx = tid;
+            int block = idx / (2 * h);
+            int pos = idx % (2 * h);
+            float a, b;
+            if (pos < h) {
+                a = shared[block * 2 * h + pos];
+                b = shared[block * 2 * h + pos + h];
+            } else {
+                a = shared[block * 2 * h + (pos - h)];
+                b = shared[block * 2 * h + pos];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (pos < h) {
+                shared[idx] = a + b;
+            } else {
+                shared[idx] = a - b;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        float inv_sqrt_dim = rsqrt(static_cast<float>(Dim));
+        out_ptr[tid] = shared[tid] * inv_sqrt_dim;
+    """
+    return mx.fast.metal_kernel(
+        name="fast_wht_forward",
+        input_names=["x", "signs"],
+        output_names=["out"],
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _wht_inverse_metal_kernel():
+    """Metal kernel for inverse WHT: D · H · x / sqrt(d)."""
+    if not _metal_available():
+        return None
+
+    source = r"""
+        auto tid = thread_position_in_grid.x;
+        auto row = thread_position_in_grid.y;
+
+        if (row >= x_shape[0] || tid >= Dim) {
+            return;
+        }
+
+        auto x_ptr = x + row * Dim;
+        auto signs_ptr = signs;
+        auto out_ptr = out + row * Dim;
+
+        // No sign flips before Hadamard (inverse: D · H · x)
+        threadgroup float shared[1024];
+        shared[tid] = static_cast<float>(x_ptr[tid]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Butterfly stages
+        for (int h = 1; h < Dim; h *= 2) {
+            int idx = tid;
+            int block = idx / (2 * h);
+            int pos = idx % (2 * h);
+            float a, b;
+            if (pos < h) {
+                a = shared[block * 2 * h + pos];
+                b = shared[block * 2 * h + pos + h];
+            } else {
+                a = shared[block * 2 * h + (pos - h)];
+                b = shared[block * 2 * h + pos];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (pos < h) {
+                shared[idx] = a + b;
+            } else {
+                shared[idx] = a - b;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // Apply sign flips AFTER Hadamard (inverse: D · H · x)
+        float inv_sqrt_dim = rsqrt(static_cast<float>(Dim));
+        out_ptr[tid] = shared[tid] * inv_sqrt_dim * static_cast<float>(signs_ptr[tid]);
+    """
+    return mx.fast.metal_kernel(
+        name="fast_wht_inverse",
+        input_names=["x", "signs"],
+        output_names=["out"],
+        source=source,
+    )
+
+
+def _apply_wht_metal(x: mx.array, signs: mx.array, kernel) -> mx.array:
+    """Run a WHT Metal kernel on input x."""
+    dim = x.shape[-1]
+    orig_shape = x.shape
+    flat = x.reshape(-1, dim)
+    rows = flat.shape[0]
+
+    result = kernel(
+        inputs=[flat, signs],
+        template=[("Dim", dim)],
+        grid=(dim, rows, 1),
+        threadgroup=(dim, 1, 1),
+        output_shapes=[(rows, dim)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+    return result.reshape(orig_shape)
+
+
+def _apply_wht_forward(x: mx.array, signs: mx.array) -> mx.array:
+    """Forward WHT: H · D · x / sqrt(d). Metal kernel or MLX fallback."""
+    dim = x.shape[-1]
+    if not _is_power_of_two(dim) or dim > 1024:
+        return _fast_walsh_hadamard_forward(x, signs)
+    kernel = _wht_forward_metal_kernel()
+    if kernel is None:
+        return _fast_walsh_hadamard_forward(x, signs)
+    return _apply_wht_metal(x, signs, kernel)
+
+
+def _apply_wht_inverse(x: mx.array, signs: mx.array) -> mx.array:
+    """Inverse WHT: D · H · x / sqrt(d). Metal kernel or MLX fallback."""
+    dim = x.shape[-1]
+    if not _is_power_of_two(dim) or dim > 1024:
+        return _fast_walsh_hadamard_inverse(x, signs)
+    kernel = _wht_inverse_metal_kernel()
+    if kernel is None:
+        return _fast_walsh_hadamard_inverse(x, signs)
+    return _apply_wht_metal(x, signs, kernel)
 
 
 @lru_cache(maxsize=None)
@@ -2126,9 +2331,53 @@ class _TurboQuantMSECodec:
     def __init__(self, dim: int, bits: int, seed: int):
         self.dim = dim
         self.bits = bits
-        self.rotation = _rotation_matrix(dim, seed)
-        self.rotation_t = self.rotation.transpose() if dim > 0 else self.rotation
+        self._seed = seed
+        self.use_wht = _is_power_of_two(dim) and dim > 1
+        if self.use_wht:
+            self.wht_signs = _random_signs(dim, seed + dim * 7919)
+            self._dense_rotation = None
+            self._dense_rotation_t = None
+        else:
+            self.wht_signs = None
+            self._dense_rotation = _rotation_matrix(dim, seed)
+            self._dense_rotation_t = (
+                self._dense_rotation.transpose() if dim > 0
+                else self._dense_rotation
+            )
         self.codebook = _codebook(dim, bits)
+        # Pre-compute sorted codebook boundaries for binary search
+        if bits > 0:
+            cb_np = np.array(self.codebook)
+            self._boundaries = mx.array(
+                (0.5 * (cb_np[:-1] + cb_np[1:])).astype(np.float32)
+            )
+        else:
+            self._boundaries = None
+
+    @property
+    def rotation(self) -> mx.array:
+        """Dense rotation matrix (materialised lazily for Metal kernels)."""
+        if self._dense_rotation is None:
+            self._dense_rotation = _rotation_matrix(self.dim, self._seed)
+        return self._dense_rotation
+
+    @property
+    def rotation_t(self) -> mx.array:
+        if self._dense_rotation_t is None:
+            self._dense_rotation_t = self.rotation.transpose()
+        return self._dense_rotation_t
+
+    def _rotate(self, vectors: mx.array) -> mx.array:
+        """Apply forward rotation: O(d log d) WHT or O(d²) dense fallback."""
+        if self.use_wht:
+            return _apply_wht_forward(vectors.astype(mx.float32), self.wht_signs)
+        return mx.matmul(vectors, self._dense_rotation_t)
+
+    def _unrotate(self, rotated: mx.array) -> mx.array:
+        """Apply inverse rotation."""
+        if self.use_wht:
+            return _apply_wht_inverse(rotated.astype(mx.float32), self.wht_signs)
+        return mx.matmul(rotated, self._dense_rotation)
 
     def _quantize_unit_with_estimate(
         self, unit_vectors: mx.array
@@ -2139,12 +2388,14 @@ class _TurboQuantMSECodec:
                 mx.zeros(unit_vectors.shape, dtype=mx.float32),
             )
 
-        rotated = mx.matmul(unit_vectors, self.rotation_t)
-        distances = mx.abs(rotated[..., None] - self.codebook)
-        indices = mx.argmin(distances, axis=-1).astype(mx.uint32)
+        rotated = self._rotate(unit_vectors)
+        # Use boundaries comparison instead of broadcasting argmin
+        # This avoids the O(d * 2^bits) temporary from abs(rotated[..., None] - codebook)
+        # by doing 2^bits - 1 comparisons instead
+        indices = mx.sum(rotated[..., None] >= self._boundaries, axis=-1).astype(mx.uint32)
         packed = _pack_lowbit(indices, self.bits)
         estimated_rotated = mx.take(self.codebook, indices, axis=0)
-        return packed, mx.matmul(estimated_rotated, self.rotation)
+        return packed, self._unrotate(estimated_rotated)
 
     def _quantize_unit(self, unit_vectors: mx.array) -> mx.array:
         packed, _ = self._quantize_unit_with_estimate(unit_vectors)
@@ -2156,7 +2407,7 @@ class _TurboQuantMSECodec:
 
         indices = _unpack_lowbit(packed_indices, self.bits, self.dim).astype(mx.int32)
         rotated = mx.take(self.codebook, indices, axis=0)
-        return mx.matmul(rotated, self.rotation)
+        return self._unrotate(rotated)
 
     def quantize(self, vectors: mx.array) -> TurboQuantMSEState:
         vectors_f32 = vectors.astype(mx.float32)
@@ -2177,7 +2428,7 @@ class _TurboQuantMSECodec:
         return state.norms[..., None].astype(unit_vectors.dtype) * unit_vectors
 
     def prepare_queries(self, queries: mx.array) -> mx.array:
-        return mx.matmul(queries, self.rotation_t)
+        return self._rotate(queries)
 
     def score_prepared(
         self, prepared_queries: mx.array, state: TurboQuantMSEState
@@ -2213,6 +2464,7 @@ class _TurboQuantMSECodec:
                 self.bits,
                 self.codebook,
                 self.rotation,
+                unrotate_fn=self._unrotate,
             )
             if fast_output is not None:
                 return fast_output
@@ -2225,7 +2477,7 @@ class _TurboQuantMSECodec:
             state.norms.astype(mx.float32),
             rotated,
         )
-        return mx.matmul(weighted_rot, self.rotation)
+        return self._unrotate(weighted_rot)
 
     def weighted_sum_from_scores(
         self, scores: mx.array, state: TurboQuantMSEState
@@ -2236,6 +2488,7 @@ class _TurboQuantMSECodec:
             self.bits,
             self.codebook,
             self.rotation,
+            unrotate_fn=self._unrotate,
         )
         if fast_output is not None:
             return fast_output
@@ -2251,6 +2504,7 @@ class _TurboQuantMSECodec:
             self.bits,
             self.codebook,
             self.rotation,
+            unrotate_fn=self._unrotate,
         )
         if fast_output is not None:
             denom = mx.sum(mx.exp(scores - max_scores[..., None]), axis=-1)
@@ -2268,16 +2522,49 @@ class _PolarQuantUnitCodec:
             raise ValueError(f"PolarQuant requires a power-of-two dimension, got {dim}.")
         self.dim = dim
         self.bits = bits
+        self._seed = seed
         self.level_bits = _polar_level_bits(dim, bits)
         self.levels = len(self.level_bits)
-        self.rotation = _rotation_matrix(dim, seed)
-        self.rotation_t = self.rotation.transpose() if dim > 0 else self.rotation
+        self.use_wht = dim > 1
+        if self.use_wht:
+            self.wht_signs = _random_signs(dim, seed + dim * 7919)
+            self._dense_rotation = None
+            self._dense_rotation_t = None
+        else:
+            self.wht_signs = None
+            self._dense_rotation = _rotation_matrix(dim, seed)
+            self._dense_rotation_t = (
+                self._dense_rotation.transpose() if dim > 0
+                else self._dense_rotation
+            )
         self.angle_codebooks = tuple(
             _polar_angle_codebook(level, level_bits)
             for level, level_bits in enumerate(self.level_bits, start=1)
         )
         self.cos_tables = tuple(mx.cos(codebook) for codebook in self.angle_codebooks)
         self.sin_tables = tuple(mx.sin(codebook) for codebook in self.angle_codebooks)
+
+    @property
+    def rotation(self) -> mx.array:
+        if self._dense_rotation is None:
+            self._dense_rotation = _rotation_matrix(self.dim, self._seed)
+        return self._dense_rotation
+
+    @property
+    def rotation_t(self) -> mx.array:
+        if self._dense_rotation_t is None:
+            self._dense_rotation_t = self.rotation.transpose()
+        return self._dense_rotation_t
+
+    def _rotate(self, vectors: mx.array) -> mx.array:
+        if self.use_wht:
+            return _apply_wht_forward(vectors.astype(mx.float32), self.wht_signs)
+        return mx.matmul(vectors, self._dense_rotation_t)
+
+    def _unrotate(self, rotated: mx.array) -> mx.array:
+        if self.use_wht:
+            return _apply_wht_inverse(rotated.astype(mx.float32), self.wht_signs)
+        return mx.matmul(rotated, self._dense_rotation)
 
     def _quantize_level(self, angles: mx.array, level: int) -> mx.array:
         codebook = self.angle_codebooks[level - 1]
@@ -2306,7 +2593,7 @@ class _PolarQuantUnitCodec:
     def quantize_unit_with_estimate(
         self, unit_vectors: mx.array, storage_dtype
     ) -> tuple[TurboQuantPolarState, mx.array]:
-        preconditioned = mx.matmul(unit_vectors, self.rotation_t)
+        preconditioned = self._rotate(unit_vectors)
         radii = preconditioned
         packed_levels = []
         for level, bits in enumerate(self.level_bits, start=1):
@@ -2323,11 +2610,11 @@ class _PolarQuantUnitCodec:
             tuple(packed_levels),
         )
         approx_preconditioned = self._dequantize_preconditioned(state)
-        approx_unit = mx.matmul(approx_preconditioned, self.rotation)
+        approx_unit = self._unrotate(approx_preconditioned)
         return state, approx_unit
 
     def dequantize_unit(self, state: TurboQuantPolarState) -> mx.array:
-        return mx.matmul(self._dequantize_preconditioned(state), self.rotation)
+        return self._unrotate(self._dequantize_preconditioned(state))
 
     def score_prepared(
         self, prepared_queries: mx.array, state: TurboQuantPolarState, norms: mx.array
@@ -2362,18 +2649,54 @@ class _TurboQuantPolarProdCodec:
     def __init__(self, dim: int, bits: int, seed: int):
         self.dim = dim
         self.bits = bits
+        self._seed = seed
         self.polar_codec = _PolarQuantUnitCodec(dim, bits, seed)
-        self.projection = _projection_matrix(dim, seed + 1)
-        self.projection_t = (
-            self.projection.transpose() if dim > 0 else self.projection
-        )
-        self.query_transform_t = (
-            mx.concatenate([self.polar_codec.rotation_t, self.projection_t], axis=-1)
-            if dim > 0
-            else mx.zeros((0, 0), dtype=mx.float32)
-        )
+        self.use_wht = _is_power_of_two(dim) and dim > 1
+        if self.use_wht:
+            self.proj_wht_signs = _random_signs(dim, (seed + 1) + dim * 2971 + 17)
+            self._dense_projection = None
+            self._dense_projection_t = None
+        else:
+            self.proj_wht_signs = None
+            self._dense_projection = _projection_matrix(dim, seed + 1)
+            self._dense_projection_t = (
+                self._dense_projection.transpose() if dim > 0
+                else self._dense_projection
+            )
         self.scale = math.sqrt(math.pi / 2) / dim if dim > 0 else 0.0
         self.scale_array = mx.array([self.scale], dtype=mx.float32)
+
+    @property
+    def projection(self) -> mx.array:
+        if self._dense_projection is None:
+            self._dense_projection = _projection_matrix(self.dim,
+                                                         self._seed + 1)
+        return self._dense_projection
+
+    @property
+    def projection_t(self) -> mx.array:
+        if self._dense_projection_t is None:
+            self._dense_projection_t = self.projection.transpose()
+        return self._dense_projection_t
+
+    def _project(self, vectors: mx.array) -> mx.array:
+        if self.use_wht:
+            return _apply_wht_forward(vectors.astype(mx.float32), self.proj_wht_signs)
+        return mx.matmul(vectors, self._dense_projection_t)
+
+    def _unproject(self, projected: mx.array) -> mx.array:
+        if self.use_wht:
+            return _apply_wht_inverse(projected.astype(mx.float32), self.proj_wht_signs)
+        return mx.matmul(projected, self._dense_projection)
+
+    @property
+    def query_transform_t(self) -> mx.array:
+        """For Metal kernel paths that need the concatenated dense matrix."""
+        return (
+            mx.concatenate([self.polar_codec.rotation_t, self.projection_t], axis=-1)
+            if self.dim > 0
+            else mx.zeros((0, 0), dtype=mx.float32)
+        )
 
     def quantize(self, vectors: mx.array) -> TurboQuantPolarProdState:
         vectors_f32 = vectors.astype(mx.float32)
@@ -2391,7 +2714,7 @@ class _TurboQuantPolarProdCodec:
         )
         residual = unit_vectors - approx_unit
         residual_norms = mx.linalg.norm(residual, axis=-1)
-        projected = mx.matmul(residual, self.projection_t)
+        projected = self._project(residual)
         signs = mx.where(projected >= 0, 1, 0).astype(mx.uint32)
 
         return TurboQuantPolarProdState(
@@ -2407,12 +2730,13 @@ class _TurboQuantPolarProdCodec:
         signs = sign_bits * 2.0 - 1.0
         qjl_unit = self.scale * state.residual_norms[..., None].astype(
             mx.float32
-        ) * mx.matmul(signs, self.projection)
+        ) * self._unproject(signs)
         return state.norms[..., None].astype(mx.float32) * (polar_unit + qjl_unit)
 
     def prepare_queries(self, queries: mx.array) -> tuple[mx.array, mx.array]:
-        transformed = mx.matmul(queries, self.query_transform_t)
-        return transformed[..., : self.dim], transformed[..., self.dim :]
+        rot_q = self.polar_codec._rotate(queries)
+        proj_q = self._project(queries)
+        return rot_q, proj_q
 
     def score_prepared(
         self,
@@ -2484,18 +2808,53 @@ class _TurboQuantProdCodec:
     def __init__(self, dim: int, bits: int, seed: int):
         self.dim = dim
         self.bits = bits
+        self._seed = seed
         self.mse_codec = _TurboQuantMSECodec(dim, max(bits - 1, 0), seed)
-        self.projection = _projection_matrix(dim, seed + 1)
-        self.projection_t = (
-            self.projection.transpose() if dim > 0 else self.projection
-        )
-        self.query_transform_t = (
-            mx.concatenate([self.mse_codec.rotation_t, self.projection_t], axis=-1)
-            if dim > 0
-            else mx.zeros((0, 0), dtype=mx.float32)
-        )
+        self.use_wht = _is_power_of_two(dim) and dim > 1
+        if self.use_wht:
+            self.proj_wht_signs = _random_signs(dim, (seed + 1) + dim * 2971 + 17)
+            self._dense_projection = None
+            self._dense_projection_t = None
+        else:
+            self.proj_wht_signs = None
+            self._dense_projection = _projection_matrix(dim, seed + 1)
+            self._dense_projection_t = (
+                self._dense_projection.transpose() if dim > 0
+                else self._dense_projection
+            )
         self.scale = math.sqrt(math.pi / 2) / dim if dim > 0 else 0.0
         self.scale_array = mx.array([self.scale], dtype=mx.float32)
+
+    @property
+    def projection(self) -> mx.array:
+        if self._dense_projection is None:
+            self._dense_projection = _projection_matrix(self.dim,
+                                                         self._seed + 1)
+        return self._dense_projection
+
+    @property
+    def projection_t(self) -> mx.array:
+        if self._dense_projection_t is None:
+            self._dense_projection_t = self.projection.transpose()
+        return self._dense_projection_t
+
+    @property
+    def query_transform_t(self) -> mx.array:
+        return (
+            mx.concatenate([self.mse_codec.rotation_t, self.projection_t], axis=-1)
+            if self.dim > 0
+            else mx.zeros((0, 0), dtype=mx.float32)
+        )
+
+    def _project(self, vectors: mx.array) -> mx.array:
+        if self.use_wht:
+            return _apply_wht_forward(vectors.astype(mx.float32), self.proj_wht_signs)
+        return mx.matmul(vectors, self._dense_projection_t)
+
+    def _unproject(self, projected: mx.array) -> mx.array:
+        if self.use_wht:
+            return _apply_wht_inverse(projected.astype(mx.float32), self.proj_wht_signs)
+        return mx.matmul(projected, self._dense_projection)
 
     def quantize(self, vectors: mx.array) -> TurboQuantProdState:
         vectors_f32 = vectors.astype(mx.float32)
@@ -2512,7 +2871,7 @@ class _TurboQuantProdCodec:
         )
         residual = unit_vectors - mse_unit
         residual_norms = mx.linalg.norm(residual, axis=-1)
-        projected = mx.matmul(residual, self.projection_t)
+        projected = self._project(residual)
         signs = mx.where(projected >= 0, 1, 0).astype(mx.uint32)
 
         return TurboQuantProdState(
@@ -2528,12 +2887,13 @@ class _TurboQuantProdCodec:
         signs = sign_bits * 2.0 - 1.0
         qjl_unit = self.scale * state.residual_norms[..., None].astype(
             mx.float32
-        ) * mx.matmul(signs, self.projection)
+        ) * self._unproject(signs)
         return state.norms[..., None].astype(mx.float32) * (mse_unit + qjl_unit)
 
     def prepare_queries(self, queries: mx.array) -> tuple[mx.array, mx.array]:
-        transformed = mx.matmul(queries, self.query_transform_t)
-        return transformed[..., : self.dim], transformed[..., self.dim :]
+        rot_q = self.mse_codec._rotate(queries)
+        proj_q = self._project(queries)
+        return rot_q, proj_q
 
     def score_prepared(
         self,
