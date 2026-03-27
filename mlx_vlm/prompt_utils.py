@@ -60,6 +60,7 @@ MODEL_CONFIG = {
     "mllama": MessageFormat.LIST_WITH_IMAGE,
     "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "molmo2": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "molmo_point": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
