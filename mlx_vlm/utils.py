@@ -540,28 +540,66 @@ def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list
     return shards
 
 
-def upload_to_hub(path: str, upload_repo: str, hf_path: str):
+def create_model_card(
+    path: Union[str, Path], hf_path: Optional[Union[str, Path]] = None
+):
+    """
+    Create model card for a converted MLX model.
+
+    Args:
+        path (Union[str, Path]): Local path to the converted model.
+        hf_path (Optional[Union[str, Path]]): Original Hugging Face repo id or local path used for conversion.
+    """
+    from huggingface_hub import ModelCard, ModelCardData
+
+    if hf_path is None:
+        card = ModelCard.from_template(ModelCardData(language="en"))
+    else:
+        card = ModelCard.load(hf_path)
+    card.data.library_name = "mlx"
+    if card.data.pipeline_tag is None:
+        card.data.pipeline_tag = "image-text-to-text"
+    if card.data.tags is None:
+        card.data.tags = ["mlx"]
+    elif "mlx" not in card.data.tags:
+        card.data.tags += ["mlx"]
+    if hf_path is not None:
+        card.data.base_model = str(hf_path)
+    card.text = ""
+    card.save(Path(path) / "README.md")
+
+
+def upload_to_hub(path: str, upload_repo: str):
     """
     Uploads the model to Hugging Face hub.
 
     Args:
         path (str): Local path to the model.
         upload_repo (str): Name of the HF repo to upload to.
-        hf_path (str): Path to the original Hugging Face model.
     """
-    import os
-
     from huggingface_hub import HfApi, ModelCard, logging
 
     from . import __version__
 
-    card = ModelCard.load(hf_path)
-    card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"]
+    logging.set_verbosity_info()
+    card_path = Path(path) / "README.md"
+    card = ModelCard.load(card_path)
+
+    hf_path = card.data.base_model
+
+    if hf_path is not None:
+        provenance = f"""
+        This model was converted to MLX format from [`{hf_path}`](https://huggingface.co/{hf_path})
+        using mlx-vlm version **{__version__}**.
+        Refer to the [original model card](https://huggingface.co/{hf_path}) for more details on the model.
+        """
+    else:
+        provenance = ""
+
     card.text = dedent(
         f"""
         # {upload_repo}
-        This model was converted to MLX format from [`{hf_path}`]() using mlx-vlm version **{__version__}**.
-        Refer to the [original model card](https://huggingface.co/{hf_path}) for more details on the model.
+        {provenance}
         ## Use with mlx
 
         ```bash
@@ -573,9 +611,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         ```
         """
     )
-    card.save(os.path.join(path, "README.md"))
-
-    logging.set_verbosity_info()
+    card.save(card_path)
 
     api = HfApi()
     api.create_repo(repo_id=upload_repo, exist_ok=True)
