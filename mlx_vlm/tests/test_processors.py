@@ -802,6 +802,59 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertEqual(_num_image_tokens_from_patch_grid(1, 1, 2), 1)
         self.assertEqual(_num_image_tokens_from_patch_grid(7, 9, 4), 6)
 
+    def test_from_pretrained_uses_slow_image_processor(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from transformers.models.siglip2.image_processing_siglip2 import (
+            Siglip2ImageProcessor,
+        )
+
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlProcessor
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "preprocessor_config.json").write_text(
+                json.dumps(
+                    {
+                        "image_processor_type": "Lfm2VlImageProcessorFast",
+                        "do_resize": False,
+                        "do_image_splitting": True,
+                        "do_normalize": True,
+                        "do_rescale": True,
+                        "image_mean": [0.5, 0.5, 0.5],
+                        "image_std": [0.5, 0.5, 0.5],
+                        "max_num_patches": 1024,
+                        "patch_size": 16,
+                        "return_row_col_info": True,
+                    }
+                )
+            )
+
+            def _fake_init(
+                self, image_processor, tokenizer, chat_template=None, **kwargs
+            ):
+                self.image_processor = image_processor
+                self.tokenizer = tokenizer
+                self.chat_template = chat_template
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=_mock_tokenizer(),
+                ),
+                patch(
+                    "mlx_vlm.models.lfm2_vl.processing_lfm2_vl._original_init",
+                    _fake_init,
+                ),
+            ):
+                processor = Lfm2VlProcessor.from_pretrained(tmpdir)
+
+        self.assertIsInstance(processor.image_processor, Siglip2ImageProcessor)
+        self.assertTrue(processor.image_processor.do_resize)
+        self.assertFalse(processor.image_processor.do_image_splitting)
+
 
 # ── AutoProcessor patch tests ─────────────────────────────────────────────────
 
@@ -877,6 +930,27 @@ class TestHunYuanVLPatch(unittest.TestCase):
             "mlx_vlm.models.hunyuan_vl.processing_hunyuan_vl",
             "HunYuanVLProcessor",
         )
+
+
+class TestLfm2VlPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        import importlib
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        importlib.import_module("mlx_vlm.models.lfm2_vl")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps({"model_type": "lfm2_vl"})
+            )
+            with self.assertRaises(Exception) as cm:
+                AutoProcessor.from_pretrained(tmpdir)
+
+            self.assertNotIn("requires `torchvision`", str(cm.exception).lower())
 
 
 class TestErnie4_5VLPatch(unittest.TestCase):
