@@ -29,6 +29,8 @@ from .generate import (
     DEFAULT_QUANTIZED_KV_START,
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
+    DEFAULT_THINKING_END_TOKEN,
+    DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
     generate,
     normalize_resize_shape,
@@ -336,21 +338,23 @@ class TemplateParams(FlexibleBaseModel):
         description="Maximum number of thinking tokens before forcing the end token.",
     )
     thinking_start_token: Optional[str] = Field(
-        None,
+        DEFAULT_THINKING_START_TOKEN,
         description="Token that marks the start of a thinking block.",
     )
     thinking_end_token: Optional[str] = Field(
-        None,
+        DEFAULT_THINKING_END_TOKEN,
         description="Token that marks the end of a thinking block.",
     )
 
     def template_kwargs(self) -> dict[str, Any]:
-        return self.dump_kwargs(
+        kwargs = self.dump_kwargs(
             "enable_thinking",
             "thinking_budget",
             "thinking_start_token",
             "thinking_end_token",
         )
+        kwargs.setdefault("enable_thinking", False)
+        return kwargs
 
 
 class OpenAIRequest(GenerationParams, TemplateParams):

@@ -1075,7 +1075,7 @@ def test_generate_cli_smoke(capsys):
         prefill_step_size=128,
         enable_thinking=False,
         thinking_budget=None,
-        thinking_start_token=None,
+        thinking_start_token="<think>",
         thinking_end_token="</think>",
     )
     model = SimpleNamespace(config=SimpleNamespace(model_type="demo"))
@@ -1101,6 +1101,15 @@ def test_generate_cli_smoke(capsys):
     assert mock_generate.call_args.kwargs["temperature"] == pytest.approx(0.7)
     assert mock_generate.call_args.kwargs["prefill_step_size"] == 128
     assert capsys.readouterr().out.strip() == "done"
+
+
+def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["mlx_vlm.generate"])
+
+    args = generate_module.parse_arguments()
+
+    assert args.thinking_start_token == "<think>"
+    assert args.thinking_end_token == "</think>"
 
 
 if __name__ == "__main__":
