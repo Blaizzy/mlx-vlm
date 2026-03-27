@@ -99,7 +99,7 @@ class Qwen3_5RMSNormGated(nn.Module):
         x = mx.fast.rms_norm(hidden_states, self.weight, self.eps)
         if gate is not None:
             x = swiglu(gate, x)
-        return x
+        return x.astype(hidden_states.dtype)
 
 
 class Qwen3_5Attention(nn.Module):
