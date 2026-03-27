@@ -889,6 +889,26 @@ class TestErnie4_5VLPatch(unittest.TestCase):
         )
 
 
+class TestQwen3_5Patch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "qwen3_5",
+            "mlx_vlm.models.qwen3_vl.processing_qwen3_vl",
+            "Qwen3VLProcessor",
+        )
+
+
+class TestQwen3_5MoePatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "qwen3_5_moe",
+            "mlx_vlm.models.qwen3_vl.processing_qwen3_vl",
+            "Qwen3VLProcessor",
+        )
+
+
 class TestPatchChainsForUnknownModelType(unittest.TestCase):
     def test_falls_through(self):
         import importlib
