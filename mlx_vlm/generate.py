@@ -1369,9 +1369,8 @@ def main():
     num_audios = (
         1 if args.audio is not None else 0
     )  # TODO: Support multiple audio files
-    chat_template_kwargs = {}
-    if args.enable_thinking:
-        chat_template_kwargs["enable_thinking"] = True
+
+    chat_template_kwargs = {"enable_thinking": args.enable_thinking}
 
     prompt = apply_chat_template(
         processor,
@@ -1402,8 +1401,7 @@ def main():
         kwargs.update(args.processor_kwargs)
 
     # Add thinking kwargs
-    if args.enable_thinking:
-        kwargs["enable_thinking"] = True
+    kwargs["enable_thinking"] = args.enable_thinking
     if args.thinking_budget is not None:
         kwargs["thinking_budget"] = args.thinking_budget
         kwargs["thinking_end_token"] = args.thinking_end_token

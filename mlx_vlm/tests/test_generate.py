@@ -1084,7 +1084,9 @@ def test_generate_cli_smoke(capsys):
     with (
         patch.object(generate_module, "parse_arguments", return_value=args),
         patch.object(generate_module, "load", return_value=(model, processor)),
-        patch.object(generate_module, "apply_chat_template", return_value="prompt"),
+        patch.object(
+            generate_module, "apply_chat_template", return_value="prompt"
+        ) as mock_apply_chat_template,
         patch.object(
             generate_module,
             "generate",
@@ -1093,6 +1095,8 @@ def test_generate_cli_smoke(capsys):
     ):
         generate_module.main()
 
+    assert mock_apply_chat_template.call_args.kwargs["enable_thinking"] is False
+    assert mock_generate.call_args.kwargs["enable_thinking"] is False
     assert mock_generate.call_args.kwargs["max_tokens"] == 12
     assert mock_generate.call_args.kwargs["temperature"] == pytest.approx(0.7)
     assert mock_generate.call_args.kwargs["prefill_step_size"] == 128
