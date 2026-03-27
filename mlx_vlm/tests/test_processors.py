@@ -1,6 +1,7 @@
 """Tests for custom processor implementations."""
 
 import unittest
+from unittest.mock import patch, sentinel
 
 import numpy as np
 from PIL import Image
@@ -886,6 +887,51 @@ class TestErnie4_5VLPatch(unittest.TestCase):
             "ernie4_5_moe_vl",
             "mlx_vlm.models.ernie4_5_moe_vl",
             "Ernie4_5_VLProcessor",
+        )
+
+
+def _assert_patch_dispatches_to_custom_processor(
+    test_case, model_type, module_path, cls_name
+):
+    import importlib
+    import json
+    import tempfile
+    from pathlib import Path
+
+    from transformers import AutoProcessor
+
+    mod = importlib.import_module(module_path)
+    cls = getattr(mod, cls_name, None)
+    test_case.assertIsNotNone(cls, f"{cls_name} not found in {module_path}")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        (Path(tmpdir) / "config.json").write_text(
+            json.dumps({"model_type": model_type})
+        )
+        with patch.object(cls, "from_pretrained", return_value=sentinel.processor) as m:
+            processor = AutoProcessor.from_pretrained(tmpdir)
+
+        test_case.assertIs(processor, sentinel.processor)
+        m.assert_called_once_with(tmpdir, trust_remote_code=True)
+
+
+class TestQwen3_5Patch(unittest.TestCase):
+    def test_patch_dispatches_to_custom_processor(self):
+        _assert_patch_dispatches_to_custom_processor(
+            self,
+            "qwen3_5",
+            "mlx_vlm.models.qwen3_5",
+            "Qwen3VLProcessor",
+        )
+
+
+class TestQwen3_5MoePatch(unittest.TestCase):
+    def test_patch_dispatches_to_custom_processor(self):
+        _assert_patch_dispatches_to_custom_processor(
+            self,
+            "qwen3_5_moe",
+            "mlx_vlm.models.qwen3_5_moe",
+            "Qwen3VLProcessor",
         )
 
 
