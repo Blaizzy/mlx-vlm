@@ -3,23 +3,11 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from transformers import AutoImageProcessor, AutoProcessor
 
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
-from .processing_kimi_vl import KimiVLImageProcessor, KimiVLProcessor
 from .vision import VisionModel
-
-# Register custom processor classes for kimi_vl model type
-try:
-    MODEL_TYPE = "kimi_vl"
-    AutoImageProcessor.register(
-        MODEL_TYPE, slow_image_processor_class=KimiVLImageProcessor
-    )
-    AutoProcessor.register(MODEL_TYPE, KimiVLProcessor)
-except Exception:
-    raise Exception("Failed to register kimi_vl processor")
 
 
 class KimiVLMultiModalProjector(nn.Module):
