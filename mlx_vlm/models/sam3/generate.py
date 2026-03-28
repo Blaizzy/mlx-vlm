@@ -907,9 +907,12 @@ def run_image(
             box_array = np.array(box_list)
             print(f"Box prompts: {box_array.tolist()}")
 
-    result = predictor.predict(image, text_prompt=prompt, boxes=box_array)
+    result = predictor.predict(image, text_prompt=prompt)
     if len(result.scores) > 0:
         result = nms(result, nms_thresh)
+        # Filter to only objects inside the input box regions
+        if box_array is not None:
+            result = _filter_by_regions(result, box_array)
 
     print(f"Detections: {len(result.scores)}")
     for i in range(len(result.scores)):
