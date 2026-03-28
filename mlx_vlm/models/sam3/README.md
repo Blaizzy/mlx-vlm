@@ -53,18 +53,28 @@ overlay[mask > 0] = overlay[mask > 0] * 0.5 + np.array([255, 0, 0]) * 0.5
 
 ### Video Tracking
 
-Track objects across frames using text, point, or box prompts:
+Track objects across video frames using text, point, or box prompts:
 
 ```python
+import cv2
 from mlx_vlm.models.sam3.generate import Sam3VideoPredictor
 
-video_predictor = Sam3VideoPredictor(model, processor)
-video_predictor.set_video(frames)  # list of PIL Images
+# Load video frames
+cap = cv2.VideoCapture("video.mp4")
+frames = []
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+    frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+cap.release()
+
+# Set up tracker
+video_predictor = Sam3VideoPredictor(model, processor, score_threshold=0.15)
+video_predictor.set_video(frames)
 
 # Initialize with any prompt type on a keyframe
-video_predictor.add_text_prompt("a person", frame_idx=0)
-video_predictor.add_point_prompt(points, labels, frame_idx=0)  # (N,2) xy coords, (N,) 0/1 labels
-video_predictor.add_box_prompt(box, frame_idx=0)                # (4,) xyxy
+video_predictor.add_text_prompt("a car", frame_idx=0)
 
 # Propagate through all frames
 results = video_predictor.propagate()
@@ -123,8 +133,8 @@ mlx_vlm/models/sam3/
 ├── sam3.py               # Main Model class + sanitize
 ├── vision.py             # ViT backbone + FPN neck
 ├── text_encoder.py       # CLIP text encoder
-├── encoder.py            # DETR transformer encoder
-├── decoder.py            # DETR transformer decoder
+├── encoder.py            # DETR transformer encoder (pre-norm)
+├── decoder.py            # DETR transformer decoder (post-norm, BoxRPB)
 ├── geometry.py           # Geometry encoder (box/point prompts)
 ├── segmentation.py       # Mask decoder + dot product scoring
 ├── position.py           # Sinusoidal + 2D RoPE position encodings

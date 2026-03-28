@@ -343,11 +343,15 @@ class Sam3VideoPredictor:
             mx.eval(outputs)
 
             # Take best detection
-            logits = np.array(outputs["pred_logits"][0]).squeeze(-1)
+            logits = np.array(outputs["pred_logits"][0]).squeeze()
             masks = np.array(outputs["pred_masks"][0])
-            best_idx = np.argmax(_sigmoid(logits))
+            scores = _sigmoid(logits)
+            if "presence_logits" in outputs and outputs["presence_logits"] is not None:
+                pres = _sigmoid(np.array(outputs["presence_logits"][0]))
+                scores = scores * pres
+            best_idx = np.argmax(scores)
             mask = (masks[best_idx] > 0).astype(np.uint8)
-            score = _sigmoid(logits[best_idx])
+            score = scores[best_idx]
             return mask, float(score)
 
         elif prompt["type"] == "points":
@@ -427,11 +431,14 @@ class Sam3VideoPredictor:
 
         mask_mx = mx.array(mask.astype(np.float32))[None, :, :, None]  # (1, H, W, 1)
 
-        # Resize mask to match features if needed
-        B, H, W, D = track_features.shape
-        if mask_mx.shape[1] != H or mask_mx.shape[2] != W:
-            # Simple nearest-neighbor resize
-            up = nn.Upsample(scale_factor=(H / mask_mx.shape[1], W / mask_mx.shape[2]), mode="nearest")
+        # Resize mask to 1152x1152 so downsampler (stride=16) produces 72x72
+        # matching the backbone feature spatial dimensions
+        target = 1152
+        if mask_mx.shape[1] != target or mask_mx.shape[2] != target:
+            up = nn.Upsample(
+                scale_factor=(target / mask_mx.shape[1], target / mask_mx.shape[2]),
+                mode="nearest",
+            )
             mask_mx = up(mask_mx)
 
         memory = self.model.tracker_model.memory_encoder(track_features, mask_mx)

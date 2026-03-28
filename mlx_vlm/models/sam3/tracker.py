@@ -410,11 +410,17 @@ class TrackerModel(nn.Module):
         obj_ptr = self.object_pointer_proj(sam_tokens[:, 0])
 
         # Encode memory from current frame
-        # Use best mask for memory encoding
-        best_mask_idx = mx.argmax(iou_pred, axis=-1)
-        # Simplified: take first mask
         mask_for_mem = masks[:, 0:1]  # (B, 1, H_mask, W_mask)
         mask_for_mem = mask_for_mem.transpose(0, 2, 3, 1)  # (B, H, W, 1)
+
+        # Resize mask to 1152x1152 so downsampler (stride=16) produces 72x72
+        target = 1152
+        if mask_for_mem.shape[1] != target:
+            up = nn.Upsample(
+                scale_factor=(target / mask_for_mem.shape[1], target / mask_for_mem.shape[2]),
+                mode="nearest",
+            )
+            mask_for_mem = up(mask_for_mem)
 
         memory = self.memory_encoder(current_features, mask_for_mem)
         B_m, H_m, W_m, C_m = memory.shape
