@@ -2,6 +2,7 @@
 Processor class for PaliGemma.
 """
 
+import inspect
 import logging
 
 import numpy as np
@@ -36,6 +37,35 @@ def is_image_or_image_url(elem):
 
 def _is_str_or_image(elem):
     return isinstance(elem, (str)) or is_image_or_image_url(elem)
+
+
+def _split_image_processor_kwargs(image_processor, kwargs):
+    image_kwargs = {}
+    valid_kwargs = set()
+
+    typed_valid_kwargs = getattr(image_processor, "valid_kwargs", None)
+    annotations = getattr(typed_valid_kwargs, "__annotations__", None)
+    if annotations:
+        valid_kwargs.update(annotations.keys())
+
+    try:
+        parameters = inspect.signature(image_processor.__call__).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+
+    valid_kwargs.update(
+        name
+        for name, parameter in parameters.items()
+        if name not in {"self", "images"}
+        and parameter.kind
+        not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    )
+
+    for key in list(kwargs.keys()):
+        if key in valid_kwargs:
+            image_kwargs[key] = kwargs.pop(key)
+
+    return image_kwargs
 
 
 def build_string_from_input(prompt, bos_token, image_seq_len, image_token, num_images):
@@ -267,7 +297,8 @@ class PaliGemmaProcessor(ProcessorMixin):
         if suffix is not None:
             suffix = [sfx + self.tokenizer.eos_token for sfx in suffix]
 
-        pixel_values = self.image_processor(images, **kwargs)["pixel_values"]
+        image_kwargs = _split_image_processor_kwargs(self.image_processor, kwargs)
+        pixel_values = self.image_processor(images, **image_kwargs)["pixel_values"]
 
         inputs = self.tokenizer(
             input_strings,

@@ -209,6 +209,73 @@ class TestPaliGemmaProcessor(_ProcessorTestBase, unittest.TestCase):
     def _text_call_args(self):
         return None  # PaliGemma requires images
 
+    def test_tokenizer_kwargs_do_not_leak_into_image_processor(self):
+        from mlx_vlm.models.paligemma.processing_paligemma import PaliGemmaProcessor
+
+        calls = {}
+
+        class ImageProcessor:
+            model_input_names = ["pixel_values"]
+            valid_kwargs = type(
+                "ImageValidKwargs",
+                (),
+                {"__annotations__": {"do_resize": bool}},
+            )
+
+            def __call__(self, images=None, **kwargs):
+                if "padding" in kwargs or "add_special_tokens" in kwargs:
+                    raise AssertionError("Tokenizer kwargs reached the image processor")
+                calls["image_kwargs"] = kwargs
+                return {
+                    "pixel_values": np.random.randn(1, 3, 224, 224).astype(np.float32)
+                }
+
+        class Tokenizer:
+            bos_token = "<bos>"
+            eos_token = "<eos>"
+            model_input_names = ["input_ids", "attention_mask"]
+
+            def __call__(
+                self,
+                text,
+                text_pair=None,
+                return_token_type_ids=False,
+                **kwargs,
+            ):
+                calls["tokenizer_kwargs"] = kwargs
+                batch = [text] if isinstance(text, str) else text
+                return {
+                    "input_ids": [list(range(10)) for _ in batch],
+                    "attention_mask": [[1] * 10 for _ in batch],
+                    "token_type_ids": [[0] * 10 for _ in batch],
+                }
+
+        p = PaliGemmaProcessor.__new__(PaliGemmaProcessor)
+        p.image_token = "<image>"
+        p.image_seq_length = 4
+        p.image_processor = ImageProcessor()
+        p.tokenizer = Tokenizer()
+
+        result = p(
+            text="describe",
+            images=[_make_image()],
+            padding=True,
+            padding_side="left",
+            add_special_tokens=False,
+            do_resize=False,
+        )
+
+        self._assert_all_mx(result)
+        self.assertEqual(calls["image_kwargs"], {"do_resize": False})
+        self.assertEqual(
+            calls["tokenizer_kwargs"],
+            {
+                "padding": True,
+                "padding_side": "left",
+                "add_special_tokens": False,
+            },
+        )
+
 
 class TestGemma3Processor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
