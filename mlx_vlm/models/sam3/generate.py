@@ -812,29 +812,39 @@ def draw_frame(
         )
         cv2.drawContours(out, contours, -1, color, 2)
 
+        # Label text
+        lbl = labels[i] if labels and i < len(labels) else prompt
+        label = f"{lbl} {scores[i]:.2f}"
+
         if show_boxes:
             x1, y1, x2, y2 = boxes[i].astype(int)
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+            lx, ly = x1, max(y1 - 8, 12)
+        else:
+            # Place label at top of mask bounding box
+            ys, xs = np.where(binary)
+            if len(ys) > 0:
+                lx, ly = int(xs.min()), max(int(ys.min()) - 8, 12)
+            else:
+                lx, ly = 10, 30
 
-            lbl = labels[i] if labels and i < len(labels) else prompt
-            label = f"{lbl} {scores[i]:.2f}"
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-            cv2.rectangle(
-                out,
-                (x1, max(y1 - th - 10, 0)),
-                (x1 + tw + 6, max(y1, th + 10)),
-                color,
-                -1,
-            )
-            cv2.putText(
-                out,
-                label,
-                (x1 + 3, max(y1 - 4, th + 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2,
-            )
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(
+            out,
+            (lx, max(ly - th - 6, 0)),
+            (lx + tw + 6, ly + 4),
+            color,
+            -1,
+        )
+        cv2.putText(
+            out,
+            label,
+            (lx + 3, ly),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+        )
     return out
 
 
@@ -1119,34 +1129,44 @@ def track_video_realtime(
                     )
                     cv2.drawContours(overlay, contours, -1, color, 2)
 
+                    # Label (always shown)
+                    lbl = (
+                        result.labels[i]
+                        if result.labels and i < len(result.labels)
+                        else prompt_str
+                    )
+                    label = f"{lbl} {result.scores[i]:.2f}"
+
                     if show_boxes:
                         x1, y1, x2, y2 = result.boxes[i].astype(int)
                         cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-                        lbl = (
-                            result.labels[i]
-                            if result.labels and i < len(result.labels)
-                            else prompt_str
-                        )
-                        label = f"{lbl} {result.scores[i]:.2f}"
-                        (tw, th), _ = cv2.getTextSize(
-                            label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
-                        )
-                        cv2.rectangle(
-                            overlay,
-                            (x1, max(y1 - th - 10, 0)),
-                            (x1 + tw + 6, max(y1, th + 10)),
-                            color,
-                            -1,
-                        )
-                        cv2.putText(
-                            overlay,
-                            label,
-                            (x1 + 3, max(y1 - 4, th + 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7,
-                            (255, 255, 255),
-                            2,
-                        )
+                        lx, ly = x1, max(y1 - 8, 12)
+                    else:
+                        ys, xs = np.where(binary)
+                        if len(ys) > 0:
+                            lx, ly = int(xs.min()), max(int(ys.min()) - 8, 12)
+                        else:
+                            lx, ly = 10, 30
+
+                    (tw, th), _ = cv2.getTextSize(
+                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+                    )
+                    cv2.rectangle(
+                        overlay,
+                        (lx, max(ly - th - 6, 0)),
+                        (lx + tw + 6, ly + 4),
+                        color,
+                        -1,
+                    )
+                    cv2.putText(
+                        overlay,
+                        label,
+                        (lx + 3, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2,
+                    )
 
             scaled = (overlay.astype(np.uint16) * 115 >> 8).astype(np.uint8)
 
