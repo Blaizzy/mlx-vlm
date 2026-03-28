@@ -165,7 +165,7 @@ print(result.text)
 
 ## Notebook Walkthrough
 
-- [`examples/dots_mocr_demo.ipynb`](../../../examples/dots_mocr_demo.ipynb) runs the unique upstream `dots.mocr` README scenarios with MLX-VLM only, uses bundled local demo assets, and saves raw outputs, overlays, rendered SVG previews, and a contact sheet.
+- [`examples/dots_mocr_demo.ipynb`](../../../examples/dots_mocr_demo.ipynb) runs the unique upstream `dots.mocr` README scenarios with MLX-VLM only, uses bundled local demo assets, and saves raw outputs, overlays, rendered SVG previews, and a contact sheet. Invalid SVG generations fall back to a readable text overlay instead of a renderer error page.
 - The bundled source assets for that notebook live under [`examples/images`](../../../examples/images).
 - The notebook writes alias artifacts for `demo_hf_layout` and `parser_image_default` because those upstream examples reuse the same image and prompt as the main document-parsing run.
 - SVG preview rendering in the notebook uses macOS `qlmanage`.
