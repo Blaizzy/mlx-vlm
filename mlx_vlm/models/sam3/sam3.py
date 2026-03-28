@@ -275,7 +275,10 @@ class Model(nn.Module):
         Pass inputs_embeds (from get_input_embeddings) to skip text encoding.
         """
         return self.detector_model(
-            pixel_values, input_ids, attention_mask, boxes,
+            pixel_values,
+            input_ids,
+            attention_mask,
+            boxes,
             inputs_embeds=inputs_embeds,
         )
 
@@ -289,7 +292,9 @@ class Model(nn.Module):
         Returns:
             (inputs_embeds, attention_mask) tuple for passing to detect().
         """
-        inputs_embeds = self.detector_model.get_input_embeddings(input_ids, attention_mask)
+        inputs_embeds = self.detector_model.get_input_embeddings(
+            input_ids, attention_mask
+        )
         mx.eval(inputs_embeds)
         return inputs_embeds, attention_mask
 

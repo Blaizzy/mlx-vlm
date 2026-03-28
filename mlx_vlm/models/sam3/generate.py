@@ -63,7 +63,9 @@ class Sam3Predictor:
             text_inputs = self.processor.preprocess_text(text_prompt)
             input_ids = mx.array(text_inputs["input_ids"])
             attention_mask = mx.array(text_inputs["attention_mask"])
-            inputs_embeds, attention_mask = self.model.get_input_embeddings(input_ids, attention_mask)
+            inputs_embeds, attention_mask = self.model.get_input_embeddings(
+                input_ids, attention_mask
+            )
             self._text_cache[text_prompt] = (inputs_embeds, attention_mask)
         return self._text_cache[text_prompt]
 
@@ -372,7 +374,9 @@ class Sam3VideoPredictor:
             inputs_embeds, attention_mask = self._text_cache[text]
 
             outputs = self.model.detect(
-                pixel_values, attention_mask=attention_mask, inputs_embeds=inputs_embeds,
+                pixel_values,
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
             )
             mx.eval(outputs)
 

@@ -4360,6 +4360,7 @@ class TestPhi4MM(unittest.TestCase):
         # Should not raise even with modality flags set
         model.set_modality(has_image=True, has_audio=True)
 
+
 class TestSam3(unittest.TestCase):
 
     # ─── SAM3 Tests ────────────────────────────────────────────
@@ -4370,7 +4371,9 @@ class TestSam3(unittest.TestCase):
 
         config = sam3.ModelConfig()
         self.assertEqual(config.model_type, "sam3_video")
-        self.assertEqual(config.detector_config.vision_config.backbone_config.hidden_size, 1024)
+        self.assertEqual(
+            config.detector_config.vision_config.backbone_config.hidden_size, 1024
+        )
         self.assertEqual(config.detector_config.text_config.hidden_size, 1024)
         self.assertEqual(config.detector_config.detr_encoder_config.num_layers, 6)
         self.assertEqual(config.detector_config.detr_decoder_config.num_queries, 200)
@@ -4432,7 +4435,9 @@ class TestSam3(unittest.TestCase):
         from mlx_vlm.models.sam3.config import DETREncoderConfig
         from mlx_vlm.models.sam3.encoder import DETREncoder
 
-        cfg = DETREncoderConfig(hidden_size=64, num_layers=2, num_attention_heads=2, intermediate_size=128)
+        cfg = DETREncoderConfig(
+            hidden_size=64, num_layers=2, num_attention_heads=2, intermediate_size=128
+        )
         encoder = DETREncoder(cfg)
 
         src = mx.random.normal((1, 16, 64))
@@ -4461,9 +4466,9 @@ class TestSam3(unittest.TestCase):
         pos = mx.random.normal((1, 16, 64))
 
         hs, boxes, presence = decoder(memory, text, pos, spatial_shape=(4, 4))
-        self.assertEqual(hs.shape, (2, 1, 10, 64))      # (L, B, Q, D)
-        self.assertEqual(boxes.shape, (2, 1, 10, 4))     # (L, B, Q, 4)
-        self.assertEqual(presence.shape, (2, 1, 1))       # (L, B, 1)
+        self.assertEqual(hs.shape, (2, 1, 10, 64))  # (L, B, Q, D)
+        self.assertEqual(boxes.shape, (2, 1, 10, 4))  # (L, B, Q, 4)
+        self.assertEqual(presence.shape, (2, 1, 1))  # (L, B, 1)
 
     def test_sam3_dot_product_scoring(self):
         """DotProductScoring with scale and clamp."""
@@ -4535,17 +4540,27 @@ class TestSam3(unittest.TestCase):
                     projection_dim=32,
                 ),
                 detr_encoder_config=sam3.DETREncoderConfig(
-                    hidden_size=32, num_layers=1, num_attention_heads=2, intermediate_size=64,
+                    hidden_size=32,
+                    num_layers=1,
+                    num_attention_heads=2,
+                    intermediate_size=64,
                 ),
                 detr_decoder_config=sam3.DETRDecoderConfig(
-                    hidden_size=32, num_layers=1, num_attention_heads=2,
-                    num_queries=10, intermediate_size=64,
+                    hidden_size=32,
+                    num_layers=1,
+                    num_attention_heads=2,
+                    num_queries=10,
+                    intermediate_size=64,
                 ),
                 geometry_encoder_config=sam3.GeometryEncoderConfig(
-                    hidden_size=32, num_layers=1, num_attention_heads=2, intermediate_size=64,
+                    hidden_size=32,
+                    num_layers=1,
+                    num_attention_heads=2,
+                    intermediate_size=64,
                 ),
                 mask_decoder_config=sam3.DetectorMaskDecoderConfig(
-                    hidden_size=32, num_upsampling_stages=3,
+                    hidden_size=32,
+                    num_upsampling_stages=3,
                 ),
             ),
         )
@@ -4571,22 +4586,34 @@ class TestSam3(unittest.TestCase):
         from mlx_vlm.models.sam3.sam3 import Model
 
         weights = {
-            "detector_model.vision_encoder.backbone.embeddings.patch_embeddings.projection.weight": mx.zeros((64, 3, 14, 14)),
-            "detector_model.vision_encoder.neck.fpn_layers.0.scale_layers.0.weight": mx.zeros((128, 64, 2, 2)),
-            "tracker_model.memory_temporal_positional_encoding": mx.zeros((7, 1, 1, 32)),
-            "detector_model.detr_encoder.layers.0.self_attn.q_proj.weight": mx.zeros((64, 64)),
+            "detector_model.vision_encoder.backbone.embeddings.patch_embeddings.projection.weight": mx.zeros(
+                (64, 3, 14, 14)
+            ),
+            "detector_model.vision_encoder.neck.fpn_layers.0.scale_layers.0.weight": mx.zeros(
+                (128, 64, 2, 2)
+            ),
+            "tracker_model.memory_temporal_positional_encoding": mx.zeros(
+                (7, 1, 1, 32)
+            ),
+            "detector_model.detr_encoder.layers.0.self_attn.q_proj.weight": mx.zeros(
+                (64, 64)
+            ),
         }
 
         sanitized = Model.sanitize(weights)
 
         # Conv2d: (out, in, H, W) -> (out, H, W, in)
         self.assertEqual(
-            sanitized["detector_model.vision_encoder.backbone.embeddings.patch_embeddings.projection.weight"].shape,
+            sanitized[
+                "detector_model.vision_encoder.backbone.embeddings.patch_embeddings.projection.weight"
+            ].shape,
             (64, 14, 14, 3),
         )
         # ConvTranspose2d: (in, out, H, W) -> (out, H, W, in)
         self.assertEqual(
-            sanitized["detector_model.vision_encoder.neck.fpn_layers.0.scale_layers.0.weight"].shape,
+            sanitized[
+                "detector_model.vision_encoder.neck.fpn_layers.0.scale_layers.0.weight"
+            ].shape,
             (64, 2, 2, 128),
         )
         # Non-conv 4D param: unchanged
@@ -4596,7 +4623,9 @@ class TestSam3(unittest.TestCase):
         )
         # 2D weight: unchanged
         self.assertEqual(
-            sanitized["detector_model.detr_encoder.layers.0.self_attn.q_proj.weight"].shape,
+            sanitized[
+                "detector_model.detr_encoder.layers.0.self_attn.q_proj.weight"
+            ].shape,
             (64, 64),
         )
 
@@ -4609,21 +4638,53 @@ class TestSam3(unittest.TestCase):
                 self.weight = mx.zeros(shape)
 
         # Should quantize: large linear in DETR
-        self.assertTrue(Model.quant_predicate("detector_model.detr_encoder.layers.0.self_attn.q_proj", FakeModule((256, 256))))
+        self.assertTrue(
+            Model.quant_predicate(
+                "detector_model.detr_encoder.layers.0.self_attn.q_proj",
+                FakeModule((256, 256)),
+            )
+        )
         # Should skip: conv layers
-        self.assertFalse(Model.quant_predicate("detector_model.vision_encoder.neck.fpn_layers.0.proj1", FakeModule((256, 256))))
+        self.assertFalse(
+            Model.quant_predicate(
+                "detector_model.vision_encoder.neck.fpn_layers.0.proj1",
+                FakeModule((256, 256)),
+            )
+        )
         # Should skip: small embedding
-        self.assertFalse(Model.quant_predicate("detector_model.detr_decoder.query_embed", FakeModule((200, 256))))
+        self.assertFalse(
+            Model.quant_predicate(
+                "detector_model.detr_decoder.query_embed", FakeModule((200, 256))
+            )
+        )
         # Should quantize: vision encoder linear (not skipped for better compression)
-        self.assertTrue(Model.quant_predicate("detector_model.vision_encoder.backbone.layers.0.attention.q_proj", FakeModule((1024, 1024))))
+        self.assertTrue(
+            Model.quant_predicate(
+                "detector_model.vision_encoder.backbone.layers.0.attention.q_proj",
+                FakeModule((1024, 1024)),
+            )
+        )
         # Should skip: patch_embeddings (conv)
-        self.assertFalse(Model.quant_predicate("detector_model.vision_encoder.backbone.embeddings.patch_embeddings.projection", FakeModule((1024, 1024))))
+        self.assertFalse(
+            Model.quant_predicate(
+                "detector_model.vision_encoder.backbone.embeddings.patch_embeddings.projection",
+                FakeModule((1024, 1024)),
+            )
+        )
         # Should skip: odd dimension
-        self.assertFalse(Model.quant_predicate("detector_model.geometry_encoder.boxes_pos_enc_project", FakeModule((256, 258))))
+        self.assertFalse(
+            Model.quant_predicate(
+                "detector_model.geometry_encoder.boxes_pos_enc_project",
+                FakeModule((256, 258)),
+            )
+        )
 
     def test_sam3_position_encoding(self):
         """Sinusoidal position encoding and 2D RoPE produce correct shapes."""
-        from mlx_vlm.models.sam3.position import PositionEmbeddingSine, compute_axial_cis
+        from mlx_vlm.models.sam3.position import (
+            PositionEmbeddingSine,
+            compute_axial_cis,
+        )
 
         pos_enc = PositionEmbeddingSine(num_pos_feats=32)
         x = mx.random.normal((1, 8, 8, 64))
