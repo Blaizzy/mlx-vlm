@@ -21,7 +21,7 @@ image = Image.open("photo.jpg")
 predictor = Sam3Predictor(model, processor, score_threshold=0.3)
 ```
 
-### Object Detection
+## Image: Object Detection
 
 Detect objects by text prompt — returns bounding boxes and confidence scores:
 
@@ -33,9 +33,9 @@ for i in range(len(result.scores)):
     print(f"[{result.scores[i]:.2f}] box=({x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f})")
 ```
 
-### Instance Segmentation
+## Image: Instance Segmentation
 
-Same call — masks are returned alongside boxes:
+Same call — per-instance masks are returned alongside boxes:
 
 ```python
 result = predictor.predict(image, text_prompt="a person")
@@ -43,15 +43,67 @@ result = predictor.predict(image, text_prompt="a person")
 # result.boxes   -> (N, 4) xyxy bounding boxes, scaled to image size
 # result.masks   -> (N, H, W) binary segmentation masks
 # result.scores  -> (N,) confidence scores
-
-# Overlay mask on image
-import numpy as np
-mask = result.masks[0]  # first detection
-overlay = np.array(image).copy()
-overlay[mask > 0] = overlay[mask > 0] * 0.5 + np.array([255, 0, 0]) * 0.5
 ```
 
-### Video Tracking (CLI)
+### Overlay Masks on Image
+
+```python
+import numpy as np
+
+result = predictor.predict(image, text_prompt="a cat")
+
+overlay = np.array(image).copy()
+colors = [(30, 120, 255), (255, 80, 30), (30, 200, 30)]
+
+W, H = image.size
+for i in range(len(result.scores)):
+    mask = result.masks[i]
+    if mask.shape != (H, W):
+        mask = np.array(Image.fromarray(mask.astype(np.float32)).resize((W, H)))
+    binary = mask > 0
+    color = np.array(colors[i % len(colors)])
+    overlay[binary] = (overlay[binary] * 0.5 + color * 0.5).astype(np.uint8)
+
+Image.fromarray(overlay).save("segmentation_output.png")
+```
+
+## Image: Box-Guided Detection
+
+Pass bounding box prompts to guide detection to specific regions:
+
+```python
+import numpy as np
+
+# Box covering a region of interest in xyxy pixel coordinates
+boxes = np.array([[100, 50, 400, 350]])
+result = predictor.predict(image, text_prompt="a cat", boxes=boxes)
+```
+
+## Image: Semantic Segmentation
+
+Access the dense semantic segmentation output alongside instance predictions:
+
+```python
+import mlx.core as mx
+
+inputs = processor.preprocess_image(image)
+text_inputs = processor.preprocess_text("a cat")
+
+outputs = model.detect(
+    mx.array(inputs["pixel_values"]),
+    mx.array(text_inputs["input_ids"]),
+    mx.array(text_inputs["attention_mask"]),
+)
+mx.eval(outputs)
+
+# Instance masks: (B, 200, 288, 288)
+pred_masks = outputs["pred_masks"]
+
+# Semantic segmentation: (B, 1, 288, 288)
+semantic_seg = outputs["semantic_seg"]
+```
+
+## Video: Tracking (CLI)
 
 Track objects in a video from the command line:
 
@@ -81,7 +133,7 @@ python -m mlx_vlm.models.sam3.track_video \
 | `--every` | `2` | Run detection every N frames |
 | `--nms-thresh` | `0.5` | NMS IoU threshold |
 
-### Video Tracking (Python)
+## Video: Tracking (Python)
 
 ```python
 import cv2
