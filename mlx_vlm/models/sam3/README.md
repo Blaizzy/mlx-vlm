@@ -346,3 +346,14 @@ mlx_vlm/models/sam3/
 ├── generate.py           # Inference pipeline (Sam3Predictor, Sam3VideoPredictor)
 └── processing_sam3.py    # Image/text preprocessing
 ```
+
+## License
+
+The original SAM3 model weights are released by Meta under the [**SAM License**](https://huggingface.co/facebook/sam3/blob/main/LICENSE), a custom permissive license that grants a non-exclusive, worldwide, royalty-free license to use, reproduce, distribute, and modify the SAM Materials. Key points:
+
+- Commercial and research use is permitted
+- Derivative works must include a copy of the SAM License and attribution to Meta
+- Provided "AS IS" without warranty
+- Subject to applicable trade controls
+
+By using it, you agree to the terms of Meta's SAM License. See the [full license text](https://huggingface.co/facebook/sam3/blob/main/LICENSE) for details.
