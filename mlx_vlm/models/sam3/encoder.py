@@ -181,4 +181,5 @@ class DETREncoder(nn.Module):
         output = src
         for layer in self.layers:
             output = layer(output, pos, text_memory, text_mask)
+            mx.eval(output)
         return output

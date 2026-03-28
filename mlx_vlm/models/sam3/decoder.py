@@ -317,6 +317,8 @@ class DETRDecoder(nn.Module):
             )
             intermediate_presence.append(pres_logit)
 
+            mx.eval(hidden_states, reference_boxes)
+
         return (
             mx.stack(intermediate_hs),  # (L, B, Q, D)
             mx.stack(intermediate_boxes),  # (L, B, Q, 4)
