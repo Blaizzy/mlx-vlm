@@ -1,6 +1,7 @@
 """Tests for custom processor implementations."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -314,15 +315,21 @@ class TestDotsVLProcessor(unittest.TestCase):
                 '{"chat_template": "{{ messages[0].content }}"}'
             )
 
+            tokenizer_from_pretrained = lambda *args, **kwargs: _mock_tokenizer()
+            image_from_pretrained = unittest.mock.Mock(return_value=_mock_ip())
+
             with (
-                patch(
-                    "transformers.AutoTokenizer.from_pretrained",
-                    return_value=_mock_tokenizer(),
+                patch.dict(
+                    "transformers.__dict__",
+                    {
+                        "AutoTokenizer": SimpleNamespace(
+                            from_pretrained=tokenizer_from_pretrained
+                        ),
+                        "AutoImageProcessor": SimpleNamespace(
+                            from_pretrained=image_from_pretrained
+                        ),
+                    },
                 ),
-                patch(
-                    "transformers.AutoImageProcessor.from_pretrained",
-                    return_value=_mock_ip(),
-                ) as image_from_pretrained,
                 patch(
                     "mlx_vlm.models.dots_ocr.processing_dots_ocr.ProcessorMixin.__init__",
                     _fake_init,
