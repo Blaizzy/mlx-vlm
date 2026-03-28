@@ -1285,7 +1285,7 @@ def main():
             video_path=args.video,
             prompt=args.prompt,
             model_path=args.model,
-            threshold=args.threshold if args.threshold is not None else 0.3,
+            threshold=args.threshold if args.threshold is not None else 0.5,
             nms_thresh=args.nms_thresh if args.nms_thresh != 0.5 else 0.3,
             boxes=args.boxes,
             show_boxes=args.show_boxes,
