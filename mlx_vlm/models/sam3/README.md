@@ -164,27 +164,51 @@ python -m mlx_vlm.models.sam3.generate --image photo.jpg --prompt "a cat" --boxe
 python -m mlx_vlm.models.sam3.generate --image photo.jpg --prompt "a cat" --boxes "0,50,350,480;300,20,640,375"
 ```
 
-### Video Tracking
+### Video Tracking (to file)
 
 ```bash
 python -m mlx_vlm.models.sam3.generate --task track --video input.mp4 --prompt "a car"
+
+# Track only objects in a region
+python -m mlx_vlm.models.sam3.generate --task track --video input.mp4 --prompt "a car" --boxes "200,100,1200,900"
+
+# Faster with lower resolution
+python -m mlx_vlm.models.sam3.generate --task track --video input.mp4 --prompt "a car" --resolution 336
 ```
+
+### Real-Time Tracking (live preview)
+
+Opens a window with live detection overlay. Press `q` to quit.
+
+```bash
+# Video file
+python -m mlx_vlm.models.sam3.generate --task realtime --video input.mp4 --prompt "a car" --resolution 224
+
+# Webcam
+python -m mlx_vlm.models.sam3.generate --task realtime --video 0 --prompt "a person" --resolution 224
+
+# With boxes + region filter
+python -m mlx_vlm.models.sam3.generate --task realtime --video input.mp4 --prompt "a car" --resolution 224 --show-boxes --boxes "200,100,1200,900"
+```
+
+Uses 3 threads: frame reader (paced to native FPS), inference (~11 FPS at 224x224), and display. Detection updates asynchronously without blocking playback.
 
 ### All Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--task` | `segment` | `detect` (boxes), `segment` (masks), `track` (video) |
+| `--task` | `segment` | `detect`, `segment`, `track`, `realtime` |
 | `--image` | | Input image path (detect/segment) |
-| `--video` | | Input video path (track) |
+| `--video` | | Input video path or `0` for webcam (track/realtime) |
 | `--prompt` | *(required)* | Text prompt |
-| `--boxes` | | Box prompts: `"x1,y1,x2,y2"` or `"...;..."` in pixel coords |
-| `--show-boxes` | off | Overlay bounding boxes on segment/track output |
-| `--output` | auto-named | Output file path |
+| `--boxes` | | Region filter: `"x1,y1,x2,y2"` or `"...;..."` in pixel coords |
+| `--show-boxes` | off | Overlay bounding boxes and labels |
+| `--output` | auto-named | Output file path (track only) |
 | `--model` | `facebook/sam3` | Model path or HF repo |
 | `--threshold` | 0.3 / 0.15 | Score threshold (image / video default) |
 | `--nms-thresh` | `0.5` | NMS IoU threshold |
 | `--every` | `2` | Detect every N frames (track only) |
+| `--resolution` | `1008` | Input resolution. Lower = faster: `336` (~8 FPS), `224` (~11 FPS) |
 
 ## Video: Tracking (Python)
 

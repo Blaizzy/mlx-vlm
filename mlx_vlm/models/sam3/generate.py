@@ -883,24 +883,63 @@ def track_video_realtime(
     print(f'Prompt: "{prompt}", threshold {threshold}, resolution {resolution}x{resolution}')
     print("Press 'q' to quit")
 
-    # Shared state between threads
+    import collections
+    import queue
+
+    frame_buffer = queue.Queue(maxsize=10)
+
+    # Shared state
     lock = threading.Lock()
     latest = {
-        "overlay": None,  # pre-rendered BGRA overlay (H, W, 4), reused every frame
+        "overlay_scaled": np.zeros((H, W, 3), dtype=np.uint8),
+        "has_detections": False,
         "n_obj": 0,
         "fps": 0.0,
     }
     pending_frame = {"pil": None}
     running = {"active": True}
 
+    # --- Thread 1: Read frames into ring buffer ---
+    is_camera = str(video_path).isdigit()
+    frame_interval = 1.0 / fps if not is_camera else 0
+
+    def reader_loop():
+        next_frame_time = time.perf_counter()
+        while running["active"]:
+            # Pace to native FPS for video files, read ASAP for camera
+            if not is_camera:
+                now = time.perf_counter()
+                if now < next_frame_time:
+                    time.sleep(max(0, next_frame_time - now - 0.001))
+                    continue
+
+            ret, frame = cap.read()
+            if not ret:
+                if is_camera:
+                    continue  # camera drop, retry
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                next_frame_time = time.perf_counter()
+                continue
+
+            # For camera: drop oldest to always show latest frame
+            if frame_buffer.full():
+                try:
+                    frame_buffer.get_nowait()
+                except queue.Empty:
+                    pass
+            frame_buffer.put(frame)
+
+            if not is_camera:
+                next_frame_time += frame_interval
+
+    # --- Thread 2: Run inference on latest frame ---
     def inference_loop():
-        """Background thread: runs detection and pre-renders the overlay."""
         while running["active"]:
             with lock:
                 frame_pil = pending_frame["pil"]
 
             if frame_pil is None:
-                time.sleep(0.01)
+                time.sleep(0.005)
                 continue
 
             t0 = time.perf_counter()
@@ -912,89 +951,101 @@ def track_video_realtime(
                 if box_array is not None:
                     result = _filter_by_regions(result, box_array)
 
-            # Pre-render overlay (BGRA with alpha) so the display loop
-            # just does a single alpha-blend instead of per-mask work
-            overlay = np.zeros((H, W, 4), dtype=np.uint8)
-            for i in range(len(result.scores)):
-                color = COLORS_BGR[i % len(COLORS_BGR)]
-                mask = result.masks[i]
-                if mask.shape[0] != H or mask.shape[1] != W:
-                    mask = cv2.resize(
-                        mask.astype(np.float32), (W, H),
-                        interpolation=cv2.INTER_NEAREST,
+            # Pre-render overlay once per detection
+            overlay = np.zeros((H, W, 3), dtype=np.uint8)
+            if len(result.scores) > 0:
+                for i in range(len(result.scores)):
+                    color = COLORS_BGR[i % len(COLORS_BGR)]
+                    mask = result.masks[i]
+                    if mask.shape[0] != H or mask.shape[1] != W:
+                        mask = cv2.resize(
+                            mask.astype(np.float32), (W, H),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                    binary = mask > 0
+                    for c in range(3):
+                        overlay[:, :, c] = np.where(
+                            binary, color[c], overlay[:, :, c]
+                        )
+                    contours, _ = cv2.findContours(
+                        binary.astype(np.uint8),
+                        cv2.RETR_EXTERNAL,
+                        cv2.CHAIN_APPROX_SIMPLE,
                     )
-                binary = mask > 0
-                for c in range(3):
-                    overlay[:, :, c] = np.where(
-                        binary,
-                        np.maximum(overlay[:, :, c], int(color[c])),
-                        overlay[:, :, c],
-                    )
-                overlay[:, :, 3] = np.where(binary, 128, overlay[:, :, 3])
+                    cv2.drawContours(overlay, contours, -1, color, 2)
 
-                if show_boxes:
-                    x1, y1, x2, y2 = result.boxes[i].astype(int)
-                    cv2.rectangle(overlay, (x1, y1), (x2, y2), (*color, 255), 2)
-                    label = f"{prompt} {result.scores[i]:.2f}"
-                    (tw, th), _ = cv2.getTextSize(
-                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
-                    )
-                    cv2.rectangle(
-                        overlay,
-                        (x1, max(y1 - th - 10, 0)),
-                        (x1 + tw + 6, max(y1, th + 10)),
-                        (*color, 255),
-                        -1,
-                    )
-                    cv2.putText(
-                        overlay, label,
-                        (x1 + 3, max(y1 - 4, th + 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255, 255), 2,
-                    )
+                    if show_boxes:
+                        x1, y1, x2, y2 = result.boxes[i].astype(int)
+                        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+                        label = f"{prompt} {result.scores[i]:.2f}"
+                        (tw, th), _ = cv2.getTextSize(
+                            label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
+                        )
+                        cv2.rectangle(
+                            overlay,
+                            (x1, max(y1 - th - 10, 0)),
+                            (x1 + tw + 6, max(y1, th + 10)),
+                            color, -1,
+                        )
+                        cv2.putText(
+                            overlay, label,
+                            (x1 + 3, max(y1 - 4, th + 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
+                        )
+
+            scaled = (overlay.astype(np.uint16) * 115 >> 8).astype(np.uint8)
 
             with lock:
-                latest["overlay"] = overlay
+                latest["overlay_scaled"] = scaled
+                latest["has_detections"] = len(result.scores) > 0
                 latest["n_obj"] = len(result.scores)
                 latest["fps"] = 1.0 / max(dt, 1e-6)
                 pending_frame["pil"] = None
 
-    # Start inference thread
-    thread = threading.Thread(target=inference_loop, daemon=True)
-    thread.start()
+    # Start threads
+    reader_thread = threading.Thread(target=reader_loop, daemon=True)
+    inference_thread = threading.Thread(target=inference_loop, daemon=True)
+    reader_thread.start()
+    inference_thread.start()
 
-    frame_delay = max(1, int(1000 / fps))
+    display_fps_counter = 0
+    display_fps_t0 = time.perf_counter()
+    display_fps_val = 0.0
 
     while True:
-        ret, frame_bgr = cap.read()
-        if not ret:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        # Get frame from buffer (non-blocking)
+        try:
+            frame_bgr = frame_buffer.get(timeout=0.05)
+        except queue.Empty:
             continue
 
-        # Submit frame for inference if idle
+        # Submit for inference if idle
         with lock:
             if pending_frame["pil"] is None:
                 pending_frame["pil"] = Image.fromarray(
                     cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 )
 
-        # Fast overlay compositing (single alpha-blend)
+        # Composite: just cv2.add (~1.5ms, no copy needed)
         with lock:
-            overlay = latest["overlay"]
+            overlay_scaled = latest["overlay_scaled"]
+            has_det = latest["has_detections"]
             det_fps = latest["fps"]
             n_obj = latest["n_obj"]
 
-        out = frame_bgr
-        if overlay is not None:
-            alpha = overlay[:, :, 3:4].astype(np.float32) / 255.0
-            bgr_overlay = overlay[:, :, :3].astype(np.float32)
-            out = (
-                frame_bgr.astype(np.float32) * (1 - alpha) + bgr_overlay * alpha
-            ).astype(np.uint8)
+        out = cv2.add(frame_bgr, overlay_scaled) if has_det else frame_bgr
 
-        # HUD
+        # Measure display FPS
+        display_fps_counter += 1
+        now = time.perf_counter()
+        if now - display_fps_t0 >= 0.5:
+            display_fps_val = display_fps_counter / (now - display_fps_t0)
+            display_fps_counter = 0
+            display_fps_t0 = now
+
         cv2.putText(
             out,
-            f"Detect: {det_fps:.1f} FPS | Display: {fps:.0f} FPS | {n_obj} obj",
+            f"Detect: {det_fps:.1f} FPS | Display: {display_fps_val:.0f} FPS | {n_obj} obj",
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
@@ -1004,7 +1055,7 @@ def track_video_realtime(
 
         cv2.imshow(f"SAM3 Tracking - \"{prompt}\"", out)
 
-        key = cv2.waitKey(frame_delay) & 0xFF
+        key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
 
