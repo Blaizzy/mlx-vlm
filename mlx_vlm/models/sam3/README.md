@@ -140,13 +140,13 @@ for i in range(len(images)):
 Track objects in a video from the command line:
 
 ```bash
-python -m mlx_vlm.models.sam3.track_video --video input.mp4 --prompt "a car"
+python -m mlx_vlm.models.sam3.generate --video input.mp4 --prompt "a car"
 ```
 
 Output saves to `input_tracked.mp4` by default. Full options:
 
 ```bash
-python -m mlx_vlm.models.sam3.track_video \
+python -m mlx_vlm.models.sam3.generate \
     --video input.mp4 \
     --prompt "a person" \
     --output output.mp4 \
@@ -299,6 +299,5 @@ mlx_vlm/models/sam3/
 ├── sam_components.py     # SAM prompt encoder, mask decoder, TwoWayTransformer
 ├── tracker.py            # Memory encoder, memory attention, tracker model
 ├── generate.py           # Inference pipeline (Sam3Predictor, Sam3VideoPredictor)
-├── track_video.py        # CLI: python -m mlx_vlm.models.sam3.track_video
 └── processing_sam3.py    # Image/text preprocessing
 ```
