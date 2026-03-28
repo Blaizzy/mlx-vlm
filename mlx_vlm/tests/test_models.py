@@ -4361,5 +4361,340 @@ class TestPhi4MM(unittest.TestCase):
         model.set_modality(has_image=True, has_audio=True)
 
 
+class TestSam3(unittest.TestCase):
+
+    # ─── SAM3 Tests ────────────────────────────────────────────
+
+    def test_sam3_config(self):
+        """Config parses the nested detector/tracker structure."""
+        from mlx_vlm.models import sam3
+
+        config = sam3.ModelConfig()
+        self.assertEqual(config.model_type, "sam3_video")
+        self.assertEqual(
+            config.detector_config.vision_config.backbone_config.hidden_size, 1024
+        )
+        self.assertEqual(config.detector_config.text_config.hidden_size, 1024)
+        self.assertEqual(config.detector_config.detr_encoder_config.num_layers, 6)
+        self.assertEqual(config.detector_config.detr_decoder_config.num_queries, 200)
+        self.assertEqual(config.tracker_config.memory_attention_num_layers, 4)
+
+    def test_sam3_vision_encoder(self):
+        """ViT backbone + FPN produce correct shapes."""
+        from mlx_vlm.models.sam3.config import VisionEncoderConfig, ViTConfig
+        from mlx_vlm.models.sam3.vision import VisionEncoder
+
+        vit_cfg = ViTConfig(
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            intermediate_size=128,
+            image_size=112,
+            patch_size=14,
+            window_size=4,
+            global_attn_indexes=[1],
+            pretrain_image_size=56,
+        )
+        vision_cfg = VisionEncoderConfig(
+            backbone_config=vit_cfg,
+            fpn_hidden_size=32,
+            scale_factors=[2.0, 1.0],
+        )
+        encoder = VisionEncoder(vision_cfg)
+
+        x = mx.random.normal((1, 112, 112, 3))
+        fpn_out = encoder(x)
+        self.assertIsInstance(fpn_out, list)
+        self.assertEqual(len(fpn_out), 2)
+        # 1x scale = 8x8 (112/14), 2x scale = 16x16
+        self.assertEqual(fpn_out[1].shape, (1, 8, 8, 32))
+        self.assertEqual(fpn_out[0].shape, (1, 16, 16, 32))
+
+    def test_sam3_text_encoder(self):
+        """CLIP text encoder produces correct shapes."""
+        from mlx_vlm.models.sam3.config import TextEncoderConfig
+        from mlx_vlm.models.sam3.text_encoder import TextEncoder
+
+        cfg = TextEncoderConfig(
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            intermediate_size=128,
+            vocab_size=100,
+            max_position_embeddings=16,
+            projection_dim=32,
+        )
+        encoder = TextEncoder(cfg, d_model=32)
+
+        input_ids = mx.array([[1, 2, 3, 4, 0, 0]])
+        out = encoder(input_ids)
+        self.assertEqual(out.shape, (1, 6, 64))
+
+    def test_sam3_detr_encoder(self):
+        """DETR encoder with text cross-attention."""
+        from mlx_vlm.models.sam3.config import DETREncoderConfig
+        from mlx_vlm.models.sam3.encoder import DETREncoder
+
+        cfg = DETREncoderConfig(
+            hidden_size=64, num_layers=2, num_attention_heads=2, intermediate_size=128
+        )
+        encoder = DETREncoder(cfg)
+
+        src = mx.random.normal((1, 16, 64))
+        pos = mx.random.normal((1, 16, 64))
+        text = mx.random.normal((1, 4, 64))
+
+        out = encoder(src, pos, text)
+        self.assertEqual(out.shape, (1, 16, 64))
+
+    def test_sam3_detr_decoder(self):
+        """DETR decoder with box refinement and presence token."""
+        from mlx_vlm.models.sam3.config import DETRDecoderConfig
+        from mlx_vlm.models.sam3.decoder import DETRDecoder
+
+        cfg = DETRDecoderConfig(
+            hidden_size=64,
+            num_layers=2,
+            num_attention_heads=2,
+            num_queries=10,
+            intermediate_size=128,
+        )
+        decoder = DETRDecoder(cfg)
+
+        memory = mx.random.normal((1, 16, 64))
+        text = mx.random.normal((1, 4, 64))
+        pos = mx.random.normal((1, 16, 64))
+
+        hs, boxes, presence = decoder(memory, text, pos, spatial_shape=(4, 4))
+        self.assertEqual(hs.shape, (2, 1, 10, 64))  # (L, B, Q, D)
+        self.assertEqual(boxes.shape, (2, 1, 10, 4))  # (L, B, Q, 4)
+        self.assertEqual(presence.shape, (2, 1, 1))  # (L, B, 1)
+
+    def test_sam3_dot_product_scoring(self):
+        """DotProductScoring with scale and clamp."""
+        from mlx_vlm.models.sam3.segmentation import DotProductScoring
+
+        scorer = DotProductScoring(64)
+        hs = mx.random.normal((2, 1, 10, 64))  # (L, B, Q, D)
+        text = mx.random.normal((1, 4, 64))
+        mask = mx.array([[1, 1, 1, 0]])
+
+        scores = scorer(hs, text, mask)
+        self.assertEqual(scores.shape, (2, 1, 10, 1))
+        # Scores should be clamped to [-12, 12]
+        scores_np = scores.tolist()
+        for layer in scores_np:
+            for batch in layer:
+                for query in batch:
+                    for val in query:
+                        self.assertGreaterEqual(val, -12.0)
+                        self.assertLessEqual(val, 12.0)
+
+    def test_sam3_mask_decoder(self):
+        """Mask decoder produces correct mask resolution."""
+        from mlx_vlm.models.sam3.config import DetectorMaskDecoderConfig
+        from mlx_vlm.models.sam3.segmentation import MaskDecoder
+
+        cfg = DetectorMaskDecoderConfig(hidden_size=32, num_upsampling_stages=2)
+        decoder = MaskDecoder(cfg)
+
+        queries = mx.random.normal((1, 10, 32))
+        # 2 FPN levels: 8x8, 4x4
+        features = [mx.random.normal((1, 8, 8, 32)), mx.random.normal((1, 4, 4, 32))]
+        encoder_hs = mx.random.normal((1, 16, 32))
+
+        out = decoder(queries, features, encoder_hidden_states=encoder_hs)
+        self.assertIn("pred_masks", out)
+        self.assertIn("semantic_seg", out)
+        self.assertEqual(out["pred_masks"].shape[0], 1)
+        self.assertEqual(out["pred_masks"].shape[1], 10)
+
+    def test_sam3_full_model(self):
+        """Full SAM3 model instantiation and forward pass."""
+        from mlx_vlm.models import sam3
+
+        config = sam3.ModelConfig(
+            detector_config=sam3.DetectorConfig(
+                vision_config=sam3.VisionEncoderConfig(
+                    backbone_config=sam3.ViTConfig(
+                        hidden_size=64,
+                        num_hidden_layers=2,
+                        num_attention_heads=2,
+                        intermediate_size=128,
+                        image_size=112,
+                        patch_size=14,
+                        window_size=4,
+                        global_attn_indexes=[1],
+                        pretrain_image_size=56,
+                    ),
+                    fpn_hidden_size=32,
+                    scale_factors=[4.0, 2.0, 1.0, 0.5],
+                ),
+                text_config=sam3.TextEncoderConfig(
+                    hidden_size=64,
+                    num_hidden_layers=2,
+                    num_attention_heads=2,
+                    intermediate_size=128,
+                    vocab_size=100,
+                    max_position_embeddings=16,
+                    projection_dim=32,
+                ),
+                detr_encoder_config=sam3.DETREncoderConfig(
+                    hidden_size=32,
+                    num_layers=1,
+                    num_attention_heads=2,
+                    intermediate_size=64,
+                ),
+                detr_decoder_config=sam3.DETRDecoderConfig(
+                    hidden_size=32,
+                    num_layers=1,
+                    num_attention_heads=2,
+                    num_queries=10,
+                    intermediate_size=64,
+                ),
+                geometry_encoder_config=sam3.GeometryEncoderConfig(
+                    hidden_size=32,
+                    num_layers=1,
+                    num_attention_heads=2,
+                    intermediate_size=64,
+                ),
+                mask_decoder_config=sam3.DetectorMaskDecoderConfig(
+                    hidden_size=32,
+                    num_upsampling_stages=3,
+                ),
+            ),
+        )
+
+        model = sam3.Model(config)
+
+        pixel_values = mx.random.normal((1, 112, 112, 3))
+        input_ids = mx.array([[1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]])
+        attention_mask = mx.array([[1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]])
+
+        outputs = model.detect(pixel_values, input_ids, attention_mask)
+        mx.eval(outputs)
+
+        self.assertIn("pred_logits", outputs)
+        self.assertIn("pred_boxes", outputs)
+        self.assertIn("pred_masks", outputs)
+        self.assertIn("presence_logits", outputs)
+        self.assertEqual(outputs["pred_logits"].shape, (1, 10))
+        self.assertEqual(outputs["pred_boxes"].shape, (1, 10, 4))
+
+    def test_sam3_sanitize(self):
+        """Sanitize transposes conv weights correctly."""
+        from mlx_vlm.models.sam3.sam3 import Model
+
+        weights = {
+            "detector_model.vision_encoder.backbone.embeddings.patch_embeddings.projection.weight": mx.zeros(
+                (64, 3, 14, 14)
+            ),
+            "detector_model.vision_encoder.neck.fpn_layers.0.scale_layers.0.weight": mx.zeros(
+                (128, 64, 2, 2)
+            ),
+            "tracker_model.memory_temporal_positional_encoding": mx.zeros(
+                (7, 1, 1, 32)
+            ),
+            "detector_model.detr_encoder.layers.0.self_attn.q_proj.weight": mx.zeros(
+                (64, 64)
+            ),
+        }
+
+        sanitized = Model.sanitize(weights)
+
+        # Conv2d: (out, in, H, W) -> (out, H, W, in)
+        self.assertEqual(
+            sanitized[
+                "detector_model.vision_encoder.backbone.embeddings.patch_embeddings.projection.weight"
+            ].shape,
+            (64, 14, 14, 3),
+        )
+        # ConvTranspose2d: (in, out, H, W) -> (out, H, W, in)
+        self.assertEqual(
+            sanitized[
+                "detector_model.vision_encoder.neck.fpn_layers.0.scale_layers.0.weight"
+            ].shape,
+            (64, 2, 2, 128),
+        )
+        # Non-conv 4D param: unchanged
+        self.assertEqual(
+            sanitized["tracker_model.memory_temporal_positional_encoding"].shape,
+            (7, 1, 1, 32),
+        )
+        # 2D weight: unchanged
+        self.assertEqual(
+            sanitized[
+                "detector_model.detr_encoder.layers.0.self_attn.q_proj.weight"
+            ].shape,
+            (64, 64),
+        )
+
+    def test_sam3_quant_predicate(self):
+        """quant_predicate skips convs, small embeddings, and odd dimensions."""
+        from mlx_vlm.models.sam3.sam3 import Model
+
+        class FakeModule:
+            def __init__(self, shape):
+                self.weight = mx.zeros(shape)
+
+        # Should quantize: large linear in DETR
+        self.assertTrue(
+            Model.quant_predicate(
+                "detector_model.detr_encoder.layers.0.self_attn.q_proj",
+                FakeModule((256, 256)),
+            )
+        )
+        # Should skip: conv layers
+        self.assertFalse(
+            Model.quant_predicate(
+                "detector_model.vision_encoder.neck.fpn_layers.0.proj1",
+                FakeModule((256, 256)),
+            )
+        )
+        # Should skip: small embedding
+        self.assertFalse(
+            Model.quant_predicate(
+                "detector_model.detr_decoder.query_embed", FakeModule((200, 256))
+            )
+        )
+        # Should quantize: vision encoder linear (not skipped for better compression)
+        self.assertTrue(
+            Model.quant_predicate(
+                "detector_model.vision_encoder.backbone.layers.0.attention.q_proj",
+                FakeModule((1024, 1024)),
+            )
+        )
+        # Should skip: patch_embeddings (conv)
+        self.assertFalse(
+            Model.quant_predicate(
+                "detector_model.vision_encoder.backbone.embeddings.patch_embeddings.projection",
+                FakeModule((1024, 1024)),
+            )
+        )
+        # Should skip: odd dimension
+        self.assertFalse(
+            Model.quant_predicate(
+                "detector_model.geometry_encoder.boxes_pos_enc_project",
+                FakeModule((256, 258)),
+            )
+        )
+
+    def test_sam3_position_encoding(self):
+        """Sinusoidal position encoding and 2D RoPE produce correct shapes."""
+        from mlx_vlm.models.sam3.position import (
+            PositionEmbeddingSine,
+            compute_axial_cis,
+        )
+
+        pos_enc = PositionEmbeddingSine(num_pos_feats=32)
+        x = mx.random.normal((1, 8, 8, 64))
+        pos = pos_enc(x)
+        self.assertEqual(pos.shape, (1, 8, 8, 64))
+
+        cos, sin = compute_axial_cis(64, 8, 8)
+        self.assertEqual(cos.shape, (64, 64))
+        self.assertEqual(sin.shape, (64, 64))
+
+
 if __name__ == "__main__":
     unittest.main()
