@@ -48,6 +48,19 @@ def _num_image_tokens_from_patch_grid(
     return (padded_rows // downsample_factor) * (padded_cols // downsample_factor)
 
 
+def _normalize_image_layout_axis(values, num_images: int) -> list[int]:
+    """Normalize scalar or array-like row/col metadata to a per-image list."""
+    if isinstance(values, np.ndarray):
+        if values.ndim == 0:
+            return [int(values.item())] * max(1, num_images)
+        return [int(v) for v in values.tolist()]
+
+    if np.isscalar(values):
+        return [int(values)] * max(1, num_images)
+
+    return [int(v) for v in values]
+
+
 # Try to import the slow image processor to force its use
 try:
     from transformers.models.siglip2.image_processing_siglip2 import (
@@ -365,6 +378,8 @@ def _patched_call(self, images=None, text=None, **kwargs):
     for sample_text, sample_images, rows, cols, _sizes in zip(
         text, batched_images, image_rows, image_cols, image_sizes
     ):
+        rows = _normalize_image_layout_axis(rows, len(sample_images))
+        cols = _normalize_image_layout_axis(cols, len(sample_images))
         split_sample = sample_text.split(self.image_token)
         result = ""
         for i, _ in enumerate(sample_images):

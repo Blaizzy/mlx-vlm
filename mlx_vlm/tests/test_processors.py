@@ -802,6 +802,51 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertEqual(_num_image_tokens_from_patch_grid(1, 1, 2), 1)
         self.assertEqual(_num_image_tokens_from_patch_grid(7, 9, 4), 6)
 
+    def test_scalar_image_rows_and_cols_are_supported(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import _patched_call
+
+        class DummyImageProcessor:
+            def __init__(self):
+                self.patch_size = 16
+                self.downsample_factor = 2
+                self.tile_size = 512
+                self.max_image_tokens = 256
+                self.min_image_tokens = 64
+                self.encoder_patch_size = 16
+                self.do_image_splitting = False
+                self.use_thumbnail = False
+
+            def fetch_images(self, images):
+                return [images]
+
+            def __call__(self, images, **kwargs):
+                return {
+                    "pixel_values": np.zeros((1, 16, 768), dtype=np.float32),
+                    "image_rows": np.array([np.int64(1)]),
+                    "image_cols": np.array([np.int64(1)]),
+                    "image_sizes": [[416, 576]],
+                }
+
+        processor = type("DummyProcessor", (), {})()
+        processor.image_processor = DummyImageProcessor()
+        processor.tokenizer = _mock_tokenizer(image_token="<image>")
+        processor.image_token = "<image>"
+        processor.image_start_token = "<|image_start|>"
+        processor.image_end_token = "<|image_end|>"
+        processor._merge_kwargs = lambda *args, **kwargs: {
+            "text_kwargs": {},
+            "images_kwargs": {},
+        }
+
+        result = _patched_call(
+            processor,
+            images=_make_image(),
+            text="<image>Describe this image",
+        )
+
+        self.assertIn("input_ids", result)
+        self.assertIn("attention_mask", result)
+
     def test_from_pretrained_uses_slow_image_processor(self):
         import json
         import tempfile
