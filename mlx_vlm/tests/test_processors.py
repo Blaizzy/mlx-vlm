@@ -702,7 +702,7 @@ class TestMistral3Processor(_ProcessorTestBase, unittest.TestCase):
                     return_value=_mock_tokenizer(),
                 ),
                 patch(
-                    "transformers.AutoImageProcessor.from_pretrained",
+                    "mlx_vlm.models.mistral3.processing_mistral3._load_mistral3_image_processor",
                     return_value=DummyImageProcessor(),
                 ),
                 patch.object(Mistral3Processor, "__init__", _fake_init),

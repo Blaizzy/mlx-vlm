@@ -23,6 +23,22 @@ def is_image_or_image_url(elem):
     return is_url(elem) or is_valid_image(elem)
 
 
+def _load_mistral3_image_processor(pretrained_model_name_or_path, **kwargs):
+    from transformers import AutoImageProcessor
+
+    try:
+        return AutoImageProcessor.from_pretrained(
+            pretrained_model_name_or_path,
+            use_fast=False,
+            **kwargs,
+        )
+    except ValueError:
+        return AutoImageProcessor.from_pretrained(
+            pretrained_model_name_or_path,
+            **kwargs,
+        )
+
+
 class Mistral3Processor(ProcessorMixin):
     """Mistral3 processor, based on PixtralProcessor."""
 
@@ -165,7 +181,7 @@ class Mistral3Processor(ProcessorMixin):
         from pathlib import Path
 
         from huggingface_hub import hf_hub_download
-        from transformers import AutoImageProcessor, AutoTokenizer
+        from transformers import AutoTokenizer
 
         kwargs.pop("use_fast", None)
         model_path = Path(pretrained_model_name_or_path)
@@ -218,17 +234,10 @@ class Mistral3Processor(ProcessorMixin):
         if spatial_merge_size is not None:
             proc_kwargs["spatial_merge_size"] = spatial_merge_size
 
-        try:
-            image_processor = AutoImageProcessor.from_pretrained(
-                resolved_model_path,
-                use_fast=False,
-                **kwargs,
-            )
-        except ValueError:
-            image_processor = AutoImageProcessor.from_pretrained(
-                resolved_model_path,
-                **kwargs,
-            )
+        image_processor = _load_mistral3_image_processor(
+            resolved_model_path,
+            **kwargs,
+        )
         return cls(
             image_processor=image_processor,
             tokenizer=tokenizer,
