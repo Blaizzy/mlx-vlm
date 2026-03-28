@@ -172,6 +172,118 @@ class Sam3Predictor:
         )
 
 
+def predict_multi(
+    predictor: Sam3Predictor,
+    image,
+    prompts: List[str],
+    boxes: Optional[np.ndarray] = None,
+    score_threshold: Optional[float] = None,
+) -> DetectionResult:
+    """Run vision backbone ONCE, then text+DETR per prompt. Merge with labels.
+
+    For N prompts, cost = 1x ViT + Nx (text + DETR) instead of Nx full pipeline.
+    """
+    if len(prompts) == 1:
+        result = predictor.predict(
+            image, text_prompt=prompts[0], boxes=boxes, score_threshold=score_threshold,
+        )
+        if len(result.scores) > 0:
+            result = nms(result)
+            result.labels = [prompts[0]] * len(result.scores)
+        else:
+            result.labels = []
+        return result
+
+    # Run vision backbone once
+    inputs = predictor.processor.preprocess_image(image)
+    pixel_values = mx.array(inputs["pixel_values"])
+
+    det = predictor.model.detector_model
+    fpn_features = det.vision_encoder(pixel_values)
+    fpn_pos = [det._pos_enc(feat) for feat in fpn_features]
+    fpn_trimmed = fpn_features[:-1]
+    fpn_pos_trimmed = fpn_pos[:-1]
+
+    encoder_feat = fpn_trimmed[-1]
+    B, H_f, W_f, D = encoder_feat.shape
+    src = encoder_feat.reshape(B, H_f * W_f, D)
+    pos_flat = fpn_pos_trimmed[-1].reshape(B, H_f * W_f, D)
+    mx.eval(src, pos_flat)
+
+    threshold = score_threshold or predictor.score_threshold
+    image_size = image.size if hasattr(image, "size") else image.shape[:2]
+
+    all_boxes, all_masks, all_scores, all_labels = [], [], [], []
+
+    # Run text + DETR per prompt (cheap: ~15ms each vs 80ms ViT)
+    for prompt in prompts:
+        inputs_embeds, attention_mask = predictor._get_input_embeddings(prompt)
+
+        encoded = det.detr_encoder(src, pos_flat, inputs_embeds, attention_mask)
+        mx.eval(encoded)
+
+        hs, ref_boxes, presence_logits = det.detr_decoder(
+            vision_features=encoded,
+            inputs_embeds=inputs_embeds,
+            vision_pos_encoding=pos_flat,
+            text_mask=attention_mask,
+            spatial_shape=(H_f, W_f),
+        )
+
+        pred_boxes_cxcywh = ref_boxes[-1]
+        cx = pred_boxes_cxcywh[..., 0]
+        cy = pred_boxes_cxcywh[..., 1]
+        w = pred_boxes_cxcywh[..., 2]
+        h = pred_boxes_cxcywh[..., 3]
+        pred_boxes_xyxy = mx.stack(
+            [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=-1
+        )
+
+        all_logits = det.dot_product_scoring(hs, inputs_embeds, attention_mask)
+        pred_logits = all_logits[-1].squeeze(-1)
+        presence = presence_logits[-1]
+
+        last_hs = hs[-1]
+        seg_out = det.mask_decoder(
+            last_hs,
+            list(fpn_trimmed),
+            encoder_hidden_states=encoded,
+            prompt_features=inputs_embeds,
+            prompt_mask=attention_mask,
+        )
+        mx.eval(pred_logits, pred_boxes_xyxy, seg_out, presence)
+
+        # Postprocess — ensure batch dim is present
+        outputs = {
+            "pred_logits": pred_logits if pred_logits.ndim == 2 else pred_logits[None],
+            "pred_boxes": pred_boxes_xyxy if pred_boxes_xyxy.ndim == 3 else pred_boxes_xyxy[None],
+            "pred_masks": seg_out["pred_masks"],
+            "presence_logits": presence if presence.ndim == 2 else presence[None],
+        }
+        result = predictor._postprocess(outputs, image_size, threshold)
+        if len(result.scores) > 0:
+            result = nms(result)
+            all_boxes.append(result.boxes)
+            all_masks.append(result.masks)
+            all_scores.append(result.scores)
+            all_labels.extend([prompt] * len(result.scores))
+
+    if not all_scores:
+        return DetectionResult(
+            boxes=np.zeros((0, 4)),
+            masks=np.zeros((0, 1, 1), dtype=np.uint8),
+            scores=np.zeros((0,)),
+            labels=[],
+        )
+
+    return DetectionResult(
+        boxes=np.concatenate(all_boxes),
+        masks=np.concatenate(all_masks),
+        scores=np.concatenate(all_scores),
+        labels=all_labels,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Video Predictor
 # ---------------------------------------------------------------------------
@@ -585,12 +697,15 @@ def _filter_by_regions(
                 break
     if not keep:
         return DetectionResult(
-            boxes=np.zeros((0, 4)), masks=np.zeros((0, 0, 0)), scores=np.zeros((0,))
+            boxes=np.zeros((0, 4)), masks=np.zeros((0, 0, 0)), scores=np.zeros((0,)),
+            labels=[],
         )
+    labels = [result.labels[i] for i in keep] if result.labels else None
     return DetectionResult(
         boxes=result.boxes[keep],
         masks=result.masks[keep],
         scores=result.scores[keep],
+        labels=labels,
     )
 
 
@@ -634,8 +749,9 @@ def nms(result: DetectionResult, iou_thresh: float = 0.5) -> DetectionResult:
                 break
         if not discard:
             keep.append(i)
+    labels = [result.labels[i] for i in keep] if result.labels else None
     return DetectionResult(
-        boxes=boxes[keep], masks=masks[keep], scores=scores[keep]
+        boxes=boxes[keep], masks=masks[keep], scores=scores[keep], labels=labels,
     )
 
 
@@ -653,7 +769,7 @@ COLORS_BGR = [
 ]
 
 
-def draw_frame(frame_bgr, masks, scores, boxes, prompt, H, W, show_boxes=True):
+def draw_frame(frame_bgr, masks, scores, boxes, prompt, H, W, show_boxes=True, labels=None):
     """Draw masks, contours, boxes, and labels on a BGR frame.
 
     Args:
@@ -689,7 +805,8 @@ def draw_frame(frame_bgr, masks, scores, boxes, prompt, H, W, show_boxes=True):
             x1, y1, x2, y2 = boxes[i].astype(int)
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
 
-            label = f"{prompt} {scores[i]:.2f}"
+            lbl = labels[i] if labels and i < len(labels) else prompt
+            label = f"{lbl} {scores[i]:.2f}"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
             cv2.rectangle(
                 out,
@@ -712,7 +829,7 @@ def draw_frame(frame_bgr, masks, scores, boxes, prompt, H, W, show_boxes=True):
 
 def track_video(
     video_path: str,
-    prompt: str,
+    prompts: List[str],
     output: Optional[str] = None,
     model_path: str = "facebook/sam3",
     threshold: float = 0.15,
@@ -774,14 +891,15 @@ def track_video(
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Video: {total_frames} frames, {fps:.1f} fps, {W}x{H}")
-    print(f'Prompt: "{prompt}", detect every {every} frames, threshold {threshold}, resolution {resolution}')
+    prompt_str = " + ".join(prompts)
+    print(f'Prompts: {prompts}, detect every {every} frames, threshold {threshold}, resolution {resolution}')
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output, fourcc, fps, (W, H))
 
-    latest_masks = np.array([])
-    latest_scores = np.array([])
-    latest_boxes = np.array([])
+    latest_result = DetectionResult(
+        boxes=np.array([]), masks=np.array([]), scores=np.array([]), labels=[],
+    )
 
     for fi in range(total_frames):
         ret, frame_bgr = cap.read()
@@ -790,26 +908,18 @@ def track_video(
 
         if fi % every == 0:
             frame_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-            result = predictor.predict(frame_pil, text_prompt=prompt)
-            if len(result.scores) > 0:
-                result = nms(result, nms_thresh)
-                # Filter to only objects inside the input box regions
-                if box_array is not None:
-                    result = _filter_by_regions(result, box_array)
-                latest_masks = result.masks
-                latest_scores = result.scores
-                latest_boxes = result.boxes
-            else:
-                latest_masks = np.array([])
-                latest_scores = np.array([])
-                latest_boxes = np.array([])
+            result = predict_multi(predictor, frame_pil, prompts)
+            if box_array is not None and len(result.scores) > 0:
+                result = _filter_by_regions(result, box_array)
+            latest_result = result
 
             if fi % 40 == 0:
-                print(f"  Frame {fi}/{total_frames}: {len(latest_scores)} detections")
+                print(f"  Frame {fi}/{total_frames}: {len(latest_result.scores)} detections")
 
         out = draw_frame(
-            frame_bgr, latest_masks, latest_scores, latest_boxes, prompt, H, W,
-            show_boxes=show_boxes,
+            frame_bgr, latest_result.masks, latest_result.scores,
+            latest_result.boxes, prompt_str, H, W,
+            show_boxes=show_boxes, labels=latest_result.labels,
         )
         writer.write(out)
 
@@ -820,7 +930,7 @@ def track_video(
 
 def track_video_realtime(
     video_path: str,
-    prompt: str,
+    prompts: List[str],
     model_path: str = "facebook/sam3",
     threshold: float = 0.15,
     nms_thresh: float = 0.5,
@@ -880,7 +990,8 @@ def track_video_realtime(
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Video: {fps:.1f} fps, {W}x{H}")
-    print(f'Prompt: "{prompt}", threshold {threshold}, resolution {resolution}x{resolution}')
+    prompt_str = " + ".join(prompts)
+    print(f'Prompts: {prompts}, threshold {threshold}, resolution {resolution}x{resolution}')
     print("Press 'q' to quit")
 
     import collections
@@ -943,7 +1054,7 @@ def track_video_realtime(
                 continue
 
             t0 = time.perf_counter()
-            result = predictor.predict(frame_pil, text_prompt=prompt)
+            result = predict_multi(predictor, frame_pil, prompts)
             dt = time.perf_counter() - t0
 
             if len(result.scores) > 0:
@@ -977,7 +1088,8 @@ def track_video_realtime(
                     if show_boxes:
                         x1, y1, x2, y2 = result.boxes[i].astype(int)
                         cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-                        label = f"{prompt} {result.scores[i]:.2f}"
+                        lbl = result.labels[i] if result.labels and i < len(result.labels) else prompt_str
+                        label = f"{lbl} {result.scores[i]:.2f}"
                         (tw, th), _ = cv2.getTextSize(
                             label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
                         )
@@ -1053,7 +1165,7 @@ def track_video_realtime(
             2,
         )
 
-        cv2.imshow(f"SAM3 Tracking - \"{prompt}\"", out)
+        cv2.imshow(f"SAM3 Tracking - {prompt_str}", out)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
@@ -1111,9 +1223,21 @@ def _draw_boxes_only(frame_bgr, scores, boxes, prompt, H, W):
     return out
 
 
+def _parse_boxes(boxes_str: Optional[str]) -> Optional[np.ndarray]:
+    """Parse box string 'x1,y1,x2,y2;...' into numpy array."""
+    if boxes_str is None:
+        return None
+    box_list = []
+    for b in boxes_str.split(";"):
+        coords = [float(x) for x in b.split(",")]
+        if len(coords) == 4:
+            box_list.append(coords)
+    return np.array(box_list) if box_list else None
+
+
 def run_image(
     image_path: str,
-    prompt: str,
+    prompts: List[str],
     task: str = "segment",
     output: Optional[str] = None,
     model_path: str = "facebook/sam3",
@@ -1123,20 +1247,7 @@ def run_image(
     show_boxes: bool = True,
     resolution: int = 1008,
 ):
-    """Run detection or segmentation on an image.
-
-    Args:
-        image_path: Input image path
-        prompt: Text prompt
-        task: "detect" (boxes only) or "segment" (masks + boxes)
-        output: Output image path
-        model_path: Model path or HF repo
-        threshold: Score threshold
-        nms_thresh: NMS IoU threshold
-        boxes: Comma-separated box coords
-        show_boxes: Draw bounding boxes and labels on output
-        resolution: Input resolution (lower = faster)
-    """
+    """Run detection or segmentation on an image."""
     import cv2
 
     suffix = "_detected" if task == "detect" else "_segmented"
@@ -1145,46 +1256,34 @@ def run_image(
         output = str(p.parent / f"{p.stem}{suffix}{p.suffix}")
 
     predictor = _load_predictor(model_path, threshold, resolution)
+    box_array = _parse_boxes(boxes)
 
     image = Image.open(image_path).convert("RGB")
     W, H = image.size
     print(f"Image: {W}x{H}")
-    print(f'Task: {task}, prompt: "{prompt}", threshold {threshold}')
+    print(f'Task: {task}, prompts: {prompts}, threshold {threshold}')
 
-    # Parse box prompts
-    box_array = None
-    if boxes is not None:
-        box_list = []
-        for b in boxes.split(";"):
-            coords = [float(x) for x in b.split(",")]
-            if len(coords) == 4:
-                box_list.append(coords)
-        if box_list:
-            box_array = np.array(box_list)
-            print(f"Box prompts: {box_array.tolist()}")
-
-    result = predictor.predict(image, text_prompt=prompt)
-    if len(result.scores) > 0:
-        result = nms(result, nms_thresh)
-        # Filter to only objects inside the input box regions
-        if box_array is not None:
-            result = _filter_by_regions(result, box_array)
+    result = predict_multi(predictor, image, prompts, boxes=box_array)
+    if box_array is not None and len(result.scores) > 0:
+        result = _filter_by_regions(result, box_array)
 
     print(f"Detections: {len(result.scores)}")
     for i in range(len(result.scores)):
         x1, y1, x2, y2 = result.boxes[i]
-        line = f"  [{result.scores[i]:.2f}] box=({x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f})"
+        lbl = result.labels[i] if result.labels else prompts[0]
+        line = f"  [{result.scores[i]:.2f}] {lbl} box=({x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f})"
         if task == "segment":
             line += f"  mask={int(result.masks[i].sum())}px"
         print(line)
 
     frame_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    prompt_str = " + ".join(prompts)
     if task == "detect":
-        out = _draw_boxes_only(frame_bgr, result.scores, result.boxes, prompt, H, W)
+        out = _draw_boxes_only(frame_bgr, result.scores, result.boxes, prompt_str, H, W)
     else:
         out = draw_frame(
-            frame_bgr, result.masks, result.scores, result.boxes, prompt, H, W,
-            show_boxes=show_boxes,
+            frame_bgr, result.masks, result.scores, result.boxes, prompt_str, H, W,
+            show_boxes=show_boxes, labels=result.labels,
         )
     cv2.imwrite(output, out)
     print(f"Saved: {output}")
@@ -1225,7 +1324,10 @@ def main():
     )
     parser.add_argument("--image", default=None, help="Input image path (detect/segment)")
     parser.add_argument("--video", default=None, help="Input video path or '0' for webcam (track/realtime)")
-    parser.add_argument("--prompt", required=True, help="Text prompt (e.g. 'a car')")
+    parser.add_argument(
+        "--prompt", required=True, nargs="+",
+        help="Text prompt(s). Pass multiple to track different objects: --prompt 'a car' 'a person'",
+    )
     parser.add_argument(
         "--boxes", default=None,
         help="Box prompts as 'x1,y1,x2,y2' or 'x1,y1,x2,y2;x1,y1,x2,y2' in pixel coords",
@@ -1248,12 +1350,14 @@ def main():
     )
     args = parser.parse_args()
 
+    prompts = args.prompt  # list of 1+ prompts
+
     if args.task in ("detect", "segment"):
         if args.image is None:
             parser.error("--image is required for --task detect/segment")
         run_image(
             image_path=args.image,
-            prompt=args.prompt,
+            prompts=prompts,
             task=args.task,
             output=args.output,
             model_path=args.model,
@@ -1268,7 +1372,7 @@ def main():
             parser.error("--video is required for --task track")
         track_video(
             video_path=args.video,
-            prompt=args.prompt,
+            prompts=prompts,
             output=args.output,
             model_path=args.model,
             threshold=args.threshold if args.threshold is not None else 0.15,
@@ -1283,7 +1387,7 @@ def main():
             parser.error("--video is required for --task realtime (use '0' for webcam)")
         track_video_realtime(
             video_path=args.video,
-            prompt=args.prompt,
+            prompts=prompts,
             model_path=args.model,
             threshold=args.threshold if args.threshold is not None else 0.5,
             nms_thresh=args.nms_thresh if args.nms_thresh != 0.5 else 0.3,
