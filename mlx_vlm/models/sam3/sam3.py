@@ -6,7 +6,6 @@ Weight keys:
     tracker_neck.*    -> self.tracker_neck.*
 """
 
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -21,7 +20,6 @@ from .segmentation import DotProductScoring, MaskDecoder
 from .text_encoder import TextEncoder
 from .tracker import FPNNeck, TrackerModel
 from .vision import VisionEncoder
-
 
 # ---------------------------------------------------------------------------
 # Detector Model
@@ -42,7 +40,9 @@ class DetectorModel(nn.Module):
         self.vision_encoder = VisionEncoder(det_cfg.vision_config)
 
         # Text encoder (CLIP)
-        self.text_encoder = TextEncoder(det_cfg.text_config, d_model=det_cfg.detr_encoder_config.hidden_size)
+        self.text_encoder = TextEncoder(
+            det_cfg.text_config, d_model=det_cfg.detr_encoder_config.hidden_size
+        )
 
         # Text projection: CLIP hidden -> DETR d_model
         self.text_projection = nn.Linear(
@@ -61,7 +61,9 @@ class DetectorModel(nn.Module):
         self.mask_decoder = MaskDecoder(det_cfg.mask_decoder_config)
 
         # Scoring
-        self.dot_product_scoring = DotProductScoring(det_cfg.detr_encoder_config.hidden_size)
+        self.dot_product_scoring = DotProductScoring(
+            det_cfg.detr_encoder_config.hidden_size
+        )
 
         # Position encoding
         self._pos_enc = PositionEmbeddingSine(
@@ -120,8 +122,15 @@ class DetectorModel(nn.Module):
         #    on intermediate_hidden_states outside - the decoder already does this)
         # Convert cxcywh to xyxy for final output
         pred_boxes_cxcywh = ref_boxes[-1]  # (B, Q, 4)
-        cx, cy, w, h = pred_boxes_cxcywh[..., 0], pred_boxes_cxcywh[..., 1], pred_boxes_cxcywh[..., 2], pred_boxes_cxcywh[..., 3]
-        pred_boxes_xyxy = mx.stack([cx - w/2, cy - h/2, cx + w/2, cy + h/2], axis=-1)
+        cx, cy, w, h = (
+            pred_boxes_cxcywh[..., 0],
+            pred_boxes_cxcywh[..., 1],
+            pred_boxes_cxcywh[..., 2],
+            pred_boxes_cxcywh[..., 3],
+        )
+        pred_boxes_xyxy = mx.stack(
+            [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=-1
+        )
 
         # 7. Classification: dot-product scoring on all intermediate hidden states
         all_pred_logits = self.dot_product_scoring(hs, prompt, prompt_mask)
@@ -189,21 +198,44 @@ class Model(nn.Module):
         - Layers with dimensions not divisible by 64
         """
         # Skip conv layers (not supported by QuantizedLinear)
-        if any(k in path for k in [
-            "conv", "depthwise", "mask_downsample",
-            "pixel_decoder", "instance_projection", "semantic_projection",
-            "fpn_layers", "patch_embeddings",
-        ]):
+        if any(
+            k in path
+            for k in [
+                "conv",
+                "depthwise",
+                "mask_downsample",
+                "pixel_decoder",
+                "instance_projection",
+                "semantic_projection",
+                "fpn_layers",
+                "patch_embeddings",
+            ]
+        ):
             return False
         # Skip small/structural embeddings
-        if any(k in path for k in [
-            "query_embed", "reference_points", "presence_token",
-            "label_embed", "cls_embed", "point_embed", "not_a_point",
-            "no_mask_embed", "no_memory", "no_object", "iou_token",
-            "mask_tokens", "obj_score_token", "shared_embedding",
-            "shared_image_embedding", "occlusion_spatial",
-            "memory_temporal", "position_embedding",
-        ]):
+        if any(
+            k in path
+            for k in [
+                "query_embed",
+                "reference_points",
+                "presence_token",
+                "label_embed",
+                "cls_embed",
+                "point_embed",
+                "not_a_point",
+                "no_mask_embed",
+                "no_memory",
+                "no_object",
+                "iou_token",
+                "mask_tokens",
+                "obj_score_token",
+                "shared_embedding",
+                "shared_image_embedding",
+                "occlusion_spatial",
+                "memory_temporal",
+                "position_embedding",
+            ]
+        ):
             return False
         # Skip layers with weight dims not divisible by 64
         if hasattr(module, "weight"):
@@ -276,7 +308,9 @@ class Model(nn.Module):
     ) -> Dict[str, mx.array]:
         """Default forward: run detection."""
         if input_ids is not None:
-            return self.detect(pixel_values, input_ids, attention_mask, kwargs.get("boxes"))
+            return self.detect(
+                pixel_values, input_ids, attention_mask, kwargs.get("boxes")
+            )
         # If no text, return backbone features (for tracker use)
         return {"features": self.detector_model.vision_encoder(pixel_values)}
 
@@ -292,30 +326,30 @@ class Model(nn.Module):
 
         # Patterns for ConvTranspose2d weights (need transpose(1,2,3,0))
         conv_transpose_patterns = [
-            "scale_layers.",     # FPN upsampling layers
-            "upscale_conv",      # Tracker mask decoder upscaling
+            "scale_layers.",  # FPN upsampling layers
+            "upscale_conv",  # Tracker mask decoder upscaling
         ]
 
         # Patterns for special 4D weights that are NOT ConvTranspose2d
         # (regular Conv2d: transpose(0,2,3,1))
         conv2d_patterns = [
-            "projection.weight",     # Patch embedding
-            "proj1.weight",          # FPN 1x1 conv
-            "proj2.weight",          # FPN 3x3 conv
-            ".conv.",                # Generic conv layers
-            "conv_layers.",          # Pixel decoder convs
+            "projection.weight",  # Patch embedding
+            "proj1.weight",  # FPN 1x1 conv
+            "proj2.weight",  # FPN 3x3 conv
+            ".conv.",  # Generic conv layers
+            "conv_layers.",  # Pixel decoder convs
             "instance_projection.",  # 1x1 conv
             "semantic_projection.",  # 1x1 conv
-            "feature_projection.",   # Memory encoder 1x1
-            "final_conv.",           # Mask downsampler final
-            "conv_s0.",              # Tracker skip conv
-            "conv_s1.",              # Tracker skip conv
-            "depthwise_conv.",       # CXBlock depthwise
-            "mask_downsample.",      # Mask downsampling
-            "conv1.",                # Mask embed convs
-            "conv2.",                # Mask embed convs
-            "conv3.",                # Mask embed convs
-            "boxes_pool_project.",   # Geometry encoder Conv2d
+            "feature_projection.",  # Memory encoder 1x1
+            "final_conv.",  # Mask downsampler final
+            "conv_s0.",  # Tracker skip conv
+            "conv_s1.",  # Tracker skip conv
+            "depthwise_conv.",  # CXBlock depthwise
+            "mask_downsample.",  # Mask downsampling
+            "conv1.",  # Mask embed convs
+            "conv2.",  # Mask embed convs
+            "conv3.",  # Mask embed convs
+            "boxes_pool_project.",  # Geometry encoder Conv2d
         ]
 
         # 4D parameters that are NOT convolution weights (skip transposition)

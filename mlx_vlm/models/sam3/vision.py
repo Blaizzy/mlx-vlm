@@ -8,11 +8,9 @@ from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from .config import VisionEncoderConfig, ViTConfig
-from .position import compute_axial_cis, apply_rotary_enc
-
+from .position import apply_rotary_enc, compute_axial_cis
 
 # ---------------------------------------------------------------------------
 # ViT Components
@@ -71,9 +69,15 @@ class VitAttention(nn.Module):
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.scale = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.qkv_bias)
-        self.k_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.qkv_bias)
-        self.v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.qkv_bias)
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=config.qkv_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=config.qkv_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=config.qkv_bias
+        )
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
 
         self.use_rope = use_rope
@@ -100,9 +104,21 @@ class VitAttention(nn.Module):
         else:
             B, N, C = x.shape
 
-        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = (
+            self.q_proj(x)
+            .reshape(B, N, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        k = (
+            self.k_proj(x)
+            .reshape(B, N, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        v = (
+            self.v_proj(x)
+            .reshape(B, N, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
 
         # Apply RoPE after transpose to (B, H, N, D) - matching HF
         if self.use_rope and rope_cos is not None:
@@ -360,16 +376,28 @@ class FPNLayer(nn.Module):
             mid2 = mid // 2
             # scale_layers indices: 0=ConvT, 1=None(GELU), 2=ConvT
             self.scale_layers = [
-                nn.ConvTranspose2d(current_channels, mid, kernel_size=fpn_kernel_size, stride=fpn_stride),
+                nn.ConvTranspose2d(
+                    current_channels,
+                    mid,
+                    kernel_size=fpn_kernel_size,
+                    stride=fpn_stride,
+                ),
                 None,  # placeholder for GELU (index 1)
-                nn.ConvTranspose2d(mid, mid2, kernel_size=fpn_kernel_size, stride=fpn_stride),
+                nn.ConvTranspose2d(
+                    mid, mid2, kernel_size=fpn_kernel_size, stride=fpn_stride
+                ),
             ]
             current_channels = mid2
             self.num_upscale = 2
         elif scale_factor >= 2.0:
             mid = current_channels // 2
             self.scale_layers = [
-                nn.ConvTranspose2d(current_channels, mid, kernel_size=fpn_kernel_size, stride=fpn_stride),
+                nn.ConvTranspose2d(
+                    current_channels,
+                    mid,
+                    kernel_size=fpn_kernel_size,
+                    stride=fpn_stride,
+                ),
             ]
             current_channels = mid
             self.num_upscale = 1
@@ -381,7 +409,9 @@ class FPNLayer(nn.Module):
 
         # 1x1 projection + 3x3 refinement (weights have biases)
         self.proj1 = nn.Conv2d(current_channels, out_channels, kernel_size=1, bias=True)
-        self.proj2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=True)
+        self.proj2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, padding=1, bias=True
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
         """
@@ -429,9 +459,7 @@ class FPNNeck(nn.Module):
             for sf in config.scale_factors
         ]
 
-    def __call__(
-        self, x: mx.array
-    ) -> Tuple[List[mx.array], List[mx.array]]:
+    def __call__(self, x: mx.array) -> Tuple[List[mx.array], List[mx.array]]:
         """
         Args:
             x: (B, H, W, C) backbone output

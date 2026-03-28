@@ -4,7 +4,6 @@ Compares HF PyTorch Sam3Model outputs with MLX Model outputs
 on the same image + text input.
 """
 
-import json
 import sys
 import time
 from pathlib import Path
@@ -12,19 +11,19 @@ from pathlib import Path
 # Ensure mlx_vlm is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from io import BytesIO
+
 import mlx.core as mx
 import numpy as np
 import requests
 import torch
-from huggingface_hub import hf_hub_download
 from PIL import Image
-from io import BytesIO
+from transformers import AutoModel
 
-# Import mlx_vlm BEFORE transformers to avoid module shadowing
-from mlx_vlm.utils import load_model, get_model_path
 from mlx_vlm.models.sam3.processing_sam3 import Sam3Processor as MLXSam3Processor
 
-from transformers import AutoModel, AutoProcessor
+# Import mlx_vlm BEFORE transformers to avoid module shadowing
+from mlx_vlm.utils import get_model_path, load_model
 
 
 def load_test_image():
@@ -41,6 +40,7 @@ def load_hf_model():
     model.eval()
     # Load HF processor directly to avoid our auto-processor patch
     from transformers.models.sam3_video.processing_sam3_video import Sam3VideoProcessor
+
     processor = Sam3VideoProcessor.from_pretrained("facebook/sam3")
     return model, processor
 
@@ -57,7 +57,11 @@ def load_mlx_model():
 def check_closeness(name, mlx_arr, torch_arr, rtol=1e-3, atol=1e-3):
     """Compare MLX and PyTorch arrays."""
     mlx_np = np.array(mlx_arr) if not isinstance(mlx_arr, np.ndarray) else mlx_arr
-    torch_np = torch_arr.detach().cpu().float().numpy() if isinstance(torch_arr, torch.Tensor) else torch_arr
+    torch_np = (
+        torch_arr.detach().cpu().float().numpy()
+        if isinstance(torch_arr, torch.Tensor)
+        else torch_arr
+    )
 
     # Handle shape mismatches
     if mlx_np.shape != torch_np.shape:
@@ -69,7 +73,9 @@ def check_closeness(name, mlx_arr, torch_arr, rtol=1e-3, atol=1e-3):
     is_close = np.allclose(mlx_np, torch_np, rtol=rtol, atol=atol)
 
     status = "PASS" if is_close else "FAIL"
-    print(f"  {name}: {status} | max_diff={max_diff:.6f} mean_diff={mean_diff:.6f} shape={mlx_np.shape}")
+    print(
+        f"  {name}: {status} | max_diff={max_diff:.6f} mean_diff={mean_diff:.6f} shape={mlx_np.shape}"
+    )
     return is_close
 
 
@@ -90,7 +96,7 @@ def test_full_pipeline():
     hf_inputs = {**hf_img_inputs, **hf_txt_inputs}
     print(f"\nHF input keys: {list(hf_inputs.keys())}")
     for k, v in hf_inputs.items():
-        if hasattr(v, 'shape'):
+        if hasattr(v, "shape"):
             print(f"  {k}: {v.shape} {v.dtype}")
 
     print("\nRunning HF forward...")
@@ -155,7 +161,11 @@ def test_full_pipeline():
     print("\n=== Closeness Test Results ===")
 
     # Flatten MLX logits to match HF shape
-    mlx_logits_np = np.array(mlx_logits).squeeze(-1) if mlx_logits.ndim == 3 else np.array(mlx_logits)
+    mlx_logits_np = (
+        np.array(mlx_logits).squeeze(-1)
+        if mlx_logits.ndim == 3
+        else np.array(mlx_logits)
+    )
     hf_logits_np = hf_logits.detach().numpy()
     check_closeness("pred_logits", mlx_logits_np, hf_logits_np, rtol=1e-2, atol=1e-2)
     check_closeness("pred_boxes", mlx_boxes, hf_boxes, rtol=1e-2, atol=1e-2)
@@ -166,7 +176,9 @@ def test_full_pipeline():
     if mlx_masks_np.shape == hf_masks_np.shape:
         check_closeness("pred_masks", mlx_masks_np, hf_masks_np, rtol=1e-1, atol=1e-1)
     else:
-        print(f"  pred_masks: shapes differ mlx={mlx_masks_np.shape} torch={hf_masks_np.shape}")
+        print(
+            f"  pred_masks: shapes differ mlx={mlx_masks_np.shape} torch={hf_masks_np.shape}"
+        )
 
     # Compare detection scores (sigmoid of logits * presence)
     hf_scores_np = 1 / (1 + np.exp(-hf_logits_np))
@@ -177,7 +189,9 @@ def test_full_pipeline():
 
     mlx_scores_np = 1 / (1 + np.exp(-mlx_logits_np))
 
-    check_closeness("detection_scores", mlx_scores_np, hf_scores_np, rtol=1e-1, atol=1e-1)
+    check_closeness(
+        "detection_scores", mlx_scores_np, hf_scores_np, rtol=1e-1, atol=1e-1
+    )
 
     # Show top detections from both
     hf_top5 = np.argsort(hf_scores_np[0])[-5:][::-1]
@@ -211,8 +225,8 @@ def save_prediction_image(results, output_path="sam3_predictions.png"):
     import matplotlib
 
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
     import matplotlib.patches as patches
+    import matplotlib.pyplot as plt
 
     image = results["image"]
     W, H = image.size
@@ -278,7 +292,8 @@ def save_prediction_image(results, output_path="sam3_predictions.png"):
             )
             ax.add_patch(rect)
             ax.text(
-                x1, y1 - 5,
+                x1,
+                y1 - 5,
                 f"{kept_scores[i]:.2f}",
                 color="white",
                 fontsize=10,
@@ -301,6 +316,7 @@ def save_video_tracking(mlx_model, mlx_proc, output_path="sam3_tracking.png"):
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
     from mlx_vlm.models.sam3.generate import Sam3Predictor
 
     predictor = Sam3Predictor(mlx_model, mlx_proc, score_threshold=0.1)
@@ -352,13 +368,20 @@ def save_video_tracking(mlx_model, mlx_proc, output_path="sam3_tracking.png"):
             # Draw box
             x1, y1, x2, y2 = result.boxes[i]
             rect = plt.Rectangle(
-                (x1, y1), x2 - x1, y2 - y1,
-                linewidth=2, edgecolor=color, facecolor="none"
+                (x1, y1),
+                x2 - x1,
+                y2 - y1,
+                linewidth=2,
+                edgecolor=color,
+                facecolor="none",
             )
             ax.add_patch(rect)
             ax.text(
-                x1, y1 - 5, f"{result.scores[i]:.2f}",
-                color="white", fontsize=9,
+                x1,
+                y1 - 5,
+                f"{result.scores[i]:.2f}",
+                color="white",
+                fontsize=9,
                 bbox=dict(boxstyle="round,pad=0.2", facecolor=color, alpha=0.8),
             )
 
@@ -376,7 +399,9 @@ def save_video_tracking(mlx_model, mlx_proc, output_path="sam3_tracking.png"):
 
 if __name__ == "__main__":
     results = test_full_pipeline()
-    save_prediction_image(results, "/Users/prince_canuma/Projects/mlx-vlm/sam3_predictions.png")
+    save_prediction_image(
+        results, "/Users/prince_canuma/Projects/mlx-vlm/sam3_predictions.png"
+    )
     mlx_proc = MLXSam3Processor.from_pretrained(str(get_model_path("facebook/sam3")))
     save_video_tracking(
         results["mlx_model"],

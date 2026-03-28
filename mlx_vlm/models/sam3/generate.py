@@ -14,7 +14,6 @@ Usage:
     results = video_predictor.propagate()
 """
 
-import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -100,7 +99,9 @@ class Sam3Predictor:
         # Post-process
         return self._postprocess(
             outputs,
-            image_size=image.size if isinstance(image, Image.Image) else image.shape[:2],
+            image_size=(
+                image.size if isinstance(image, Image.Image) else image.shape[:2]
+            ),
             threshold=threshold,
         )
 
@@ -294,17 +295,27 @@ class Sam3VideoPredictor:
                 all_scores = np.array([frame_scores[i] for i in obj_ids])
             else:
                 obj_ids = []
-                H = self._frames[0].size[1] if isinstance(self._frames[0], Image.Image) else self._frames[0].shape[0]
-                W = self._frames[0].size[0] if isinstance(self._frames[0], Image.Image) else self._frames[0].shape[1]
+                H = (
+                    self._frames[0].size[1]
+                    if isinstance(self._frames[0], Image.Image)
+                    else self._frames[0].shape[0]
+                )
+                W = (
+                    self._frames[0].size[0]
+                    if isinstance(self._frames[0], Image.Image)
+                    else self._frames[0].shape[1]
+                )
                 all_masks = np.zeros((0, H, W))
                 all_scores = np.zeros((0,))
 
-            results.append(TrackingResult(
-                frame_idx=frame_idx,
-                masks=all_masks,
-                scores=all_scores,
-                object_ids=obj_ids,
-            ))
+            results.append(
+                TrackingResult(
+                    frame_idx=frame_idx,
+                    masks=all_masks,
+                    scores=all_scores,
+                    object_ids=obj_ids,
+                )
+            )
 
         return results
 
@@ -473,13 +484,20 @@ def _cxcywh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
     return np.stack([x1, y1, x2, y2], axis=1)
 
 
-def _nms(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float = 0.5) -> np.ndarray:
+def _nms(
+    boxes: np.ndarray, scores: np.ndarray, iou_threshold: float = 0.5
+) -> np.ndarray:
     """Non-maximum suppression."""
     if len(boxes) == 0:
         return np.array([], dtype=np.int64)
 
     boxes_xyxy = _cxcywh_to_xyxy(boxes)
-    x1, y1, x2, y2 = boxes_xyxy[:, 0], boxes_xyxy[:, 1], boxes_xyxy[:, 2], boxes_xyxy[:, 3]
+    x1, y1, x2, y2 = (
+        boxes_xyxy[:, 0],
+        boxes_xyxy[:, 1],
+        boxes_xyxy[:, 2],
+        boxes_xyxy[:, 3],
+    )
     areas = (x2 - x1) * (y2 - y1)
 
     order = scores.argsort()[::-1]

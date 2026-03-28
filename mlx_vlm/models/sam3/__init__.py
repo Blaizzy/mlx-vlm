@@ -8,7 +8,6 @@ Usage:
 """
 
 from . import processing_sam3  # Install processor patch
-
 from .config import (
     DetectorConfig,
     DetectorMaskDecoderConfig,

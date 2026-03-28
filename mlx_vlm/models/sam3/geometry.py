@@ -9,8 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .config import GeometryEncoderConfig
-from .encoder import MultiheadAttention, MLP
-from .position import PositionEmbeddingSine
+from .encoder import MLP, MultiheadAttention
 
 
 class GeometryEncoderLayer(nn.Module):
@@ -30,8 +29,12 @@ class GeometryEncoderLayer(nn.Module):
         super().__init__()
         d = config.hidden_size
 
-        self.self_attn = MultiheadAttention(d, config.num_attention_heads, config.dropout)
-        self.cross_attn = MultiheadAttention(d, config.num_attention_heads, config.dropout)
+        self.self_attn = MultiheadAttention(
+            d, config.num_attention_heads, config.dropout
+        )
+        self.cross_attn = MultiheadAttention(
+            d, config.num_attention_heads, config.dropout
+        )
 
         self.layer_norm1 = nn.LayerNorm(d, eps=config.layer_norm_eps)
         self.layer_norm2 = nn.LayerNorm(d, eps=config.layer_norm_eps)
@@ -82,7 +85,9 @@ class GeometryEncoder(nn.Module):
 
         # Direct projections for points and boxes
         self.boxes_direct_project = nn.Linear(4, d)
-        self.boxes_pool_project = nn.Conv2d(d, d, kernel_size=config.roi_size, bias=True)
+        self.boxes_pool_project = nn.Conv2d(
+            d, d, kernel_size=config.roi_size, bias=True
+        )
         self.boxes_pos_enc_project = nn.Linear(d + 2, d)
 
         # Label and CLS embeddings

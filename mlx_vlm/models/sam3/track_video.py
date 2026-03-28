@@ -49,17 +49,23 @@ def draw_frame(frame_bgr, masks, scores, boxes, prompt, H, W):
         color = COLORS_BGR[i % len(COLORS_BGR)]
         mask = masks[i]
         if mask.shape[0] != H or mask.shape[1] != W:
-            mask = cv2.resize(mask.astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST)
+            mask = cv2.resize(
+                mask.astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST
+            )
         binary = mask > 0
 
         for c in range(3):
             out[:, :, c] = np.where(
                 binary,
-                (out[:, :, c].astype(np.float32) * 0.55 + color[c] * 0.45).astype(np.uint8),
+                (out[:, :, c].astype(np.float32) * 0.55 + color[c] * 0.45).astype(
+                    np.uint8
+                ),
                 out[:, :, c],
             )
 
-        contours, _ = cv2.findContours(binary.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(
+            binary.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
         cv2.drawContours(out, contours, -1, color, 2)
 
         x1, y1, x2, y2 = boxes[i].astype(int)
@@ -67,8 +73,18 @@ def draw_frame(frame_bgr, masks, scores, boxes, prompt, H, W):
 
         label = f"{prompt} {scores[i]:.2f}"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-        cv2.rectangle(out, (x1, max(y1 - th - 10, 0)), (x1 + tw + 6, max(y1, th + 10)), color, -1)
-        cv2.putText(out, label, (x1 + 3, max(y1 - 4, th + 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.rectangle(
+            out, (x1, max(y1 - th - 10, 0)), (x1 + tw + 6, max(y1, th + 10)), color, -1
+        )
+        cv2.putText(
+            out,
+            label,
+            (x1 + 3, max(y1 - 4, th + 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+        )
 
     return out
 
@@ -77,11 +93,21 @@ def main():
     parser = argparse.ArgumentParser(description="SAM3 video tracking")
     parser.add_argument("--video", required=True, help="Input video path")
     parser.add_argument("--prompt", required=True, help="Text prompt (e.g. 'a car')")
-    parser.add_argument("--output", default=None, help="Output video path (default: <input>_tracked.mp4)")
-    parser.add_argument("--model", default="facebook/sam3", help="Model path or HF repo")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Output video path (default: <input>_tracked.mp4)",
+    )
+    parser.add_argument(
+        "--model", default="facebook/sam3", help="Model path or HF repo"
+    )
     parser.add_argument("--threshold", type=float, default=0.15, help="Score threshold")
-    parser.add_argument("--nms-thresh", type=float, default=0.5, help="NMS IoU threshold")
-    parser.add_argument("--every", type=int, default=2, help="Run detection every N frames")
+    parser.add_argument(
+        "--nms-thresh", type=float, default=0.5, help="NMS IoU threshold"
+    )
+    parser.add_argument(
+        "--every", type=int, default=2, help="Run detection every N frames"
+    )
     args = parser.parse_args()
 
     video_path = args.video
@@ -90,9 +116,9 @@ def main():
         args.output = str(p.parent / f"{p.stem}_tracked{p.suffix}")
 
     # Load model
-    from mlx_vlm.utils import load_model, get_model_path
     from mlx_vlm.models.sam3.generate import Sam3Predictor
     from mlx_vlm.models.sam3.processing_sam3 import Sam3Processor
+    from mlx_vlm.utils import get_model_path, load_model
 
     print(f"Loading model: {args.model}")
     model_path = get_model_path(args.model)
@@ -111,7 +137,9 @@ def main():
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Video: {total_frames} frames, {fps:.1f} fps, {W}x{H}")
-    print(f'Prompt: "{args.prompt}", detect every {args.every} frames, threshold {args.threshold}')
+    print(
+        f'Prompt: "{args.prompt}", detect every {args.every} frames, threshold {args.threshold}'
+    )
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(args.output, fourcc, fps, (W, H))
@@ -127,7 +155,9 @@ def main():
 
         if fi % args.every == 0:
             frame_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-            result = predictor.predict(frame_pil, text_prompt=args.prompt, score_threshold=args.threshold)
+            result = predictor.predict(
+                frame_pil, text_prompt=args.prompt, score_threshold=args.threshold
+            )
             if len(result.scores) > 0:
                 latest_boxes, latest_scores, latest_masks = nms(
                     result.boxes, result.scores, result.masks, args.nms_thresh
@@ -140,7 +170,9 @@ def main():
             if fi % 40 == 0:
                 print(f"  Frame {fi}/{total_frames}: {len(latest_scores)} detections")
 
-        out = draw_frame(frame_bgr, latest_masks, latest_scores, latest_boxes, args.prompt, H, W)
+        out = draw_frame(
+            frame_bgr, latest_masks, latest_scores, latest_boxes, args.prompt, H, W
+        )
         writer.write(out)
 
     writer.release()

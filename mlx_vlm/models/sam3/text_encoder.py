@@ -3,7 +3,6 @@
 Weight keys: detector_model.text_encoder.text_model.* and detector_model.text_projection.*
 """
 
-import math
 from typing import Optional
 
 import mlx.core as mx
@@ -26,9 +25,21 @@ class CLIPAttention(nn.Module):
 
     def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
         B, N, C = x.shape
-        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = (
+            self.q_proj(x)
+            .reshape(B, N, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        k = (
+            self.k_proj(x)
+            .reshape(B, N, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        v = (
+            self.v_proj(x)
+            .reshape(B, N, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
 
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(B, N, C)
@@ -62,7 +73,9 @@ class CLIPEncoderLayer(nn.Module):
 class CLIPEncoder(nn.Module):
     def __init__(self, config: TextEncoderConfig):
         super().__init__()
-        self.layers = [CLIPEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+        self.layers = [
+            CLIPEncoderLayer(config) for _ in range(config.num_hidden_layers)
+        ]
 
     def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
         for layer in self.layers:
@@ -74,7 +87,9 @@ class CLIPTextEmbeddings(nn.Module):
     def __init__(self, config: TextEncoderConfig):
         super().__init__()
         self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.position_embedding = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        self.position_embedding = nn.Embedding(
+            config.max_position_embeddings, config.hidden_size
+        )
 
     def __call__(self, input_ids: mx.array) -> mx.array:
         seq_len = input_ids.shape[1]
@@ -93,7 +108,9 @@ class CLIPTextModel(nn.Module):
         self.config = config
         self.embeddings = CLIPTextEmbeddings(config)
         self.encoder = CLIPEncoder(config)
-        self.final_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.final_layer_norm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
 
     def __call__(
         self,
@@ -136,7 +153,9 @@ class TextEncoder(nn.Module):
         super().__init__()
         self.text_model = CLIPTextModel(config)
         # Projects from CLIP hidden to projection_dim (e.g. 1024 -> 512)
-        self.text_projection = nn.Linear(config.hidden_size, config.projection_dim, bias=False)
+        self.text_projection = nn.Linear(
+            config.hidden_size, config.projection_dim, bias=False
+        )
         self.d_model = d_model
 
     def __call__(

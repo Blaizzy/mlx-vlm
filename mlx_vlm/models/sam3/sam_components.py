@@ -9,9 +9,8 @@ from typing import List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from .config import TrackerMaskDecoderConfig, PromptEncoderConfig
+from .config import PromptEncoderConfig, TrackerMaskDecoderConfig
 from .position import apply_rotary_enc_1d, init_2d_freqs
-
 
 # ---------------------------------------------------------------------------
 # Basic building blocks
@@ -87,9 +86,21 @@ class SAMAttention(nn.Module):
         B, N_q, _ = q.shape
         N_k = k.shape[1]
 
-        q = self.q_proj(q).reshape(B, N_q, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.k_proj(k).reshape(B, N_k, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.v_proj(v).reshape(B, N_k, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = (
+            self.q_proj(q)
+            .reshape(B, N_q, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        k = (
+            self.k_proj(k)
+            .reshape(B, N_k, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        v = (
+            self.v_proj(v)
+            .reshape(B, N_k, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
 
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
         out = out.transpose(0, 2, 1, 3).reshape(B, N_q, -1)
@@ -146,8 +157,10 @@ class RoPEAttention(nn.Module):
 
         # Apply RoPE
         q, k = apply_rotary_enc_1d(
-            q, k,
-            self._freqs_cos, self._freqs_sin,
+            q,
+            k,
+            self._freqs_cos,
+            self._freqs_sin,
             repeat_freqs_k=self.rope_k_repeat,
         )
 
@@ -286,7 +299,8 @@ class TwoWayTransformer(nn.Module):
 
         for layer in self.layers:
             queries, keys = layer(
-                queries, keys,
+                queries,
+                keys,
                 query_pe=point_embedding,
                 key_pe=image_pe,
             )
@@ -359,7 +373,8 @@ class SAMPromptEncoder(nn.Module):
             B = coords.shape[0]
             point_emb = self._embed_points(coords, labels)
             sparse_embeddings = mx.concatenate(
-                [mx.broadcast_to(sparse_embeddings, (B, 0, self.embed_dim)), point_emb], axis=1
+                [mx.broadcast_to(sparse_embeddings, (B, 0, self.embed_dim)), point_emb],
+                axis=1,
             )
 
         if boxes is not None:
@@ -373,7 +388,9 @@ class SAMPromptEncoder(nn.Module):
         else:
             H, W = self.image_embedding_size
             dense_embeddings = self.no_mask_embed.weight.reshape(1, 1, self.embed_dim)
-            dense_embeddings = mx.broadcast_to(dense_embeddings, (B, H * W, self.embed_dim))
+            dense_embeddings = mx.broadcast_to(
+                dense_embeddings, (B, H * W, self.embed_dim)
+            )
 
         return sparse_embeddings, dense_embeddings
 
@@ -389,13 +406,11 @@ class SAMPromptEncoder(nn.Module):
 
         # Add label-specific embedding
         for i in range(labels.shape[-1]):
-            label = labels[:, i:i+1].astype(mx.int32)
-            point_emb = point_emb.at[:, i:i+1].add(
-                self.point_embed(label)
-            )
+            label = labels[:, i : i + 1].astype(mx.int32)
+            point_emb = point_emb.at[:, i : i + 1].add(self.point_embed(label))
 
         # Mark padding points
-        padding_mask = (labels == -1)
+        padding_mask = labels == -1
         if padding_mask.any():
             not_a_point = self.not_a_point_embed.weight
             point_emb = mx.where(padding_mask[..., None], not_a_point, point_emb)
@@ -420,7 +435,9 @@ class MaskEmbedConvs(nn.Module):
     def __init__(self, embed_dim: int, mask_in_chans: int):
         super().__init__()
         self.conv1 = nn.Conv2d(1, mask_in_chans // 4, kernel_size=2, stride=2)
-        self.conv2 = nn.Conv2d(mask_in_chans // 4, mask_in_chans, kernel_size=2, stride=2)
+        self.conv2 = nn.Conv2d(
+            mask_in_chans // 4, mask_in_chans, kernel_size=2, stride=2
+        )
         self.conv3 = nn.Conv2d(mask_in_chans, embed_dim, kernel_size=1)
         self.layer_norm1 = LayerNorm2d(mask_in_chans // 4)
         self.layer_norm2 = LayerNorm2d(mask_in_chans)
@@ -526,8 +543,12 @@ class SAMMaskDecoder(nn.Module):
         self.conv_s1 = nn.Conv2d(d, d // 4, kernel_size=1, bias=True)
 
         self.dynamic_multimask_via_stability = config.dynamic_multimask_via_stability
-        self.dynamic_multimask_stability_delta = config.dynamic_multimask_stability_delta
-        self.dynamic_multimask_stability_thresh = config.dynamic_multimask_stability_thresh
+        self.dynamic_multimask_stability_delta = (
+            config.dynamic_multimask_stability_delta
+        )
+        self.dynamic_multimask_stability_thresh = (
+            config.dynamic_multimask_stability_thresh
+        )
 
     def __call__(
         self,
@@ -555,11 +576,16 @@ class SAMMaskDecoder(nn.Module):
         d = image_embeddings.shape[-1]
 
         # Concatenate special tokens with sparse embeddings
-        tokens = mx.concatenate([
-            mx.broadcast_to(self.iou_token.weight[None], (B, 1, d)),
-            mx.broadcast_to(self.mask_tokens.weight[None], (B, self.num_mask_tokens, d)),
-            mx.broadcast_to(self.obj_score_token.weight[None], (B, 1, d)),
-        ], axis=1)
+        tokens = mx.concatenate(
+            [
+                mx.broadcast_to(self.iou_token.weight[None], (B, 1, d)),
+                mx.broadcast_to(
+                    self.mask_tokens.weight[None], (B, self.num_mask_tokens, d)
+                ),
+                mx.broadcast_to(self.obj_score_token.weight[None], (B, 1, d)),
+            ],
+            axis=1,
+        )
         tokens = mx.concatenate([tokens, sparse_prompt_embeddings], axis=1)
 
         # Add dense prompt to image embeddings
@@ -570,8 +596,8 @@ class SAMMaskDecoder(nn.Module):
 
         # Extract token outputs
         iou_token_out = hs[:, 0:1]
-        mask_tokens_out = hs[:, 1:1 + self.num_mask_tokens]
-        obj_score_token_out = hs[:, 1 + self.num_mask_tokens:2 + self.num_mask_tokens]
+        mask_tokens_out = hs[:, 1 : 1 + self.num_mask_tokens]
+        obj_score_token_out = hs[:, 1 + self.num_mask_tokens : 2 + self.num_mask_tokens]
 
         # Upscale image features
         HW = src.shape[1]
@@ -603,8 +629,12 @@ class SAMMaskDecoder(nn.Module):
         # Generate masks via hypernetworks
         masks = []
         for i in range(self.num_mask_tokens):
-            hyper_out = self.output_hypernetworks_mlps[i](mask_tokens_out[:, i])  # (B, C_up)
-            mask = (upscaled_flat * hyper_out[:, None, :]).sum(axis=-1)  # (B, H_up*W_up)
+            hyper_out = self.output_hypernetworks_mlps[i](
+                mask_tokens_out[:, i]
+            )  # (B, C_up)
+            mask = (upscaled_flat * hyper_out[:, None, :]).sum(
+                axis=-1
+            )  # (B, H_up*W_up)
             masks.append(mask.reshape(B, 1, H_up, W_up))
 
         masks = mx.concatenate(masks, axis=1)  # (B, num_mask_tokens, H_up, W_up)

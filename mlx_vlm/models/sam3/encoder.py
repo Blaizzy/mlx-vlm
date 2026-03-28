@@ -14,7 +14,13 @@ from .config import DETREncoderConfig
 class MultiheadAttention(nn.Module):
     """Standard multi-head attention with separate q/k/v/o projections."""
 
-    def __init__(self, hidden_size: int, num_heads: int, dropout: float = 0.0, kv_dim: Optional[int] = None):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        kv_dim: Optional[int] = None,
+    ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
@@ -36,9 +42,21 @@ class MultiheadAttention(nn.Module):
         B, N_q, _ = query.shape
         N_k = key.shape[1]
 
-        q = self.q_proj(query).reshape(B, N_q, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.k_proj(key).reshape(B, N_k, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.v_proj(value).reshape(B, N_k, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = (
+            self.q_proj(query)
+            .reshape(B, N_q, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        k = (
+            self.k_proj(key)
+            .reshape(B, N_k, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        v = (
+            self.v_proj(value)
+            .reshape(B, N_k, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
 
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(B, N_q, -1)
@@ -62,8 +80,12 @@ class DETREncoderLayer(nn.Module):
         super().__init__()
         d = config.hidden_size
 
-        self.self_attn = MultiheadAttention(d, config.num_attention_heads, config.dropout)
-        self.cross_attn = MultiheadAttention(d, config.num_attention_heads, config.dropout)
+        self.self_attn = MultiheadAttention(
+            d, config.num_attention_heads, config.dropout
+        )
+        self.cross_attn = MultiheadAttention(
+            d, config.num_attention_heads, config.dropout
+        )
 
         self.layer_norm1 = nn.LayerNorm(d, eps=config.layer_norm_eps)
         self.layer_norm2 = nn.LayerNorm(d, eps=config.layer_norm_eps)

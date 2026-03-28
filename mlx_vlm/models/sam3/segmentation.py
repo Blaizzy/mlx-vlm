@@ -5,7 +5,6 @@ Weight keys:
     detector_model.dot_product_scoring.*
 """
 
-import math
 from typing import Dict, List, Optional
 
 import mlx.core as mx
@@ -28,8 +27,7 @@ class PixelDecoder(nn.Module):
             for _ in range(num_upsampling_stages)
         ]
         self.norms = [
-            nn.GroupNorm(8, hidden_size)
-            for _ in range(num_upsampling_stages)
+            nn.GroupNorm(8, hidden_size) for _ in range(num_upsampling_stages)
         ]
 
     def __call__(self, features: List[mx.array]) -> mx.array:
@@ -124,8 +122,12 @@ class MaskDecoder(nn.Module):
             normed = self.prompt_cross_attn_norm(encoder_hidden_states)
             cross_mask = None
             if prompt_mask is not None:
-                cross_mask = (1 - prompt_mask[:, None, None, :].astype(mx.float32)) * -1e9
-            attn_out = self.prompt_cross_attn(normed, prompt_features, prompt_features, mask=cross_mask)
+                cross_mask = (
+                    1 - prompt_mask[:, None, None, :].astype(mx.float32)
+                ) * -1e9
+            attn_out = self.prompt_cross_attn(
+                normed, prompt_features, prompt_features, mask=cross_mask
+            )
             encoder_hidden_states = residual + attn_out
 
         # Build pixel embeddings: replace finest backbone feature with encoder output
@@ -150,7 +152,9 @@ class MaskDecoder(nn.Module):
         mask_embeddings = self.mask_embedder(obj_queries)  # (B, Q, D)
         B, H, W, D = instance_embed.shape
         instance_flat = instance_embed.reshape(B, H * W, D)  # (B, HW, D)
-        pred_masks = mx.matmul(mask_embeddings, instance_flat.transpose(0, 2, 1))  # (B, Q, HW)
+        pred_masks = mx.matmul(
+            mask_embeddings, instance_flat.transpose(0, 2, 1)
+        )  # (B, Q, HW)
         pred_masks = pred_masks.reshape(B, -1, H, W)
 
         # Semantic segmentation
@@ -184,7 +188,7 @@ class DotProductScoring(nn.Module):
         self.text_proj = nn.Linear(hidden_size, hidden_size)
         self.text_mlp = TextScoringMLP(hidden_size)
         self.text_mlp_out_norm = nn.LayerNorm(hidden_size)
-        self.scale = 1.0 / (hidden_size ** 0.5)
+        self.scale = 1.0 / (hidden_size**0.5)
         self.clamp_max_val = 12.0
 
     def __call__(

@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .config import DETRDecoderConfig
-from .encoder import MultiheadAttention, MLP
+from .encoder import MLP, MultiheadAttention
 
 
 class DETRDecoderLayer(nn.Module):
@@ -148,7 +148,12 @@ class BoxRPBEmbed(nn.Module):
 class SinePositionEmbeddingForBoxes:
     """Sine position encoding for box coordinates (used in decoder conditioning)."""
 
-    def __init__(self, num_pos_feats: int = 128, temperature: float = 10000.0, scale: float = 2 * math.pi):
+    def __init__(
+        self,
+        num_pos_feats: int = 128,
+        temperature: float = 10000.0,
+        scale: float = 2 * math.pi,
+    ):
         self.num_pos_feats = num_pos_feats
         self.temperature = temperature
         self.scale = scale
@@ -241,12 +246,16 @@ class DETRDecoder(nn.Module):
         presence_token = mx.broadcast_to(self.presence_token.weight[None], (B, 1, d))
 
         # Presence token at position 0
-        hidden_states = mx.concatenate([presence_token, query_embeds], axis=1)  # (B, Q+1, D)
+        hidden_states = mx.concatenate(
+            [presence_token, query_embeds], axis=1
+        )  # (B, Q+1, D)
 
         # Text cross-attention mask
         text_cross_mask = None
         if text_mask is not None:
-            text_cross_mask = (1 - text_mask[:, None, None, :].astype(mx.float32)) * -1e9
+            text_cross_mask = (
+                1 - text_mask[:, None, None, :].astype(mx.float32)
+            ) * -1e9
 
         intermediate_hs = []
         intermediate_boxes = []
@@ -254,7 +263,9 @@ class DETRDecoder(nn.Module):
 
         for layer in self.layers:
             # Generate query position from sine-encoded reference boxes
-            query_sine_embed = self._pos_enc.encode_boxes(reference_boxes)  # (B, Q, 4*D/2=2D)
+            query_sine_embed = self._pos_enc.encode_boxes(
+                reference_boxes
+            )  # (B, Q, 4*D/2=2D)
             query_pos = self.ref_point_head(query_sine_embed)  # (B, Q, D)
 
             # Pad query_pos with zeros for presence token at position 0
@@ -296,13 +307,19 @@ class DETRDecoder(nn.Module):
 
             # Presence logit from presence token (index 0)
             pres_hidden = hidden_states[:, :1]
-            pres_logit = self.presence_head(self.presence_layer_norm(pres_hidden)).squeeze(-1)
-            pres_logit = mx.clip(pres_logit, -self.clamp_presence_logit_max_val, self.clamp_presence_logit_max_val)
+            pres_logit = self.presence_head(
+                self.presence_layer_norm(pres_hidden)
+            ).squeeze(-1)
+            pres_logit = mx.clip(
+                pres_logit,
+                -self.clamp_presence_logit_max_val,
+                self.clamp_presence_logit_max_val,
+            )
             intermediate_presence.append(pres_logit)
 
         return (
-            mx.stack(intermediate_hs),       # (L, B, Q, D)
-            mx.stack(intermediate_boxes),     # (L, B, Q, 4)
+            mx.stack(intermediate_hs),  # (L, B, Q, D)
+            mx.stack(intermediate_boxes),  # (L, B, Q, 4)
             mx.stack(intermediate_presence),  # (L, B, 1)
         )
 
@@ -323,7 +340,12 @@ class DETRDecoder(nn.Module):
         B, Q, _ = reference_boxes.shape
 
         # Convert cxcywh to xyxy
-        cx, cy, w, h = reference_boxes[..., 0], reference_boxes[..., 1], reference_boxes[..., 2], reference_boxes[..., 3]
+        cx, cy, w, h = (
+            reference_boxes[..., 0],
+            reference_boxes[..., 1],
+            reference_boxes[..., 2],
+            reference_boxes[..., 3],
+        )
         x1 = cx - w / 2
         y1 = cy - h / 2
         x2 = cx + w / 2
@@ -346,9 +368,13 @@ class DETRDecoder(nn.Module):
 
         # Log-scale encoding
         deltas_x_log = deltas_x * 8
-        deltas_x_log = mx.sign(deltas_x_log) * mx.log2(mx.abs(deltas_x_log) + 1.0) / math.log2(8)
+        deltas_x_log = (
+            mx.sign(deltas_x_log) * mx.log2(mx.abs(deltas_x_log) + 1.0) / math.log2(8)
+        )
         deltas_y_log = deltas_y * 8
-        deltas_y_log = mx.sign(deltas_y_log) * mx.log2(mx.abs(deltas_y_log) + 1.0) / math.log2(8)
+        deltas_y_log = (
+            mx.sign(deltas_y_log) * mx.log2(mx.abs(deltas_y_log) + 1.0) / math.log2(8)
+        )
 
         # Embed deltas -> (B, Q, H/W, num_heads)
         rpb_x = self.box_rpb_embed_x(deltas_x_log)  # (B, Q, W, num_heads)

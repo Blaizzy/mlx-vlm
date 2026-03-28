@@ -3,7 +3,7 @@
 Handles image resizing/normalization and CLIP tokenization.
 """
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Tuple, Union
 
 import numpy as np
 from PIL import Image
@@ -30,6 +30,7 @@ class Sam3Processor:
         """Load processor from pretrained model."""
         import json
         from pathlib import Path
+
         from huggingface_hub import hf_hub_download
 
         model_path = Path(pretrained_model_name_or_path)
@@ -106,7 +107,9 @@ class Sam3Processor:
             from transformers import CLIPTokenizer
 
             # SAM3 uses CLIP tokenizer
-            self._tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+            self._tokenizer = CLIPTokenizer.from_pretrained(
+                "openai/clip-vit-base-patch32"
+            )
         return self._tokenizer
 
     def preprocess_image(
@@ -128,7 +131,9 @@ class Sam3Processor:
 
         return {"pixel_values": pixel_values}
 
-    def _process_single_image(self, image: Union[Image.Image, np.ndarray]) -> np.ndarray:
+    def _process_single_image(
+        self, image: Union[Image.Image, np.ndarray]
+    ) -> np.ndarray:
         """Process a single image."""
         if isinstance(image, np.ndarray):
             image = Image.fromarray(image.astype(np.uint8))

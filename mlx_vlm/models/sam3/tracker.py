@@ -9,16 +9,8 @@ from typing import Dict, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from .config import TrackerConfig, VisionEncoderConfig
-from .encoder import MultiheadAttention, MLP
-from .sam_components import (
-    SAMMaskDecoder,
-    SAMPromptEncoder,
-    LayerNorm2d,
-    RoPEAttention,
-)
-from .vision import FPNNeck
-
+from .config import TrackerConfig
+from .sam_components import LayerNorm2d, RoPEAttention, SAMMaskDecoder, SAMPromptEncoder
 
 # ---------------------------------------------------------------------------
 # Memory Components
@@ -42,9 +34,11 @@ class SimpleMaskDownSampler(nn.Module):
         channels = [1, 4, 16, 64, embed_dim]
         self.layers = []
         for i in range(4):
-            self.layers.append(DownsampleConvBlock(
-                channels[i], channels[i + 1], kernel_size, stride, padding
-            ))
+            self.layers.append(
+                DownsampleConvBlock(
+                    channels[i], channels[i + 1], kernel_size, stride, padding
+                )
+            )
 
         self.final_conv = nn.Conv2d(embed_dim, embed_dim, kernel_size=1, bias=True)
 
@@ -65,9 +59,13 @@ class SimpleMaskDownSampler(nn.Module):
 class DownsampleConvBlock(nn.Module):
     """Single conv + layernorm + GELU block."""
 
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, stride: int, padding: int):
+    def __init__(
+        self, in_ch: int, out_ch: int, kernel_size: int, stride: int, padding: int
+    ):
         super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size, stride=stride, padding=padding)
+        self.conv = nn.Conv2d(
+            in_ch, out_ch, kernel_size, stride=stride, padding=padding
+        )
         self.layer_norm = LayerNorm2d(out_ch)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -253,7 +251,10 @@ class MemoryAttention(nn.Module):
 
     def __init__(self, config: TrackerConfig):
         super().__init__()
-        self.layers = [MemoryAttentionLayer(config) for _ in range(config.memory_attention_num_layers)]
+        self.layers = [
+            MemoryAttentionLayer(config)
+            for _ in range(config.memory_attention_num_layers)
+        ]
         self.layer_norm = nn.LayerNorm(config.memory_attention_hidden_size)
 
     def __call__(
@@ -331,7 +332,9 @@ class TrackerModel(nn.Module):
         self.no_object_pointer = mx.zeros((1, d))
 
         # Memory temporal positional encoding
-        self.memory_temporal_positional_encoding = mx.zeros((config.num_maskmem, 1, 1, mem_dim))
+        self.memory_temporal_positional_encoding = mx.zeros(
+            (config.num_maskmem, 1, 1, mem_dim)
+        )
 
         # Object pointer
         self.object_pointer_proj = ObjectPointerMLP(d)
@@ -417,7 +420,10 @@ class TrackerModel(nn.Module):
         target = 1152
         if mask_for_mem.shape[1] != target:
             up = nn.Upsample(
-                scale_factor=(target / mask_for_mem.shape[1], target / mask_for_mem.shape[2]),
+                scale_factor=(
+                    target / mask_for_mem.shape[1],
+                    target / mask_for_mem.shape[2],
+                ),
                 mode="nearest",
             )
             mask_for_mem = up(mask_for_mem)
