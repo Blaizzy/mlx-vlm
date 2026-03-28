@@ -18,8 +18,8 @@ from .geometry import GeometryEncoder
 from .position import PositionEmbeddingSine
 from .segmentation import DotProductScoring, MaskDecoder
 from .text_encoder import TextEncoder
-from .tracker import FPNNeck, TrackerModel
-from .vision import VisionEncoder
+from .tracker import TrackerModel
+from .vision import FPNNeck, VisionEncoder
 
 # ---------------------------------------------------------------------------
 # Detector Model
