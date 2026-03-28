@@ -1386,11 +1386,11 @@ def main():
   # Video tracking
   python -m mlx_vlm.models.sam3.generate --task track --video input.mp4 --prompt "a car"
 
-  # Real-time tracking (live preview window, press 'q' to quit)
-  python -m mlx_vlm.models.sam3.generate --task realtime --video input.mp4 --prompt "a car"
+  # Real-time webcam (live preview window, press 'q' to quit)
+  python -m mlx_vlm.models.sam3.generate --task realtime --prompt "a person"
 
-  # Real-time webcam
-  python -m mlx_vlm.models.sam3.generate --task realtime --video 0 --prompt "a person"
+  # Real-time webcam with background swap
+  python -m mlx_vlm.models.sam3.generate --task realtime --prompt "a person" --bg-image beach.jpg
 """,
     )
     parser.add_argument(
@@ -1405,7 +1405,7 @@ def main():
     parser.add_argument(
         "--video",
         default=None,
-        help="Input video path or '0' for webcam (track/realtime)",
+        help="Input video path (track only)",
     )
     parser.add_argument(
         "--prompt",
@@ -1487,10 +1487,8 @@ def main():
             resolution=args.resolution,
         )
     elif args.task == "realtime":
-        if args.video is None:
-            parser.error("--video is required for --task realtime (use '0' for webcam)")
         track_video_realtime(
-            video_path=args.video,
+            video_path="0",
             prompts=prompts,
             model_path=args.model,
             threshold=args.threshold if args.threshold is not None else 0.5,
