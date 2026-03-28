@@ -4,7 +4,7 @@ Open-vocabulary detection, segmentation, and tracking model.
 Unlike standard VLMs, SAM3 outputs masks/boxes instead of text.
 
 Usage:
-    from mlx_vlm.models.sam3.segment import Sam3Predictor, Sam3VideoPredictor
+    from mlx_vlm.models.sam3.generate import Sam3Predictor, Sam3VideoPredictor
 """
 
 from . import processing_sam3  # Install processor patch

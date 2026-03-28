@@ -301,7 +301,7 @@ def save_video_tracking(mlx_model, mlx_proc, output_path="sam3_tracking.png"):
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from mlx_vlm.models.sam3.segment import Sam3Predictor
+    from mlx_vlm.models.sam3.generate import Sam3Predictor
 
     predictor = Sam3Predictor(mlx_model, mlx_proc, score_threshold=0.1)
 

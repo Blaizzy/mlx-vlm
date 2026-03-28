@@ -1,7 +1,7 @@
 """SAM3 Inference Pipeline for image and video segmentation.
 
 Usage:
-    from mlx_vlm.models.sam3.segment import Sam3Predictor, Sam3VideoPredictor
+    from mlx_vlm.models.sam3.generate import Sam3Predictor, Sam3VideoPredictor
 
     # Image segmentation
     predictor = Sam3Predictor(model, processor)
