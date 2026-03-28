@@ -194,19 +194,19 @@ class DotProductScoring(nn.Module):
     def __call__(
         self,
         hs: mx.array,
-        text_features: mx.array,
+        inputs_embeds: mx.array,
         text_mask: Optional[mx.array] = None,
     ) -> mx.array:
         """
         Args:
             hs: (L, B, Q, D) intermediate hidden states from decoder
-            text_features: (B, T, D)
+            inputs_embeds: (B, T, D)
             text_mask: (B, T) where 1=valid, 0=padding
         Returns:
             scores: (L, B, Q, 1)
         """
-        orig_text = text_features
-        text_processed = self.text_mlp(text_features) + orig_text
+        orig_text = inputs_embeds
+        text_processed = self.text_mlp(inputs_embeds) + orig_text
         text_processed = self.text_mlp_out_norm(text_processed)
 
         if text_mask is not None:

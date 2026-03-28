@@ -43,7 +43,7 @@ class DETRDecoderLayer(nn.Module):
         self,
         hidden_states: mx.array,
         query_pos: mx.array,
-        text_features: mx.array,
+        inputs_embeds: mx.array,
         vision_features: mx.array,
         vision_pos_encoding: mx.array,
         text_cross_attn_mask: Optional[mx.array] = None,
@@ -53,7 +53,7 @@ class DETRDecoderLayer(nn.Module):
         Args:
             hidden_states: (B, Q+1, D) queries + presence token at index 0
             query_pos: (B, Q+1, D) position embeddings (0 for presence token)
-            text_features: (B, T, D)
+            inputs_embeds: (B, T, D)
             vision_features: (B, HW, D)
             vision_pos_encoding: (B, HW, D)
             text_cross_attn_mask: (B, 1, Q+1, T) cross-attention mask
@@ -69,7 +69,7 @@ class DETRDecoderLayer(nn.Module):
         residual = hidden_states
         q_with_pos = hidden_states + query_pos
         attn_out = self.text_cross_attn(
-            q_with_pos, text_features, text_features, mask=text_cross_attn_mask
+            q_with_pos, inputs_embeds, inputs_embeds, mask=text_cross_attn_mask
         )
         hidden_states = self.text_cross_attn_layer_norm(residual + attn_out)
 
@@ -224,7 +224,7 @@ class DETRDecoder(nn.Module):
     def __call__(
         self,
         vision_features: mx.array,
-        text_features: mx.array,
+        inputs_embeds: mx.array,
         vision_pos_encoding: mx.array,
         text_mask: Optional[mx.array] = None,
         spatial_shape: Optional[Tuple[int, int]] = None,
@@ -286,7 +286,7 @@ class DETRDecoder(nn.Module):
             hidden_states = layer(
                 hidden_states,
                 query_pos=query_pos_padded,
-                text_features=text_features,
+                inputs_embeds=inputs_embeds,
                 vision_features=vision_features,
                 vision_pos_encoding=vision_pos_encoding,
                 text_cross_attn_mask=text_cross_mask,

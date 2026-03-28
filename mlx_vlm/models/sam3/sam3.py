@@ -70,14 +70,32 @@ class DetectorModel(nn.Module):
             det_cfg.detr_encoder_config.hidden_size // 2
         )
 
+    def get_input_embeddings(
+        self,
+        input_ids: mx.array,
+        attention_mask: Optional[mx.array] = None,
+    ) -> mx.array:
+        """Encode text separately (cacheable across frames).
+
+        Returns:
+            inputs_embeds: (B, T, D) projected text features
+        """
+        text_hidden = self.text_encoder(input_ids, attention_mask)
+        return self.text_projection(text_hidden)
+
     def __call__(
         self,
         pixel_values: mx.array,
-        input_ids: mx.array,
+        input_ids: Optional[mx.array] = None,
         attention_mask: Optional[mx.array] = None,
         boxes: Optional[mx.array] = None,
+        inputs_embeds: Optional[mx.array] = None,
     ) -> Dict[str, mx.array]:
-        """Matching HF Sam3Model.forward."""
+        """Matching HF Sam3Model.forward.
+
+        Either pass (input_ids, attention_mask) to encode text on the fly,
+        or pass pre-computed inputs_embeds to skip text encoding.
+        """
         B = pixel_values.shape[0]
 
         # 1. Vision backbone -> multi-scale FPN features + position encodings
@@ -90,12 +108,12 @@ class DetectorModel(nn.Module):
         fpn_features_trimmed = fpn_features[:-1]
         fpn_pos_trimmed = fpn_pos[:-1]
 
-        # 2. Text encoding
-        text_hidden = self.text_encoder(input_ids, attention_mask)  # (B, T, 1024)
-        text_features = self.text_projection(text_hidden)  # (B, T, D=256)
+        # 2. Text encoding (use cache if provided)
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings(input_ids, attention_mask)
 
         # 3. Combine text + optional geometry prompts
-        prompt = text_features
+        prompt = inputs_embeds
         prompt_mask = attention_mask
 
         # 4. DETR Encoder: uses LAST level of trimmed FPN (72x72)
@@ -112,7 +130,7 @@ class DetectorModel(nn.Module):
         # 5. DETR Decoder
         hs, ref_boxes, presence_logits = self.detr_decoder(
             vision_features=encoded,
-            text_features=prompt,
+            inputs_embeds=prompt,
             vision_pos_encoding=pos_flat,
             text_mask=prompt_mask,
             spatial_shape=(H, W),
@@ -247,12 +265,33 @@ class Model(nn.Module):
     def detect(
         self,
         pixel_values: mx.array,
-        input_ids: mx.array,
+        input_ids: Optional[mx.array] = None,
         attention_mask: Optional[mx.array] = None,
         boxes: Optional[mx.array] = None,
+        inputs_embeds: Optional[mx.array] = None,
     ) -> Dict[str, mx.array]:
-        """Run detection on a single image."""
-        return self.detector_model(pixel_values, input_ids, attention_mask, boxes)
+        """Run detection on a single image.
+
+        Pass inputs_embeds (from get_input_embeddings) to skip text encoding.
+        """
+        return self.detector_model(
+            pixel_values, input_ids, attention_mask, boxes,
+            inputs_embeds=inputs_embeds,
+        )
+
+    def get_input_embeddings(
+        self,
+        input_ids: mx.array,
+        attention_mask: Optional[mx.array] = None,
+    ) -> Tuple[mx.array, mx.array]:
+        """Encode text once, reuse across frames.
+
+        Returns:
+            (inputs_embeds, attention_mask) tuple for passing to detect().
+        """
+        inputs_embeds = self.detector_model.get_input_embeddings(input_ids, attention_mask)
+        mx.eval(inputs_embeds)
+        return inputs_embeds, attention_mask
 
     def track_init(
         self,

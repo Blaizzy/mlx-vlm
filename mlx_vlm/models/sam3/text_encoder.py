@@ -168,7 +168,7 @@ class TextEncoder(nn.Module):
             input_ids: (B, seq_len)
             attention_mask: (B, seq_len)
         Returns:
-            text_features: (B, seq_len, hidden_size) - raw hidden states
+            inputs_embeds: (B, seq_len, hidden_size) - raw hidden states
         """
         hidden_states = self.text_model(input_ids, attention_mask)
         return hidden_states
