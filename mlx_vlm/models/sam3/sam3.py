@@ -178,6 +178,40 @@ class Model(nn.Module):
         # Tracker FPN neck (separate from detector's neck)
         self.tracker_neck = FPNNeck(config.tracker_config.vision_config)
 
+    @staticmethod
+    def quant_predicate(path: str, module) -> bool:
+        """Control which layers get quantized.
+
+        Skip:
+        - Vision encoder (keep full precision for accuracy)
+        - Small embeddings (query_embed, reference_points, presence_token, etc.)
+        - Conv layers (not supported by quantization)
+        - Layers with dimensions not divisible by 64
+        """
+        # Skip conv layers (not supported by QuantizedLinear)
+        if any(k in path for k in [
+            "conv", "depthwise", "mask_downsample",
+            "pixel_decoder", "instance_projection", "semantic_projection",
+            "fpn_layers", "patch_embeddings",
+        ]):
+            return False
+        # Skip small/structural embeddings
+        if any(k in path for k in [
+            "query_embed", "reference_points", "presence_token",
+            "label_embed", "cls_embed", "point_embed", "not_a_point",
+            "no_mask_embed", "no_memory", "no_object", "iou_token",
+            "mask_tokens", "obj_score_token", "shared_embedding",
+            "shared_image_embedding", "occlusion_spatial",
+            "memory_temporal", "position_embedding",
+        ]):
+            return False
+        # Skip layers with weight dims not divisible by 64
+        if hasattr(module, "weight"):
+            shape = module.weight.shape
+            if any(d % 64 != 0 for d in shape):
+                return False
+        return True
+
     def detect(
         self,
         pixel_values: mx.array,

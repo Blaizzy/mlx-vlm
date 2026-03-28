@@ -62,6 +62,43 @@ class Sam3Processor:
             image_std=image_std,
         )
 
+    def save_pretrained(self, save_directory: str, **kwargs):
+        """Save processor config and tokenizer to directory."""
+        import json
+        from pathlib import Path
+
+        save_dir = Path(save_directory)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save processor_config.json
+        proc_config = {
+            "processor_class": "Sam3Processor",
+            "image_processor": {
+                "image_processor_type": "Sam3ImageProcessor",
+                "size": {"height": self.image_size, "width": self.image_size},
+                "image_mean": [float(x) for x in self.image_mean],
+                "image_std": [float(x) for x in self.image_std],
+                "do_resize": True,
+                "do_normalize": True,
+                "do_rescale": True,
+                "rescale_factor": 1 / 255.0,
+            },
+            "target_size": self.image_size,
+        }
+        with open(save_dir / "processor_config.json", "w") as f:
+            json.dump(proc_config, f, indent=2)
+
+        # Copy tokenizer files if available
+        if self._tokenizer is not None:
+            self._tokenizer.save_pretrained(str(save_dir))
+        else:
+            # Save tokenizer from the CLIP model
+            try:
+                tok = self.tokenizer  # triggers lazy load
+                tok.save_pretrained(str(save_dir))
+            except Exception:
+                pass
+
     @property
     def tokenizer(self):
         """Lazy-load CLIP tokenizer."""
