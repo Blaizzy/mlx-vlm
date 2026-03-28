@@ -1,6 +1,8 @@
 """Tests for custom processor implementations."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -314,6 +316,97 @@ class TestGemma3nProcessor(_ProcessorTestBase, unittest.TestCase):
 
     def _image_call_args(self):
         return {"text": ["<image> Cats"], "images": [_make_image()]}
+
+
+class TestDotsVLProcessor(unittest.TestCase):
+    def test_sets_upstream_special_token_ids(self):
+        from mlx_vlm.models.dots_ocr.processing_dots_ocr import (
+            DotsDummyVideoProcessor,
+            DotsVLProcessor,
+        )
+
+        def _fake_init(
+            self,
+            image_processor=None,
+            tokenizer=None,
+            chat_template=None,
+        ):
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+            self.chat_template = chat_template
+
+        tokenizer = _mock_tokenizer(
+            image_token="<|imgpad|>",
+            image_token_id=7,
+            video_token="<|video_pad|>",
+            video_token_id=13,
+        )
+
+        with patch(
+            "mlx_vlm.models.dots_ocr.processing_dots_ocr.ProcessorMixin.__init__",
+            _fake_init,
+        ):
+            processor = DotsVLProcessor(
+                image_processor=_mock_ip(),
+                tokenizer=tokenizer,
+            )
+
+        self.assertEqual(processor.image_token, "<|imgpad|>")
+        self.assertEqual(processor.image_token_id, 151665)
+        self.assertEqual(processor.video_token, "<|video_pad|>")
+        self.assertEqual(processor.video_token_id, 151656)
+        self.assertIsInstance(processor.video_processor, DotsDummyVideoProcessor)
+        self.assertEqual(processor.video_processor.temporal_patch_size, 1)
+
+    def test_from_pretrained_uses_slow_image_processor(self):
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.dots_ocr.processing_dots_ocr import (
+            DotsDummyVideoProcessor,
+            DotsVLProcessor,
+        )
+
+        def _fake_init(
+            self,
+            image_processor=None,
+            tokenizer=None,
+            chat_template=None,
+        ):
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+            self.chat_template = chat_template
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "chat_template.json").write_text(
+                '{"chat_template": "{{ messages[0].content }}"}'
+            )
+
+            tokenizer_from_pretrained = lambda *args, **kwargs: _mock_tokenizer()
+            image_from_pretrained = unittest.mock.Mock(return_value=_mock_ip())
+
+            with (
+                patch.dict(
+                    "transformers.__dict__",
+                    {
+                        "AutoTokenizer": SimpleNamespace(
+                            from_pretrained=tokenizer_from_pretrained
+                        ),
+                        "AutoImageProcessor": SimpleNamespace(
+                            from_pretrained=image_from_pretrained
+                        ),
+                    },
+                ),
+                patch(
+                    "mlx_vlm.models.dots_ocr.processing_dots_ocr.ProcessorMixin.__init__",
+                    _fake_init,
+                ),
+            ):
+                processor = DotsVLProcessor.from_pretrained(tmpdir, use_fast=True)
+
+        image_from_pretrained.assert_called_once()
+        self.assertEqual(image_from_pretrained.call_args.kwargs["use_fast"], False)
+        self.assertIsInstance(processor.video_processor, DotsDummyVideoProcessor)
 
 
 class TestSmolVLMProcessor(_ProcessorTestBase, unittest.TestCase):
@@ -1188,6 +1281,16 @@ class TestQwen3_5MoePatch(unittest.TestCase):
             "qwen3_5_moe",
             "mlx_vlm.models.qwen3_vl.processing_qwen3_vl",
             "Qwen3VLProcessor",
+        )
+
+
+class TestDotsVLPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "dots_ocr",
+            "mlx_vlm.models.dots_ocr.processing_dots_ocr",
+            "DotsVLProcessor",
         )
 
 
