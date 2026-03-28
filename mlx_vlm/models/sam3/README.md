@@ -103,6 +103,38 @@ pred_masks = outputs["pred_masks"]
 semantic_seg = outputs["semantic_seg"]
 ```
 
+## Image: Batched Inference
+
+Process multiple images in a single forward pass:
+
+```python
+import mlx.core as mx
+import numpy as np
+
+images = [Image.open("photo1.jpg"), Image.open("photo2.jpg")]
+
+# Stack pixel values into a batch
+pixel_values = mx.array(np.stack([
+    processor.preprocess_image(img)["pixel_values"][0] for img in images
+]))  # (B, 1008, 1008, 3)
+
+# Encode text once (shared across the batch)
+text_inputs = processor.preprocess_text("a cat")
+input_ids = mx.array(np.tile(text_inputs["input_ids"], (len(images), 1)))
+attention_mask = mx.array(np.tile(text_inputs["attention_mask"], (len(images), 1)))
+
+outputs = model.detect(pixel_values, input_ids, attention_mask)
+mx.eval(outputs)
+
+# outputs["pred_logits"]: (B, 200)
+# outputs["pred_boxes"]:  (B, 200, 4)
+# outputs["pred_masks"]:  (B, 200, 288, 288)
+for i in range(len(images)):
+    scores = 1 / (1 + np.exp(-np.array(outputs["pred_logits"][i])))
+    print(f"Image {i}: top score = {scores.max():.2f}")
+```
+
+
 ## Video: Tracking (CLI)
 
 Track objects in a video from the command line:
@@ -156,6 +188,56 @@ results = video_predictor.propagate()
 for r in results:
     print(f"Frame {r.frame_idx}: {len(r.object_ids)} objects tracked")
 ```
+
+### Video: Batched Frame Processing
+
+For maximum throughput, process multiple video frames at once using the low-level API:
+
+```python
+import cv2
+import mlx.core as mx
+import numpy as np
+
+cap = cv2.VideoCapture("video.mp4")
+batch_size = 4
+
+# Encode text once, reuse for all frames
+text_inputs = processor.preprocess_text("a car")
+input_ids = mx.array(text_inputs["input_ids"])
+attention_mask = mx.array(text_inputs["attention_mask"])
+inputs_embeds, attention_mask = model.get_text_features(input_ids, attention_mask)
+
+while cap.isOpened():
+    frames = []
+    for _ in range(batch_size):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        frames.append(processor.preprocess_image(pil)["pixel_values"][0])
+
+    if not frames:
+        break
+
+    pixel_values = mx.array(np.stack(frames))  # (B, 1008, 1008, 3)
+    B = len(frames)
+
+    outputs = model.detect(
+        pixel_values,
+        attention_mask=mx.tile(attention_mask, (B, 1)),
+        inputs_embeds=mx.tile(inputs_embeds, (B, 1, 1)),
+    )
+    mx.eval(outputs)
+
+    # Process each image in the batch
+    for i in range(B):
+        scores = 1 / (1 + np.exp(-np.array(outputs["pred_logits"][i])))
+        print(f"  {scores[scores > 0.3].shape[0]} detections")
+
+cap.release()
+```
+
+> **Tip:** Use `--every N` in the CLI to skip frames — this gives a real Nx speedup since it avoids the expensive ViT pass entirely. Batching processes more frames but doesn't improve per-frame speed.
 
 See [`examples/sam3_demo.ipynb`](../../../examples/sam3_demo.ipynb) for a full interactive notebook demo.
 
