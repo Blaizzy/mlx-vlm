@@ -51,15 +51,42 @@ overlay = np.array(image).copy()
 overlay[mask > 0] = overlay[mask > 0] * 0.5 + np.array([255, 0, 0]) * 0.5
 ```
 
-### Video Tracking
+### Video Tracking (CLI)
 
-Track objects across video frames using text, point, or box prompts:
+Track objects in a video from the command line:
+
+```bash
+python -m mlx_vlm.models.sam3.track_video --video input.mp4 --prompt "a car"
+```
+
+Output saves to `input_tracked.mp4` by default. Full options:
+
+```bash
+python -m mlx_vlm.models.sam3.track_video \
+    --video input.mp4 \
+    --prompt "a person" \
+    --output output.mp4 \
+    --threshold 0.2 \
+    --every 4 \
+    --nms-thresh 0.5
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--video` | *(required)* | Input video path |
+| `--prompt` | *(required)* | Text prompt for detection |
+| `--output` | `<input>_tracked.mp4` | Output video path |
+| `--model` | `facebook/sam3` | Model path or HF repo |
+| `--threshold` | `0.15` | Detection score threshold |
+| `--every` | `2` | Run detection every N frames |
+| `--nms-thresh` | `0.5` | NMS IoU threshold |
+
+### Video Tracking (Python)
 
 ```python
 import cv2
 from mlx_vlm.models.sam3.generate import Sam3VideoPredictor
 
-# Load video frames
 cap = cv2.VideoCapture("video.mp4")
 frames = []
 while cap.isOpened():
@@ -69,19 +96,16 @@ while cap.isOpened():
     frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
 cap.release()
 
-# Set up tracker
 video_predictor = Sam3VideoPredictor(model, processor, score_threshold=0.15)
 video_predictor.set_video(frames)
-
-# Initialize with any prompt type on a keyframe
 video_predictor.add_text_prompt("a car", frame_idx=0)
 
-# Propagate through all frames
 results = video_predictor.propagate()
 for r in results:
-    # r.frame_idx, r.masks (N_obj, H, W), r.scores (N_obj,), r.object_ids
     print(f"Frame {r.frame_idx}: {len(r.object_ids)} objects tracked")
 ```
+
+See [`examples/sam3_demo.ipynb`](../../../examples/sam3_demo.ipynb) for a full interactive notebook demo.
 
 ## Architecture
 
@@ -141,5 +165,6 @@ mlx_vlm/models/sam3/
 ├── sam_components.py     # SAM prompt encoder, mask decoder, TwoWayTransformer
 ├── tracker.py            # Memory encoder, memory attention, tracker model
 ├── generate.py           # Inference pipeline (Sam3Predictor, Sam3VideoPredictor)
+├── track_video.py        # CLI: python -m mlx_vlm.models.sam3.track_video
 └── processing_sam3.py    # Image/text preprocessing
 ```
