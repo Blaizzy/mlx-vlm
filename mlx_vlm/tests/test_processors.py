@@ -633,6 +633,88 @@ class TestMistral3Processor(_ProcessorTestBase, unittest.TestCase):
     def _image_call_args(self):
         return {"text": ["[IMG]Describe"], "images": [[_make_image()]]}
 
+    def test_from_pretrained_prefers_model_geometry_over_processor_config(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from mlx_vlm.models.mistral3.processing_mistral3 import Mistral3Processor
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            (path / "processor_config.json").write_text(
+                json.dumps(
+                    {
+                        "patch_size": 16,
+                        "spatial_merge_size": 1,
+                        "image_token": "[IMG]",
+                        "image_break_token": "[IMG_BREAK]",
+                        "image_end_token": "[IMG_END]",
+                    }
+                )
+            )
+            (path / "preprocessor_config.json").write_text(
+                json.dumps(
+                    {
+                        "patch_size": {"height": 14, "width": 14},
+                        "image_processor_type": "PixtralImageProcessor",
+                    }
+                )
+            )
+            (path / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "mistral3",
+                        "spatial_merge_size": 2,
+                        "vision_config": {"patch_size": 14},
+                    }
+                )
+            )
+
+            class DummyImageProcessor:
+                model_input_names = ["pixel_values"]
+
+            def _fake_init(
+                self,
+                image_processor=None,
+                tokenizer=None,
+                patch_size=16,
+                spatial_merge_size=1,
+                image_token="[IMG]",
+                image_break_token="[IMG_BREAK]",
+                image_end_token="[IMG_END]",
+                chat_template=None,
+                **kwargs,
+            ):
+                self.image_processor = image_processor
+                self.tokenizer = tokenizer
+                self.patch_size = patch_size
+                self.spatial_merge_size = spatial_merge_size
+                self.image_token = image_token
+                self.image_break_token = image_break_token
+                self.image_end_token = image_end_token
+                self.chat_template = chat_template
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=_mock_tokenizer(),
+                ),
+                patch(
+                    "mlx_vlm.models.mistral3.processing_mistral3._load_mistral3_image_processor",
+                    return_value=DummyImageProcessor(),
+                ),
+                patch.object(Mistral3Processor, "__init__", _fake_init),
+            ):
+                processor = Mistral3Processor.from_pretrained(tmpdir)
+
+        self.assertEqual(processor.patch_size, 14)
+        self.assertEqual(processor.spatial_merge_size, 2)
+        self.assertEqual(processor.image_token, "[IMG]")
+        self.assertEqual(processor.image_break_token, "[IMG_BREAK]")
+        self.assertEqual(processor.image_end_token, "[IMG_END]")
+
 
 class TestMultiModalityProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
@@ -802,6 +884,118 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertEqual(_num_image_tokens_from_patch_grid(1, 1, 2), 1)
         self.assertEqual(_num_image_tokens_from_patch_grid(7, 9, 4), 6)
 
+    def test_scalar_image_rows_and_cols_are_supported(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import _patched_call
+
+        class DummyImageProcessor:
+            def __init__(self):
+                self.patch_size = 16
+                self.downsample_factor = 2
+                self.tile_size = 512
+                self.max_image_tokens = 256
+                self.min_image_tokens = 64
+                self.encoder_patch_size = 16
+                self.do_image_splitting = False
+                self.use_thumbnail = False
+
+            def fetch_images(self, images):
+                return [images]
+
+            def __call__(self, images, **kwargs):
+                return {
+                    "pixel_values": np.zeros((1, 16, 768), dtype=np.float32),
+                    "image_rows": np.array([np.int64(1)]),
+                    "image_cols": np.array([np.int64(1)]),
+                    "image_sizes": [[416, 576]],
+                }
+
+        processor = type("DummyProcessor", (), {})()
+        processor.image_processor = DummyImageProcessor()
+        processor.tokenizer = _mock_tokenizer(image_token="<image>")
+        processor.image_token = "<image>"
+        processor.image_start_token = "<|image_start|>"
+        processor.image_end_token = "<|image_end|>"
+        processor._merge_kwargs = lambda *args, **kwargs: {
+            "text_kwargs": {},
+            "images_kwargs": {},
+        }
+
+        result = _patched_call(
+            processor,
+            images=_make_image(),
+            text="<image>Describe this image",
+        )
+
+        self.assertIn("input_ids", result)
+        self.assertIn("attention_mask", result)
+
+    def test_from_pretrained_uses_slow_image_processor(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlProcessor
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "preprocessor_config.json").write_text(
+                json.dumps(
+                    {
+                        "image_processor_type": "Lfm2VlImageProcessorFast",
+                        "do_resize": False,
+                        "do_image_splitting": True,
+                        "do_normalize": True,
+                        "do_rescale": True,
+                        "image_mean": [0.5, 0.5, 0.5],
+                        "image_std": [0.5, 0.5, 0.5],
+                        "max_num_patches": 1024,
+                        "patch_size": 16,
+                        "return_row_col_info": True,
+                    }
+                )
+            )
+
+            class DummySiglip2ImageProcessor:
+                def __init__(self, **kwargs):
+                    self.do_resize = kwargs.get("do_resize", True)
+                    self.do_image_splitting = kwargs.get("do_image_splitting", False)
+                    self.image_mean = kwargs.get("image_mean")
+                    self.image_std = kwargs.get("image_std")
+                    self.max_num_patches = kwargs.get("max_num_patches")
+                    self.patch_size = kwargs.get("patch_size")
+
+            def _fake_init(
+                self, image_processor, tokenizer, chat_template=None, **kwargs
+            ):
+                self.image_processor = image_processor
+                self.tokenizer = tokenizer
+                self.chat_template = chat_template
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=_mock_tokenizer(),
+                ),
+                patch(
+                    "mlx_vlm.models.lfm2_vl.processing_lfm2_vl.Siglip2ImageProcessor",
+                    DummySiglip2ImageProcessor,
+                    create=True,
+                ),
+                patch(
+                    "mlx_vlm.models.lfm2_vl.processing_lfm2_vl._SLOW_PROCESSOR_AVAILABLE",
+                    True,
+                ),
+                patch(
+                    "mlx_vlm.models.lfm2_vl.processing_lfm2_vl._original_init",
+                    _fake_init,
+                ),
+            ):
+                processor = Lfm2VlProcessor.from_pretrained(tmpdir)
+
+        self.assertIsInstance(processor.image_processor, DummySiglip2ImageProcessor)
+        self.assertTrue(processor.image_processor.do_resize)
+        self.assertFalse(processor.image_processor.do_image_splitting)
+
 
 # ── AutoProcessor patch tests ─────────────────────────────────────────────────
 
@@ -879,6 +1073,27 @@ class TestHunYuanVLPatch(unittest.TestCase):
         )
 
 
+class TestLfm2VlPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        import importlib
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        importlib.import_module("mlx_vlm.models.lfm2_vl")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps({"model_type": "lfm2_vl"})
+            )
+            with self.assertRaises(Exception) as cm:
+                AutoProcessor.from_pretrained(tmpdir)
+
+            self.assertNotIn("requires `torchvision`", str(cm.exception).lower())
+
+
 class TestErnie4_5VLPatch(unittest.TestCase):
     def test_patch_intercepts(self):
         _assert_patch_intercepts(
@@ -886,6 +1101,26 @@ class TestErnie4_5VLPatch(unittest.TestCase):
             "ernie4_5_moe_vl",
             "mlx_vlm.models.ernie4_5_moe_vl",
             "Ernie4_5_VLProcessor",
+        )
+
+
+class TestQwen3_5Patch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "qwen3_5",
+            "mlx_vlm.models.qwen3_vl.processing_qwen3_vl",
+            "Qwen3VLProcessor",
+        )
+
+
+class TestQwen3_5MoePatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "qwen3_5_moe",
+            "mlx_vlm.models.qwen3_vl.processing_qwen3_vl",
+            "Qwen3VLProcessor",
         )
 
 

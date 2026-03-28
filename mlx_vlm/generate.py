@@ -40,6 +40,7 @@ DEFAULT_REPETITION_CONTEXT_SIZE = 20
 DEFAULT_KV_GROUP_SIZE = 64
 DEFAULT_COMPLETION_BATCH_SIZE = 32
 DEFAULT_PREFILL_BATCH_SIZE = 8
+DEFAULT_THINKING_START_TOKEN = "<think>"
 DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
@@ -197,9 +198,8 @@ def parse_arguments():
     parser.add_argument(
         "--thinking-start-token",
         type=str,
-        default=None,
-        help="Token that marks the start of a thinking block (e.g. '<think>'). "
-        "If not set, thinking is assumed to start immediately.",
+        default=DEFAULT_THINKING_START_TOKEN,
+        help="Token that marks the start of a thinking block (default: %(default)s).",
     )
     parser.add_argument(
         "--thinking-end-token",
@@ -509,7 +509,9 @@ def stream_generate(
     # Set up thinking budget criteria if requested
     thinking_budget = kwargs.pop("thinking_budget", None)
     thinking_end_token = kwargs.pop("thinking_end_token", DEFAULT_THINKING_END_TOKEN)
-    thinking_start_token = kwargs.pop("thinking_start_token", None)
+    thinking_start_token = kwargs.pop(
+        "thinking_start_token", DEFAULT_THINKING_START_TOKEN
+    )
     enable_thinking = kwargs.pop("enable_thinking", False)
 
     # Skip special tokens
@@ -1369,9 +1371,8 @@ def main():
     num_audios = (
         1 if args.audio is not None else 0
     )  # TODO: Support multiple audio files
-    chat_template_kwargs = {}
-    if args.enable_thinking:
-        chat_template_kwargs["enable_thinking"] = True
+
+    chat_template_kwargs = {"enable_thinking": args.enable_thinking}
 
     prompt = apply_chat_template(
         processor,
@@ -1402,8 +1403,7 @@ def main():
         kwargs.update(args.processor_kwargs)
 
     # Add thinking kwargs
-    if args.enable_thinking:
-        kwargs["enable_thinking"] = True
+    kwargs["enable_thinking"] = args.enable_thinking
     if args.thinking_budget is not None:
         kwargs["thinking_budget"] = args.thinking_budget
         kwargs["thinking_end_token"] = args.thinking_end_token
