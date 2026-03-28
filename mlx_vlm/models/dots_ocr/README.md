@@ -1,6 +1,6 @@
-# DOTS-OCR
+# DOTS OCR
 
-DOTS-OCR is a vision-language OCR model for document parsing, layout analysis, and structured extraction.
+DOTS models are vision-language OCR models for document parsing, layout analysis, and structured extraction. `dots.mocr` extends the original `dots.ocr` checkpoint with stronger multilingual parsing and structured-graphics generation capabilities.
 
 ## Model
 
@@ -17,7 +17,7 @@ uv pip install mlx-vlm
 ### 1) Layout JSON extraction (detailed prompt)
 
 ```bash
-uv run mlx_vlm.generate --model rednote-hilab/dots.ocr --prompt "Please output the layout information from the PDF image, including each layout element's bbox, its category, and the corresponding text content within the bbox.
+uv run mlx_vlm.generate --model rednote-hilab/dots.mocr --prompt "Please output the layout information from the PDF image, including each layout element's bbox, its category, and the corresponding text content within the bbox.
 
 1. Bbox format: [x1, y1, x2, y2]
 
@@ -40,7 +40,7 @@ uv run mlx_vlm.generate --model rednote-hilab/dots.ocr --prompt "Please output t
 
 ```bash
 uv run mlx_vlm.generate \
-  --model rednote-hilab/dots.ocr \
+  --model rednote-hilab/dots.mocr \
   --image receipt.jpg \
   --prompt "Extract all text from this image." \
   --max-tokens 1024
@@ -50,7 +50,7 @@ uv run mlx_vlm.generate \
 
 ```bash
 uv run mlx_vlm.generate \
-  --model mlx-community/dots.ocr-4bit \
+  --model mlx-community/dots.mocr-4bit \
   --image page.png \
   --prompt "Convert this page to clean Markdown while preserving reading order." \
   --max-tokens 4096
@@ -66,7 +66,7 @@ uv run mlx_vlm.generate \
 from mlx_vlm import generate, load
 from mlx_vlm.prompt_utils import apply_chat_template
 
-MODEL = "mlx-community/dots.ocr-4bit"
+MODEL = "mlx-community/dots.mocr-4bit"
 IMAGE_PATH = "path_to_image.jpg"
 
 PROMPT = """Please output the layout information from the PDF image, including each layout element's bbox, its category, and the corresponding text content within the bbox.
@@ -112,7 +112,7 @@ print(result.text)
 from mlx_vlm import generate, load
 from mlx_vlm.prompt_utils import apply_chat_template
 
-MODEL = "mlx-community/dots.ocr-4bit"
+MODEL = "mlx-community/dots.mocr-4bit"
 IMAGE_PATH = "receipt.jpg"
 PROMPT = "Extract all text from this image."
 
@@ -140,7 +140,7 @@ print(result.text)
 from mlx_vlm import generate, load
 from mlx_vlm.prompt_utils import apply_chat_template
 
-MODEL = "mlx-community/dots.ocr-4bit"
+MODEL = "mlx-community/dots.mocr-4bit"
 IMAGE_PATH = "page.png"
 PROMPT = "Convert this page to clean Markdown while preserving reading order."
 
@@ -167,5 +167,6 @@ print(result.text)
 
 - For long documents and layout-heavy pages, increase `--max-tokens`.
 - To enforce strict structured output, keep prompts explicit about schema and sorting.
-- Official DOTS README: https://huggingface.co/rednote-hilab/dots.ocr
-- DOTS project/blog: https://github.com/rednote-hilab/dots.ocr
+- Official `dots.ocr` README: https://huggingface.co/rednote-hilab/dots.ocr
+- Official `dots.mocr` README: https://huggingface.co/rednote-hilab/dots.mocr
+- DOTS project/blog: https://github.com/rednote-hilab/dots.mocr
