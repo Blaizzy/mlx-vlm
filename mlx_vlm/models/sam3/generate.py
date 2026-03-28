@@ -794,7 +794,7 @@ def draw_frame(
         mask = masks[i]
         if mask.shape[0] != H or mask.shape[1] != W:
             mask = cv2.resize(
-                mask.astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST
+                mask.astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR
             )
         binary = mask > 0
 
@@ -1107,7 +1107,7 @@ def track_video_realtime(
                         mask = cv2.resize(
                             mask.astype(np.float32),
                             (W, H),
-                            interpolation=cv2.INTER_NEAREST,
+                            interpolation=cv2.INTER_LINEAR,
                         )
                     binary = mask > 0
                     for c in range(3):
@@ -1160,7 +1160,7 @@ def track_video_realtime(
                         mask = cv2.resize(
                             mask.astype(np.float32),
                             (W, H),
-                            interpolation=cv2.INTER_NEAREST,
+                            interpolation=cv2.INTER_LINEAR,
                         )
                     fg_mask = np.maximum(fg_mask, (mask > 0).astype(np.uint8))
 
