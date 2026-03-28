@@ -553,6 +553,47 @@ def _nms(
     return np.array(keep, dtype=np.int64)
 
 
+def _box_iou(box1: np.ndarray, box2: np.ndarray) -> float:
+    """IoU between two xyxy boxes."""
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    a1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    a2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    return inter / max(a1 + a2 - inter, 1e-6)
+
+
+def _filter_by_regions(
+    result: DetectionResult, regions: np.ndarray, iou_thresh: float = 0.1
+) -> DetectionResult:
+    """Keep only detections that overlap with any of the input box regions.
+
+    Args:
+        result: Detection result to filter
+        regions: (N, 4) xyxy boxes defining regions of interest
+        iou_thresh: Minimum IoU with any region to keep a detection
+    """
+    if len(result.scores) == 0:
+        return result
+    keep = []
+    for i in range(len(result.scores)):
+        for region in regions:
+            if _box_iou(result.boxes[i], region) > iou_thresh:
+                keep.append(i)
+                break
+    if not keep:
+        return DetectionResult(
+            boxes=np.zeros((0, 4)), masks=np.zeros((0, 0, 0)), scores=np.zeros((0,))
+        )
+    return DetectionResult(
+        boxes=result.boxes[keep],
+        masks=result.masks[keep],
+        scores=result.scores[keep],
+    )
+
+
 def _resize_masks(masks: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
     """Resize masks to target size using bilinear interpolation."""
     from PIL import Image as PILImage
@@ -677,6 +718,8 @@ def track_video(
     threshold: float = 0.15,
     nms_thresh: float = 0.5,
     every: int = 2,
+    boxes: Optional[str] = None,
+    show_boxes: bool = True,
 ):
     """Track objects in a video file.
 
@@ -688,6 +731,8 @@ def track_video(
         threshold: Detection score threshold
         nms_thresh: NMS IoU threshold
         every: Run detection every N frames
+        boxes: Box prompts as "x1,y1,x2,y2" or "x1,y1,x2,y2;..." in pixel coords
+        show_boxes: Draw bounding boxes and labels on output
     """
     import cv2
 
@@ -697,6 +742,18 @@ def track_video(
     if output is None:
         p = Path(video_path)
         output = str(p.parent / f"{p.stem}_tracked{p.suffix}")
+
+    # Parse box prompts
+    box_array = None
+    if boxes is not None:
+        box_list = []
+        for b in boxes.split(";"):
+            coords = [float(x) for x in b.split(",")]
+            if len(coords) == 4:
+                box_list.append(coords)
+        if box_list:
+            box_array = np.array(box_list)
+            print(f"Box prompts: {box_array.tolist()}")
 
     print(f"Loading model: {model_path}")
     mp = get_model_path(model_path)
@@ -733,6 +790,9 @@ def track_video(
             result = predictor.predict(frame_pil, text_prompt=prompt)
             if len(result.scores) > 0:
                 result = nms(result, nms_thresh)
+                # Filter to only objects inside the input box regions
+                if box_array is not None:
+                    result = _filter_by_regions(result, box_array)
                 latest_masks = result.masks
                 latest_scores = result.scores
                 latest_boxes = result.boxes
@@ -745,7 +805,8 @@ def track_video(
                 print(f"  Frame {fi}/{total_frames}: {len(latest_scores)} detections")
 
         out = draw_frame(
-            frame_bgr, latest_masks, latest_scores, latest_boxes, prompt, H, W
+            frame_bgr, latest_masks, latest_scores, latest_boxes, prompt, H, W,
+            show_boxes=show_boxes,
         )
         writer.write(out)
 
@@ -943,6 +1004,8 @@ def main():
             threshold=args.threshold if args.threshold is not None else 0.15,
             nms_thresh=args.nms_thresh,
             every=args.every,
+            boxes=args.boxes,
+            show_boxes=args.show_boxes,
         )
 
 
