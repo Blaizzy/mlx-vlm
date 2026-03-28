@@ -23,6 +23,22 @@ def is_image_or_image_url(elem):
     return is_url(elem) or is_valid_image(elem)
 
 
+def _load_mistral3_image_processor(pretrained_model_name_or_path, **kwargs):
+    from transformers import AutoImageProcessor
+
+    try:
+        return AutoImageProcessor.from_pretrained(
+            pretrained_model_name_or_path,
+            use_fast=False,
+            **kwargs,
+        )
+    except ValueError:
+        return AutoImageProcessor.from_pretrained(
+            pretrained_model_name_or_path,
+            **kwargs,
+        )
+
+
 class Mistral3Processor(ProcessorMixin):
     """Mistral3 processor, based on PixtralProcessor."""
 
@@ -164,50 +180,64 @@ class Mistral3Processor(ProcessorMixin):
         import json
         from pathlib import Path
 
-        from transformers import AutoImageProcessor, AutoTokenizer
+        from huggingface_hub import hf_hub_download
+        from transformers import AutoTokenizer
 
         kwargs.pop("use_fast", None)
-        tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path, **kwargs
+        model_path = Path(pretrained_model_name_or_path)
+        is_local = model_path.exists() and model_path.is_dir()
+        resolved_model_path = (
+            str(model_path) if is_local else pretrained_model_name_or_path
         )
-        load_chat_template(tokenizer, pretrained_model_name_or_path)
 
-        # Read processor_config.json for correct patch_size, spatial_merge_size, etc.
-        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
+        tokenizer = AutoTokenizer.from_pretrained(resolved_model_path, **kwargs)
+        load_chat_template(tokenizer, resolved_model_path)
+
+        def _load_json_config(filename):
+            try:
+                path = (
+                    model_path / filename
+                    if is_local
+                    else Path(hf_hub_download(pretrained_model_name_or_path, filename))
+                )
+            except Exception:
+                return {}
+
+            if not path.exists():
+                return {}
+
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+
+        proc_cfg = _load_json_config("processor_config.json")
+        model_cfg = _load_json_config("config.json")
+        preproc_cfg = _load_json_config("preprocessor_config.json")
+
         proc_kwargs = {}
-        ip_overrides = {}
-        if proc_cfg_path.exists():
-            with open(proc_cfg_path) as f:
-                proc_cfg = json.load(f)
-            for k in (
-                "patch_size",
-                "spatial_merge_size",
-                "image_token",
-                "image_break_token",
-                "image_end_token",
-            ):
-                if k in proc_cfg:
-                    proc_kwargs[k] = proc_cfg[k]
-            # Image processor config (patch_size, size, etc.)
-            ip_cfg = proc_cfg.get("image_processor", {})
-            if "patch_size" in ip_cfg:
-                ip_overrides["patch_size"] = ip_cfg["patch_size"]
-            if "size" in ip_cfg:
-                ip_overrides["size"] = ip_cfg["size"]
+        for k in ("image_token", "image_break_token", "image_end_token"):
+            if k in proc_cfg:
+                proc_kwargs[k] = proc_cfg[k]
 
-        try:
-            image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path,
-                use_fast=False,
-                **ip_overrides,
-                **kwargs,
-            )
-        except ValueError:
-            image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path,
-                **ip_overrides,
-                **kwargs,
-            )
+        patch_size = model_cfg.get("vision_config", {}).get("patch_size")
+        if patch_size is None:
+            patch_size = preproc_cfg.get("patch_size")
+            if isinstance(patch_size, dict):
+                patch_size = patch_size.get("height") or patch_size.get("width")
+        if patch_size is None:
+            patch_size = proc_cfg.get("patch_size")
+        if patch_size is not None:
+            proc_kwargs["patch_size"] = patch_size
+
+        spatial_merge_size = model_cfg.get("spatial_merge_size")
+        if spatial_merge_size is None:
+            spatial_merge_size = proc_cfg.get("spatial_merge_size")
+        if spatial_merge_size is not None:
+            proc_kwargs["spatial_merge_size"] = spatial_merge_size
+
+        image_processor = _load_mistral3_image_processor(
+            resolved_model_path,
+            **kwargs,
+        )
         return cls(
             image_processor=image_processor,
             tokenizer=tokenizer,

@@ -633,6 +633,88 @@ class TestMistral3Processor(_ProcessorTestBase, unittest.TestCase):
     def _image_call_args(self):
         return {"text": ["[IMG]Describe"], "images": [[_make_image()]]}
 
+    def test_from_pretrained_prefers_model_geometry_over_processor_config(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from mlx_vlm.models.mistral3.processing_mistral3 import Mistral3Processor
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            (path / "processor_config.json").write_text(
+                json.dumps(
+                    {
+                        "patch_size": 16,
+                        "spatial_merge_size": 1,
+                        "image_token": "[IMG]",
+                        "image_break_token": "[IMG_BREAK]",
+                        "image_end_token": "[IMG_END]",
+                    }
+                )
+            )
+            (path / "preprocessor_config.json").write_text(
+                json.dumps(
+                    {
+                        "patch_size": {"height": 14, "width": 14},
+                        "image_processor_type": "PixtralImageProcessor",
+                    }
+                )
+            )
+            (path / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "mistral3",
+                        "spatial_merge_size": 2,
+                        "vision_config": {"patch_size": 14},
+                    }
+                )
+            )
+
+            class DummyImageProcessor:
+                model_input_names = ["pixel_values"]
+
+            def _fake_init(
+                self,
+                image_processor=None,
+                tokenizer=None,
+                patch_size=16,
+                spatial_merge_size=1,
+                image_token="[IMG]",
+                image_break_token="[IMG_BREAK]",
+                image_end_token="[IMG_END]",
+                chat_template=None,
+                **kwargs,
+            ):
+                self.image_processor = image_processor
+                self.tokenizer = tokenizer
+                self.patch_size = patch_size
+                self.spatial_merge_size = spatial_merge_size
+                self.image_token = image_token
+                self.image_break_token = image_break_token
+                self.image_end_token = image_end_token
+                self.chat_template = chat_template
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=_mock_tokenizer(),
+                ),
+                patch(
+                    "mlx_vlm.models.mistral3.processing_mistral3._load_mistral3_image_processor",
+                    return_value=DummyImageProcessor(),
+                ),
+                patch.object(Mistral3Processor, "__init__", _fake_init),
+            ):
+                processor = Mistral3Processor.from_pretrained(tmpdir)
+
+        self.assertEqual(processor.patch_size, 14)
+        self.assertEqual(processor.spatial_merge_size, 2)
+        self.assertEqual(processor.image_token, "[IMG]")
+        self.assertEqual(processor.image_break_token, "[IMG_BREAK]")
+        self.assertEqual(processor.image_end_token, "[IMG_END]")
+
 
 class TestMultiModalityProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
