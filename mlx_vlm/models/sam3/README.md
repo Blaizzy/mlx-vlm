@@ -187,11 +187,28 @@ python -m mlx_vlm.models.sam3.generate --task realtime --video input.mp4 --promp
 # Webcam
 python -m mlx_vlm.models.sam3.generate --task realtime --video 0 --prompt "a person" --resolution 224
 
+# Multiple objects
+python -m mlx_vlm.models.sam3.generate --task realtime --video 0 --prompt "a person" "a phone" --resolution 224
+
 # With boxes + region filter
 python -m mlx_vlm.models.sam3.generate --task realtime --video input.mp4 --prompt "a car" --resolution 224 --show-boxes --boxes "200,100,1200,900"
 ```
 
-Uses 3 threads: frame reader (paced to native FPS), inference (~11 FPS at 224x224), and display. Detection updates asynchronously without blocking playback.
+Uses 3 threads: frame reader (paced to native FPS), inference (~11 FPS at 224x224), and display. Detection updates asynchronously without blocking playback. Multiple `--prompt` values share the ViT backbone — each extra prompt adds ~30ms, not a full inference pass.
+
+### Background Swap (realtime)
+
+Replace the background with a custom image while keeping detected objects in the foreground:
+
+```bash
+# Webcam: keep person, swap background
+python -m mlx_vlm.models.sam3.generate --task realtime --video 0 --prompt "a person" --resolution 224 --bg-image beach.jpg
+
+# Video: keep car, swap background
+python -m mlx_vlm.models.sam3.generate --task realtime --video input.mp4 --prompt "a car" --resolution 224 --bg-image office.jpg
+```
+
+The background image is auto-resized to match the video resolution. The segmentation mask determines which pixels come from the live video (foreground) vs the background image.
 
 ### All Flags
 
@@ -200,9 +217,10 @@ Uses 3 threads: frame reader (paced to native FPS), inference (~11 FPS at 224x22
 | `--task` | `segment` | `detect`, `segment`, `track`, `realtime` |
 | `--image` | | Input image path (detect/segment) |
 | `--video` | | Input video path or `0` for webcam (track/realtime) |
-| `--prompt` | *(required)* | Text prompt |
+| `--prompt` | *(required)* | Text prompt(s). Multiple: `--prompt "a cat" "a dog"` |
 | `--boxes` | | Region filter: `"x1,y1,x2,y2"` or `"...;..."` in pixel coords |
 | `--show-boxes` | off | Overlay bounding boxes and labels |
+| `--bg-image` | | Background image for realtime bg swap |
 | `--output` | auto-named | Output file path (track only) |
 | `--model` | `facebook/sam3` | Model path or HF repo |
 | `--threshold` | 0.3 / 0.15 | Score threshold (image / video default) |

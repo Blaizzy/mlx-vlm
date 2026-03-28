@@ -937,6 +937,7 @@ def track_video_realtime(
     boxes: Optional[str] = None,
     show_boxes: bool = True,
     resolution: int = 1008,
+    bg_image: Optional[str] = None,
 ):
     """Track objects in a video with a real-time preview window.
 
@@ -992,6 +993,14 @@ def track_video_realtime(
     print(f"Video: {fps:.1f} fps, {W}x{H}")
     prompt_str = " + ".join(prompts)
     print(f'Prompts: {prompts}, threshold {threshold}, resolution {resolution}x{resolution}')
+
+    # Load background image for bg swap mode
+    bg_frame = None
+    if bg_image is not None:
+        bg_pil = Image.open(bg_image).convert("RGB").resize((W, H))
+        bg_frame = cv2.cvtColor(np.array(bg_pil), cv2.COLOR_RGB2BGR)
+        print(f"Background swap: {bg_image} ({W}x{H})")
+
     print("Press 'q' to quit")
 
     import collections
@@ -1003,6 +1012,7 @@ def track_video_realtime(
     lock = threading.Lock()
     latest = {
         "overlay_scaled": np.zeros((H, W, 3), dtype=np.uint8),
+        "fg_mask": None,  # (H, W) uint8 foreground mask for bg swap
         "has_detections": False,
         "n_obj": 0,
         "fps": 0.0,
@@ -1107,8 +1117,22 @@ def track_video_realtime(
 
             scaled = (overlay.astype(np.uint16) * 115 >> 8).astype(np.uint8)
 
+            # Build combined foreground mask for bg swap
+            fg_mask = None
+            if bg_frame is not None and len(result.scores) > 0:
+                fg_mask = np.zeros((H, W), dtype=np.uint8)
+                for i in range(len(result.scores)):
+                    mask = result.masks[i]
+                    if mask.shape[0] != H or mask.shape[1] != W:
+                        mask = cv2.resize(
+                            mask.astype(np.float32), (W, H),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                    fg_mask = np.maximum(fg_mask, (mask > 0).astype(np.uint8))
+
             with lock:
                 latest["overlay_scaled"] = scaled
+                latest["fg_mask"] = fg_mask
                 latest["has_detections"] = len(result.scores) > 0
                 latest["n_obj"] = len(result.scores)
                 latest["fps"] = 1.0 / max(dt, 1e-6)
@@ -1138,14 +1162,21 @@ def track_video_realtime(
                     cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 )
 
-        # Composite: just cv2.add (~1.5ms, no copy needed)
         with lock:
             overlay_scaled = latest["overlay_scaled"]
+            fg_mask = latest["fg_mask"]
             has_det = latest["has_detections"]
             det_fps = latest["fps"]
             n_obj = latest["n_obj"]
 
-        out = cv2.add(frame_bgr, overlay_scaled) if has_det else frame_bgr
+        if bg_frame is not None and fg_mask is not None:
+            # Background swap: keep foreground from video, background from bg_image
+            fg_mask_3d = fg_mask[:, :, None]  # (H, W, 1)
+            out = np.where(fg_mask_3d, frame_bgr, bg_frame)
+        elif has_det:
+            out = cv2.add(frame_bgr, overlay_scaled)
+        else:
+            out = frame_bgr
 
         # Measure display FPS
         display_fps_counter += 1
@@ -1348,6 +1379,10 @@ def main():
         "--resolution", type=int, default=1008,
         help="Input resolution (default: 1008). Lower = faster: 336 (~8 FPS), 504 (~3 FPS)",
     )
+    parser.add_argument(
+        "--bg-image", default=None,
+        help="Background image for realtime bg swap (replaces area outside detected objects)",
+    )
     args = parser.parse_args()
 
     prompts = args.prompt  # list of 1+ prompts
@@ -1394,6 +1429,7 @@ def main():
             boxes=args.boxes,
             show_boxes=args.show_boxes,
             resolution=args.resolution,
+            bg_image=args.bg_image,
         )
 
 
