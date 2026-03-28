@@ -308,7 +308,10 @@ class ViTBackbone(nn.Module):
         if H != self.feat_size or W != self.feat_size:
             head_dim = self.config.hidden_size // self.config.num_attention_heads
             global_cos, global_sin = compute_axial_cis(
-                head_dim, H, W, theta=self.config.rope_theta,
+                head_dim,
+                H,
+                W,
+                theta=self.config.rope_theta,
             )
         else:
             global_cos = self._rope_global_cos
@@ -323,7 +326,10 @@ class ViTBackbone(nn.Module):
         return x
 
     def _tile_pos_embed(
-        self, pos: mx.array, target_h: Optional[int] = None, target_w: Optional[int] = None
+        self,
+        pos: mx.array,
+        target_h: Optional[int] = None,
+        target_w: Optional[int] = None,
     ) -> mx.array:
         """Tile position embeddings to match target spatial dimensions.
 

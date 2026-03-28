@@ -12,7 +12,6 @@ Usage:
 """
 
 import argparse
-
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -185,7 +184,10 @@ def predict_multi(
     """
     if len(prompts) == 1:
         result = predictor.predict(
-            image, text_prompt=prompts[0], boxes=boxes, score_threshold=score_threshold,
+            image,
+            text_prompt=prompts[0],
+            boxes=boxes,
+            score_threshold=score_threshold,
         )
         if len(result.scores) > 0:
             result = nms(result)
@@ -256,7 +258,9 @@ def predict_multi(
         # Postprocess — ensure batch dim is present
         outputs = {
             "pred_logits": pred_logits if pred_logits.ndim == 2 else pred_logits[None],
-            "pred_boxes": pred_boxes_xyxy if pred_boxes_xyxy.ndim == 3 else pred_boxes_xyxy[None],
+            "pred_boxes": (
+                pred_boxes_xyxy if pred_boxes_xyxy.ndim == 3 else pred_boxes_xyxy[None]
+            ),
             "pred_masks": seg_out["pred_masks"],
             "presence_logits": presence if presence.ndim == 2 else presence[None],
         }
@@ -697,7 +701,9 @@ def _filter_by_regions(
                 break
     if not keep:
         return DetectionResult(
-            boxes=np.zeros((0, 4)), masks=np.zeros((0, 0, 0)), scores=np.zeros((0,)),
+            boxes=np.zeros((0, 4)),
+            masks=np.zeros((0, 0, 0)),
+            scores=np.zeros((0,)),
             labels=[],
         )
     labels = [result.labels[i] for i in keep] if result.labels else None
@@ -751,7 +757,10 @@ def nms(result: DetectionResult, iou_thresh: float = 0.5) -> DetectionResult:
             keep.append(i)
     labels = [result.labels[i] for i in keep] if result.labels else None
     return DetectionResult(
-        boxes=boxes[keep], masks=masks[keep], scores=scores[keep], labels=labels,
+        boxes=boxes[keep],
+        masks=masks[keep],
+        scores=scores[keep],
+        labels=labels,
     )
 
 
@@ -769,7 +778,9 @@ COLORS_BGR = [
 ]
 
 
-def draw_frame(frame_bgr, masks, scores, boxes, prompt, H, W, show_boxes=True, labels=None):
+def draw_frame(
+    frame_bgr, masks, scores, boxes, prompt, H, W, show_boxes=True, labels=None
+):
     """Draw masks, contours, boxes, and labels on a BGR frame.
 
     Args:
@@ -892,13 +903,18 @@ def track_video(
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Video: {total_frames} frames, {fps:.1f} fps, {W}x{H}")
     prompt_str = " + ".join(prompts)
-    print(f'Prompts: {prompts}, detect every {every} frames, threshold {threshold}, resolution {resolution}')
+    print(
+        f"Prompts: {prompts}, detect every {every} frames, threshold {threshold}, resolution {resolution}"
+    )
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output, fourcc, fps, (W, H))
 
     latest_result = DetectionResult(
-        boxes=np.array([]), masks=np.array([]), scores=np.array([]), labels=[],
+        boxes=np.array([]),
+        masks=np.array([]),
+        scores=np.array([]),
+        labels=[],
     )
 
     for fi in range(total_frames):
@@ -914,12 +930,20 @@ def track_video(
             latest_result = result
 
             if fi % 40 == 0:
-                print(f"  Frame {fi}/{total_frames}: {len(latest_result.scores)} detections")
+                print(
+                    f"  Frame {fi}/{total_frames}: {len(latest_result.scores)} detections"
+                )
 
         out = draw_frame(
-            frame_bgr, latest_result.masks, latest_result.scores,
-            latest_result.boxes, prompt_str, H, W,
-            show_boxes=show_boxes, labels=latest_result.labels,
+            frame_bgr,
+            latest_result.masks,
+            latest_result.scores,
+            latest_result.boxes,
+            prompt_str,
+            H,
+            W,
+            show_boxes=show_boxes,
+            labels=latest_result.labels,
         )
         writer.write(out)
 
@@ -992,7 +1016,9 @@ def track_video_realtime(
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Video: {fps:.1f} fps, {W}x{H}")
     prompt_str = " + ".join(prompts)
-    print(f'Prompts: {prompts}, threshold {threshold}, resolution {resolution}x{resolution}')
+    print(
+        f"Prompts: {prompts}, threshold {threshold}, resolution {resolution}x{resolution}"
+    )
 
     # Load background image for bg swap mode
     bg_frame = None
@@ -1003,7 +1029,6 @@ def track_video_realtime(
 
     print("Press 'q' to quit")
 
-    import collections
     import queue
 
     frame_buffer = queue.Queue(maxsize=10)
@@ -1080,14 +1105,13 @@ def track_video_realtime(
                     mask = result.masks[i]
                     if mask.shape[0] != H or mask.shape[1] != W:
                         mask = cv2.resize(
-                            mask.astype(np.float32), (W, H),
+                            mask.astype(np.float32),
+                            (W, H),
                             interpolation=cv2.INTER_NEAREST,
                         )
                     binary = mask > 0
                     for c in range(3):
-                        overlay[:, :, c] = np.where(
-                            binary, color[c], overlay[:, :, c]
-                        )
+                        overlay[:, :, c] = np.where(binary, color[c], overlay[:, :, c])
                     contours, _ = cv2.findContours(
                         binary.astype(np.uint8),
                         cv2.RETR_EXTERNAL,
@@ -1098,7 +1122,11 @@ def track_video_realtime(
                     if show_boxes:
                         x1, y1, x2, y2 = result.boxes[i].astype(int)
                         cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-                        lbl = result.labels[i] if result.labels and i < len(result.labels) else prompt_str
+                        lbl = (
+                            result.labels[i]
+                            if result.labels and i < len(result.labels)
+                            else prompt_str
+                        )
                         label = f"{lbl} {result.scores[i]:.2f}"
                         (tw, th), _ = cv2.getTextSize(
                             label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
@@ -1107,12 +1135,17 @@ def track_video_realtime(
                             overlay,
                             (x1, max(y1 - th - 10, 0)),
                             (x1 + tw + 6, max(y1, th + 10)),
-                            color, -1,
+                            color,
+                            -1,
                         )
                         cv2.putText(
-                            overlay, label,
+                            overlay,
+                            label,
                             (x1 + 3, max(y1 - 4, th + 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (255, 255, 255),
+                            2,
                         )
 
             scaled = (overlay.astype(np.uint16) * 115 >> 8).astype(np.uint8)
@@ -1125,7 +1158,8 @@ def track_video_realtime(
                     mask = result.masks[i]
                     if mask.shape[0] != H or mask.shape[1] != W:
                         mask = cv2.resize(
-                            mask.astype(np.float32), (W, H),
+                            mask.astype(np.float32),
+                            (W, H),
                             interpolation=cv2.INTER_NEAREST,
                         )
                     fg_mask = np.maximum(fg_mask, (mask > 0).astype(np.uint8))
@@ -1248,8 +1282,13 @@ def _draw_boxes_only(frame_bgr, scores, boxes, prompt, H, W):
             -1,
         )
         cv2.putText(
-            out, label, (x1 + 3, max(y1 - 4, th + 6)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
+            out,
+            label,
+            (x1 + 3, max(y1 - 4, th + 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
         )
     return out
 
@@ -1292,7 +1331,7 @@ def run_image(
     image = Image.open(image_path).convert("RGB")
     W, H = image.size
     print(f"Image: {W}x{H}")
-    print(f'Task: {task}, prompts: {prompts}, threshold {threshold}')
+    print(f"Task: {task}, prompts: {prompts}, threshold {threshold}")
 
     result = predict_multi(predictor, image, prompts, boxes=box_array)
     if box_array is not None and len(result.scores) > 0:
@@ -1313,8 +1352,15 @@ def run_image(
         out = _draw_boxes_only(frame_bgr, result.scores, result.boxes, prompt_str, H, W)
     else:
         out = draw_frame(
-            frame_bgr, result.masks, result.scores, result.boxes, prompt_str, H, W,
-            show_boxes=show_boxes, labels=result.labels,
+            frame_bgr,
+            result.masks,
+            result.scores,
+            result.boxes,
+            prompt_str,
+            H,
+            W,
+            show_boxes=show_boxes,
+            labels=result.labels,
         )
     cv2.imwrite(output, out)
     print(f"Saved: {output}")
@@ -1353,34 +1399,57 @@ def main():
         default="segment",
         help="Task: detect, segment, track, realtime (default: segment)",
     )
-    parser.add_argument("--image", default=None, help="Input image path (detect/segment)")
-    parser.add_argument("--video", default=None, help="Input video path or '0' for webcam (track/realtime)")
     parser.add_argument(
-        "--prompt", required=True, nargs="+",
+        "--image", default=None, help="Input image path (detect/segment)"
+    )
+    parser.add_argument(
+        "--video",
+        default=None,
+        help="Input video path or '0' for webcam (track/realtime)",
+    )
+    parser.add_argument(
+        "--prompt",
+        required=True,
+        nargs="+",
         help="Text prompt(s). Pass multiple to track different objects: --prompt 'a car' 'a person'",
     )
     parser.add_argument(
-        "--boxes", default=None,
+        "--boxes",
+        default=None,
         help="Box prompts as 'x1,y1,x2,y2' or 'x1,y1,x2,y2;x1,y1,x2,y2' in pixel coords",
     )
     parser.add_argument(
-        "--show-boxes", action="store_true",
+        "--show-boxes",
+        action="store_true",
         help="Draw bounding boxes and labels on segment/track output",
     )
-    parser.add_argument("--output", default=None, help="Output path (default: auto-named)")
-    parser.add_argument("--model", default="facebook/sam3", help="Model path or HF repo")
     parser.add_argument(
-        "--threshold", type=float, default=None,
+        "--output", default=None, help="Output path (default: auto-named)"
+    )
+    parser.add_argument(
+        "--model", default="facebook/sam3", help="Model path or HF repo"
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
         help="Score threshold (default: 0.3 image, 0.15 video)",
     )
-    parser.add_argument("--nms-thresh", type=float, default=0.5, help="NMS IoU threshold")
-    parser.add_argument("--every", type=int, default=2, help="Detect every N frames (track only)")
     parser.add_argument(
-        "--resolution", type=int, default=1008,
+        "--nms-thresh", type=float, default=0.5, help="NMS IoU threshold"
+    )
+    parser.add_argument(
+        "--every", type=int, default=2, help="Detect every N frames (track only)"
+    )
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=1008,
         help="Input resolution (default: 1008). Lower = faster: 336 (~8 FPS), 504 (~3 FPS)",
     )
     parser.add_argument(
-        "--bg-image", default=None,
+        "--bg-image",
+        default=None,
         help="Background image for realtime bg swap (replaces area outside detected objects)",
     )
     args = parser.parse_args()
