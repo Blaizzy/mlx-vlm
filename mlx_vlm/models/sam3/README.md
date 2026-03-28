@@ -135,35 +135,56 @@ for i in range(len(images)):
 ```
 
 
-## Video: Tracking (CLI)
+## CLI
 
-Track objects in a video from the command line:
-
-```bash
-python -m mlx_vlm.models.sam3.generate --video input.mp4 --prompt "a car"
-```
-
-Output saves to `input_tracked.mp4` by default. Full options:
+All tasks are available via a single command:
 
 ```bash
-python -m mlx_vlm.models.sam3.generate \
-    --video input.mp4 \
-    --prompt "a person" \
-    --output output.mp4 \
-    --threshold 0.2 \
-    --every 4 \
-    --nms-thresh 0.5
+python -m mlx_vlm.models.sam3.generate --task <task> --prompt "..." ...
 ```
+
+### Object Detection (boxes only)
+
+```bash
+python -m mlx_vlm.models.sam3.generate --task detect --image photo.jpg --prompt "a cat"
+```
+
+### Instance Segmentation (masks only, default)
+
+```bash
+python -m mlx_vlm.models.sam3.generate --image photo.jpg --prompt "a cat"
+
+# With boxes overlaid
+python -m mlx_vlm.models.sam3.generate --image photo.jpg --prompt "a cat" --show-boxes
+
+# Box-guided segmentation
+python -m mlx_vlm.models.sam3.generate --image photo.jpg --prompt "a cat" --boxes "0,50,350,480"
+
+# Multiple box prompts
+python -m mlx_vlm.models.sam3.generate --image photo.jpg --prompt "a cat" --boxes "0,50,350,480;300,20,640,375"
+```
+
+### Video Tracking
+
+```bash
+python -m mlx_vlm.models.sam3.generate --task track --video input.mp4 --prompt "a car"
+```
+
+### All Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--video` | *(required)* | Input video path |
-| `--prompt` | *(required)* | Text prompt for detection |
-| `--output` | `<input>_tracked.mp4` | Output video path |
+| `--task` | `segment` | `detect` (boxes), `segment` (masks), `track` (video) |
+| `--image` | | Input image path (detect/segment) |
+| `--video` | | Input video path (track) |
+| `--prompt` | *(required)* | Text prompt |
+| `--boxes` | | Box prompts: `"x1,y1,x2,y2"` or `"...;..."` in pixel coords |
+| `--show-boxes` | off | Overlay bounding boxes on segment/track output |
+| `--output` | auto-named | Output file path |
 | `--model` | `facebook/sam3` | Model path or HF repo |
-| `--threshold` | `0.15` | Detection score threshold |
-| `--every` | `2` | Run detection every N frames |
+| `--threshold` | 0.3 / 0.15 | Score threshold (image / video default) |
 | `--nms-thresh` | `0.5` | NMS IoU threshold |
+| `--every` | `2` | Detect every N frames (track only) |
 
 ## Video: Tracking (Python)
 

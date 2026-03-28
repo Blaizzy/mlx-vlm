@@ -612,8 +612,12 @@ COLORS_BGR = [
 ]
 
 
-def draw_frame(frame_bgr, masks, scores, boxes, prompt, H, W):
-    """Draw masks, contours, boxes, and labels on a BGR frame."""
+def draw_frame(frame_bgr, masks, scores, boxes, prompt, H, W, show_boxes=True):
+    """Draw masks, contours, boxes, and labels on a BGR frame.
+
+    Args:
+        show_boxes: If False, draw only mask overlays + contours (no boxes/labels).
+    """
     import cv2
 
     out = frame_bgr.copy()
@@ -640,27 +644,28 @@ def draw_frame(frame_bgr, masks, scores, boxes, prompt, H, W):
         )
         cv2.drawContours(out, contours, -1, color, 2)
 
-        x1, y1, x2, y2 = boxes[i].astype(int)
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        if show_boxes:
+            x1, y1, x2, y2 = boxes[i].astype(int)
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
 
-        label = f"{prompt} {scores[i]:.2f}"
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-        cv2.rectangle(
-            out,
-            (x1, max(y1 - th - 10, 0)),
-            (x1 + tw + 6, max(y1, th + 10)),
-            color,
-            -1,
-        )
-        cv2.putText(
-            out,
-            label,
-            (x1 + 3, max(y1 - 4, th + 6)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-        )
+            label = f"{prompt} {scores[i]:.2f}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.rectangle(
+                out,
+                (x1, max(y1 - th - 10, 0)),
+                (x1 + tw + 6, max(y1, th + 10)),
+                color,
+                -1,
+            )
+            cv2.putText(
+                out,
+                label,
+                (x1 + 3, max(y1 - 4, th + 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+            )
     return out
 
 
@@ -754,39 +759,191 @@ def track_video(
 # ---------------------------------------------------------------------------
 
 
+def _load_predictor(model_path, threshold):
+    """Shared model loading for CLI tasks."""
+    from mlx_vlm.models.sam3.processing_sam3 import Sam3Processor
+    from mlx_vlm.utils import get_model_path, load_model
+
+    print(f"Loading model: {model_path}")
+    mp = get_model_path(model_path)
+    model = load_model(mp)
+    processor = Sam3Processor.from_pretrained(str(mp))
+    return Sam3Predictor(model, processor, score_threshold=threshold)
+
+
+def _draw_boxes_only(frame_bgr, scores, boxes, prompt, H, W):
+    """Draw boxes and labels only (no masks)."""
+    import cv2
+
+    out = frame_bgr.copy()
+    for i in range(len(scores)):
+        color = COLORS_BGR[i % len(COLORS_BGR)]
+        x1, y1, x2, y2 = boxes[i].astype(int)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 3)
+        label = f"{prompt} {scores[i]:.2f}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cv2.rectangle(
+            out,
+            (x1, max(y1 - th - 10, 0)),
+            (x1 + tw + 6, max(y1, th + 10)),
+            color,
+            -1,
+        )
+        cv2.putText(
+            out, label, (x1 + 3, max(y1 - 4, th + 6)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
+        )
+    return out
+
+
+def run_image(
+    image_path: str,
+    prompt: str,
+    task: str = "segment",
+    output: Optional[str] = None,
+    model_path: str = "facebook/sam3",
+    threshold: float = 0.3,
+    nms_thresh: float = 0.5,
+    boxes: Optional[str] = None,
+    show_boxes: bool = True,
+):
+    """Run detection or segmentation on an image.
+
+    Args:
+        image_path: Input image path
+        prompt: Text prompt
+        task: "detect" (boxes only) or "segment" (masks + boxes)
+        output: Output image path
+        model_path: Model path or HF repo
+        threshold: Score threshold
+        nms_thresh: NMS IoU threshold
+        boxes: Comma-separated box coords "x1,y1,x2,y2" or "x1,y1,x2,y2;x1,y1,x2,y2"
+        show_boxes: Draw bounding boxes and labels on output (default: True)
+    """
+    import cv2
+
+    suffix = "_detected" if task == "detect" else "_segmented"
+    if output is None:
+        p = Path(image_path)
+        output = str(p.parent / f"{p.stem}{suffix}{p.suffix}")
+
+    predictor = _load_predictor(model_path, threshold)
+
+    image = Image.open(image_path).convert("RGB")
+    W, H = image.size
+    print(f"Image: {W}x{H}")
+    print(f'Task: {task}, prompt: "{prompt}", threshold {threshold}')
+
+    # Parse box prompts
+    box_array = None
+    if boxes is not None:
+        box_list = []
+        for b in boxes.split(";"):
+            coords = [float(x) for x in b.split(",")]
+            if len(coords) == 4:
+                box_list.append(coords)
+        if box_list:
+            box_array = np.array(box_list)
+            print(f"Box prompts: {box_array.tolist()}")
+
+    result = predictor.predict(image, text_prompt=prompt, boxes=box_array)
+    if len(result.scores) > 0:
+        result = nms(result, nms_thresh)
+
+    print(f"Detections: {len(result.scores)}")
+    for i in range(len(result.scores)):
+        x1, y1, x2, y2 = result.boxes[i]
+        line = f"  [{result.scores[i]:.2f}] box=({x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f})"
+        if task == "segment":
+            line += f"  mask={int(result.masks[i].sum())}px"
+        print(line)
+
+    frame_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    if task == "detect":
+        out = _draw_boxes_only(frame_bgr, result.scores, result.boxes, prompt, H, W)
+    else:
+        out = draw_frame(
+            frame_bgr, result.masks, result.scores, result.boxes, prompt, H, W,
+            show_boxes=show_boxes,
+        )
+    cv2.imwrite(output, out)
+    print(f"Saved: {output}")
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="SAM3 video tracking",
-        usage="python -m mlx_vlm.models.sam3.generate --video input.mp4 --prompt 'a car'",
+        description="SAM3: detection, segmentation, and video tracking",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  # Object detection (boxes only)
+  python -m mlx_vlm.models.sam3.generate --task detect --image photo.jpg --prompt "a cat"
+
+  # Instance segmentation (masks only)
+  python -m mlx_vlm.models.sam3.generate --task segment --image photo.jpg --prompt "a cat"
+
+  # Instance segmentation with boxes overlaid
+  python -m mlx_vlm.models.sam3.generate --task segment --image photo.jpg --prompt "a cat" --show-boxes
+
+  # Box-guided segmentation
+  python -m mlx_vlm.models.sam3.generate --task segment --image photo.jpg --prompt "a cat" --boxes "10,50,300,400"
+
+  # Video tracking
+  python -m mlx_vlm.models.sam3.generate --task track --video input.mp4 --prompt "a car"
+""",
     )
-    parser.add_argument("--video", required=True, help="Input video path")
+    parser.add_argument(
+        "--task",
+        choices=["detect", "segment", "track"],
+        default="segment",
+        help="Task: detect (boxes), segment (masks), track (video) (default: segment)",
+    )
+    parser.add_argument("--image", default=None, help="Input image path (detect/segment)")
+    parser.add_argument("--video", default=None, help="Input video path (track)")
     parser.add_argument("--prompt", required=True, help="Text prompt (e.g. 'a car')")
     parser.add_argument(
-        "--output", default=None, help="Output path (default: <input>_tracked.mp4)"
+        "--boxes", default=None,
+        help="Box prompts as 'x1,y1,x2,y2' or 'x1,y1,x2,y2;x1,y1,x2,y2' in pixel coords",
     )
     parser.add_argument(
-        "--model", default="facebook/sam3", help="Model path or HF repo"
+        "--show-boxes", action="store_true",
+        help="Draw bounding boxes and labels on segment/track output",
     )
+    parser.add_argument("--output", default=None, help="Output path (default: auto-named)")
+    parser.add_argument("--model", default="facebook/sam3", help="Model path or HF repo")
     parser.add_argument(
-        "--threshold", type=float, default=0.15, help="Score threshold"
+        "--threshold", type=float, default=None,
+        help="Score threshold (default: 0.3 image, 0.15 video)",
     )
-    parser.add_argument(
-        "--nms-thresh", type=float, default=0.5, help="NMS IoU threshold"
-    )
-    parser.add_argument(
-        "--every", type=int, default=2, help="Run detection every N frames"
-    )
+    parser.add_argument("--nms-thresh", type=float, default=0.5, help="NMS IoU threshold")
+    parser.add_argument("--every", type=int, default=2, help="Detect every N frames (track only)")
     args = parser.parse_args()
 
-    track_video(
-        video_path=args.video,
-        prompt=args.prompt,
-        output=args.output,
-        model_path=args.model,
-        threshold=args.threshold,
-        nms_thresh=args.nms_thresh,
-        every=args.every,
-    )
+    if args.task in ("detect", "segment"):
+        if args.image is None:
+            parser.error("--image is required for --task detect/segment")
+        run_image(
+            image_path=args.image,
+            prompt=args.prompt,
+            task=args.task,
+            output=args.output,
+            model_path=args.model,
+            threshold=args.threshold if args.threshold is not None else 0.3,
+            nms_thresh=args.nms_thresh,
+            boxes=args.boxes,
+            show_boxes=args.show_boxes if args.task == "segment" else True,
+        )
+    elif args.task == "track":
+        if args.video is None:
+            parser.error("--video is required for --task track")
+        track_video(
+            video_path=args.video,
+            prompt=args.prompt,
+            output=args.output,
+            model_path=args.model,
+            threshold=args.threshold if args.threshold is not None else 0.15,
+            nms_thresh=args.nms_thresh,
+            every=args.every,
+        )
 
 
 if __name__ == "__main__":
