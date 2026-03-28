@@ -853,10 +853,6 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         from pathlib import Path
         from unittest.mock import patch
 
-        from transformers.models.siglip2.image_processing_siglip2 import (
-            Siglip2ImageProcessor,
-        )
-
         from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlProcessor
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -877,6 +873,15 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
                 )
             )
 
+            class DummySiglip2ImageProcessor:
+                def __init__(self, **kwargs):
+                    self.do_resize = kwargs.get("do_resize", True)
+                    self.do_image_splitting = kwargs.get("do_image_splitting", False)
+                    self.image_mean = kwargs.get("image_mean")
+                    self.image_std = kwargs.get("image_std")
+                    self.max_num_patches = kwargs.get("max_num_patches")
+                    self.patch_size = kwargs.get("patch_size")
+
             def _fake_init(
                 self, image_processor, tokenizer, chat_template=None, **kwargs
             ):
@@ -890,13 +895,22 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
                     return_value=_mock_tokenizer(),
                 ),
                 patch(
+                    "mlx_vlm.models.lfm2_vl.processing_lfm2_vl.Siglip2ImageProcessor",
+                    DummySiglip2ImageProcessor,
+                    create=True,
+                ),
+                patch(
+                    "mlx_vlm.models.lfm2_vl.processing_lfm2_vl._SLOW_PROCESSOR_AVAILABLE",
+                    True,
+                ),
+                patch(
                     "mlx_vlm.models.lfm2_vl.processing_lfm2_vl._original_init",
                     _fake_init,
                 ),
             ):
                 processor = Lfm2VlProcessor.from_pretrained(tmpdir)
 
-        self.assertIsInstance(processor.image_processor, Siglip2ImageProcessor)
+        self.assertIsInstance(processor.image_processor, DummySiglip2ImageProcessor)
         self.assertTrue(processor.image_processor.do_resize)
         self.assertFalse(processor.image_processor.do_image_splitting)
 
