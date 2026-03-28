@@ -720,6 +720,7 @@ def track_video(
     every: int = 2,
     boxes: Optional[str] = None,
     show_boxes: bool = True,
+    resolution: int = 1008,
 ):
     """Track objects in a video file.
 
@@ -759,6 +760,8 @@ def track_video(
     mp = get_model_path(model_path)
     model = load_model(mp)
     processor = Sam3Processor.from_pretrained(str(mp))
+    if resolution != 1008:
+        processor.image_size = resolution
     predictor = Sam3Predictor(model, processor, score_threshold=threshold)
 
     cap = cv2.VideoCapture(video_path)
@@ -771,7 +774,7 @@ def track_video(
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Video: {total_frames} frames, {fps:.1f} fps, {W}x{H}")
-    print(f'Prompt: "{prompt}", detect every {every} frames, threshold {threshold}')
+    print(f'Prompt: "{prompt}", detect every {every} frames, threshold {threshold}, resolution {resolution}')
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output, fourcc, fps, (W, H))
@@ -815,12 +818,209 @@ def track_video(
     print(f"\nSaved: {output}")
 
 
+def track_video_realtime(
+    video_path: str,
+    prompt: str,
+    model_path: str = "facebook/sam3",
+    threshold: float = 0.15,
+    nms_thresh: float = 0.5,
+    boxes: Optional[str] = None,
+    show_boxes: bool = True,
+    resolution: int = 1008,
+):
+    """Track objects in a video with a real-time preview window.
+
+    Inference runs in a background thread (~1 FPS). The display loop runs
+    at the video's native FPS, reusing the latest detection until a new
+    one is ready. Press 'q' to quit.
+
+    Args:
+        video_path: Input video path (or 0 for webcam)
+        prompt: Text prompt for detection
+        model_path: Model path or HF repo
+        threshold: Detection score threshold
+        nms_thresh: NMS IoU threshold
+        boxes: Box prompts as "x1,y1,x2,y2" or "..." for region filtering
+        show_boxes: Draw bounding boxes on output
+    """
+    import threading
+    import time
+
+    import cv2
+
+    from mlx_vlm.models.sam3.processing_sam3 import Sam3Processor
+    from mlx_vlm.utils import get_model_path, load_model
+
+    # Parse box prompts
+    box_array = None
+    if boxes is not None:
+        box_list = []
+        for b in boxes.split(";"):
+            coords = [float(x) for x in b.split(",")]
+            if len(coords) == 4:
+                box_list.append(coords)
+        if box_list:
+            box_array = np.array(box_list)
+
+    print(f"Loading model: {model_path}")
+    mp = get_model_path(model_path)
+    model = load_model(mp)
+    processor = Sam3Processor.from_pretrained(str(mp))
+    if resolution != 1008:
+        processor.image_size = resolution
+    predictor = Sam3Predictor(model, processor, score_threshold=threshold)
+
+    source = int(video_path) if video_path.isdigit() else video_path
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        print(f"Error: cannot open {video_path}")
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"Video: {fps:.1f} fps, {W}x{H}")
+    print(f'Prompt: "{prompt}", threshold {threshold}, resolution {resolution}x{resolution}')
+    print("Press 'q' to quit")
+
+    # Shared state between threads
+    lock = threading.Lock()
+    latest = {
+        "overlay": None,  # pre-rendered BGRA overlay (H, W, 4), reused every frame
+        "n_obj": 0,
+        "fps": 0.0,
+    }
+    pending_frame = {"pil": None}
+    running = {"active": True}
+
+    def inference_loop():
+        """Background thread: runs detection and pre-renders the overlay."""
+        while running["active"]:
+            with lock:
+                frame_pil = pending_frame["pil"]
+
+            if frame_pil is None:
+                time.sleep(0.01)
+                continue
+
+            t0 = time.perf_counter()
+            result = predictor.predict(frame_pil, text_prompt=prompt)
+            dt = time.perf_counter() - t0
+
+            if len(result.scores) > 0:
+                result = nms(result, nms_thresh)
+                if box_array is not None:
+                    result = _filter_by_regions(result, box_array)
+
+            # Pre-render overlay (BGRA with alpha) so the display loop
+            # just does a single alpha-blend instead of per-mask work
+            overlay = np.zeros((H, W, 4), dtype=np.uint8)
+            for i in range(len(result.scores)):
+                color = COLORS_BGR[i % len(COLORS_BGR)]
+                mask = result.masks[i]
+                if mask.shape[0] != H or mask.shape[1] != W:
+                    mask = cv2.resize(
+                        mask.astype(np.float32), (W, H),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                binary = mask > 0
+                for c in range(3):
+                    overlay[:, :, c] = np.where(
+                        binary,
+                        np.maximum(overlay[:, :, c], int(color[c])),
+                        overlay[:, :, c],
+                    )
+                overlay[:, :, 3] = np.where(binary, 128, overlay[:, :, 3])
+
+                if show_boxes:
+                    x1, y1, x2, y2 = result.boxes[i].astype(int)
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2), (*color, 255), 2)
+                    label = f"{prompt} {result.scores[i]:.2f}"
+                    (tw, th), _ = cv2.getTextSize(
+                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
+                    )
+                    cv2.rectangle(
+                        overlay,
+                        (x1, max(y1 - th - 10, 0)),
+                        (x1 + tw + 6, max(y1, th + 10)),
+                        (*color, 255),
+                        -1,
+                    )
+                    cv2.putText(
+                        overlay, label,
+                        (x1 + 3, max(y1 - 4, th + 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255, 255), 2,
+                    )
+
+            with lock:
+                latest["overlay"] = overlay
+                latest["n_obj"] = len(result.scores)
+                latest["fps"] = 1.0 / max(dt, 1e-6)
+                pending_frame["pil"] = None
+
+    # Start inference thread
+    thread = threading.Thread(target=inference_loop, daemon=True)
+    thread.start()
+
+    frame_delay = max(1, int(1000 / fps))
+
+    while True:
+        ret, frame_bgr = cap.read()
+        if not ret:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue
+
+        # Submit frame for inference if idle
+        with lock:
+            if pending_frame["pil"] is None:
+                pending_frame["pil"] = Image.fromarray(
+                    cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                )
+
+        # Fast overlay compositing (single alpha-blend)
+        with lock:
+            overlay = latest["overlay"]
+            det_fps = latest["fps"]
+            n_obj = latest["n_obj"]
+
+        out = frame_bgr
+        if overlay is not None:
+            alpha = overlay[:, :, 3:4].astype(np.float32) / 255.0
+            bgr_overlay = overlay[:, :, :3].astype(np.float32)
+            out = (
+                frame_bgr.astype(np.float32) * (1 - alpha) + bgr_overlay * alpha
+            ).astype(np.uint8)
+
+        # HUD
+        cv2.putText(
+            out,
+            f"Detect: {det_fps:.1f} FPS | Display: {fps:.0f} FPS | {n_obj} obj",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+        )
+
+        cv2.imshow(f"SAM3 Tracking - \"{prompt}\"", out)
+
+        key = cv2.waitKey(frame_delay) & 0xFF
+        if key == ord("q"):
+            break
+
+    running["active"] = False
+    thread.join(timeout=2)
+    cap.release()
+    cv2.destroyAllWindows()
+    print("Done")
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
 
-def _load_predictor(model_path, threshold):
+def _load_predictor(model_path, threshold, resolution=1008):
     """Shared model loading for CLI tasks."""
     from mlx_vlm.models.sam3.processing_sam3 import Sam3Processor
     from mlx_vlm.utils import get_model_path, load_model
@@ -829,6 +1029,9 @@ def _load_predictor(model_path, threshold):
     mp = get_model_path(model_path)
     model = load_model(mp)
     processor = Sam3Processor.from_pretrained(str(mp))
+    if resolution != 1008:
+        processor.image_size = resolution
+        print(f"Resolution: {resolution}x{resolution}")
     return Sam3Predictor(model, processor, score_threshold=threshold)
 
 
@@ -867,6 +1070,7 @@ def run_image(
     nms_thresh: float = 0.5,
     boxes: Optional[str] = None,
     show_boxes: bool = True,
+    resolution: int = 1008,
 ):
     """Run detection or segmentation on an image.
 
@@ -878,8 +1082,9 @@ def run_image(
         model_path: Model path or HF repo
         threshold: Score threshold
         nms_thresh: NMS IoU threshold
-        boxes: Comma-separated box coords "x1,y1,x2,y2" or "x1,y1,x2,y2;x1,y1,x2,y2"
-        show_boxes: Draw bounding boxes and labels on output (default: True)
+        boxes: Comma-separated box coords
+        show_boxes: Draw bounding boxes and labels on output
+        resolution: Input resolution (lower = faster)
     """
     import cv2
 
@@ -888,7 +1093,7 @@ def run_image(
         p = Path(image_path)
         output = str(p.parent / f"{p.stem}{suffix}{p.suffix}")
 
-    predictor = _load_predictor(model_path, threshold)
+    predictor = _load_predictor(model_path, threshold, resolution)
 
     image = Image.open(image_path).convert("RGB")
     W, H = image.size
@@ -953,16 +1158,22 @@ def main():
 
   # Video tracking
   python -m mlx_vlm.models.sam3.generate --task track --video input.mp4 --prompt "a car"
+
+  # Real-time tracking (live preview window, press 'q' to quit)
+  python -m mlx_vlm.models.sam3.generate --task realtime --video input.mp4 --prompt "a car"
+
+  # Real-time webcam
+  python -m mlx_vlm.models.sam3.generate --task realtime --video 0 --prompt "a person"
 """,
     )
     parser.add_argument(
         "--task",
-        choices=["detect", "segment", "track"],
+        choices=["detect", "segment", "track", "realtime"],
         default="segment",
-        help="Task: detect (boxes), segment (masks), track (video) (default: segment)",
+        help="Task: detect, segment, track, realtime (default: segment)",
     )
     parser.add_argument("--image", default=None, help="Input image path (detect/segment)")
-    parser.add_argument("--video", default=None, help="Input video path (track)")
+    parser.add_argument("--video", default=None, help="Input video path or '0' for webcam (track/realtime)")
     parser.add_argument("--prompt", required=True, help="Text prompt (e.g. 'a car')")
     parser.add_argument(
         "--boxes", default=None,
@@ -980,6 +1191,10 @@ def main():
     )
     parser.add_argument("--nms-thresh", type=float, default=0.5, help="NMS IoU threshold")
     parser.add_argument("--every", type=int, default=2, help="Detect every N frames (track only)")
+    parser.add_argument(
+        "--resolution", type=int, default=1008,
+        help="Input resolution (default: 1008). Lower = faster: 336 (~8 FPS), 504 (~3 FPS)",
+    )
     args = parser.parse_args()
 
     if args.task in ("detect", "segment"):
@@ -995,6 +1210,7 @@ def main():
             nms_thresh=args.nms_thresh,
             boxes=args.boxes,
             show_boxes=args.show_boxes if args.task == "segment" else True,
+            resolution=args.resolution,
         )
     elif args.task == "track":
         if args.video is None:
@@ -1009,6 +1225,20 @@ def main():
             every=args.every,
             boxes=args.boxes,
             show_boxes=args.show_boxes,
+            resolution=args.resolution,
+        )
+    elif args.task == "realtime":
+        if args.video is None:
+            parser.error("--video is required for --task realtime (use '0' for webcam)")
+        track_video_realtime(
+            video_path=args.video,
+            prompt=args.prompt,
+            model_path=args.model,
+            threshold=args.threshold if args.threshold is not None else 0.15,
+            nms_thresh=args.nms_thresh,
+            boxes=args.boxes,
+            show_boxes=args.show_boxes,
+            resolution=args.resolution,
         )
 
 

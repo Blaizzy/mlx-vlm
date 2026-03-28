@@ -285,35 +285,46 @@ class ViTBackbone(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         """
         Args:
-            x: (B, H, W, C) image
+            x: (B, H, W, C) image — supports any resolution divisible by patch_size
         Returns:
-            (B, feat_H, feat_W, hidden_size) - feature map from last global attention block
+            (B, feat_H, feat_W, hidden_size)
         """
         B = x.shape[0]
+        input_h, input_w = x.shape[1], x.shape[2]
+        H = input_h // self.config.patch_size
+        W = input_w // self.config.patch_size
+
         x = self.embeddings(x)  # (B, N, C)
 
-        # Add position embeddings (with tiling if size differs)
-        pos = self.embeddings.position_embeddings
-        if pos.shape[1] != x.shape[1]:
-            pos = self._tile_pos_embed(pos)
+        # Tile position embeddings to match actual feature size
+        pos = self._tile_pos_embed(self.embeddings.position_embeddings, H, W)
         x = x + pos
-
-        H = W = self.feat_size
 
         # Reshape to spatial format: (B, H, W, C) matching HF
         x = x.reshape(B, H, W, -1)
         x = self.layer_norm(x)
 
+        # Compute RoPE for actual size if different from default
+        if H != self.feat_size or W != self.feat_size:
+            head_dim = self.config.hidden_size // self.config.num_attention_heads
+            global_cos, global_sin = compute_axial_cis(
+                head_dim, H, W, theta=self.config.rope_theta,
+            )
+        else:
+            global_cos = self._rope_global_cos
+            global_sin = self._rope_global_sin
+
         for layer in self.layers:
             if layer.is_global:
-                x = layer(x, self._rope_global_cos, self._rope_global_sin)
+                x = layer(x, global_cos, global_sin)
             else:
                 x = layer(x, self._rope_window_cos, self._rope_window_sin)
 
-        # Already in spatial format (B, H, W, C)
         return x
 
-    def _tile_pos_embed(self, pos: mx.array) -> mx.array:
+    def _tile_pos_embed(
+        self, pos: mx.array, target_h: Optional[int] = None, target_w: Optional[int] = None
+    ) -> mx.array:
         """Tile position embeddings to match target spatial dimensions.
 
         HF SAM3 uses tiling (repeating), not interpolation.
@@ -321,23 +332,24 @@ class ViTBackbone(nn.Module):
         """
         N = pos.shape[1]
         pretrain_size = int(math.sqrt(N))
-        target_size = self.feat_size
+        target_h = target_h or self.feat_size
+        target_w = target_w or self.feat_size
         hidden_size = pos.shape[-1]
 
-        if pretrain_size == target_size:
+        if pretrain_size == target_h and pretrain_size == target_w:
             return pos
 
         pos = pos.reshape(1, pretrain_size, pretrain_size, hidden_size)
 
         # Tile to cover target size
-        repeat_h = target_size // pretrain_size + 1
-        repeat_w = target_size // pretrain_size + 1
+        repeat_h = target_h // pretrain_size + 1
+        repeat_w = target_w // pretrain_size + 1
 
         # Tile along H and W dimensions
         pos = mx.tile(pos, (1, repeat_h, repeat_w, 1))
         # Crop to target size
-        pos = pos[:, :target_size, :target_size, :]
-        pos = pos.reshape(1, target_size * target_size, hidden_size)
+        pos = pos[:, :target_h, :target_w, :]
+        pos = pos.reshape(1, target_h * target_w, hidden_size)
         return pos
 
 
