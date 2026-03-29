@@ -201,10 +201,23 @@ def predict_multi(
     pixel_values = mx.array(inputs["pixel_values"])
 
     det = predictor.model.detector_model
-    fpn_features = det.vision_encoder(pixel_values)
+    vision_out = det.vision_encoder(pixel_values)
+
+    # Handle both SAM 3 FPNNeck (list) and SAM 3.1 TriViTDetNeck (tuple of 3 lists)
+    if isinstance(vision_out, tuple):
+        fpn_features = vision_out[0]  # detection FPN
+    else:
+        fpn_features = vision_out
+
     fpn_pos = [det._pos_enc(feat) for feat in fpn_features]
-    fpn_trimmed = fpn_features[:-1]
-    fpn_pos_trimmed = fpn_pos[:-1]
+
+    # SAM 3: 4 scales, trim last (0.5x); SAM 3.1: 3 scales, no trimming
+    if len(fpn_features) > 3:
+        fpn_trimmed = fpn_features[:-1]
+        fpn_pos_trimmed = fpn_pos[:-1]
+    else:
+        fpn_trimmed = fpn_features
+        fpn_pos_trimmed = fpn_pos
 
     encoder_feat = fpn_trimmed[-1]
     B, H_f, W_f, D = encoder_feat.shape
