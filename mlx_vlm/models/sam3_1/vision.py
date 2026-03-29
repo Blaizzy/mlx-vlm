@@ -6,15 +6,14 @@ The TriViTDetNeck has 3 parallel FPN heads:
 - propagation_convs: tracking propagation features
 """
 
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .config import VisionEncoderConfig
-
 # Reuse ViT backbone and FPN building blocks from SAM 3
 from ..sam3.vision import FPNLayer, ViTBackbone
+from .config import VisionEncoderConfig
 
 
 class TriViTDetNeck(nn.Module):

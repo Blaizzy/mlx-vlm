@@ -7,9 +7,9 @@ from ..base import BaseModelConfig
 
 # Reuse unchanged configs from SAM 3
 from ..sam3.config import (
+    DetectorMaskDecoderConfig,
     DETRDecoderConfig,
     DETREncoderConfig,
-    DetectorMaskDecoderConfig,
     GeometryEncoderConfig,
     PromptEncoderConfig,
     TextEncoderConfig,

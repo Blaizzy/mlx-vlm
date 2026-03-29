@@ -3,27 +3,16 @@
 Reuses SAMPromptEncoder, TwoWayTransformer etc. from SAM 3.
 """
 
-import math
 from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .config import TrackerMaskDecoderConfig
+from ..sam3.position import apply_rotary_enc_1d, init_2d_freqs
 
 # Reuse unchanged components from SAM 3
-from ..sam3.sam_components import (
-    LayerNorm2d,
-    MLPBlock,
-    OutputMLP,
-    PositionalEmbedding,
-    SAMAttention,
-    SAMPromptEncoder,
-    TwoWayAttentionBlock,
-    TwoWayTransformer,
-)
-from ..sam3.position import init_2d_freqs, apply_rotary_enc_1d
-
+from ..sam3.sam_components import LayerNorm2d, OutputMLP, TwoWayTransformer
+from .config import TrackerMaskDecoderConfig
 
 # ---------------------------------------------------------------------------
 # MultiplexMaskDecoder
@@ -98,11 +87,21 @@ class MultiplexMaskDecoder(nn.Module):
         d = image_embeddings.shape[-1]
 
         # Build token sequence: iou + mask + obj_score + sparse prompts
-        tokens = mx.concatenate([
-            mx.broadcast_to(self.iou_token.weight[None], (B, self.multiplex_count, d)),
-            mx.broadcast_to(self.mask_tokens.weight[None], (B, self.multiplex_count * self.num_mask_tokens, d)),
-            mx.broadcast_to(self.obj_score_token.weight[None], (B, self.multiplex_count, d)),
-        ], axis=1)
+        tokens = mx.concatenate(
+            [
+                mx.broadcast_to(
+                    self.iou_token.weight[None], (B, self.multiplex_count, d)
+                ),
+                mx.broadcast_to(
+                    self.mask_tokens.weight[None],
+                    (B, self.multiplex_count * self.num_mask_tokens, d),
+                ),
+                mx.broadcast_to(
+                    self.obj_score_token.weight[None], (B, self.multiplex_count, d)
+                ),
+            ],
+            axis=1,
+        )
         tokens = mx.concatenate([tokens, sparse_prompt_embeddings], axis=1)
 
         src = image_embeddings + dense_prompt_embeddings
@@ -112,8 +111,8 @@ class MultiplexMaskDecoder(nn.Module):
         M = self.multiplex_count
         N_mask = self.num_mask_tokens
         iou_out = hs[:, :M]
-        mask_out = hs[:, M:M + M * N_mask]
-        obj_out = hs[:, M + M * N_mask:2 * M + M * N_mask]
+        mask_out = hs[:, M : M + M * N_mask]
+        obj_out = hs[:, M + M * N_mask : 2 * M + M * N_mask]
 
         # Upscale
         HW = src.shape[1]
@@ -145,21 +144,23 @@ class MultiplexMaskDecoder(nn.Module):
         for obj_i in range(M):
             for mask_j in range(N_mask):
                 token_idx = obj_i * N_mask + mask_j
-                hyper_out = self.output_hypernetworks_mlps[mask_j](mask_out[:, token_idx])
+                hyper_out = self.output_hypernetworks_mlps[mask_j](
+                    mask_out[:, token_idx]
+                )
                 mask = (upscaled_flat * hyper_out[:, None, :]).sum(axis=-1)
                 masks.append(mask.reshape(B, 1, H_up, W_up))
         masks = mx.concatenate(masks, axis=1)  # (B, M*N_mask, H, W)
         masks = masks.reshape(B, M, N_mask, H_up, W_up)
 
         # IoU prediction — per multiplex slot
-        iou_pred = mx.stack([
-            self.iou_prediction_head(iou_out[:, i]) for i in range(M)
-        ], axis=1)  # (B, M, N_mask)
+        iou_pred = mx.stack(
+            [self.iou_prediction_head(iou_out[:, i]) for i in range(M)], axis=1
+        )  # (B, M, N_mask)
 
         # Object score
-        obj_score = mx.stack([
-            self.pred_obj_score_head(obj_out[:, i]) for i in range(M)
-        ], axis=1)  # (B, M, 1)
+        obj_score = mx.stack(
+            [self.pred_obj_score_head(obj_out[:, i]) for i in range(M)], axis=1
+        )  # (B, M, 1)
 
         if multimask_output:
             out_masks = masks
@@ -230,8 +231,10 @@ class SimpleRoPEAttention(nn.Module):
             k_no_rope = None
 
         q, k_rope = apply_rotary_enc_1d(
-            q, k_rope,
-            self._freqs_cos, self._freqs_sin,
+            q,
+            k_rope,
+            self._freqs_cos,
+            self._freqs_sin,
             repeat_freqs_k=self.rope_k_repeat,
         )
 
@@ -262,7 +265,12 @@ class DecoupledMemoryAttentionLayer(nn.Module):
         norm{1,2,3}.{weight,bias}
     """
 
-    def __init__(self, config, self_attn_rope: SimpleRoPEAttention, cross_attn_rope: SimpleRoPEAttention):
+    def __init__(
+        self,
+        config,
+        self_attn_rope: SimpleRoPEAttention,
+        cross_attn_rope: SimpleRoPEAttention,
+    ):
         super().__init__()
         d = config.memory_attention_hidden_size
 
@@ -354,12 +362,16 @@ class DecoupledMemoryAttention(nn.Module):
         self.layers = []
         for _ in range(config.memory_attention_num_layers):
             self_rope = SimpleRoPEAttention(
-                d, config.memory_attention_num_attention_heads,
-                feat_sizes=feat_sizes, rope_theta=theta,
+                d,
+                config.memory_attention_num_attention_heads,
+                feat_sizes=feat_sizes,
+                rope_theta=theta,
             )
             cross_rope = SimpleRoPEAttention(
-                d, config.memory_attention_num_attention_heads,
-                feat_sizes=feat_sizes, rope_theta=theta,
+                d,
+                config.memory_attention_num_attention_heads,
+                feat_sizes=feat_sizes,
+                rope_theta=theta,
                 rope_k_repeat=True,
             )
             self.layers.append(

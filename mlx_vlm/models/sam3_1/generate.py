@@ -23,16 +23,12 @@ from ..sam3.generate import (
     COLORS_BGR,
     DetectionResult,
     Sam3Predictor,
-    Sam3VideoPredictor,
-    TrackingResult,
     _filter_by_regions,
     _resize_masks,
-    _sigmoid,
     draw_frame,
     nms,
     run_image,
 )
-
 
 # ---------------------------------------------------------------------------
 # SAM 3.1 predict_multi — handles TriViTDetNeck's 3-tuple output
@@ -196,7 +192,9 @@ def _get_det_features(model, backbone_features: mx.array):
 
 def _run_detr_encoder(model, src, pos_flat, inputs_embeds, attention_mask):
     """Run DETR encoder. Cacheable when backbone + text are unchanged."""
-    encoded = model.detector_model.detr_encoder(src, pos_flat, inputs_embeds, attention_mask)
+    encoded = model.detector_model.detr_encoder(
+        src, pos_flat, inputs_embeds, attention_mask
+    )
     mx.eval(encoded)
     return encoded
 
@@ -210,7 +208,9 @@ def _postprocess_mlx(
     threshold: float,
 ) -> DetectionResult:
     """Postprocess entirely in MLX, single numpy conversion at the end."""
-    W, H = image_size if isinstance(image_size, tuple) else (image_size[1], image_size[0])
+    W, H = (
+        image_size if isinstance(image_size, tuple) else (image_size[1], image_size[0])
+    )
 
     # All scoring in MLX
     scores = mx.sigmoid(pred_logits[0].squeeze())
@@ -270,7 +270,9 @@ def _detect_with_backbone(
     det = predictor.model.detector_model
 
     # FPN neck (cheap ~3ms)
-    src, pos_flat, det_features, spatial = _get_det_features(predictor.model, backbone_features)
+    src, pos_flat, det_features, spatial = _get_det_features(
+        predictor.model, backbone_features
+    )
     H_f, W_f = spatial
 
     all_boxes, all_masks, all_scores, all_labels = [], [], [], []
@@ -302,8 +304,10 @@ def _detect_with_backbone(
         # Box conversion in MLX (no numpy)
         pred_boxes_cxcywh = ref_boxes[-1]
         cx, cy, w, h = (
-            pred_boxes_cxcywh[..., 0], pred_boxes_cxcywh[..., 1],
-            pred_boxes_cxcywh[..., 2], pred_boxes_cxcywh[..., 3],
+            pred_boxes_cxcywh[..., 0],
+            pred_boxes_cxcywh[..., 1],
+            pred_boxes_cxcywh[..., 2],
+            pred_boxes_cxcywh[..., 3],
         )
         pred_boxes_xyxy = mx.stack(
             [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=-1
@@ -317,7 +321,8 @@ def _detect_with_backbone(
         # Mask decoder
         last_hs = hs[-1]
         seg_out = det.mask_decoder(
-            last_hs, list(det_features),
+            last_hs,
+            list(det_features),
             encoder_hidden_states=encoded,
             prompt_features=inputs_embeds,
             prompt_mask=attention_mask,
@@ -332,7 +337,8 @@ def _detect_with_backbone(
             pred_boxes_xyxy if pred_boxes_xyxy.ndim == 3 else pred_boxes_xyxy[None],
             seg_out["pred_masks"],
             presence if presence.ndim == 2 else presence[None],
-            image_size, threshold,
+            image_size,
+            threshold,
         )
         if len(result.scores) > 0:
             result = nms(result)
@@ -342,7 +348,11 @@ def _detect_with_backbone(
             all_labels.extend([prompt] * len(result.scores))
 
     if not all_scores:
-        W, H = image_size if isinstance(image_size, tuple) else (image_size[1], image_size[0])
+        W, H = (
+            image_size
+            if isinstance(image_size, tuple)
+            else (image_size[1], image_size[0])
+        )
         return DetectionResult(
             boxes=np.zeros((0, 4)),
             masks=np.zeros((0, H, W), dtype=np.uint8),
@@ -376,10 +386,14 @@ def _init_tracker_memory(
     # Build combined multiplex mask in MLX
     N = min(len(detection_masks), multiplex_count)
     # Stack masks → (N, H_mask, W_mask), resize once
-    masks_mx = mx.array(np.stack(detection_masks[:N]).astype(np.float32))  # single conversion
+    masks_mx = mx.array(
+        np.stack(detection_masks[:N]).astype(np.float32)
+    )  # single conversion
     mask_h, mask_w = masks_mx.shape[1], masks_mx.shape[2]
     if mask_h != target or mask_w != target:
-        up = nn.Upsample(scale_factor=(target / mask_h, target / mask_w), mode="nearest")
+        up = nn.Upsample(
+            scale_factor=(target / mask_h, target / mask_w), mode="nearest"
+        )
         masks_mx = up(masks_mx[:, :, :, None])[:, :, :, 0]  # (N, target, target)
 
     # Pack into multiplex channels in MLX
@@ -388,9 +402,9 @@ def _init_tracker_memory(
         slot = ch // 2
         if slot < N:
             if ch % 2 == 0:
-                channels.append(masks_mx[slot:slot+1, :, :, None])  # mask
+                channels.append(masks_mx[slot : slot + 1, :, :, None])  # mask
             else:
-                channels.append(1.0 - masks_mx[slot:slot+1, :, :, None])  # inverse
+                channels.append(1.0 - masks_mx[slot : slot + 1, :, :, None])  # inverse
         else:
             channels.append(mx.zeros((1, target, target, 1)))
     # (multiplex*2, target, target, 1) → (1, target, target, n_ch)
@@ -426,7 +440,9 @@ def _propagate_tracker(
     pred_masks = result["pred_masks"]  # (B, M, num_masks, H, W) or (B, num_masks, H, W)
     iou_scores = result["iou_scores"]
 
-    W, H = image_size if isinstance(image_size, tuple) else (image_size[1], image_size[0])
+    W, H = (
+        image_size if isinstance(image_size, tuple) else (image_size[1], image_size[0])
+    )
     N = min(n_objects, 16)
 
     # Extract per-object masks and scores in MLX (batched, no per-object np.array)
@@ -571,8 +587,10 @@ def track_video(
     writer = cv2.VideoWriter(output, fourcc, fps, (W, H))
 
     latest_result = DetectionResult(
-        boxes=np.array([]), masks=np.array([]),
-        scores=np.array([]), labels=[],
+        boxes=np.array([]),
+        masks=np.array([]),
+        scores=np.array([]),
+        labels=[],
     )
 
     for fi in range(total_frames):
@@ -588,12 +606,20 @@ def track_video(
             latest_result = result
 
             if fi % 40 == 0:
-                print(f"  Frame {fi}/{total_frames}: {len(latest_result.scores)} detections")
+                print(
+                    f"  Frame {fi}/{total_frames}: {len(latest_result.scores)} detections"
+                )
 
         out = draw_frame(
-            frame_bgr, latest_result.masks, latest_result.scores,
-            latest_result.boxes, prompt_str, H, W,
-            show_boxes=show_boxes, labels=latest_result.labels,
+            frame_bgr,
+            latest_result.masks,
+            latest_result.scores,
+            latest_result.boxes,
+            prompt_str,
+            H,
+            W,
+            show_boxes=show_boxes,
+            labels=latest_result.labels,
         )
         writer.write(out)
 
@@ -670,9 +696,13 @@ def track_video_realtime(
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     prompt_str = " + ".join(prompts)
     print(f"Video: {fps:.1f} fps, {W}x{H}")
-    print(f"Prompts: {prompts}, threshold {threshold}, resolution {resolution}x{resolution}")
-    print(f"Optimized: detect every {detect_every}, ViT every {recompute_backbone_every}, "
-          f"memory update every {update_memory_every}")
+    print(
+        f"Prompts: {prompts}, threshold {threshold}, resolution {resolution}x{resolution}"
+    )
+    print(
+        f"Optimized: detect every {detect_every}, ViT every {recompute_backbone_every}, "
+        f"memory update every {update_memory_every}"
+    )
 
     # Load background image for bg swap mode
     bg_frame = None
@@ -766,8 +796,11 @@ def track_video_realtime(
             # Step 2: Detect or propagate
             # Tracker propagation only works at native resolution (1008px)
             # because positional encodings are fixed-size
-            can_track = (resolution >= 1008 and tracker_state["memory_bank"]
-                         and tracker_state["n_objects"] > 0)
+            can_track = (
+                resolution >= 1008
+                and tracker_state["memory_bank"]
+                and tracker_state["n_objects"] > 0
+            )
             need_detect = (
                 inference_count % detect_every == 0
                 or not tracker_state["memory_bank"]
@@ -777,7 +810,11 @@ def track_video_realtime(
             if need_detect:
                 # Full DETR detection (with cached backbone + encoder cache)
                 result = _detect_with_backbone(
-                    predictor, backbone_features, prompts, image_size, threshold,
+                    predictor,
+                    backbone_features,
+                    prompts,
+                    image_size,
+                    threshold,
                     encoder_cache=encoder_cache,
                 )
                 if box_array is not None and len(result.scores) > 0:
@@ -792,19 +829,26 @@ def track_video_realtime(
                     )
                     tracker_state["n_objects"] = len(result.scores)
                     tracker_state["labels"] = (
-                        result.labels if result.labels else [prompt_str] * len(result.scores)
+                        result.labels
+                        if result.labels
+                        else [prompt_str] * len(result.scores)
                     )
                     prop_count = 0
                 elif len(result.scores) > 0:
                     # At lower resolutions, just carry labels forward
                     tracker_state["labels"] = (
-                        result.labels if result.labels else [prompt_str] * len(result.scores)
+                        result.labels
+                        if result.labels
+                        else [prompt_str] * len(result.scores)
                     )
             else:
                 # Tracker propagation (fast path — native resolution only)
                 result, updated_bank = _propagate_tracker(
-                    model, backbone_features, tracker_state["memory_bank"],
-                    tracker_state["n_objects"], image_size,
+                    model,
+                    backbone_features,
+                    tracker_state["memory_bank"],
+                    tracker_state["n_objects"],
+                    image_size,
                 )
                 result.labels = tracker_state["labels"]
 
@@ -829,7 +873,8 @@ def track_video_realtime(
                         mask = result.masks[i]
                         if mask.shape[0] != H or mask.shape[1] != W:
                             mask = cv2.resize(
-                                mask.astype(np.uint8), (W, H),
+                                mask.astype(np.uint8),
+                                (W, H),
                                 interpolation=cv2.INTER_NEAREST,
                             )
                         overlay[mask > 0] = COLORS_BGR[i % len(COLORS_BGR)]
@@ -838,12 +883,18 @@ def track_video_realtime(
                     if bg_frame is not None:
                         fg_mask = np.any(result.masks > 0, axis=0).astype(np.uint8)
                         if fg_mask.shape[0] != H or fg_mask.shape[1] != W:
-                            fg_mask = cv2.resize(fg_mask, (W, H), interpolation=cv2.INTER_NEAREST)
+                            fg_mask = cv2.resize(
+                                fg_mask, (W, H), interpolation=cv2.INTER_NEAREST
+                            )
 
                 # Boxes + labels
                 for i in range(len(result.scores)):
                     color = COLORS_BGR[i % len(COLORS_BGR)]
-                    lbl = result.labels[i] if result.labels and i < len(result.labels) else prompt_str
+                    lbl = (
+                        result.labels[i]
+                        if result.labels and i < len(result.labels)
+                        else prompt_str
+                    )
                     label = f"{lbl} {result.scores[i]:.2f}"
 
                     x1, y1, x2, y2 = result.boxes[i].astype(int)
@@ -851,9 +902,25 @@ def track_video_realtime(
                         cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
                     lx, ly = x1, max(y1 - 8, 12)
 
-                    (tw, th_t), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                    cv2.rectangle(overlay, (lx, max(ly - th_t - 6, 0)), (lx + tw + 6, ly + 4), color, -1)
-                    cv2.putText(overlay, label, (lx + 3, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    (tw, th_t), _ = cv2.getTextSize(
+                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+                    )
+                    cv2.rectangle(
+                        overlay,
+                        (lx, max(ly - th_t - 6, 0)),
+                        (lx + tw + 6, ly + 4),
+                        color,
+                        -1,
+                    )
+                    cv2.putText(
+                        overlay,
+                        label,
+                        (lx + 3, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2,
+                    )
 
             scaled = (overlay.astype(np.uint16) * 115 >> 8).astype(np.uint8)
 
@@ -916,7 +983,11 @@ def track_video_realtime(
         cv2.putText(
             out,
             f"{mode.upper()}: {det_fps:.1f} FPS | Display: {display_fps_val:.0f} FPS | {n_obj} obj",
-            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
         )
 
         cv2.imshow(f"SAM3.1 Tracking - {prompt_str}", out)
@@ -942,8 +1013,9 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="SAM 3.1 inference")
-    parser.add_argument("--task", default="segment",
-                        choices=["detect", "segment", "track", "realtime"])
+    parser.add_argument(
+        "--task", default="segment", choices=["detect", "segment", "track", "realtime"]
+    )
     parser.add_argument("--image", type=str)
     parser.add_argument("--video", type=str)
     parser.add_argument("--prompt", nargs="+", required=True)
@@ -958,37 +1030,65 @@ def main():
     parser.add_argument("--resolution", type=int, default=1008)
     parser.add_argument("--bg-image", type=str)
     # Optimization parameters
-    parser.add_argument("--detect-every", type=int, default=15,
-                        help="Re-run DETR detection every N inference frames (default: 15)")
-    parser.add_argument("--backbone-every", type=int, default=5,
-                        help="Re-run ViT backbone every N inference frames (default: 5)")
-    parser.add_argument("--memory-every", type=int, default=3,
-                        help="Update tracker memory every N propagation frames (default: 3)")
+    parser.add_argument(
+        "--detect-every",
+        type=int,
+        default=15,
+        help="Re-run DETR detection every N inference frames (default: 15)",
+    )
+    parser.add_argument(
+        "--backbone-every",
+        type=int,
+        default=5,
+        help="Re-run ViT backbone every N inference frames (default: 5)",
+    )
+    parser.add_argument(
+        "--memory-every",
+        type=int,
+        default=3,
+        help="Update tracker memory every N propagation frames (default: 3)",
+    )
     args = parser.parse_args()
 
     if args.task in ("track", "realtime"):
         video = args.video or "0"
         if args.task == "track":
             track_video(
-                video, args.prompt, output=args.output, model_path=args.model,
-                threshold=args.threshold, nms_thresh=args.nms_thresh,
-                every=args.every, boxes=args.boxes, show_boxes=args.show_boxes,
+                video,
+                args.prompt,
+                output=args.output,
+                model_path=args.model,
+                threshold=args.threshold,
+                nms_thresh=args.nms_thresh,
+                every=args.every,
+                boxes=args.boxes,
+                show_boxes=args.show_boxes,
                 resolution=args.resolution,
             )
         else:
             track_video_realtime(
-                video, args.prompt, model_path=args.model,
-                threshold=args.threshold, nms_thresh=args.nms_thresh,
-                boxes=args.boxes, show_boxes=args.show_boxes,
-                resolution=args.resolution, bg_image=args.bg_image,
+                video,
+                args.prompt,
+                model_path=args.model,
+                threshold=args.threshold,
+                nms_thresh=args.nms_thresh,
+                boxes=args.boxes,
+                show_boxes=args.show_boxes,
+                resolution=args.resolution,
+                bg_image=args.bg_image,
                 detect_every=args.detect_every,
                 recompute_backbone_every=args.backbone_every,
                 update_memory_every=args.memory_every,
             )
     else:
         run_image(
-            args.image, args.prompt, task=args.task, model_path=args.model,
-            output=args.output, threshold=args.threshold, boxes=args.boxes,
+            args.image,
+            args.prompt,
+            task=args.task,
+            model_path=args.model,
+            output=args.output,
+            threshold=args.threshold,
+            boxes=args.boxes,
             show_boxes=args.show_boxes,
         )
 

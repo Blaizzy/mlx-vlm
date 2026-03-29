@@ -35,6 +35,7 @@ def split_qkv(weight, bias=None):
 # FPN neck sub-key mapping
 # ---------------------------------------------------------------------------
 
+
 def _map_fpn_conv_key(suffix):
     """Map FPN conv sub-keys: dconv_2x2_0 -> scale_layers.0, etc."""
     # dconv_2x2_0 -> scale_layers.0  (ConvTranspose2d, first upsample)
@@ -100,6 +101,7 @@ def is_conv_transpose(key):
 # Main key conversion
 # ---------------------------------------------------------------------------
 
+
 def convert_key(old_key):
     """Map a Meta checkpoint key to MLX format.
 
@@ -118,13 +120,11 @@ def convert_key(old_key):
     # DETECTOR keys
     # ==================================================================
     if key.startswith("detector."):
-        key = key[len("detector."):]  # strip "detector."
+        key = key[len("detector.") :]  # strip "detector."
 
         # --- Vision backbone trunk ---
         # ViT blocks
-        m = re.match(
-            r"backbone\.vision_backbone\.trunk\.blocks\.(\d+)\.(.+)", key
-        )
+        m = re.match(r"backbone\.vision_backbone\.trunk\.blocks\.(\d+)\.(.+)", key)
         if m:
             block_idx = m.group(1)
             rest = m.group(2)
@@ -132,14 +132,14 @@ def convert_key(old_key):
 
             # attn sub-keys (excluding qkv which is handled separately)
             if rest.startswith("attn."):
-                attn_rest = rest[len("attn."):]
+                attn_rest = rest[len("attn.") :]
                 # qkv is handled by QKV splitter
                 if attn_rest.startswith("qkv."):
                     return None, False  # signal caller to handle QKV
                 # Meta uses attn.proj for output projection -> out_proj
                 # But don't double-prefix if already out_proj (from probe keys)
                 if attn_rest.startswith("proj.") and not attn_rest.startswith("proj_"):
-                    attn_rest = "out_proj." + attn_rest[len("proj."):]
+                    attn_rest = "out_proj." + attn_rest[len("proj.") :]
                 return f"{prefix}.attention.{attn_rest}", False
 
             if rest.startswith("norm1."):
@@ -159,33 +159,39 @@ def convert_key(old_key):
 
         # ln_pre -> layer_norm
         if key.startswith("backbone.vision_backbone.trunk.ln_pre."):
-            rest = key[len("backbone.vision_backbone.trunk.ln_pre."):]
+            rest = key[len("backbone.vision_backbone.trunk.ln_pre.") :]
             return f"detector_model.vision_encoder.backbone.layer_norm.{rest}", False
 
         # patch_embed.proj -> embeddings.patch_embeddings.projection
         if key.startswith("backbone.vision_backbone.trunk.patch_embed.proj."):
-            rest = key[len("backbone.vision_backbone.trunk.patch_embed.proj."):]
-            return f"detector_model.vision_encoder.backbone.embeddings.patch_embeddings.projection.{rest}", False
+            rest = key[len("backbone.vision_backbone.trunk.patch_embed.proj.") :]
+            return (
+                f"detector_model.vision_encoder.backbone.embeddings.patch_embeddings.projection.{rest}",
+                False,
+            )
 
         # pos_embed -> position_embeddings
         if key == "backbone.vision_backbone.trunk.pos_embed":
-            return "detector_model.vision_encoder.backbone.embeddings.position_embeddings", False
+            return (
+                "detector_model.vision_encoder.backbone.embeddings.position_embeddings",
+                False,
+            )
 
         # Other trunk keys (pos_embed_window, etc.)
         if key.startswith("backbone.vision_backbone.trunk."):
-            rest = key[len("backbone.vision_backbone.trunk."):]
+            rest = key[len("backbone.vision_backbone.trunk.") :]
             return f"detector_model.vision_encoder.backbone.{rest}", False
 
         # --- FPN neck convs ---
         for conv_type in ["convs", "interactive_convs", "propagation_convs"]:
             if key.startswith(f"backbone.vision_backbone.{conv_type}."):
-                rest = key[len(f"backbone.vision_backbone.{conv_type}."):]
+                rest = key[len(f"backbone.vision_backbone.{conv_type}.") :]
                 rest = _map_fpn_conv_key(rest)
                 return f"detector_model.vision_encoder.neck.{conv_type}.{rest}", False
 
         # --- Language backbone (CLIP text encoder) ---
         if key.startswith("backbone.language_backbone."):
-            lk = key[len("backbone.language_backbone."):]
+            lk = key[len("backbone.language_backbone.") :]
 
             # text_projection (can be either top-level or under encoder.)
             if lk == "text_projection" or lk == "encoder.text_projection":
@@ -193,31 +199,42 @@ def convert_key(old_key):
 
             # encoder.ln_final -> text_model.final_layer_norm
             if lk.startswith("encoder.ln_final."):
-                rest = lk[len("encoder.ln_final."):]
-                return f"detector_model.text_encoder.text_model.final_layer_norm.{rest}", False
+                rest = lk[len("encoder.ln_final.") :]
+                return (
+                    f"detector_model.text_encoder.text_model.final_layer_norm.{rest}",
+                    False,
+                )
 
             # encoder.token_embedding -> text_model.embeddings.token_embedding
             if lk.startswith("encoder.token_embedding."):
-                rest = lk[len("encoder.token_embedding."):]
-                return f"detector_model.text_encoder.text_model.embeddings.token_embedding.{rest}", False
+                rest = lk[len("encoder.token_embedding.") :]
+                return (
+                    f"detector_model.text_encoder.text_model.embeddings.token_embedding.{rest}",
+                    False,
+                )
 
             # encoder.positional_embedding -> text_model.embeddings.position_embedding.weight
             if lk == "encoder.positional_embedding":
-                return "detector_model.text_encoder.text_model.embeddings.position_embedding.weight", False
+                return (
+                    "detector_model.text_encoder.text_model.embeddings.position_embedding.weight",
+                    False,
+                )
 
             # encoder.transformer.resblocks.{N}
             m2 = re.match(r"encoder\.transformer\.resblocks\.(\d+)\.(.+)", lk)
             if m2:
                 layer_idx = m2.group(1)
                 rest = m2.group(2)
-                prefix = f"detector_model.text_encoder.text_model.encoder.layers.{layer_idx}"
+                prefix = (
+                    f"detector_model.text_encoder.text_model.encoder.layers.{layer_idx}"
+                )
 
                 # attn.in_proj_weight/bias -> QKV split (handled separately)
                 if rest.startswith("attn.in_proj_"):
                     return None, False
 
                 if rest.startswith("attn.out_proj."):
-                    attn_rest = rest[len("attn.out_proj."):]
+                    attn_rest = rest[len("attn.out_proj.") :]
                     return f"{prefix}.self_attn.out_proj.{attn_rest}", False
 
                 if rest.startswith("ln_1."):
@@ -234,7 +251,7 @@ def convert_key(old_key):
 
             # resizer -> text_projection (the MLP resizer)
             if lk.startswith("resizer."):
-                rest = lk[len("resizer."):]
+                rest = lk[len("resizer.") :]
                 return f"detector_model.text_projection.{rest}", False
 
             # Fallback for language backbone
@@ -266,12 +283,12 @@ def convert_key(old_key):
 
         # encoder.norm -> detr_encoder output norm
         if key.startswith("transformer.encoder.norm."):
-            rest = key[len("transformer.encoder.norm."):]
+            rest = key[len("transformer.encoder.norm.") :]
             return f"detector_model.detr_encoder.layer_norm.{rest}", False
 
         # --- DETR Transformer decoder ---
         if key.startswith("transformer.decoder."):
-            dk = key[len("transformer.decoder."):]
+            dk = key[len("transformer.decoder.") :]
 
             # decoder.layers.{N}
             m4 = re.match(r"layers\.(\d+)\.(.+)", dk)
@@ -314,25 +331,34 @@ def convert_key(old_key):
             if m5:
                 layer_idx = int(m5.group(1)) + 1
                 rest = m5.group(2)
-                return f"detector_model.detr_decoder.box_head.layer{layer_idx}.{rest}", False
+                return (
+                    f"detector_model.detr_decoder.box_head.layer{layer_idx}.{rest}",
+                    False,
+                )
 
             # boxRPB_embed_x.layers.{N} -> box_rpb_embed_x.layer{N+1}
             m5b = re.match(r"boxRPB_embed_x\.layers\.(\d+)\.(.+)", dk)
             if m5b:
                 layer_idx = int(m5b.group(1)) + 1
                 rest = m5b.group(2)
-                return f"detector_model.detr_decoder.box_rpb_embed_x.layer{layer_idx}.{rest}", False
+                return (
+                    f"detector_model.detr_decoder.box_rpb_embed_x.layer{layer_idx}.{rest}",
+                    False,
+                )
 
             # boxRPB_embed_y.layers.{N} -> box_rpb_embed_y.layer{N+1}
             m5c = re.match(r"boxRPB_embed_y\.layers\.(\d+)\.(.+)", dk)
             if m5c:
                 layer_idx = int(m5c.group(1)) + 1
                 rest = m5c.group(2)
-                return f"detector_model.detr_decoder.box_rpb_embed_y.layer{layer_idx}.{rest}", False
+                return (
+                    f"detector_model.detr_decoder.box_rpb_embed_y.layer{layer_idx}.{rest}",
+                    False,
+                )
 
             # presence_token.weight
             if dk.startswith("presence_token."):
-                rest = dk[len("presence_token."):]
+                rest = dk[len("presence_token.") :]
                 return f"detector_model.detr_decoder.presence_token.{rest}", False
 
             # presence_token_head.layers.{N} -> presence_head.layer{N+1}
@@ -340,21 +366,24 @@ def convert_key(old_key):
             if m6:
                 layer_idx = int(m6.group(1)) + 1
                 rest = m6.group(2)
-                return f"detector_model.detr_decoder.presence_head.layer{layer_idx}.{rest}", False
+                return (
+                    f"detector_model.detr_decoder.presence_head.layer{layer_idx}.{rest}",
+                    False,
+                )
 
             # presence_token_out_norm -> presence_layer_norm
             if dk.startswith("presence_token_out_norm."):
-                rest = dk[len("presence_token_out_norm."):]
+                rest = dk[len("presence_token_out_norm.") :]
                 return f"detector_model.detr_decoder.presence_layer_norm.{rest}", False
 
             # query_embed
             if dk.startswith("query_embed."):
-                rest = dk[len("query_embed."):]
+                rest = dk[len("query_embed.") :]
                 return f"detector_model.detr_decoder.query_embed.{rest}", False
 
             # reference_points
             if dk.startswith("reference_points."):
-                rest = dk[len("reference_points."):]
+                rest = dk[len("reference_points.") :]
                 return f"detector_model.detr_decoder.reference_points.{rest}", False
 
             # ref_point_head.layers.{N} -> ref_point_head.layer{N+1}
@@ -362,11 +391,14 @@ def convert_key(old_key):
             if m7:
                 layer_idx = int(m7.group(1)) + 1
                 rest = m7.group(2)
-                return f"detector_model.detr_decoder.ref_point_head.layer{layer_idx}.{rest}", False
+                return (
+                    f"detector_model.detr_decoder.ref_point_head.layer{layer_idx}.{rest}",
+                    False,
+                )
 
             # norm -> output_layer_norm
             if dk.startswith("norm."):
-                rest = dk[len("norm."):]
+                rest = dk[len("norm.") :]
                 return f"detector_model.detr_decoder.output_layer_norm.{rest}", False
 
             # Fallback decoder keys
@@ -374,7 +406,7 @@ def convert_key(old_key):
 
         # --- Dot product scoring ---
         if key.startswith("dot_prod_scoring."):
-            dk = key[len("dot_prod_scoring."):]
+            dk = key[len("dot_prod_scoring.") :]
             # prompt_mlp.out_norm -> text_mlp_out_norm (must be before prompt_mlp)
             dk = dk.replace("prompt_mlp.out_norm", "text_mlp_out_norm")
             dk = dk.replace("prompt_mlp", "text_mlp")
@@ -384,7 +416,7 @@ def convert_key(old_key):
 
         # --- Geometry encoder ---
         if key.startswith("geometry_encoder."):
-            gk = key[len("geometry_encoder."):]
+            gk = key[len("geometry_encoder.") :]
 
             # QKV in geometry encoder
             if "self_attn.in_proj_" in gk or "cross_attn_image.in_proj_" in gk:
@@ -400,7 +432,7 @@ def convert_key(old_key):
 
         # --- Segmentation head ---
         if key.startswith("segmentation_head."):
-            sk = key[len("segmentation_head."):]
+            sk = key[len("segmentation_head.") :]
 
             # cross_attend_prompt.in_proj -> QKV split
             if "cross_attend_prompt.in_proj_" in sk:
@@ -408,32 +440,35 @@ def convert_key(old_key):
 
             # pixel_decoder
             if sk.startswith("pixel_decoder."):
-                rest = sk[len("pixel_decoder."):]
+                rest = sk[len("pixel_decoder.") :]
                 return f"detector_model.mask_decoder.pixel_decoder.{rest}", False
 
             # mask_predictor.mask_embed -> mask_embedder
             if sk.startswith("mask_predictor.mask_embed."):
-                rest = sk[len("mask_predictor.mask_embed."):]
+                rest = sk[len("mask_predictor.mask_embed.") :]
                 return f"detector_model.mask_decoder.mask_embedder.{rest}", False
 
             # cross_attend_prompt -> prompt_cross_attn
             if sk.startswith("cross_attend_prompt."):
-                rest = sk[len("cross_attend_prompt."):]
+                rest = sk[len("cross_attend_prompt.") :]
                 return f"detector_model.mask_decoder.prompt_cross_attn.{rest}", False
 
             # cross_attn_norm -> prompt_cross_attn_norm
             if sk.startswith("cross_attn_norm."):
-                rest = sk[len("cross_attn_norm."):]
-                return f"detector_model.mask_decoder.prompt_cross_attn_norm.{rest}", False
+                rest = sk[len("cross_attn_norm.") :]
+                return (
+                    f"detector_model.mask_decoder.prompt_cross_attn_norm.{rest}",
+                    False,
+                )
 
             # instance_seg_head -> instance_projection
             if sk.startswith("instance_seg_head."):
-                rest = sk[len("instance_seg_head."):]
+                rest = sk[len("instance_seg_head.") :]
                 return f"detector_model.mask_decoder.instance_projection.{rest}", False
 
             # semantic_seg_head -> semantic_projection
             if sk.startswith("semantic_seg_head."):
-                rest = sk[len("semantic_seg_head."):]
+                rest = sk[len("semantic_seg_head.") :]
                 return f"detector_model.mask_decoder.semantic_projection.{rest}", False
 
             # Fallback
@@ -446,11 +481,11 @@ def convert_key(old_key):
     # TRACKER keys
     # ==================================================================
     if key.startswith("tracker.model."):
-        tk = key[len("tracker.model."):]
+        tk = key[len("tracker.model.") :]
 
         # --- Memory encoder (maskmem_backbone) ---
         if tk.startswith("maskmem_backbone."):
-            mk = tk[len("maskmem_backbone."):]
+            mk = tk[len("maskmem_backbone.") :]
 
             # mask_downsampler.encoder.{N} -> mask_downsampler.layers.{N//3}.conv or .layer_norm
             # Last conv (layer_idx 4) maps to final_conv instead of layers.4
@@ -463,11 +498,20 @@ def convert_key(old_key):
                 if sub_idx == 0:
                     # Conv layer — layer 4 is the final 1x1 conv
                     if layer_idx == 4:
-                        return f"tracker_model.memory_encoder.mask_downsampler.final_conv.{rest}", False
-                    return f"tracker_model.memory_encoder.mask_downsampler.layers.{layer_idx}.conv.{rest}", False
+                        return (
+                            f"tracker_model.memory_encoder.mask_downsampler.final_conv.{rest}",
+                            False,
+                        )
+                    return (
+                        f"tracker_model.memory_encoder.mask_downsampler.layers.{layer_idx}.conv.{rest}",
+                        False,
+                    )
                 elif sub_idx == 1:
                     # LayerNorm
-                    return f"tracker_model.memory_encoder.mask_downsampler.layers.{layer_idx}.layer_norm.{rest}", False
+                    return (
+                        f"tracker_model.memory_encoder.mask_downsampler.layers.{layer_idx}.layer_norm.{rest}",
+                        False,
+                    )
                 else:
                     # Activation (sub_idx == 2), typically no params, skip
                     return None, True
@@ -491,7 +535,7 @@ def convert_key(old_key):
 
             # pix_feat_proj -> feature_projection
             if mk.startswith("pix_feat_proj."):
-                rest = mk[len("pix_feat_proj."):]
+                rest = mk[len("pix_feat_proj.") :]
                 return f"tracker_model.memory_encoder.feature_projection.{rest}", False
 
             # Fallback memory encoder
@@ -499,13 +543,16 @@ def convert_key(old_key):
 
         # --- Memory temporal positional encoding ---
         if tk.startswith("maskmem_tpos_enc"):
-            rest = tk[len("maskmem_tpos_enc"):]
+            rest = tk[len("maskmem_tpos_enc") :]
             return f"tracker_model.memory_temporal_positional_encoding{rest}", False
 
         # --- obj_ptr_tpos_proj ---
         if tk.startswith("obj_ptr_tpos_proj."):
-            rest = tk[len("obj_ptr_tpos_proj."):]
-            return f"tracker_model.temporal_positional_encoding_projection_layer.{rest}", False
+            rest = tk[len("obj_ptr_tpos_proj.") :]
+            return (
+                f"tracker_model.temporal_positional_encoding_projection_layer.{rest}",
+                False,
+            )
 
         # --- Memory attention (transformer.encoder) ---
         if tk.startswith("transformer.encoder.layers."):
@@ -523,20 +570,20 @@ def convert_key(old_key):
 
         # transformer.encoder.norm -> memory_attention.layer_norm
         if tk.startswith("transformer.encoder.norm."):
-            rest = tk[len("transformer.encoder.norm."):]
+            rest = tk[len("transformer.encoder.norm.") :]
             return f"tracker_model.memory_attention.layer_norm.{rest}", False
 
         # --- Interactive SAM components (keep paths mostly intact) ---
         # interactive_sam_mask_decoder, interactive_sam_prompt_encoder, etc.
         if tk.startswith("interactive_sam_mask_decoder."):
-            rest = tk[len("interactive_sam_mask_decoder."):]
+            rest = tk[len("interactive_sam_mask_decoder.") :]
             # QKV in SAM mask decoder
             if ".in_proj_" in rest:
                 return None, False
             return f"tracker_model.interactive_sam_mask_decoder.{rest}", False
 
         if tk.startswith("interactive_sam_prompt_encoder."):
-            rest = tk[len("interactive_sam_prompt_encoder."):]
+            rest = tk[len("interactive_sam_prompt_encoder.") :]
             # Remap mask_embed sequential indices to named convs
             mask_embed_map = {
                 "mask_embed.0.": "mask_embed.conv1.",
@@ -552,33 +599,33 @@ def convert_key(old_key):
             return f"tracker_model.interactive_sam_prompt_encoder.{rest}", False
 
         if tk.startswith("interactive_obj_ptr_proj."):
-            rest = tk[len("interactive_obj_ptr_proj."):]
+            rest = tk[len("interactive_obj_ptr_proj.") :]
             return f"tracker_model.interactive_obj_ptr_proj.{rest}", False
 
         # --- SAM mask decoder (non-interactive) ---
         if tk.startswith("sam_mask_decoder."):
-            rest = tk[len("sam_mask_decoder."):]
+            rest = tk[len("sam_mask_decoder.") :]
             if ".in_proj_" in rest:
                 return None, False
             return f"tracker_model.sam_mask_decoder.{rest}", False
 
         if tk.startswith("sam_prompt_encoder."):
-            rest = tk[len("sam_prompt_encoder."):]
+            rest = tk[len("sam_prompt_encoder.") :]
             return f"tracker_model.sam_prompt_encoder.{rest}", False
 
         # obj_ptr_proj
         if tk.startswith("obj_ptr_proj."):
-            rest = tk[len("obj_ptr_proj."):]
+            rest = tk[len("obj_ptr_proj.") :]
             return f"tracker_model.obj_ptr_proj.{rest}", False
 
         # memory_encoder
         if tk.startswith("memory_encoder."):
-            rest = tk[len("memory_encoder."):]
+            rest = tk[len("memory_encoder.") :]
             return f"tracker_model.memory_encoder.{rest}", False
 
         # --- Image encoder (shared with detector potentially) ---
         if tk.startswith("image_encoder."):
-            rest = tk[len("image_encoder."):]
+            rest = tk[len("image_encoder.") :]
             return f"tracker_model.image_encoder.{rest}", False
 
         # --- Fallback tracker keys ---
@@ -819,7 +866,11 @@ def convert_weights(checkpoint):
                 value = value.transpose(0, 2, 3, 1)
 
         # CLS token strip from pos_embed
-        if "position_embeddings" in new_key and value.ndim >= 2 and value.shape[-2] == 577:
+        if (
+            "position_embeddings" in new_key
+            and value.ndim >= 2
+            and value.shape[-2] == 577
+        ):
             # Strip CLS token at index 0: (1, 577, 1024) -> (1, 576, 1024)
             value = value[..., 1:, :]
 
@@ -882,9 +933,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Convert SAM 3.1 Meta checkpoint to MLX safetensors format."
     )
-    parser.add_argument(
-        "--output", default="/tmp/sam3.1-mlx", help="Output directory"
-    )
+    parser.add_argument("--output", default="/tmp/sam3.1-mlx", help="Output directory")
     args = parser.parse_args()
 
     print("Loading checkpoint...")

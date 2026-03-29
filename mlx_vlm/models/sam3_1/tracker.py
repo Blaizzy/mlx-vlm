@@ -3,25 +3,20 @@
 Weight keys: tracker_model.*
 """
 
-import math
 from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+# Reuse memory encoder components from SAM 3
+from ..sam3.tracker import DownsampleConvBlock, MemoryFuser
 from .config import TrackerConfig
 from .sam_components import (
     DecoupledMemoryAttention,
     MultiplexMaskDecoder,
-    SAMPromptEncoder,
-    LayerNorm2d,
     PositionalEmbedding,
-    OutputMLP,
+    SAMPromptEncoder,
 )
-
-# Reuse memory encoder components from SAM 3
-from ..sam3.tracker import CXBlock, DownsampleConvBlock, MemoryFuser
-
 
 # ---------------------------------------------------------------------------
 # Multiplex Memory Encoder
@@ -131,11 +126,16 @@ class MultiplexTrackerModel(nn.Module):
 
         # Interactive SAM components (for point/box prompts — single object, 4 mask outputs)
         from .config import TrackerMaskDecoderConfig
-        self.interactive_sam_prompt_encoder = SAMPromptEncoder(config.prompt_encoder_config)
+
+        self.interactive_sam_prompt_encoder = SAMPromptEncoder(
+            config.prompt_encoder_config
+        )
         interactive_cfg = TrackerMaskDecoderConfig(
-            **{**config.mask_decoder_config.__dict__,
-               "multiplex_count": 1,
-               "num_multimask_outputs": 4}  # interactive uses 4 mask outputs
+            **{
+                **config.mask_decoder_config.__dict__,
+                "multiplex_count": 1,
+                "num_multimask_outputs": 4,
+            }  # interactive uses 4 mask outputs
         )
         self.interactive_sam_mask_decoder = MultiplexMaskDecoder(interactive_cfg)
 
@@ -151,7 +151,9 @@ class MultiplexTrackerModel(nn.Module):
         self.interactive_obj_ptr_proj = ObjectPointerMLP(d)
 
         # Learned embeddings
-        self.memory_temporal_positional_encoding = mx.zeros((config.num_maskmem, 1, 1, d))
+        self.memory_temporal_positional_encoding = mx.zeros(
+            (config.num_maskmem, 1, 1, d)
+        )
         self.temporal_positional_encoding_projection_layer = nn.Linear(d, d)
 
         # Multiplex-specific embeddings
@@ -166,7 +168,9 @@ class MultiplexTrackerModel(nn.Module):
         self.shared_image_embedding = PositionalEmbedding(d // 2)
 
         # Interactive mask downsample
-        self.interactive_mask_downsample = nn.Conv2d(1, 1, kernel_size=4, stride=4, bias=True)
+        self.interactive_mask_downsample = nn.Conv2d(
+            1, 1, kernel_size=4, stride=4, bias=True
+        )
 
     def track_step(
         self,
@@ -193,18 +197,22 @@ class MultiplexTrackerModel(nn.Module):
         if pe_len != H * W:
             pe_side = int(pe_len**0.5)
             image_pe = image_pe.reshape(1, pe_side, pe_side, D)
-            image_pe = mx.broadcast_to(
-                image_pe[:, :H, :W, :], (B, H, W, D)
-            ) if H <= pe_side else nn.Upsample(
-                scale_factor=(H / pe_side, W / pe_side), mode="nearest"
-            )(image_pe)
+            image_pe = (
+                mx.broadcast_to(image_pe[:, :H, :W, :], (B, H, W, D))
+                if H <= pe_side
+                else nn.Upsample(
+                    scale_factor=(H / pe_side, W / pe_side), mode="nearest"
+                )(image_pe)
+            )
             image_pe = image_pe.reshape(B, H * W, D)
         else:
             image_pe = mx.broadcast_to(image_pe, (B, H * W, D))
 
         # Encode prompts
         sparse_emb, dense_emb = self.interactive_sam_prompt_encoder(
-            points=prompt_points, boxes=prompt_boxes, masks=prompt_masks,
+            points=prompt_points,
+            boxes=prompt_boxes,
+            masks=prompt_masks,
         )
 
         # Predict masks

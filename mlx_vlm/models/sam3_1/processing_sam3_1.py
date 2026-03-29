@@ -1,7 +1,7 @@
 """SAM 3.1 Processor — same preprocessing as SAM 3."""
 
-from ..sam3.processing_sam3 import Sam3Processor
 from ..base import install_auto_processor_patch
+from ..sam3.processing_sam3 import Sam3Processor
 
 # SAM 3.1 uses identical preprocessing (1008x1008, same normalization)
 Sam31Processor = Sam3Processor

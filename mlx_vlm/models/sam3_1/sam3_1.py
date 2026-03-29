@@ -9,17 +9,16 @@ from typing import Dict, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from .config import ModelConfig
-from .tracker import MultiplexTrackerModel
-from .vision import TriViTDetNeck, VisionEncoder
-
 # Reuse from SAM 3
-from ..sam3.decoder import DETRDecoder, inverse_sigmoid
+from ..sam3.decoder import DETRDecoder
 from ..sam3.encoder import DETREncoder
 from ..sam3.geometry import GeometryEncoder as _GeometryEncoder
 from ..sam3.position import PositionEmbeddingSine
 from ..sam3.segmentation import DotProductScoring, MaskDecoder
 from ..sam3.text_encoder import TextEncoder
+from .config import ModelConfig
+from .tracker import MultiplexTrackerModel
+from .vision import VisionEncoder
 
 
 class GeometryEncoder(_GeometryEncoder):
@@ -226,7 +225,10 @@ class Model(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
     ) -> Dict[str, mx.array]:
         return self.detector_model(
-            pixel_values, input_ids, attention_mask, boxes,
+            pixel_values,
+            input_ids,
+            attention_mask,
+            boxes,
             inputs_embeds=inputs_embeds,
         )
 
@@ -243,7 +245,9 @@ class Model(nn.Module):
         input_ids: mx.array,
         attention_mask: Optional[mx.array] = None,
     ) -> Tuple[mx.array, mx.array]:
-        inputs_embeds = self.detector_model.get_input_embeddings(input_ids, attention_mask)
+        inputs_embeds = self.detector_model.get_input_embeddings(
+            input_ids, attention_mask
+        )
         mx.eval(inputs_embeds)
         return inputs_embeds, attention_mask
 
@@ -255,7 +259,9 @@ class Model(nn.Module):
         **kwargs,
     ) -> Dict[str, mx.array]:
         if input_ids is not None:
-            return self.detect(pixel_values, input_ids, attention_mask, kwargs.get("boxes"))
+            return self.detect(
+                pixel_values, input_ids, attention_mask, kwargs.get("boxes")
+            )
         return {"features": self.detector_model.vision_encoder(pixel_values)}
 
     @staticmethod
@@ -319,23 +325,42 @@ class Model(nn.Module):
         if any(
             k in path
             for k in [
-                "conv", "depthwise", "mask_downsample",
-                "pixel_decoder", "instance_projection", "semantic_projection",
-                "fpn_layers", "patch_embeddings",
+                "conv",
+                "depthwise",
+                "mask_downsample",
+                "pixel_decoder",
+                "instance_projection",
+                "semantic_projection",
+                "fpn_layers",
+                "patch_embeddings",
             ]
         ):
             return False
         if any(
             k in path
             for k in [
-                "query_embed", "reference_points", "presence_token",
-                "label_embed", "cls_embed", "point_embed", "not_a_point",
-                "no_mask_embed", "no_memory", "no_object", "iou_token",
-                "mask_tokens", "obj_score_token", "shared_embedding",
-                "shared_image_embedding", "occlusion_spatial",
-                "memory_temporal", "position_embedding",
-                "output_valid_embed", "output_invalid_embed",
-                "no_obj_embed_spatial", "image_pe_layer",
+                "query_embed",
+                "reference_points",
+                "presence_token",
+                "label_embed",
+                "cls_embed",
+                "point_embed",
+                "not_a_point",
+                "no_mask_embed",
+                "no_memory",
+                "no_object",
+                "iou_token",
+                "mask_tokens",
+                "obj_score_token",
+                "shared_embedding",
+                "shared_image_embedding",
+                "occlusion_spatial",
+                "memory_temporal",
+                "position_embedding",
+                "output_valid_embed",
+                "output_invalid_embed",
+                "no_obj_embed_spatial",
+                "image_pe_layer",
                 "interactivity_no_mem",
             ]
         ):

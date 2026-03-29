@@ -329,10 +329,14 @@ def _detect_with_backbone(
     All scoring stays in MLX until final conversion.
     """
     det = predictor.model.detector_model
-    src, pos_flat, fpn_trimmed, spatial = _get_det_features(predictor.model, backbone_features)
+    src, pos_flat, fpn_trimmed, spatial = _get_det_features(
+        predictor.model, backbone_features
+    )
     H_f, W_f = spatial
 
-    W, H = image_size if isinstance(image_size, tuple) else (image_size[1], image_size[0])
+    W, H = (
+        image_size if isinstance(image_size, tuple) else (image_size[1], image_size[0])
+    )
     all_boxes, all_masks, all_scores, all_labels = [], [], [], []
     bb_id = id(backbone_features)
 
@@ -360,8 +364,10 @@ def _detect_with_backbone(
         # Box conversion + scoring in MLX
         pred_boxes_cxcywh = ref_boxes[-1]
         cx, cy, w, h = (
-            pred_boxes_cxcywh[..., 0], pred_boxes_cxcywh[..., 1],
-            pred_boxes_cxcywh[..., 2], pred_boxes_cxcywh[..., 3],
+            pred_boxes_cxcywh[..., 0],
+            pred_boxes_cxcywh[..., 1],
+            pred_boxes_cxcywh[..., 2],
+            pred_boxes_cxcywh[..., 3],
         )
         pred_boxes_xyxy = mx.stack(
             [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=-1
@@ -373,7 +379,8 @@ def _detect_with_backbone(
 
         last_hs = hs[-1]
         seg_out = det.mask_decoder(
-            last_hs, list(fpn_trimmed),
+            last_hs,
+            list(fpn_trimmed),
             encoder_hidden_states=encoded,
             prompt_features=inputs_embeds,
             prompt_mask=attention_mask,
@@ -399,7 +406,9 @@ def _detect_with_backbone(
         masks_resized = _resize_masks(masks_np, (H, W))
         masks_binary = (masks_resized > 0).astype(np.uint8)
 
-        result = DetectionResult(boxes=boxes_np, masks=masks_binary, scores=scores_np[keep])
+        result = DetectionResult(
+            boxes=boxes_np, masks=masks_binary, scores=scores_np[keep]
+        )
         if len(result.scores) > 0:
             result = nms(result)
             all_boxes.append(result.boxes)
@@ -1249,7 +1258,11 @@ def track_video_realtime(
 
             # Detection with cached backbone + encoder
             result = _detect_with_backbone(
-                predictor, backbone_features, prompts, image_size, threshold,
+                predictor,
+                backbone_features,
+                prompts,
+                image_size,
+                threshold,
                 encoder_cache=encoder_cache,
             )
             if len(result.scores) > 0:
@@ -1270,7 +1283,8 @@ def track_video_realtime(
                         mask = result.masks[i]
                         if mask.shape[0] != H or mask.shape[1] != W:
                             mask = cv2.resize(
-                                mask.astype(np.uint8), (W, H),
+                                mask.astype(np.uint8),
+                                (W, H),
                                 interpolation=cv2.INTER_NEAREST,
                             )
                         overlay[mask > 0] = COLORS_BGR[i % len(COLORS_BGR)]
@@ -1278,11 +1292,17 @@ def track_video_realtime(
                     if bg_frame is not None:
                         fg_mask = np.any(result.masks > 0, axis=0).astype(np.uint8)
                         if fg_mask.shape[0] != H or fg_mask.shape[1] != W:
-                            fg_mask = cv2.resize(fg_mask, (W, H), interpolation=cv2.INTER_NEAREST)
+                            fg_mask = cv2.resize(
+                                fg_mask, (W, H), interpolation=cv2.INTER_NEAREST
+                            )
 
                 for i in range(len(result.scores)):
                     color = COLORS_BGR[i % len(COLORS_BGR)]
-                    lbl = result.labels[i] if result.labels and i < len(result.labels) else prompt_str
+                    lbl = (
+                        result.labels[i]
+                        if result.labels and i < len(result.labels)
+                        else prompt_str
+                    )
                     label = f"{lbl} {result.scores[i]:.2f}"
 
                     x1, y1, x2, y2 = result.boxes[i].astype(int)
@@ -1290,9 +1310,25 @@ def track_video_realtime(
                         cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
                     lx, ly = x1, max(y1 - 8, 12)
 
-                    (tw, th_t), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                    cv2.rectangle(overlay, (lx, max(ly - th_t - 6, 0)), (lx + tw + 6, ly + 4), color, -1)
-                    cv2.putText(overlay, label, (lx + 3, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    (tw, th_t), _ = cv2.getTextSize(
+                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+                    )
+                    cv2.rectangle(
+                        overlay,
+                        (lx, max(ly - th_t - 6, 0)),
+                        (lx + tw + 6, ly + 4),
+                        color,
+                        -1,
+                    )
+                    cv2.putText(
+                        overlay,
+                        label,
+                        (lx + 3, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2,
+                    )
 
             scaled = (overlay.astype(np.uint16) * 115 >> 8).astype(np.uint8)
 

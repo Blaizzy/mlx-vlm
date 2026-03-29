@@ -9,15 +9,13 @@ Usage:
     from mlx_vlm.models.sam3_1.generate import Sam3Predictor, Sam3VideoPredictor
 """
 
-from . import processing_sam3_1  # Install processor patch
-
-from .config import ModelConfig
-from .sam3_1 import Model
-
 # Reuse text encoder and vision model wrappers from SAM 3
 from ..sam3.text_encoder import LanguageModel
 from ..sam3.vision import VisionModel
+from . import processing_sam3_1  # Install processor patch
 
 # Required exports for mlx-vlm compatibility
+from .config import ModelConfig
 from .config import TextEncoderConfig as TextConfig
 from .config import VisionEncoderConfig as VisionConfig
+from .sam3_1 import Model
