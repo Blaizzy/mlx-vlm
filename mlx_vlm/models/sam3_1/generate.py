@@ -178,17 +178,9 @@ def _get_backbone_features(model, pixel_values: mx.array) -> mx.array:
     return features
 
 
-def _detect_with_backbone(
-    predictor: Sam3Predictor,
-    backbone_features: mx.array,
-    prompts: List[str],
-    image_size,
-    threshold: float,
-) -> DetectionResult:
-    """Run detection FPN + DETR on pre-computed backbone features (skip ViT)."""
-    det = predictor.model.detector_model
-
-    # Run detection FPN head only
+def _get_det_features(model, backbone_features: mx.array):
+    """Run detection FPN neck + flatten for DETR. Returns (src, pos_flat, det_features, spatial)."""
+    det = model.detector_model
     det_features, _, _ = det.vision_encoder.neck(
         backbone_features, need_det=True, need_interactive=False, need_propagation=False
     )
@@ -199,15 +191,105 @@ def _detect_with_backbone(
     src = encoder_feat.reshape(B, H_f * W_f, D)
     pos_flat = fpn_pos[-1].reshape(B, H_f * W_f, D)
     mx.eval(src, pos_flat)
+    return src, pos_flat, det_features, (H_f, W_f)
+
+
+def _run_detr_encoder(model, src, pos_flat, inputs_embeds, attention_mask):
+    """Run DETR encoder. Cacheable when backbone + text are unchanged."""
+    encoded = model.detector_model.detr_encoder(src, pos_flat, inputs_embeds, attention_mask)
+    mx.eval(encoded)
+    return encoded
+
+
+def _postprocess_mlx(
+    pred_logits: mx.array,
+    pred_boxes: mx.array,
+    pred_masks,
+    presence: mx.array,
+    image_size,
+    threshold: float,
+) -> DetectionResult:
+    """Postprocess in MLX, convert to numpy only at the end."""
+    # Scoring in MLX
+    scores = mx.sigmoid(pred_logits[0].squeeze())
+    if presence is not None:
+        pres = mx.sigmoid(presence[0])
+        scores = scores * pres
+
+    # Filter by threshold — convert once
+    scores_np = np.array(scores)
+    keep = scores_np > threshold
+    scores_np = scores_np[keep]
+
+    if len(scores_np) == 0:
+        W, H = image_size if isinstance(image_size, tuple) else (image_size[1], image_size[0])
+        return DetectionResult(
+            boxes=np.zeros((0, 4)),
+            masks=np.zeros((0, H, W), dtype=np.uint8),
+            scores=np.zeros((0,)),
+        )
+
+    W, H = image_size if isinstance(image_size, tuple) else (image_size[1], image_size[0])
+
+    # Boxes: scale in MLX, then convert
+    boxes_all = pred_boxes[0]  # (Q, 4)
+    boxes_all = boxes_all * mx.array([W, H, W, H], dtype=boxes_all.dtype)
+    boxes_np = np.array(boxes_all)[keep]
+    boxes_np = np.clip(boxes_np, 0, max(H, W))
+
+    # Masks: convert + resize only kept detections
+    if pred_masks is not None:
+        masks_all = np.array(pred_masks[0])  # single conversion
+        masks_kept = masks_all[keep]
+        masks_resized = _resize_masks(masks_kept, (H, W))
+        masks_binary = (masks_resized > 0).astype(np.uint8)
+    else:
+        masks_binary = np.zeros((len(scores_np), H, W), dtype=np.uint8)
+
+    return DetectionResult(
+        boxes=boxes_np,
+        masks=masks_binary,
+        scores=scores_np,
+    )
+
+
+def _detect_with_backbone(
+    predictor: Sam3Predictor,
+    backbone_features: mx.array,
+    prompts: List[str],
+    image_size,
+    threshold: float,
+    encoder_cache: Optional[Dict] = None,
+) -> DetectionResult:
+    """Run detection on pre-computed backbone features.
+
+    With encoder_cache: skips DETR encoder when backbone + text are unchanged.
+    All computation stays in MLX until final postprocessing.
+    """
+    det = predictor.model.detector_model
+
+    # FPN neck (cheap ~3ms)
+    src, pos_flat, det_features, spatial = _get_det_features(predictor.model, backbone_features)
+    H_f, W_f = spatial
 
     all_boxes, all_masks, all_scores, all_labels = [], [], [], []
 
     for prompt in prompts:
         inputs_embeds, attention_mask = predictor._get_input_embeddings(prompt)
 
-        encoded = det.detr_encoder(src, pos_flat, inputs_embeds, attention_mask)
-        mx.eval(encoded)
+        # DETR encoder — use cache if backbone hasn't changed
+        bb_id = id(backbone_features)
+        cached = encoder_cache.get(prompt) if encoder_cache is not None else None
+        if cached is not None and cached["backbone_id"] == bb_id:
+            encoded = cached["encoded"]
+        else:
+            encoded = _run_detr_encoder(
+                predictor.model, src, pos_flat, inputs_embeds, attention_mask
+            )
+            if encoder_cache is not None:
+                encoder_cache[prompt] = {"backbone_id": bb_id, "encoded": encoded}
 
+        # DETR decoder
         hs, ref_boxes, presence_logits = det.detr_decoder(
             vision_features=encoded,
             inputs_embeds=inputs_embeds,
@@ -216,6 +298,7 @@ def _detect_with_backbone(
             spatial_shape=(H_f, W_f),
         )
 
+        # Box conversion in MLX (no numpy)
         pred_boxes_cxcywh = ref_boxes[-1]
         cx, cy, w, h = (
             pred_boxes_cxcywh[..., 0], pred_boxes_cxcywh[..., 1],
@@ -225,10 +308,12 @@ def _detect_with_backbone(
             [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=-1
         )
 
+        # Scoring in MLX
         all_logits = det.dot_product_scoring(hs, inputs_embeds, attention_mask)
         pred_logits = all_logits[-1].squeeze(-1)
         presence = presence_logits[-1]
 
+        # Mask decoder
         last_hs = hs[-1]
         seg_out = det.mask_decoder(
             last_hs, list(det_features),
@@ -236,15 +321,18 @@ def _detect_with_backbone(
             prompt_features=inputs_embeds,
             prompt_mask=attention_mask,
         )
+
+        # Single eval for all outputs
         mx.eval(pred_logits, pred_boxes_xyxy, seg_out, presence)
 
-        outputs = {
-            "pred_logits": pred_logits if pred_logits.ndim == 2 else pred_logits[None],
-            "pred_boxes": pred_boxes_xyxy if pred_boxes_xyxy.ndim == 3 else pred_boxes_xyxy[None],
-            "pred_masks": seg_out["pred_masks"],
-            "presence_logits": presence if presence.ndim == 2 else presence[None],
-        }
-        result = predictor._postprocess(outputs, image_size, threshold)
+        # Postprocess — MLX until final conversion
+        result = _postprocess_mlx(
+            pred_logits if pred_logits.ndim == 2 else pred_logits[None],
+            pred_boxes_xyxy if pred_boxes_xyxy.ndim == 3 else pred_boxes_xyxy[None],
+            seg_out["pred_masks"],
+            presence if presence.ndim == 2 else presence[None],
+            image_size, threshold,
+        )
         if len(result.scores) > 0:
             result = nms(result)
             all_boxes.append(result.boxes)
@@ -633,6 +721,7 @@ def track_video_realtime(
     # --- Thread 2: Inference (backbone caching + tracker propagation) ---
     def inference_loop():
         backbone_cache = {"features": None, "frame_idx": -1}
+        encoder_cache = {}  # DETR encoder output cache (per prompt)
         tracker_state = {"memory_bank": [], "n_objects": 0, "labels": []}
         inference_count = 0
         prop_count = 0  # propagation frames since last memory update
@@ -661,6 +750,7 @@ def track_video_realtime(
                 backbone_features = _get_backbone_features(model, pixel_values)
                 backbone_cache["features"] = backbone_features
                 backbone_cache["frame_idx"] = inference_count
+                encoder_cache.clear()  # invalidate encoder cache when backbone changes
             else:
                 backbone_features = backbone_cache["features"]
 
@@ -676,9 +766,10 @@ def track_video_realtime(
             )
 
             if need_detect:
-                # Full DETR detection (with cached backbone)
+                # Full DETR detection (with cached backbone + encoder cache)
                 result = _detect_with_backbone(
-                    predictor, backbone_features, prompts, image_size, threshold
+                    predictor, backbone_features, prompts, image_size, threshold,
+                    encoder_cache=encoder_cache,
                 )
                 if box_array is not None and len(result.scores) > 0:
                     result = _filter_by_regions(result, box_array)
