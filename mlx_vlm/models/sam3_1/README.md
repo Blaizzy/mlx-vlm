@@ -69,20 +69,36 @@ result = predictor.predict(image, text_prompt="a cat", boxes=boxes)
 
 ## CLI
 
-SAM 3.1 uses the same CLI as SAM 3:
+SAM 3.1 has its own CLI with optimized realtime mode:
 
 ```bash
 # Object detection
-python -m mlx_vlm.models.sam3.generate --task detect --image photo.jpg --prompt "a cat" --model mlx-community/sam3.1-bf16
+python -m mlx_vlm.models.sam3_1.generate --task detect --image photo.jpg --prompt "a cat" --model mlx-community/sam3.1-bf16
 
 # Instance segmentation
-python -m mlx_vlm.models.sam3.generate --image photo.jpg --prompt "a cat" --model mlx-community/sam3.1-bf16
+python -m mlx_vlm.models.sam3_1.generate --image photo.jpg --prompt "a cat" --model mlx-community/sam3.1-bf16
 
 # Video tracking
-python -m mlx_vlm.models.sam3.generate --task track --video input.mp4 --prompt "a car" --model mlx-community/sam3.1-bf16
+python -m mlx_vlm.models.sam3_1.generate --task track --video input.mp4 --prompt "a car" --model mlx-community/sam3.1-bf16
 
-# Real-time webcam
-python -m mlx_vlm.models.sam3.generate --task realtime --prompt "a person" --model mlx-community/sam3.1-bf16 --resolution 224
+# Real-time webcam (optimized: backbone caching + tracker propagation)
+python -m mlx_vlm.models.sam3_1.generate --task realtime --prompt "a person" --model mlx-community/sam3.1-bf16 --resolution 224
+```
+
+### Optimized Realtime Mode
+
+The SAM 3.1 realtime pipeline uses two optimizations for faster inference:
+
+1. **Backbone caching**: The ViT backbone (~67ms at 224px, ~783ms at 1008px) is reused across intermediate frames, running only the lightweight DETR head on cached features.
+2. **Tracker propagation** (1008px only): Between full detections, the multiplex tracker propagates masks using memory attention + mask decoder instead of re-running DETR.
+
+```bash
+# Tune optimization parameters
+python -m mlx_vlm.models.sam3_1.generate --task realtime --prompt "a person" \
+  --model mlx-community/sam3.1-bf16 --resolution 224 \
+  --backbone-every 5 \    # Re-run ViT every N frames (default: 5)
+  --detect-every 15 \     # Re-run full DETR every N frames (default: 15)
+  --memory-every 3        # Update tracker memory every N propagation frames (default: 3)
 ```
 
 ## Architecture
@@ -136,7 +152,7 @@ mlx_vlm/models/sam3_1/
 ├── tracker.py            # MultiplexTrackerModel (dual decoder, multiplex embeddings)
 ├── sam3_1.py             # Main Model + sanitize
 ├── processing_sam3_1.py  # Processor (same as SAM 3)
-├── generate.py           # Inference pipeline (reuses SAM 3 generate.py)
+├── generate.py           # Inference pipeline (optimized realtime with backbone caching + tracker)
 └── convert_weights.py    # Meta .pt → MLX safetensors converter
 ```
 
@@ -193,6 +209,30 @@ SAM 3.1 tracking (4 objects): 1 × track_step =             203ms/frame (4.9 FPS
 ```
 
 > **Note:** Meta reports ~7x at 128 objects on H100 GPU. Speedup scales with object count — more objects = bigger advantage for SAM 3.1.
+
+### Optimized Realtime Pipeline
+
+Backbone caching + tracker propagation vs naive detect-per-frame:
+
+| Resolution | Baseline | Optimized (avg) | Speedup | Strategy |
+|-----------|----------|-----------------|---------|----------|
+| 224px | 117ms (8.5 FPS) | 63ms (15.8 FPS) | **1.8x** | Backbone caching, DETR on cached features |
+| 1008px | 992ms (1.0 FPS) | 253ms (3.9 FPS) | **3.9x** | Backbone caching + tracker propagation |
+
+Per-frame breakdown at 224px:
+
+| Frame type | Time | Notes |
+|-----------|------|-------|
+| DETECT + ViT | 113ms | Full backbone + DETR (every 5th frame) |
+| DETECT cached | 51ms | DETR only, skip ViT (4 out of 5 frames) |
+
+Per-frame breakdown at 1008px:
+
+| Frame type | Time | Notes |
+|-----------|------|-------|
+| DETECT + ViT | 972ms | Full backbone + DETR (every 15th frame) |
+| PROPAGATE + ViT | 880ms | Backbone + tracker (every 5th frame) |
+| PROPAGATE cached | 97ms | Tracker only, skip ViT (most frames) |
 
 ## Weight Conversion
 

@@ -187,9 +187,20 @@ class MultiplexTrackerModel(nn.Module):
             memory = mx.concatenate(memory_bank, axis=1)
             src = self.memory_attention(src, memory)
 
-        # Image positional encoding
+        # Image positional encoding (resize if resolution differs from training)
         image_pe = self.interactive_sam_prompt_encoder.get_dense_pe()
-        image_pe = mx.broadcast_to(image_pe, (B, H * W, D))
+        pe_len = image_pe.shape[1]
+        if pe_len != H * W:
+            pe_side = int(pe_len**0.5)
+            image_pe = image_pe.reshape(1, pe_side, pe_side, D)
+            image_pe = mx.broadcast_to(
+                image_pe[:, :H, :W, :], (B, H, W, D)
+            ) if H <= pe_side else nn.Upsample(
+                scale_factor=(H / pe_side, W / pe_side), mode="nearest"
+            )(image_pe)
+            image_pe = image_pe.reshape(B, H * W, D)
+        else:
+            image_pe = mx.broadcast_to(image_pe, (B, H * W, D))
 
         # Encode prompts
         sparse_emb, dense_emb = self.interactive_sam_prompt_encoder(
