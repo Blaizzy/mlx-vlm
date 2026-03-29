@@ -617,7 +617,7 @@ def track_video_realtime(
     resolution: int = 1008,
     bg_image: Optional[str] = None,
     detect_every: int = 15,
-    recompute_backbone_every: int = 5,
+    recompute_backbone_every: int = 30,
     update_memory_every: int = 3,
 ):
     """Optimized realtime tracking with backbone caching + tracker propagation.
@@ -1010,8 +1010,8 @@ def main():
     parser.add_argument(
         "--backbone-every",
         type=int,
-        default=5,
-        help="Re-run ViT backbone every N inference frames (default: 5)",
+        default=30,
+        help="Re-run ViT backbone every N inference frames (default: 30)",
     )
     parser.add_argument(
         "--memory-every",
