@@ -289,6 +289,141 @@ def predict_multi(
 
 
 # ---------------------------------------------------------------------------
+# Optimized realtime helpers: backbone caching + encoder caching
+# ---------------------------------------------------------------------------
+
+
+def _get_backbone_features(model, pixel_values: mx.array) -> mx.array:
+    """Run ViT backbone only (no FPN neck)."""
+    features = model.detector_model.vision_encoder.backbone(pixel_values)
+    mx.eval(features)
+    return features
+
+
+def _get_det_features(model, backbone_features: mx.array):
+    """Run FPN neck + flatten for DETR. Returns (src, pos_flat, fpn_trimmed, spatial)."""
+    det = model.detector_model
+    fpn_features = det.vision_encoder.neck(backbone_features)
+    fpn_pos = [det._pos_enc(feat) for feat in fpn_features]
+    fpn_trimmed = fpn_features[:-1]
+
+    encoder_feat = fpn_trimmed[-1]
+    B, H_f, W_f, D = encoder_feat.shape
+    src = encoder_feat.reshape(B, H_f * W_f, D)
+    pos_flat = fpn_pos[:-1][-1].reshape(B, H_f * W_f, D)
+    mx.eval(src, pos_flat)
+    return src, pos_flat, fpn_trimmed, (H_f, W_f)
+
+
+def _detect_with_backbone(
+    predictor: Sam3Predictor,
+    backbone_features: mx.array,
+    prompts: List[str],
+    image_size,
+    threshold: float,
+    encoder_cache: Optional[Dict] = None,
+) -> DetectionResult:
+    """Run detection on pre-computed backbone features.
+
+    With encoder_cache: skips DETR encoder when backbone + text are unchanged.
+    All scoring stays in MLX until final conversion.
+    """
+    det = predictor.model.detector_model
+    src, pos_flat, fpn_trimmed, spatial = _get_det_features(predictor.model, backbone_features)
+    H_f, W_f = spatial
+
+    W, H = image_size if isinstance(image_size, tuple) else (image_size[1], image_size[0])
+    all_boxes, all_masks, all_scores, all_labels = [], [], [], []
+    bb_id = id(backbone_features)
+
+    for prompt in prompts:
+        inputs_embeds, attention_mask = predictor._get_input_embeddings(prompt)
+
+        # DETR encoder — use cache if backbone hasn't changed
+        cached = encoder_cache.get(prompt) if encoder_cache is not None else None
+        if cached is not None and cached["backbone_id"] == bb_id:
+            encoded = cached["encoded"]
+        else:
+            encoded = det.detr_encoder(src, pos_flat, inputs_embeds, attention_mask)
+            mx.eval(encoded)
+            if encoder_cache is not None:
+                encoder_cache[prompt] = {"backbone_id": bb_id, "encoded": encoded}
+
+        hs, ref_boxes, presence_logits = det.detr_decoder(
+            vision_features=encoded,
+            inputs_embeds=inputs_embeds,
+            vision_pos_encoding=pos_flat,
+            text_mask=attention_mask,
+            spatial_shape=(H_f, W_f),
+        )
+
+        # Box conversion + scoring in MLX
+        pred_boxes_cxcywh = ref_boxes[-1]
+        cx, cy, w, h = (
+            pred_boxes_cxcywh[..., 0], pred_boxes_cxcywh[..., 1],
+            pred_boxes_cxcywh[..., 2], pred_boxes_cxcywh[..., 3],
+        )
+        pred_boxes_xyxy = mx.stack(
+            [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=-1
+        )
+
+        all_logits = det.dot_product_scoring(hs, inputs_embeds, attention_mask)
+        pred_logits = all_logits[-1].squeeze(-1)
+        presence = presence_logits[-1]
+
+        last_hs = hs[-1]
+        seg_out = det.mask_decoder(
+            last_hs, list(fpn_trimmed),
+            encoder_hidden_states=encoded,
+            prompt_features=inputs_embeds,
+            prompt_mask=attention_mask,
+        )
+
+        # Single eval, scoring in MLX
+        scores = mx.sigmoid(pred_logits[0].squeeze())
+        if presence is not None:
+            scores = scores * mx.sigmoid(presence[0])
+        boxes = pred_boxes_xyxy[0] * mx.array([W, H, W, H], dtype=pred_boxes_xyxy.dtype)
+        boxes = mx.clip(boxes, 0, max(H, W))
+
+        mx.eval(scores, boxes, seg_out)
+
+        # Single numpy conversion
+        scores_np = np.array(scores)
+        keep = scores_np > threshold
+        if not keep.any():
+            continue
+
+        boxes_np = np.array(boxes)[keep]
+        masks_np = np.array(seg_out["pred_masks"][0])[keep]
+        masks_resized = _resize_masks(masks_np, (H, W))
+        masks_binary = (masks_resized > 0).astype(np.uint8)
+
+        result = DetectionResult(boxes=boxes_np, masks=masks_binary, scores=scores_np[keep])
+        if len(result.scores) > 0:
+            result = nms(result)
+            all_boxes.append(result.boxes)
+            all_masks.append(result.masks)
+            all_scores.append(result.scores)
+            all_labels.extend([prompt] * len(result.scores))
+
+    if not all_scores:
+        return DetectionResult(
+            boxes=np.zeros((0, 4)),
+            masks=np.zeros((0, H, W), dtype=np.uint8),
+            scores=np.zeros((0,)),
+            labels=[],
+        )
+
+    return DetectionResult(
+        boxes=np.concatenate(all_boxes),
+        masks=np.concatenate(all_masks),
+        scores=np.concatenate(all_scores),
+        labels=all_labels,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Video Predictor
 # ---------------------------------------------------------------------------
 
@@ -972,21 +1107,12 @@ def track_video_realtime(
     show_boxes: bool = True,
     resolution: int = 1008,
     bg_image: Optional[str] = None,
+    recompute_backbone_every: int = 5,
 ):
     """Track objects in a video with a real-time preview window.
 
-    Inference runs in a background thread (~1 FPS). The display loop runs
-    at the video's native FPS, reusing the latest detection until a new
-    one is ready. Press 'q' to quit.
-
-    Args:
-        video_path: Input video path (or 0 for webcam)
-        prompt: Text prompt for detection
-        model_path: Model path or HF repo
-        threshold: Detection score threshold
-        nms_thresh: NMS IoU threshold
-        boxes: Box prompts as "x1,y1,x2,y2" or "..." for region filtering
-        show_boxes: Draw bounding boxes on output
+    Optimized with backbone caching, DETR encoder caching, and fast overlay.
+    Press 'q' to quit.
     """
     import threading
     import time
@@ -1088,8 +1214,12 @@ def track_video_realtime(
             if not is_camera:
                 next_frame_time += frame_interval
 
-    # --- Thread 2: Run inference on latest frame ---
+    # --- Thread 2: Optimized inference (backbone + encoder caching, fast overlay) ---
     def inference_loop():
+        backbone_cache = {"features": None, "frame_idx": -1}
+        encoder_cache = {}
+        inference_count = 0
+
         while running["active"]:
             with lock:
                 frame_pil = pending_frame["pil"]
@@ -1099,90 +1229,72 @@ def track_video_realtime(
                 continue
 
             t0 = time.perf_counter()
-            result = predict_multi(predictor, frame_pil, prompts)
-            dt = time.perf_counter() - t0
+            image_size = frame_pil.size
 
+            # Preprocess
+            inputs = predictor.processor.preprocess_image(frame_pil)
+            pixel_values = mx.array(inputs["pixel_values"])
+
+            # Backbone (cached or fresh)
+            need_backbone = (
+                inference_count % recompute_backbone_every == 0
+                or backbone_cache["features"] is None
+            )
+            if need_backbone:
+                backbone_features = _get_backbone_features(model, pixel_values)
+                backbone_cache["features"] = backbone_features
+                encoder_cache.clear()
+            else:
+                backbone_features = backbone_cache["features"]
+
+            # Detection with cached backbone + encoder
+            result = _detect_with_backbone(
+                predictor, backbone_features, prompts, image_size, threshold,
+                encoder_cache=encoder_cache,
+            )
             if len(result.scores) > 0:
                 result = nms(result, nms_thresh)
                 if box_array is not None:
                     result = _filter_by_regions(result, box_array)
 
-            # Pre-render overlay once per detection
+            dt = time.perf_counter() - t0
+
+            # Fast overlay — boolean indexing, no contours
             overlay = np.zeros((H, W, 3), dtype=np.uint8)
+            fg_mask = None
             if len(result.scores) > 0:
+                has_masks = result.masks.any()
+
+                if has_masks:
+                    for i in range(len(result.scores)):
+                        mask = result.masks[i]
+                        if mask.shape[0] != H or mask.shape[1] != W:
+                            mask = cv2.resize(
+                                mask.astype(np.uint8), (W, H),
+                                interpolation=cv2.INTER_NEAREST,
+                            )
+                        overlay[mask > 0] = COLORS_BGR[i % len(COLORS_BGR)]
+
+                    if bg_frame is not None:
+                        fg_mask = np.any(result.masks > 0, axis=0).astype(np.uint8)
+                        if fg_mask.shape[0] != H or fg_mask.shape[1] != W:
+                            fg_mask = cv2.resize(fg_mask, (W, H), interpolation=cv2.INTER_NEAREST)
+
                 for i in range(len(result.scores)):
                     color = COLORS_BGR[i % len(COLORS_BGR)]
-                    mask = result.masks[i]
-                    if mask.shape[0] != H or mask.shape[1] != W:
-                        mask = cv2.resize(
-                            mask.astype(np.float32),
-                            (W, H),
-                            interpolation=cv2.INTER_LINEAR,
-                        )
-                    binary = mask > 0
-                    for c in range(3):
-                        overlay[:, :, c] = np.where(binary, color[c], overlay[:, :, c])
-                    contours, _ = cv2.findContours(
-                        binary.astype(np.uint8),
-                        cv2.RETR_EXTERNAL,
-                        cv2.CHAIN_APPROX_SIMPLE,
-                    )
-                    cv2.drawContours(overlay, contours, -1, color, 2)
-
-                    # Label (always shown)
-                    lbl = (
-                        result.labels[i]
-                        if result.labels and i < len(result.labels)
-                        else prompt_str
-                    )
+                    lbl = result.labels[i] if result.labels and i < len(result.labels) else prompt_str
                     label = f"{lbl} {result.scores[i]:.2f}"
 
-                    if show_boxes:
-                        x1, y1, x2, y2 = result.boxes[i].astype(int)
+                    x1, y1, x2, y2 = result.boxes[i].astype(int)
+                    if show_boxes or not has_masks:
                         cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-                        lx, ly = x1, max(y1 - 8, 12)
-                    else:
-                        ys, xs = np.where(binary)
-                        if len(ys) > 0:
-                            lx, ly = int(xs.min()), max(int(ys.min()) - 8, 12)
-                        else:
-                            lx, ly = 10, 30
+                    lx, ly = x1, max(y1 - 8, 12)
 
-                    (tw, th), _ = cv2.getTextSize(
-                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
-                    )
-                    cv2.rectangle(
-                        overlay,
-                        (lx, max(ly - th - 6, 0)),
-                        (lx + tw + 6, ly + 4),
-                        color,
-                        -1,
-                    )
-                    cv2.putText(
-                        overlay,
-                        label,
-                        (lx + 3, ly),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 255, 255),
-                        2,
-                    )
+                    (tw, th_t), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    cv2.rectangle(overlay, (lx, max(ly - th_t - 6, 0)), (lx + tw + 6, ly + 4), color, -1)
+                    cv2.putText(overlay, label, (lx + 3, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
             scaled = (overlay.astype(np.uint16) * 115 >> 8).astype(np.uint8)
-
-            # Build combined foreground mask for bg swap
-            fg_mask = None
-            if bg_frame is not None and len(result.scores) > 0:
-                fg_mask = np.zeros((H, W), dtype=np.uint8)
-                for i in range(len(result.scores)):
-                    mask = result.masks[i]
-                    if mask.shape[0] != H or mask.shape[1] != W:
-                        mask = cv2.resize(
-                            mask.astype(np.float32),
-                            (W, H),
-                            interpolation=cv2.INTER_LINEAR,
-                        )
-                    fg_mask = np.maximum(fg_mask, (mask > 0).astype(np.uint8))
 
             with lock:
                 latest["overlay_scaled"] = scaled
@@ -1191,6 +1303,8 @@ def track_video_realtime(
                 latest["n_obj"] = len(result.scores)
                 latest["fps"] = 1.0 / max(dt, 1e-6)
                 pending_frame["pil"] = None
+
+            inference_count += 1
 
     # Start threads
     reader_thread = threading.Thread(target=reader_loop, daemon=True)
