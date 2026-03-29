@@ -264,17 +264,16 @@ def _detect_with_backbone(
     for prompt in prompts:
         inputs_embeds, attention_mask = predictor._get_input_embeddings(prompt)
 
-        # DETR encoder — use cache if backbone hasn't changed
-        bb_id = id(backbone_features)
+        # DETR encoder — use cache if available (caller controls invalidation)
         cached = encoder_cache.get(prompt) if encoder_cache is not None else None
-        if cached is not None and cached["backbone_id"] == bb_id:
+        if cached is not None:
             encoded = cached["encoded"]
         else:
             encoded = _run_detr_encoder(
                 predictor.model, src, pos_flat, inputs_embeds, attention_mask
             )
             if encoder_cache is not None:
-                encoder_cache[prompt] = {"backbone_id": bb_id, "encoded": encoded}
+                encoder_cache[prompt] = {"encoded": encoded}
 
         # DETR decoder
         hs, ref_boxes, presence_logits = det.detr_decoder(
@@ -768,13 +767,10 @@ def track_video_realtime(
                 backbone_features = _get_backbone_features(model, pixel_values)
                 backbone_cache["features"] = backbone_features
                 backbone_cache["frame_idx"] = inference_count
-                encoder_cache.clear()  # invalidate encoder cache when backbone changes
             else:
                 backbone_features = backbone_cache["features"]
 
             # Step 2: Detect or propagate
-            # Tracker propagation only works at native resolution (1008px)
-            # because positional encodings are fixed-size
             can_track = (
                 resolution >= 1008
                 and tracker_state["memory_bank"]
@@ -787,7 +783,7 @@ def track_video_realtime(
             )
 
             if need_detect:
-                # Full DETR detection (with cached backbone + encoder cache)
+                encoder_cache.clear()  # fresh detection needs fresh encoder
                 result = _detect_with_backbone(
                     predictor,
                     backbone_features,

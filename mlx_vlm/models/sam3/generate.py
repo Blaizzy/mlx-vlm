@@ -328,20 +328,18 @@ def _detect_with_backbone(
         image_size if isinstance(image_size, tuple) else (image_size[1], image_size[0])
     )
     all_boxes, all_masks, all_scores, all_labels = [], [], [], []
-    bb_id = id(backbone_features)
-
     for prompt in prompts:
         inputs_embeds, attention_mask = predictor._get_input_embeddings(prompt)
 
-        # DETR encoder — use cache if backbone hasn't changed
+        # DETR encoder — use cache if available (caller controls invalidation)
         cached = encoder_cache.get(prompt) if encoder_cache is not None else None
-        if cached is not None and cached["backbone_id"] == bb_id:
+        if cached is not None:
             encoded = cached["encoded"]
         else:
             encoded = det.detr_encoder(src, pos_flat, inputs_embeds, attention_mask)
             mx.eval(encoded)
             if encoder_cache is not None:
-                encoder_cache[prompt] = {"backbone_id": bb_id, "encoded": encoded}
+                encoder_cache[prompt] = {"encoded": encoded}
 
         hs, ref_boxes, presence_logits = det.detr_decoder(
             vision_features=encoded,
