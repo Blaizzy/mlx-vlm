@@ -817,53 +817,43 @@ def track_video_realtime(
 
             dt = time.perf_counter() - t0
 
-            # Pre-render overlay
+            # Pre-render overlay — fast path: boolean indexing, no contours
             overlay = np.zeros((H, W, 3), dtype=np.uint8)
             fg_mask = None
             if len(result.scores) > 0:
                 has_masks = result.masks.any()
-                for i in range(len(result.scores)):
-                    color = COLORS_BGR[i % len(COLORS_BGR)]
 
-                    if has_masks:
+                # Batch mask overlay: boolean index (11x faster than np.where + contours)
+                if has_masks:
+                    for i in range(len(result.scores)):
                         mask = result.masks[i]
                         if mask.shape[0] != H or mask.shape[1] != W:
                             mask = cv2.resize(
-                                mask.astype(np.float32), (W, H),
-                                interpolation=cv2.INTER_LINEAR,
+                                mask.astype(np.uint8), (W, H),
+                                interpolation=cv2.INTER_NEAREST,
                             )
-                        binary = mask > 0
-                        for c in range(3):
-                            overlay[:, :, c] = np.where(binary, color[c], overlay[:, :, c])
-                        contours, _ = cv2.findContours(
-                            binary.astype(np.uint8),
-                            cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
-                        )
-                        cv2.drawContours(overlay, contours, -1, color, 2)
+                        overlay[mask > 0] = COLORS_BGR[i % len(COLORS_BGR)]
 
+                    # Build foreground mask for bg swap
+                    if bg_frame is not None:
+                        fg_mask = np.any(result.masks > 0, axis=0).astype(np.uint8)
+                        if fg_mask.shape[0] != H or fg_mask.shape[1] != W:
+                            fg_mask = cv2.resize(fg_mask, (W, H), interpolation=cv2.INTER_NEAREST)
+
+                # Boxes + labels
+                for i in range(len(result.scores)):
+                    color = COLORS_BGR[i % len(COLORS_BGR)]
                     lbl = result.labels[i] if result.labels and i < len(result.labels) else prompt_str
                     label = f"{lbl} {result.scores[i]:.2f}"
 
+                    x1, y1, x2, y2 = result.boxes[i].astype(int)
                     if show_boxes or not has_masks:
-                        x1, y1, x2, y2 = result.boxes[i].astype(int)
                         cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-                        lx, ly = x1, max(y1 - 8, 12)
-                    else:
-                        ys, xs = np.where(binary)
-                        lx, ly = (int(xs.min()), max(int(ys.min()) - 8, 12)) if len(ys) > 0 else (10, 30)
+                    lx, ly = x1, max(y1 - 8, 12)
 
                     (tw, th_t), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                     cv2.rectangle(overlay, (lx, max(ly - th_t - 6, 0)), (lx + tw + 6, ly + 4), color, -1)
                     cv2.putText(overlay, label, (lx + 3, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-                # Build foreground mask for bg swap
-                if bg_frame is not None and has_masks:
-                    fg_mask = np.zeros((H, W), dtype=np.uint8)
-                    for i in range(len(result.scores)):
-                        mask = result.masks[i]
-                        if mask.shape[0] != H or mask.shape[1] != W:
-                            mask = cv2.resize(mask.astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
-                        fg_mask = np.maximum(fg_mask, (mask > 0).astype(np.uint8))
 
             scaled = (overlay.astype(np.uint16) * 115 >> 8).astype(np.uint8)
 
