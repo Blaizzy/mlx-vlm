@@ -151,6 +151,62 @@ SAM 3.1 imports these modules directly from `sam3/` (no duplication):
 - Detector segmentation head (`sam3.segmentation`)
 - SAM prompt encoder, TwoWayTransformer (`sam3.sam_components`)
 
+## Benchmarks (Apple Silicon)
+
+Measured on M3 Max with MLX, bf16 precision. SAM 3.1's multiplex tracker calls `track_step` **once per frame** for all objects, while SAM 3 calls it **once per object**.
+
+### Detection Speed
+
+Detection uses the same DETR pipeline — roughly equal speed:
+
+| Task | SAM 3 | SAM 3.1 | Notes |
+|------|-------|---------|-------|
+| Single prompt | 998ms | 1036ms | ~same (ViT backbone dominates) |
+| 2 prompts | 1202ms | 1234ms | ~same |
+| 5 prompts | 1746ms | 1796ms | ~same |
+
+### Detection Accuracy
+
+SAM 3.1 has improved weights — higher scores and fewer false positives:
+
+| Prompt | SAM 3 | SAM 3.1 |
+|--------|-------|---------|
+| "a cat" (2 cats) | 0.87, 0.82, ~~0.35~~ | **0.90, 0.86** |
+| "a remote control" | 0.95, 0.94 | 0.94, 0.94 |
+| Parameters | 859.9M | 873.2M (+1.5%) |
+
+### Tracker Propagation Speed (Object Multiplex)
+
+This is where SAM 3.1 shines — the MultiplexMaskDecoder processes up to 16 objects in a single forward pass:
+
+| Objects | SAM 3 | SAM 3.1 | Speedup |
+|---------|-------|---------|---------|
+| 3 (video) | 547ms/frame | 227ms/frame | **2.4x** |
+| 4 | 608ms/frame | 203ms/frame | **3.0x** |
+| 5 | 766ms/frame | 190ms/frame | **4.0x** |
+
+SAM 3 scales linearly (~150ms × N objects). SAM 3.1 is roughly constant (~190-227ms) regardless of object count — one `track_step` handles all objects simultaneously.
+
+```
+SAM 3 tracking (4 objects):   4 × track_step = 4 × 150ms = 608ms/frame (1.6 FPS)
+SAM 3.1 tracking (4 objects): 1 × track_step =             203ms/frame (4.9 FPS)
+```
+
+> **Note:** Meta reports ~7x at 128 objects on H100 GPU. Speedup scales with object count — more objects = bigger advantage for SAM 3.1.
+
+### Run Benchmarks
+
+```bash
+# Detection benchmark
+python examples/benchmark_sam3_vs_sam31.py
+
+# Tracker propagation benchmark (the important one)
+python examples/benchmark_tracker.py --frames 20
+
+# With real video
+python examples/benchmark_tracker.py --video input.mp4 --prompts "a car" "a person" --frames 20
+```
+
 ## Weight Conversion
 
 SAM 3.1 weights are distributed as a Meta `.pt` checkpoint, not HuggingFace safetensors. The converter handles:

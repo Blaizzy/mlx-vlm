@@ -161,6 +161,62 @@ class Model(nn.Module):
         self.detector_model = DetectorModel(config)
         self.tracker_model = MultiplexTrackerModel(config.tracker_config)
 
+    def _get_tracker_features(self, backbone_features: mx.array):
+        """Get propagation FPN features from TriViTDetNeck for tracking."""
+        _, _, prop_features = self.detector_model.vision_encoder.neck(
+            backbone_features,
+            need_det=False,
+            need_interactive=False,
+            need_propagation=True,
+        )
+        return prop_features
+
+    def tracker_neck(self, backbone_features: mx.array):
+        """Compat shim for Sam3VideoPredictor — returns propagation FPN features."""
+        return self._get_tracker_features(backbone_features)
+
+    def track_init(
+        self,
+        backbone_features: mx.array,
+        detection_masks: mx.array,
+    ) -> Dict[str, mx.array]:
+        """Initialize tracker with detection results."""
+        prop_fpn = self._get_tracker_features(backbone_features)
+        features = prop_fpn[2]  # 1x scale (72x72)
+        B, H, W, D = features.shape
+
+        mask_input = detection_masks[:, :1].transpose(0, 2, 3, 1)  # (B, H, W, 1)
+        memory = self.tracker_model.memory_encoder(features, mask_input)
+
+        return {
+            "memory": memory.reshape(B, -1, memory.shape[-1]),
+            "features": features,
+        }
+
+    def track_step(
+        self,
+        backbone_features: mx.array,
+        memory_bank: Optional[List[mx.array]] = None,
+        prompt_points=None,
+        prompt_boxes=None,
+        prompt_masks=None,
+        multimask_output: bool = False,
+    ) -> Dict[str, mx.array]:
+        """Run one tracking step using propagation FPN."""
+        prop_fpn = self._get_tracker_features(backbone_features)
+        features = prop_fpn[2]
+        high_res = [prop_fpn[0], prop_fpn[1]] if len(prop_fpn) > 1 else None
+
+        return self.tracker_model.track_step(
+            current_features=features,
+            memory_bank=memory_bank,
+            prompt_points=prompt_points,
+            prompt_boxes=prompt_boxes,
+            prompt_masks=prompt_masks,
+            multimask_output=multimask_output,
+            high_res_features=high_res,
+        )
+
     def detect(
         self,
         pixel_values: mx.array,
