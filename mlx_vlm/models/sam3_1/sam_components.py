@@ -11,7 +11,13 @@ import mlx.nn as nn
 from ..sam3.position import apply_rotary_enc_1d, init_2d_freqs
 
 # Reuse unchanged components from SAM 3
-from ..sam3.sam_components import LayerNorm2d, OutputMLP, TwoWayTransformer
+from ..sam3.sam_components import (  # noqa: F401
+    LayerNorm2d,
+    OutputMLP,
+    PositionalEmbedding,
+    SAMPromptEncoder,
+    TwoWayTransformer,
+)
 from .config import TrackerMaskDecoderConfig
 
 # ---------------------------------------------------------------------------

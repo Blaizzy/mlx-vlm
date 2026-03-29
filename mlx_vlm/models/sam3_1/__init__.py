@@ -10,9 +10,9 @@ Usage:
 """
 
 # Reuse text encoder and vision model wrappers from SAM 3
-from ..sam3.text_encoder import LanguageModel
-from ..sam3.vision import VisionModel
-from . import processing_sam3_1  # Install processor patch
+from ..sam3.text_encoder import LanguageModel  # noqa: F401
+from ..sam3.vision import VisionModel  # noqa: F401
+from . import processing_sam3_1  # noqa: F401
 
 # Required exports for mlx-vlm compatibility
 from .config import ModelConfig
