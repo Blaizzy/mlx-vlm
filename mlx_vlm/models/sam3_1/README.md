@@ -194,19 +194,6 @@ SAM 3.1 tracking (4 objects): 1 × track_step =             203ms/frame (4.9 FPS
 
 > **Note:** Meta reports ~7x at 128 objects on H100 GPU. Speedup scales with object count — more objects = bigger advantage for SAM 3.1.
 
-### Run Benchmarks
-
-```bash
-# Detection benchmark
-python examples/benchmark_sam3_vs_sam31.py
-
-# Tracker propagation benchmark (the important one)
-python examples/benchmark_tracker.py --frames 20
-
-# With real video
-python examples/benchmark_tracker.py --video input.mp4 --prompts "a car" "a person" --frames 20
-```
-
 ## Weight Conversion
 
 SAM 3.1 weights are distributed as a Meta `.pt` checkpoint, not HuggingFace safetensors. The converter handles:
