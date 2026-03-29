@@ -737,11 +737,11 @@ def track_video_realtime(
 
     # --- Thread 2: Inference (backbone caching + tracker propagation) ---
     def inference_loop():
-        backbone_cache = {"features": None, "frame_idx": -1}
-        encoder_cache = {}  # DETR encoder output cache (per prompt)
+        backbone_cache = {"features": None}
+        encoder_cache = {}
         tracker_state = {"memory_bank": [], "n_objects": 0, "labels": []}
         inference_count = 0
-        prop_count = 0  # propagation frames since last memory update
+        prop_count = 0
 
         while running["active"]:
             with lock:
@@ -752,23 +752,15 @@ def track_video_realtime(
                 continue
 
             t0 = time.perf_counter()
-            image_size = frame_pil.size  # (W, H)
+            image_size = frame_pil.size
 
-            # Preprocess
             inputs = predictor.processor.preprocess_image(frame_pil)
             pixel_values = mx.array(inputs["pixel_values"])
 
-            # Step 1: Backbone (cached or fresh)
-            need_backbone = (
-                inference_count % recompute_backbone_every == 0
-                or backbone_cache["features"] is None
-            )
-            if need_backbone:
-                backbone_features = _get_backbone_features(model, pixel_values)
-                backbone_cache["features"] = backbone_features
-                backbone_cache["frame_idx"] = inference_count
-            else:
-                backbone_features = backbone_cache["features"]
+            # Step 1: Backbone — always use pre-computed from previous frame
+            if backbone_cache["features"] is None:
+                backbone_cache["features"] = _get_backbone_features(model, pixel_values)
+            backbone_features = backbone_cache["features"]
 
             # Step 2: Detect or propagate
             can_track = (
@@ -898,6 +890,15 @@ def track_video_realtime(
                     )
 
             scaled = (overlay.astype(np.uint16) * 115 >> 8).astype(np.uint8)
+
+            # Pre-compute backbone for next refresh frame
+            # This hides the ViT latency: detection always uses ready features
+            next_count = inference_count + 1
+            if (
+                next_count % recompute_backbone_every == 0
+                or next_count % detect_every == 0
+            ):
+                backbone_cache["features"] = _get_backbone_features(model, pixel_values)
 
             with lock:
                 latest["overlay_scaled"] = scaled
