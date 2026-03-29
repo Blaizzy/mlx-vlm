@@ -8,7 +8,6 @@ from typing import Dict, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-# Reuse memory encoder components from SAM 3
 from ..sam3.tracker import DownsampleConvBlock, MemoryFuser
 from .config import TrackerConfig
 from .sam_components import (
@@ -17,10 +16,6 @@ from .sam_components import (
     PositionalEmbedding,
     SAMPromptEncoder,
 )
-
-# ---------------------------------------------------------------------------
-# Multiplex Memory Encoder
-# ---------------------------------------------------------------------------
 
 
 class MultiplexMaskDownSampler(nn.Module):
@@ -79,11 +74,6 @@ class MultiplexMemoryEncoder(nn.Module):
         return self.memory_fuser(fused)
 
 
-# ---------------------------------------------------------------------------
-# Object Pointer
-# ---------------------------------------------------------------------------
-
-
 class ObjectPointerMLP(nn.Module):
     """Projects SAM output tokens to object pointers.
 
@@ -104,11 +94,6 @@ class ObjectPointerMLP(nn.Module):
             if i < len(self.layers) - 1:
                 x = nn.relu(x)
         return x
-
-
-# ---------------------------------------------------------------------------
-# Multiplex Tracker Model
-# ---------------------------------------------------------------------------
 
 
 class MultiplexTrackerModel(nn.Module):

@@ -9,7 +9,6 @@ Usage:
     from mlx_vlm.models.sam3_1.generate import Sam3Predictor, Sam3VideoPredictor
 """
 
-# Reuse text encoder and vision model wrappers from SAM 3
 from ..sam3.text_encoder import LanguageModel  # noqa: F401
 from ..sam3.vision import VisionModel  # noqa: F401
 from . import processing_sam3_1  # noqa: F401

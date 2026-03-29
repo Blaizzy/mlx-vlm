@@ -1,13 +1,7 @@
-"""SAM 3.1 Inference Pipeline — reuses SAM 3 generate.py.
+"""SAM 3.1 Inference Pipeline.
 
-Same API: Sam3Predictor, Sam3VideoPredictor, CLI.
 Overrides predict_multi, track_video, and track_video_realtime to handle
 TriViTDetNeck's 3-tuple output (detection, interactive, propagation FPNs).
-
-Optimized realtime pipeline:
-- Backbone caching: skip ViT on intermediate frames (~67ms saved)
-- Tracker propagation: use memory attention + mask decoder instead of DETR
-- Combined: ~16ms per intermediate frame vs ~92ms for full detection
 """
 
 from pathlib import Path
@@ -18,7 +12,6 @@ import mlx.nn as nn
 import numpy as np
 from PIL import Image
 
-# Re-export unchanged utilities from SAM 3
 from ..sam3.generate import (
     COLORS_BGR,
     DetectionResult,
@@ -29,10 +22,6 @@ from ..sam3.generate import (
     nms,
     run_image,
 )
-
-# ---------------------------------------------------------------------------
-# SAM 3.1 predict_multi — handles TriViTDetNeck's 3-tuple output
-# ---------------------------------------------------------------------------
 
 
 def predict_multi(
@@ -160,11 +149,6 @@ def predict_multi(
         scores=np.concatenate(all_scores),
         labels=all_labels,
     )
-
-
-# ---------------------------------------------------------------------------
-# Optimized realtime helpers: backbone caching + tracker propagation
-# ---------------------------------------------------------------------------
 
 
 def _get_backbone_features(model, pixel_values: mx.array) -> mx.array:
@@ -519,11 +503,6 @@ def _propagate_tracker(
         updated_bank = updated_bank[-max_mem:]
 
     return det_result, updated_bank
-
-
-# ---------------------------------------------------------------------------
-# track_video / track_video_realtime
-# ---------------------------------------------------------------------------
 
 
 def track_video(
@@ -1001,11 +980,6 @@ def track_video_realtime(
     cap.release()
     cv2.destroyAllWindows()
     print("Done")
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
 
 
 def main():

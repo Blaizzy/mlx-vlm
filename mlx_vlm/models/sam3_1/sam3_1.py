@@ -9,7 +9,6 @@ from typing import Dict, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-# Reuse from SAM 3
 from ..sam3.decoder import DETRDecoder
 from ..sam3.encoder import DETREncoder
 from ..sam3.geometry import GeometryEncoder as _GeometryEncoder

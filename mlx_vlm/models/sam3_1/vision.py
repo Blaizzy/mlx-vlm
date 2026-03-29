@@ -11,7 +11,6 @@ from typing import List, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-# Reuse ViT backbone and FPN building blocks from SAM 3
 from ..sam3.vision import FPNLayer, ViTBackbone
 from .config import VisionEncoderConfig
 

@@ -42,11 +42,6 @@ class TrackingResult:
     object_ids: List[int] = None
 
 
-# ---------------------------------------------------------------------------
-# Image Predictor
-# ---------------------------------------------------------------------------
-
-
 class Sam3Predictor:
     """Image-level segmentation predictor."""
 
@@ -288,11 +283,6 @@ def predict_multi(
     )
 
 
-# ---------------------------------------------------------------------------
-# Optimized realtime helpers: backbone caching + encoder caching
-# ---------------------------------------------------------------------------
-
-
 def _get_backbone_features(model, pixel_values: mx.array) -> mx.array:
     """Run ViT backbone only (no FPN neck)."""
     features = model.detector_model.vision_encoder.backbone(pixel_values)
@@ -430,11 +420,6 @@ def _detect_with_backbone(
         scores=np.concatenate(all_scores),
         labels=all_labels,
     )
-
-
-# ---------------------------------------------------------------------------
-# Video Predictor
-# ---------------------------------------------------------------------------
 
 
 class Sam3VideoPredictor:
@@ -752,11 +737,6 @@ class Sam3VideoPredictor:
             self._memory_bank[obj_id] = self._memory_bank[obj_id][-max_mem:]
 
 
-# ---------------------------------------------------------------------------
-# Utility Functions
-# ---------------------------------------------------------------------------
-
-
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1 / (1 + np.exp(-x))
 
@@ -872,11 +852,6 @@ def _resize_masks(masks: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray
     return np.stack(resized) if resized else np.zeros((0, H, W))
 
 
-# ---------------------------------------------------------------------------
-# NMS (public API)
-# ---------------------------------------------------------------------------
-
-
 def nms(result: DetectionResult, iou_thresh: float = 0.5) -> DetectionResult:
     """Remove duplicate detections via Non-Maximum Suppression."""
     if len(result.scores) == 0:
@@ -907,10 +882,6 @@ def nms(result: DetectionResult, iou_thresh: float = 0.5) -> DetectionResult:
         labels=labels,
     )
 
-
-# ---------------------------------------------------------------------------
-# Video Tracking CLI
-# ---------------------------------------------------------------------------
 
 COLORS_BGR = [
     (181, 120, 31),
@@ -1411,11 +1382,6 @@ def track_video_realtime(
     cap.release()
     cv2.destroyAllWindows()
     print("Done")
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
 
 
 def _load_predictor(model_path, threshold, resolution=1008):

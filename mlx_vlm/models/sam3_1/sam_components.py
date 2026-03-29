@@ -9,8 +9,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..sam3.position import apply_rotary_enc_1d, init_2d_freqs
-
-# Reuse unchanged components from SAM 3
 from ..sam3.sam_components import (  # noqa: F401
     LayerNorm2d,
     OutputMLP,
@@ -19,10 +17,6 @@ from ..sam3.sam_components import (  # noqa: F401
     TwoWayTransformer,
 )
 from .config import TrackerMaskDecoderConfig
-
-# ---------------------------------------------------------------------------
-# MultiplexMaskDecoder
-# ---------------------------------------------------------------------------
 
 
 class MultiplexMaskDecoder(nn.Module):
@@ -176,11 +170,6 @@ class MultiplexMaskDecoder(nn.Module):
             out_iou = iou_pred[:, :, 0:1]
 
         return out_masks, out_iou, hs, obj_score
-
-
-# ---------------------------------------------------------------------------
-# Decoupled Memory Attention Components
-# ---------------------------------------------------------------------------
 
 
 class SimpleRoPEAttention(nn.Module):
