@@ -2599,6 +2599,50 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
         )
 
+    def test_falcon_ocr(self):
+        from mlx_vlm.models import falcon_ocr
+
+        text_config = falcon_ocr.TextConfig(
+            model_type="falcon_ocr",
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            head_dim=16,
+            num_key_value_heads=2,
+            vocab_size=256,
+            intermediate_size=128,
+            rms_norm_eps=1e-5,
+            max_position_embeddings=512,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+        )
+
+        vision_config = falcon_ocr.VisionConfig(
+            model_type="falcon_ocr",
+            spatial_patch_size=4,
+            temporal_patch_size=1,
+            channel_size=3,
+        )
+
+        config = falcon_ocr.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="falcon_ocr",
+            vocab_size=256,
+            img_id=227,
+            image_cls_token_id=244,
+            img_end_id=230,
+        )
+
+        model = falcon_ocr.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
@@ -3180,6 +3224,40 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "deepseekocr")
+
+    def test_falcon_ocr_input_embeddings(self):
+        from mlx_vlm.models import falcon_ocr
+
+        model = falcon_ocr.Model(
+            falcon_ocr.ModelConfig(
+                text_config=falcon_ocr.TextConfig(
+                    model_type="falcon_ocr",
+                    hidden_size=64,
+                    num_hidden_layers=2,
+                    num_attention_heads=4,
+                    head_dim=16,
+                    num_key_value_heads=2,
+                    vocab_size=256,
+                    intermediate_size=128,
+                    rms_norm_eps=1e-5,
+                    max_position_embeddings=512,
+                    rope_theta=10000.0,
+                    tie_word_embeddings=False,
+                ),
+                vision_config=falcon_ocr.VisionConfig(
+                    model_type="falcon_ocr",
+                    spatial_patch_size=4,
+                    temporal_patch_size=1,
+                    channel_size=3,
+                ),
+                model_type="falcon_ocr",
+                vocab_size=256,
+                img_id=227,
+                image_cls_token_id=244,
+                img_end_id=230,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "falcon_ocr")
 
     def test_fastvlm_input_embeddings(self):
         from mlx_vlm.models import fastvlm

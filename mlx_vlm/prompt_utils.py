@@ -77,6 +77,7 @@ MODEL_CONFIG = {
     "florence2": MessageFormat.PROMPT_ONLY,
     "molmo": MessageFormat.PROMPT_ONLY,
     "moondream3": MessageFormat.PROMPT_ONLY,
+    "falcon_ocr": MessageFormat.PROMPT_ONLY,
     "paligemma": MessageFormat.PROMPT_WITH_IMAGE_TOKEN,
 }
 
@@ -88,6 +89,7 @@ SINGLE_IMAGE_ONLY_MODELS = {
     "paligemma",
     "multi_modality",
     "mllama",
+    "falcon_ocr",
 }
 
 
@@ -723,7 +725,7 @@ def apply_chat_template(
         return messages
 
     # Some models only need the last message
-    if model_type in ["paligemma", "molmo", "florence2"]:
+    if model_type in ["paligemma", "molmo", "florence2", "falcon_ocr"]:
         return messages[-1]
 
     return get_chat_template(processor, messages, add_generation_prompt, **kwargs)

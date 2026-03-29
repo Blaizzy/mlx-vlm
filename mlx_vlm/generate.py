@@ -431,6 +431,8 @@ def generate_step(
                 if k != "inputs_embeds" and v is not None
             }
         )
+        if getattr(model, "no_chunked_prefill", False):
+            prefill_step_size = None
         if prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size:
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
@@ -1316,6 +1318,10 @@ def _generate_batch(
         for k, v in inputs.items()
         if k not in ["input_ids", "pixel_values", "attention_mask"]
     }
+
+    if getattr(model, "no_chunked_prefill", False):
+        kwargs.pop("prefill_step_size", None)
+        kwargs["prefill_step_size"] = None
 
     # Use batch_size for prefill and completion to ensure consistent processing
     gen = BatchGenerator(
