@@ -209,47 +209,48 @@ def _postprocess_mlx(
     image_size,
     threshold: float,
 ) -> DetectionResult:
-    """Postprocess in MLX, convert to numpy only at the end."""
-    # Scoring in MLX
-    scores = mx.sigmoid(pred_logits[0].squeeze())
-    if presence is not None:
-        pres = mx.sigmoid(presence[0])
-        scores = scores * pres
-
-    # Filter by threshold — convert once
-    scores_np = np.array(scores)
-    keep = scores_np > threshold
-    scores_np = scores_np[keep]
-
-    if len(scores_np) == 0:
-        W, H = image_size if isinstance(image_size, tuple) else (image_size[1], image_size[0])
-        return DetectionResult(
-            boxes=np.zeros((0, 4)),
-            masks=np.zeros((0, H, W), dtype=np.uint8),
-            scores=np.zeros((0,)),
-        )
-
+    """Postprocess entirely in MLX, single numpy conversion at the end."""
     W, H = image_size if isinstance(image_size, tuple) else (image_size[1], image_size[0])
 
-    # Boxes: scale in MLX, then convert
-    boxes_all = pred_boxes[0]  # (Q, 4)
-    boxes_all = boxes_all * mx.array([W, H, W, H], dtype=boxes_all.dtype)
-    boxes_np = np.array(boxes_all)[keep]
-    boxes_np = np.clip(boxes_np, 0, max(H, W))
+    # All scoring in MLX
+    scores = mx.sigmoid(pred_logits[0].squeeze())
+    if presence is not None:
+        scores = scores * mx.sigmoid(presence[0])
 
-    # Masks: convert + resize only kept detections
+    # Scale boxes in MLX before converting
+    boxes = pred_boxes[0] * mx.array([W, H, W, H], dtype=pred_boxes.dtype)
+    boxes = mx.clip(boxes, 0, max(H, W))
+
+    # Single eval, single conversion
     if pred_masks is not None:
-        masks_all = np.array(pred_masks[0])  # single conversion
-        masks_kept = masks_all[keep]
-        masks_resized = _resize_masks(masks_kept, (H, W))
+        mx.eval(scores, boxes, pred_masks)
+        scores_np = np.array(scores)
+        keep = scores_np > threshold
+        if not keep.any():
+            return DetectionResult(
+                boxes=np.zeros((0, 4)),
+                masks=np.zeros((0, H, W), dtype=np.uint8),
+                scores=np.zeros((0,)),
+            )
+        masks_np = np.array(pred_masks[0])[keep]
+        masks_resized = _resize_masks(masks_np, (H, W))
         masks_binary = (masks_resized > 0).astype(np.uint8)
     else:
-        masks_binary = np.zeros((len(scores_np), H, W), dtype=np.uint8)
+        mx.eval(scores, boxes)
+        scores_np = np.array(scores)
+        keep = scores_np > threshold
+        if not keep.any():
+            return DetectionResult(
+                boxes=np.zeros((0, 4)),
+                masks=np.zeros((0, H, W), dtype=np.uint8),
+                scores=np.zeros((0,)),
+            )
+        masks_binary = np.zeros((keep.sum(), H, W), dtype=np.uint8)
 
     return DetectionResult(
-        boxes=boxes_np,
+        boxes=np.array(boxes)[keep],
         masks=masks_binary,
-        scores=scores_np,
+        scores=scores_np[keep],
     )
 
 
@@ -372,18 +373,29 @@ def _init_tracker_memory(
     # Mask downsampler has stride 16 total, so input must be feat_size * 16
     target = feat_H * 16
 
-    # Build combined multiplex mask
-    multi = np.zeros((1, target, target, n_ch), dtype=np.float32)
-    for slot, mask in enumerate(detection_masks):
-        if slot >= multiplex_count:
-            break
-        resized = np.array(
-            Image.fromarray(mask.astype(np.float32)).resize((target, target), Image.NEAREST)
-        )
-        multi[0, :, :, slot * 2] = resized
-        multi[0, :, :, slot * 2 + 1] = 1.0 - resized
+    # Build combined multiplex mask in MLX
+    N = min(len(detection_masks), multiplex_count)
+    # Stack masks → (N, H_mask, W_mask), resize once
+    masks_mx = mx.array(np.stack(detection_masks[:N]).astype(np.float32))  # single conversion
+    mask_h, mask_w = masks_mx.shape[1], masks_mx.shape[2]
+    if mask_h != target or mask_w != target:
+        up = nn.Upsample(scale_factor=(target / mask_h, target / mask_w), mode="nearest")
+        masks_mx = up(masks_mx[:, :, :, None])[:, :, :, 0]  # (N, target, target)
 
-    mask_mx = mx.array(multi)
+    # Pack into multiplex channels in MLX
+    channels = []
+    for ch in range(n_ch):
+        slot = ch // 2
+        if slot < N:
+            if ch % 2 == 0:
+                channels.append(masks_mx[slot:slot+1, :, :, None])  # mask
+            else:
+                channels.append(1.0 - masks_mx[slot:slot+1, :, :, None])  # inverse
+        else:
+            channels.append(mx.zeros((1, target, target, 1)))
+    # (multiplex*2, target, target, 1) → (1, target, target, n_ch)
+    mask_mx = mx.concatenate(channels, axis=0)  # (n_ch, target, target, 1)
+    mask_mx = mask_mx[:, :, :, 0].transpose(1, 2, 0)[None]  # (1, target, target, n_ch)
     memory = model.tracker_model.memory_encoder(track_features, mask_mx)
     mx.eval(memory)
     _, H_m, W_m, C = memory.shape
@@ -410,51 +422,48 @@ def _propagate_tracker(
     )
     mx.eval(result)
 
-    # Convert tracker output to DetectionResult
+    # Convert tracker output to DetectionResult — stay in MLX as long as possible
     pred_masks = result["pred_masks"]  # (B, M, num_masks, H, W) or (B, num_masks, H, W)
     iou_scores = result["iou_scores"]
 
     W, H = image_size if isinstance(image_size, tuple) else (image_size[1], image_size[0])
+    N = min(n_objects, 16)
 
-    masks_list = []
-    scores_list = []
+    # Extract per-object masks and scores in MLX (batched, no per-object np.array)
+    if pred_masks.ndim == 5:
+        # (B, M, num_masks, H_out, W_out) → take best mask per object
+        obj_masks = pred_masks[0, :N, 0]  # (N, H_out, W_out) — still MLX
+        obj_scores = iou_scores[0, :N, 0]  # (N,)
+    else:
+        obj_masks = mx.broadcast_to(pred_masks[0, 0:1], (N,) + pred_masks.shape[2:])
+        obj_scores = mx.broadcast_to(iou_scores[0, 0:1], (N,))
+
+    # Resize masks in MLX using Upsample (batched, no per-object PIL)
+    mask_h, mask_w = obj_masks.shape[1], obj_masks.shape[2]
+    if mask_h != H or mask_w != W:
+        up = nn.Upsample(scale_factor=(H / mask_h, W / mask_w), mode="nearest")
+        obj_masks_up = up(obj_masks[:, :, :, None])[:, :, :, 0]  # (N, H, W)
+    else:
+        obj_masks_up = obj_masks
+
+    # Single eval + conversion
+    mx.eval(obj_masks_up, obj_scores)
+    masks_np = (np.array(obj_masks_up) > 0).astype(np.uint8)
+    scores_np = np.array(obj_scores)
+
+    # Derive boxes from masks (numpy — needed for contour-based boxes)
     boxes_list = []
-
-    for obj_idx in range(min(n_objects, 16)):
-        if pred_masks.ndim == 5:
-            mask = np.array(pred_masks[0, obj_idx, 0])  # (H_out, W_out)
-            score = float(np.array(iou_scores[0, obj_idx, 0]))
-        else:
-            mask = np.array(pred_masks[0, 0])
-            score = float(np.array(iou_scores[0, 0]))
-
-        # Resize mask to image size
-        mask_resized = np.array(
-            Image.fromarray(mask.astype(np.float32)).resize((W, H), Image.BILINEAR)
-        )
-        binary = (mask_resized > 0).astype(np.uint8)
-
-        # Derive box from mask
-        ys, xs = np.where(binary)
+    for i in range(N):
+        ys, xs = np.where(masks_np[i])
         if len(ys) > 0:
-            box = np.array([xs.min(), ys.min(), xs.max(), ys.max()], dtype=np.float32)
+            boxes_list.append([xs.min(), ys.min(), xs.max(), ys.max()])
         else:
-            box = np.zeros(4, dtype=np.float32)
-
-        masks_list.append(binary)
-        scores_list.append(score)
-        boxes_list.append(box)
-
-    if not masks_list:
-        return DetectionResult(
-            boxes=np.zeros((0, 4)), masks=np.zeros((0, H, W), dtype=np.uint8),
-            scores=np.zeros((0,)), labels=[],
-        ), memory_bank
+            boxes_list.append([0, 0, 0, 0])
 
     det_result = DetectionResult(
-        boxes=np.stack(boxes_list),
-        masks=np.stack(masks_list),
-        scores=np.array(scores_list),
+        boxes=np.array(boxes_list, dtype=np.float32),
+        masks=masks_np,
+        scores=scores_np,
         labels=[],
     )
 
