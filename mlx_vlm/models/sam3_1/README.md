@@ -212,19 +212,29 @@ SAM 3.1 tracking (4 objects): 1 × track_step =             203ms/frame (4.9 FPS
 
 ### Optimized Realtime Pipeline
 
-Backbone caching + tracker propagation vs naive detect-per-frame:
+Four optimizations combined: backbone caching, DETR encoder caching, MLX-native postprocessing, and fast overlay rendering.
 
-| Resolution | Baseline | Optimized (avg) | Speedup | Strategy |
-|-----------|----------|-----------------|---------|----------|
-| 224px | 117ms (8.5 FPS) | 63ms (15.8 FPS) | **1.8x** | Backbone caching, DETR on cached features |
-| 1008px | 992ms (1.0 FPS) | 253ms (3.9 FPS) | **3.9x** | Backbone caching + tracker propagation |
+| Resolution | Baseline | Optimized (cached) | Speedup |
+|-----------|----------|-------------------|---------|
+| 224px (2 prompts, 5 obj) | ~212ms (5 FPS) | **43ms (23 FPS)** | **4.6x** |
+| 1008px (1 prompt) | ~992ms (1 FPS) | **97ms propagate** | **3.9x avg** |
 
-Per-frame breakdown at 224px:
+Optimization breakdown at 224px:
 
-| Frame type | Time | Notes |
+| Optimization | Cached frame | FPS | Savings |
+|-------------|-------------|-----|---------|
+| Baseline (no caching) | ~212ms | ~5 | — |
+| + Backbone caching | ~147ms | ~7 | skip ViT (62ms) |
+| + DETR encoder caching | ~135ms | ~7.4 | skip encoder (12ms) |
+| + Fast overlay | **43ms** | **23** | drop contours (93ms) |
+
+Per-frame breakdown at 224px (cached):
+
+| Component | Time | Notes |
 |-----------|------|-------|
-| DETECT + ViT | 113ms | Full backbone + DETR (every 5th frame) |
-| DETECT cached | 51ms | DETR only, skip ViT (4 out of 5 frames) |
+| DETR decoder + scoring + masks | 37ms | Encoder cached, backbone cached |
+| Overlay rendering | 6ms | Boolean indexing, no contours |
+| **Total** | **43ms** | **23 FPS** |
 
 Per-frame breakdown at 1008px:
 
