@@ -1163,6 +1163,7 @@ def track_video_realtime(
         "fps": 0.0,
     }
     pending_frame = {"pil": None}
+    latest_frame = {"bgr": None}
     running = {"active": True}
 
     # --- Thread 1: Read frames into ring buffer ---
@@ -1187,7 +1188,9 @@ def track_video_realtime(
                 next_frame_time = time.perf_counter()
                 continue
 
-            # For camera: drop oldest to always show latest frame
+            with lock:
+                latest_frame["bgr"] = frame
+
             if frame_buffer.full():
                 try:
                     frame_buffer.get_nowait()
@@ -1206,16 +1209,17 @@ def track_video_realtime(
 
         while running["active"]:
             with lock:
-                frame_pil = pending_frame["pil"]
+                latest_bgr = latest_frame["bgr"]
+                latest_frame["bgr"] = None
 
-            if frame_pil is None:
+            if latest_bgr is None:
                 time.sleep(0.005)
                 continue
 
             t0 = time.perf_counter()
+            frame_pil = Image.fromarray(cv2.cvtColor(latest_bgr, cv2.COLOR_BGR2RGB))
             image_size = frame_pil.size
 
-            # Preprocess
             inputs = predictor.processor.preprocess_image(frame_pil)
             pixel_values = mx.array(inputs["pixel_values"])
 
@@ -1321,7 +1325,6 @@ def track_video_realtime(
                 latest["has_detections"] = len(result.scores) > 0
                 latest["n_obj"] = len(result.scores)
                 latest["fps"] = 1.0 / max(dt, 1e-6)
-                pending_frame["pil"] = None
 
             inference_count += 1
 
@@ -1341,13 +1344,6 @@ def track_video_realtime(
             frame_bgr = frame_buffer.get(timeout=0.05)
         except queue.Empty:
             continue
-
-        # Submit for inference if idle
-        with lock:
-            if pending_frame["pil"] is None:
-                pending_frame["pil"] = Image.fromarray(
-                    cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                )
 
         with lock:
             overlay_scaled = latest["overlay_scaled"]
