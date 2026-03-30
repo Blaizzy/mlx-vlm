@@ -162,9 +162,10 @@ class RoundBoxAnnotator(BaseAnnotator):
 
 @dataclass
 class MaskAnnotator(BaseAnnotator):
-    """Draw semi-transparent segmentation masks."""
+    """Draw semi-transparent segmentation masks with contour outline."""
 
     opacity: float = 0.6
+    contour_thickness: int = 2
     colors: List[Tuple[int, int, int]] = field(default_factory=lambda: DEFAULT_COLORS)
 
     def annotate(self, scene: np.ndarray, result) -> np.ndarray:
@@ -175,13 +176,19 @@ class MaskAnnotator(BaseAnnotator):
                 continue
             mask = _resize_mask(result.masks[i], H, W)
             binary = mask > 0
-            color = np.array(
-                _get_color(_color_idx(result, i), self.colors), dtype=np.float32
-            )
+            color = _get_color(_color_idx(result, i), self.colors)
+            color_f = np.array(color, dtype=np.float32)
             out[binary] = (
                 out[binary].astype(np.float32) * (1 - self.opacity)
-                + color * self.opacity
+                + color_f * self.opacity
             ).astype(np.uint8)
+            if self.contour_thickness > 0:
+                contours, _ = cv2.findContours(
+                    binary.astype(np.uint8),
+                    cv2.RETR_EXTERNAL,
+                    cv2.CHAIN_APPROX_SIMPLE,
+                )
+                cv2.drawContours(out, contours, -1, color, self.contour_thickness)
         return out
 
 
