@@ -981,7 +981,7 @@ def main():
     parser.add_argument("--output", type=str)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--nms-thresh", type=float, default=0.5)
-    parser.add_argument("--every", type=int, default=2)
+    parser.add_argument("--every", type=int, default=1)
     parser.add_argument("--boxes", type=str)
     parser.add_argument("--show-boxes", action="store_true", default=True)
     parser.add_argument("--no-show-boxes", dest="show_boxes", action="store_false")
@@ -991,14 +991,14 @@ def main():
     parser.add_argument(
         "--detect-every",
         type=int,
-        default=15,
-        help="Re-run DETR detection every N inference frames (default: 15)",
+        default=1,
+        help="Re-run DETR detection every N inference frames (default: 1)",
     )
     parser.add_argument(
         "--backbone-every",
         type=int,
-        default=30,
-        help="Re-run ViT backbone every N inference frames (default: 30)",
+        default=1,
+        help="Re-run ViT backbone every N inference frames (default: 1)",
     )
     parser.add_argument(
         "--memory-every",

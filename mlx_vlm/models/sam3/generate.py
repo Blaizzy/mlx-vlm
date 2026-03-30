@@ -1652,14 +1652,14 @@ def main():
     parser.add_argument(
         "--threshold",
         type=float,
-        default=None,
+        default=0.5,
         help="Score threshold (default: 0.3 image, 0.15 video)",
     )
     parser.add_argument(
         "--nms-thresh", type=float, default=0.5, help="NMS IoU threshold"
     )
     parser.add_argument(
-        "--every", type=int, default=2, help="Detect every N frames (track only)"
+        "--every", type=int, default=1, help="Detect every N frames (track only)"
     )
     parser.add_argument(
         "--resolution",
