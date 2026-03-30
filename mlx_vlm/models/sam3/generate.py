@@ -46,7 +46,7 @@ class TrackingResult:
 class SimpleTracker:
     """Assigns stable IDs to detections across frames using IoU matching."""
 
-    def __init__(self, iou_threshold: float = 0.3, max_lost: int = 5):
+    def __init__(self, iou_threshold: float = 0.3, max_lost: int = 10):
         self.iou_threshold = iou_threshold
         self.max_lost = max_lost
         self._next_id = 0

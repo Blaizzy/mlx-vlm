@@ -272,7 +272,7 @@ class TriangleAnnotator(BaseAnnotator):
             x1, y1, x2, y2 = result.boxes[i].astype(int)
             cx = (x1 + x2) // 2
             color = _get_color(_color_idx(result, i), self.colors)
-            pts = np.array([[cx, y1 - s], [cx - s, y1], [cx + s, y1]], dtype=np.int32)
+            pts = np.array([[cx, y1 + s], [cx - s, y1], [cx + s, y1]], dtype=np.int32)
             cv2.fillPoly(out, [pts], color)
         return out
 
