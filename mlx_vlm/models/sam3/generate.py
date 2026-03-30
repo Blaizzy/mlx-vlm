@@ -1427,6 +1427,51 @@ def _draw_boxes_only(frame_bgr, scores, boxes, prompt, H, W):
     return out
 
 
+ANNOTATOR_PRESETS = {
+    "box": "BoxAnnotator+LabelAnnotator",
+    "corner": "BoxCornerAnnotator+LabelAnnotator",
+    "round": "RoundBoxAnnotator+LabelAnnotator",
+    "mask": "MaskAnnotator+LabelAnnotator",
+    "mask+box": "MaskAnnotator+BoxAnnotator+LabelAnnotator",
+    "halo": "HaloAnnotator+LabelAnnotator",
+    "halo+box": "HaloAnnotator+BoxAnnotator+LabelAnnotator",
+    "color": "ColorAnnotator+LabelAnnotator",
+    "ellipse": "EllipseAnnotator+LabelAnnotator",
+    "triangle": "TriangleAnnotator+LabelAnnotator",
+    "dot": "DotAnnotator+LabelAnnotator",
+    "circle": "CircleAnnotator+LabelAnnotator",
+    "bar": "PercentageBarAnnotator+BoxAnnotator",
+    "blur": "BlurAnnotator",
+    "pixelate": "PixelateAnnotator",
+    "background": "BackgroundOverlayAnnotator+LabelAnnotator",
+}
+
+
+def build_annotator(name: str):
+    """Build an annotator from a preset name or explicit chain.
+
+    Examples:
+        build_annotator("mask+box")
+        build_annotator("BoxAnnotator+LabelAnnotator")
+        build_annotator("halo")
+    """
+    from mlx_vlm.models.sam3 import annotators as ann_module
+
+    spec = ANNOTATOR_PRESETS.get(name, name)
+    parts = [p.strip() for p in spec.split("+")]
+    chain = None
+    for part in parts:
+        cls = getattr(ann_module, part, None)
+        if cls is None:
+            raise ValueError(
+                f"Unknown annotator: {part}. "
+                f"Presets: {list(ANNOTATOR_PRESETS.keys())}"
+            )
+        a = cls()
+        chain = a if chain is None else chain + a
+    return chain
+
+
 def _parse_boxes(boxes_str: Optional[str]) -> Optional[np.ndarray]:
     """Parse box string 'x1,y1,x2,y2;...' into numpy array."""
     if boxes_str is None:
@@ -1450,6 +1495,7 @@ def run_image(
     boxes: Optional[str] = None,
     show_boxes: bool = True,
     resolution: int = 1008,
+    annotator_name: Optional[str] = None,
 ):
     """Run detection or segmentation on an image."""
     import cv2
@@ -1482,7 +1528,10 @@ def run_image(
 
     frame_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
     prompt_str = " + ".join(prompts)
-    if task == "detect":
+    if annotator_name:
+        ann = build_annotator(annotator_name)
+        out = ann.annotate(frame_bgr, result)
+    elif task == "detect":
         out = _draw_boxes_only(frame_bgr, result.scores, result.boxes, prompt_str, H, W)
     else:
         out = draw_frame(
@@ -1586,6 +1635,15 @@ def main():
         default=None,
         help="Background image for realtime bg swap (replaces area outside detected objects)",
     )
+    parser.add_argument(
+        "--annotator",
+        default=None,
+        help=(
+            "Annotation style. Presets: "
+            + ", ".join(ANNOTATOR_PRESETS.keys())
+            + ". Or chain: BoxAnnotator+LabelAnnotator"
+        ),
+    )
     args = parser.parse_args()
 
     prompts = args.prompt  # list of 1+ prompts
@@ -1604,6 +1662,7 @@ def main():
             boxes=args.boxes,
             show_boxes=args.show_boxes if args.task == "segment" else True,
             resolution=args.resolution,
+            annotator_name=args.annotator,
         )
     elif args.task == "track":
         if args.video is None:

@@ -1019,6 +1019,11 @@ def main():
         default=3,
         help="Update tracker memory every N propagation frames (default: 3)",
     )
+    parser.add_argument(
+        "--annotator",
+        default=None,
+        help="Annotation style preset or chain (e.g. mask+box, halo, BoxCornerAnnotator+LabelAnnotator)",
+    )
     args = parser.parse_args()
 
     if args.task in ("track", "realtime"):
@@ -1061,6 +1066,7 @@ def main():
             threshold=args.threshold,
             boxes=args.boxes,
             show_boxes=args.show_boxes,
+            annotator_name=args.annotator,
         )
 
 
