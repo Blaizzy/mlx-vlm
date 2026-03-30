@@ -838,9 +838,9 @@ def track_video_realtime(
                 from ..sam3.generate import build_annotator
 
                 ann = build_annotator(annotator_name)
-                # Annotator draws directly on a copy of a black frame
                 overlay = ann.annotate(np.zeros((H, W, 3), dtype=np.uint8), result)
                 scaled = (overlay.astype(np.uint16) * 115 >> 8).astype(np.uint8)
+                fg_mask = None
             else:
                 overlay = np.zeros((H, W, 3), dtype=np.uint8)
                 fg_mask = None
