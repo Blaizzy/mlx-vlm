@@ -28,10 +28,10 @@ It is a single Transformer processes image patches and text tokens in a shared p
 pip install mlx-vlm
 ```
 
-Layout+OCR additionally requires PyTorch (for the PP-DocLayoutV3 layout detector):
+Layout+OCR additionally requires PyTorch (for the layout detector):
 
 ```bash
-pip install mlx-vlm[torch]
+pip install torch
 ```
 
 ## Python Examples
