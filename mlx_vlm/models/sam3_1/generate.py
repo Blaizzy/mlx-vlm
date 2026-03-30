@@ -516,8 +516,13 @@ def track_video(
     show_boxes: bool = True,
     resolution: int = 1008,
     annotator_name: Optional[str] = None,
+    backbone_every: int = 3,
 ):
-    """Track objects in a video file using SAM 3.1."""
+    """Track objects in a video file using SAM 3.1.
+
+    Uses backbone caching: fresh ViT every backbone_every frames,
+    DETR decoder runs every frame for real detections.
+    """
     import cv2
 
     from mlx_vlm.models.sam3_1.processing_sam3_1 import Sam31Processor
@@ -572,6 +577,18 @@ def track_video(
     )
 
     id_tracker = SimpleTracker()
+    if annotator_name:
+        ann = build_annotator(annotator_name)
+    else:
+        ann = None
+
+    backbone_cache = None
+    encoder_cache = {}
+    import time as _time
+
+    t_start = _time.perf_counter()
+
+    detect_count = 0
 
     for fi in range(total_frames):
         ret, frame_bgr = cap.read()
@@ -580,32 +597,52 @@ def track_video(
 
         if fi % every == 0:
             frame_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-            result = predict_multi(predictor, frame_pil, prompts)
+            inputs = predictor.processor.preprocess_image(frame_pil)
+            pixel_values = mx.array(inputs["pixel_values"])
+
+            # Fresh backbone every backbone_every detection frames
+            if detect_count % backbone_every == 0 or backbone_cache is None:
+                backbone_cache = _get_backbone_features(
+                    predictor.model, pixel_values
+                )
+                encoder_cache.clear()
+
+            result = _detect_with_backbone(
+                predictor,
+                backbone_cache,
+                prompts,
+                frame_pil.size,
+                threshold,
+                encoder_cache=encoder_cache,
+            )
             if box_array is not None and len(result.scores) > 0:
                 result = _filter_by_regions(result, box_array)
             latest_result = id_tracker.update(result)
+            detect_count += 1
 
-            if fi % 40 == 0:
-                print(
-                    f"  Frame {fi}/{total_frames}: {len(latest_result.scores)} detections"
-                )
-
-        if annotator_name and len(latest_result.scores) > 0:
-            ann = build_annotator(annotator_name)
-            out = ann.annotate(frame_bgr, latest_result)
+        if ann and len(result.scores) > 0:
+            out = ann.annotate(frame_bgr, result)
         else:
             out = draw_frame(
                 frame_bgr,
-                latest_result.masks,
-                latest_result.scores,
-                latest_result.boxes,
+                result.masks,
+                result.scores,
+                result.boxes,
                 prompt_str,
                 H,
                 W,
                 show_boxes=show_boxes,
-                labels=latest_result.labels,
+                labels=result.labels,
             )
         writer.write(out)
+
+        if fi % 40 == 0:
+            elapsed = _time.perf_counter() - t_start
+            fps_actual = (fi + 1) / elapsed if elapsed > 0 else 0
+            print(
+                f"  Frame {fi}/{total_frames}: {len(result.scores)} det, "
+                f"{fps_actual:.1f} fps"
+            )
 
     writer.release()
     cap.release()
@@ -993,6 +1030,7 @@ def main():
                 show_boxes=args.show_boxes,
                 resolution=args.resolution,
                 annotator_name=args.annotator,
+                backbone_every=args.backbone_every,
             )
         else:
             track_video_realtime(
