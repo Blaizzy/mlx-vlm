@@ -515,15 +515,15 @@ def track_video(
     boxes: Optional[str] = None,
     show_boxes: bool = True,
     resolution: int = 1008,
+    annotator_name: Optional[str] = None,
 ):
-    """Track objects in a video file using SAM 3.1.
-
-    Uses SAM 3.1's predict_multi which handles TriViTDetNeck output.
-    """
+    """Track objects in a video file using SAM 3.1."""
     import cv2
 
     from mlx_vlm.models.sam3_1.processing_sam3_1 import Sam31Processor
     from mlx_vlm.utils import get_model_path, load_model
+
+    from ..sam3.generate import build_annotator
 
     if output is None:
         p = Path(video_path)
@@ -588,17 +588,21 @@ def track_video(
                     f"  Frame {fi}/{total_frames}: {len(latest_result.scores)} detections"
                 )
 
-        out = draw_frame(
-            frame_bgr,
-            latest_result.masks,
-            latest_result.scores,
-            latest_result.boxes,
-            prompt_str,
-            H,
-            W,
-            show_boxes=show_boxes,
-            labels=latest_result.labels,
-        )
+        if annotator_name and len(latest_result.scores) > 0:
+            ann = build_annotator(annotator_name)
+            out = ann.annotate(frame_bgr, latest_result)
+        else:
+            out = draw_frame(
+                frame_bgr,
+                latest_result.masks,
+                latest_result.scores,
+                latest_result.boxes,
+                prompt_str,
+                H,
+                W,
+                show_boxes=show_boxes,
+                labels=latest_result.labels,
+            )
         writer.write(out)
 
     writer.release()
@@ -619,6 +623,7 @@ def track_video_realtime(
     detect_every: int = 15,
     recompute_backbone_every: int = 30,
     update_memory_every: int = 3,
+    annotator_name: Optional[str] = None,
 ):
     """Optimized realtime tracking with backbone caching + tracker propagation.
 
@@ -828,68 +833,75 @@ def track_video_realtime(
 
             dt = time.perf_counter() - t0
 
-            # Pre-render overlay — fast path: boolean indexing, no contours
-            overlay = np.zeros((H, W, 3), dtype=np.uint8)
-            fg_mask = None
-            if len(result.scores) > 0:
-                has_masks = result.masks.any()
+            # Render overlay
+            if annotator_name and len(result.scores) > 0:
+                from ..sam3.generate import build_annotator
 
-                # Batch mask overlay: boolean index (11x faster than np.where + contours)
-                if has_masks:
+                ann = build_annotator(annotator_name)
+                # Annotator draws directly on a copy of a black frame
+                overlay = ann.annotate(np.zeros((H, W, 3), dtype=np.uint8), result)
+                scaled = (overlay.astype(np.uint16) * 115 >> 8).astype(np.uint8)
+            else:
+                overlay = np.zeros((H, W, 3), dtype=np.uint8)
+                fg_mask = None
+                if len(result.scores) > 0:
+                    has_masks = result.masks.any()
+
+                    if has_masks:
+                        for i in range(len(result.scores)):
+                            mask = result.masks[i]
+                            if mask.shape[0] != H or mask.shape[1] != W:
+                                mask = cv2.resize(
+                                    mask.astype(np.uint8),
+                                    (W, H),
+                                    interpolation=cv2.INTER_NEAREST,
+                                )
+                            overlay[mask > 0] = COLORS_BGR[i % len(COLORS_BGR)]
+
+                        if bg_frame is not None:
+                            fg_mask = np.any(result.masks > 0, axis=0).astype(np.uint8)
+                            if fg_mask.shape[0] != H or fg_mask.shape[1] != W:
+                                fg_mask = cv2.resize(
+                                    fg_mask,
+                                    (W, H),
+                                    interpolation=cv2.INTER_NEAREST,
+                                )
+
                     for i in range(len(result.scores)):
-                        mask = result.masks[i]
-                        if mask.shape[0] != H or mask.shape[1] != W:
-                            mask = cv2.resize(
-                                mask.astype(np.uint8),
-                                (W, H),
-                                interpolation=cv2.INTER_NEAREST,
-                            )
-                        overlay[mask > 0] = COLORS_BGR[i % len(COLORS_BGR)]
+                        color = COLORS_BGR[i % len(COLORS_BGR)]
+                        lbl = (
+                            result.labels[i]
+                            if result.labels and i < len(result.labels)
+                            else prompt_str
+                        )
+                        label = f"{lbl} {result.scores[i]:.2f}"
 
-                    # Build foreground mask for bg swap
-                    if bg_frame is not None:
-                        fg_mask = np.any(result.masks > 0, axis=0).astype(np.uint8)
-                        if fg_mask.shape[0] != H or fg_mask.shape[1] != W:
-                            fg_mask = cv2.resize(
-                                fg_mask, (W, H), interpolation=cv2.INTER_NEAREST
-                            )
+                        x1, y1, x2, y2 = result.boxes[i].astype(int)
+                        if show_boxes or not has_masks:
+                            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+                        lx, ly = x1, max(y1 - 8, 12)
 
-                # Boxes + labels
-                for i in range(len(result.scores)):
-                    color = COLORS_BGR[i % len(COLORS_BGR)]
-                    lbl = (
-                        result.labels[i]
-                        if result.labels and i < len(result.labels)
-                        else prompt_str
-                    )
-                    label = f"{lbl} {result.scores[i]:.2f}"
+                        (tw, th_t), _ = cv2.getTextSize(
+                            label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+                        )
+                        cv2.rectangle(
+                            overlay,
+                            (lx, max(ly - th_t - 6, 0)),
+                            (lx + tw + 6, ly + 4),
+                            color,
+                            -1,
+                        )
+                        cv2.putText(
+                            overlay,
+                            label,
+                            (lx + 3, ly),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (255, 255, 255),
+                            2,
+                        )
 
-                    x1, y1, x2, y2 = result.boxes[i].astype(int)
-                    if show_boxes or not has_masks:
-                        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-                    lx, ly = x1, max(y1 - 8, 12)
-
-                    (tw, th_t), _ = cv2.getTextSize(
-                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
-                    )
-                    cv2.rectangle(
-                        overlay,
-                        (lx, max(ly - th_t - 6, 0)),
-                        (lx + tw + 6, ly + 4),
-                        color,
-                        -1,
-                    )
-                    cv2.putText(
-                        overlay,
-                        label,
-                        (lx + 3, ly),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 255, 255),
-                        2,
-                    )
-
-            scaled = (overlay.astype(np.uint16) * 115 >> 8).astype(np.uint8)
+                scaled = (overlay.astype(np.uint16) * 115 >> 8).astype(np.uint8)
 
             # Pre-compute backbone for next refresh frame
             # This hides the ViT latency: detection always uses ready features
@@ -1040,6 +1052,7 @@ def main():
                 boxes=args.boxes,
                 show_boxes=args.show_boxes,
                 resolution=args.resolution,
+                annotator_name=args.annotator,
             )
         else:
             track_video_realtime(
@@ -1055,6 +1068,7 @@ def main():
                 detect_every=args.detect_every,
                 recompute_backbone_every=args.backbone_every,
                 update_memory_every=args.memory_every,
+                annotator_name=args.annotator,
             )
     else:
         run_image(
