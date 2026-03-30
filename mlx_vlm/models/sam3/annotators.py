@@ -20,7 +20,7 @@ Usage:
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -45,7 +45,9 @@ def _get_color(idx: int, colors: List[Tuple[int, int, int]]) -> Tuple[int, int, 
 
 def _resize_mask(mask: np.ndarray, H: int, W: int) -> np.ndarray:
     if mask.shape[0] != H or mask.shape[1] != W:
-        return cv2.resize(mask.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
+        return cv2.resize(
+            mask.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST
+        )
     return mask.astype(np.uint8) if mask.dtype != np.uint8 else mask
 
 
@@ -168,7 +170,8 @@ class MaskAnnotator(BaseAnnotator):
             binary = mask > 0
             color = np.array(_get_color(i, self.colors), dtype=np.float32)
             out[binary] = (
-                out[binary].astype(np.float32) * (1 - self.opacity) + color * self.opacity
+                out[binary].astype(np.float32) * (1 - self.opacity)
+                + color * self.opacity
             ).astype(np.uint8)
         return out
 
@@ -205,7 +208,9 @@ class EllipseAnnotator(BaseAnnotator):
             color = _get_color(i, self.colors)
             cx = (x1 + x2) // 2
             w = (x2 - x1) // 2
-            cv2.ellipse(out, (cx, y2), (w, max(w // 4, 5)), 0, -180, 0, color, self.thickness)
+            cv2.ellipse(
+                out, (cx, y2), (w, max(w // 4, 5)), 0, -180, 0, color, self.thickness
+            )
         return out
 
 
@@ -298,8 +303,13 @@ class LabelAnnotator(BaseAnnotator):
                 out, (x1, max(y1 - th - 2 * p, 0)), (x1 + tw + 2 * p, y1), color, -1
             )
             cv2.putText(
-                out, label, (x1 + p, max(y1 - p, th + p)),
-                cv2.FONT_HERSHEY_SIMPLEX, self.font_scale, self.text_color, self.thickness,
+                out,
+                label,
+                (x1 + p, max(y1 - p, th + p)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                self.font_scale,
+                self.text_color,
+                self.thickness,
             )
         return out
 
@@ -320,8 +330,12 @@ class PercentageBarAnnotator(BaseAnnotator):
             bar_y = max(y1 - self.height - 2, 0)
             bar_w = x2 - x1
             fill_w = int(bar_w * result.scores[i])
-            cv2.rectangle(out, (x1, bar_y), (x2, bar_y + self.height), self.bg_color, -1)
-            cv2.rectangle(out, (x1, bar_y), (x1 + fill_w, bar_y + self.height), color, -1)
+            cv2.rectangle(
+                out, (x1, bar_y), (x2, bar_y + self.height), self.bg_color, -1
+            )
+            cv2.rectangle(
+                out, (x1, bar_y), (x1 + fill_w, bar_y + self.height), color, -1
+            )
         return out
 
 
@@ -356,8 +370,14 @@ class PixelateAnnotator(BaseAnnotator):
             roi = out[y1:y2, x1:x2]
             if roi.size > 0:
                 h, w = roi.shape[:2]
-                small = cv2.resize(roi, (max(w // ps, 1), max(h // ps, 1)), interpolation=cv2.INTER_LINEAR)
-                out[y1:y2, x1:x2] = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+                small = cv2.resize(
+                    roi,
+                    (max(w // ps, 1), max(h // ps, 1)),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                out[y1:y2, x1:x2] = cv2.resize(
+                    small, (w, h), interpolation=cv2.INTER_NEAREST
+                )
         return out
 
 
@@ -408,6 +428,7 @@ class BackgroundOverlayAnnotator(BaseAnnotator):
         bg = ~fg
         overlay_color = np.array(self.color, dtype=np.float32)
         out[bg] = (
-            out[bg].astype(np.float32) * (1 - self.opacity) + overlay_color * self.opacity
+            out[bg].astype(np.float32) * (1 - self.opacity)
+            + overlay_color * self.opacity
         ).astype(np.uint8)
         return out

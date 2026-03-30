@@ -67,6 +67,39 @@ boxes = np.array([[100, 50, 400, 350]])
 result = predictor.predict(image, text_prompt="a cat", boxes=boxes)
 ```
 
+## Annotators
+
+15 built-in annotators for visualization. Chainable with `+`, no external dependencies.
+
+```python
+from mlx_vlm.models.sam3.annotators import (
+    MaskAnnotator, BoxAnnotator, LabelAnnotator,
+    BoxCornerAnnotator, RoundBoxAnnotator, EllipseAnnotator,
+    HaloAnnotator, ColorAnnotator, BackgroundOverlayAnnotator,
+    BlurAnnotator, PixelateAnnotator, PercentageBarAnnotator,
+    TriangleAnnotator, DotAnnotator, CircleAnnotator,
+)
+
+frame = np.array(image)[..., ::-1]  # RGB->BGR
+
+# Chain annotators
+annotator = MaskAnnotator(opacity=0.4) + BoxAnnotator() + LabelAnnotator()
+out = annotator.annotate(frame, result)
+
+# Or mix and match
+annotator = HaloAnnotator() + BoxCornerAnnotator() + PercentageBarAnnotator()
+out = annotator.annotate(frame, result)
+
+# Privacy mode
+out = BlurAnnotator(kernel_size=31).annotate(frame, result)
+```
+
+| Fast (<1ms) | Medium (1-3ms) | Mask-based (~10ms) |
+|------------|----------------|-------------------|
+| Box, BoxCorner, RoundBox | Blur, Pixelate, Color | Mask, Halo, BgOverlay |
+| Ellipse, Circle, Dot | | |
+| Triangle, Label, PercentBar | | |
+
 ## CLI
 
 SAM 3.1 has its own CLI with optimized realtime mode:
