@@ -1702,14 +1702,14 @@ def main():
     parser.add_argument(
         "--opacity",
         type=float,
-        default=0.6,
-        help="Mask/overlay opacity (default: 0.6)",
+        default=0.5,
+        help="Mask/overlay opacity (default: 0.5)",
     )
     parser.add_argument(
         "--contour-thickness",
         type=int,
-        default=2,
-        help="Mask contour thickness, 0 to disable (default: 2)",
+        default=1,
+        help="Mask contour thickness, 0 to disable (default: 1)",
     )
     args = parser.parse_args()
 

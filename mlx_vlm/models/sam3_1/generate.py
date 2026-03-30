@@ -1014,13 +1014,13 @@ def main():
         help="Annotation style preset or chain (e.g. mask+box, halo, BoxCornerAnnotator+LabelAnnotator)",
     )
     parser.add_argument(
-        "--opacity", type=float, default=0.6, help="Mask opacity (default: 0.6)"
+        "--opacity", type=float, default=0.5, help="Mask opacity (default: 0.5)"
     )
     parser.add_argument(
         "--contour-thickness",
         type=int,
-        default=2,
-        help="Mask contour thickness (default: 2)",
+        default=1,
+        help="Mask contour thickness (default: 1)",
     )
     args = parser.parse_args()
 
