@@ -157,7 +157,7 @@ class RoundBoxAnnotator(BaseAnnotator):
 class MaskAnnotator(BaseAnnotator):
     """Draw semi-transparent segmentation masks."""
 
-    opacity: float = 0.4
+    opacity: float = 0.6
     colors: List[Tuple[int, int, int]] = field(default_factory=lambda: DEFAULT_COLORS)
 
     def annotate(self, scene: np.ndarray, result) -> np.ndarray:
