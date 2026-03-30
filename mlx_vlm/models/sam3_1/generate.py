@@ -602,9 +602,7 @@ def track_video(
 
             # Fresh backbone every backbone_every detection frames
             if detect_count % backbone_every == 0 or backbone_cache is None:
-                backbone_cache = _get_backbone_features(
-                    predictor.model, pixel_values
-                )
+                backbone_cache = _get_backbone_features(predictor.model, pixel_values)
                 encoder_cache.clear()
 
             result = _detect_with_backbone(

@@ -1042,19 +1042,12 @@ def track_video(
     show_boxes: bool = True,
     resolution: int = 1008,
     annotator_name: Optional[str] = None,
+    backbone_every: int = 3,
 ):
     """Track objects in a video file.
 
-    Args:
-        video_path: Input video path
-        prompt: Text prompt for detection
-        output: Output video path (default: <input>_tracked.mp4)
-        model_path: Model path or HF repo
-        threshold: Detection score threshold
-        nms_thresh: NMS IoU threshold
-        every: Run detection every N frames
-        boxes: Box prompts as "x1,y1,x2,y2" or "x1,y1,x2,y2;..." in pixel coords
-        show_boxes: Draw bounding boxes and labels on output
+    Uses backbone caching: fresh ViT every backbone_every detection frames,
+    DETR decoder runs on every detection frame for real detections.
     """
     import cv2
 
@@ -1111,6 +1104,12 @@ def track_video(
     )
 
     id_tracker = SimpleTracker()
+    backbone_cache = None
+    encoder_cache = {}
+    detect_count = 0
+    import time as _time
+
+    t_start = _time.perf_counter()
 
     for fi in range(total_frames):
         ret, frame_bgr = cap.read()
@@ -1119,14 +1118,32 @@ def track_video(
 
         if fi % every == 0:
             frame_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-            result = predict_multi(predictor, frame_pil, prompts)
+            inputs = predictor.processor.preprocess_image(frame_pil)
+            pixel_values = mx.array(inputs["pixel_values"])
+
+            if detect_count % backbone_every == 0 or backbone_cache is None:
+                backbone_cache = _get_backbone_features(model, pixel_values)
+                encoder_cache.clear()
+
+            result = _detect_with_backbone(
+                predictor,
+                backbone_cache,
+                prompts,
+                frame_pil.size,
+                threshold,
+                encoder_cache=encoder_cache,
+            )
             if box_array is not None and len(result.scores) > 0:
                 result = _filter_by_regions(result, box_array)
             latest_result = id_tracker.update(result)
+            detect_count += 1
 
             if fi % 40 == 0:
+                elapsed = _time.perf_counter() - t_start
+                fps_actual = (fi + 1) / elapsed if elapsed > 0 else 0
                 print(
-                    f"  Frame {fi}/{total_frames}: {len(latest_result.scores)} detections"
+                    f"  Frame {fi}/{total_frames}: {len(latest_result.scores)} det, "
+                    f"{fps_actual:.1f} fps"
                 )
 
         if annotator_name and len(latest_result.scores) > 0:
@@ -1664,6 +1681,12 @@ def main():
             + ". Or chain: BoxAnnotator+LabelAnnotator"
         ),
     )
+    parser.add_argument(
+        "--backbone-every",
+        type=int,
+        default=3,
+        help="Re-run ViT backbone every N detection frames for track/realtime (default: 3)",
+    )
     args = parser.parse_args()
 
     prompts = args.prompt  # list of 1+ prompts
@@ -1699,6 +1722,7 @@ def main():
             show_boxes=args.show_boxes,
             resolution=args.resolution,
             annotator_name=args.annotator,
+            backbone_every=args.backbone_every,
         )
     elif args.task == "realtime":
         track_video_realtime(
