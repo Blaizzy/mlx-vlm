@@ -13,7 +13,6 @@ import numpy as np
 from PIL import Image
 
 from ..sam3.generate import (
-    COLORS_BGR,
     DetectionResult,
     Sam3Predictor,
     _filter_by_regions,
@@ -699,16 +698,19 @@ def track_video_realtime(
 
     # Shared state between threads
     lock = threading.Lock()
+    empty_result = DetectionResult(
+        boxes=np.zeros((0, 4)),
+        masks=np.zeros((0, H, W), dtype=np.uint8),
+        scores=np.zeros((0,)),
+        labels=[],
+    )
     latest = {
-        "overlay_scaled": np.zeros((H, W, 3), dtype=np.uint8),
-        "fg_mask": None,
-        "has_detections": False,
+        "result": empty_result,
         "n_obj": 0,
         "fps": 0.0,
-        "mode": "init",  # "detect" or "track"
+        "mode": "init",
     }
-    pending_frame = {"pil": None}
-    latest_frame = {"bgr": None}  # shared latest camera frame
+    latest_frame = {"bgr": None}
     running = {"active": True}
 
     # --- Thread 1: Read frames ---
@@ -841,78 +843,7 @@ def track_video_realtime(
 
             dt = time.perf_counter() - t0
 
-            # Render overlay
-            if annotator_name and len(result.scores) > 0:
-                from ..sam3.generate import build_annotator
-
-                ann = build_annotator(annotator_name)
-                overlay = ann.annotate(np.zeros((H, W, 3), dtype=np.uint8), result)
-                scaled = (overlay.astype(np.uint16) * 115 >> 8).astype(np.uint8)
-                fg_mask = None
-            else:
-                overlay = np.zeros((H, W, 3), dtype=np.uint8)
-                fg_mask = None
-                if len(result.scores) > 0:
-                    has_masks = result.masks.any()
-
-                    if has_masks:
-                        for i in range(len(result.scores)):
-                            mask = result.masks[i]
-                            if mask.shape[0] != H or mask.shape[1] != W:
-                                mask = cv2.resize(
-                                    mask.astype(np.uint8),
-                                    (W, H),
-                                    interpolation=cv2.INTER_NEAREST,
-                                )
-                            overlay[mask > 0] = COLORS_BGR[i % len(COLORS_BGR)]
-
-                        if bg_frame is not None:
-                            fg_mask = np.any(result.masks > 0, axis=0).astype(np.uint8)
-                            if fg_mask.shape[0] != H or fg_mask.shape[1] != W:
-                                fg_mask = cv2.resize(
-                                    fg_mask,
-                                    (W, H),
-                                    interpolation=cv2.INTER_NEAREST,
-                                )
-
-                    for i in range(len(result.scores)):
-                        color = COLORS_BGR[i % len(COLORS_BGR)]
-                        lbl = (
-                            result.labels[i]
-                            if result.labels and i < len(result.labels)
-                            else prompt_str
-                        )
-                        label = f"{lbl} {result.scores[i]:.2f}"
-
-                        x1, y1, x2, y2 = result.boxes[i].astype(int)
-                        if show_boxes or not has_masks:
-                            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-                        lx, ly = x1, max(y1 - 8, 12)
-
-                        (tw, th_t), _ = cv2.getTextSize(
-                            label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
-                        )
-                        cv2.rectangle(
-                            overlay,
-                            (lx, max(ly - th_t - 6, 0)),
-                            (lx + tw + 6, ly + 4),
-                            color,
-                            -1,
-                        )
-                        cv2.putText(
-                            overlay,
-                            label,
-                            (lx + 3, ly),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (255, 255, 255),
-                            2,
-                        )
-
-                scaled = (overlay.astype(np.uint16) * 115 >> 8).astype(np.uint8)
-
             # Pre-compute backbone for next refresh frame
-            # This hides the ViT latency: detection always uses ready features
             next_count = inference_count + 1
             if (
                 next_count % recompute_backbone_every == 0
@@ -920,10 +851,9 @@ def track_video_realtime(
             ):
                 backbone_cache["features"] = _get_backbone_features(model, pixel_values)
 
+            # Store detection result — display thread renders per frame
             with lock:
-                latest["overlay_scaled"] = scaled
-                latest["fg_mask"] = fg_mask
-                latest["has_detections"] = len(result.scores) > 0
+                latest["result"] = result
                 latest["n_obj"] = len(result.scores)
                 latest["fps"] = 1.0 / max(dt, 1e-6)
                 latest["mode"] = mode
@@ -940,6 +870,16 @@ def track_video_realtime(
     display_fps_t0 = time.perf_counter()
     display_fps_val = 0.0
 
+    # Build annotator once for display thread
+    from ..sam3.generate import build_annotator
+
+    if annotator_name:
+        display_ann = build_annotator(annotator_name)
+    else:
+        from ..sam3.annotators import BoxAnnotator, LabelAnnotator, MaskAnnotator
+
+        display_ann = MaskAnnotator() + BoxAnnotator() + LabelAnnotator()
+
     while True:
         try:
             frame_bgr = frame_buffer.get(timeout=0.05)
@@ -947,18 +887,13 @@ def track_video_realtime(
             continue
 
         with lock:
-            overlay_scaled = latest["overlay_scaled"]
-            fg_mask = latest["fg_mask"]
-            has_det = latest["has_detections"]
+            result = latest["result"]
             det_fps = latest["fps"]
             n_obj = latest["n_obj"]
             mode = latest["mode"]
 
-        if bg_frame is not None and fg_mask is not None:
-            fg_mask_3d = fg_mask[:, :, None]
-            out = np.where(fg_mask_3d, frame_bgr, bg_frame)
-        elif has_det:
-            out = cv2.add(frame_bgr, overlay_scaled)
+        if len(result.scores) > 0:
+            out = display_ann.annotate(frame_bgr.copy(), result)
         else:
             out = frame_bgr
 
