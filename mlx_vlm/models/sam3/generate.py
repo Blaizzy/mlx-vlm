@@ -1043,12 +1043,10 @@ def track_video(
     resolution: int = 1008,
     annotator_name: Optional[str] = None,
     backbone_every: int = 1,
+    opacity: float = 0.6,
+    contour_thickness: int = 2,
 ):
-    """Track objects in a video file.
-
-    backbone_every=1 (default): fresh backbone every frame (best quality).
-    backbone_every=N: cache backbone for N frames (faster, slight quality loss).
-    """
+    """Track objects in a video file."""
     import cv2
 
     from mlx_vlm.models.sam3.processing_sam3 import Sam3Processor
@@ -1147,7 +1145,9 @@ def track_video(
                 )
 
         if annotator_name and len(latest_result.scores) > 0:
-            ann = build_annotator(annotator_name)
+            ann = build_annotator(
+                annotator_name, opacity=opacity, contour_thickness=contour_thickness
+            )
             out = ann.annotate(frame_bgr, latest_result)
         else:
             out = draw_frame(
@@ -1180,6 +1180,8 @@ def track_video_realtime(
     bg_image: Optional[str] = None,
     recompute_backbone_every: int = 5,
     annotator_name: Optional[str] = None,
+    opacity: float = 0.6,
+    contour_thickness: int = 2,
 ):
     """Track objects in a video with a real-time preview window.
 
@@ -1362,7 +1364,9 @@ def track_video_realtime(
     display_fps_val = 0.0
 
     if annotator_name:
-        display_ann = build_annotator(annotator_name)
+        display_ann = build_annotator(
+            annotator_name, opacity=opacity, contour_thickness=contour_thickness
+        )
     else:
         from mlx_vlm.models.sam3.annotators import (
             BoxAnnotator,
@@ -1484,13 +1488,12 @@ ANNOTATOR_PRESETS = {
 }
 
 
-def build_annotator(name: str):
+def build_annotator(name: str, opacity: float = 0.6, contour_thickness: int = 2):
     """Build an annotator from a preset name or explicit chain.
 
     Examples:
         build_annotator("mask+box")
-        build_annotator("BoxAnnotator+LabelAnnotator")
-        build_annotator("halo")
+        build_annotator("halo", opacity=0.8, contour_thickness=3)
     """
     from mlx_vlm.models.sam3 import annotators as ann_module
 
@@ -1504,7 +1507,12 @@ def build_annotator(name: str):
                 f"Unknown annotator: {part}. "
                 f"Presets: {list(ANNOTATOR_PRESETS.keys())}"
             )
-        a = cls()
+        kwargs = {}
+        if hasattr(cls, "opacity"):
+            kwargs["opacity"] = opacity
+        if hasattr(cls, "contour_thickness"):
+            kwargs["contour_thickness"] = contour_thickness
+        a = cls(**kwargs)
         chain = a if chain is None else chain + a
     return chain
 
@@ -1533,6 +1541,8 @@ def run_image(
     show_boxes: bool = True,
     resolution: int = 1008,
     annotator_name: Optional[str] = None,
+    opacity: float = 0.6,
+    contour_thickness: int = 2,
 ):
     """Run detection or segmentation on an image."""
     import cv2
@@ -1566,7 +1576,9 @@ def run_image(
     frame_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
     prompt_str = " + ".join(prompts)
     if annotator_name:
-        ann = build_annotator(annotator_name)
+        ann = build_annotator(
+            annotator_name, opacity=opacity, contour_thickness=contour_thickness
+        )
         out = ann.annotate(frame_bgr, result)
     elif task == "detect":
         out = _draw_boxes_only(frame_bgr, result.scores, result.boxes, prompt_str, H, W)
@@ -1687,6 +1699,18 @@ def main():
         default=1,
         help="Re-run ViT backbone every N detection frames (default: 1, increase for speed)",
     )
+    parser.add_argument(
+        "--opacity",
+        type=float,
+        default=0.6,
+        help="Mask/overlay opacity (default: 0.6)",
+    )
+    parser.add_argument(
+        "--contour-thickness",
+        type=int,
+        default=2,
+        help="Mask contour thickness, 0 to disable (default: 2)",
+    )
     args = parser.parse_args()
 
     prompts = args.prompt  # list of 1+ prompts
@@ -1706,6 +1730,8 @@ def main():
             show_boxes=args.show_boxes if args.task == "segment" else True,
             resolution=args.resolution,
             annotator_name=args.annotator,
+            opacity=args.opacity,
+            contour_thickness=args.contour_thickness,
         )
     elif args.task == "track":
         if args.video is None:
@@ -1723,6 +1749,8 @@ def main():
             resolution=args.resolution,
             annotator_name=args.annotator,
             backbone_every=args.backbone_every,
+            opacity=args.opacity,
+            contour_thickness=args.contour_thickness,
         )
     elif args.task == "realtime":
         track_video_realtime(
@@ -1736,6 +1764,8 @@ def main():
             resolution=args.resolution,
             bg_image=args.bg_image,
             annotator_name=args.annotator,
+            opacity=args.opacity,
+            contour_thickness=args.contour_thickness,
         )
 
 

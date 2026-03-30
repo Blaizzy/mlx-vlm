@@ -517,12 +517,10 @@ def track_video(
     resolution: int = 1008,
     annotator_name: Optional[str] = None,
     backbone_every: int = 1,
+    opacity: float = 0.6,
+    contour_thickness: int = 2,
 ):
-    """Track objects in a video file using SAM 3.1.
-
-    Uses backbone caching: fresh ViT every backbone_every frames,
-    DETR decoder runs every frame for real detections.
-    """
+    """Track objects in a video file using SAM 3.1."""
     import cv2
 
     from mlx_vlm.models.sam3_1.processing_sam3_1 import Sam31Processor
@@ -578,7 +576,9 @@ def track_video(
 
     id_tracker = SimpleTracker()
     if annotator_name:
-        ann = build_annotator(annotator_name)
+        ann = build_annotator(
+            annotator_name, opacity=opacity, contour_thickness=contour_thickness
+        )
     else:
         ann = None
 
@@ -661,6 +661,8 @@ def track_video_realtime(
     recompute_backbone_every: int = 30,
     update_memory_every: int = 3,
     annotator_name: Optional[str] = None,
+    opacity: float = 0.6,
+    contour_thickness: int = 2,
 ):
     """Optimized realtime tracking with backbone caching + tracker propagation.
 
@@ -1011,6 +1013,15 @@ def main():
         default=None,
         help="Annotation style preset or chain (e.g. mask+box, halo, BoxCornerAnnotator+LabelAnnotator)",
     )
+    parser.add_argument(
+        "--opacity", type=float, default=0.6, help="Mask opacity (default: 0.6)"
+    )
+    parser.add_argument(
+        "--contour-thickness",
+        type=int,
+        default=2,
+        help="Mask contour thickness (default: 2)",
+    )
     args = parser.parse_args()
 
     if args.task in ("track", "realtime"):
@@ -1029,6 +1040,8 @@ def main():
                 resolution=args.resolution,
                 annotator_name=args.annotator,
                 backbone_every=args.backbone_every,
+                opacity=args.opacity,
+                contour_thickness=args.contour_thickness,
             )
         else:
             track_video_realtime(
@@ -1045,6 +1058,8 @@ def main():
                 recompute_backbone_every=args.backbone_every,
                 update_memory_every=args.memory_every,
                 annotator_name=args.annotator,
+                opacity=args.opacity,
+                contour_thickness=args.contour_thickness,
             )
     else:
         run_image(
@@ -1057,6 +1072,8 @@ def main():
             boxes=args.boxes,
             show_boxes=args.show_boxes,
             annotator_name=args.annotator,
+            opacity=args.opacity,
+            contour_thickness=args.contour_thickness,
         )
 
 
