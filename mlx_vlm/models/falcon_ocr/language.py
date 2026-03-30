@@ -383,7 +383,9 @@ class LanguageModel(nn.Module):
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return LanguageModelOutput(logits=out.astype(self.model.embed_tokens.weight.dtype))
+        return LanguageModelOutput(
+            logits=out.astype(self.model.embed_tokens.weight.dtype)
+        )
 
     @property
     def layers(self):
