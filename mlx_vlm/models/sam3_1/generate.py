@@ -516,7 +516,7 @@ def track_video(
     show_boxes: bool = True,
     resolution: int = 1008,
     annotator_name: Optional[str] = None,
-    backbone_every: int = 3,
+    backbone_every: int = 1,
 ):
     """Track objects in a video file using SAM 3.1.
 

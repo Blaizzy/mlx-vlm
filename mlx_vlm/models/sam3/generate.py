@@ -1042,12 +1042,12 @@ def track_video(
     show_boxes: bool = True,
     resolution: int = 1008,
     annotator_name: Optional[str] = None,
-    backbone_every: int = 3,
+    backbone_every: int = 1,
 ):
     """Track objects in a video file.
 
-    Uses backbone caching: fresh ViT every backbone_every detection frames,
-    DETR decoder runs on every detection frame for real detections.
+    backbone_every=1 (default): fresh backbone every frame (best quality).
+    backbone_every=N: cache backbone for N frames (faster, slight quality loss).
     """
     import cv2
 
@@ -1684,8 +1684,8 @@ def main():
     parser.add_argument(
         "--backbone-every",
         type=int,
-        default=3,
-        help="Re-run ViT backbone every N detection frames for track/realtime (default: 3)",
+        default=1,
+        help="Re-run ViT backbone every N detection frames (default: 1, increase for speed)",
     )
     args = parser.parse_args()
 
