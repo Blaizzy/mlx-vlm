@@ -43,6 +43,13 @@ def _get_color(idx: int, colors: List[Tuple[int, int, int]]) -> Tuple[int, int, 
     return colors[idx % len(colors)]
 
 
+def _color_idx(result, i: int) -> int:
+    """Get stable color index: use track_ids if available, else detection index."""
+    if hasattr(result, "track_ids") and result.track_ids is not None:
+        return int(result.track_ids[i])
+    return i
+
+
 def _resize_mask(mask: np.ndarray, H: int, W: int) -> np.ndarray:
     if mask.shape[0] != H or mask.shape[1] != W:
         return cv2.resize(
@@ -90,7 +97,7 @@ class BoxAnnotator(BaseAnnotator):
         out = scene.copy()
         for i in range(len(result.scores)):
             x1, y1, x2, y2 = result.boxes[i].astype(int)
-            color = _get_color(i, self.colors)
+            color = _get_color(_color_idx(result, i), self.colors)
             cv2.rectangle(out, (x1, y1), (x2, y2), color, self.thickness)
         return out
 
@@ -109,7 +116,7 @@ class BoxCornerAnnotator(BaseAnnotator):
         t = self.thickness
         for i in range(len(result.scores)):
             x1, y1, x2, y2 = result.boxes[i].astype(int)
-            color = _get_color(i, self.colors)
+            color = _get_color(_color_idx(result, i), self.colors)
             # Top-left
             cv2.line(out, (x1, y1), (x1 + cl, y1), color, t)
             cv2.line(out, (x1, y1), (x1, y1 + cl), color, t)
@@ -139,7 +146,7 @@ class RoundBoxAnnotator(BaseAnnotator):
         t = self.thickness
         for i in range(len(result.scores)):
             x1, y1, x2, y2 = result.boxes[i].astype(int)
-            color = _get_color(i, self.colors)
+            color = _get_color(_color_idx(result, i), self.colors)
             # Edges
             cv2.line(out, (x1 + r, y1), (x2 - r, y1), color, t)
             cv2.line(out, (x1 + r, y2), (x2 - r, y2), color, t)
@@ -168,7 +175,9 @@ class MaskAnnotator(BaseAnnotator):
                 continue
             mask = _resize_mask(result.masks[i], H, W)
             binary = mask > 0
-            color = np.array(_get_color(i, self.colors), dtype=np.float32)
+            color = np.array(
+                _get_color(_color_idx(result, i), self.colors), dtype=np.float32
+            )
             out[binary] = (
                 out[binary].astype(np.float32) * (1 - self.opacity)
                 + color * self.opacity
@@ -188,7 +197,7 @@ class ColorAnnotator(BaseAnnotator):
         overlay = out.copy()
         for i in range(len(result.scores)):
             x1, y1, x2, y2 = result.boxes[i].astype(int)
-            color = _get_color(i, self.colors)
+            color = _get_color(_color_idx(result, i), self.colors)
             cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
         cv2.addWeighted(overlay, self.opacity, out, 1 - self.opacity, 0, out)
         return out
@@ -205,7 +214,7 @@ class EllipseAnnotator(BaseAnnotator):
         out = scene.copy()
         for i in range(len(result.scores)):
             x1, y1, x2, y2 = result.boxes[i].astype(int)
-            color = _get_color(i, self.colors)
+            color = _get_color(_color_idx(result, i), self.colors)
             cx = (x1 + x2) // 2
             w = (x2 - x1) // 2
             cv2.ellipse(
@@ -227,7 +236,7 @@ class CircleAnnotator(BaseAnnotator):
         for i in range(len(result.scores)):
             x1, y1, x2, y2 = result.boxes[i].astype(int)
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            color = _get_color(i, self.colors)
+            color = _get_color(_color_idx(result, i), self.colors)
             cv2.circle(out, (cx, cy), self.radius, color, self.thickness)
         return out
 
@@ -244,7 +253,7 @@ class DotAnnotator(BaseAnnotator):
         for i in range(len(result.scores)):
             x1, y1, x2, y2 = result.boxes[i].astype(int)
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            color = _get_color(i, self.colors)
+            color = _get_color(_color_idx(result, i), self.colors)
             cv2.circle(out, (cx, cy), self.radius, color, -1)
         return out
 
@@ -262,7 +271,7 @@ class TriangleAnnotator(BaseAnnotator):
         for i in range(len(result.scores)):
             x1, y1, x2, y2 = result.boxes[i].astype(int)
             cx = (x1 + x2) // 2
-            color = _get_color(i, self.colors)
+            color = _get_color(_color_idx(result, i), self.colors)
             pts = np.array([[cx, y1 - s], [cx - s, y1], [cx + s, y1]], dtype=np.int32)
             cv2.fillPoly(out, [pts], color)
         return out
@@ -294,7 +303,7 @@ class LabelAnnotator(BaseAnnotator):
                 label = f"{result.scores[i]:.2f}"
 
             x1, y1 = result.boxes[i][:2].astype(int)
-            color = _get_color(i, self.colors)
+            color = _get_color(_color_idx(result, i), self.colors)
             (tw, th), _ = cv2.getTextSize(
                 label, cv2.FONT_HERSHEY_SIMPLEX, self.font_scale, self.thickness
             )
@@ -326,7 +335,7 @@ class PercentageBarAnnotator(BaseAnnotator):
         out = scene.copy()
         for i in range(len(result.scores)):
             x1, y1, x2, y2 = result.boxes[i].astype(int)
-            color = _get_color(i, self.colors)
+            color = _get_color(_color_idx(result, i), self.colors)
             bar_y = max(y1 - self.height - 2, 0)
             bar_w = x2 - x1
             fill_w = int(bar_w * result.scores[i])
@@ -400,7 +409,9 @@ class HaloAnnotator(BaseAnnotator):
             binary = mask > 0
             blurred = cv2.GaussianBlur(mask.astype(np.float32), (k, k), 0)
             halo = (blurred > 0.01) & ~binary
-            color = np.array(_get_color(i, self.colors), dtype=np.float32)
+            color = np.array(
+                _get_color(_color_idx(result, i), self.colors), dtype=np.float32
+            )
             intensity = blurred[halo].clip(0, 1)
             out[halo] = (
                 out[halo].astype(np.float32) * (1 - intensity[:, None] * self.opacity)

@@ -15,6 +15,7 @@ from PIL import Image
 from ..sam3.generate import (
     DetectionResult,
     Sam3Predictor,
+    SimpleTracker,
     _filter_by_regions,
     _resize_masks,
     draw_frame,
@@ -754,6 +755,7 @@ def track_video_realtime(
         tracker_state = {"memory_bank": [], "n_objects": 0, "labels": []}
         inference_count = 0
         prop_count = 0
+        id_tracker = SimpleTracker()
 
         while running["active"]:
             # Grab the freshest frame directly (no queuing delay)
@@ -851,7 +853,7 @@ def track_video_realtime(
             ):
                 backbone_cache["features"] = _get_backbone_features(model, pixel_values)
 
-            # Store detection result — display thread renders per frame
+            result = id_tracker.update(result)
             with lock:
                 latest["result"] = result
                 latest["n_obj"] = len(result.scores)

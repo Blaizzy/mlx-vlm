@@ -30,6 +30,7 @@ class DetectionResult:
     masks: np.ndarray  # (N, H, W) binary masks
     scores: np.ndarray  # (N,) confidence scores
     labels: Optional[List[str]] = None
+    track_ids: Optional[np.ndarray] = None  # (N,) stable IDs for color consistency
 
 
 @dataclass
@@ -40,6 +41,74 @@ class TrackingResult:
     masks: np.ndarray  # (N_obj, H, W) binary masks
     scores: np.ndarray  # (N_obj,) confidence scores
     object_ids: List[int] = None
+
+
+class SimpleTracker:
+    """Assigns stable IDs to detections across frames using IoU matching."""
+
+    def __init__(self, iou_threshold: float = 0.3, max_lost: int = 5):
+        self.iou_threshold = iou_threshold
+        self.max_lost = max_lost
+        self._next_id = 0
+        self._tracks = {}  # id -> {"box": ndarray, "lost": int}
+
+    def update(self, result: DetectionResult) -> DetectionResult:
+        if len(result.scores) == 0:
+            for tid in list(self._tracks):
+                self._tracks[tid]["lost"] += 1
+                if self._tracks[tid]["lost"] > self.max_lost:
+                    del self._tracks[tid]
+            return result
+
+        new_boxes = result.boxes
+        track_ids = list(self._tracks.keys())
+        assigned = np.full(len(new_boxes), -1, dtype=int)
+
+        if track_ids:
+            old_boxes = np.stack([self._tracks[t]["box"] for t in track_ids])
+            ious = self._box_iou(new_boxes, old_boxes)
+
+            for _ in range(min(len(new_boxes), len(track_ids))):
+                i, j = np.unravel_index(np.argmax(ious), ious.shape)
+                if ious[i, j] < self.iou_threshold:
+                    break
+                assigned[i] = track_ids[j]
+                ious[i, :] = -1
+                ious[:, j] = -1
+
+        matched_track_ids = set(assigned[assigned >= 0])
+        for tid in track_ids:
+            if tid in matched_track_ids:
+                self._tracks[tid]["lost"] = 0
+            else:
+                self._tracks[tid]["lost"] += 1
+                if self._tracks[tid]["lost"] > self.max_lost:
+                    del self._tracks[tid]
+
+        ids = []
+        for i in range(len(new_boxes)):
+            if assigned[i] >= 0:
+                tid = int(assigned[i])
+            else:
+                tid = self._next_id
+                self._next_id += 1
+            self._tracks[tid] = {"box": new_boxes[i], "lost": 0}
+            ids.append(tid)
+
+        result.track_ids = np.array(ids)
+        return result
+
+    @staticmethod
+    def _box_iou(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        x1 = np.maximum(a[:, None, 0], b[None, :, 0])
+        y1 = np.maximum(a[:, None, 1], b[None, :, 1])
+        x2 = np.minimum(a[:, None, 2], b[None, :, 2])
+        y2 = np.minimum(a[:, None, 3], b[None, :, 3])
+        inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+        a_area = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+        b_area = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+        union = a_area[:, None] + b_area[None, :] - inter
+        return inter / (union + 1e-6)
 
 
 class Sam3Predictor:
@@ -1209,6 +1278,7 @@ def track_video_realtime(
         backbone_cache = {"features": None, "frame_idx": -1}
         encoder_cache = {}
         inference_count = 0
+        id_tracker = SimpleTracker()
 
         while running["active"]:
             with lock:
@@ -1254,6 +1324,7 @@ def track_video_realtime(
 
             dt = time.perf_counter() - t0
 
+            result = id_tracker.update(result)
             with lock:
                 latest["result"] = result
                 latest["n_obj"] = len(result.scores)
