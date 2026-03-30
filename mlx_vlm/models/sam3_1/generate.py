@@ -571,6 +571,8 @@ def track_video(
         labels=[],
     )
 
+    id_tracker = SimpleTracker()
+
     for fi in range(total_frames):
         ret, frame_bgr = cap.read()
         if not ret:
@@ -581,7 +583,7 @@ def track_video(
             result = predict_multi(predictor, frame_pil, prompts)
             if box_array is not None and len(result.scores) > 0:
                 result = _filter_by_regions(result, box_array)
-            latest_result = result
+            latest_result = id_tracker.update(result)
 
             if fi % 40 == 0:
                 print(
