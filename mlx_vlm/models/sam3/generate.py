@@ -30,6 +30,7 @@ class DetectionResult:
     masks: np.ndarray  # (N, H, W) binary masks
     scores: np.ndarray  # (N,) confidence scores
     labels: Optional[List[str]] = None
+    track_ids: Optional[np.ndarray] = None  # (N,) stable IDs for color consistency
 
 
 @dataclass
@@ -42,9 +43,72 @@ class TrackingResult:
     object_ids: List[int] = None
 
 
-# ---------------------------------------------------------------------------
-# Image Predictor
-# ---------------------------------------------------------------------------
+class SimpleTracker:
+    """Assigns stable IDs to detections across frames using IoU matching."""
+
+    def __init__(self, iou_threshold: float = 0.3, max_lost: int = 10):
+        self.iou_threshold = iou_threshold
+        self.max_lost = max_lost
+        self._next_id = 0
+        self._tracks = {}  # id -> {"box": ndarray, "lost": int}
+
+    def update(self, result: DetectionResult) -> DetectionResult:
+        if len(result.scores) == 0:
+            for tid in list(self._tracks):
+                self._tracks[tid]["lost"] += 1
+                if self._tracks[tid]["lost"] > self.max_lost:
+                    del self._tracks[tid]
+            return result
+
+        new_boxes = result.boxes
+        track_ids = list(self._tracks.keys())
+        assigned = np.full(len(new_boxes), -1, dtype=int)
+
+        if track_ids:
+            old_boxes = np.stack([self._tracks[t]["box"] for t in track_ids])
+            ious = self._box_iou(new_boxes, old_boxes)
+
+            for _ in range(min(len(new_boxes), len(track_ids))):
+                i, j = np.unravel_index(np.argmax(ious), ious.shape)
+                if ious[i, j] < self.iou_threshold:
+                    break
+                assigned[i] = track_ids[j]
+                ious[i, :] = -1
+                ious[:, j] = -1
+
+        matched_track_ids = set(assigned[assigned >= 0])
+        for tid in track_ids:
+            if tid in matched_track_ids:
+                self._tracks[tid]["lost"] = 0
+            else:
+                self._tracks[tid]["lost"] += 1
+                if self._tracks[tid]["lost"] > self.max_lost:
+                    del self._tracks[tid]
+
+        ids = []
+        for i in range(len(new_boxes)):
+            if assigned[i] >= 0:
+                tid = int(assigned[i])
+            else:
+                tid = self._next_id
+                self._next_id += 1
+            self._tracks[tid] = {"box": new_boxes[i], "lost": 0}
+            ids.append(tid)
+
+        result.track_ids = np.array(ids)
+        return result
+
+    @staticmethod
+    def _box_iou(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        x1 = np.maximum(a[:, None, 0], b[None, :, 0])
+        y1 = np.maximum(a[:, None, 1], b[None, :, 1])
+        x2 = np.minimum(a[:, None, 2], b[None, :, 2])
+        y2 = np.minimum(a[:, None, 3], b[None, :, 3])
+        inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+        a_area = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+        b_area = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+        union = a_area[:, None] + b_area[None, :] - inter
+        return inter / (union + 1e-6)
 
 
 class Sam3Predictor:
@@ -288,9 +352,141 @@ def predict_multi(
     )
 
 
-# ---------------------------------------------------------------------------
-# Video Predictor
-# ---------------------------------------------------------------------------
+def _get_backbone_features(model, pixel_values: mx.array) -> mx.array:
+    """Run ViT backbone only (no FPN neck)."""
+    features = model.detector_model.vision_encoder.backbone(pixel_values)
+    mx.eval(features)
+    return features
+
+
+def _get_det_features(model, backbone_features: mx.array):
+    """Run FPN neck + flatten for DETR. Returns (src, pos_flat, fpn_trimmed, spatial)."""
+    det = model.detector_model
+    fpn_features = det.vision_encoder.neck(backbone_features)
+    fpn_pos = [det._pos_enc(feat) for feat in fpn_features]
+    fpn_trimmed = fpn_features[:-1]
+
+    encoder_feat = fpn_trimmed[-1]
+    B, H_f, W_f, D = encoder_feat.shape
+    src = encoder_feat.reshape(B, H_f * W_f, D)
+    pos_flat = fpn_pos[:-1][-1].reshape(B, H_f * W_f, D)
+    mx.eval(src, pos_flat)
+    return src, pos_flat, fpn_trimmed, (H_f, W_f)
+
+
+def _detect_with_backbone(
+    predictor: Sam3Predictor,
+    backbone_features: mx.array,
+    prompts: List[str],
+    image_size,
+    threshold: float,
+    encoder_cache: Optional[Dict] = None,
+) -> DetectionResult:
+    """Run detection on pre-computed backbone features.
+
+    With encoder_cache: skips DETR encoder when backbone + text are unchanged.
+    All scoring stays in MLX until final conversion.
+    """
+    det = predictor.model.detector_model
+    src, pos_flat, fpn_trimmed, spatial = _get_det_features(
+        predictor.model, backbone_features
+    )
+    H_f, W_f = spatial
+
+    W, H = (
+        image_size if isinstance(image_size, tuple) else (image_size[1], image_size[0])
+    )
+    all_boxes, all_masks, all_scores, all_labels = [], [], [], []
+    for prompt in prompts:
+        inputs_embeds, attention_mask = predictor._get_input_embeddings(prompt)
+
+        # DETR encoder — use cache if available (caller controls invalidation)
+        cached = encoder_cache.get(prompt) if encoder_cache is not None else None
+        if cached is not None:
+            encoded = cached["encoded"]
+        else:
+            encoded = det.detr_encoder(src, pos_flat, inputs_embeds, attention_mask)
+            mx.eval(encoded)
+            if encoder_cache is not None:
+                encoder_cache[prompt] = {"encoded": encoded}
+
+        hs, ref_boxes, presence_logits = det.detr_decoder(
+            vision_features=encoded,
+            inputs_embeds=inputs_embeds,
+            vision_pos_encoding=pos_flat,
+            text_mask=attention_mask,
+            spatial_shape=(H_f, W_f),
+        )
+
+        # Box conversion + scoring in MLX
+        pred_boxes_cxcywh = ref_boxes[-1]
+        cx, cy, w, h = (
+            pred_boxes_cxcywh[..., 0],
+            pred_boxes_cxcywh[..., 1],
+            pred_boxes_cxcywh[..., 2],
+            pred_boxes_cxcywh[..., 3],
+        )
+        pred_boxes_xyxy = mx.stack(
+            [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=-1
+        )
+
+        all_logits = det.dot_product_scoring(hs, inputs_embeds, attention_mask)
+        pred_logits = all_logits[-1].squeeze(-1)
+        presence = presence_logits[-1]
+
+        last_hs = hs[-1]
+        seg_out = det.mask_decoder(
+            last_hs,
+            list(fpn_trimmed),
+            encoder_hidden_states=encoded,
+            prompt_features=inputs_embeds,
+            prompt_mask=attention_mask,
+        )
+
+        # Single eval, scoring in MLX
+        scores = mx.sigmoid(pred_logits[0].squeeze())
+        if presence is not None:
+            scores = scores * mx.sigmoid(presence[0])
+        boxes = pred_boxes_xyxy[0] * mx.array([W, H, W, H], dtype=pred_boxes_xyxy.dtype)
+        boxes = mx.clip(boxes, 0, max(H, W))
+
+        mx.eval(scores, boxes, seg_out)
+
+        # Single numpy conversion
+        scores_np = np.array(scores)
+        keep = scores_np > threshold
+        if not keep.any():
+            continue
+
+        boxes_np = np.array(boxes)[keep]
+        masks_np = np.array(seg_out["pred_masks"][0])[keep]
+        masks_resized = _resize_masks(masks_np, (H, W))
+        masks_binary = (masks_resized > 0).astype(np.uint8)
+
+        result = DetectionResult(
+            boxes=boxes_np, masks=masks_binary, scores=scores_np[keep]
+        )
+        if len(result.scores) > 0:
+            result = nms(result)
+            all_boxes.append(result.boxes)
+            all_masks.append(result.masks)
+            all_scores.append(result.scores)
+            all_labels.extend([prompt] * len(result.scores))
+
+    if not all_scores:
+        return DetectionResult(
+            boxes=np.zeros((0, 4)),
+            masks=np.zeros((0, H, W), dtype=np.uint8),
+            scores=np.zeros((0,)),
+            labels=[],
+        )
+
+    return DetectionResult(
+        boxes=np.concatenate(all_boxes),
+        masks=np.concatenate(all_masks),
+        scores=np.concatenate(all_scores),
+        labels=all_labels,
+    )
 
 
 class Sam3VideoPredictor:
@@ -608,11 +804,6 @@ class Sam3VideoPredictor:
             self._memory_bank[obj_id] = self._memory_bank[obj_id][-max_mem:]
 
 
-# ---------------------------------------------------------------------------
-# Utility Functions
-# ---------------------------------------------------------------------------
-
-
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1 / (1 + np.exp(-x))
 
@@ -728,11 +919,6 @@ def _resize_masks(masks: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray
     return np.stack(resized) if resized else np.zeros((0, H, W))
 
 
-# ---------------------------------------------------------------------------
-# NMS (public API)
-# ---------------------------------------------------------------------------
-
-
 def nms(result: DetectionResult, iou_thresh: float = 0.5) -> DetectionResult:
     """Remove duplicate detections via Non-Maximum Suppression."""
     if len(result.scores) == 0:
@@ -763,10 +949,6 @@ def nms(result: DetectionResult, iou_thresh: float = 0.5) -> DetectionResult:
         labels=labels,
     )
 
-
-# ---------------------------------------------------------------------------
-# Video Tracking CLI
-# ---------------------------------------------------------------------------
 
 COLORS_BGR = [
     (181, 120, 31),
@@ -859,20 +1041,12 @@ def track_video(
     boxes: Optional[str] = None,
     show_boxes: bool = True,
     resolution: int = 1008,
+    annotator_name: Optional[str] = None,
+    backbone_every: int = 1,
+    opacity: float = 0.6,
+    contour_thickness: int = 2,
 ):
-    """Track objects in a video file.
-
-    Args:
-        video_path: Input video path
-        prompt: Text prompt for detection
-        output: Output video path (default: <input>_tracked.mp4)
-        model_path: Model path or HF repo
-        threshold: Detection score threshold
-        nms_thresh: NMS IoU threshold
-        every: Run detection every N frames
-        boxes: Box prompts as "x1,y1,x2,y2" or "x1,y1,x2,y2;..." in pixel coords
-        show_boxes: Draw bounding boxes and labels on output
-    """
+    """Track objects in a video file."""
     import cv2
 
     from mlx_vlm.models.sam3.processing_sam3 import Sam3Processor
@@ -927,6 +1101,14 @@ def track_video(
         labels=[],
     )
 
+    id_tracker = SimpleTracker()
+    backbone_cache = None
+    encoder_cache = {}
+    detect_count = 0
+    import time as _time
+
+    t_start = _time.perf_counter()
+
     for fi in range(total_frames):
         ret, frame_bgr = cap.read()
         if not ret:
@@ -934,27 +1116,51 @@ def track_video(
 
         if fi % every == 0:
             frame_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-            result = predict_multi(predictor, frame_pil, prompts)
+            inputs = predictor.processor.preprocess_image(frame_pil)
+            pixel_values = mx.array(inputs["pixel_values"])
+
+            if detect_count % backbone_every == 0 or backbone_cache is None:
+                backbone_cache = _get_backbone_features(model, pixel_values)
+                encoder_cache.clear()
+
+            result = _detect_with_backbone(
+                predictor,
+                backbone_cache,
+                prompts,
+                frame_pil.size,
+                threshold,
+                encoder_cache=encoder_cache,
+            )
             if box_array is not None and len(result.scores) > 0:
                 result = _filter_by_regions(result, box_array)
-            latest_result = result
+            latest_result = id_tracker.update(result)
+            detect_count += 1
 
             if fi % 40 == 0:
+                elapsed = _time.perf_counter() - t_start
+                fps_actual = (fi + 1) / elapsed if elapsed > 0 else 0
                 print(
-                    f"  Frame {fi}/{total_frames}: {len(latest_result.scores)} detections"
+                    f"  Frame {fi}/{total_frames}: {len(latest_result.scores)} det, "
+                    f"{fps_actual:.1f} fps"
                 )
 
-        out = draw_frame(
-            frame_bgr,
-            latest_result.masks,
-            latest_result.scores,
-            latest_result.boxes,
-            prompt_str,
-            H,
-            W,
-            show_boxes=show_boxes,
-            labels=latest_result.labels,
-        )
+        if annotator_name and len(latest_result.scores) > 0:
+            ann = build_annotator(
+                annotator_name, opacity=opacity, contour_thickness=contour_thickness
+            )
+            out = ann.annotate(frame_bgr, latest_result)
+        else:
+            out = draw_frame(
+                frame_bgr,
+                latest_result.masks,
+                latest_result.scores,
+                latest_result.boxes,
+                prompt_str,
+                H,
+                W,
+                show_boxes=show_boxes,
+                labels=latest_result.labels,
+            )
         writer.write(out)
 
     writer.release()
@@ -972,21 +1178,15 @@ def track_video_realtime(
     show_boxes: bool = True,
     resolution: int = 1008,
     bg_image: Optional[str] = None,
+    recompute_backbone_every: int = 5,
+    annotator_name: Optional[str] = None,
+    opacity: float = 0.6,
+    contour_thickness: int = 2,
 ):
     """Track objects in a video with a real-time preview window.
 
-    Inference runs in a background thread (~1 FPS). The display loop runs
-    at the video's native FPS, reusing the latest detection until a new
-    one is ready. Press 'q' to quit.
-
-    Args:
-        video_path: Input video path (or 0 for webcam)
-        prompt: Text prompt for detection
-        model_path: Model path or HF repo
-        threshold: Detection score threshold
-        nms_thresh: NMS IoU threshold
-        boxes: Box prompts as "x1,y1,x2,y2" or "..." for region filtering
-        show_boxes: Draw bounding boxes on output
+    Optimized with backbone caching, DETR encoder caching, and fast overlay.
+    Press 'q' to quit.
     """
     import threading
     import time
@@ -1045,14 +1245,18 @@ def track_video_realtime(
 
     # Shared state
     lock = threading.Lock()
+    empty_result = DetectionResult(
+        boxes=np.zeros((0, 4)),
+        masks=np.zeros((0, H, W), dtype=np.uint8),
+        scores=np.zeros((0,)),
+        labels=[],
+    )
     latest = {
-        "overlay_scaled": np.zeros((H, W, 3), dtype=np.uint8),
-        "fg_mask": None,  # (H, W) uint8 foreground mask for bg swap
-        "has_detections": False,
+        "result": empty_result,
         "n_obj": 0,
         "fps": 0.0,
     }
-    pending_frame = {"pil": None}
+    latest_frame = {"bgr": None}
     running = {"active": True}
 
     # --- Thread 1: Read frames into ring buffer ---
@@ -1077,7 +1281,9 @@ def track_video_realtime(
                 next_frame_time = time.perf_counter()
                 continue
 
-            # For camera: drop oldest to always show latest frame
+            with lock:
+                latest_frame["bgr"] = frame
+
             if frame_buffer.full():
                 try:
                     frame_buffer.get_nowait()
@@ -1088,109 +1294,64 @@ def track_video_realtime(
             if not is_camera:
                 next_frame_time += frame_interval
 
-    # --- Thread 2: Run inference on latest frame ---
+    # --- Thread 2: Optimized inference (backbone + encoder caching, fast overlay) ---
     def inference_loop():
+        backbone_cache = {"features": None, "frame_idx": -1}
+        encoder_cache = {}
+        inference_count = 0
+        id_tracker = SimpleTracker()
+
         while running["active"]:
             with lock:
-                frame_pil = pending_frame["pil"]
+                latest_bgr = latest_frame["bgr"]
+                latest_frame["bgr"] = None
 
-            if frame_pil is None:
+            if latest_bgr is None:
                 time.sleep(0.005)
                 continue
 
             t0 = time.perf_counter()
-            result = predict_multi(predictor, frame_pil, prompts)
-            dt = time.perf_counter() - t0
+            frame_pil = Image.fromarray(cv2.cvtColor(latest_bgr, cv2.COLOR_BGR2RGB))
+            image_size = frame_pil.size
 
+            inputs = predictor.processor.preprocess_image(frame_pil)
+            pixel_values = mx.array(inputs["pixel_values"])
+
+            # Backbone (cached or fresh)
+            need_backbone = (
+                inference_count % recompute_backbone_every == 0
+                or backbone_cache["features"] is None
+            )
+            if need_backbone:
+                backbone_features = _get_backbone_features(model, pixel_values)
+                backbone_cache["features"] = backbone_features
+                encoder_cache.clear()
+            else:
+                backbone_features = backbone_cache["features"]
+
+            # Detection with cached backbone + encoder
+            result = _detect_with_backbone(
+                predictor,
+                backbone_features,
+                prompts,
+                image_size,
+                threshold,
+                encoder_cache=encoder_cache,
+            )
             if len(result.scores) > 0:
                 result = nms(result, nms_thresh)
                 if box_array is not None:
                     result = _filter_by_regions(result, box_array)
 
-            # Pre-render overlay once per detection
-            overlay = np.zeros((H, W, 3), dtype=np.uint8)
-            if len(result.scores) > 0:
-                for i in range(len(result.scores)):
-                    color = COLORS_BGR[i % len(COLORS_BGR)]
-                    mask = result.masks[i]
-                    if mask.shape[0] != H or mask.shape[1] != W:
-                        mask = cv2.resize(
-                            mask.astype(np.float32),
-                            (W, H),
-                            interpolation=cv2.INTER_LINEAR,
-                        )
-                    binary = mask > 0
-                    for c in range(3):
-                        overlay[:, :, c] = np.where(binary, color[c], overlay[:, :, c])
-                    contours, _ = cv2.findContours(
-                        binary.astype(np.uint8),
-                        cv2.RETR_EXTERNAL,
-                        cv2.CHAIN_APPROX_SIMPLE,
-                    )
-                    cv2.drawContours(overlay, contours, -1, color, 2)
+            dt = time.perf_counter() - t0
 
-                    # Label (always shown)
-                    lbl = (
-                        result.labels[i]
-                        if result.labels and i < len(result.labels)
-                        else prompt_str
-                    )
-                    label = f"{lbl} {result.scores[i]:.2f}"
-
-                    if show_boxes:
-                        x1, y1, x2, y2 = result.boxes[i].astype(int)
-                        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-                        lx, ly = x1, max(y1 - 8, 12)
-                    else:
-                        ys, xs = np.where(binary)
-                        if len(ys) > 0:
-                            lx, ly = int(xs.min()), max(int(ys.min()) - 8, 12)
-                        else:
-                            lx, ly = 10, 30
-
-                    (tw, th), _ = cv2.getTextSize(
-                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
-                    )
-                    cv2.rectangle(
-                        overlay,
-                        (lx, max(ly - th - 6, 0)),
-                        (lx + tw + 6, ly + 4),
-                        color,
-                        -1,
-                    )
-                    cv2.putText(
-                        overlay,
-                        label,
-                        (lx + 3, ly),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 255, 255),
-                        2,
-                    )
-
-            scaled = (overlay.astype(np.uint16) * 115 >> 8).astype(np.uint8)
-
-            # Build combined foreground mask for bg swap
-            fg_mask = None
-            if bg_frame is not None and len(result.scores) > 0:
-                fg_mask = np.zeros((H, W), dtype=np.uint8)
-                for i in range(len(result.scores)):
-                    mask = result.masks[i]
-                    if mask.shape[0] != H or mask.shape[1] != W:
-                        mask = cv2.resize(
-                            mask.astype(np.float32),
-                            (W, H),
-                            interpolation=cv2.INTER_LINEAR,
-                        )
-                    fg_mask = np.maximum(fg_mask, (mask > 0).astype(np.uint8))
-
+            result = id_tracker.update(result)
             with lock:
-                latest["overlay_scaled"] = scaled
-                latest["fg_mask"] = fg_mask
-                latest["has_detections"] = len(result.scores) > 0
+                latest["result"] = result
                 latest["n_obj"] = len(result.scores)
                 latest["fps"] = 1.0 / max(dt, 1e-6)
-                pending_frame["pil"] = None
+
+            inference_count += 1
 
     # Start threads
     reader_thread = threading.Thread(target=reader_loop, daemon=True)
@@ -1202,33 +1363,32 @@ def track_video_realtime(
     display_fps_t0 = time.perf_counter()
     display_fps_val = 0.0
 
+    if annotator_name:
+        display_ann = build_annotator(
+            annotator_name, opacity=opacity, contour_thickness=contour_thickness
+        )
+    else:
+        from mlx_vlm.models.sam3.annotators import (
+            BoxAnnotator,
+            LabelAnnotator,
+            MaskAnnotator,
+        )
+
+        display_ann = MaskAnnotator() + BoxAnnotator() + LabelAnnotator()
+
     while True:
-        # Get frame from buffer (non-blocking)
         try:
             frame_bgr = frame_buffer.get(timeout=0.05)
         except queue.Empty:
             continue
 
-        # Submit for inference if idle
         with lock:
-            if pending_frame["pil"] is None:
-                pending_frame["pil"] = Image.fromarray(
-                    cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                )
-
-        with lock:
-            overlay_scaled = latest["overlay_scaled"]
-            fg_mask = latest["fg_mask"]
-            has_det = latest["has_detections"]
+            result = latest["result"]
             det_fps = latest["fps"]
             n_obj = latest["n_obj"]
 
-        if bg_frame is not None and fg_mask is not None:
-            # Background swap: keep foreground from video, background from bg_image
-            fg_mask_3d = fg_mask[:, :, None]  # (H, W, 1)
-            out = np.where(fg_mask_3d, frame_bgr, bg_frame)
-        elif has_det:
-            out = cv2.add(frame_bgr, overlay_scaled)
+        if len(result.scores) > 0:
+            out = display_ann.annotate(frame_bgr.copy(), result)
         else:
             out = frame_bgr
 
@@ -1261,11 +1421,6 @@ def track_video_realtime(
     cap.release()
     cv2.destroyAllWindows()
     print("Done")
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
 
 
 def _load_predictor(model_path, threshold, resolution=1008):
@@ -1313,6 +1468,55 @@ def _draw_boxes_only(frame_bgr, scores, boxes, prompt, H, W):
     return out
 
 
+ANNOTATOR_PRESETS = {
+    "box": "BoxAnnotator+LabelAnnotator",
+    "corner": "BoxCornerAnnotator+LabelAnnotator",
+    "round": "RoundBoxAnnotator+LabelAnnotator",
+    "mask": "MaskAnnotator+LabelAnnotator",
+    "mask+box": "MaskAnnotator+BoxAnnotator+LabelAnnotator",
+    "halo": "HaloAnnotator+LabelAnnotator",
+    "halo+box": "HaloAnnotator+BoxAnnotator+LabelAnnotator",
+    "color": "ColorAnnotator+LabelAnnotator",
+    "ellipse": "EllipseAnnotator+LabelAnnotator",
+    "triangle": "TriangleAnnotator+LabelAnnotator",
+    "dot": "DotAnnotator+LabelAnnotator",
+    "circle": "CircleAnnotator+LabelAnnotator",
+    "bar": "PercentageBarAnnotator+BoxAnnotator",
+    "blur": "BlurAnnotator",
+    "pixelate": "PixelateAnnotator",
+    "background": "BackgroundOverlayAnnotator+LabelAnnotator",
+}
+
+
+def build_annotator(name: str, opacity: float = 0.6, contour_thickness: int = 2):
+    """Build an annotator from a preset name or explicit chain.
+
+    Examples:
+        build_annotator("mask+box")
+        build_annotator("halo", opacity=0.8, contour_thickness=3)
+    """
+    from mlx_vlm.models.sam3 import annotators as ann_module
+
+    spec = ANNOTATOR_PRESETS.get(name, name)
+    parts = [p.strip() for p in spec.split("+")]
+    chain = None
+    for part in parts:
+        cls = getattr(ann_module, part, None)
+        if cls is None:
+            raise ValueError(
+                f"Unknown annotator: {part}. "
+                f"Presets: {list(ANNOTATOR_PRESETS.keys())}"
+            )
+        kwargs = {}
+        if hasattr(cls, "opacity"):
+            kwargs["opacity"] = opacity
+        if hasattr(cls, "contour_thickness"):
+            kwargs["contour_thickness"] = contour_thickness
+        a = cls(**kwargs)
+        chain = a if chain is None else chain + a
+    return chain
+
+
 def _parse_boxes(boxes_str: Optional[str]) -> Optional[np.ndarray]:
     """Parse box string 'x1,y1,x2,y2;...' into numpy array."""
     if boxes_str is None:
@@ -1336,6 +1540,9 @@ def run_image(
     boxes: Optional[str] = None,
     show_boxes: bool = True,
     resolution: int = 1008,
+    annotator_name: Optional[str] = None,
+    opacity: float = 0.6,
+    contour_thickness: int = 2,
 ):
     """Run detection or segmentation on an image."""
     import cv2
@@ -1368,7 +1575,12 @@ def run_image(
 
     frame_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
     prompt_str = " + ".join(prompts)
-    if task == "detect":
+    if annotator_name:
+        ann = build_annotator(
+            annotator_name, opacity=opacity, contour_thickness=contour_thickness
+        )
+        out = ann.annotate(frame_bgr, result)
+    elif task == "detect":
         out = _draw_boxes_only(frame_bgr, result.scores, result.boxes, prompt_str, H, W)
     else:
         out = draw_frame(
@@ -1452,14 +1664,14 @@ def main():
     parser.add_argument(
         "--threshold",
         type=float,
-        default=None,
+        default=0.5,
         help="Score threshold (default: 0.3 image, 0.15 video)",
     )
     parser.add_argument(
         "--nms-thresh", type=float, default=0.5, help="NMS IoU threshold"
     )
     parser.add_argument(
-        "--every", type=int, default=2, help="Detect every N frames (track only)"
+        "--every", type=int, default=1, help="Detect every N frames (track only)"
     )
     parser.add_argument(
         "--resolution",
@@ -1471,6 +1683,33 @@ def main():
         "--bg-image",
         default=None,
         help="Background image for realtime bg swap (replaces area outside detected objects)",
+    )
+    parser.add_argument(
+        "--annotator",
+        default=None,
+        help=(
+            "Annotation style. Presets: "
+            + ", ".join(ANNOTATOR_PRESETS.keys())
+            + ". Or chain: BoxAnnotator+LabelAnnotator"
+        ),
+    )
+    parser.add_argument(
+        "--backbone-every",
+        type=int,
+        default=1,
+        help="Re-run ViT backbone every N detection frames (default: 1, increase for speed)",
+    )
+    parser.add_argument(
+        "--opacity",
+        type=float,
+        default=0.5,
+        help="Mask/overlay opacity (default: 0.5)",
+    )
+    parser.add_argument(
+        "--contour-thickness",
+        type=int,
+        default=1,
+        help="Mask contour thickness, 0 to disable (default: 1)",
     )
     args = parser.parse_args()
 
@@ -1490,6 +1729,9 @@ def main():
             boxes=args.boxes,
             show_boxes=args.show_boxes if args.task == "segment" else True,
             resolution=args.resolution,
+            annotator_name=args.annotator,
+            opacity=args.opacity,
+            contour_thickness=args.contour_thickness,
         )
     elif args.task == "track":
         if args.video is None:
@@ -1505,6 +1747,10 @@ def main():
             boxes=args.boxes,
             show_boxes=args.show_boxes,
             resolution=args.resolution,
+            annotator_name=args.annotator,
+            backbone_every=args.backbone_every,
+            opacity=args.opacity,
+            contour_thickness=args.contour_thickness,
         )
     elif args.task == "realtime":
         track_video_realtime(
@@ -1517,6 +1763,9 @@ def main():
             show_boxes=args.show_boxes,
             resolution=args.resolution,
             bg_image=args.bg_image,
+            annotator_name=args.annotator,
+            opacity=args.opacity,
+            contour_thickness=args.contour_thickness,
         )
 
 
