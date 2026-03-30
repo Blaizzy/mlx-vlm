@@ -1004,7 +1004,7 @@ def main():
     parser.add_argument("--prompt", nargs="+", required=True)
     parser.add_argument("--model", default="facebook/sam3.1")
     parser.add_argument("--output", type=str)
-    parser.add_argument("--threshold", type=float, default=0.3)
+    parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--nms-thresh", type=float, default=0.5)
     parser.add_argument("--every", type=int, default=2)
     parser.add_argument("--boxes", type=str)
