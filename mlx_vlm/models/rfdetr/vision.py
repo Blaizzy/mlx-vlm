@@ -229,11 +229,14 @@ class DINOv2Backbone(nn.Module):
     def __init__(self, config: DINOv2Config):
         super().__init__()
         self.config = config
-        self.num_windows = 4  # RF-DETR default for base/small
-        # Windowed layers = all layers NOT in out_feature_indexes
-        self.window_block_indexes = set(
-            i for i in range(config.num_hidden_layers) if i not in config.out_feature_indexes
-        )
+        self.num_windows = 4  # Overridden by Model.__init__
+        # Windowed layers from config, or derive from out_feature_indexes
+        if config.window_block_indexes is not None:
+            self.window_block_indexes = set(config.window_block_indexes)
+        else:
+            self.window_block_indexes = set(
+                i for i in range(config.num_hidden_layers) if i not in config.out_feature_indexes
+            )
         self.embeddings = DINOv2Embeddings(config)
         self.encoder = DINOv2Encoder(config)
         self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -306,7 +309,7 @@ class ConvBN(nn.Module):
 
 
 class Bottleneck(nn.Module):
-    """Bottleneck block with two 3x3 convolutions and residual connection."""
+    """Bottleneck block with two 3x3 convolutions. No residual (shortcut=False in RF-DETR)."""
 
     def __init__(self, channels: int):
         super().__init__()
@@ -314,7 +317,7 @@ class Bottleneck(nn.Module):
         self.cv2 = ConvBN(channels, channels, kernel_size=3, padding=1)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return x + self.cv2(self.cv1(x))
+        return self.cv2(self.cv1(x))
 
 
 class C2f(nn.Module):

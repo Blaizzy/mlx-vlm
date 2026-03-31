@@ -195,7 +195,7 @@ def _box_iou(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
 
 
 def _resize_masks(masks: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
-    """Resize mask logits to target size and binarize.
+    """Resize mask logits to target size and binarize with smooth edges.
 
     Args:
         masks: (N, mH, mW) mask logits
@@ -208,8 +208,8 @@ def _resize_masks(masks: np.ndarray, target_h: int, target_w: int) -> np.ndarray
     N = masks.shape[0]
     out = np.empty((N, target_h, target_w), dtype=np.uint8)
     for i in range(N):
-        # cv2.resize is C-optimized, ~100x faster than numpy bilinear
-        resized = cv2.resize(masks[i], (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        # Cubic interpolation for smoother upscale of logits
+        resized = cv2.resize(masks[i], (target_w, target_h), interpolation=cv2.INTER_CUBIC)
         out[i] = (resized > 0).astype(np.uint8)
     return out
 

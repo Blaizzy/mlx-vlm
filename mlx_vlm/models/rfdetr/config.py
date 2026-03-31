@@ -23,6 +23,7 @@ class DINOv2Config(BaseModelConfig):
     out_feature_indexes: List[int] = field(
         default_factory=lambda: [2, 5, 8, 11]
     )
+    window_block_indexes: Optional[List[int]] = None
 
 
 @dataclass
@@ -102,17 +103,31 @@ class ModelConfig(BaseModelConfig):
         }
         encoder_params = dinov2_sizes.get(self.encoder, dinov2_sizes["dinov2_windowed_small"])
 
-        # Normalize out_feature_indexes to 0-indexed layer indices
-        # HF convention uses 1-indexed (stage3=after layer 2), detect uses 0-indexed
-        num_layers = 12  # DINOv2 small/base
-        if any(idx >= num_layers for idx in self.out_feature_indexes):
-            self.out_feature_indexes = [idx - 1 for idx in self.out_feature_indexes]
+        # Compute window_block_indexes from out_feature_indexes
+        # Global attention layers = out_feature_indexes (in raw config space)
+        # Feature extraction layers = out_feature_indexes - 1 (0-indexed layer output)
+        num_layers = 12
+        raw_indexes = list(self.out_feature_indexes)
+        is_hf_indexed = any(idx >= num_layers for idx in raw_indexes)
+
+        # Global attention layer indices (0-indexed, within [0, num_layers))
+        global_layers = set()
+        for idx in raw_indexes:
+            layer_idx = idx if not is_hf_indexed else idx
+            if 0 <= layer_idx < num_layers:
+                global_layers.add(layer_idx)
+        window_block_indexes = [i for i in range(num_layers) if i not in global_layers]
+
+        # Feature extraction: convert to 0-indexed layer output indices
+        if is_hf_indexed:
+            self.out_feature_indexes = [idx - 1 for idx in raw_indexes]
 
         if self.backbone_config is None:
             self.backbone_config = DINOv2Config(
                 out_feature_indexes=self.out_feature_indexes,
                 patch_size=self.patch_size,
                 positional_encoding_size=self.positional_encoding_size,
+                window_block_indexes=window_block_indexes,
                 **encoder_params,
             )
         elif isinstance(self.backbone_config, dict):
