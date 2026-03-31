@@ -44,9 +44,19 @@ def _get_color(idx: int, colors: List[Tuple[int, int, int]]) -> Tuple[int, int, 
 
 
 def _color_idx(result, i: int) -> int:
-    """Get stable color index: use track_ids if available, else detection index."""
+    """Get stable color index: track_ids > class label hash > detection index."""
     if hasattr(result, "track_ids") and result.track_ids is not None:
         return int(result.track_ids[i])
+    # Use class label for stable per-class colors (avoids flickering across frames)
+    if (
+        hasattr(result, "labels")
+        and result.labels is not None
+        and i < len(result.labels)
+    ):
+        label = result.labels[i]
+        if isinstance(label, str):
+            return hash(label) % 1000
+        return int(label)
     return i
 
 
@@ -169,26 +179,42 @@ class MaskAnnotator(BaseAnnotator):
     colors: List[Tuple[int, int, int]] = field(default_factory=lambda: DEFAULT_COLORS)
 
     def annotate(self, scene: np.ndarray, result) -> np.ndarray:
+        if (
+            not hasattr(result, "masks")
+            or result.masks is None
+            or len(result.scores) == 0
+        ):
+            return scene.copy()
+
+        H, W = scene.shape[:2]
         out = scene.copy()
-        H, W = out.shape[:2]
+
+        # Paint all mask colors onto a single overlay, then blend once with cv2
+        overlay = out.copy()
         for i in range(len(result.scores)):
-            if not hasattr(result, "masks") or result.masks is None:
-                continue
             mask = _resize_mask(result.masks[i], H, W)
-            binary = mask > 0
             color = _get_color(_color_idx(result, i), self.colors)
-            color_f = np.array(color, dtype=np.float32)
-            out[binary] = (
-                out[binary].astype(np.float32) * (1 - self.opacity)
-                + color_f * self.opacity
-            ).astype(np.uint8)
+            overlay[mask > 0] = color
+
             if self.contour_thickness > 0:
-                contours, _ = cv2.findContours(
-                    binary.astype(np.uint8),
-                    cv2.RETR_EXTERNAL,
-                    cv2.CHAIN_APPROX_SIMPLE,
-                )
+                # Find contours on downscaled mask for speed, scale back
+                scale = max(1, min(H, W) // 360)
+                if scale > 1:
+                    small = cv2.resize(
+                        mask, (W // scale, H // scale), interpolation=cv2.INTER_NEAREST
+                    )
+                    contours, _ = cv2.findContours(
+                        small, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    )
+                    contours = [c * scale for c in contours]
+                else:
+                    contours, _ = cv2.findContours(
+                        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    )
                 cv2.drawContours(out, contours, -1, color, self.contour_thickness)
+
+        # Single cv2 blend (C-optimized, ~0.5ms vs ~9ms for numpy)
+        cv2.addWeighted(overlay, self.opacity, out, 1 - self.opacity, 0, out)
         return out
 
 
@@ -357,43 +383,70 @@ class PercentageBarAnnotator(BaseAnnotator):
 
 @dataclass
 class BlurAnnotator(BaseAnnotator):
-    """Blur detected regions (privacy mode)."""
+    """Blur detected regions. Uses mask shape when available, falls back to box.
+
+    Set ``background=True`` to blur the background instead (focus mode).
+    """
 
     kernel_size: int = 31
+    background: bool = False
 
     def annotate(self, scene: np.ndarray, result) -> np.ndarray:
         out = scene.copy()
+        H, W = out.shape[:2]
         k = self.kernel_size | 1
-        for i in range(len(result.scores)):
-            x1, y1, x2, y2 = result.boxes[i].astype(int)
-            roi = out[y1:y2, x1:x2]
-            if roi.size > 0:
-                out[y1:y2, x1:x2] = cv2.GaussianBlur(roi, (k, k), 0)
+        has_masks = hasattr(result, "masks") and result.masks is not None
+        blurred = cv2.GaussianBlur(out, (k, k), 0)
+
+        if self.background and has_masks:
+            fg = np.zeros((H, W), dtype=bool)
+            for i in range(len(result.scores)):
+                fg |= _resize_mask(result.masks[i], H, W) > 0
+            out[~fg] = blurred[~fg]
+        else:
+            for i in range(len(result.scores)):
+                if has_masks:
+                    mask = _resize_mask(result.masks[i], H, W) > 0
+                    out[mask] = blurred[mask]
+                else:
+                    x1, y1, x2, y2 = result.boxes[i].astype(int)
+                    out[y1:y2, x1:x2] = blurred[y1:y2, x1:x2]
         return out
 
 
 @dataclass
 class PixelateAnnotator(BaseAnnotator):
-    """Pixelate detected regions."""
+    """Pixelate detected regions. Uses mask shape when available, falls back to box.
+
+    Set ``background=True`` to pixelate the background instead (focus mode).
+    """
 
     pixel_size: int = 12
+    background: bool = False
 
     def annotate(self, scene: np.ndarray, result) -> np.ndarray:
         out = scene.copy()
+        H, W = out.shape[:2]
         ps = self.pixel_size
-        for i in range(len(result.scores)):
-            x1, y1, x2, y2 = result.boxes[i].astype(int)
-            roi = out[y1:y2, x1:x2]
-            if roi.size > 0:
-                h, w = roi.shape[:2]
-                small = cv2.resize(
-                    roi,
-                    (max(w // ps, 1), max(h // ps, 1)),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-                out[y1:y2, x1:x2] = cv2.resize(
-                    small, (w, h), interpolation=cv2.INTER_NEAREST
-                )
+        has_masks = hasattr(result, "masks") and result.masks is not None
+        small = cv2.resize(
+            out, (max(W // ps, 1), max(H // ps, 1)), interpolation=cv2.INTER_LINEAR
+        )
+        pixelated = cv2.resize(small, (W, H), interpolation=cv2.INTER_NEAREST)
+
+        if self.background and has_masks:
+            fg = np.zeros((H, W), dtype=bool)
+            for i in range(len(result.scores)):
+                fg |= _resize_mask(result.masks[i], H, W) > 0
+            out[~fg] = pixelated[~fg]
+        else:
+            for i in range(len(result.scores)):
+                if has_masks:
+                    mask = _resize_mask(result.masks[i], H, W) > 0
+                    out[mask] = pixelated[mask]
+                else:
+                    x1, y1, x2, y2 = result.boxes[i].astype(int)
+                    out[y1:y2, x1:x2] = pixelated[y1:y2, x1:x2]
         return out
 
 
@@ -441,12 +494,12 @@ class BackgroundOverlayAnnotator(BaseAnnotator):
         for i in range(len(result.scores)):
             if not hasattr(result, "masks") or result.masks is None:
                 continue
-            mask = _resize_mask(result.masks[i], H, W)
-            fg |= mask > 0
+            fg |= _resize_mask(result.masks[i], H, W) > 0
         bg = ~fg
-        overlay_color = np.array(self.color, dtype=np.float32)
-        out[bg] = (
-            out[bg].astype(np.float32) * (1 - self.opacity)
-            + overlay_color * self.opacity
-        ).astype(np.uint8)
+        color_layer = np.full_like(out, self.color)
+        # Blend only the background region
+        cv2.addWeighted(
+            color_layer, self.opacity, out, 1 - self.opacity, 0, color_layer
+        )
+        out[bg] = color_layer[bg]
         return out
