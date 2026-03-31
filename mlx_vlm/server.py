@@ -1415,6 +1415,14 @@ def main():
         default=DEFAULT_QUANTIZED_KV_START,
         help="Start index (of token) for the quantized KV cache.",
     )
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        default=False,
+        help="Enable auto-reload on file changes (development only). "
+        "WARNING: watches the entire working directory — can cause excessive memory "
+        "usage with large models in repos with frequent file changes.",
+    )
     args = parser.parse_args()
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
@@ -1429,8 +1437,8 @@ def main():
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
 
     uvicorn.run(
-        "mlx_vlm.server:app", host=args.host, port=args.port, workers=1, reload=True
-    )  # reload=True for development to automatically restart on code changes.
+        "mlx_vlm.server:app", host=args.host, port=args.port, workers=1, reload=args.reload
+    )
 
 
 if __name__ == "__main__":
