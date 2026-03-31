@@ -20,7 +20,9 @@ class DINOv2Embeddings(nn.Module):
         self.config = config
         self.num_windows = 4  # RF-DETR default for base/small
         self.cls_token = mx.zeros((1, 1, config.hidden_size))
-        self.position_embeddings = mx.zeros((1, 1370, config.hidden_size))
+        # Position embeddings: size from positional_encoding_size or image_size
+        pe_grid = config.positional_encoding_size or (config.image_size // config.patch_size)
+        self.position_embeddings = mx.zeros((1, 1 + pe_grid * pe_grid, config.hidden_size))
         self.patch_embeddings = PatchEmbeddings(config)
 
     def interpolate_pos_encoding(self, x: mx.array, h: int, w: int) -> mx.array:

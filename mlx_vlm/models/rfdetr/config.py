@@ -17,6 +17,7 @@ class DINOv2Config(BaseModelConfig):
     patch_size: int = 14
     num_channels: int = 3
     image_size: int = 518
+    positional_encoding_size: Optional[int] = None  # Overrides image_size for pos embed init
     layer_norm_eps: float = 1e-6
     qkv_bias: bool = True
     out_feature_indexes: List[int] = field(
@@ -52,6 +53,15 @@ class TransformerConfig(BaseModelConfig):
 
 
 @dataclass
+class SegmentationConfig(BaseModelConfig):
+    model_type: str = "rfdetr_segmentation"
+    in_dim: int = 256
+    num_blocks: int = 4
+    bottleneck_ratio: int = 1
+    downsample_ratio: int = 4
+
+
+@dataclass
 class ModelConfig(BaseModelConfig):
     model_type: str = "rf-detr"
     resolution: int = 560
@@ -68,10 +78,16 @@ class ModelConfig(BaseModelConfig):
     lite_refpoint_refine: bool = True
     layer_norm: bool = True
     encoder: str = "dinov2_windowed_small"
+    patch_size: int = 14
+    num_windows: int = 4
     projector_scale: List[str] = field(default_factory=lambda: ["P4"])
     out_feature_indexes: List[int] = field(
         default_factory=lambda: [2, 5, 8, 11]
     )
+    # Segmentation
+    positional_encoding_size: Optional[int] = None  # Override for pos embed grid size
+    segmentation: bool = False
+    segmentation_config: Optional[dict] = None
     # Sub-configs
     backbone_config: Optional[dict] = None
     projector_config: Optional[dict] = None
@@ -89,9 +105,17 @@ class ModelConfig(BaseModelConfig):
         }
         encoder_params = dinov2_sizes.get(self.encoder, dinov2_sizes["dinov2_windowed_small"])
 
+        # Normalize out_feature_indexes to 0-indexed layer indices
+        # HF convention uses 1-indexed (stage3=after layer 2), detect uses 0-indexed
+        num_layers = 12  # DINOv2 small/base
+        if any(idx >= num_layers for idx in self.out_feature_indexes):
+            self.out_feature_indexes = [idx - 1 for idx in self.out_feature_indexes]
+
         if self.backbone_config is None:
             self.backbone_config = DINOv2Config(
                 out_feature_indexes=self.out_feature_indexes,
+                patch_size=self.patch_size,
+                positional_encoding_size=self.positional_encoding_size,
                 **encoder_params,
             )
         elif isinstance(self.backbone_config, dict):
@@ -127,3 +151,9 @@ class ModelConfig(BaseModelConfig):
             )
         elif isinstance(self.transformer_config, dict):
             self.transformer_config = TransformerConfig.from_dict(self.transformer_config)
+
+        # Auto-detect segmentation from weight keys (set externally)
+        if self.segmentation_config is None and self.segmentation:
+            self.segmentation_config = SegmentationConfig(in_dim=self.hidden_dim)
+        elif isinstance(self.segmentation_config, dict):
+            self.segmentation_config = SegmentationConfig.from_dict(self.segmentation_config)

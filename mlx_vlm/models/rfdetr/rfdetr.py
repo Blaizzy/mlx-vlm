@@ -6,6 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .config import ModelConfig
+from .segmentation import SegmentationHead
 from .transformer import MLP, Transformer
 from .vision import DINOv2Backbone, MultiScaleProjector
 
@@ -17,6 +18,8 @@ class Model(nn.Module):
 
         # Vision backbone
         self.backbone = DINOv2Backbone(config.backbone_config)
+        self.backbone.num_windows = config.num_windows
+        self.backbone.embeddings.num_windows = config.num_windows
 
         # Feature projector
         self.projector = MultiScaleProjector(config.projector_config)
@@ -34,6 +37,18 @@ class Model(nn.Module):
         total_queries = config.transformer_config.num_queries * config.transformer_config.group_detr
         self.query_feat = nn.Embedding(total_queries, d)
         self.refpoint_embed = nn.Embedding(total_queries, 4)
+
+        # Optional segmentation head
+        if config.segmentation and config.segmentation_config is not None:
+            sc = config.segmentation_config
+            self.segmentation_head = SegmentationHead(
+                in_dim=sc.in_dim,
+                num_blocks=sc.num_blocks,
+                bottleneck_ratio=sc.bottleneck_ratio,
+                downsample_ratio=sc.downsample_ratio,
+            )
+        else:
+            self.segmentation_head = None
 
     def __call__(self, pixel_values: mx.array) -> Dict[str, mx.array]:
         """
@@ -74,10 +89,17 @@ class Model(nn.Module):
         else:
             pred_boxes = mx.sigmoid(self.bbox_embed(hs) + inverse_sigmoid(ref_points))
 
-        return {
+        result = {
             "pred_logits": pred_logits,
             "pred_boxes": pred_boxes,
         }
+
+        # Optional segmentation
+        if self.segmentation_head is not None:
+            pred_masks = self.segmentation_head(memory, hs, (H, W))
+            result["pred_masks"] = pred_masks
+
+        return result
 
     @staticmethod
     def sanitize(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
@@ -138,8 +160,12 @@ class Model(nn.Module):
                 sanitized[base + "v_proj.bias"] = v[2*d:]
                 continue
 
+            # 7b. Detect segmentation head presence
+            if "segmentation_head" in new_k:
+                has_seg = True
+
             # 8. Conv2d weight transposition: PyTorch (out, in, kH, kW) -> MLX (out, kH, kW, in)
-            if v.ndim == 4 and "conv" in new_k.lower():
+            if v.ndim == 4 and ("conv" in new_k.lower() or "spatial_features_proj" in new_k):
                 v = v.transpose(0, 2, 3, 1)
             elif v.ndim == 4 and "patch_embeddings.projection" in new_k:
                 v = v.transpose(0, 2, 3, 1)
