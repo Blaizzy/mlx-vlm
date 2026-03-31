@@ -363,43 +363,47 @@ class PercentageBarAnnotator(BaseAnnotator):
 
 @dataclass
 class BlurAnnotator(BaseAnnotator):
-    """Blur detected regions (privacy mode)."""
+    """Blur detected regions. Uses mask shape when available, falls back to box."""
 
     kernel_size: int = 31
 
     def annotate(self, scene: np.ndarray, result) -> np.ndarray:
         out = scene.copy()
+        H, W = out.shape[:2]
         k = self.kernel_size | 1
+        has_masks = hasattr(result, "masks") and result.masks is not None
+        blurred = cv2.GaussianBlur(out, (k, k), 0)
         for i in range(len(result.scores)):
-            x1, y1, x2, y2 = result.boxes[i].astype(int)
-            roi = out[y1:y2, x1:x2]
-            if roi.size > 0:
-                out[y1:y2, x1:x2] = cv2.GaussianBlur(roi, (k, k), 0)
+            if has_masks:
+                mask = _resize_mask(result.masks[i], H, W) > 0
+                out[mask] = blurred[mask]
+            else:
+                x1, y1, x2, y2 = result.boxes[i].astype(int)
+                out[y1:y2, x1:x2] = blurred[y1:y2, x1:x2]
         return out
 
 
 @dataclass
 class PixelateAnnotator(BaseAnnotator):
-    """Pixelate detected regions."""
+    """Pixelate detected regions. Uses mask shape when available, falls back to box."""
 
     pixel_size: int = 12
 
     def annotate(self, scene: np.ndarray, result) -> np.ndarray:
         out = scene.copy()
+        H, W = out.shape[:2]
         ps = self.pixel_size
+        has_masks = hasattr(result, "masks") and result.masks is not None
+        # Pre-compute full-frame pixelated version
+        small = cv2.resize(out, (max(W // ps, 1), max(H // ps, 1)), interpolation=cv2.INTER_LINEAR)
+        pixelated = cv2.resize(small, (W, H), interpolation=cv2.INTER_NEAREST)
         for i in range(len(result.scores)):
-            x1, y1, x2, y2 = result.boxes[i].astype(int)
-            roi = out[y1:y2, x1:x2]
-            if roi.size > 0:
-                h, w = roi.shape[:2]
-                small = cv2.resize(
-                    roi,
-                    (max(w // ps, 1), max(h // ps, 1)),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-                out[y1:y2, x1:x2] = cv2.resize(
-                    small, (w, h), interpolation=cv2.INTER_NEAREST
-                )
+            if has_masks:
+                mask = _resize_mask(result.masks[i], H, W) > 0
+                out[mask] = pixelated[mask]
+            else:
+                x1, y1, x2, y2 = result.boxes[i].astype(int)
+                out[y1:y2, x1:x2] = pixelated[y1:y2, x1:x2]
         return out
 
 

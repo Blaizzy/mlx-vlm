@@ -592,8 +592,8 @@ def _to_annotator_result(result: DetectionResult):
     r.boxes = result.boxes
     r.scores = result.scores
     r.masks = result.masks
-    # SAM3 LabelAnnotator checks `result.labels` with truthiness — use class_names as labels
-    r.labels = [f"{n} {s:.2f}" for n, s in zip(result.class_names, result.scores)]
+    # SAM3 LabelAnnotator uses result.labels for display text
+    r.labels = list(result.class_names)
     r.class_names = result.class_names
     return r
 
