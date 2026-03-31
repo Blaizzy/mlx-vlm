@@ -249,12 +249,14 @@ class RFDETRPredictor:
         score_threshold: float = 0.5,
         nms_threshold: float = 0.5,
         class_names: Optional[List[str]] = None,
+        exclude_classes: Optional[List[str]] = None,
     ):
         self.model = model
         self.processor = processor
         self.score_threshold = score_threshold
         self.nms_threshold = nms_threshold
         self.class_names = class_names or COCO_CLASSES
+        self.exclude_classes = set(exclude_classes) if exclude_classes else set()
 
     def predict(
         self,
@@ -292,7 +294,7 @@ class RFDETRPredictor:
         pred_boxes = np.array(outputs["pred_boxes"])
         pred_masks = np.array(outputs["pred_masks"]) if "pred_masks" in outputs else None
 
-        return postprocess(
+        result = postprocess(
             pred_logits,
             pred_boxes,
             original_size=inputs["original_size"],
@@ -302,3 +304,16 @@ class RFDETRPredictor:
             pred_masks=pred_masks,
             nms_threshold=self.nms_threshold,
         )
+
+        # Filter excluded classes
+        if self.exclude_classes and len(result.scores) > 0:
+            keep = np.array([n not in self.exclude_classes for n in result.class_names])
+            result = DetectionResult(
+                boxes=result.boxes[keep],
+                scores=result.scores[keep],
+                labels=result.labels[keep],
+                class_names=[n for n, k in zip(result.class_names, keep) if k],
+                masks=result.masks[keep] if result.masks is not None else None,
+            )
+
+        return result
