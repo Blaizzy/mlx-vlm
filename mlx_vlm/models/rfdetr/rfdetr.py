@@ -7,7 +7,7 @@ import mlx.nn as nn
 
 from .config import ModelConfig
 from .segmentation import SegmentationHead
-from .transformer import MLP, Transformer
+from .transformer import MLP, Transformer, inverse_sigmoid
 from .vision import DINOv2Backbone, MultiScaleProjector
 
 
