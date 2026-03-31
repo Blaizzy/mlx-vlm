@@ -22,7 +22,7 @@ class Model(nn.Module):
         self.backbone.embeddings.num_windows = config.num_windows
 
         # Feature projector
-        self.projector = MultiScaleProjector(config.projector_config)
+        self.projector = MultiScaleProjector(config._projector_config)
 
         # Transformer (encoder selection + decoder)
         self.transformer = Transformer(config.transformer_config)

@@ -90,11 +90,7 @@ class ModelConfig(BaseModelConfig):
     segmentation_config: Optional[dict] = None
     # Sub-configs
     backbone_config: Optional[dict] = None
-    projector_config: Optional[dict] = None
     transformer_config: Optional[dict] = None
-    # Framework compatibility
-    text_config: Optional[dict] = None
-    vision_config: Optional[dict] = None
 
     def __post_init__(self):
         # Build DINOv2 config from encoder type
@@ -121,19 +117,11 @@ class ModelConfig(BaseModelConfig):
         elif isinstance(self.backbone_config, dict):
             self.backbone_config = DINOv2Config.from_dict(self.backbone_config)
 
-        # Compute projector in_channels from backbone
+        # Build projector config (always derived; underscore avoids framework loader match)
         n_features = len(self.out_feature_indexes)
         in_channels = encoder_params["hidden_size"] * n_features
-
-        if self.projector_config is None:
-            self.projector_config = ProjectorConfig(
-                hidden_dim=self.hidden_dim,
-            )
-        elif isinstance(self.projector_config, dict):
-            self.projector_config = ProjectorConfig.from_dict(self.projector_config)
-
-        # Store computed in_channels
-        self.projector_config.in_channels = in_channels
+        self._projector_config = ProjectorConfig(hidden_dim=self.hidden_dim)
+        self._projector_config.in_channels = in_channels
 
         if self.transformer_config is None:
             self.transformer_config = TransformerConfig(
@@ -157,3 +145,7 @@ class ModelConfig(BaseModelConfig):
             self.segmentation_config = SegmentationConfig(in_dim=self.hidden_dim)
         elif isinstance(self.segmentation_config, dict):
             self.segmentation_config = SegmentationConfig.from_dict(self.segmentation_config)
+
+        # Framework compatibility: sanitize_weights accesses these
+        self.text_config = None
+        self.vision_config = None
