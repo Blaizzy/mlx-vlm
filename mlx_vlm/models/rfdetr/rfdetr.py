@@ -1,6 +1,6 @@
 """RF-DETR main model with weight sanitization."""
 
-from typing import Dict, Optional, Tuple
+from typing import Dict
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -159,10 +159,6 @@ class Model(nn.Module):
                 sanitized[base + "k_proj.bias"] = v[d:2*d]
                 sanitized[base + "v_proj.bias"] = v[2*d:]
                 continue
-
-            # 7b. Detect segmentation head presence
-            if "segmentation_head" in new_k:
-                has_seg = True
 
             # 8. Conv2d weight transposition: PyTorch (out, in, kH, kW) -> MLX (out, kH, kW, in)
             if v.ndim == 4 and ("conv" in new_k.lower() or "spatial_features_proj" in new_k):
