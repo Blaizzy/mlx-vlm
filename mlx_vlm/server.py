@@ -1437,7 +1437,11 @@ def main():
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
 
     uvicorn.run(
-        "mlx_vlm.server:app", host=args.host, port=args.port, workers=1, reload=args.reload
+        "mlx_vlm.server:app",
+        host=args.host,
+        port=args.port,
+        workers=1,
+        reload=args.reload,
     )
 
 
