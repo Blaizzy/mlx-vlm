@@ -495,11 +495,10 @@ class RFDETRPredictor:
             print(f"Error: cannot open {source}")
             return
 
-        # Set camera to 640x480 — model only uses 384x384 anyway,
-        # and annotating at 1080p is too slow for realtime
+        # Set camera to 1280x720 (16:9) for widescreen display
         if is_camera:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
