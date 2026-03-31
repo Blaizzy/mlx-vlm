@@ -1,14 +1,13 @@
 """RF-DETR Transformer: Two-stage encoder + Decoder with deformable attention."""
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..kernels import grid_sample
 from .config import TransformerConfig
-
 
 # ─── Utility functions ───
 
@@ -92,8 +91,13 @@ def _gen_encoder_output_proposals(H: int, W: int, scale: float = 0.05) -> mx.arr
 class MSDeformableAttention(nn.Module):
     """Multi-Scale Deformable Attention using Metal grid_sample kernel."""
 
-    def __init__(self, d_model: int = 256, n_heads: int = 16,
-                 n_levels: int = 1, n_points: int = 2):
+    def __init__(
+        self,
+        d_model: int = 256,
+        n_heads: int = 16,
+        n_levels: int = 1,
+        n_points: int = 2,
+    ):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
@@ -101,12 +105,8 @@ class MSDeformableAttention(nn.Module):
         self.n_points = n_points
         self.head_dim = d_model // n_heads
 
-        self.sampling_offsets = nn.Linear(
-            d_model, n_heads * n_levels * n_points * 2
-        )
-        self.attention_weights = nn.Linear(
-            d_model, n_heads * n_levels * n_points
-        )
+        self.sampling_offsets = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
+        self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
         self.value_proj = nn.Linear(d_model, d_model)
         self.output_proj = nn.Linear(d_model, d_model)
 
@@ -135,14 +135,22 @@ class MSDeformableAttention(nn.Module):
         value = self.value_proj(value)  # (B, HW, D)
 
         # Compute sampling offsets
-        offsets = self.sampling_offsets(query)  # (B, Q, n_heads * n_levels * n_points * 2)
+        offsets = self.sampling_offsets(
+            query
+        )  # (B, Q, n_heads * n_levels * n_points * 2)
         offsets = offsets.reshape(B, Q, self.n_heads, self.n_levels, self.n_points, 2)
 
         # Compute attention weights
-        attn_weights = self.attention_weights(query)  # (B, Q, n_heads * n_levels * n_points)
-        attn_weights = attn_weights.reshape(B, Q, self.n_heads, self.n_levels * self.n_points)
+        attn_weights = self.attention_weights(
+            query
+        )  # (B, Q, n_heads * n_levels * n_points)
+        attn_weights = attn_weights.reshape(
+            B, Q, self.n_heads, self.n_levels * self.n_points
+        )
         attn_weights = mx.softmax(attn_weights, axis=-1)
-        attn_weights = attn_weights.reshape(B, Q, self.n_heads, self.n_levels, self.n_points)
+        attn_weights = attn_weights.reshape(
+            B, Q, self.n_heads, self.n_levels, self.n_points
+        )
 
         # Compute sampling locations based on reference point dimensionality
         if reference_points.ndim == 3:
@@ -157,15 +165,23 @@ class MSDeformableAttention(nn.Module):
             sampling_locations = ref + offsets / offset_normalizer
         elif reference_points.shape[-1] == 4:
             # 4D: offsets scaled by reference box size (PyTorch DETR formula)
-            ref_center = reference_points[:, :, None, :, None, :2]  # (B, Q, 1, n_levels, 1, 2)
-            ref_wh = reference_points[:, :, None, :, None, 2:]  # (B, Q, 1, n_levels, 1, 2)
+            ref_center = reference_points[
+                :, :, None, :, None, :2
+            ]  # (B, Q, 1, n_levels, 1, 2)
+            ref_wh = reference_points[
+                :, :, None, :, None, 2:
+            ]  # (B, Q, 1, n_levels, 1, 2)
             sampling_locations = ref_center + offsets / self.n_points * ref_wh * 0.5
         else:
-            raise ValueError(f"reference_points last dim must be 2 or 4, got {reference_points.shape[-1]}")
+            raise ValueError(
+                f"reference_points last dim must be 2 or 4, got {reference_points.shape[-1]}"
+            )
 
         # Reshape value for grid sampling: (B, HW, D) -> (B*n_heads, H, W, head_dim)
         value_spatial = value.reshape(B, H, W, self.n_heads, self.head_dim)
-        value_spatial = value_spatial.transpose(0, 3, 1, 2, 4)  # (B, n_heads, H, W, head_dim)
+        value_spatial = value_spatial.transpose(
+            0, 3, 1, 2, 4
+        )  # (B, n_heads, H, W, head_dim)
         value_spatial = value_spatial.reshape(B * self.n_heads, H, W, self.head_dim)
 
         # For n_levels=1, squeeze level dim
@@ -199,7 +215,9 @@ class MSDeformableAttention(nn.Module):
 class MLP(nn.Module):
     """Simple multi-layer perceptron."""
 
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, num_layers: int):
+    def __init__(
+        self, input_dim: int, hidden_dim: int, output_dim: int, num_layers: int
+    ):
         super().__init__()
         dims = [input_dim] + [hidden_dim] * (num_layers - 1) + [output_dim]
         self.layers = [nn.Linear(dims[i], dims[i + 1]) for i in range(num_layers)]
@@ -232,9 +250,21 @@ class DecoderSelfAttention(nn.Module):
         """Self-attention with position added to q and k only (not v)."""
         B, N, D = x.shape
         qk_input = x + query_pos  # Position added to q,k
-        q = self.q_proj(qk_input).reshape(B, N, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.k_proj(qk_input).reshape(B, N, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.v_proj(x).reshape(B, N, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = (
+            self.q_proj(qk_input)
+            .reshape(B, N, self.n_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        k = (
+            self.k_proj(qk_input)
+            .reshape(B, N, self.n_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        v = (
+            self.v_proj(x)
+            .reshape(B, N, self.n_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
 
         attn = (q @ k.transpose(0, 1, 3, 2)) * self.scale
         attn = mx.softmax(attn, axis=-1)
@@ -290,7 +320,9 @@ class DecoderLayer(nn.Module):
 
         # Deformable cross-attention (query_pos added to query)
         cross_query = tgt + query_pos if query_pos is not None else tgt
-        tgt = tgt + self.cross_attn(cross_query, reference_points, memory, spatial_shape)
+        tgt = tgt + self.cross_attn(
+            cross_query, reference_points, memory, spatial_shape
+        )
         tgt = self.norm2(tgt)
 
         # FFN
@@ -352,7 +384,9 @@ class Decoder(nn.Module):
             refpoints_input = ref_coords[:, :, None, :]  # (B, Q, 1, 4)
 
             # Decoder layer
-            output = layer(output, memory, refpoints_input, spatial_shape, query_pos=query_pos)
+            output = layer(
+                output, memory, refpoints_input, spatial_shape, query_pos=query_pos
+            )
 
         output = self.norm(output)
         return output, ref_coords
@@ -401,7 +435,9 @@ class Transformer(nn.Module):
         H, W = spatial_shape
 
         # Generate grid proposals (in actual coordinate space, not logit)
-        grid_proposals = _gen_encoder_output_proposals(H, W)  # (HW, 4) cx,cy,w,h in [0,1]
+        grid_proposals = _gen_encoder_output_proposals(
+            H, W
+        )  # (HW, 4) cx,cy,w,h in [0,1]
 
         # Project encoder features
         output = self.enc_output[group_idx](memory)
@@ -424,7 +460,9 @@ class Transformer(nn.Module):
 
         # Top-K selection by max class score
         max_scores = cls_logits.max(axis=-1)  # (B, HW)
-        topk_indices = mx.argpartition(-max_scores, kth=num_queries, axis=-1)[:, :num_queries]
+        topk_indices = mx.argpartition(-max_scores, kth=num_queries, axis=-1)[
+            :, :num_queries
+        ]
         topk_scores = mx.take_along_axis(max_scores, topk_indices, axis=-1)
         sort_idx = mx.argsort(-topk_scores, axis=-1)
         topk_indices = mx.take_along_axis(topk_indices, sort_idx, axis=-1)
@@ -483,7 +521,10 @@ class Transformer(nn.Module):
         # Combine learnable refpoint_embed with two-stage proposals
         if self.config.bbox_reparam:
             # Parametric combination: rp acts as delta relative to ts proposals
-            ref_cxcy = rp[None, :, :2] * refpoint_embed_ts[..., 2:] + refpoint_embed_ts[..., :2]
+            ref_cxcy = (
+                rp[None, :, :2] * refpoint_embed_ts[..., 2:]
+                + refpoint_embed_ts[..., :2]
+            )
             ref_wh = mx.exp(rp[None, :, 2:]) * refpoint_embed_ts[..., 2:]
             combined_refpoints = mx.concatenate([ref_cxcy, ref_wh], axis=-1)
         else:

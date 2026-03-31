@@ -294,13 +294,17 @@ def convert(variant: str, output_dir: str):
     print(f"\nDone! Load with:")
     print(f"  config = json.load(open('{config_path}'))")
     print(f"  model = Model(ModelConfig.from_dict(config))")
-    print(f"  model.load_weights(list(Model.sanitize(mx.load('{weights_path}')).items()))")
+    print(
+        f"  model.load_weights(list(Model.sanitize(mx.load('{weights_path}')).items()))"
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description="Convert RF-DETR weights to MLX")
     parser.add_argument(
-        "--variant", default="base", choices=list(MODEL_VARIANTS.keys()),
+        "--variant",
+        default="base",
+        choices=list(MODEL_VARIANTS.keys()),
         help="Model variant",
     )
     parser.add_argument("--output", required=True, help="Output directory")

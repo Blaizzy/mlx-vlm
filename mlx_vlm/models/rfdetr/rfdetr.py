@@ -34,7 +34,9 @@ class Model(nn.Module):
         self.bbox_embed = MLP(d, d, 4, num_layers=3)
 
         # Learnable queries and reference points
-        total_queries = config.transformer_config.num_queries * config.transformer_config.group_detr
+        total_queries = (
+            config.transformer_config.num_queries * config.transformer_config.group_detr
+        )
         self.query_feat = nn.Embedding(total_queries, d)
         self.refpoint_embed = nn.Embedding(total_queries, 4)
 
@@ -111,7 +113,7 @@ class Model(nn.Module):
 
             # 1. Strip model. prefix
             if new_k.startswith("model."):
-                new_k = new_k[len("model."):]
+                new_k = new_k[len("model.") :]
 
             # 2. Backbone key remapping
             new_k = new_k.replace(
@@ -149,19 +151,21 @@ class Model(nn.Module):
                 d = v.shape[1]  # 256
                 base = new_k.replace("in_proj_weight", "")
                 sanitized[base + "q_proj.weight"] = v[:d]
-                sanitized[base + "k_proj.weight"] = v[d:2*d]
-                sanitized[base + "v_proj.weight"] = v[2*d:]
+                sanitized[base + "k_proj.weight"] = v[d : 2 * d]
+                sanitized[base + "v_proj.weight"] = v[2 * d :]
                 continue
             if "self_attn.in_proj_bias" in new_k:
                 d = v.shape[0] // 3
                 base = new_k.replace("in_proj_bias", "")
                 sanitized[base + "q_proj.bias"] = v[:d]
-                sanitized[base + "k_proj.bias"] = v[d:2*d]
-                sanitized[base + "v_proj.bias"] = v[2*d:]
+                sanitized[base + "k_proj.bias"] = v[d : 2 * d]
+                sanitized[base + "v_proj.bias"] = v[2 * d :]
                 continue
 
             # 8. Conv2d weight transposition: PyTorch (out, in, kH, kW) -> MLX (out, kH, kW, in)
-            if v.ndim == 4 and ("conv" in new_k.lower() or "spatial_features_proj" in new_k):
+            if v.ndim == 4 and (
+                "conv" in new_k.lower() or "spatial_features_proj" in new_k
+            ):
                 v = v.transpose(0, 2, 3, 1)
             elif v.ndim == 4 and "patch_embeddings.projection" in new_k:
                 v = v.transpose(0, 2, 3, 1)
@@ -180,7 +184,9 @@ class Model(nn.Module):
         if "conv" in path:
             return False
         # Skip small embeddings
-        if any(k in path for k in ["query_feat", "refpoint_embed", "position_embeddings"]):
+        if any(
+            k in path for k in ["query_feat", "refpoint_embed", "position_embeddings"]
+        ):
             return False
         # Skip layers with small dimensions
         if hasattr(module, "weight"):

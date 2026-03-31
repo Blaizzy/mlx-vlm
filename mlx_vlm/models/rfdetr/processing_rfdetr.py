@@ -1,29 +1,105 @@
 """RF-DETR image processor."""
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Tuple, Union
 
 import numpy as np
 from PIL import Image
 
 from ..base import install_auto_processor_patch
 
-
 # COCO 91-class names (index 0 = N/A background, actual categories at specific indices)
 COCO_CLASSES = [
-    "N/A", "person", "bicycle", "car", "motorcycle", "airplane", "bus",
-    "train", "truck", "boat", "traffic light", "fire hydrant", "N/A",
-    "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse",
-    "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "N/A",
-    "backpack", "umbrella", "N/A", "N/A", "handbag", "tie", "suitcase",
-    "frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat",
-    "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
-    "N/A", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana",
-    "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza",
-    "donut", "cake", "chair", "couch", "potted plant", "bed", "N/A",
-    "dining table", "N/A", "N/A", "toilet", "N/A", "tv", "laptop", "mouse",
-    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster",
-    "sink", "refrigerator", "N/A", "book", "clock", "vase", "scissors",
-    "teddy bear", "hair drier", "toothbrush",
+    "N/A",
+    "person",
+    "bicycle",
+    "car",
+    "motorcycle",
+    "airplane",
+    "bus",
+    "train",
+    "truck",
+    "boat",
+    "traffic light",
+    "fire hydrant",
+    "N/A",
+    "stop sign",
+    "parking meter",
+    "bench",
+    "bird",
+    "cat",
+    "dog",
+    "horse",
+    "sheep",
+    "cow",
+    "elephant",
+    "bear",
+    "zebra",
+    "giraffe",
+    "N/A",
+    "backpack",
+    "umbrella",
+    "N/A",
+    "N/A",
+    "handbag",
+    "tie",
+    "suitcase",
+    "frisbee",
+    "skis",
+    "snowboard",
+    "sports ball",
+    "kite",
+    "baseball bat",
+    "baseball glove",
+    "skateboard",
+    "surfboard",
+    "tennis racket",
+    "bottle",
+    "N/A",
+    "wine glass",
+    "cup",
+    "fork",
+    "knife",
+    "spoon",
+    "bowl",
+    "banana",
+    "apple",
+    "sandwich",
+    "orange",
+    "broccoli",
+    "carrot",
+    "hot dog",
+    "pizza",
+    "donut",
+    "cake",
+    "chair",
+    "couch",
+    "potted plant",
+    "bed",
+    "N/A",
+    "dining table",
+    "N/A",
+    "N/A",
+    "toilet",
+    "N/A",
+    "tv",
+    "laptop",
+    "mouse",
+    "remote",
+    "keyboard",
+    "cell phone",
+    "microwave",
+    "oven",
+    "toaster",
+    "sink",
+    "refrigerator",
+    "N/A",
+    "book",
+    "clock",
+    "vase",
+    "scissors",
+    "teddy bear",
+    "hair drier",
+    "toothbrush",
 ]
 
 
@@ -68,12 +144,16 @@ class RFDETRProcessor:
                 resolution=resolution,
                 image_mean=tuple(img_config.get("image_mean", (0.485, 0.456, 0.406))),
                 image_std=tuple(img_config.get("image_std", (0.229, 0.224, 0.225))),
-                num_select=pconfig.get("post_process_config", {}).get("num_select", 300),
+                num_select=pconfig.get("post_process_config", {}).get(
+                    "num_select", 300
+                ),
             )
 
         return cls(resolution=resolution)
 
-    def preprocess_image(self, image: Union[Image.Image, np.ndarray]) -> Dict[str, np.ndarray]:
+    def preprocess_image(
+        self, image: Union[Image.Image, np.ndarray]
+    ) -> Dict[str, np.ndarray]:
         """Preprocess an image for RF-DETR.
 
         Args:

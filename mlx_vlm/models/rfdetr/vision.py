@@ -1,15 +1,13 @@
 """DINOv2 backbone and MultiScaleProjector for RF-DETR."""
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..kernels import bicubic_interpolate
 from .config import DINOv2Config, ProjectorConfig
-
 
 # ─── DINOv2 Backbone ───
 
@@ -21,8 +19,12 @@ class DINOv2Embeddings(nn.Module):
         self.num_windows = 4  # RF-DETR default for base/small
         self.cls_token = mx.zeros((1, 1, config.hidden_size))
         # Position embeddings: size from positional_encoding_size or image_size
-        pe_grid = config.positional_encoding_size or (config.image_size // config.patch_size)
-        self.position_embeddings = mx.zeros((1, 1 + pe_grid * pe_grid, config.hidden_size))
+        pe_grid = config.positional_encoding_size or (
+            config.image_size // config.patch_size
+        )
+        self.position_embeddings = mx.zeros(
+            (1, 1 + pe_grid * pe_grid, config.hidden_size)
+        )
         self.patch_embeddings = PatchEmbeddings(config)
 
     def interpolate_pos_encoding(self, x: mx.array, h: int, w: int) -> mx.array:
@@ -47,9 +49,7 @@ class DINOv2Embeddings(nn.Module):
         patch_pos = patch_pos.transpose(0, 3, 1, 2)  # (1, D, orig_h, orig_w)
 
         # Bicubic interpolation (matching PyTorch DINOv2)
-        patch_pos = bicubic_interpolate(
-            patch_pos, size=(new_h, new_w), antialias=True
-        )
+        patch_pos = bicubic_interpolate(patch_pos, size=(new_h, new_w), antialias=True)
 
         # Back to (1, new_h*new_w, D)
         patch_pos = patch_pos.transpose(0, 2, 3, 1)  # (1, new_h, new_w, D)
@@ -77,7 +77,9 @@ class DINOv2Embeddings(nn.Module):
             patches = x[:, 1:, :]  # (B, H*W, D)
 
             # Partition patches into windows
-            patches = _window_partition(patches, patch_h, patch_w, nw)  # (B*nw², wh*ww, D)
+            patches = _window_partition(
+                patches, patch_h, patch_w, nw
+            )  # (B*nw², wh*ww, D)
 
             # Replicate CLS token for each window
             cls_windowed = mx.tile(cls_with_pos, (nw * nw, 1, 1))  # (B*nw², 1, D)
@@ -113,16 +115,34 @@ class DINOv2Attention(nn.Module):
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.scale = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.qkv_bias)
-        self.k_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.qkv_bias)
-        self.v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.qkv_bias)
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=config.qkv_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=config.qkv_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=config.qkv_bias
+        )
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
 
     def __call__(self, x: mx.array) -> mx.array:
         B, N, D = x.shape
-        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = (
+            self.q_proj(x)
+            .reshape(B, N, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        k = (
+            self.k_proj(x)
+            .reshape(B, N, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        v = (
+            self.v_proj(x)
+            .reshape(B, N, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
 
         attn = (q @ k.transpose(0, 1, 3, 2)) * self.scale
         attn = mx.softmax(attn, axis=-1)
@@ -182,7 +202,9 @@ class DINOv2Encoder(nn.Module):
         return x, features
 
 
-def _window_partition(x: mx.array, patch_h: int, patch_w: int, num_windows: int) -> mx.array:
+def _window_partition(
+    x: mx.array, patch_h: int, patch_w: int, num_windows: int
+) -> mx.array:
     """Partition spatial tokens into windows.
 
     Args:
@@ -203,7 +225,9 @@ def _window_partition(x: mx.array, patch_h: int, patch_w: int, num_windows: int)
     return x
 
 
-def _window_unpartition(x: mx.array, B: int, patch_h: int, patch_w: int, num_windows: int) -> mx.array:
+def _window_unpartition(
+    x: mx.array, B: int, patch_h: int, patch_w: int, num_windows: int
+) -> mx.array:
     """Unpartition windows back to full spatial sequence.
 
     Args:
@@ -235,7 +259,9 @@ class DINOv2Backbone(nn.Module):
             self.window_block_indexes = set(config.window_block_indexes)
         else:
             self.window_block_indexes = set(
-                i for i in range(config.num_hidden_layers) if i not in config.out_feature_indexes
+                i
+                for i in range(config.num_hidden_layers)
+                if i not in config.out_feature_indexes
             )
         self.embeddings = DINOv2Embeddings(config)
         self.encoder = DINOv2Encoder(config)
@@ -280,7 +306,9 @@ class DINOv2Backbone(nn.Module):
                 normed = self.layernorm(hidden)
                 # Remove CLS from each window, unpartition
                 patches = normed[:, 1:, :]  # (B*nw², wh*ww, D) remove CLS per window
-                patches = _window_unpartition(patches, B, patch_h, patch_w, nw)  # (B, H*W, D)
+                patches = _window_unpartition(
+                    patches, B, patch_h, patch_w, nw
+                )  # (B, H*W, D)
                 feat = patches.reshape(B, patch_h, patch_w, -1)
                 features.append(feat)
 
@@ -293,12 +321,22 @@ class DINOv2Backbone(nn.Module):
 class ConvBN(nn.Module):
     """Conv2d + LayerNorm (weights stored as 'bn' in checkpoint despite being LayerNorm)."""
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 1,
-                 stride: int = 1, padding: int = 0):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 1,
+        stride: int = 1,
+        padding: int = 0,
+    ):
         super().__init__()
         self.conv = nn.Conv2d(
-            in_channels, out_channels, kernel_size,
-            stride=stride, padding=padding, bias=False,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=False,
         )
         self.bn = nn.LayerNorm(out_channels)
 
@@ -323,8 +361,13 @@ class Bottleneck(nn.Module):
 class C2f(nn.Module):
     """Cross Stage Partial bottleneck with 2 convolutions (C2f from YOLOv8)."""
 
-    def __init__(self, in_channels: int, out_channels: int, num_bottlenecks: int = 3,
-                 bottleneck_channels: int = 128):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        num_bottlenecks: int = 3,
+        bottleneck_channels: int = 128,
+    ):
         super().__init__()
         # cv1 reduces channels, output is split in half
         self.cv1 = ConvBN(in_channels, out_channels, kernel_size=1)

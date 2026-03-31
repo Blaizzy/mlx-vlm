@@ -1,6 +1,6 @@
 """RF-DETR Segmentation Head."""
 
-from typing import List, Optional, Tuple
+from typing import Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -49,8 +49,13 @@ class MLPBlock(nn.Module):
 class SegmentationHead(nn.Module):
     """Segmentation head that produces per-query mask predictions."""
 
-    def __init__(self, in_dim: int = 256, num_blocks: int = 4,
-                 bottleneck_ratio: int = 1, downsample_ratio: int = 4):
+    def __init__(
+        self,
+        in_dim: int = 256,
+        num_blocks: int = 4,
+        bottleneck_ratio: int = 1,
+        downsample_ratio: int = 4,
+    ):
         super().__init__()
         self.downsample_ratio = downsample_ratio
         self.interaction_dim = in_dim // bottleneck_ratio
@@ -141,4 +146,9 @@ def _interpolate_spatial(x: mx.array, target_h: int, target_w: int) -> mx.array:
     val_10 = x[:, y1, x0, :]
     val_11 = x[:, y1, x1, :]
 
-    return val_00 * (1 - fy) * (1 - fx) + val_01 * (1 - fy) * fx + val_10 * fy * (1 - fx) + val_11 * fy * fx
+    return (
+        val_00 * (1 - fy) * (1 - fx)
+        + val_01 * (1 - fy) * fx
+        + val_10 * fy * (1 - fx)
+        + val_11 * fy * fx
+    )

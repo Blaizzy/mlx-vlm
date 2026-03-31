@@ -48,7 +48,11 @@ def _color_idx(result, i: int) -> int:
     if hasattr(result, "track_ids") and result.track_ids is not None:
         return int(result.track_ids[i])
     # Use class label for stable per-class colors (avoids flickering across frames)
-    if hasattr(result, "labels") and result.labels is not None and i < len(result.labels):
+    if (
+        hasattr(result, "labels")
+        and result.labels is not None
+        and i < len(result.labels)
+    ):
         label = result.labels[i]
         if isinstance(label, str):
             return hash(label) % 1000
@@ -175,7 +179,11 @@ class MaskAnnotator(BaseAnnotator):
     colors: List[Tuple[int, int, int]] = field(default_factory=lambda: DEFAULT_COLORS)
 
     def annotate(self, scene: np.ndarray, result) -> np.ndarray:
-        if not hasattr(result, "masks") or result.masks is None or len(result.scores) == 0:
+        if (
+            not hasattr(result, "masks")
+            or result.masks is None
+            or len(result.scores) == 0
+        ):
             return scene.copy()
 
         H, W = scene.shape[:2]
@@ -192,11 +200,17 @@ class MaskAnnotator(BaseAnnotator):
                 # Find contours on downscaled mask for speed, scale back
                 scale = max(1, min(H, W) // 360)
                 if scale > 1:
-                    small = cv2.resize(mask, (W // scale, H // scale), interpolation=cv2.INTER_NEAREST)
-                    contours, _ = cv2.findContours(small, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    small = cv2.resize(
+                        mask, (W // scale, H // scale), interpolation=cv2.INTER_NEAREST
+                    )
+                    contours, _ = cv2.findContours(
+                        small, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    )
                     contours = [c * scale for c in contours]
                 else:
-                    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    contours, _ = cv2.findContours(
+                        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    )
                 cv2.drawContours(out, contours, -1, color, self.contour_thickness)
 
         # Single cv2 blend (C-optimized, ~0.5ms vs ~9ms for numpy)
@@ -415,7 +429,9 @@ class PixelateAnnotator(BaseAnnotator):
         H, W = out.shape[:2]
         ps = self.pixel_size
         has_masks = hasattr(result, "masks") and result.masks is not None
-        small = cv2.resize(out, (max(W // ps, 1), max(H // ps, 1)), interpolation=cv2.INTER_LINEAR)
+        small = cv2.resize(
+            out, (max(W // ps, 1), max(H // ps, 1)), interpolation=cv2.INTER_LINEAR
+        )
         pixelated = cv2.resize(small, (W, H), interpolation=cv2.INTER_NEAREST)
 
         if self.background and has_masks:
@@ -482,6 +498,8 @@ class BackgroundOverlayAnnotator(BaseAnnotator):
         bg = ~fg
         color_layer = np.full_like(out, self.color)
         # Blend only the background region
-        cv2.addWeighted(color_layer, self.opacity, out, 1 - self.opacity, 0, color_layer)
+        cv2.addWeighted(
+            color_layer, self.opacity, out, 1 - self.opacity, 0, color_layer
+        )
         out[bg] = color_layer[bg]
         return out

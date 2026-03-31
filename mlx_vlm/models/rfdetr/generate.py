@@ -13,6 +13,7 @@ from .processing_rfdetr import COCO_CLASSES, RFDETRProcessor
 @dataclass
 class DetectionResult:
     """Detection output container."""
+
     boxes: np.ndarray  # (N, 4) xyxy format in pixel coordinates
     scores: np.ndarray  # (N,) confidence scores
     labels: np.ndarray  # (N,) integer class indices
@@ -107,7 +108,9 @@ def postprocess(
         final_query_idx = final_query_idx[nms_keep]
 
     # Map class indices to names
-    names = [class_names[c] if c < len(class_names) else f"class_{c}" for c in max_classes]
+    names = [
+        class_names[c] if c < len(class_names) else f"class_{c}" for c in max_classes
+    ]
 
     # Process masks — only for surviving detections
     result_masks = None
@@ -209,7 +212,9 @@ def _resize_masks(masks: np.ndarray, target_h: int, target_w: int) -> np.ndarray
     out = np.empty((N, target_h, target_w), dtype=np.uint8)
     for i in range(N):
         # Cubic interpolation for smoother upscale of logits
-        resized = cv2.resize(masks[i], (target_w, target_h), interpolation=cv2.INTER_CUBIC)
+        resized = cv2.resize(
+            masks[i], (target_w, target_h), interpolation=cv2.INTER_CUBIC
+        )
         out[i] = (resized > 0).astype(np.uint8)
     return out
 
@@ -251,7 +256,9 @@ class RFDETRPredictor:
         elif isinstance(image, np.ndarray):
             image = Image.fromarray(image)
 
-        threshold = score_threshold if score_threshold is not None else self.score_threshold
+        threshold = (
+            score_threshold if score_threshold is not None else self.score_threshold
+        )
 
         # Preprocess
         inputs = self.processor.preprocess_image(image)
@@ -267,7 +274,9 @@ class RFDETRPredictor:
         # Post-process
         pred_logits = np.array(outputs["pred_logits"])
         pred_boxes = np.array(outputs["pred_boxes"])
-        pred_masks = np.array(outputs["pred_masks"]) if "pred_masks" in outputs else None
+        pred_masks = (
+            np.array(outputs["pred_masks"]) if "pred_masks" in outputs else None
+        )
 
         result = postprocess(
             pred_logits,
@@ -306,7 +315,9 @@ class RFDETRPredictor:
         Returns:
             DetectionResult
         """
-        threshold = score_threshold if score_threshold is not None else self.score_threshold
+        threshold = (
+            score_threshold if score_threshold is not None else self.score_threshold
+        )
 
         inputs = self.processor.preprocess_bgr(bgr)
         pixel_values = mx.array(inputs["pixel_values"])
@@ -319,10 +330,13 @@ class RFDETRPredictor:
 
         pred_logits = np.array(outputs["pred_logits"])
         pred_boxes = np.array(outputs["pred_boxes"])
-        pred_masks = np.array(outputs["pred_masks"]) if "pred_masks" in outputs else None
+        pred_masks = (
+            np.array(outputs["pred_masks"]) if "pred_masks" in outputs else None
+        )
 
         result = postprocess(
-            pred_logits, pred_boxes,
+            pred_logits,
+            pred_boxes,
             original_size=inputs["original_size"],
             score_threshold=threshold,
             num_select=self.processor.num_select,
@@ -334,7 +348,8 @@ class RFDETRPredictor:
         if self.exclude_classes and len(result.scores) > 0:
             keep = np.array([n not in self.exclude_classes for n in result.class_names])
             result = DetectionResult(
-                boxes=result.boxes[keep], scores=result.scores[keep],
+                boxes=result.boxes[keep],
+                scores=result.scores[keep],
                 labels=result.labels[keep],
                 class_names=[n for n, k in zip(result.class_names, keep) if k],
                 masks=result.masks[keep] if result.masks is not None else None,
@@ -363,8 +378,9 @@ class RFDETRPredictor:
         Returns:
             dict with stats: fps, total_frames, avg_detections
         """
-        import cv2
         import time
+
+        import cv2
 
         # Build default annotator if none provided
         if annotator is not None:
@@ -402,8 +418,10 @@ class RFDETRPredictor:
             # Strip masks for detect-only task
             if task == "detect":
                 result = DetectionResult(
-                    boxes=result.boxes, scores=result.scores,
-                    labels=result.labels, class_names=result.class_names,
+                    boxes=result.boxes,
+                    scores=result.scores,
+                    labels=result.labels,
+                    class_names=result.class_names,
                 )
 
             # Annotate frame
@@ -415,8 +433,13 @@ class RFDETRPredictor:
                 elapsed = time.perf_counter() - t_start
                 cur_fps = frame_idx / elapsed
                 cv2.putText(
-                    frame, f"{cur_fps:.1f} FPS", (10, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
+                    frame,
+                    f"{cur_fps:.1f} FPS",
+                    (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 0),
+                    2,
                 )
 
             writer.write(frame)
@@ -528,8 +551,10 @@ class RFDETRPredictor:
 
             if task == "detect":
                 result = DetectionResult(
-                    boxes=result.boxes, scores=result.scores,
-                    labels=result.labels, class_names=result.class_names,
+                    boxes=result.boxes,
+                    scores=result.scores,
+                    labels=result.labels,
+                    class_names=result.class_names,
                 )
 
             # Annotate
@@ -549,7 +574,11 @@ class RFDETRPredictor:
             cv2.putText(
                 out,
                 f"Infer: {infer_fps:.0f} FPS | Loop: {display_fps:.0f} FPS | {len(result.scores)} obj",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
             )
 
             cv2.imshow("RF-DETR Realtime", out)
@@ -568,7 +597,6 @@ class RFDETRPredictor:
         cap.release()
         cv2.destroyAllWindows()
         print("Done")
-
 
 
 def _to_annotator_result(result: DetectionResult):
@@ -597,12 +625,18 @@ def _get_annotator(
     from ..sam3.generate import build_annotator
 
     if name:
-        return build_annotator(name, opacity=opacity, contour_thickness=contour_thickness)
+        return build_annotator(
+            name, opacity=opacity, contour_thickness=contour_thickness
+        )
 
     from ..sam3.annotators import BoxAnnotator, LabelAnnotator, MaskAnnotator
 
     if task == "segment":
-        return MaskAnnotator(opacity=opacity, contour_thickness=contour_thickness) + BoxAnnotator() + LabelAnnotator()
+        return (
+            MaskAnnotator(opacity=opacity, contour_thickness=contour_thickness)
+            + BoxAnnotator()
+            + LabelAnnotator()
+        )
     else:
         return BoxAnnotator() + LabelAnnotator()
 
@@ -618,32 +652,50 @@ def main():
     """
     import argparse
     from pathlib import Path
+
     from mlx_vlm.utils import load_model
+
     from ..sam3.generate import ANNOTATOR_PRESETS
 
     parser = argparse.ArgumentParser(description="RF-DETR detection/segmentation")
     parser.add_argument(
-        "--task", default="auto", choices=["auto", "detect", "segment", "track", "realtime"],
+        "--task",
+        default="auto",
+        choices=["auto", "detect", "segment", "track", "realtime"],
         help="Task: detect (image), segment (image+masks), track (video to file), realtime (live display)",
     )
     parser.add_argument("--image", type=str, help="Input image path")
-    parser.add_argument("--video", type=str, help="Input video path or camera index (0)")
+    parser.add_argument(
+        "--video", type=str, help="Input video path or camera index (0)"
+    )
     parser.add_argument("--model", type=str, required=True, help="Model directory")
     parser.add_argument("--output", type=str, help="Output path (default: auto-named)")
     parser.add_argument("--threshold", type=float, default=0.3, help="Score threshold")
-    parser.add_argument("--nms-threshold", type=float, default=0.5, help="NMS IoU threshold")
+    parser.add_argument(
+        "--nms-threshold", type=float, default=0.5, help="NMS IoU threshold"
+    )
     parser.add_argument("--exclude", nargs="+", default=[], help="Classes to exclude")
-    parser.add_argument("--show-boxes", action="store_true", default=True,
-                        help="Show bounding boxes and labels (default: on)")
-    parser.add_argument("--show-fps", action="store_true", help="Show FPS overlay on video")
+    parser.add_argument(
+        "--show-boxes",
+        action="store_true",
+        default=True,
+        help="Show bounding boxes and labels (default: on)",
+    )
+    parser.add_argument(
+        "--show-fps", action="store_true", help="Show FPS overlay on video"
+    )
     parser.add_argument("--max-frames", type=int, default=None, help="Max video frames")
     parser.add_argument(
-        "--annotator", default=None,
-        help="Annotation style. Presets: " + ", ".join(ANNOTATOR_PRESETS.keys())
-             + ". Or chain: MaskAnnotator+BoxAnnotator+LabelAnnotator",
+        "--annotator",
+        default=None,
+        help="Annotation style. Presets: "
+        + ", ".join(ANNOTATOR_PRESETS.keys())
+        + ". Or chain: MaskAnnotator+BoxAnnotator+LabelAnnotator",
     )
     parser.add_argument("--opacity", type=float, default=0.5, help="Mask opacity")
-    parser.add_argument("--contour-thickness", type=int, default=1, help="Mask contour thickness")
+    parser.add_argument(
+        "--contour-thickness", type=int, default=1, help="Mask contour thickness"
+    )
     args = parser.parse_args()
 
     if args.task == "track" and not args.video:
@@ -668,7 +720,8 @@ def main():
         task = "detect" if task == "segment" else task
 
     predictor = RFDETRPredictor(
-        model, processor,
+        model,
+        processor,
         score_threshold=args.threshold,
         nms_threshold=args.nms_threshold,
         exclude_classes=args.exclude or None,
@@ -677,11 +730,11 @@ def main():
     # Build annotator
     effective_task = "segment" if has_seg and task != "detect" else "detect"
     annotator = _get_annotator(
-        args.annotator, effective_task,
+        args.annotator,
+        effective_task,
         opacity=args.opacity,
         contour_thickness=args.contour_thickness,
     )
-
 
     if task == "realtime" or (args.task == "realtime"):
         source = args.video or "0"
@@ -708,16 +761,22 @@ def main():
 
         if task == "detect":
             result = DetectionResult(
-                boxes=result.boxes, scores=result.scores,
-                labels=result.labels, class_names=result.class_names,
+                boxes=result.boxes,
+                scores=result.scores,
+                labels=result.labels,
+                class_names=result.class_names,
             )
 
         print(f"{len(result.scores)} detections:")
         for i in range(len(result.scores)):
             box = result.boxes[i]
-            mask_info = f"  mask_px={result.masks[i].sum()}" if result.masks is not None else ""
-            print(f"  {result.class_names[i]:20s} {result.scores[i]:.3f}  "
-                  f"[{box[0]:.0f},{box[1]:.0f},{box[2]:.0f},{box[3]:.0f}]{mask_info}")
+            mask_info = (
+                f"  mask_px={result.masks[i].sum()}" if result.masks is not None else ""
+            )
+            print(
+                f"  {result.class_names[i]:20s} {result.scores[i]:.3f}  "
+                f"[{box[0]:.0f},{box[1]:.0f},{box[2]:.0f},{box[3]:.0f}]{mask_info}"
+            )
 
         print(f"\nPerformance:")
         print(f"  Inference: {(t1-t0)*1000:.1f} ms ({1/(t1-t0):.1f} FPS)")
@@ -736,7 +795,8 @@ def main():
         t_start = time.perf_counter()
         out_path = args.output or args.video.rsplit(".", 1)[0] + "_rfdetr.mp4"
         stats = predictor.predict_video(
-            args.video, out_path,
+            args.video,
+            out_path,
             show_fps=args.show_fps,
             max_frames=args.max_frames,
             annotator=annotator,
@@ -744,8 +804,10 @@ def main():
         )
         peak_mem = mx.get_peak_memory() / 1e6
 
-        print(f"{stats['total_frames']} frames in {stats['elapsed_seconds']:.1f}s "
-              f"({stats['fps']:.1f} FPS, {stats['avg_detections']:.1f} avg dets)")
+        print(
+            f"{stats['total_frames']} frames in {stats['elapsed_seconds']:.1f}s "
+            f"({stats['fps']:.1f} FPS, {stats['avg_detections']:.1f} avg dets)"
+        )
         print(f"Peak memory: {peak_mem:.1f} MB")
         print(f"Saved to {stats['output_path']}")
 

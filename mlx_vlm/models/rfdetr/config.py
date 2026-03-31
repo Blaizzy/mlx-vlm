@@ -1,6 +1,5 @@
 """RF-DETR configuration."""
 
-import inspect
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -17,12 +16,12 @@ class DINOv2Config(BaseModelConfig):
     patch_size: int = 14
     num_channels: int = 3
     image_size: int = 518
-    positional_encoding_size: Optional[int] = None  # Overrides image_size for pos embed init
+    positional_encoding_size: Optional[int] = (
+        None  # Overrides image_size for pos embed init
+    )
     layer_norm_eps: float = 1e-6
     qkv_bias: bool = True
-    out_feature_indexes: List[int] = field(
-        default_factory=lambda: [2, 5, 8, 11]
-    )
+    out_feature_indexes: List[int] = field(default_factory=lambda: [2, 5, 8, 11])
     window_block_indexes: Optional[List[int]] = None
 
 
@@ -82,9 +81,7 @@ class ModelConfig(BaseModelConfig):
     patch_size: int = 14
     num_windows: int = 4
     projector_scale: List[str] = field(default_factory=lambda: ["P4"])
-    out_feature_indexes: List[int] = field(
-        default_factory=lambda: [2, 5, 8, 11]
-    )
+    out_feature_indexes: List[int] = field(default_factory=lambda: [2, 5, 8, 11])
     # Segmentation
     positional_encoding_size: Optional[int] = None  # Override for pos embed grid size
     segmentation: bool = False
@@ -97,11 +94,25 @@ class ModelConfig(BaseModelConfig):
     def __post_init__(self):
         # Build DINOv2 config from encoder type
         dinov2_sizes = {
-            "dinov2_windowed_small": {"hidden_size": 384, "num_attention_heads": 6, "intermediate_size": 1536},
-            "dinov2_windowed_base": {"hidden_size": 768, "num_attention_heads": 12, "intermediate_size": 3072},
-            "dinov2_windowed_large": {"hidden_size": 1024, "num_attention_heads": 16, "intermediate_size": 4096},
+            "dinov2_windowed_small": {
+                "hidden_size": 384,
+                "num_attention_heads": 6,
+                "intermediate_size": 1536,
+            },
+            "dinov2_windowed_base": {
+                "hidden_size": 768,
+                "num_attention_heads": 12,
+                "intermediate_size": 3072,
+            },
+            "dinov2_windowed_large": {
+                "hidden_size": 1024,
+                "num_attention_heads": 16,
+                "intermediate_size": 4096,
+            },
         }
-        encoder_params = dinov2_sizes.get(self.encoder, dinov2_sizes["dinov2_windowed_small"])
+        encoder_params = dinov2_sizes.get(
+            self.encoder, dinov2_sizes["dinov2_windowed_small"]
+        )
 
         # Compute window_block_indexes from out_feature_indexes
         # Global attention layers = out_feature_indexes (in raw config space)
@@ -154,7 +165,9 @@ class ModelConfig(BaseModelConfig):
                 lite_refpoint_refine=self.lite_refpoint_refine,
             )
         elif isinstance(self.transformer_config, dict):
-            self.transformer_config = TransformerConfig.from_dict(self.transformer_config)
+            self.transformer_config = TransformerConfig.from_dict(
+                self.transformer_config
+            )
 
         # Auto-detect segmentation from weight keys (set externally)
         if self.segmentation_config is None and self.segmentation:
@@ -162,7 +175,9 @@ class ModelConfig(BaseModelConfig):
                 in_dim=self.hidden_dim, num_blocks=self.seg_num_blocks
             )
         elif isinstance(self.segmentation_config, dict):
-            self.segmentation_config = SegmentationConfig.from_dict(self.segmentation_config)
+            self.segmentation_config = SegmentationConfig.from_dict(
+                self.segmentation_config
+            )
 
         # Framework compatibility: sanitize_weights accesses these
         self.text_config = None
