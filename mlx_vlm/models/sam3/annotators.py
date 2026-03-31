@@ -363,9 +363,13 @@ class PercentageBarAnnotator(BaseAnnotator):
 
 @dataclass
 class BlurAnnotator(BaseAnnotator):
-    """Blur detected regions. Uses mask shape when available, falls back to box."""
+    """Blur detected regions. Uses mask shape when available, falls back to box.
+
+    Set ``background=True`` to blur the background instead (focus mode).
+    """
 
     kernel_size: int = 31
+    background: bool = False
 
     def annotate(self, scene: np.ndarray, result) -> np.ndarray:
         out = scene.copy()
@@ -373,37 +377,54 @@ class BlurAnnotator(BaseAnnotator):
         k = self.kernel_size | 1
         has_masks = hasattr(result, "masks") and result.masks is not None
         blurred = cv2.GaussianBlur(out, (k, k), 0)
-        for i in range(len(result.scores)):
-            if has_masks:
-                mask = _resize_mask(result.masks[i], H, W) > 0
-                out[mask] = blurred[mask]
-            else:
-                x1, y1, x2, y2 = result.boxes[i].astype(int)
-                out[y1:y2, x1:x2] = blurred[y1:y2, x1:x2]
+
+        if self.background and has_masks:
+            fg = np.zeros((H, W), dtype=bool)
+            for i in range(len(result.scores)):
+                fg |= _resize_mask(result.masks[i], H, W) > 0
+            out[~fg] = blurred[~fg]
+        else:
+            for i in range(len(result.scores)):
+                if has_masks:
+                    mask = _resize_mask(result.masks[i], H, W) > 0
+                    out[mask] = blurred[mask]
+                else:
+                    x1, y1, x2, y2 = result.boxes[i].astype(int)
+                    out[y1:y2, x1:x2] = blurred[y1:y2, x1:x2]
         return out
 
 
 @dataclass
 class PixelateAnnotator(BaseAnnotator):
-    """Pixelate detected regions. Uses mask shape when available, falls back to box."""
+    """Pixelate detected regions. Uses mask shape when available, falls back to box.
+
+    Set ``background=True`` to pixelate the background instead (focus mode).
+    """
 
     pixel_size: int = 12
+    background: bool = False
 
     def annotate(self, scene: np.ndarray, result) -> np.ndarray:
         out = scene.copy()
         H, W = out.shape[:2]
         ps = self.pixel_size
         has_masks = hasattr(result, "masks") and result.masks is not None
-        # Pre-compute full-frame pixelated version
         small = cv2.resize(out, (max(W // ps, 1), max(H // ps, 1)), interpolation=cv2.INTER_LINEAR)
         pixelated = cv2.resize(small, (W, H), interpolation=cv2.INTER_NEAREST)
-        for i in range(len(result.scores)):
-            if has_masks:
-                mask = _resize_mask(result.masks[i], H, W) > 0
-                out[mask] = pixelated[mask]
-            else:
-                x1, y1, x2, y2 = result.boxes[i].astype(int)
-                out[y1:y2, x1:x2] = pixelated[y1:y2, x1:x2]
+
+        if self.background and has_masks:
+            fg = np.zeros((H, W), dtype=bool)
+            for i in range(len(result.scores)):
+                fg |= _resize_mask(result.masks[i], H, W) > 0
+            out[~fg] = pixelated[~fg]
+        else:
+            for i in range(len(result.scores)):
+                if has_masks:
+                    mask = _resize_mask(result.masks[i], H, W) > 0
+                    out[mask] = pixelated[mask]
+                else:
+                    x1, y1, x2, y2 = result.boxes[i].astype(int)
+                    out[y1:y2, x1:x2] = pixelated[y1:y2, x1:x2]
         return out
 
 
@@ -451,12 +472,10 @@ class BackgroundOverlayAnnotator(BaseAnnotator):
         for i in range(len(result.scores)):
             if not hasattr(result, "masks") or result.masks is None:
                 continue
-            mask = _resize_mask(result.masks[i], H, W)
-            fg |= mask > 0
+            fg |= _resize_mask(result.masks[i], H, W) > 0
         bg = ~fg
-        overlay_color = np.array(self.color, dtype=np.float32)
-        out[bg] = (
-            out[bg].astype(np.float32) * (1 - self.opacity)
-            + overlay_color * self.opacity
-        ).astype(np.uint8)
+        color_layer = np.full_like(out, self.color)
+        # Blend only the background region
+        cv2.addWeighted(color_layer, self.opacity, out, 1 - self.opacity, 0, color_layer)
+        out[bg] = color_layer[bg]
         return out

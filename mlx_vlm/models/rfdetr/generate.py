@@ -610,7 +610,6 @@ def _get_annotator(
     if name:
         return build_annotator(name, opacity=opacity, contour_thickness=contour_thickness)
 
-    # Default annotators based on task
     from ..sam3.annotators import BoxAnnotator, LabelAnnotator, MaskAnnotator
 
     if task == "segment":
@@ -691,6 +690,7 @@ def main():
         opacity=args.opacity,
         contour_thickness=args.contour_thickness,
     )
+
 
     if task == "realtime" or (args.task == "realtime"):
         source = args.video or "0"
