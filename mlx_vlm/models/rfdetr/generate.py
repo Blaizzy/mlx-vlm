@@ -701,8 +701,19 @@ def main():
         )
 
     elif args.image:
+        import time
+
         image = Image.open(args.image).convert("RGB")
+
+        # Warmup
+        _ = predictor.predict(image)
+        mx.eval(mx.zeros(1))
+
+        mem_before = mx.get_peak_memory() / 1e6
+        t0 = time.perf_counter()
         result = predictor.predict(image)
+        t1 = time.perf_counter()
+        peak_mem = mx.get_peak_memory() / 1e6
 
         if task == "detect":
             result = DetectionResult(
@@ -717,6 +728,10 @@ def main():
             print(f"  {result.class_names[i]:20s} {result.scores[i]:.3f}  "
                   f"[{box[0]:.0f},{box[1]:.0f},{box[2]:.0f},{box[3]:.0f}]{mask_info}")
 
+        print(f"\nPerformance:")
+        print(f"  Inference: {(t1-t0)*1000:.1f} ms ({1/(t1-t0):.1f} FPS)")
+        print(f"  Peak memory: {peak_mem:.1f} MB")
+
         out_path = args.output or args.image.rsplit(".", 1)[0] + "_rfdetr.jpg"
         scene = np.ascontiguousarray(np.array(image)[..., ::-1])
         scene = annotator.annotate(scene, _to_annotator_result(result))
@@ -724,6 +739,10 @@ def main():
         print(f"Saved to {out_path}")
 
     elif args.video:
+        import time
+
+        mx.reset_peak_memory()
+        t_start = time.perf_counter()
         out_path = args.output or args.video.rsplit(".", 1)[0] + "_rfdetr.mp4"
         stats = predictor.predict_video(
             args.video, out_path,
@@ -732,8 +751,11 @@ def main():
             annotator=annotator,
             task=task,
         )
+        peak_mem = mx.get_peak_memory() / 1e6
+
         print(f"{stats['total_frames']} frames in {stats['elapsed_seconds']:.1f}s "
               f"({stats['fps']:.1f} FPS, {stats['avg_detections']:.1f} avg dets)")
+        print(f"Peak memory: {peak_mem:.1f} MB")
         print(f"Saved to {stats['output_path']}")
 
 
