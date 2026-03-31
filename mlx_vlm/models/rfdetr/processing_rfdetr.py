@@ -77,25 +77,41 @@ class RFDETRProcessor:
         """Preprocess an image for RF-DETR.
 
         Args:
-            image: PIL Image or numpy array (H, W, 3)
+            image: PIL Image or numpy array (H, W, 3) in RGB
         Returns:
             dict with 'pixel_values': (1, H, W, 3) normalized array
         """
         if isinstance(image, np.ndarray):
             image = Image.fromarray(image)
 
-        # Store original size for post-processing
         orig_w, orig_h = image.size
-
-        # Resize to model resolution
         image = image.convert("RGB")
         image = image.resize((self.resolution, self.resolution), Image.BILINEAR)
 
-        # Convert to float and normalize
         pixel_values = np.array(image, dtype=np.float32) / 255.0
         pixel_values = (pixel_values - self.image_mean) / self.image_std
+        pixel_values = pixel_values[np.newaxis, ...]
 
-        # Add batch dimension: (1, H, W, 3) channel-last
+        return {
+            "pixel_values": pixel_values,
+            "original_size": (orig_h, orig_w),
+        }
+
+    def preprocess_bgr(self, bgr: np.ndarray) -> Dict[str, np.ndarray]:
+        """Fast preprocessing from BGR numpy array (skips PIL).
+
+        Args:
+            bgr: (H, W, 3) BGR uint8 array (from cv2)
+        Returns:
+            dict with 'pixel_values': (1, H, W, 3) normalized array
+        """
+        import cv2
+
+        orig_h, orig_w = bgr.shape[:2]
+        resized = cv2.resize(bgr, (self.resolution, self.resolution), interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        pixel_values = rgb.astype(np.float32) / 255.0
+        pixel_values = (pixel_values - self.image_mean) / self.image_std
         pixel_values = pixel_values[np.newaxis, ...]
 
         return {

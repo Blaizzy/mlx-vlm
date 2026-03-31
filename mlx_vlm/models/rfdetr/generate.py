@@ -310,6 +310,55 @@ class RFDETRPredictor:
 
         return result
 
+    def predict_bgr(
+        self,
+        bgr: np.ndarray,
+        score_threshold: Optional[float] = None,
+    ) -> DetectionResult:
+        """Fast prediction from BGR numpy array (skips PIL, for video/camera).
+
+        Args:
+            bgr: (H, W, 3) BGR uint8 array from cv2
+            score_threshold: override default threshold
+        Returns:
+            DetectionResult
+        """
+        threshold = score_threshold if score_threshold is not None else self.score_threshold
+
+        inputs = self.processor.preprocess_bgr(bgr)
+        pixel_values = mx.array(inputs["pixel_values"])
+
+        outputs = self.model(pixel_values)
+        to_eval = [outputs["pred_logits"], outputs["pred_boxes"]]
+        if "pred_masks" in outputs:
+            to_eval.append(outputs["pred_masks"])
+        mx.eval(*to_eval)
+
+        pred_logits = np.array(outputs["pred_logits"])
+        pred_boxes = np.array(outputs["pred_boxes"])
+        pred_masks = np.array(outputs["pred_masks"]) if "pred_masks" in outputs else None
+
+        result = postprocess(
+            pred_logits, pred_boxes,
+            original_size=inputs["original_size"],
+            score_threshold=threshold,
+            num_select=self.processor.num_select,
+            class_names=self.class_names,
+            pred_masks=pred_masks,
+            nms_threshold=self.nms_threshold,
+        )
+
+        if self.exclude_classes and len(result.scores) > 0:
+            keep = np.array([n not in self.exclude_classes for n in result.class_names])
+            result = DetectionResult(
+                boxes=result.boxes[keep], scores=result.scores[keep],
+                labels=result.labels[keep],
+                class_names=[n for n, k in zip(result.class_names, keep) if k],
+                masks=result.masks[keep] if result.masks is not None else None,
+            )
+
+        return result
+
     def predict_video(
         self,
         video_path: str,
@@ -361,8 +410,7 @@ class RFDETRPredictor:
             if not ret:
                 break
 
-            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            result = self.predict(img, score_threshold=score_threshold)
+            result = self.predict_bgr(frame, score_threshold=score_threshold)
             det_counts.append(len(result.scores))
 
             # Strip masks for detect-only task
@@ -411,7 +459,8 @@ class RFDETRPredictor:
     ):
         """Run realtime detection/segmentation from camera or video with display.
 
-        Uses threaded reader + inference for smooth display.
+        Camera: threaded reader so cap.read() doesn't block inference.
+        Video file: single-threaded with frame pacing.
         Press 'q' to quit.
 
         Args:
@@ -420,7 +469,6 @@ class RFDETRPredictor:
             annotator: annotator chain (default: auto based on task)
             task: "detect", "segment", or "auto"
         """
-        import queue
         import threading
         import time
 
@@ -435,123 +483,99 @@ class RFDETRPredictor:
             print(f"Error: cannot open {source}")
             return
 
+        # Set camera to 640x480 — model only uses 384x384 anyway,
+        # and annotating at 1080p is too slow for realtime
+        if is_camera:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f"Source: {W}x{H} @ {fps:.0f}fps {'(camera)' if is_camera else ''}")
         print("Press 'q' to quit")
 
-        # Shared state
-        lock = threading.Lock()
-        frame_buffer = queue.Queue(maxsize=10)
-        empty = DetectionResult(
-            boxes=np.zeros((0, 4)), scores=np.zeros((0,)),
-            labels=np.zeros((0,), dtype=int), class_names=[],
-        )
-        latest = {"result": empty, "fps": 0.0}
-        latest_frame = {"bgr": None}
-        running = {"active": True}
-
-        frame_interval = 1.0 / fps if not is_camera else 0
-
-        def reader_loop():
-            next_t = time.perf_counter()
-            while running["active"]:
-                if not is_camera:
-                    now = time.perf_counter()
-                    if now < next_t:
-                        time.sleep(max(0, next_t - now - 0.001))
-                        continue
-
-                ret, frame = cap.read()
-                if not ret:
-                    if is_camera:
-                        continue
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    next_t = time.perf_counter()
-                    continue
-
-                with lock:
-                    latest_frame["bgr"] = frame
-                if frame_buffer.full():
-                    try:
-                        frame_buffer.get_nowait()
-                    except queue.Empty:
-                        pass
-                frame_buffer.put(frame)
-
-                if not is_camera:
-                    next_t += frame_interval
-
-        def inference_loop():
-            threshold = score_threshold or self.score_threshold
-            while running["active"]:
-                with lock:
-                    bgr = latest_frame["bgr"]
-                    latest_frame["bgr"] = None
-
-                if bgr is None:
-                    time.sleep(0.005)
-                    continue
-
-                t0 = time.perf_counter()
-                img = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-                result = self.predict(img, score_threshold=threshold)
-
-                if task == "detect":
-                    result = DetectionResult(
-                        boxes=result.boxes, scores=result.scores,
-                        labels=result.labels, class_names=result.class_names,
-                    )
-
-                dt = time.perf_counter() - t0
-                with lock:
-                    latest["result"] = result
-                    latest["fps"] = 1.0 / max(dt, 1e-6)
-
-        reader = threading.Thread(target=reader_loop, daemon=True)
-        inferencer = threading.Thread(target=inference_loop, daemon=True)
-        reader.start()
-        inferencer.start()
-
-        display_count = 0
-        display_t0 = time.perf_counter()
+        threshold = score_threshold or self.score_threshold
+        fps_counter = 0
+        fps_t0 = time.perf_counter()
         display_fps = 0.0
+        infer_fps = 0.0
+        frame_interval = 1.0 / fps
+
+        # Threaded camera reader — always has the latest frame ready
+        if is_camera:
+            latest_frame = [None]
+            cam_lock = threading.Lock()
+            running = [True]
+
+            def _cam_reader():
+                while running[0]:
+                    ret, f = cap.read()
+                    if ret:
+                        with cam_lock:
+                            latest_frame[0] = f
+
+            reader = threading.Thread(target=_cam_reader, daemon=True)
+            reader.start()
 
         while True:
-            try:
-                frame_bgr = frame_buffer.get(timeout=0.05)
-            except queue.Empty:
-                continue
-
-            with lock:
-                result = latest["result"]
-                det_fps = latest["fps"]
-
-            if len(result.scores) > 0:
-                out = annotator.annotate(frame_bgr.copy(), _to_annotator_result(result))
+            if is_camera:
+                with cam_lock:
+                    frame = latest_frame[0]
+                if frame is None:
+                    time.sleep(0.001)
+                    continue
             else:
-                out = frame_bgr
+                ret, frame = cap.read()
+                if not ret:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
 
-            display_count += 1
+            # Inference
+            t0 = time.perf_counter()
+            result = self.predict_bgr(frame, score_threshold=threshold)
+            t1 = time.perf_counter()
+            infer_fps = 1.0 / max(t1 - t0, 1e-6)
+
+            if task == "detect":
+                result = DetectionResult(
+                    boxes=result.boxes, scores=result.scores,
+                    labels=result.labels, class_names=result.class_names,
+                )
+
+            # Annotate
+            if len(result.scores) > 0:
+                out = annotator.annotate(frame, _to_annotator_result(result))
+            else:
+                out = frame
+
+            # FPS counter
+            fps_counter += 1
             now = time.perf_counter()
-            if now - display_t0 >= 0.5:
-                display_fps = display_count / (now - display_t0)
-                display_count = 0
-                display_t0 = now
+            if now - fps_t0 >= 0.5:
+                display_fps = fps_counter / (now - fps_t0)
+                fps_counter = 0
+                fps_t0 = now
 
             cv2.putText(
                 out,
-                f"DETECT: {det_fps:.1f} FPS | Display: {display_fps:.0f} FPS | {len(result.scores)} obj",
+                f"Infer: {infer_fps:.0f} FPS | Loop: {display_fps:.0f} FPS | {len(result.scores)} obj",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
             )
 
             cv2.imshow("RF-DETR Realtime", out)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+
+            # Frame pacing for video files
+            if not is_camera:
+                elapsed = time.perf_counter() - t0
+                wait_ms = max(1, int((frame_interval - elapsed) * 1000))
+            else:
+                wait_ms = 1
+            if cv2.waitKey(wait_ms) & 0xFF == ord("q"):
                 break
 
-        running["active"] = False
-        inferencer.join(timeout=2)
+        if is_camera:
+            running[0] = False
         cap.release()
         cv2.destroyAllWindows()
         print("Done")
