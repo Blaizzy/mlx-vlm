@@ -317,6 +317,8 @@ class RFDETRPredictor:
         score_threshold: Optional[float] = None,
         max_frames: Optional[int] = None,
         show_fps: bool = False,
+        annotator=None,
+        task: str = "auto",
     ) -> Dict:
         """Run detection/segmentation on a video and save annotated output.
 
@@ -331,6 +333,12 @@ class RFDETRPredictor:
         """
         import cv2
         import time
+
+        # Build default annotator if none provided
+        if annotator is not None:
+            ann = annotator
+        else:
+            ann = _get_annotator(None, task if task != "auto" else "detect")
 
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -357,36 +365,16 @@ class RFDETRPredictor:
             result = self.predict(img, score_threshold=score_threshold)
             det_counts.append(len(result.scores))
 
-            # Draw masks
-            if result.masks is not None and len(result.scores) > 0:
-                for i in range(len(result.scores)):
-                    mask = result.masks[i].astype(bool)
-                    color = _class_color(result.class_names[i])
-                    frame[mask] = (
-                        np.array(frame[mask], dtype=np.float32) * 0.5
-                        + np.array(color, dtype=np.float32) * 0.5
-                    ).astype(np.uint8)
+            # Strip masks for detect-only task
+            if task == "detect":
+                result = DetectionResult(
+                    boxes=result.boxes, scores=result.scores,
+                    labels=result.labels, class_names=result.class_names,
+                )
 
-            # Draw boxes + labels
-            for i in range(len(result.scores)):
-                box = result.boxes[i].astype(int)
-                color = _class_color(result.class_names[i])
-                cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), color, 2)
-                label = f"{result.class_names[i]} {result.scores[i]:.2f}"
-                (tw, th), _ = cv2.getTextSize(
-                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
-                )
-                cv2.rectangle(
-                    frame,
-                    (box[0], box[1] - th - 6),
-                    (box[0] + tw, box[1]),
-                    color,
-                    -1,
-                )
-                cv2.putText(
-                    frame, label, (box[0], box[1] - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
-                )
+            # Annotate frame
+            if ann is not None and len(result.scores) > 0:
+                frame = ann.annotate(frame, _to_annotator_result(result))
 
             # FPS overlay
             if show_fps and frame_idx > 0:
@@ -415,55 +403,43 @@ class RFDETRPredictor:
         return stats
 
 
-# Per-class BGR colors for visualization
-_COLOR_MAP = {
-    "person": (50, 50, 255), "car": (255, 200, 0), "truck": (100, 255, 0),
-    "bus": (0, 100, 255), "motorcycle": (200, 0, 255), "bicycle": (0, 255, 100),
-    "traffic light": (255, 255, 0), "cat": (48, 59, 255), "dog": (48, 59, 255),
-    "remote": (255, 122, 0), "couch": (89, 199, 52),
-}
 
 
-def _class_color(name: str) -> Tuple[int, int, int]:
-    """Get a BGR color for a class name."""
-    if name in _COLOR_MAP:
-        return _COLOR_MAP[name]
-    # Deterministic hash-based color
-    h = hash(name) % 360
-    # HSV to BGR via simple conversion
-    import colorsys
-    r, g, b = colorsys.hsv_to_rgb(h / 360, 0.8, 0.9)
-    return (int(b * 255), int(g * 255), int(r * 255))
+def _to_annotator_result(result: DetectionResult):
+    """Adapt DetectionResult for SAM3 annotators (expects list labels, not numpy)."""
+
+    class _AnnResult:
+        __slots__ = ("boxes", "scores", "masks", "labels", "class_names")
+
+    r = _AnnResult()
+    r.boxes = result.boxes
+    r.scores = result.scores
+    r.masks = result.masks
+    # SAM3 LabelAnnotator checks `result.labels` with truthiness — use class_names as labels
+    r.labels = [f"{n} {s:.2f}" for n, s in zip(result.class_names, result.scores)]
+    r.class_names = result.class_names
+    return r
 
 
-def _draw_result_on_image(image: Image.Image, result: DetectionResult) -> Image.Image:
-    """Draw detection boxes, labels, and masks on a PIL image."""
-    import cv2
+def _get_annotator(
+    name: Optional[str],
+    task: str,
+    opacity: float = 0.5,
+    contour_thickness: int = 1,
+):
+    """Build an annotator chain. Reuses SAM3's annotator system."""
+    from ..sam3.generate import build_annotator
 
-    frame = np.ascontiguousarray(np.array(image)[..., ::-1])  # RGB -> BGR
+    if name:
+        return build_annotator(name, opacity=opacity, contour_thickness=contour_thickness)
 
-    # Draw masks
-    if result.masks is not None and len(result.scores) > 0:
-        for i in range(len(result.scores)):
-            mask = result.masks[i].astype(bool)
-            color = _class_color(result.class_names[i])
-            frame[mask] = (
-                np.array(frame[mask], dtype=np.float32) * 0.5
-                + np.array(color, dtype=np.float32) * 0.5
-            ).astype(np.uint8)
+    # Default annotators based on task
+    from ..sam3.annotators import BoxAnnotator, LabelAnnotator, MaskAnnotator
 
-    # Draw boxes + labels
-    for i in range(len(result.scores)):
-        box = result.boxes[i].astype(int)
-        color = _class_color(result.class_names[i])
-        cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), color, 2)
-        label = f"{result.class_names[i]} {result.scores[i]:.2f}"
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(frame, (box[0], box[1] - th - 6), (box[0] + tw, box[1]), color, -1)
-        cv2.putText(frame, label, (box[0], box[1] - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-    return Image.fromarray(frame[..., ::-1])  # BGR -> RGB
+    if task == "segment":
+        return MaskAnnotator(opacity=opacity, contour_thickness=contour_thickness) + BoxAnnotator() + LabelAnnotator()
+    else:
+        return BoxAnnotator() + LabelAnnotator()
 
 
 def main():
@@ -479,27 +455,42 @@ def main():
         # Detect on video
         python -m mlx_vlm.models.rfdetr.generate --video traffic.mp4 --model ./rfdetr-base-mlx
 
-        # Segment on video
-        python -m mlx_vlm.models.rfdetr.generate --video traffic.mp4 --model ./rfdetr-seg-small-mlx
+        # Segment on video with halo annotator
+        python -m mlx_vlm.models.rfdetr.generate --video traffic.mp4 --model ./rfdetr-seg-small-mlx \\
+            --annotator halo+box --opacity 0.6
 
-        # With options
-        python -m mlx_vlm.models.rfdetr.generate --video input.mp4 --model ./rfdetr-seg-small-mlx \\
-            --output out.mp4 --threshold 0.3 --nms-threshold 0.5 --exclude couch bed --show-fps
+        # Detect only (no masks even if seg model)
+        python -m mlx_vlm.models.rfdetr.generate --image photo.jpg --model ./rfdetr-seg-small-mlx \\
+            --task detect --no-show-boxes
     """
     import argparse
     from pathlib import Path
     from mlx_vlm.utils import load_model
+    from ..sam3.generate import ANNOTATOR_PRESETS
 
     parser = argparse.ArgumentParser(description="RF-DETR detection/segmentation")
     parser.add_argument("--image", type=str, help="Input image path")
     parser.add_argument("--video", type=str, help="Input video path")
     parser.add_argument("--model", type=str, required=True, help="Model directory")
     parser.add_argument("--output", type=str, help="Output path (default: auto-named)")
+    parser.add_argument(
+        "--task", default="auto", choices=["auto", "detect", "segment"],
+        help="Task: auto picks based on model (default: auto)",
+    )
     parser.add_argument("--threshold", type=float, default=0.3, help="Score threshold")
     parser.add_argument("--nms-threshold", type=float, default=0.5, help="NMS IoU threshold")
     parser.add_argument("--exclude", nargs="+", default=[], help="Classes to exclude")
+    parser.add_argument("--show-boxes", action="store_true", default=True)
+    parser.add_argument("--no-show-boxes", dest="show_boxes", action="store_false")
     parser.add_argument("--show-fps", action="store_true", help="Show FPS overlay on video")
     parser.add_argument("--max-frames", type=int, default=None, help="Max video frames")
+    parser.add_argument(
+        "--annotator", default=None,
+        help="Annotation style. Presets: " + ", ".join(ANNOTATOR_PRESETS.keys())
+             + ". Or chain: MaskAnnotator+BoxAnnotator+LabelAnnotator",
+    )
+    parser.add_argument("--opacity", type=float, default=0.5, help="Mask opacity")
+    parser.add_argument("--contour-thickness", type=int, default=1, help="Mask contour thickness")
     args = parser.parse_args()
 
     if not args.image and not args.video:
@@ -510,6 +501,16 @@ def main():
     print(f"Loading model from {model_path}...")
     model = load_model(model_path)
     processor = RFDETRProcessor.from_pretrained(str(model_path))
+
+    # Determine task
+    has_seg = model.segmentation_head is not None
+    task = args.task
+    if task == "auto":
+        task = "segment" if has_seg else "detect"
+    if task == "segment" and not has_seg:
+        print("Warning: model has no segmentation head, falling back to detect")
+        task = "detect"
+
     predictor = RFDETRPredictor(
         model, processor,
         score_threshold=args.threshold,
@@ -517,10 +518,29 @@ def main():
         exclude_classes=args.exclude or None,
     )
 
+    # Build annotator
+    annotator = _get_annotator(
+        args.annotator, task,
+        opacity=args.opacity,
+        contour_thickness=args.contour_thickness,
+    )
+    if not args.show_boxes:
+        # Strip box/label annotators if --no-show-boxes
+        from ..sam3.annotators import MaskAnnotator
+        annotator = MaskAnnotator(
+            opacity=args.opacity, contour_thickness=args.contour_thickness
+        )
+
     if args.image:
-        # Image inference
         image = Image.open(args.image).convert("RGB")
         result = predictor.predict(image)
+
+        # Strip masks for detect-only task
+        if task == "detect":
+            result = DetectionResult(
+                boxes=result.boxes, scores=result.scores,
+                labels=result.labels, class_names=result.class_names,
+            )
 
         print(f"{len(result.scores)} detections:")
         for i in range(len(result.scores)):
@@ -529,19 +549,21 @@ def main():
             print(f"  {result.class_names[i]:20s} {result.scores[i]:.3f}  "
                   f"[{box[0]:.0f},{box[1]:.0f},{box[2]:.0f},{box[3]:.0f}]{mask_info}")
 
-        # Save annotated image
         out_path = args.output or args.image.rsplit(".", 1)[0] + "_rfdetr.jpg"
-        annotated = _draw_result_on_image(image, result)
-        annotated.save(out_path, quality=95)
+        scene = np.ascontiguousarray(np.array(image)[..., ::-1])  # RGB->BGR
+        ann_result = _to_annotator_result(result)
+        scene = annotator.annotate(scene, ann_result)
+        Image.fromarray(scene[..., ::-1]).save(out_path, quality=95)
         print(f"Saved to {out_path}")
 
     elif args.video:
-        # Video inference
         out_path = args.output or args.video.rsplit(".", 1)[0] + "_rfdetr.mp4"
         stats = predictor.predict_video(
             args.video, out_path,
             show_fps=args.show_fps,
             max_frames=args.max_frames,
+            annotator=annotator,
+            task=task,
         )
         print(f"{stats['total_frames']} frames in {stats['elapsed_seconds']:.1f}s "
               f"({stats['fps']:.1f} FPS, {stats['avg_detections']:.1f} avg dets)")
