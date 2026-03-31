@@ -203,32 +203,15 @@ def _resize_masks(masks: np.ndarray, target_h: int, target_w: int) -> np.ndarray
     Returns:
         (N, target_h, target_w) binary uint8 masks
     """
-    N, mH, mW = masks.shape
-    # Bilinear interpolation via grid sampling
-    y_coords = np.linspace(0, mH - 1, target_h)
-    x_coords = np.linspace(0, mW - 1, target_w)
-    yy, xx = np.meshgrid(y_coords, x_coords, indexing="ij")
+    import cv2
 
-    y0 = np.clip(np.floor(yy).astype(int), 0, mH - 1)
-    y1 = np.clip(y0 + 1, 0, mH - 1)
-    x0 = np.clip(np.floor(xx).astype(int), 0, mW - 1)
-    x1 = np.clip(x0 + 1, 0, mW - 1)
-
-    fy = yy - y0
-    fx = xx - x0
-
-    resized = np.zeros((N, target_h, target_w), dtype=np.float32)
+    N = masks.shape[0]
+    out = np.empty((N, target_h, target_w), dtype=np.uint8)
     for i in range(N):
-        m = masks[i]
-        resized[i] = (
-            m[y0, x0] * (1 - fy) * (1 - fx)
-            + m[y0, x1] * (1 - fy) * fx
-            + m[y1, x0] * fy * (1 - fx)
-            + m[y1, x1] * fy * fx
-        )
-
-    # Binarize: sigmoid > 0.5 → logit > 0
-    return (resized > 0).astype(np.uint8)
+        # cv2.resize is C-optimized, ~100x faster than numpy bilinear
+        resized = cv2.resize(masks[i], (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        out[i] = (resized > 0).astype(np.uint8)
+    return out
 
 
 class RFDETRPredictor:
@@ -401,10 +384,13 @@ class RFDETRPredictor:
             output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)
         )
 
-        frame_idx = 0
+        from tqdm import tqdm
+
         det_counts = []
         t_start = time.perf_counter()
+        pbar = tqdm(total=total, desc="Processing", unit="frame")
 
+        frame_idx = 0
         while frame_idx < total:
             ret, frame = cap.read()
             if not ret:
@@ -435,6 +421,9 @@ class RFDETRPredictor:
 
             writer.write(frame)
             frame_idx += 1
+            pbar.update(1)
+
+        pbar.close()
 
         cap.release()
         writer.release()
@@ -634,8 +623,8 @@ def main():
 
     parser = argparse.ArgumentParser(description="RF-DETR detection/segmentation")
     parser.add_argument(
-        "--task", default="auto", choices=["auto", "detect", "segment", "realtime"],
-        help="Task mode (default: auto)",
+        "--task", default="auto", choices=["auto", "detect", "segment", "track", "realtime"],
+        help="Task: detect (image), segment (image+masks), track (video to file), realtime (live display)",
     )
     parser.add_argument("--image", type=str, help="Input image path")
     parser.add_argument("--video", type=str, help="Input video path or camera index (0)")
@@ -657,8 +646,10 @@ def main():
     parser.add_argument("--contour-thickness", type=int, default=1, help="Mask contour thickness")
     args = parser.parse_args()
 
-    if args.task != "realtime" and not args.image and not args.video:
-        parser.error("Provide --image or --video (or use --task realtime for camera)")
+    if args.task == "track" and not args.video:
+        parser.error("--task track requires --video")
+    if args.task not in ("realtime", "track") and not args.image and not args.video:
+        parser.error("Provide --image or --video (or use --task realtime/track)")
 
     # Load model
     model_path = Path(args.model)
@@ -738,7 +729,7 @@ def main():
         Image.fromarray(scene[..., ::-1]).save(out_path, quality=95)
         print(f"Saved to {out_path}")
 
-    elif args.video:
+    elif args.video or task == "track":
         import time
 
         mx.reset_peak_memory()

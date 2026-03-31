@@ -44,9 +44,15 @@ def _get_color(idx: int, colors: List[Tuple[int, int, int]]) -> Tuple[int, int, 
 
 
 def _color_idx(result, i: int) -> int:
-    """Get stable color index: use track_ids if available, else detection index."""
+    """Get stable color index: track_ids > class label hash > detection index."""
     if hasattr(result, "track_ids") and result.track_ids is not None:
         return int(result.track_ids[i])
+    # Use class label for stable per-class colors (avoids flickering across frames)
+    if hasattr(result, "labels") and result.labels is not None and i < len(result.labels):
+        label = result.labels[i]
+        if isinstance(label, str):
+            return hash(label) % 1000
+        return int(label)
     return i
 
 

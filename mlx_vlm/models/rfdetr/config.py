@@ -87,6 +87,7 @@ class ModelConfig(BaseModelConfig):
     # Segmentation
     positional_encoding_size: Optional[int] = None  # Override for pos embed grid size
     segmentation: bool = False
+    seg_num_blocks: int = 4  # Number of DepthwiseConvBlocks in seg head
     segmentation_config: Optional[dict] = None
     # Sub-configs
     backbone_config: Optional[dict] = None
@@ -142,7 +143,9 @@ class ModelConfig(BaseModelConfig):
 
         # Auto-detect segmentation from weight keys (set externally)
         if self.segmentation_config is None and self.segmentation:
-            self.segmentation_config = SegmentationConfig(in_dim=self.hidden_dim)
+            self.segmentation_config = SegmentationConfig(
+                in_dim=self.hidden_dim, num_blocks=self.seg_num_blocks
+            )
         elif isinstance(self.segmentation_config, dict):
             self.segmentation_config = SegmentationConfig.from_dict(self.segmentation_config)
 
