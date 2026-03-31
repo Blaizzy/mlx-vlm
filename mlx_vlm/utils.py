@@ -36,6 +36,7 @@ MODEL_REMAPPING = {
     "phi4-siglip": "phi4_siglip",
     "sam3_video": "sam3",
     "sam3.1_video": "sam3_1",
+    "rf-detr": "rfdetr",
 }
 
 MAX_FILE_SIZE_GB = 5
