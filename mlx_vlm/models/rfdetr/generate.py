@@ -402,6 +402,159 @@ class RFDETRPredictor:
         }
         return stats
 
+    def predict_realtime(
+        self,
+        source: str = "0",
+        score_threshold: Optional[float] = None,
+        annotator=None,
+        task: str = "auto",
+    ):
+        """Run realtime detection/segmentation from camera or video with display.
+
+        Uses threaded reader + inference for smooth display.
+        Press 'q' to quit.
+
+        Args:
+            source: camera index ("0") or video path
+            score_threshold: override default threshold
+            annotator: annotator chain (default: auto based on task)
+            task: "detect", "segment", or "auto"
+        """
+        import queue
+        import threading
+        import time
+
+        import cv2
+
+        if annotator is None:
+            annotator = _get_annotator(None, task if task != "auto" else "detect")
+
+        is_camera = source.isdigit()
+        cap = cv2.VideoCapture(int(source) if is_camera else source)
+        if not cap.isOpened():
+            print(f"Error: cannot open {source}")
+            return
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"Source: {W}x{H} @ {fps:.0f}fps {'(camera)' if is_camera else ''}")
+        print("Press 'q' to quit")
+
+        # Shared state
+        lock = threading.Lock()
+        frame_buffer = queue.Queue(maxsize=10)
+        empty = DetectionResult(
+            boxes=np.zeros((0, 4)), scores=np.zeros((0,)),
+            labels=np.zeros((0,), dtype=int), class_names=[],
+        )
+        latest = {"result": empty, "fps": 0.0}
+        latest_frame = {"bgr": None}
+        running = {"active": True}
+
+        frame_interval = 1.0 / fps if not is_camera else 0
+
+        def reader_loop():
+            next_t = time.perf_counter()
+            while running["active"]:
+                if not is_camera:
+                    now = time.perf_counter()
+                    if now < next_t:
+                        time.sleep(max(0, next_t - now - 0.001))
+                        continue
+
+                ret, frame = cap.read()
+                if not ret:
+                    if is_camera:
+                        continue
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    next_t = time.perf_counter()
+                    continue
+
+                with lock:
+                    latest_frame["bgr"] = frame
+                if frame_buffer.full():
+                    try:
+                        frame_buffer.get_nowait()
+                    except queue.Empty:
+                        pass
+                frame_buffer.put(frame)
+
+                if not is_camera:
+                    next_t += frame_interval
+
+        def inference_loop():
+            threshold = score_threshold or self.score_threshold
+            while running["active"]:
+                with lock:
+                    bgr = latest_frame["bgr"]
+                    latest_frame["bgr"] = None
+
+                if bgr is None:
+                    time.sleep(0.005)
+                    continue
+
+                t0 = time.perf_counter()
+                img = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+                result = self.predict(img, score_threshold=threshold)
+
+                if task == "detect":
+                    result = DetectionResult(
+                        boxes=result.boxes, scores=result.scores,
+                        labels=result.labels, class_names=result.class_names,
+                    )
+
+                dt = time.perf_counter() - t0
+                with lock:
+                    latest["result"] = result
+                    latest["fps"] = 1.0 / max(dt, 1e-6)
+
+        reader = threading.Thread(target=reader_loop, daemon=True)
+        inferencer = threading.Thread(target=inference_loop, daemon=True)
+        reader.start()
+        inferencer.start()
+
+        display_count = 0
+        display_t0 = time.perf_counter()
+        display_fps = 0.0
+
+        while True:
+            try:
+                frame_bgr = frame_buffer.get(timeout=0.05)
+            except queue.Empty:
+                continue
+
+            with lock:
+                result = latest["result"]
+                det_fps = latest["fps"]
+
+            if len(result.scores) > 0:
+                out = annotator.annotate(frame_bgr.copy(), _to_annotator_result(result))
+            else:
+                out = frame_bgr
+
+            display_count += 1
+            now = time.perf_counter()
+            if now - display_t0 >= 0.5:
+                display_fps = display_count / (now - display_t0)
+                display_count = 0
+                display_t0 = now
+
+            cv2.putText(
+                out,
+                f"DETECT: {det_fps:.1f} FPS | Display: {display_fps:.0f} FPS | {len(result.scores)} obj",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
+            )
+
+            cv2.imshow("RF-DETR Realtime", out)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+        running["active"] = False
+        inferencer.join(timeout=2)
+        cap.release()
+        cv2.destroyAllWindows()
+        print("Done")
 
 
 
@@ -446,22 +599,10 @@ def main():
     """RF-DETR CLI for detection and segmentation on images and videos.
 
     Usage:
-        # Detect on image
-        python -m mlx_vlm.models.rfdetr.generate --image photo.jpg --model ./rfdetr-base-mlx
-
-        # Segment on image
-        python -m mlx_vlm.models.rfdetr.generate --image photo.jpg --model ./rfdetr-seg-small-mlx
-
-        # Detect on video
-        python -m mlx_vlm.models.rfdetr.generate --video traffic.mp4 --model ./rfdetr-base-mlx
-
-        # Segment on video with halo annotator
-        python -m mlx_vlm.models.rfdetr.generate --video traffic.mp4 --model ./rfdetr-seg-small-mlx \\
-            --annotator halo+box --opacity 0.6
-
-        # Detect only (no masks even if seg model)
-        python -m mlx_vlm.models.rfdetr.generate --image photo.jpg --model ./rfdetr-seg-small-mlx \\
-            --task detect --no-show-boxes
+        python -m mlx_vlm.models.rfdetr.generate --task detect --image photo.jpg --model ./rfdetr-base-mlx
+        python -m mlx_vlm.models.rfdetr.generate --task segment --video traffic.mp4 --model ./rfdetr-seg-small-mlx
+        python -m mlx_vlm.models.rfdetr.generate --task realtime --model ./rfdetr-base-mlx
+        python -m mlx_vlm.models.rfdetr.generate --task realtime --video traffic.mp4 --model ./rfdetr-seg-small-mlx
     """
     import argparse
     from pathlib import Path
@@ -469,19 +610,19 @@ def main():
     from ..sam3.generate import ANNOTATOR_PRESETS
 
     parser = argparse.ArgumentParser(description="RF-DETR detection/segmentation")
+    parser.add_argument(
+        "--task", default="auto", choices=["auto", "detect", "segment", "realtime"],
+        help="Task mode (default: auto)",
+    )
     parser.add_argument("--image", type=str, help="Input image path")
-    parser.add_argument("--video", type=str, help="Input video path")
+    parser.add_argument("--video", type=str, help="Input video path or camera index (0)")
     parser.add_argument("--model", type=str, required=True, help="Model directory")
     parser.add_argument("--output", type=str, help="Output path (default: auto-named)")
-    parser.add_argument(
-        "--task", default="auto", choices=["auto", "detect", "segment"],
-        help="Task: auto picks based on model (default: auto)",
-    )
     parser.add_argument("--threshold", type=float, default=0.3, help="Score threshold")
     parser.add_argument("--nms-threshold", type=float, default=0.5, help="NMS IoU threshold")
     parser.add_argument("--exclude", nargs="+", default=[], help="Classes to exclude")
-    parser.add_argument("--show-boxes", action="store_true", default=True)
-    parser.add_argument("--no-show-boxes", dest="show_boxes", action="store_false")
+    parser.add_argument("--show-boxes", action="store_true", default=True,
+                        help="Show bounding boxes and labels (default: on)")
     parser.add_argument("--show-fps", action="store_true", help="Show FPS overlay on video")
     parser.add_argument("--max-frames", type=int, default=None, help="Max video frames")
     parser.add_argument(
@@ -493,8 +634,8 @@ def main():
     parser.add_argument("--contour-thickness", type=int, default=1, help="Mask contour thickness")
     args = parser.parse_args()
 
-    if not args.image and not args.video:
-        parser.error("Provide --image or --video")
+    if args.task != "realtime" and not args.image and not args.video:
+        parser.error("Provide --image or --video (or use --task realtime for camera)")
 
     # Load model
     model_path = Path(args.model)
@@ -507,9 +648,10 @@ def main():
     task = args.task
     if task == "auto":
         task = "segment" if has_seg else "detect"
-    if task == "segment" and not has_seg:
-        print("Warning: model has no segmentation head, falling back to detect")
-        task = "detect"
+    if task in ("segment", "realtime") and not has_seg:
+        if task == "segment":
+            print("Warning: model has no segmentation head, falling back to detect")
+        task = "detect" if task == "segment" else task
 
     predictor = RFDETRPredictor(
         model, processor,
@@ -519,23 +661,25 @@ def main():
     )
 
     # Build annotator
+    effective_task = "segment" if has_seg and task != "detect" else "detect"
     annotator = _get_annotator(
-        args.annotator, task,
+        args.annotator, effective_task,
         opacity=args.opacity,
         contour_thickness=args.contour_thickness,
     )
-    if not args.show_boxes:
-        # Strip box/label annotators if --no-show-boxes
-        from ..sam3.annotators import MaskAnnotator
-        annotator = MaskAnnotator(
-            opacity=args.opacity, contour_thickness=args.contour_thickness
+
+    if task == "realtime" or (args.task == "realtime"):
+        source = args.video or "0"
+        predictor.predict_realtime(
+            source=source,
+            annotator=annotator,
+            task="segment" if has_seg else "detect",
         )
 
-    if args.image:
+    elif args.image:
         image = Image.open(args.image).convert("RGB")
         result = predictor.predict(image)
 
-        # Strip masks for detect-only task
         if task == "detect":
             result = DetectionResult(
                 boxes=result.boxes, scores=result.scores,
@@ -550,9 +694,8 @@ def main():
                   f"[{box[0]:.0f},{box[1]:.0f},{box[2]:.0f},{box[3]:.0f}]{mask_info}")
 
         out_path = args.output or args.image.rsplit(".", 1)[0] + "_rfdetr.jpg"
-        scene = np.ascontiguousarray(np.array(image)[..., ::-1])  # RGB->BGR
-        ann_result = _to_annotator_result(result)
-        scene = annotator.annotate(scene, ann_result)
+        scene = np.ascontiguousarray(np.array(image)[..., ::-1])
+        scene = annotator.annotate(scene, _to_annotator_result(result))
         Image.fromarray(scene[..., ::-1]).save(out_path, quality=95)
         print(f"Saved to {out_path}")
 
