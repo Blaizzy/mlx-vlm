@@ -309,3 +309,244 @@ class RFDETRPredictor:
             )
 
         return result
+
+    def predict_video(
+        self,
+        video_path: str,
+        output_path: str,
+        score_threshold: Optional[float] = None,
+        max_frames: Optional[int] = None,
+        show_fps: bool = False,
+    ) -> Dict:
+        """Run detection/segmentation on a video and save annotated output.
+
+        Args:
+            video_path: path to input video
+            output_path: path to save annotated video
+            score_threshold: override default threshold
+            max_frames: limit number of frames (None = full video)
+            show_fps: overlay FPS counter on video
+        Returns:
+            dict with stats: fps, total_frames, avg_detections
+        """
+        import cv2
+        import time
+
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if max_frames:
+            total = min(total, max_frames)
+
+        writer = cv2.VideoWriter(
+            output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)
+        )
+
+        frame_idx = 0
+        det_counts = []
+        t_start = time.perf_counter()
+
+        while frame_idx < total:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            result = self.predict(img, score_threshold=score_threshold)
+            det_counts.append(len(result.scores))
+
+            # Draw masks
+            if result.masks is not None and len(result.scores) > 0:
+                for i in range(len(result.scores)):
+                    mask = result.masks[i].astype(bool)
+                    color = _class_color(result.class_names[i])
+                    frame[mask] = (
+                        np.array(frame[mask], dtype=np.float32) * 0.5
+                        + np.array(color, dtype=np.float32) * 0.5
+                    ).astype(np.uint8)
+
+            # Draw boxes + labels
+            for i in range(len(result.scores)):
+                box = result.boxes[i].astype(int)
+                color = _class_color(result.class_names[i])
+                cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), color, 2)
+                label = f"{result.class_names[i]} {result.scores[i]:.2f}"
+                (tw, th), _ = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+                )
+                cv2.rectangle(
+                    frame,
+                    (box[0], box[1] - th - 6),
+                    (box[0] + tw, box[1]),
+                    color,
+                    -1,
+                )
+                cv2.putText(
+                    frame, label, (box[0], box[1] - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
+                )
+
+            # FPS overlay
+            if show_fps and frame_idx > 0:
+                elapsed = time.perf_counter() - t_start
+                cur_fps = frame_idx / elapsed
+                cv2.putText(
+                    frame, f"{cur_fps:.1f} FPS", (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
+                )
+
+            writer.write(frame)
+            frame_idx += 1
+
+        cap.release()
+        writer.release()
+
+        elapsed = time.perf_counter() - t_start
+        avg_fps = frame_idx / elapsed
+        stats = {
+            "total_frames": frame_idx,
+            "elapsed_seconds": elapsed,
+            "fps": avg_fps,
+            "avg_detections": np.mean(det_counts) if det_counts else 0,
+            "output_path": output_path,
+        }
+        return stats
+
+
+# Per-class BGR colors for visualization
+_COLOR_MAP = {
+    "person": (50, 50, 255), "car": (255, 200, 0), "truck": (100, 255, 0),
+    "bus": (0, 100, 255), "motorcycle": (200, 0, 255), "bicycle": (0, 255, 100),
+    "traffic light": (255, 255, 0), "cat": (48, 59, 255), "dog": (48, 59, 255),
+    "remote": (255, 122, 0), "couch": (89, 199, 52),
+}
+
+
+def _class_color(name: str) -> Tuple[int, int, int]:
+    """Get a BGR color for a class name."""
+    if name in _COLOR_MAP:
+        return _COLOR_MAP[name]
+    # Deterministic hash-based color
+    h = hash(name) % 360
+    # HSV to BGR via simple conversion
+    import colorsys
+    r, g, b = colorsys.hsv_to_rgb(h / 360, 0.8, 0.9)
+    return (int(b * 255), int(g * 255), int(r * 255))
+
+
+def _draw_result_on_image(image: Image.Image, result: DetectionResult) -> Image.Image:
+    """Draw detection boxes, labels, and masks on a PIL image."""
+    import cv2
+
+    frame = np.ascontiguousarray(np.array(image)[..., ::-1])  # RGB -> BGR
+
+    # Draw masks
+    if result.masks is not None and len(result.scores) > 0:
+        for i in range(len(result.scores)):
+            mask = result.masks[i].astype(bool)
+            color = _class_color(result.class_names[i])
+            frame[mask] = (
+                np.array(frame[mask], dtype=np.float32) * 0.5
+                + np.array(color, dtype=np.float32) * 0.5
+            ).astype(np.uint8)
+
+    # Draw boxes + labels
+    for i in range(len(result.scores)):
+        box = result.boxes[i].astype(int)
+        color = _class_color(result.class_names[i])
+        cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), color, 2)
+        label = f"{result.class_names[i]} {result.scores[i]:.2f}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(frame, (box[0], box[1] - th - 6), (box[0] + tw, box[1]), color, -1)
+        cv2.putText(frame, label, (box[0], box[1] - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+    return Image.fromarray(frame[..., ::-1])  # BGR -> RGB
+
+
+def main():
+    """RF-DETR CLI for detection and segmentation on images and videos.
+
+    Usage:
+        # Detect on image
+        python -m mlx_vlm.models.rfdetr.generate --image photo.jpg --model ./rfdetr-base-mlx
+
+        # Segment on image
+        python -m mlx_vlm.models.rfdetr.generate --image photo.jpg --model ./rfdetr-seg-small-mlx
+
+        # Detect on video
+        python -m mlx_vlm.models.rfdetr.generate --video traffic.mp4 --model ./rfdetr-base-mlx
+
+        # Segment on video
+        python -m mlx_vlm.models.rfdetr.generate --video traffic.mp4 --model ./rfdetr-seg-small-mlx
+
+        # With options
+        python -m mlx_vlm.models.rfdetr.generate --video input.mp4 --model ./rfdetr-seg-small-mlx \\
+            --output out.mp4 --threshold 0.3 --nms-threshold 0.5 --exclude couch bed --show-fps
+    """
+    import argparse
+    from pathlib import Path
+    from mlx_vlm.utils import load_model
+
+    parser = argparse.ArgumentParser(description="RF-DETR detection/segmentation")
+    parser.add_argument("--image", type=str, help="Input image path")
+    parser.add_argument("--video", type=str, help="Input video path")
+    parser.add_argument("--model", type=str, required=True, help="Model directory")
+    parser.add_argument("--output", type=str, help="Output path (default: auto-named)")
+    parser.add_argument("--threshold", type=float, default=0.3, help="Score threshold")
+    parser.add_argument("--nms-threshold", type=float, default=0.5, help="NMS IoU threshold")
+    parser.add_argument("--exclude", nargs="+", default=[], help="Classes to exclude")
+    parser.add_argument("--show-fps", action="store_true", help="Show FPS overlay on video")
+    parser.add_argument("--max-frames", type=int, default=None, help="Max video frames")
+    args = parser.parse_args()
+
+    if not args.image and not args.video:
+        parser.error("Provide --image or --video")
+
+    # Load model
+    model_path = Path(args.model)
+    print(f"Loading model from {model_path}...")
+    model = load_model(model_path)
+    processor = RFDETRProcessor.from_pretrained(str(model_path))
+    predictor = RFDETRPredictor(
+        model, processor,
+        score_threshold=args.threshold,
+        nms_threshold=args.nms_threshold,
+        exclude_classes=args.exclude or None,
+    )
+
+    if args.image:
+        # Image inference
+        image = Image.open(args.image).convert("RGB")
+        result = predictor.predict(image)
+
+        print(f"{len(result.scores)} detections:")
+        for i in range(len(result.scores)):
+            box = result.boxes[i]
+            mask_info = f"  mask_px={result.masks[i].sum()}" if result.masks is not None else ""
+            print(f"  {result.class_names[i]:20s} {result.scores[i]:.3f}  "
+                  f"[{box[0]:.0f},{box[1]:.0f},{box[2]:.0f},{box[3]:.0f}]{mask_info}")
+
+        # Save annotated image
+        out_path = args.output or args.image.rsplit(".", 1)[0] + "_rfdetr.jpg"
+        annotated = _draw_result_on_image(image, result)
+        annotated.save(out_path, quality=95)
+        print(f"Saved to {out_path}")
+
+    elif args.video:
+        # Video inference
+        out_path = args.output or args.video.rsplit(".", 1)[0] + "_rfdetr.mp4"
+        stats = predictor.predict_video(
+            args.video, out_path,
+            show_fps=args.show_fps,
+            max_frames=args.max_frames,
+        )
+        print(f"{stats['total_frames']} frames in {stats['elapsed_seconds']:.1f}s "
+              f"({stats['fps']:.1f} FPS, {stats['avg_detections']:.1f} avg dets)")
+        print(f"Saved to {stats['output_path']}")
+
+
+if __name__ == "__main__":
+    main()
