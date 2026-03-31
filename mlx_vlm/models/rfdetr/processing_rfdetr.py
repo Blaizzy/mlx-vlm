@@ -48,24 +48,28 @@ class RFDETRProcessor:
         import json
         from pathlib import Path
 
-        config_path = Path(path) / "preprocessor_config.json"
+        path = Path(path)
+
+        # Always read resolution from model config
+        resolution = 560
+        model_config_path = path / "config.json"
+        if model_config_path.exists():
+            with open(model_config_path) as f:
+                mconfig = json.load(f)
+            resolution = mconfig.get("resolution", 560)
+
+        # Read image normalization from preprocessor config
+        config_path = path / "preprocessor_config.json"
         if config_path.exists():
             with open(config_path) as f:
                 pconfig = json.load(f)
             img_config = pconfig.get("config", {})
             return cls(
+                resolution=resolution,
                 image_mean=tuple(img_config.get("image_mean", (0.485, 0.456, 0.406))),
                 image_std=tuple(img_config.get("image_std", (0.229, 0.224, 0.225))),
                 num_select=pconfig.get("post_process_config", {}).get("num_select", 300),
             )
-
-        # Load resolution from model config
-        model_config_path = Path(path) / "config.json"
-        resolution = 560
-        if model_config_path.exists():
-            with open(model_config_path) as f:
-                mconfig = json.load(f)
-            resolution = mconfig.get("resolution", 560)
 
         return cls(resolution=resolution)
 
