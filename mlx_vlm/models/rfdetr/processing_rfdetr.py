@@ -98,19 +98,18 @@ class RFDETRProcessor:
         }
 
     def preprocess_bgr(self, bgr: np.ndarray) -> Dict[str, np.ndarray]:
-        """Fast preprocessing from BGR numpy array (skips PIL).
+        """Preprocessing from BGR numpy array (cv2 frame).
 
         Args:
             bgr: (H, W, 3) BGR uint8 array (from cv2)
         Returns:
             dict with 'pixel_values': (1, H, W, 3) normalized array
         """
-        import cv2
-
         orig_h, orig_w = bgr.shape[:2]
-        resized = cv2.resize(bgr, (self.resolution, self.resolution), interpolation=cv2.INTER_LINEAR)
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        pixel_values = rgb.astype(np.float32) / 255.0
+        # Use PIL resize to match predict() path exactly
+        rgb = Image.fromarray(bgr[..., ::-1])  # BGR->RGB via array flip + PIL
+        rgb = rgb.resize((self.resolution, self.resolution), Image.BILINEAR)
+        pixel_values = np.array(rgb, dtype=np.float32) / 255.0
         pixel_values = (pixel_values - self.image_mean) / self.image_std
         pixel_values = pixel_values[np.newaxis, ...]
 
