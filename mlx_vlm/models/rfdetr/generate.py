@@ -68,7 +68,7 @@ def postprocess(
     max_scores = scores.max(axis=-1)  # (Q,)
     max_classes = scores.argmax(axis=-1)  # (Q,)
 
-    # Top-K selection
+    # Top-K selection — track indices into original Q for mask lookup
     if num_select < len(max_scores):
         topk_idx = np.argpartition(-max_scores, num_select)[:num_select]
     else:
@@ -83,6 +83,8 @@ def postprocess(
     max_scores = max_scores[keep]
     max_classes = max_classes[keep]
     boxes = boxes[keep]
+    # Track which original query indices survived
+    final_query_idx = topk_idx[keep]
 
     # Convert boxes: cxcywh -> xyxy
     boxes = box_cxcywh_to_xyxy(boxes)
@@ -102,26 +104,16 @@ def postprocess(
         boxes = boxes[nms_keep]
         max_scores = max_scores[nms_keep]
         max_classes = max_classes[nms_keep]
-        if pred_masks is not None:
-            # Update topk_idx/keep tracking for masks
-            # Rebuild the full index chain
-            orig_mask_idx = topk_idx[keep][nms_keep]
-            topk_idx = orig_mask_idx
-            keep = np.ones(len(topk_idx), dtype=bool)
+        final_query_idx = final_query_idx[nms_keep]
 
     # Map class indices to names
     names = [class_names[c] if c < len(class_names) else f"class_{c}" for c in max_classes]
 
-    # Process masks if available
+    # Process masks — only for surviving detections
     result_masks = None
-    if pred_masks is not None:
-        all_masks = pred_masks[0]  # (Q, mH, mW)
-        # Index masks using the same selection chain as boxes
-        masks = all_masks[topk_idx]  # (N, mH, mW) - already filtered by keep+nms or original topk
-        # Resize masks to original image size via simple nearest/bilinear
-        if len(masks) > 0:
-            orig_h, orig_w = original_size
-            result_masks = _resize_masks(masks, orig_h, orig_w)
+    if pred_masks is not None and len(final_query_idx) > 0:
+        masks = pred_masks[0][final_query_idx]  # (N_kept, mH, mW)
+        result_masks = _resize_masks(masks, orig_h, orig_w)
 
     return DetectionResult(
         boxes=boxes,
