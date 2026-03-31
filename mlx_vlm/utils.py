@@ -36,6 +36,9 @@ MODEL_REMAPPING = {
     "phi4-siglip": "phi4_siglip",
     "sam3_video": "sam3",
     "sam3.1_video": "sam3_1",
+    "granite-vision": "granite_vision",
+    "granite4-vision": "granite4_vision",
+    "granite4_vision": "granite4_vision",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -104,6 +107,12 @@ def get_model_and_args(config: dict):
         A tuple containing the Model class and the ModelArgs class.
     """
     model_type = config["model_type"].lower()
+
+    # Handle llava_next variants based on text model type
+    if model_type == "llava_next":
+        text_model_type = config.get("text_config", {}).get("model_type", "").lower()
+        if text_model_type == "granite":
+            model_type = "granite_vision"
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
