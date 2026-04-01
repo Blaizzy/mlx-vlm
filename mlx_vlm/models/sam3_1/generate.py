@@ -598,9 +598,7 @@ def track_video(
                 break
 
             if fi % every == 0:
-                frame_pil = Image.fromarray(
-                    cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                )
+                frame_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
                 inputs = predictor.processor.preprocess_image(frame_pil)
                 pixel_values = mx.array(inputs["pixel_values"])
 
