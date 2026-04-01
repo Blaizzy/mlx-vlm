@@ -2643,6 +2643,101 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
+    def test_granite_vision(self):
+        from mlx_vlm.models import granite_vision
+
+        text_config = granite_vision.TextConfig(
+            model_type="granite",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=1000,
+            rms_norm_eps=1e-5,
+            rope_theta=300000.0,
+            embedding_multiplier=12.0,
+            attention_multiplier=0.015625,
+            residual_multiplier=0.22,
+            logits_scaling=8.0,
+        )
+
+        vision_config = granite_vision.VisionConfig(
+            model_type="siglip_vision_model",
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            image_size=56,
+            patch_size=14,
+        )
+
+        config = granite_vision.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="granite_vision",
+            vision_feature_layer=[-2, -1],
+            vision_feature_select_strategy="full",
+        )
+
+        model = granite_vision.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+    def test_granite4_vision(self):
+        from mlx_vlm.models import granite4_vision
+
+        text_config = granite4_vision.TextConfig(
+            model_type="granitemoehybrid",
+            hidden_size=64,
+            intermediate_size=128,
+            shared_intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=1000,
+            rms_norm_eps=1e-5,
+            rope_theta=10000000.0,
+            embedding_multiplier=12.0,
+            attention_multiplier=0.015625,
+            residual_multiplier=0.22,
+            logits_scaling=10.0,
+        )
+
+        vision_config = granite4_vision.VisionConfig(
+            model_type="siglip_vision_model",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            image_size=48,
+            patch_size=16,
+        )
+
+        config = granite4_vision.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="granite4_vision",
+            deepstack_layer_map=[[-1, 0]],
+            use_spatial_sampling=False,
+            downsample_rate="3/3",
+            use_image_newline_parameter=False,
+        )
+
+        model = granite4_vision.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
@@ -3944,6 +4039,78 @@ class TestGetInputEmbeddings(unittest.TestCase):
         self.assertIsInstance(result_vis, InputEmbeddingsFeatures)
         self.assertIsNotNone(result_vis.inputs_embeds)
         self.assertIsNotNone(result_vis.attention_mask_4d)
+
+    def test_granite_vision_input_embeddings(self):
+        from mlx_vlm.models import granite_vision
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        model = granite_vision.Model(
+            granite_vision.ModelConfig(
+                text_config=granite_vision.TextConfig(
+                    model_type="granite",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    vocab_size=32,
+                    rms_norm_eps=1e-5,
+                ),
+                vision_config=granite_vision.VisionConfig(
+                    model_type="siglip_vision_model",
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                ),
+                model_type="granite_vision",
+                vision_feature_layer=-1,
+            )
+        )
+        input_ids = mx.array([[1, 2, 3, 4, 5]])
+        result = model.get_input_embeddings(input_ids)
+        self.assertIsInstance(result, InputEmbeddingsFeatures)
+        self.assertIsNotNone(result.inputs_embeds)
+
+    def test_granite4_vision_input_embeddings(self):
+        from mlx_vlm.models import granite4_vision
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        model = granite4_vision.Model(
+            granite4_vision.ModelConfig(
+                text_config=granite4_vision.TextConfig(
+                    model_type="granitemoehybrid",
+                    hidden_size=64,
+                    num_hidden_layers=1,
+                    intermediate_size=128,
+                    shared_intermediate_size=128,
+                    num_attention_heads=4,
+                    num_key_value_heads=2,
+                    vocab_size=32,
+                    rms_norm_eps=1e-5,
+                ),
+                vision_config=granite4_vision.VisionConfig(
+                    model_type="siglip_vision_model",
+                    hidden_size=64,
+                    intermediate_size=128,
+                    num_hidden_layers=1,
+                    num_attention_heads=4,
+                    image_size=32,
+                    patch_size=16,
+                ),
+                model_type="granite4_vision",
+                deepstack_layer_map=[[-1, 0]],
+                use_spatial_sampling=False,
+                downsample_rate="2/2",
+                use_image_newline_parameter=False,
+            )
+        )
+        input_ids = mx.array([[1, 2, 3, 4, 5]])
+        result = model.get_input_embeddings(input_ids)
+        self.assertIsInstance(result, InputEmbeddingsFeatures)
+        self.assertIsNotNone(result.inputs_embeds)
 
 
 class TestChunkedPrefillRoPE(unittest.TestCase):
