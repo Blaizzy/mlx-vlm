@@ -142,6 +142,7 @@ class LanguageModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
+        self.model_type = config.model_type
         self.model = Granite(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.logits_scaling = config.logits_scaling
