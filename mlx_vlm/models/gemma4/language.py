@@ -1,4 +1,5 @@
 from functools import partial
+from mlx.nn import RMSNorm
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -11,18 +12,6 @@ from ..base import (
 )
 from ..cache import KVCache, RotatingKVCache
 from .config import TextConfig
-
-
-class RMSNorm(nn.Module):
-    """Gemma4 RMSNorm: weight applied directly (no scale_shift offset)."""
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = mx.ones((dim,))
-        self.eps = eps
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
 class RMSNormNoScale(nn.Module):
