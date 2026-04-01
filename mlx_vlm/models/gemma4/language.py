@@ -14,7 +14,7 @@ from .config import TextConfig
 
 
 class RMSNorm(nn.Module):
-    """Gemma4 RMSNorm with scale_shift=1.0 (weight + 1.0)."""
+    """Gemma4 RMSNorm: weight applied directly (no scale_shift offset)."""
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -22,7 +22,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
+        return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
 class RMSNormNoScale(nn.Module):

@@ -10,7 +10,7 @@ from .config import VisionConfig
 class ClippableLinear(nn.Module):
     """Linear layer with optional input/output clamping.
 
-    Matches PyTorch's Gemma4ClippableLinear: clamp input, linear, clamp output.
+    Matches PyTorch's Gemma4ClippableLinear: wraps nn.Linear, clamps input/output.
     Clip bounds are stored as buffers in the checkpoint (scalar tensors).
     Initialized to ±inf so clamping is a no-op until real values are loaded.
     When use_clipping=False, behaves as a standard nn.Linear (no clip params).
@@ -24,11 +24,7 @@ class ClippableLinear(nn.Module):
         use_clipping: bool = True,
     ):
         super().__init__()
-        self.weight = mx.zeros((out_features, in_features))
-        if bias:
-            self.bias = mx.zeros((out_features,))
-        else:
-            self.bias = None
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
         self.use_clipping = use_clipping
         if use_clipping:
             self.input_min = mx.array(float("-inf"))
@@ -39,9 +35,7 @@ class ClippableLinear(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         if self.use_clipping:
             x = mx.clip(x, self.input_min, self.input_max)
-        x = x @ self.weight.T
-        if self.bias is not None:
-            x = x + self.bias
+        x = self.linear(x)
         if self.use_clipping:
             x = mx.clip(x, self.output_min, self.output_max)
         return x
@@ -53,21 +47,21 @@ def one_hot(indices: mx.array, num_classes: int) -> mx.array:
 
 
 class VisionRMSNorm(nn.Module):
-    """RMS normalization with learned scale: normed * (1 + weight).
+    """RMS normalization with learned scale: normed * weight.
 
-    Matches PyTorch Gemma4RMSNorm(scale_shift=1.0): full float32 computation.
+    Matches PyTorch Gemma4RMSNorm(with_scale=True): full float32 computation.
     """
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = mx.zeros((dim,))
+        self.weight = mx.ones((dim,))
 
     def __call__(self, x: mx.array) -> mx.array:
         x_float = x.astype(mx.float32)
         var = mx.mean(x_float**2, axis=-1, keepdims=True)
         normed = x_float * mx.rsqrt(var + self.eps)
-        result = normed * (1.0 + self.weight.astype(mx.float32))
+        result = normed * self.weight.astype(mx.float32)
         return result.astype(x.dtype)
 
 
@@ -88,7 +82,7 @@ class VisionRMSNormNoScale(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    """Standard Gemma4 RMSNorm with scale_shift=1.0."""
+    """Standard Gemma4 RMSNorm: weight applied directly."""
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -96,7 +90,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
+        return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
 def _rotate_half(x):
@@ -171,11 +165,9 @@ class VisionAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
-        self.rope_base_frequency = config.rope_parameters["full_attention"][
-            "rope_theta"
-        ]
+        self.rope_base_frequency = config.rope_parameters["rope_theta"]
 
-        clip = getattr(config, "use_clipped_linears", True)
+        clip = getattr(config, "use_clipped_linears", False)
         self.q_proj = ClippableLinear(
             self.hidden_size,
             self.num_heads * self.head_dim,
@@ -203,7 +195,6 @@ class VisionAttention(nn.Module):
 
         self.q_norm = VisionRMSNorm(self.head_dim)
         self.k_norm = VisionRMSNorm(self.head_dim)
-        # v_norm is parameter-free (no weights in checkpoint)
         self._v_norm = VisionRMSNormNoScale()
 
     def __call__(
@@ -243,7 +234,7 @@ class VisionAttention(nn.Module):
 class VisionMLP(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
-        clip = getattr(config, "use_clipped_linears", True)
+        clip = getattr(config, "use_clipped_linears", False)
         self.gate_proj = ClippableLinear(
             config.hidden_size, config.intermediate_size, bias=False, use_clipping=clip
         )
@@ -414,6 +405,10 @@ class VisionModel(nn.Module):
         self.encoder = VisionTransformerModel(config)
         self.pooler = VisionPooler(config)
 
+        if config.standardize:
+            self.std_bias = mx.zeros((config.hidden_size,))
+            self.std_scale = mx.ones((config.hidden_size,))
+
     def _patch_positions(self, pixel_values):
         B, C, H, W = pixel_values.shape
         pH = H // self.patch_size
@@ -497,6 +492,10 @@ class VisionModel(nn.Module):
             all_real.append(pooled[i, :n_valid])
 
         hidden_states = mx.concatenate(all_real, axis=0)[None]  # [1, total_real, dim]
+
+        if self.config.standardize:
+            hidden_states = (hidden_states - self.std_bias) * self.std_scale
+
         return hidden_states
 
     @staticmethod

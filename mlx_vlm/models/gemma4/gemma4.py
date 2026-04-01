@@ -163,7 +163,7 @@ class Model(nn.Module):
         return logits
 
     def sanitize(self, weights):
-        use_clipped = getattr(self.config.vision_config, "use_clipped_linears", True)
+        use_clipped = getattr(self.config.vision_config, "use_clipped_linears", False)
         sanitized = {}
         for k, v in weights.items():
             # Skip clipping parameters when not used

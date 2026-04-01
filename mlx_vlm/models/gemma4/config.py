@@ -6,35 +6,23 @@ from ..base import BaseModelConfig
 
 @dataclass
 class AudioConfig(BaseModelConfig):
-    input_feat_size: int = 128
     hidden_size: int = 1024
-    conf_attention_chunk_size: int = 12
-    conf_attention_context_left: int = 13
-    conf_attention_context_right: int = 0
-    conf_attention_invalid_logits_value: float = -1e9
-    conf_attention_logit_cap: float = 50.0
-    conf_num_attention_heads: int = 8
-    conf_num_hidden_layers: int = 12
-    conf_conv_kernel_size: int = 5
-    conf_positional_bias_size: int = 1024
-    conf_reduction_factor: int = 1
-    conf_residual_weight: float = 0.5
-    sscp_conv_channel_size: tuple = (128, 32)
-    sscp_conv_eps: float = 1e-6
-    sscp_conv_group_norm_eps: float = 1e-6
-    sscp_conv_kernel_size: tuple = ((3, 3), (3, 3))
-    sscp_conv_stride_size: tuple = ((2, 2), (2, 2))
-    sscp_conv_norm_type: str = "layer_norm"
-    sscp_conv_padding_type: str = "semicausal"
-    sscp_conv_time_pad_top: Optional[int] = None
-    sscp_conv_time_pad_bottom: Optional[int] = None
-    streaming: bool = False
-    output_proj_dims: Optional[int] = 1536
+    num_hidden_layers: int = 12
+    num_attention_heads: int = 8
+    hidden_act: str = "silu"
+    subsampling_conv_channels: tuple = (128, 32)
+    conv_kernel_size: int = 5
+    residual_weight: float = 0.5
+    attention_chunk_size: int = 12
+    attention_context_left: int = 13
+    attention_context_right: int = 0
+    attention_logit_cap: float = 50.0
+    attention_invalid_logits_value: float = -1e9
     use_clipped_linears: bool = True
-    vocab_size: int = 128
-    vocab_offset: int = 262272
     rms_norm_eps: float = 1e-6
     gradient_clipping: float = 10000000000.0
+    output_proj_dims: Optional[int] = 1536
+
 
 
 @dataclass
@@ -59,17 +47,14 @@ class VisionConfig(BaseModelConfig):
     patch_size: int = 16
     position_embedding_size: int = 10240
     pooling_kernel_size: int = 3
-    use_clipped_linears: bool = True
-    vocab_offset: int = 262144
-    vocab_size: int = 128
+    use_clipped_linears: bool = False
+    standardize: bool = False
 
     def __post_init__(self):
         if self.layer_types is None:
             self.layer_types = ["full_attention"] * self.num_hidden_layers
         if self.rope_parameters is None:
-            self.rope_parameters = {
-                "full_attention": {"rope_theta": 100.0, "rope_type": "default"}
-            }
+            self.rope_parameters = {"rope_theta": 100.0, "rope_type": "default"}
 
 
 @dataclass
@@ -94,7 +79,6 @@ class TextConfig(BaseModelConfig):
     rope_traditional: bool = False
     partial_rotary_factor: float = 1.0
     rope_parameters: Optional[Dict] = None
-    query_pre_attn_scalar: float = 256
     sliding_window: int = 512
     sliding_window_pattern: int = 5
     _sliding_window_pattern: int = 5
@@ -103,7 +87,6 @@ class TextConfig(BaseModelConfig):
     attention_dropout: float = 0.0
     attention_k_eq_v: bool = False
     use_bidirectional_attention: Optional[str] = None
-    attn_logit_softcapping: Optional[float] = None
     final_logit_softcapping: float = 30.0
     use_double_wide_mlp: bool = True
     enable_moe_block: bool = False

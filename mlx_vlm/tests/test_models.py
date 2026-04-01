@@ -1945,7 +1945,6 @@ class TestModels(unittest.TestCase):
             sliding_window=32,
             sliding_window_pattern=3,
             final_logit_softcapping=30.0,
-            query_pre_attn_scalar=16,
         )
         vision_config = gemma4.VisionConfig(
             model_type="gemma4_vision",
@@ -2002,15 +2001,14 @@ class TestModels(unittest.TestCase):
 
         # Full model forward: text + audio tokens
         audio_config = gemma4.AudioConfig(
-            input_feat_size=16,
             hidden_size=32,
-            conf_num_hidden_layers=2,
-            conf_num_attention_heads=2,
-            conf_conv_kernel_size=3,
-            conf_attention_chunk_size=4,
-            conf_attention_context_left=5,
-            conf_attention_context_right=0,
-            sscp_conv_channel_size=(8, 4),
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            conv_kernel_size=3,
+            attention_chunk_size=4,
+            attention_context_left=5,
+            attention_context_right=0,
+            subsampling_conv_channels=(8, 4),
             output_proj_dims=32,
         )
         config_with_audio = gemma4.ModelConfig(
@@ -2025,7 +2023,7 @@ class TestModels(unittest.TestCase):
         model_audio = gemma4.Model(config_with_audio)
         aud_id = config_with_audio.audio_token_id
         input_ids_audio = mx.array([[0, aud_id, aud_id, aud_id, aud_id, 1]])
-        audio_features = mx.random.normal((1, 64, 16))
+        audio_features = mx.random.normal((1, 64, 128))
         audio_mask = mx.zeros((1, 64), dtype=mx.bool_)
         output = model_audio(
             input_ids_audio, audio_features=audio_features, audio_mask=audio_mask
@@ -2034,6 +2032,197 @@ class TestModels(unittest.TestCase):
             output.logits.shape,
             (1, 6, config_with_audio.text_config.vocab_size),
         )
+
+    def test_gemma4_moe(self):
+        """Gemma 4 MoE variant: MoE, K-eq-V, no per-layer inputs."""
+        from mlx_vlm.models import gemma4
+
+        text_config = gemma4.TextConfig(
+            model_type="gemma4_text",
+            hidden_size=32,
+            num_hidden_layers=6,
+            intermediate_size=24,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            num_global_key_value_heads=1,
+            head_dim=16,
+            global_head_dim=32,
+            rms_norm_eps=1e-6,
+            vocab_size=64,
+            hidden_size_per_layer_input=0,
+            num_kv_shared_layers=0,
+            sliding_window=32,
+            sliding_window_pattern=5,
+            final_logit_softcapping=30.0,
+            attention_k_eq_v=True,
+            enable_moe_block=True,
+            num_experts=4,
+            top_k_experts=2,
+            expert_intermediate_size=16,
+        )
+        vision_config = gemma4.VisionConfig(
+            model_type="gemma4_vision",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=16,
+            rms_norm_eps=1e-6,
+            patch_size=16,
+            pooling_kernel_size=2,
+            default_output_length=4,
+            position_embedding_size=64,
+            use_clipped_linears=False,
+        )
+        config = gemma4.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="gemma4",
+            vocab_size=64,
+            image_token_id=63,
+        )
+        model = gemma4.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            3,
+            (64, 64),
+            vision_feature_layer=0,
+            channel_first=True,
+        )
+
+        # Verify MoE layers are created
+        for layer in model.language_model.model.layers:
+            self.assertTrue(layer.enable_moe)
+            self.assertIsNotNone(layer.router)
+            self.assertIsNotNone(layer.moe)
+
+        # Verify K-eq-V on full attention layers
+        for layer in model.language_model.model.layers:
+            if layer.layer_type == "full_attention":
+                self.assertTrue(layer.self_attn.use_k_eq_v)
+                self.assertFalse(hasattr(layer.self_attn, "v_proj"))
+            else:
+                self.assertFalse(layer.self_attn.use_k_eq_v)
+
+        # Verify layer_scalar exists on all layers
+        for layer in model.language_model.model.layers:
+            self.assertIsNotNone(layer.layer_scalar)
+
+        # Full model forward: text-only
+        input_ids = mx.array([[0, 1, 2, 3]])
+        output = model(input_ids)
+        self.assertEqual(output.logits.shape, (1, 4, config.text_config.vocab_size))
+
+        # Full model forward: text + image
+        img_id = config.image_token_id
+        input_ids_with_img = mx.array([[0, img_id, img_id, img_id, img_id, 1]])
+        pixel_values = mx.random.uniform(shape=(1, 3, 64, 64))
+        output = model(input_ids_with_img, pixel_values=pixel_values)
+        self.assertEqual(output.logits.shape, (1, 6, config.text_config.vocab_size))
+
+    def test_gemma4_dense(self):
+        """Gemma 4 dense variant: K-eq-V, no per-layer inputs, no MoE."""
+        from mlx_vlm.models import gemma4
+
+        text_config = gemma4.TextConfig(
+            model_type="gemma4_text",
+            hidden_size=32,
+            num_hidden_layers=6,
+            intermediate_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            num_global_key_value_heads=1,
+            head_dim=16,
+            global_head_dim=32,
+            rms_norm_eps=1e-6,
+            vocab_size=64,
+            hidden_size_per_layer_input=0,
+            num_kv_shared_layers=0,
+            sliding_window=32,
+            sliding_window_pattern=5,
+            final_logit_softcapping=30.0,
+            attention_k_eq_v=True,
+            enable_moe_block=False,
+        )
+        vision_config = gemma4.VisionConfig(
+            model_type="gemma4_vision",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=16,
+            rms_norm_eps=1e-6,
+            patch_size=16,
+            pooling_kernel_size=2,
+            default_output_length=4,
+            position_embedding_size=64,
+            use_clipped_linears=False,
+        )
+        config = gemma4.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="gemma4",
+            vocab_size=64,
+            image_token_id=63,
+        )
+        model = gemma4.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            3,
+            (64, 64),
+            vision_feature_layer=0,
+            channel_first=True,
+        )
+
+        # Verify NO MoE layers
+        for layer in model.language_model.model.layers:
+            self.assertFalse(layer.enable_moe)
+
+        # Verify K-eq-V on full attention layers
+        for layer in model.language_model.model.layers:
+            if layer.layer_type == "full_attention":
+                self.assertTrue(layer.self_attn.use_k_eq_v)
+                self.assertFalse(hasattr(layer.self_attn, "v_proj"))
+            else:
+                self.assertFalse(layer.self_attn.use_k_eq_v)
+
+        # Verify layer_scalar exists on all layers
+        for layer in model.language_model.model.layers:
+            self.assertIsNotNone(layer.layer_scalar)
+
+        # Full model forward: text-only
+        input_ids = mx.array([[0, 1, 2, 3]])
+        output = model(input_ids)
+        self.assertEqual(output.logits.shape, (1, 4, config.text_config.vocab_size))
+
+        # Full model forward: text + image
+        img_id = config.image_token_id
+        input_ids_with_img = mx.array([[0, img_id, img_id, img_id, img_id, 1]])
+        pixel_values = mx.random.uniform(shape=(1, 3, 64, 64))
+        output = model(input_ids_with_img, pixel_values=pixel_values)
+        self.assertEqual(output.logits.shape, (1, 6, config.text_config.vocab_size))
 
     def test_deepseekocr(self):
         from mlx_vlm.models import deepseekocr
@@ -3341,7 +3530,6 @@ class TestGetInputEmbeddings(unittest.TestCase):
                     num_kv_shared_layers=0,
                     sliding_window=32,
                     sliding_window_pattern=1,
-                    query_pre_attn_scalar=8,
                 ),
                 vision_config=gemma4.VisionConfig(
                     hidden_size=16,
