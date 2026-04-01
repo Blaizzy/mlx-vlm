@@ -650,7 +650,6 @@ def main():
         python -m mlx_vlm.models.rfdetr.generate --task realtime --video traffic.mp4 --model ./rfdetr-seg-small-mlx
     """
     import argparse
-    from pathlib import Path
 
     from mlx_vlm.generate import wired_limit
     from mlx_vlm.utils import get_model_path, load_model
