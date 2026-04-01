@@ -36,6 +36,9 @@ MODEL_REMAPPING = {
     "phi4-siglip": "phi4_siglip",
     "sam3_video": "sam3",
     "sam3.1_video": "sam3_1",
+    "granite-vision": "granite_vision",
+    "granite4-vision": "granite4_vision",
+    "granite4_vision": "granite4_vision",
     "rf-detr": "rfdetr",
 }
 
