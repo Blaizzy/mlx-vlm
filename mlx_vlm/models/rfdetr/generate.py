@@ -650,9 +650,9 @@ def main():
         python -m mlx_vlm.models.rfdetr.generate --task realtime --video traffic.mp4 --model ./rfdetr-seg-small-mlx
     """
     import argparse
-    from pathlib import Path
 
-    from mlx_vlm.utils import load_model
+    from mlx_vlm.generate import wired_limit
+    from mlx_vlm.utils import get_model_path, load_model
 
     from ..sam3.generate import ANNOTATOR_PRESETS
 
@@ -703,7 +703,7 @@ def main():
         parser.error("Provide --image or --video (or use --task realtime/track)")
 
     # Load model
-    model_path = Path(args.model)
+    model_path = get_model_path(args.model)
     print(f"Loading model from {model_path}...")
     model = load_model(model_path)
     processor = RFDETRProcessor.from_pretrained(str(model_path))
@@ -735,80 +735,83 @@ def main():
         contour_thickness=args.contour_thickness,
     )
 
-    if task == "realtime" or (args.task == "realtime"):
-        source = args.video or "0"
-        predictor.predict_realtime(
-            source=source,
-            annotator=annotator,
-            task="segment" if has_seg else "detect",
-        )
-
-    elif args.image:
-        import time
-
-        image = Image.open(args.image).convert("RGB")
-
-        # Warmup
-        _ = predictor.predict(image)
-        mx.eval(mx.zeros(1))
-
-        mem_before = mx.get_peak_memory() / 1e6
-        t0 = time.perf_counter()
-        result = predictor.predict(image)
-        t1 = time.perf_counter()
-        peak_mem = mx.get_peak_memory() / 1e6
-
-        if task == "detect":
-            result = DetectionResult(
-                boxes=result.boxes,
-                scores=result.scores,
-                labels=result.labels,
-                class_names=result.class_names,
+    with wired_limit(model):
+        if task == "realtime" or (args.task == "realtime"):
+            source = args.video or "0"
+            predictor.predict_realtime(
+                source=source,
+                annotator=annotator,
+                task="segment" if has_seg else "detect",
             )
 
-        print(f"{len(result.scores)} detections:")
-        for i in range(len(result.scores)):
-            box = result.boxes[i]
-            mask_info = (
-                f"  mask_px={result.masks[i].sum()}" if result.masks is not None else ""
+        elif args.image:
+            import time
+
+            image = Image.open(args.image).convert("RGB")
+
+            # Warmup
+            _ = predictor.predict(image)
+            mx.eval(mx.zeros(1))
+
+            mem_before = mx.get_peak_memory() / 1e6
+            t0 = time.perf_counter()
+            result = predictor.predict(image)
+            t1 = time.perf_counter()
+            peak_mem = mx.get_peak_memory() / 1e6
+
+            if task == "detect":
+                result = DetectionResult(
+                    boxes=result.boxes,
+                    scores=result.scores,
+                    labels=result.labels,
+                    class_names=result.class_names,
+                )
+
+            print(f"{len(result.scores)} detections:")
+            for i in range(len(result.scores)):
+                box = result.boxes[i]
+                mask_info = (
+                    f"  mask_px={result.masks[i].sum()}"
+                    if result.masks is not None
+                    else ""
+                )
+                print(
+                    f"  {result.class_names[i]:20s} {result.scores[i]:.3f}  "
+                    f"[{box[0]:.0f},{box[1]:.0f},{box[2]:.0f},{box[3]:.0f}]{mask_info}"
+                )
+
+            print(f"\nPerformance:")
+            print(f"  Inference: {(t1-t0)*1000:.1f} ms ({1/(t1-t0):.1f} FPS)")
+            print(f"  Peak memory: {peak_mem:.1f} MB")
+
+            out_path = args.output or args.image.rsplit(".", 1)[0] + "_rfdetr.jpg"
+            scene = np.ascontiguousarray(np.array(image)[..., ::-1])
+            scene = annotator.annotate(scene, _to_annotator_result(result))
+            Image.fromarray(scene[..., ::-1]).save(out_path, quality=95)
+            print(f"Saved to {out_path}")
+
+        elif args.video or task == "track":
+            import time
+
+            mx.reset_peak_memory()
+            t_start = time.perf_counter()
+            out_path = args.output or args.video.rsplit(".", 1)[0] + "_rfdetr.mp4"
+            stats = predictor.predict_video(
+                args.video,
+                out_path,
+                show_fps=args.show_fps,
+                max_frames=args.max_frames,
+                annotator=annotator,
+                task=task,
             )
+            peak_mem = mx.get_peak_memory() / 1e6
+
             print(
-                f"  {result.class_names[i]:20s} {result.scores[i]:.3f}  "
-                f"[{box[0]:.0f},{box[1]:.0f},{box[2]:.0f},{box[3]:.0f}]{mask_info}"
+                f"{stats['total_frames']} frames in {stats['elapsed_seconds']:.1f}s "
+                f"({stats['fps']:.1f} FPS, {stats['avg_detections']:.1f} avg dets)"
             )
-
-        print(f"\nPerformance:")
-        print(f"  Inference: {(t1-t0)*1000:.1f} ms ({1/(t1-t0):.1f} FPS)")
-        print(f"  Peak memory: {peak_mem:.1f} MB")
-
-        out_path = args.output or args.image.rsplit(".", 1)[0] + "_rfdetr.jpg"
-        scene = np.ascontiguousarray(np.array(image)[..., ::-1])
-        scene = annotator.annotate(scene, _to_annotator_result(result))
-        Image.fromarray(scene[..., ::-1]).save(out_path, quality=95)
-        print(f"Saved to {out_path}")
-
-    elif args.video or task == "track":
-        import time
-
-        mx.reset_peak_memory()
-        t_start = time.perf_counter()
-        out_path = args.output or args.video.rsplit(".", 1)[0] + "_rfdetr.mp4"
-        stats = predictor.predict_video(
-            args.video,
-            out_path,
-            show_fps=args.show_fps,
-            max_frames=args.max_frames,
-            annotator=annotator,
-            task=task,
-        )
-        peak_mem = mx.get_peak_memory() / 1e6
-
-        print(
-            f"{stats['total_frames']} frames in {stats['elapsed_seconds']:.1f}s "
-            f"({stats['fps']:.1f} FPS, {stats['avg_detections']:.1f} avg dets)"
-        )
-        print(f"Peak memory: {peak_mem:.1f} MB")
-        print(f"Saved to {stats['output_path']}")
+            print(f"Peak memory: {peak_mem:.1f} MB")
+            print(f"Saved to {stats['output_path']}")
 
 
 if __name__ == "__main__":
