@@ -5,6 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
+from .anyup import AnyUp
 from .config import ModelConfig, VisionConfig
 from .language import LanguageModel, compute_pos_hw, create_falcon_perception_mask
 
@@ -77,6 +78,9 @@ class Model(nn.Module):
             )
             self.conv_segm = nn.Conv2d(
                 hidden_size, config.segm_out_dim, kernel_size=3, padding=1
+            )
+            self.itok_upsampler = AnyUp(
+                input_dim=3, qk_dim=128, num_heads=4
             )
 
     def get_input_embeddings(
@@ -270,6 +274,133 @@ class Model(nn.Module):
         pred = pred * (max_size - min_size) + min_size
         return 2.0 ** pred
 
+    def compute_segm_features(
+        self,
+        hidden_state: mx.array,
+        input_ids: mx.array,
+        pixel_values: mx.array,
+        grid_h: int,
+        grid_w: int,
+    ) -> mx.array:
+        """Extract image token hidden states and produce high-res segm features via AnyUp.
+
+        Returns: (1, H, W, segm_out_dim) high-res features at original image resolution
+        """
+        img_mask = (input_ids[0] == self.config.img_id)
+        n_img = mx.sum(img_mask).item()
+        expected = grid_h * grid_w
+        if n_img != expected:
+            raise ValueError(
+                f"Image tokens ({n_img}) != grid ({grid_h}x{grid_w}={expected})"
+            )
+
+        # Gather image hidden states
+        indices = mx.array([i for i, v in enumerate(img_mask.tolist()) if v])
+        img_features = hidden_state[0, indices]  # (n_img, D)
+        img_features = img_features.reshape(1, grid_h, grid_w, -1)  # (1, h, w, D)
+
+        # Low-res segm features
+        lr_features = self.conv_segm(img_features)  # (1, h, w, segm_out_dim)
+
+        # Upsample to high-res via AnyUp
+        if hasattr(self, "itok_upsampler"):
+            images = pixel_values
+            if images.ndim == 3:
+                images = images[None]
+
+            _, H, W, _ = images.shape
+            ps = self.config.vision_config.spatial_patch_size
+
+            # Match PyTorch pipeline: pad images and features to multiples
+            # of ps so AnyUp sees the same spatial context as training.
+            max_dim = max(H, W)
+            pad_h = ((max_dim + ps - 1) // ps) * ps
+            pad_w = pad_h
+            if pad_h != H or pad_w != W:
+                images = mx.pad(images, [(0, 0), (0, pad_h - H), (0, pad_w - W), (0, 0)])
+                gh_pad = pad_h // ps
+                gw_pad = pad_w // ps
+                lr_features = mx.pad(
+                    lr_features,
+                    [(0, 0), (0, gh_pad - grid_h), (0, gw_pad - grid_w), (0, 0)],
+                )
+
+            hr_features = self.itok_upsampler(images, lr_features)
+
+            # Crop back to actual image region
+            if pad_h != H or pad_w != W:
+                hr_features = hr_features[:, :H, :W, :]
+
+            return hr_features
+
+        return lr_features
+
+    @staticmethod
+    def _bilinear_upsample(x: mx.array, out_h: int, out_w: int) -> mx.array:
+        """Bilinear upsample a 2D array from (h, w) to (out_h, out_w)."""
+        in_h, in_w = x.shape
+
+        # Map output coords to input space (align_corners=False style)
+        y = (mx.arange(out_h).astype(mx.float32) + 0.5) * (in_h / out_h) - 0.5
+        xc = (mx.arange(out_w).astype(mx.float32) + 0.5) * (in_w / out_w) - 0.5
+
+        y = mx.clip(y, 0, in_h - 1.0)
+        xc = mx.clip(xc, 0, in_w - 1.0)
+
+        y0 = mx.floor(y).astype(mx.int32)
+        x0 = mx.floor(xc).astype(mx.int32)
+        y1 = mx.minimum(y0 + 1, in_h - 1)
+        x1 = mx.minimum(x0 + 1, in_w - 1)
+
+        wy = (y - y0.astype(mx.float32))[:, None]  # (out_h, 1)
+        wx = (xc - x0.astype(mx.float32))[None, :]  # (1, out_w)
+
+        val_00 = x[y0][:, x0]
+        val_01 = x[y0][:, x1]
+        val_10 = x[y1][:, x0]
+        val_11 = x[y1][:, x1]
+
+        return (
+            (1 - wy) * (1 - wx) * val_00
+            + (1 - wy) * wx * val_01
+            + wy * (1 - wx) * val_10
+            + wy * wx * val_11
+        )
+
+    def decode_segm_mask(
+        self,
+        seg_hidden: mx.array,
+        segm_features: mx.array,
+        orig_h: int,
+        orig_w: int,
+        threshold: float = 0.5,
+    ) -> mx.array:
+        """Decode a segmentation mask from a seg token's hidden state.
+
+        Args:
+            seg_hidden: (D,) hidden state at the seg token position
+            segm_features: (1, feat_h, feat_w, segm_out_dim) from compute_segm_features
+            orig_h, orig_w: original image dimensions
+            threshold: sigmoid threshold for binary mask
+
+        Returns: (orig_h, orig_w) binary mask
+        """
+        seg_token = self.proj_segm(seg_hidden)  # (segm_out_dim,)
+
+        # Dot product: features (feat_h, feat_w, D) x token (D,) → (feat_h, feat_w)
+        mask_logits = mx.sum(
+            segm_features[0] * seg_token[None, None, :], axis=-1
+        )
+
+        feat_h, feat_w = mask_logits.shape
+        if feat_h == orig_h and feat_w == orig_w:
+            # High-res features from AnyUp - no upsampling needed
+            return mx.sigmoid(mask_logits) > threshold
+
+        # Low-res fallback - bilinear upsample
+        upsampled = self._bilinear_upsample(mask_logits, orig_h, orig_w)
+        return mx.sigmoid(upsampled) > threshold
+
     @property
     def last_hidden_state(self) -> Optional[mx.array]:
         return self.language_model.model._last_hidden_state
@@ -304,14 +435,107 @@ class Model(nn.Module):
             **kwargs,
         )
 
+    @staticmethod
+    def _remap_anyup_key(suffix):
+        """Remap a PyTorch itok_upsampler weight key suffix to MLX AnyUp naming."""
+        import re
+
+        # ResBlock: block.<idx>.<param> → <mapped>
+        # PyTorch Sequential indices: 0=GroupNorm, 1=SiLU, 2=Conv2d, 3=GroupNorm, 4=SiLU, 5=Conv2d
+        BLOCK_MAP = {
+            "0.weight": "norm1.weight", "0.bias": "norm1.bias",
+            "2.weight": "conv1.weight",
+            "3.weight": "norm2.weight", "3.bias": "norm2.bias",
+            "5.weight": "conv2.weight",
+        }
+
+        # Encoder pattern: <enc>.<seq_idx>.block.<block_param> or <enc>.<seq_idx>.weight
+        ENCODERS = [
+            "image_encoder", "key_encoder", "query_encoder", "aggregation",
+        ]
+        for enc in ENCODERS:
+            if not suffix.startswith(enc + "."):
+                continue
+            rest = suffix[len(enc) + 1:]
+            # First layer (Conv2d): "0.weight"
+            if rest == "0.weight":
+                return enc + ".conv.weight"
+            # ResBlock layers: "<n>.block.<idx>.<param>"
+            m = re.match(r"(\d+)\.block\.(.+)", rest)
+            if m:
+                block_idx = int(m.group(1)) - 1  # PyTorch 1-indexed → 0-indexed
+                block_param = BLOCK_MAP.get(m.group(2))
+                if block_param:
+                    return f"{enc}.blocks.{block_idx}.{block_param}"
+            # Shortcut: "<n>.shortcut.weight"
+            m = re.match(r"(\d+)\.shortcut\.weight", rest)
+            if m:
+                block_idx = int(m.group(1)) - 1
+                return f"{enc}.blocks.{block_idx}.shortcut.weight"
+
+        # key_features_encoder (LFU + ResBlocks)
+        if suffix.startswith("key_features_encoder."):
+            rest = suffix[len("key_features_encoder."):]
+            if rest == "0.basis":
+                return "key_features_encoder.lfu.basis"
+            m = re.match(r"(\d+)\.block\.(.+)", rest)
+            if m:
+                block_idx = int(m.group(1)) - 1
+                block_param = BLOCK_MAP.get(m.group(2))
+                if block_param:
+                    return f"key_features_encoder.blocks.{block_idx}.{block_param}"
+
+        # cross_decode
+        if suffix == "cross_decode.conv2d.weight":
+            return "cross_decode.conv.weight"
+        if suffix == "cross_decode.cross_attn.norm_q.weight":
+            return "cross_decode.cross_attn.norm_q.weight"
+        if suffix == "cross_decode.cross_attn.norm_k.weight":
+            return "cross_decode.cross_attn.norm_k.weight"
+        # in_proj_weight/bias handled separately (needs split)
+        if suffix.startswith("cross_decode.cross_attn.attention.in_proj_"):
+            return suffix  # handled by caller
+
+        # rope
+        if suffix == "rope.freqs":
+            return "rope.freqs"
+
+        return None
+
     def sanitize(self, weights):
         new_weights = {}
+        anyup_attn_weight = None
+        anyup_attn_bias = None
+
         for k, v in weights.items():
-            # Skip itok_upsampler (AnyUp) weights - segmentation upsampler
-            # not needed for text generation
+            # --- AnyUp weights ---
             if k.startswith("itok_upsampler."):
+                suffix = k[len("itok_upsampler."):]
+
+                # Collect attention in_proj for splitting later
+                if suffix == "cross_decode.cross_attn.attention.in_proj_weight":
+                    anyup_attn_weight = v
+                    continue
+                if suffix == "cross_decode.cross_attn.attention.in_proj_bias":
+                    anyup_attn_bias = v
+                    continue
+
+                new_suffix = self._remap_anyup_key(suffix)
+                if new_suffix is None:
+                    continue
+                new_key = "itok_upsampler." + new_suffix
+
+                # Transpose Conv2d weights: PyTorch [O,I,H,W] → MLX [O,H,W,I]
+                if v.ndim == 4 and "norm" not in new_key and "basis" not in new_key:
+                    v = v.transpose(0, 2, 3, 1)
+                # LFU basis: PyTorch (out_ch, 1, k, k) → MLX (out_ch, k, k, 1)
+                if "lfu.basis" in new_key:
+                    v = v.transpose(0, 2, 3, 1)
+
+                new_weights[new_key] = v
                 continue
 
+            # --- Standard backbone weights ---
             new_key = k
 
             if k.startswith("tok_embeddings."):
@@ -341,6 +565,17 @@ class Model(nn.Module):
                 v = v.transpose(0, 2, 3, 1)
 
             new_weights[new_key] = v
+
+        # Split AnyUp attention in_proj into q_proj and k_proj
+        # in_proj_weight is (3*qk_dim, qk_dim) = (out, in), same layout as nn.Linear
+        if anyup_attn_weight is not None:
+            w_q, w_k, _ = mx.split(anyup_attn_weight, 3, axis=0)
+            new_weights["itok_upsampler.cross_decode.cross_attn.q_proj.weight"] = w_q
+            new_weights["itok_upsampler.cross_decode.cross_attn.k_proj.weight"] = w_k
+        if anyup_attn_bias is not None:
+            b_q, b_k, _ = mx.split(anyup_attn_bias, 3, axis=0)
+            new_weights["itok_upsampler.cross_decode.cross_attn.q_proj.bias"] = b_q
+            new_weights["itok_upsampler.cross_decode.cross_attn.k_proj.bias"] = b_k
 
         new_weights["language_model.model.cos_1d"] = self.language_model.model.cos_1d
         new_weights["language_model.model.sin_1d"] = self.language_model.model.sin_1d

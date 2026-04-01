@@ -282,10 +282,14 @@ def generate_perception(
     query: str,
     max_new_tokens: int = 512,
     temperature: float = 0.0,
+    segm_threshold: float = 0.5,
 ) -> List[Dict]:
-    """Run Falcon Perception detection with proper coord/size decode loop.
+    """Run Falcon Perception detection with proper coord/size/seg decode loop.
 
-    Returns list of detections, each with 'xy' (dict x,y) and 'hw' (dict h,w).
+    Returns list of detections, each with:
+      - 'xy': dict with 'x', 'y' (center coords, normalized 0-1)
+      - 'hw': dict with 'h', 'w' (size, as fraction of image)
+      - 'mask': (H, W) binary mx.array segmentation mask (if seg token decoded)
     """
     import mlx.core as mx
     from mlx_vlm.utils import load_image as _load_image
@@ -293,6 +297,7 @@ def generate_perception(
     if not isinstance(image, Image.Image):
         image = _load_image(image)
     image = image.convert("RGB")
+    orig_w, orig_h = image.size
 
     from ..base import to_mlx
 
@@ -308,6 +313,15 @@ def generate_perception(
     seg_token_id = config.seg_token_id
     eos_id = config.eos_id
 
+    # Get grid dimensions for segmentation
+    if image_grid_hw is not None:
+        grid_h = int(image_grid_hw[0, 0].item())
+        grid_w = int(image_grid_hw[0, 1].item())
+    else:
+        ps = config.vision_config.spatial_patch_size
+        grid_h = orig_h // ps
+        grid_w = orig_w // ps
+
     from ..cache import make_prompt_cache
 
     cache = make_prompt_cache(model)
@@ -320,6 +334,16 @@ def generate_perception(
         image_grid_hw=image_grid_hw,
     )
     logits = logits_out.logits
+
+    # Compute segmentation features from prefill hidden states (via AnyUp if available)
+    segm_features = None
+    if hasattr(model, "conv_segm"):
+        prefill_hidden = model.last_hidden_state
+        if prefill_hidden is not None:
+            segm_features = model.compute_segm_features(
+                prefill_hidden, input_ids, pixel_values, grid_h, grid_w
+            )
+            mx.eval(segm_features)
 
     # After prefill, clear _position_ids so decode falls back to _rope_delta.
     # _position_ids is sized for prefill only; indexing it at decode offsets fails.
@@ -349,7 +373,7 @@ def generate_perception(
 
         token_2d = token.reshape(1, 1)
 
-        # Decode coord/size from the hidden state of the PREVIOUS step
+        # Decode coord/size/seg from the hidden state of the PREVIOUS step
         h_state = model.last_hidden_state
         h_last = h_state[:, -1:, :] if h_state is not None else None
 
@@ -370,7 +394,14 @@ def generate_perception(
             size_hw_val = mx.array([[pred_h, pred_w]])
             current_det["hw"] = {"h": pred_h, "w": pred_w}
 
-        elif token_id == seg_token_id:
+        elif token_id == seg_token_id and h_last is not None:
+            if segm_features is not None:
+                seg_hidden = h_last.reshape(-1)  # (D,)
+                mask = model.decode_segm_mask(
+                    seg_hidden, segm_features, orig_h, orig_w, segm_threshold
+                )
+                mx.eval(mask)
+                current_det["mask"] = mask
             if "xy" in current_det and "hw" in current_det:
                 detections.append(current_det)
             current_det = {}
@@ -400,7 +431,7 @@ def generate_perception(
 
 
 def plot_detections(image, detections, save_path="perception_output.png"):
-    """Plot bounding box detections on the image and save."""
+    """Plot bounding box detections and segmentation masks on the image and save."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.patches as patches
@@ -418,9 +449,22 @@ def plot_detections(image, detections, save_path="perception_output.png"):
     colors = plt.cm.Set2(np.linspace(0, 1, max(len(detections), 1)))
 
     for i, det in enumerate(detections):
+        color = colors[i % len(colors)]
         xy = det["xy"]
         hw = det["hw"]
 
+        # Draw segmentation mask if available
+        if "mask" in det:
+            import mlx.core as mx
+
+            mask_arr = det["mask"]
+            if isinstance(mask_arr, mx.array):
+                mask_arr = np.array(mask_arr)
+            mask_rgba = np.zeros((h, w, 4))
+            mask_rgba[mask_arr > 0] = [*color[:3], 0.4]
+            ax.imshow(mask_rgba)
+
+        # Draw bounding box
         cx = xy["x"] * w
         cy = xy["y"] * h
         bw = hw["w"] * w
@@ -432,14 +476,14 @@ def plot_detections(image, detections, save_path="perception_output.png"):
         rect = patches.Rectangle(
             (x0, y0), bw, bh,
             linewidth=2,
-            edgecolor=colors[i % len(colors)],
+            edgecolor=color,
             facecolor="none",
         )
         ax.add_patch(rect)
         ax.text(
             x0, y0 - 5,
             f"det {i}",
-            color=colors[i % len(colors)],
+            color=color,
             fontsize=10,
             fontweight="bold",
             bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.7),
