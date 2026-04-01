@@ -1,14 +1,31 @@
 import mlx.core as mx
 
+_HAS_METAL = mx.metal.is_available()
+
+
+def _nearest_interpolate_mlx(x, out_h, out_w):
+    """Pure-MLX nearest-neighbor interpolation (no Metal kernel)."""
+    batch_size, channels, in_h, in_w = x.shape
+
+    # PyTorch coordinate mapping: floor(out_idx * in_size / out_size)
+    y_idx = mx.floor(mx.arange(out_h, dtype=mx.float32) * (in_h / out_h)).astype(
+        mx.int32
+    )
+    x_idx = mx.floor(mx.arange(out_w, dtype=mx.float32) * (in_w / out_w)).astype(
+        mx.int32
+    )
+    y_idx = mx.clip(y_idx, 0, in_h - 1)
+    x_idx = mx.clip(x_idx, 0, in_w - 1)
+
+    return x[:, :, y_idx][:, :, :, x_idx]
+
 
 def nearest_interpolate(x, size=None, scale_factor=None):
     """
     Nearest neighbor interpolation that exactly matches PyTorch's behavior.
     """
-    # Get input dimensions
     batch_size, channels, in_h, in_w = x.shape
 
-    # Calculate output dimensions
     if size is not None:
         out_h, out_w = size
     elif scale_factor is not None:
@@ -19,6 +36,9 @@ def nearest_interpolate(x, size=None, scale_factor=None):
         out_h, out_w = int(in_h * scale_h), int(in_w * scale_w)
     else:
         raise ValueError("Either size or scale_factor must be specified")
+
+    if not _HAS_METAL:
+        return _nearest_interpolate_mlx(x, out_h, out_w)
 
     # Create dimensions tensor
     dims = mx.array([batch_size, channels, in_h, in_w, out_h, out_w], dtype=mx.int32)
@@ -67,7 +87,6 @@ def nearest_interpolate(x, size=None, scale_factor=None):
         output[output_offset] = input[input_offset];
     """
 
-    # Create and run kernel
     kernel = mx.fast.metal_kernel(
         name="nearest_interpolation",
         input_names=["input", "dims"],
@@ -88,6 +107,78 @@ def nearest_interpolate(x, size=None, scale_factor=None):
     if input_dtype != mx.float32:
         result = result.astype(input_dtype)
 
+    return result
+
+
+def _cubic_weight(t):
+    """Bicubic kernel with a=-0.5 (Keys' cubic), pure MLX."""
+    at = mx.abs(t)
+    at2 = at * at
+    at3 = at2 * at
+    a = -0.5
+    w1 = (a + 2.0) * at3 - (a + 3.0) * at2 + 1.0
+    w2 = a * at3 - 5.0 * a * at2 + 8.0 * a * at - 4.0 * a
+    return mx.where(at <= 1.0, w1, mx.where(at < 2.0, w2, mx.zeros_like(t)))
+
+
+def _bicubic_interpolate_mlx(x, out_h, out_w, align_corners=False, antialias=False):
+    """Pure-MLX bicubic interpolation (no Metal kernel)."""
+    B, C, in_h, in_w = x.shape
+    input_dtype = x.dtype
+    x = x.astype(mx.float32)
+
+    scale_h = out_h / in_h
+    scale_w = out_w / in_w
+
+    # Coordinate mapping
+    if align_corners and out_h > 1 and out_w > 1:
+        y_out = mx.arange(out_h, dtype=mx.float32) * (in_h - 1) / (out_h - 1)
+        x_out = mx.arange(out_w, dtype=mx.float32) * (in_w - 1) / (out_w - 1)
+    else:
+        y_out = (mx.arange(out_h, dtype=mx.float32) + 0.5) / out_h * in_h - 0.5
+        x_out = (mx.arange(out_w, dtype=mx.float32) + 0.5) / out_w * in_w - 0.5
+
+    # Antialiasing filter scale
+    fs_h = (1.0 / scale_h) if (antialias and scale_h < 1.0) else 1.0
+    fs_w = (1.0 / scale_w) if (antialias and scale_w < 1.0) else 1.0
+    support_h = 2.0 * fs_h
+    support_w = 2.0 * fs_w
+
+    # Build 1-D weight tables: shape (out, taps)
+    def _weights_1d(coords, in_size, fs, support):
+        start = mx.floor(coords - support).astype(mx.int32) + 1  # (out,)
+        n_taps = int(2 * support + 1)  # conservative upper bound
+        offsets = mx.arange(n_taps, dtype=mx.int32)  # (taps,)
+        pix = start[:, None] + offsets[None, :]  # (out, taps)
+        dist = coords[:, None] - pix.astype(mx.float32)  # (out, taps)
+        w = _cubic_weight(dist / fs)
+        # Zero out-of-bounds
+        mask = (pix >= 0) & (pix < in_size)
+        w = w * mask
+        pix = mx.clip(pix, 0, in_size - 1)
+        # Normalise
+        w = w / (mx.sum(w, axis=-1, keepdims=True) + 1e-8)
+        return pix, w
+
+    pix_y, wy = _weights_1d(y_out, in_h, fs_h, support_h)  # (oh, taps_h)
+    pix_x, wx = _weights_1d(x_out, in_w, fs_w, support_w)  # (ow, taps_w)
+
+    # Gather + contract along taps: height first, then width
+    # x: (B, C, in_h, in_w), pix_y: (oh, th) -> gather -> (B, C, oh, th, in_w)
+    gathered_y = x[:, :, pix_y.reshape(-1), :]  # (B, C, oh*th, in_w)
+    th = pix_y.shape[1]
+    tw = pix_x.shape[1]
+    gathered_y = gathered_y.reshape(B, C, out_h, th, in_w)
+    # Weight along height taps
+    tmp = mx.sum(gathered_y * wy[None, None, :, :, None], axis=3)  # (B,C,oh,in_w)
+
+    # Now width: gather columns
+    gathered_x = tmp[:, :, :, pix_x.reshape(-1)]  # (B, C, oh, ow*tw)
+    gathered_x = gathered_x.reshape(B, C, out_h, out_w, tw)
+    result = mx.sum(gathered_x * wx[None, None, None, :, :], axis=4)  # (B,C,oh,ow)
+
+    if input_dtype != mx.float32:
+        result = result.astype(input_dtype)
     return result
 
 
@@ -122,6 +213,9 @@ def bicubic_interpolate(
         out_h, out_w = int(in_h * scale_h), int(in_w * scale_w)
     else:
         raise ValueError("Either size or scale_factor must be specified")
+
+    if not _HAS_METAL:
+        return _bicubic_interpolate_mlx(x, out_h, out_w, align_corners, antialias)
 
     # Calculate antialiasing parameters
     # PyTorch uses support = 2.0 for bicubic when antialiasing
@@ -315,6 +409,52 @@ def bicubic_interpolate(
     return result
 
 
+def _grid_sample_mlx(x, grid):
+    """Pure-MLX bilinear grid sample (no Metal kernel).
+
+    x: (B, H, W, C)  — channel-last
+    grid: (B, gN, gM, 2) — normalised [-1, 1]
+    """
+    B, H, W, C = x.shape
+    _, gN, gM, _ = grid.shape
+
+    # Unnormalise grid to pixel coords
+    ix = ((grid[..., 0] + 1) * W - 1) / 2  # (B, gN, gM)
+    iy = ((grid[..., 1] + 1) * H - 1) / 2
+
+    ix0 = mx.floor(ix).astype(mx.int32)
+    iy0 = mx.floor(iy).astype(mx.int32)
+    ix1 = ix0 + 1
+    iy1 = iy0 + 1
+
+    # Bilinear weights
+    wa = ((ix1.astype(mx.float32) - ix) * (iy1.astype(mx.float32) - iy))[..., None]
+    wb = ((ix - ix0.astype(mx.float32)) * (iy1.astype(mx.float32) - iy))[..., None]
+    wc = ((ix1.astype(mx.float32) - ix) * (iy - iy0.astype(mx.float32)))[..., None]
+    wd = ((ix - ix0.astype(mx.float32)) * (iy - iy0.astype(mx.float32)))[..., None]
+
+    def _gather(yy, xx):
+        valid = (yy >= 0) & (yy < H) & (xx >= 0) & (xx < W)  # (B, gN, gM)
+        yy_c = mx.clip(yy, 0, H - 1)
+        xx_c = mx.clip(xx, 0, W - 1)
+        # Flatten spatial dims for take_along_axis
+        idx = (yy_c * W + xx_c).reshape(B, -1)  # (B, gN*gM)
+        x_flat = x.reshape(B, H * W, C)
+        # Gather
+        b_idx = mx.arange(B)[:, None]
+        vals = x_flat[b_idx, idx]  # (B, gN*gM, C)
+        vals = vals.reshape(B, gN, gM, C)
+        return vals * valid[..., None]
+
+    out = (
+        wa * _gather(iy0, ix0)
+        + wb * _gather(iy0, ix1)
+        + wc * _gather(iy1, ix0)
+        + wd * _gather(iy1, ix1)
+    )
+    return out
+
+
 def grid_sample(x, grid):
     """
     Grid sample using MLX's built-in interpolate function.
@@ -334,6 +474,9 @@ def grid_sample(x, grid):
     out_shape = (B, gN, gM, C)
 
     assert D == 2, "Last dim of `grid` must be size 2."
+
+    if not _HAS_METAL:
+        return _grid_sample_mlx(x, grid)
 
     source = """
         uint elem = thread_position_in_grid.x;

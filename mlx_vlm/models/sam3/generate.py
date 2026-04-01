@@ -1049,6 +1049,7 @@ def track_video(
     """Track objects in a video file."""
     import cv2
 
+    from mlx_vlm.generate import wired_limit
     from mlx_vlm.models.sam3.processing_sam3 import Sam3Processor
     from mlx_vlm.utils import get_model_path, load_model
 
@@ -1109,59 +1110,60 @@ def track_video(
 
     t_start = _time.perf_counter()
 
-    for fi in range(total_frames):
-        ret, frame_bgr = cap.read()
-        if not ret:
-            break
+    with wired_limit(model):
+        for fi in range(total_frames):
+            ret, frame_bgr = cap.read()
+            if not ret:
+                break
 
-        if fi % every == 0:
-            frame_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-            inputs = predictor.processor.preprocess_image(frame_pil)
-            pixel_values = mx.array(inputs["pixel_values"])
+            if fi % every == 0:
+                frame_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+                inputs = predictor.processor.preprocess_image(frame_pil)
+                pixel_values = mx.array(inputs["pixel_values"])
 
-            if detect_count % backbone_every == 0 or backbone_cache is None:
-                backbone_cache = _get_backbone_features(model, pixel_values)
-                encoder_cache.clear()
+                if detect_count % backbone_every == 0 or backbone_cache is None:
+                    backbone_cache = _get_backbone_features(model, pixel_values)
+                    encoder_cache.clear()
 
-            result = _detect_with_backbone(
-                predictor,
-                backbone_cache,
-                prompts,
-                frame_pil.size,
-                threshold,
-                encoder_cache=encoder_cache,
-            )
-            if box_array is not None and len(result.scores) > 0:
-                result = _filter_by_regions(result, box_array)
-            latest_result = id_tracker.update(result)
-            detect_count += 1
-
-            if fi % 40 == 0:
-                elapsed = _time.perf_counter() - t_start
-                fps_actual = (fi + 1) / elapsed if elapsed > 0 else 0
-                print(
-                    f"  Frame {fi}/{total_frames}: {len(latest_result.scores)} det, "
-                    f"{fps_actual:.1f} fps"
+                result = _detect_with_backbone(
+                    predictor,
+                    backbone_cache,
+                    prompts,
+                    frame_pil.size,
+                    threshold,
+                    encoder_cache=encoder_cache,
                 )
+                if box_array is not None and len(result.scores) > 0:
+                    result = _filter_by_regions(result, box_array)
+                latest_result = id_tracker.update(result)
+                detect_count += 1
 
-        if annotator_name and len(latest_result.scores) > 0:
-            ann = build_annotator(
-                annotator_name, opacity=opacity, contour_thickness=contour_thickness
-            )
-            out = ann.annotate(frame_bgr, latest_result)
-        else:
-            out = draw_frame(
-                frame_bgr,
-                latest_result.masks,
-                latest_result.scores,
-                latest_result.boxes,
-                prompt_str,
-                H,
-                W,
-                show_boxes=show_boxes,
-                labels=latest_result.labels,
-            )
-        writer.write(out)
+                if fi % 40 == 0:
+                    elapsed = _time.perf_counter() - t_start
+                    fps_actual = (fi + 1) / elapsed if elapsed > 0 else 0
+                    print(
+                        f"  Frame {fi}/{total_frames}: {len(latest_result.scores)} det, "
+                        f"{fps_actual:.1f} fps"
+                    )
+
+            if annotator_name and len(latest_result.scores) > 0:
+                ann = build_annotator(
+                    annotator_name, opacity=opacity, contour_thickness=contour_thickness
+                )
+                out = ann.annotate(frame_bgr, latest_result)
+            else:
+                out = draw_frame(
+                    frame_bgr,
+                    latest_result.masks,
+                    latest_result.scores,
+                    latest_result.boxes,
+                    prompt_str,
+                    H,
+                    W,
+                    show_boxes=show_boxes,
+                    labels=latest_result.labels,
+                )
+            writer.write(out)
 
     writer.release()
     cap.release()
@@ -1193,6 +1195,7 @@ def track_video_realtime(
 
     import cv2
 
+    from mlx_vlm.generate import wired_limit
     from mlx_vlm.models.sam3.processing_sam3 import Sam3Processor
     from mlx_vlm.utils import get_model_path, load_model
 
@@ -1353,71 +1356,73 @@ def track_video_realtime(
 
             inference_count += 1
 
-    # Start threads
-    reader_thread = threading.Thread(target=reader_loop, daemon=True)
-    inference_thread = threading.Thread(target=inference_loop, daemon=True)
-    reader_thread.start()
-    inference_thread.start()
+    # Start threads with wired limit for GPU memory management
+    with wired_limit(model):
+        reader_thread = threading.Thread(target=reader_loop, daemon=True)
+        inference_thread = threading.Thread(target=inference_loop, daemon=True)
+        reader_thread.start()
+        inference_thread.start()
 
-    display_fps_counter = 0
-    display_fps_t0 = time.perf_counter()
-    display_fps_val = 0.0
+        display_fps_counter = 0
+        display_fps_t0 = time.perf_counter()
+        display_fps_val = 0.0
 
-    if annotator_name:
-        display_ann = build_annotator(
-            annotator_name, opacity=opacity, contour_thickness=contour_thickness
-        )
-    else:
-        from mlx_vlm.models.sam3.annotators import (
-            BoxAnnotator,
-            LabelAnnotator,
-            MaskAnnotator,
-        )
-
-        display_ann = MaskAnnotator() + BoxAnnotator() + LabelAnnotator()
-
-    while True:
-        try:
-            frame_bgr = frame_buffer.get(timeout=0.05)
-        except queue.Empty:
-            continue
-
-        with lock:
-            result = latest["result"]
-            det_fps = latest["fps"]
-            n_obj = latest["n_obj"]
-
-        if len(result.scores) > 0:
-            out = display_ann.annotate(frame_bgr.copy(), result)
+        if annotator_name:
+            display_ann = build_annotator(
+                annotator_name, opacity=opacity, contour_thickness=contour_thickness
+            )
         else:
-            out = frame_bgr
+            from mlx_vlm.models.sam3.annotators import (
+                BoxAnnotator,
+                LabelAnnotator,
+                MaskAnnotator,
+            )
 
-        # Measure display FPS
-        display_fps_counter += 1
-        now = time.perf_counter()
-        if now - display_fps_t0 >= 0.5:
-            display_fps_val = display_fps_counter / (now - display_fps_t0)
-            display_fps_counter = 0
-            display_fps_t0 = now
+            display_ann = MaskAnnotator() + BoxAnnotator() + LabelAnnotator()
 
-        cv2.putText(
-            out,
-            f"Detect: {det_fps:.1f} FPS | Display: {display_fps_val:.0f} FPS | {n_obj} obj",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 0),
-            2,
-        )
+        while True:
+            try:
+                frame_bgr = frame_buffer.get(timeout=0.05)
+            except queue.Empty:
+                continue
 
-        cv2.imshow(f"SAM3 Tracking - {prompt_str}", out)
+            with lock:
+                result = latest["result"]
+                det_fps = latest["fps"]
+                n_obj = latest["n_obj"]
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
+            if len(result.scores) > 0:
+                out = display_ann.annotate(frame_bgr.copy(), result)
+            else:
+                out = frame_bgr
 
-    running["active"] = False
-    thread.join(timeout=2)
+            # Measure display FPS
+            display_fps_counter += 1
+            now = time.perf_counter()
+            if now - display_fps_t0 >= 0.5:
+                display_fps_val = display_fps_counter / (now - display_fps_t0)
+                display_fps_counter = 0
+                display_fps_t0 = now
+
+            cv2.putText(
+                out,
+                f"Detect: {det_fps:.1f} FPS | Display: {display_fps_val:.0f} FPS | {n_obj} obj",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2,
+            )
+
+            cv2.imshow(f"SAM3 Tracking - {prompt_str}", out)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+
+        running["active"] = False
+        inference_thread.join(timeout=2)
+
     cap.release()
     cv2.destroyAllWindows()
     print("Done")
@@ -1568,6 +1573,8 @@ def run_image(
     """Run detection or segmentation on an image."""
     import cv2
 
+    from mlx_vlm.generate import wired_limit
+
     suffix = "_detected" if task == "detect" else "_segmented"
     if output is None:
         p = Path(image_path)
@@ -1581,7 +1588,8 @@ def run_image(
     print(f"Image: {W}x{H}")
     print(f"Task: {task}, prompts: {prompts}, threshold {threshold}")
 
-    result = predict_multi(predictor, image, prompts, boxes=box_array)
+    with wired_limit(predictor.model):
+        result = predict_multi(predictor, image, prompts, boxes=box_array)
     if box_array is not None and len(result.scores) > 0:
         result = _filter_by_regions(result, box_array)
 
