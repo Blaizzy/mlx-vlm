@@ -653,7 +653,7 @@ def main():
     from pathlib import Path
 
     from mlx_vlm.generate import wired_limit
-    from mlx_vlm.utils import load_model
+    from mlx_vlm.utils import get_model_path, load_model
 
     from ..sam3.generate import ANNOTATOR_PRESETS
 
@@ -704,7 +704,7 @@ def main():
         parser.error("Provide --image or --video (or use --task realtime/track)")
 
     # Load model
-    model_path = Path(args.model)
+    model_path = get_model_path(args.model)
     print(f"Loading model from {model_path}...")
     model = load_model(model_path)
     processor = RFDETRProcessor.from_pretrained(str(model_path))
