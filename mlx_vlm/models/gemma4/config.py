@@ -93,7 +93,7 @@ class TextConfig(BaseModelConfig):
     use_second_mlp_block: bool = False
     num_experts: Optional[int] = None
     top_k_experts: Optional[int] = None
-    expert_intermediate_size: Optional[int] = None
+    moe_intermediate_size: Optional[int] = None
     layer_types: Optional[List[str]] = None
     tie_word_embeddings: bool = True
 

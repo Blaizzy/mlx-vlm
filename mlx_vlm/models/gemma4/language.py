@@ -82,6 +82,7 @@ class Router(nn.Module):
         self.norm = RMSNormNoScale(config.hidden_size, eps=config.rms_norm_eps)
         self.proj = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.scale = mx.ones((config.hidden_size,))
+        self.per_expert_scale = mx.ones((config.num_experts,))
         self._root_size = config.hidden_size**-0.5
 
     def __call__(self, x: mx.array):
@@ -98,6 +99,7 @@ class Router(nn.Module):
 
         top_k_weights = mx.take_along_axis(router_probs, top_k_indices, axis=-1)
         top_k_weights = top_k_weights / mx.sum(top_k_weights, axis=-1, keepdims=True)
+        top_k_weights = top_k_weights * self.per_expert_scale[top_k_indices]
         return top_k_indices, top_k_weights
 
 
@@ -108,7 +110,7 @@ class GeGLU(nn.Module):
         return nn.gelu_approx(gate) * x
 
 
-class MoEBlock(nn.Module):
+class Experts(nn.Module):
     """Sparse MoE using mlx_lm SwitchGLU with gather_mm."""
 
     def __init__(self, config: TextConfig):
@@ -117,12 +119,11 @@ class MoEBlock(nn.Module):
 
         self.switch_glu = SwitchGLU(
             input_dims=config.hidden_size,
-            hidden_dims=config.expert_intermediate_size,
+            hidden_dims=config.moe_intermediate_size,
             num_experts=config.num_experts,
             activation=GeGLU(),
             bias=False,
         )
-        self.per_expert_scale = mx.ones((config.num_experts,))
 
     def __call__(
         self, x: mx.array, top_k_indices: mx.array, top_k_weights: mx.array
@@ -135,8 +136,7 @@ class MoEBlock(nn.Module):
 
         expert_out = self.switch_glu(x_flat, indices_flat)
 
-        expert_scales = self.per_expert_scale[indices_flat]
-        weights = (top_k_weights.reshape(B * S, K) * expert_scales)[..., None]
+        weights = top_k_weights.reshape(B * S, K)[..., None]
         return (expert_out * weights).sum(axis=-2).reshape(B, S, H)
 
 
@@ -292,7 +292,7 @@ class DecoderLayer(nn.Module):
         self.enable_moe = getattr(config, "enable_moe_block", False)
         if self.enable_moe:
             self.router = Router(config)
-            self.moe = MoEBlock(config)
+            self.experts = Experts(config)
             self.post_feedforward_layernorm_1 = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
@@ -349,7 +349,7 @@ class DecoderLayer(nn.Module):
 
             top_k_indices, top_k_weights = self.router(h)
             h2 = self.pre_feedforward_layernorm_2(h)
-            h2 = self.moe(h2, top_k_indices, top_k_weights)
+            h2 = self.experts(h2, top_k_indices, top_k_weights)
             h2 = self.post_feedforward_layernorm_2(h2)
 
             h = h1 + h2

@@ -2058,7 +2058,7 @@ class TestModels(unittest.TestCase):
             enable_moe_block=True,
             num_experts=4,
             top_k_experts=2,
-            expert_intermediate_size=16,
+            moe_intermediate_size=16,
         )
         vision_config = gemma4.VisionConfig(
             model_type="gemma4_vision",
@@ -2105,7 +2105,7 @@ class TestModels(unittest.TestCase):
         for layer in model.language_model.model.layers:
             self.assertTrue(layer.enable_moe)
             self.assertIsNotNone(layer.router)
-            self.assertIsNotNone(layer.moe)
+            self.assertIsNotNone(layer.experts)
 
         # Verify K-eq-V on full attention layers
         for layer in model.language_model.model.layers:

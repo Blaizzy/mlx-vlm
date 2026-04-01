@@ -77,15 +77,12 @@ class Model(nn.Module):
         input_features_mask: Optional[mx.array] = None,
         **kwargs,
     ):
-        # Support both naming conventions
         if input_features is not None and audio_features is None:
             audio_features = input_features
         if input_features_mask is not None and audio_mask is None:
-
             audio_mask = ~input_features_mask.astype(mx.bool_)
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Compute per-layer inputs for text tokens only (exclude image/audio tokens)
         per_layer_inputs = None
         if self.language_model.model.hidden_size_per_layer_input:
             image_mask_ids = input_ids == self.config.image_token_id
@@ -98,7 +95,6 @@ class Model(nn.Module):
                 per_layer_inputs_tokens
             )
 
-        # Scatter vision features
         if pixel_values is not None:
             image_features = self.vision_tower(pixel_values)
             image_features = self.embed_vision(image_features)
@@ -199,15 +195,21 @@ class Model(nn.Module):
             if "depthwise_conv1d.weight" in new_key and v.ndim == 3:
                 v = v.transpose(0, 2, 1)
 
-            # MoE: remap moe.{proj} -> moe.switch_glu.{proj}.weight
-            # handle fused gate_up_proj
-            if new_key.endswith(".moe.down_proj"):
+            # MoE: experts.down_proj -> experts.switch_glu.down_proj.weight
+            # experts.gate_up_proj -> split into switch_glu.gate_proj + switch_glu.up_proj
+            if new_key.endswith(".experts.down_proj"):
                 new_key = new_key.replace(
-                    ".moe.down_proj", ".moe.switch_glu.down_proj.weight"
+                    ".experts.down_proj", ".experts.switch_glu.down_proj.weight"
                 )
-            if new_key.endswith(".moe.gate_up_proj"):
-                gate_key = new_key.replace("gate_up_proj", "switch_glu.gate_proj.weight")
-                up_key = new_key.replace("gate_up_proj", "switch_glu.up_proj.weight")
+            if new_key.endswith(".experts.gate_up_proj"):
+                gate_key = new_key.replace(
+                    ".experts.gate_up_proj",
+                    ".experts.switch_glu.gate_proj.weight",
+                )
+                up_key = new_key.replace(
+                    ".experts.gate_up_proj",
+                    ".experts.switch_glu.up_proj.weight",
+                )
 
                 v = v.swapaxes(-1, -2)
                 mid_dim = v.shape[-1] // 2
