@@ -31,7 +31,9 @@ class Blip2QFormerSelfAttention(nn.Module):
         self.scale = math.sqrt(self.head_dim)
 
         self.query = nn.Linear(hidden_size, hidden_size)
-        kv_input_size = encoder_hidden_size if encoder_hidden_size is not None else hidden_size
+        kv_input_size = (
+            encoder_hidden_size if encoder_hidden_size is not None else hidden_size
+        )
         self.key = nn.Linear(kv_input_size, hidden_size)
         self.value = nn.Linear(kv_input_size, hidden_size)
 
@@ -44,15 +46,25 @@ class Blip2QFormerSelfAttention(nn.Module):
 
         queries = self.query(hidden_states)
 
-        kv_input = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+        kv_input = (
+            encoder_hidden_states
+            if encoder_hidden_states is not None
+            else hidden_states
+        )
         keys = self.key(kv_input)
         values = self.value(kv_input)
 
         _, S, _ = keys.shape
 
-        queries = queries.reshape(B, L, self.num_attention_heads, self.head_dim).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, S, self.num_attention_heads, self.head_dim).transpose(0, 2, 1, 3)
-        values = values.reshape(B, S, self.num_attention_heads, self.head_dim).transpose(0, 2, 1, 3)
+        queries = queries.reshape(
+            B, L, self.num_attention_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, S, self.num_attention_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+        values = values.reshape(
+            B, S, self.num_attention_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=1.0 / self.scale
@@ -164,9 +176,7 @@ class Blip2QFormerLayer(nn.Module):
         attention_output = self.attention(hidden_states)
 
         # 2. Cross-attention
-        cross_output = self.crossattention(
-            attention_output, encoder_hidden_states
-        )
+        cross_output = self.crossattention(attention_output, encoder_hidden_states)
 
         # 3. FFN
         intermediate_output = self.intermediate_query(cross_output)

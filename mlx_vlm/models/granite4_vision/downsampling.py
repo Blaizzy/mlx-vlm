@@ -20,7 +20,9 @@ class InterpolateDownsampler:
         self.orig_image_side = (
             config.vision_config.image_size // config.vision_config.patch_size
         )
-        self.new_image_side = int(self.orig_image_side * Fraction(config.downsample_rate))
+        self.new_image_side = int(
+            self.orig_image_side * Fraction(config.downsample_rate)
+        )
 
     def __call__(self, image_features: mx.array) -> mx.array:
         B, _, C = image_features.shape
@@ -111,14 +113,16 @@ class WindowQFormerDownsampler(nn.Module):
         )
         q, w = config.downsample_rate.split("/")
         self.query_side, self.window_side = int(q), int(w)
-        self.query_length = self.query_side ** 2
+        self.query_length = self.query_side**2
 
         # Learnable parameters
         embed_std = 1 / math.sqrt(vision_hidden_size)
         self.norm = nn.LayerNorm(vision_hidden_size, eps=1e-6)
-        self.query = mx.random.normal((1, self.query_length, vision_hidden_size)) * embed_std
+        self.query = (
+            mx.random.normal((1, self.query_length, vision_hidden_size)) * embed_std
+        )
         self.image_positions = (
-            mx.random.normal((1, self.window_side ** 2, vision_hidden_size)) * embed_std
+            mx.random.normal((1, self.window_side**2, vision_hidden_size)) * embed_std
         )
 
         # Output projection to LLM hidden size

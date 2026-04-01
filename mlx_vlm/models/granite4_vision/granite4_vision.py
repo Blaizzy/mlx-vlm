@@ -115,9 +115,7 @@ class Model(nn.Module):
                 )
 
                 # Unpad
-                image_feature = unpad_image(
-                    image_feature, image_sizes[image_idx]
-                )
+                image_feature = unpad_image(image_feature, image_sizes[image_idx])
 
                 # Add image newline
                 if self.image_newline is not None:
@@ -125,9 +123,7 @@ class Model(nn.Module):
                     newline = mx.broadcast_to(
                         self.image_newline[:, None, None], (C, H, 1)
                     )
-                    image_feature = mx.concatenate(
-                        [image_feature, newline], axis=-1
-                    )
+                    image_feature = mx.concatenate([image_feature, newline], axis=-1)
 
                 # Flatten to (seq_len, C)
                 image_feature = image_feature.reshape(C, -1).T
@@ -226,9 +222,7 @@ class Model(nn.Module):
 
         if len(all_features) > 0:
             # Use first feature set to determine token count and positions
-            first_features = mx.concatenate(
-                [f for f in all_features[0]], axis=0
-            )
+            first_features = mx.concatenate([f for f in all_features[0]], axis=0)
             num_image_tokens = first_features.shape[0]
 
             # Create vision position mask
@@ -282,7 +276,9 @@ class Model(nn.Module):
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds,
             deepstack_visual_embeds=deepstack_visual_embeds,
-            visual_pos_masks=vision_mask_mx if deepstack_visual_embeds is not None else None,
+            visual_pos_masks=(
+                vision_mask_mx if deepstack_visual_embeds is not None else None
+            ),
         )
 
     @property
@@ -304,9 +300,7 @@ class Model(nn.Module):
         # Build target layer list for deepstack injection
         target_layers = []
         if self.config.deepstack_layer_map is not None:
-            target_layers.extend(
-                [lyr for _, lyr in self.config.deepstack_layer_map]
-            )
+            target_layers.extend([lyr for _, lyr in self.config.deepstack_layer_map])
         if (
             self.config.use_spatial_sampling
             and self.config.spatial_target_layers is not None
@@ -333,12 +327,12 @@ class Model(nn.Module):
                 # Strip base_model.model. prefix to get the module path
                 base_key = k.replace("lora_A.weight", "weight")
                 if base_key.startswith("base_model.model."):
-                    base_key = base_key[len("base_model.model."):]
+                    base_key = base_key[len("base_model.model.") :]
                 lora_a[base_key] = v
             elif "lora_B.weight" in k:
                 base_key = k.replace("lora_B.weight", "weight")
                 if base_key.startswith("base_model.model."):
-                    base_key = base_key[len("base_model.model."):]
+                    base_key = base_key[len("base_model.model.") :]
                 lora_b[base_key] = v
 
         # lora_alpha / r = 256 / 256 = 1.0 for this model
@@ -359,10 +353,10 @@ class Model(nn.Module):
 
             # Strip "model." prefix from non-vision, non-lm_head keys
             if new_k.startswith("model."):
-                suffix = new_k[len("model."):]
+                suffix = new_k[len("model.") :]
                 if suffix.startswith("language_model."):
                     # model.language_model.X → language_model.model.X
-                    lm_suffix = suffix[len("language_model."):]
+                    lm_suffix = suffix[len("language_model.") :]
                     new_k = f"language_model.model.{lm_suffix}"
                 else:
                     new_k = suffix

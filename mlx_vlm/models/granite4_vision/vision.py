@@ -164,7 +164,9 @@ class SigLipVisionModel(nn.Module):
         super().__init__()
         self.embeddings = VisionEmbeddings(config)
         self.encoder = Encoder(config)
-        self.post_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.post_layernorm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
         self.head = SigLipMultiheadAttentionPoolingHead(config)
 
     def __call__(self, x: mx.array, output_hidden_states: Optional[bool] = None):

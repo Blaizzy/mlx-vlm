@@ -80,7 +80,9 @@ class TransformerBlock(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.self_attn = Attention(config)
-        self.mlp = MLP(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
+        self.mlp = MLP(
+            config.hidden_size, config.intermediate_size, bias=config.mlp_bias
+        )
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -163,9 +165,7 @@ class LanguageModel(nn.Module):
     @staticmethod
     def sanitize(weights):
         return {
-            k: v
-            for k, v in weights.items()
-            if "self_attn.rotary_emb.inv_freq" not in k
+            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
         }
 
     @property

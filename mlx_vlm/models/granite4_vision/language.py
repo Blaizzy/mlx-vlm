@@ -8,7 +8,6 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import KVCache
 from .config import TextConfig
 
 
@@ -62,7 +61,9 @@ class SharedMLP(nn.Module):
         super().__init__()
         # Fused gate + up projection: output is 2 * intermediate_size
         self.input_linear = nn.Linear(
-            config.hidden_size, config.shared_intermediate_size * 2, bias=config.mlp_bias
+            config.hidden_size,
+            config.shared_intermediate_size * 2,
+            bias=config.mlp_bias,
         )
         self.output_linear = nn.Linear(
             config.shared_intermediate_size, config.hidden_size, bias=config.mlp_bias
@@ -175,9 +176,7 @@ class LanguageModel(nn.Module):
     @staticmethod
     def sanitize(weights):
         return {
-            k: v
-            for k, v in weights.items()
-            if "self_attn.rotary_emb.inv_freq" not in k
+            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
         }
 
     @property
