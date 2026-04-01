@@ -4,7 +4,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import InputEmbeddingsFeatures, LanguageModelOutput
+from ..base import InputEmbeddingsFeatures
 from .anyup import AnyUp
 from .config import ModelConfig, VisionConfig
 from .language import LanguageModel, compute_pos_hw, create_falcon_perception_mask
@@ -59,15 +59,11 @@ class Model(nn.Module):
 
         hidden_size = config.text_config.hidden_size
 
-        self.coord_encoder = FourierEncoder(
-            2, config.coord_enc_dim, hidden_size
-        )
+        self.coord_encoder = FourierEncoder(2, config.coord_enc_dim, hidden_size)
         self.coord_decoder = BboxDecoder(
             hidden_size, config.coord_dec_dim, config.coord_out_dim
         )
-        self.size_encoder = FourierEncoder(
-            2, config.size_enc_dim, hidden_size
-        )
+        self.size_encoder = FourierEncoder(2, config.size_enc_dim, hidden_size)
         self.size_decoder = BboxDecoder(
             hidden_size, config.size_dec_dim, config.size_out_dim
         )
@@ -79,21 +75,19 @@ class Model(nn.Module):
             self.conv_segm = nn.Conv2d(
                 hidden_size, config.segm_out_dim, kernel_size=3, padding=1
             )
-            self.itok_upsampler = AnyUp(
-                input_dim=3, qk_dim=128, num_heads=4
-            )
+            self.itok_upsampler = AnyUp(input_dim=3, qk_dim=128, num_heads=4)
 
         # Give LM direct refs to perception heads (not circular — leaf modules)
         lm = self.language_model
-        object.__setattr__(lm, '_coord_encoder', self.coord_encoder)
-        object.__setattr__(lm, '_coord_decoder', self.coord_decoder)
-        object.__setattr__(lm, '_size_encoder', self.size_encoder)
-        object.__setattr__(lm, '_size_decoder', self.size_decoder)
-        object.__setattr__(lm, '_perception_config', config)
+        object.__setattr__(lm, "_coord_encoder", self.coord_encoder)
+        object.__setattr__(lm, "_coord_decoder", self.coord_decoder)
+        object.__setattr__(lm, "_size_encoder", self.size_encoder)
+        object.__setattr__(lm, "_size_decoder", self.size_decoder)
+        object.__setattr__(lm, "_perception_config", config)
         if config.do_segmentation:
-            object.__setattr__(lm, '_proj_segm', self.proj_segm)
+            object.__setattr__(lm, "_proj_segm", self.proj_segm)
         # Weak-ish ref for segm features (stored on Model, not a module)
-        object.__setattr__(lm, '_parent_model_ref', self)
+        object.__setattr__(lm, "_parent_model_ref", self)
 
     def get_input_embeddings(
         self,
@@ -143,7 +137,8 @@ class Model(nn.Module):
         self._prefill_pixel_values = pixel_values
         self._prefill_grid_hw = (
             (int(image_grid_hw[0, 0].item()), int(image_grid_hw[0, 1].item()))
-            if image_grid_hw is not None else None
+            if image_grid_hw is not None
+            else None
         )
         self._prefill_hidden_state = None  # set after first forward
         self._segm_features_computed = False
@@ -261,7 +256,9 @@ class Model(nn.Module):
         if not mx.any(coord_mask).item():
             return inputs_embeds
         coord_tokens = self.coord_encoder(coord_xy.reshape(-1, 2))
-        coord_tokens = coord_tokens.reshape(inputs_embeds.shape[0], -1, inputs_embeds.shape[-1])
+        coord_tokens = coord_tokens.reshape(
+            inputs_embeds.shape[0], -1, inputs_embeds.shape[-1]
+        )
         mask_exp = mx.expand_dims(coord_mask, axis=-1)
         return mx.where(mask_exp, coord_tokens, inputs_embeds)
 
@@ -277,7 +274,9 @@ class Model(nn.Module):
         if not mx.any(size_mask).item():
             return inputs_embeds
         size_tokens = self.size_encoder(size_hw.reshape(-1, 2))
-        size_tokens = size_tokens.reshape(inputs_embeds.shape[0], -1, inputs_embeds.shape[-1])
+        size_tokens = size_tokens.reshape(
+            inputs_embeds.shape[0], -1, inputs_embeds.shape[-1]
+        )
         mask_exp = mx.expand_dims(size_mask, axis=-1)
         return mx.where(mask_exp, size_tokens, inputs_embeds)
 
@@ -298,7 +297,7 @@ class Model(nn.Module):
         min_size = math.log2(1.0 / num_bins)
         max_size = 0.0
         pred = pred * (max_size - min_size) + min_size
-        return 2.0 ** pred
+        return 2.0**pred
 
     def compute_segm_features(
         self,
@@ -312,7 +311,7 @@ class Model(nn.Module):
 
         Returns: (1, H, W, segm_out_dim) high-res features at original image resolution
         """
-        img_mask = (input_ids[0] == self.config.img_id)
+        img_mask = input_ids[0] == self.config.img_id
         n_img = mx.sum(img_mask).item()
         expected = grid_h * grid_w
         if n_img != expected:
@@ -343,7 +342,9 @@ class Model(nn.Module):
             pad_h = ((max_dim + ps - 1) // ps) * ps
             pad_w = pad_h
             if pad_h != H or pad_w != W:
-                images = mx.pad(images, [(0, 0), (0, pad_h - H), (0, pad_w - W), (0, 0)])
+                images = mx.pad(
+                    images, [(0, 0), (0, pad_h - H), (0, pad_w - W), (0, 0)]
+                )
                 gh_pad = pad_h // ps
                 gw_pad = pad_w // ps
                 lr_features = mx.pad(
@@ -414,9 +415,7 @@ class Model(nn.Module):
         seg_token = self.proj_segm(seg_hidden)  # (segm_out_dim,)
 
         # Dot product: features (feat_h, feat_w, D) x token (D,) → (feat_h, feat_w)
-        mask_logits = mx.sum(
-            segm_features[0] * seg_token[None, None, :], axis=-1
-        )
+        mask_logits = mx.sum(segm_features[0] * seg_token[None, None, :], axis=-1)
 
         feat_h, feat_w = mask_logits.shape
         if feat_h == orig_h and feat_w == orig_w:
@@ -438,7 +437,8 @@ class Model(nn.Module):
             self._prefill_hidden_state,
             self._prefill_input_ids,
             self._prefill_pixel_values,
-            grid_h, grid_w,
+            grid_h,
+            grid_w,
         )
         self._orig_hw = (
             self._prefill_pixel_values.shape[-3],
@@ -513,20 +513,25 @@ class Model(nn.Module):
         # ResBlock: block.<idx>.<param> → <mapped>
         # PyTorch Sequential indices: 0=GroupNorm, 1=SiLU, 2=Conv2d, 3=GroupNorm, 4=SiLU, 5=Conv2d
         BLOCK_MAP = {
-            "0.weight": "norm1.weight", "0.bias": "norm1.bias",
+            "0.weight": "norm1.weight",
+            "0.bias": "norm1.bias",
             "2.weight": "conv1.weight",
-            "3.weight": "norm2.weight", "3.bias": "norm2.bias",
+            "3.weight": "norm2.weight",
+            "3.bias": "norm2.bias",
             "5.weight": "conv2.weight",
         }
 
         # Encoder pattern: <enc>.<seq_idx>.block.<block_param> or <enc>.<seq_idx>.weight
         ENCODERS = [
-            "image_encoder", "key_encoder", "query_encoder", "aggregation",
+            "image_encoder",
+            "key_encoder",
+            "query_encoder",
+            "aggregation",
         ]
         for enc in ENCODERS:
             if not suffix.startswith(enc + "."):
                 continue
-            rest = suffix[len(enc) + 1:]
+            rest = suffix[len(enc) + 1 :]
             # First layer (Conv2d): "0.weight"
             if rest == "0.weight":
                 return enc + ".conv.weight"
@@ -545,7 +550,7 @@ class Model(nn.Module):
 
         # key_features_encoder (LFU + ResBlocks)
         if suffix.startswith("key_features_encoder."):
-            rest = suffix[len("key_features_encoder."):]
+            rest = suffix[len("key_features_encoder.") :]
             if rest == "0.basis":
                 return "key_features_encoder.lfu.basis"
             m = re.match(r"(\d+)\.block\.(.+)", rest)
@@ -580,7 +585,7 @@ class Model(nn.Module):
         for k, v in weights.items():
             # --- AnyUp weights ---
             if k.startswith("itok_upsampler."):
-                suffix = k[len("itok_upsampler."):]
+                suffix = k[len("itok_upsampler.") :]
 
                 # Collect attention in_proj for splitting later
                 if suffix == "cross_decode.cross_attn.attention.in_proj_weight":

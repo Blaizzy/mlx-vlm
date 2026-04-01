@@ -292,6 +292,7 @@ def generate_perception(
       - 'mask': (H, W) binary mx.array segmentation mask (if seg token decoded)
     """
     import mlx.core as mx
+
     from mlx_vlm.utils import load_image as _load_image
 
     if not isinstance(image, Image.Image):
@@ -409,11 +410,13 @@ def generate_perception(
         # Decode step: embed token, apply coord/size encoding, run LM
         embeds = embed_fn(token_2d)
         embeds = model.encode_coords_into_embeds(
-            embeds, token_2d,
+            embeds,
+            token_2d,
             coord_xy if token_id == coord_token_id else None,
         )
         embeds = model.encode_sizes_into_embeds(
-            embeds, token_2d,
+            embeds,
+            token_2d,
             size_hw_val if token_id == size_token_id else None,
         )
         logits_out = lm(
@@ -433,12 +436,14 @@ def generate_perception(
 def plot_detections(image, detections, save_path="perception_output.png"):
     """Plot bounding box detections and segmentation masks on the image and save."""
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.patches as patches
     import matplotlib.pyplot as plt
 
     if not isinstance(image, Image.Image):
         from mlx_vlm.utils import load_image as _load_image
+
         image = _load_image(image)
     image = image.convert("RGB")
 
@@ -464,7 +469,9 @@ def plot_detections(image, detections, save_path="perception_output.png"):
             # Resize mask to match image if needed
             if mask_arr.shape != (h, w):
                 mask_arr = np.array(
-                    _PILImage.fromarray(mask_arr.astype(np.uint8)).resize((w, h), _PILImage.NEAREST)
+                    _PILImage.fromarray(mask_arr.astype(np.uint8)).resize(
+                        (w, h), _PILImage.NEAREST
+                    )
                 ).astype(bool)
             mask_rgba = np.zeros((h, w, 4))
             mask_rgba[mask_arr > 0] = [*color[:3], 0.4]
@@ -480,14 +487,17 @@ def plot_detections(image, detections, save_path="perception_output.png"):
         y0 = cy - bh / 2
 
         rect = patches.Rectangle(
-            (x0, y0), bw, bh,
+            (x0, y0),
+            bw,
+            bh,
             linewidth=2,
             edgecolor=color,
             facecolor="none",
         )
         ax.add_patch(rect)
         ax.text(
-            x0, y0 - 5,
+            x0,
+            y0 - 5,
             f"det {i}",
             color=color,
             fontsize=10,

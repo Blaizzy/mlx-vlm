@@ -6,7 +6,6 @@ MLX port of the PyTorch AnyUp module from Falcon-Perception.
 import mlx.core as mx
 import mlx.nn as nn
 
-
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
@@ -54,8 +53,15 @@ def _reflect_pad(x, pad):
 
 
 class Encoder(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, num_blocks=2, block_ks=1,
-                 reflect_padding=False):
+    def __init__(
+        self,
+        in_ch,
+        out_ch,
+        kernel_size,
+        num_blocks=2,
+        block_ks=1,
+        reflect_padding=False,
+    ):
         super().__init__()
         self._reflect = reflect_padding and kernel_size > 1
         pad = kernel_size // 2 if not self._reflect else 0
@@ -173,8 +179,12 @@ def _window_mask_chunk(q_start, chunk_size, H, W, h, w, window_ratio):
     k_r = mx.arange(h)
     k_c = mx.arange(w)
 
-    row_ok = (k_r[None, :] >= r_lo[:, None]) & (k_r[None, :] < r_hi[:, None])  # (chunk, h)
-    col_ok = (k_c[None, :] >= c_lo[:, None]) & (k_c[None, :] < c_hi[:, None])  # (chunk, w)
+    row_ok = (k_r[None, :] >= r_lo[:, None]) & (
+        k_r[None, :] < r_hi[:, None]
+    )  # (chunk, h)
+    col_ok = (k_c[None, :] >= c_lo[:, None]) & (
+        k_c[None, :] < c_hi[:, None]
+    )  # (chunk, w)
 
     mask = (row_ok[:, :, None] & col_ok[:, None, :]).reshape(chunk_size, h * w)
     return mask
@@ -192,9 +202,16 @@ class CrossAttention(nn.Module):
         self.k_proj = nn.Linear(qk_dim, qk_dim)
 
     def __call__(
-        self, query, key, value,
-        H=None, W=None, h=None, w=None,
-        window_ratio=0.1, chunk_size=4096,
+        self,
+        query,
+        key,
+        value,
+        H=None,
+        W=None,
+        h=None,
+        w=None,
+        window_ratio=0.1,
+        chunk_size=4096,
     ):
         # query: (B, Q, D_qk), key: (B, KV, D_qk), value: (B, KV, D_v)
         B, Q, _ = query.shape
@@ -247,8 +264,13 @@ class CrossDecodeBlock(nn.Module):
         k_flat = k.reshape(B, h_k * w_k, -1)
         v_flat = v.reshape(B, h_k * w_k, -1)
         out = self.cross_attn(
-            q_flat, k_flat, v_flat,
-            H=H, W=W, h=h_k, w=w_k,
+            q_flat,
+            k_flat,
+            v_flat,
+            H=H,
+            W=W,
+            h=h_k,
+            w=w_k,
             window_ratio=window_ratio,
         )
         return out.reshape(B, H, W, -1)
@@ -292,11 +314,17 @@ class AnyUp(nn.Module):
     def __init__(self, input_dim=3, qk_dim=128, num_heads=4):
         super().__init__()
         self.qk_dim = qk_dim
-        self.image_encoder = Encoder(input_dim, qk_dim, kernel_size=1, reflect_padding=True)
+        self.image_encoder = Encoder(
+            input_dim, qk_dim, kernel_size=1, reflect_padding=True
+        )
         self.key_encoder = Encoder(qk_dim, qk_dim, kernel_size=1, reflect_padding=True)
-        self.query_encoder = Encoder(qk_dim, qk_dim, kernel_size=1, reflect_padding=True)
+        self.query_encoder = Encoder(
+            qk_dim, qk_dim, kernel_size=1, reflect_padding=True
+        )
         self.key_features_encoder = LFUEncoder(qk_dim, kernel_size_lfu=5)
-        self.aggregation = Encoder(2 * qk_dim, qk_dim, kernel_size=3, reflect_padding=True)
+        self.aggregation = Encoder(
+            2 * qk_dim, qk_dim, kernel_size=3, reflect_padding=True
+        )
         self.cross_decode = CrossDecodeBlock(qk_dim, num_heads)
         self.rope = AnyUpRoPE(qk_dim)
 
@@ -339,7 +367,11 @@ class AnyUp(nn.Module):
 
         # Key features from low-res features
         feat_norm = features / mx.sqrt(
-            mx.clip(mx.sum(features * features, axis=-1, keepdims=True), a_min=1e-12, a_max=None)
+            mx.clip(
+                mx.sum(features * features, axis=-1, keepdims=True),
+                a_min=1e-12,
+                a_max=None,
+            )
         )
         k_feat = self.key_features_encoder(feat_norm)  # (B, h, w, qk_dim)
 

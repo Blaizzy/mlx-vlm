@@ -360,7 +360,7 @@ class LanguageModel(nn.Module):
             L = 1
 
         # Auto coord/size feedback during decode
-        has_perception = hasattr(self, '_perception_config')
+        has_perception = hasattr(self, "_perception_config")
         if has_perception and inputs_embeds is None and cache_offset > 0 and L == 1:
             cfg = self._perception_config
             input_ids = inputs if inputs.ndim == 2 else inputs[None]
@@ -375,11 +375,11 @@ class LanguageModel(nn.Module):
                 self._current_det["hw"] = {"h": hw[0, 0].item(), "w": hw[0, 1].item()}
             elif token_id == cfg.seg_token_id:
                 # Decode segmentation mask via parent model's segm pipeline
-                if hasattr(self, '_proj_segm'):
+                if hasattr(self, "_proj_segm"):
                     # Get parent Model to lazily compute segm features
                     # We find it by going: self (LM) is model.language_model
                     # The segm features are on the parent Model
-                    parent = getattr(self, '_parent_model_ref', None)
+                    parent = getattr(self, "_parent_model_ref", None)
                     if parent is not None:
                         parent._ensure_segm_features()
                         if parent._segm_features is not None:
@@ -387,8 +387,10 @@ class LanguageModel(nn.Module):
                             if h_state is not None:
                                 seg_h = h_state[:, -1, :].reshape(-1)
                                 seg_mask = parent.decode_segm_mask(
-                                    seg_h, parent._segm_features,
-                                    parent._orig_hw[0], parent._orig_hw[1],
+                                    seg_h,
+                                    parent._segm_features,
+                                    parent._orig_hw[0],
+                                    parent._orig_hw[1],
                                 )
                                 mx.eval(seg_mask)
                                 self._current_det["mask"] = seg_mask
@@ -445,7 +447,7 @@ class LanguageModel(nn.Module):
 
         # After prefill, save hidden state for lazy segm feature computation
         if has_perception and L > 1:
-            parent = getattr(self, '_parent_model_ref', None)
+            parent = getattr(self, "_parent_model_ref", None)
             if parent is not None and not parent._segm_features_computed:
                 parent._prefill_hidden_state = self.model._last_hidden_state
                 mx.eval(parent._prefill_hidden_state)
@@ -453,6 +455,7 @@ class LanguageModel(nn.Module):
         # After forward, decode coord/size for next step's feedback
         if has_perception:
             import math
+
             h = self.model._last_hidden_state
             if h is not None:
                 h_last = h[:, -1, :]
@@ -486,7 +489,7 @@ class LanguageModel(nn.Module):
                 pred = mx.argmax(size_logits, axis=-1).astype(mx.float32) / (half_s - 1)
                 min_sz = math.log2(1.0 / half_s)
                 pred = pred * (0.0 - min_sz) + min_sz
-                self._pending_size_hw = 2.0 ** pred
+                self._pending_size_hw = 2.0**pred
 
         return LanguageModelOutput(
             logits=out.astype(self.model.embed_tokens.weight.dtype),
