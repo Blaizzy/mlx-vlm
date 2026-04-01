@@ -456,13 +456,29 @@ class LanguageModel(nn.Module):
             h = self.model._last_hidden_state
             if h is not None:
                 h_last = h[:, -1, :]
+
+                # Coord decode with deduplication
                 coord_logits = self._coord_decoder(h_last)
                 half_c = coord_logits.shape[-1] // 2
                 coord_logits = coord_logits.reshape(-1, 2, half_c)
-                pred_bins = mx.argmax(coord_logits, axis=-1)
-                px = pred_bins[0, 0].astype(mx.float32) / (half_c - 1)
-                py = pred_bins[0, 1].astype(mx.float32) / (half_c - 1)
-                self._pending_coord_xy = mx.stack([px, py]).reshape(1, 2)
+                cl = coord_logits[0]  # (2, half_c)
+
+                # Suppress already-detected coordinates
+                existing = [d["xy"] for d in self._detections if "xy" in d]
+                threshold = 0.01
+                for _ in range(100):
+                    bins = mx.argmax(cl, axis=-1)
+                    px = bins[0].item() / (half_c - 1)
+                    py = bins[1].item() / (half_c - 1)
+                    is_dup = any(
+                        abs(e["x"] - px) < threshold and abs(e["y"] - py) < threshold
+                        for e in existing
+                    )
+                    if not is_dup:
+                        break
+                    cl = cl.at[0, bins[0]].add(-1e9)
+                    cl = cl.at[1, bins[1]].add(-1e9)
+                self._pending_coord_xy = mx.array([[px, py]])
 
                 size_logits = self._size_decoder(h_last)
                 half_s = size_logits.shape[-1] // 2

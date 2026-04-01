@@ -456,10 +456,16 @@ def plot_detections(image, detections, save_path="perception_output.png"):
         # Draw segmentation mask if available
         if "mask" in det:
             import mlx.core as mx
+            from PIL import Image as _PILImage
 
             mask_arr = det["mask"]
             if isinstance(mask_arr, mx.array):
                 mask_arr = np.array(mask_arr)
+            # Resize mask to match image if needed
+            if mask_arr.shape != (h, w):
+                mask_arr = np.array(
+                    _PILImage.fromarray(mask_arr.astype(np.uint8)).resize((w, h), _PILImage.NEAREST)
+                ).astype(bool)
             mask_rgba = np.zeros((h, w, 4))
             mask_rgba[mask_arr > 0] = [*color[:3], 0.4]
             ax.imshow(mask_rgba)
