@@ -39,6 +39,7 @@ MODEL_REMAPPING = {
     "granite-vision": "granite_vision",
     "granite4-vision": "granite4_vision",
     "granite4_vision": "granite4_vision",
+    "rf-detr": "rfdetr",
 }
 
 MAX_FILE_SIZE_GB = 5

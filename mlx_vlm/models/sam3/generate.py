@@ -1491,16 +1491,36 @@ ANNOTATOR_PRESETS = {
 def build_annotator(name: str, opacity: float = 0.6, contour_thickness: int = 2):
     """Build an annotator from a preset name or explicit chain.
 
+    Append ``+bg`` to blur/pixelate to target the background instead of objects.
+
     Examples:
         build_annotator("mask+box")
+        build_annotator("blur+bg")          # blur background
+        build_annotator("pixelate+bg")      # pixelate background
         build_annotator("halo", opacity=0.8, contour_thickness=3)
     """
     from mlx_vlm.models.sam3 import annotators as ann_module
 
-    spec = ANNOTATOR_PRESETS.get(name, name)
+    # Handle +bg modifier: strip it, resolve preset, re-append
+    bg_modifier = False
+    base_name = name
+    if "+bg" in name:
+        base_name = name.replace("+bg", "").strip("+")
+        bg_modifier = True
+
+    spec = ANNOTATOR_PRESETS.get(base_name, base_name)
+    if bg_modifier:
+        spec += "+bg"
+
     parts = [p.strip() for p in spec.split("+")]
     chain = None
+    last = None
     for part in parts:
+        if part == "bg":
+            # Apply background=True to the previous annotator
+            if last is not None and hasattr(last, "background"):
+                last.background = True
+            continue
         cls = getattr(ann_module, part, None)
         if cls is None:
             raise ValueError(
@@ -1513,6 +1533,7 @@ def build_annotator(name: str, opacity: float = 0.6, contour_thickness: int = 2)
         if hasattr(cls, "contour_thickness"):
             kwargs["contour_thickness"] = contour_thickness
         a = cls(**kwargs)
+        last = a
         chain = a if chain is None else chain + a
     return chain
 
