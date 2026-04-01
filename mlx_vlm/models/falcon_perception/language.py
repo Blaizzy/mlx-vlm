@@ -325,6 +325,12 @@ class LanguageModel(nn.Module):
         self._position_ids = None
         self._pos_hw = None
         self._full_attn_mask = None
+        # Set by parent Model via object.__setattr__:
+        # _coord_encoder, _coord_decoder, _size_encoder, _size_decoder, _perception_config
+        self._pending_coord_xy = None
+        self._pending_size_hw = None
+        self._detections = []
+        self._current_det = {}
 
     def __call__(
         self,
@@ -336,6 +342,7 @@ class LanguageModel(nn.Module):
     ):
         kwargs.pop("image_grid_hw", None)
         kwargs.pop("pixel_values", None)
+        kwargs.pop("cross_attention_states", None)
 
         cache_offset = 0
         if cache and cache[0] is not None:
@@ -352,10 +359,66 @@ class LanguageModel(nn.Module):
         else:
             L = 1
 
+        # Auto coord/size feedback during decode
+        has_perception = hasattr(self, '_perception_config')
+        if has_perception and inputs_embeds is None and cache_offset > 0 and L == 1:
+            cfg = self._perception_config
+            input_ids = inputs if inputs.ndim == 2 else inputs[None]
+            token_id = input_ids.reshape(-1)[0].item()
+
+            # Accumulate detection from the token just generated
+            if token_id == cfg.coord_token_id and self._pending_coord_xy is not None:
+                xy = self._pending_coord_xy
+                self._current_det["xy"] = {"x": xy[0, 0].item(), "y": xy[0, 1].item()}
+            elif token_id == cfg.size_token_id and self._pending_size_hw is not None:
+                hw = self._pending_size_hw
+                self._current_det["hw"] = {"h": hw[0, 0].item(), "w": hw[0, 1].item()}
+            elif token_id == cfg.seg_token_id:
+                # Decode segmentation mask via parent model's segm pipeline
+                if hasattr(self, '_proj_segm'):
+                    # Get parent Model to lazily compute segm features
+                    # We find it by going: self (LM) is model.language_model
+                    # The segm features are on the parent Model
+                    parent = getattr(self, '_parent_model_ref', None)
+                    if parent is not None:
+                        parent._ensure_segm_features()
+                        if parent._segm_features is not None:
+                            h_state = self.model._last_hidden_state
+                            if h_state is not None:
+                                seg_h = h_state[:, -1, :].reshape(-1)
+                                seg_mask = parent.decode_segm_mask(
+                                    seg_h, parent._segm_features,
+                                    parent._orig_hw[0], parent._orig_hw[1],
+                                )
+                                mx.eval(seg_mask)
+                                self._current_det["mask"] = seg_mask
+                if "xy" in self._current_det and "hw" in self._current_det:
+                    self._detections.append(self._current_det)
+                self._current_det = {}
+
+            # Apply coord/size encoding to embeddings
+            embeds = self.model.embed_tokens(input_ids)
+            if self._pending_coord_xy is not None:
+                coord_mask = input_ids == cfg.coord_token_id
+                if mx.any(coord_mask).item():
+                    encoded = self._coord_encoder(self._pending_coord_xy.reshape(-1, 2))
+                    encoded = encoded.reshape(1, 1, -1)
+                    embeds = mx.where(mx.expand_dims(coord_mask, -1), encoded, embeds)
+            if self._pending_size_hw is not None:
+                size_mask = input_ids == cfg.size_token_id
+                if mx.any(size_mask).item():
+                    encoded = self._size_encoder(self._pending_size_hw.reshape(-1, 2))
+                    encoded = encoded.reshape(1, 1, -1)
+                    embeds = mx.where(mx.expand_dims(size_mask, -1), encoded, embeds)
+            self._pending_coord_xy = None
+            self._pending_size_hw = None
+            inputs_embeds = embeds
+
         position_ids = None
         pos_hw = None
 
-        if self._position_ids is not None and inputs_embeds is not None:
+        is_prefill = inputs_embeds is not None and L > 1
+        if is_prefill and self._position_ids is not None:
             position_ids = self._position_ids[cache_offset : cache_offset + L]
             if self._pos_hw is not None:
                 pos_hw = self._pos_hw[:, cache_offset : cache_offset + L, :]
@@ -379,8 +442,38 @@ class LanguageModel(nn.Module):
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
+
+        # After prefill, save hidden state for lazy segm feature computation
+        if has_perception and L > 1:
+            parent = getattr(self, '_parent_model_ref', None)
+            if parent is not None and not parent._segm_features_computed:
+                parent._prefill_hidden_state = self.model._last_hidden_state
+                mx.eval(parent._prefill_hidden_state)
+
+        # After forward, decode coord/size for next step's feedback
+        if has_perception:
+            import math
+            h = self.model._last_hidden_state
+            if h is not None:
+                h_last = h[:, -1, :]
+                coord_logits = self._coord_decoder(h_last)
+                half_c = coord_logits.shape[-1] // 2
+                coord_logits = coord_logits.reshape(-1, 2, half_c)
+                pred_bins = mx.argmax(coord_logits, axis=-1)
+                px = pred_bins[0, 0].astype(mx.float32) / (half_c - 1)
+                py = pred_bins[0, 1].astype(mx.float32) / (half_c - 1)
+                self._pending_coord_xy = mx.stack([px, py]).reshape(1, 2)
+
+                size_logits = self._size_decoder(h_last)
+                half_s = size_logits.shape[-1] // 2
+                size_logits = size_logits.reshape(-1, 2, half_s)
+                pred = mx.argmax(size_logits, axis=-1).astype(mx.float32) / (half_s - 1)
+                min_sz = math.log2(1.0 / half_s)
+                pred = pred * (0.0 - min_sz) + min_sz
+                self._pending_size_hw = 2.0 ** pred
+
         return LanguageModelOutput(
-            logits=out.astype(self.model.embed_tokens.weight.dtype)
+            logits=out.astype(self.model.embed_tokens.weight.dtype),
         )
 
     @property

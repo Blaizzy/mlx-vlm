@@ -4,7 +4,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import InputEmbeddingsFeatures
+from ..base import InputEmbeddingsFeatures, LanguageModelOutput
 from .anyup import AnyUp
 from .config import ModelConfig, VisionConfig
 from .language import LanguageModel, compute_pos_hw, create_falcon_perception_mask
@@ -83,6 +83,18 @@ class Model(nn.Module):
                 input_dim=3, qk_dim=128, num_heads=4
             )
 
+        # Give LM direct refs to perception heads (not circular — leaf modules)
+        lm = self.language_model
+        object.__setattr__(lm, '_coord_encoder', self.coord_encoder)
+        object.__setattr__(lm, '_coord_decoder', self.coord_decoder)
+        object.__setattr__(lm, '_size_encoder', self.size_encoder)
+        object.__setattr__(lm, '_size_decoder', self.size_decoder)
+        object.__setattr__(lm, '_perception_config', config)
+        if config.do_segmentation:
+            object.__setattr__(lm, '_proj_segm', self.proj_segm)
+        # Weak-ish ref for segm features (stored on Model, not a module)
+        object.__setattr__(lm, '_parent_model_ref', self)
+
     def get_input_embeddings(
         self,
         input_ids: Optional[mx.array] = None,
@@ -92,13 +104,15 @@ class Model(nn.Module):
         image_grid_hw = kwargs.get("image_grid_hw", None)
 
         if pixel_values is None:
-            self.language_model._rope_delta = None
-            self.language_model._position_ids = None
-            self.language_model._pos_hw = None
-            self.language_model._full_attn_mask = None
             return InputEmbeddingsFeatures(
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids)
             )
+
+        # New image — reset detection state
+        self.language_model._detections = []
+        self.language_model._current_det = {}
+        self.language_model._pending_coord_xy = None
+        self.language_model._pending_size_hw = None
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
@@ -123,6 +137,18 @@ class Model(nn.Module):
             self.config.image_cls_token_id,
             self.config.img_end_id,
         )
+
+        # Store info for lazy segm feature computation (after first LM forward)
+        self._prefill_input_ids = input_ids
+        self._prefill_pixel_values = pixel_values
+        self._prefill_grid_hw = (
+            (int(image_grid_hw[0, 0].item()), int(image_grid_hw[0, 1].item()))
+            if image_grid_hw is not None else None
+        )
+        self._prefill_hidden_state = None  # set after first forward
+        self._segm_features_computed = False
+        self._segm_features = None
+        self._orig_hw = None
 
         return InputEmbeddingsFeatures(inputs_embeds=final_embeds)
 
@@ -401,6 +427,41 @@ class Model(nn.Module):
         upsampled = self._bilinear_upsample(mask_logits, orig_h, orig_w)
         return mx.sigmoid(upsampled) > threshold
 
+    def _ensure_segm_features(self):
+        """Lazily compute AnyUp segm features from prefill hidden states."""
+        if self._segm_features_computed or not hasattr(self, "conv_segm"):
+            return
+        if self._prefill_hidden_state is None or self._prefill_grid_hw is None:
+            return
+        grid_h, grid_w = self._prefill_grid_hw
+        self._segm_features = self.compute_segm_features(
+            self._prefill_hidden_state,
+            self._prefill_input_ids,
+            self._prefill_pixel_values,
+            grid_h, grid_w,
+        )
+        self._orig_hw = (
+            self._prefill_pixel_values.shape[-3],
+            self._prefill_pixel_values.shape[-2],
+        )
+        mx.eval(self._segm_features)
+        self._segm_features_computed = True
+        # Free prefill data after computing features
+        self._prefill_hidden_state = None
+        self._prefill_pixel_values = None
+
+    def get_detections(self):
+        """Return detections accumulated during the last generate() call.
+
+        Each detection has 'xy' (center coords), 'hw' (size), and optionally 'mask'.
+        """
+        lm = self.language_model
+        # Flush any pending detection
+        if "xy" in lm._current_det and "hw" in lm._current_det:
+            lm._detections.append(lm._current_det)
+            lm._current_det = {}
+        return lm._detections
+
     @property
     def last_hidden_state(self) -> Optional[mx.array]:
         return self.language_model.model._last_hidden_state
@@ -427,13 +488,22 @@ class Model(nn.Module):
         embeds = self.encode_sizes_into_embeds(embeds, input_ids, size_hw)
 
         kwargs["pixel_values"] = pixel_values
-        return self.language_model(
+        out = self.language_model(
             input_ids,
             inputs_embeds=embeds,
             mask=mask,
             cache=cache,
             **kwargs,
         )
+
+        # Save prefill hidden state for lazy segm features
+        if pixel_values is not None and not self._segm_features_computed:
+            h = self.last_hidden_state
+            if h is not None:
+                self._prefill_hidden_state = h
+                mx.eval(self._prefill_hidden_state)
+
+        return out
 
     @staticmethod
     def _remap_anyup_key(suffix):
