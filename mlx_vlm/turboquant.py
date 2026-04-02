@@ -1585,7 +1585,7 @@ def _compiled_integer_decode_kernel(bits: int):
 
 
 @lru_cache(maxsize=None)
-def _fused_integer_decode_kernel(bits: int, repeat_count: int):
+def _fused_integer_decode_kernel(bits: int, repeat_count: int, key_mse_bits: int = -1):
     """Single Metal kernel: score + online-softmax + weighted-sum for integer-bit
     ProdCodec keys + MSECodec values. Eliminates intermediate scores tensor.
 
@@ -1596,7 +1596,7 @@ def _fused_integer_decode_kernel(bits: int, repeat_count: int):
     if not _metal_available() or repeat_count < 1:
         return None
 
-    mse_bits = max(bits - 1, 0)
+    mse_bits = key_mse_bits if key_mse_bits >= 0 else max(bits - 1, 0)
     mse_mask = (1 << mse_bits) - 1
     val_mask = (1 << bits) - 1
 
@@ -1727,7 +1727,7 @@ def _fused_integer_decode_kernel(bits: int, repeat_count: int):
 
 
 @lru_cache(maxsize=None)
-def _fused_integer_decode_single_tile_kernel(bits: int, repeat_count: int, dims_per_lane: int):
+def _fused_integer_decode_single_tile_kernel(bits: int, repeat_count: int, dims_per_lane: int, key_mse_bits: int = -1):
     """Single-tile fused kernel — each lane handles multiple value dims.
     Zero key read redundancy: keys are read once per token, not once per val_tile.
     Faster than multi-tile at long contexts (256k+) where memory bandwidth dominates.
@@ -1735,7 +1735,7 @@ def _fused_integer_decode_single_tile_kernel(bits: int, repeat_count: int, dims_
     if not _metal_available() or repeat_count < 1:
         return None
 
-    mse_bits = max(bits - 1, 0)
+    mse_bits = key_mse_bits if key_mse_bits >= 0 else max(bits - 1, 0)
     mse_mask = (1 << mse_bits) - 1
     val_mask = (1 << bits) - 1
 
@@ -3349,10 +3349,15 @@ class TurboQuantKVCache(_BaseCache):
 
     def _ensure_codecs(self, keys: mx.array, values: mx.array):
         if self.key_codec is None:
-            self.key_codec = _build_codec(keys, self.bits, mode="prod", seed=self.seed)
+            # For fractional bits (e.g. 3.5), use lower bits for keys and higher
+            # for values instead of SplitCodec. Both stay as fast integer codecs
+            # with single-tile kernel support. Values benefit more from extra bits.
+            key_bits = math.floor(self.bits) if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6) else self.bits
+            self.key_codec = _build_codec(keys, key_bits, mode="prod", seed=self.seed)
         if self.value_codec is None:
+            val_bits = math.ceil(self.bits) if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6) else self.bits
             self.value_codec = _build_codec(
-                values, self.bits, mode="mse", seed=self.seed + 1
+                values, val_bits, mode="mse", seed=self.seed + 1
             )
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
@@ -3587,8 +3592,6 @@ class TurboQuantKVCache(_BaseCache):
         high_mse_bits = max(high_bits - 1, 0)
         val_dim = dim_low + dim_high
 
-        # Single fused kernel: score + online-softmax + weighted_sum.
-        # Token-tiled for GPU parallelism, with lightweight cross-tile reduction.
         tok_tile_size = 1024
         num_val_tiles = (val_dim + 31) // 32
         num_tok_tiles = (T + tok_tile_size - 1) // tok_tile_size
@@ -3654,7 +3657,6 @@ class TurboQuantKVCache(_BaseCache):
             _metal_available()
             and isinstance(self.key_codec, _TurboQuantProdCodec)
             and isinstance(self.value_codec, _TurboQuantMSECodec)
-            and self.key_codec.bits == self.value_codec.bits
             and self.key_codec.mse_codec.bits > 0
             and isinstance(keys_state, TurboQuantProdState)
             and isinstance(values_state, TurboQuantMSEState)
@@ -3679,12 +3681,15 @@ class TurboQuantKVCache(_BaseCache):
         num_tok_tiles = (T + tok_tile_size - 1) // tok_tile_size
         dims_per_lane = (D + 31) // 32
 
+        # Key MSE bits may differ from value bits (e.g. 3-bit keys + 4-bit values)
+        key_mse_bits = self.key_codec.mse_codec.bits
+
         # Single-tile path: each lane handles all its value dims.
         # Zero key read redundancy — faster at 256k+ where bandwidth dominates.
-        single_kernel = _fused_integer_decode_single_tile_kernel(bits, R, dims_per_lane)
+        single_kernel = _fused_integer_decode_single_tile_kernel(bits, R, dims_per_lane, key_mse_bits)
         # Multi-tile path: one val_dim per lane, multiple tiles read keys redundantly.
         # Better parallelism at shorter contexts.
-        multi_kernel = _fused_integer_decode_kernel(bits, R)
+        multi_kernel = _fused_integer_decode_kernel(bits, R, key_mse_bits)
 
         # Crossover: single-tile wins when key data exceeds L2 cache (~32MB)
         # and there are enough tok_tiles for parallelism (>= ~64 threadgroups)
