@@ -276,7 +276,7 @@ def test_turboquant_decode_attention_4bit_uses_paper_prod_key_codec():
     assert output.shape == queries.shape
 
 
-def test_turboquant_decode_attention_integer_fast_path_skips_prepare(monkeypatch):
+def test_turboquant_decode_attention_integer_separate_path_bypasses_fused(monkeypatch):
     if not mx.metal.is_available():
         pytest.skip("Metal kernels are unavailable on this host")
 
@@ -291,10 +291,10 @@ def test_turboquant_decode_attention_integer_fast_path_skips_prepare(monkeypatch
 
     def fail(*args, **kwargs):
         raise AssertionError(
-            "integer TurboQuant decode fast path should bypass prepare_queries"
+            "separate-kernel path should handle integer bits without fused fallback"
         )
 
-    monkeypatch.setattr(turbo_cache.key_codec, "prepare_queries", fail)
+    monkeypatch.setattr(turbo_cache, "_compiled_integer_decode_attention", fail)
     output = scaled_dot_product_attention(
         queries,
         turbo_keys,
@@ -307,11 +307,9 @@ def test_turboquant_decode_attention_integer_fast_path_skips_prepare(monkeypatch
     assert output.shape == queries.shape
 
 
-def test_turboquant_decode_attention_fast_path_skips_softmax(monkeypatch):
+def test_turboquant_decode_attention_separate_path_bypasses_fused_split(monkeypatch):
     if not mx.metal.is_available():
         pytest.skip("Metal kernels are unavailable on this host")
-
-    import mlx_vlm.turboquant as turboquant
 
     keys = mx.random.normal((1, 2, 8, 32))
     values = mx.random.normal((1, 2, 8, 32))
@@ -323,9 +321,11 @@ def test_turboquant_decode_attention_fast_path_skips_softmax(monkeypatch):
     turbo_keys, turbo_values = turbo_cache.state
 
     def fail(*args, **kwargs):
-        raise AssertionError("TurboQuant decode fast path should bypass mx.softmax")
+        raise AssertionError(
+            "separate-kernel path should handle this without fused split fallback"
+        )
 
-    monkeypatch.setattr(turboquant.mx, "softmax", fail)
+    monkeypatch.setattr(turbo_cache, "_compiled_split_decode_attention", fail)
     output = scaled_dot_product_attention(
         queries,
         turbo_keys,
