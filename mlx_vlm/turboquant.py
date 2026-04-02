@@ -1587,7 +1587,12 @@ def _compiled_integer_decode_kernel(bits: int):
 @lru_cache(maxsize=None)
 def _fused_integer_decode_kernel(bits: int, repeat_count: int):
     """Single Metal kernel: score + online-softmax + weighted-sum for integer-bit
-    ProdCodec keys + MSECodec values. Eliminates intermediate scores tensor."""
+    ProdCodec keys + MSECodec values. Eliminates intermediate scores tensor.
+
+    Grid: (32, num_val_tiles, B*H*num_tok_tiles) with threadgroup=(32,1,1).
+    32 SIMD lanes cooperate on scoring (simd_sum across dims) and each lane
+    accumulates one value dim with online softmax.
+    """
     if not _metal_available() or repeat_count < 1:
         return None
 
@@ -1699,10 +1704,12 @@ def _fused_integer_decode_kernel(bits: int, repeat_count: int):
     for r in range(repeat_count):
         lines += [
             f"        if (v_valid) {{",
-            f"            int out_base = ((bh * num_tok_tiles + tok_tile) * RepeatCount + {r}) * out_stride + val_dim;",
-            f"            out_acc[out_base] = lacc_{r};",
-            f"            out_sum[out_base] = lsum_{r};",
-            f"            out_max[out_base] = lmax_{r};",
+            f"            out_acc[((bh * num_tok_tiles + tok_tile) * RepeatCount + {r}) * out_stride + val_dim] = lacc_{r};",
+            f"        }}",
+            f"        if (val_dim == 0) {{",
+            f"            int sm_base = (bh * num_tok_tiles + tok_tile) * RepeatCount + {r};",
+            f"            out_sum[sm_base] = lsum_{r};",
+            f"            out_max[sm_base] = lmax_{r};",
             f"        }}",
         ]
 
@@ -1897,14 +1904,18 @@ def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int)
 
     lines += ["        }", ""]
 
+    # Write acc per val_dim, but sum/max are identical across lanes —
+    # only write once per (bh, tok_tile, repeat) to avoid redundant writes.
     lines += [f"        int out_stride = ({val_dim_total});"]
     for r in range(repeat_count):
         lines += [
             f"        if (v_valid) {{",
-            f"            int out_base = ((bh * num_tok_tiles + tok_tile) * RepeatCount + {r}) * out_stride + val_dim;",
-            f"            out_acc[out_base] = lacc_{r};",
-            f"            out_sum[out_base] = lsum_{r};",
-            f"            out_max[out_base] = lmax_{r};",
+            f"            out_acc[((bh * num_tok_tiles + tok_tile) * RepeatCount + {r}) * out_stride + val_dim] = lacc_{r};",
+            f"        }}",
+            f"        if (val_dim == 0) {{",
+            f"            int sm_base = (bh * num_tok_tiles + tok_tile) * RepeatCount + {r};",
+            f"            out_sum[sm_base] = lsum_{r};",
+            f"            out_max[sm_base] = lmax_{r};",
             f"        }}",
         ]
 
@@ -3060,6 +3071,21 @@ class _SplitCodec:
         self.low_codec = codec_cls(len(low_idx), self.lower_bits, seed)
         self.high_codec = codec_cls(len(high_idx), self.upper_bits, seed + 97)
 
+        # Pre-build combined query transform for fused decode:
+        # single (D, 2*dim_low + 2*dim_high) matrix replaces 2 takes + 2 matmuls
+        if mode == "prod" and isinstance(self.low_codec, _TurboQuantProdCodec):
+            dim = tensor.shape[-1]
+            dl = len(low_idx)
+            dh = len(high_idx)
+            combined = mx.zeros((dim, 2 * dl + 2 * dh), dtype=mx.float32)
+            combined[self.low_idx, :dl] = self.low_codec.query_transform_t[:, :dl]
+            combined[self.low_idx, dl:2*dl] = self.low_codec.query_transform_t[:, dl:]
+            combined[self.high_idx, 2*dl:2*dl+dh] = self.high_codec.query_transform_t[:, :dh]
+            combined[self.high_idx, 2*dl+dh:] = self.high_codec.query_transform_t[:, dh:]
+            self.combined_query_transform_t = combined
+        else:
+            self.combined_query_transform_t = None
+
     def quantize(self, tensor: mx.array) -> TurboQuantSplitState:
         low_tensor = mx.take(tensor, self.low_idx, axis=-1)
         high_tensor = mx.take(tensor, self.high_idx, axis=-1)
@@ -3397,17 +3423,23 @@ class TurboQuantKVCache(_BaseCache):
         if kernel is None:
             return None
 
-        # Pre-transform queries for both halves
-        q_low = mx.take(grouped_queries, kc.low_idx, axis=-1)
-        q_high = mx.take(grouped_queries, kc.high_idx, axis=-1)
-
-        qt_low = mx.matmul(q_low, kc.low_codec.query_transform_t)
-        qt_high = mx.matmul(q_high, kc.high_codec.query_transform_t)
-
-        q_rot_low = qt_low[..., :dim_low].reshape(B, H, R, dim_low)
-        q_proj_low = qt_low[..., dim_low:].reshape(B, H, R, dim_low)
-        q_rot_high = qt_high[..., :dim_high].reshape(B, H, R, dim_high)
-        q_proj_high = qt_high[..., dim_high:].reshape(B, H, R, dim_high)
+        # Single combined query transform: 1 matmul replaces 2 takes + 2 matmuls
+        if kc.combined_query_transform_t is not None:
+            qt = mx.matmul(grouped_queries, kc.combined_query_transform_t)
+            dl2 = dim_low * 2
+            q_rot_low = qt[..., :dim_low].reshape(B, H, R, dim_low)
+            q_proj_low = qt[..., dim_low:dl2].reshape(B, H, R, dim_low)
+            q_rot_high = qt[..., dl2:dl2+dim_high].reshape(B, H, R, dim_high)
+            q_proj_high = qt[..., dl2+dim_high:].reshape(B, H, R, dim_high)
+        else:
+            q_low = mx.take(grouped_queries, kc.low_idx, axis=-1)
+            q_high = mx.take(grouped_queries, kc.high_idx, axis=-1)
+            qt_low = mx.matmul(q_low, kc.low_codec.query_transform_t)
+            qt_high = mx.matmul(q_high, kc.high_codec.query_transform_t)
+            q_rot_low = qt_low[..., :dim_low].reshape(B, H, R, dim_low)
+            q_proj_low = qt_low[..., dim_low:].reshape(B, H, R, dim_low)
+            q_rot_high = qt_high[..., :dim_high].reshape(B, H, R, dim_high)
+            q_proj_high = qt_high[..., dim_high:].reshape(B, H, R, dim_high)
 
         low_mse_bits = max(low_bits - 1, 0)
         high_mse_bits = max(high_bits - 1, 0)
@@ -3419,7 +3451,8 @@ class TurboQuantKVCache(_BaseCache):
         num_val_tiles = (val_dim + 31) // 32
         num_tok_tiles = (T + tok_tile_size - 1) // tok_tile_size
 
-        tile_shape = (B * H * num_tok_tiles, R, val_dim)
+        acc_shape = (B * H * num_tok_tiles, R, val_dim)
+        sm_shape = (B * H * num_tok_tiles * R,)  # scalar per (bh, tile, repeat)
         out_acc, out_sum, out_max = kernel(
             inputs=[
                 q_rot_low, q_proj_low, q_rot_high, q_proj_high,
@@ -3449,19 +3482,19 @@ class TurboQuantKVCache(_BaseCache):
             ],
             grid=(32, num_val_tiles, B * H * num_tok_tiles),
             threadgroup=(32, 1, 1),
-            output_shapes=[tile_shape, tile_shape, tile_shape],
+            output_shapes=[acc_shape, sm_shape, sm_shape],
             output_dtypes=[mx.float32, mx.float32, mx.float32],
         )
 
-        # Cross-tile online-softmax reduction + rotation + reorder
+        # Cross-tile reduction: sum/max are (BH*tiles*R,) scalars, acc is (BH*tiles, R, D)
         out_acc = out_acc.reshape(B * H, num_tok_tiles, R, val_dim)
-        out_sum = out_sum.reshape(B * H, num_tok_tiles, R, val_dim)
-        out_max = out_max.reshape(B * H, num_tok_tiles, R, val_dim)
-        global_max = mx.max(out_max, axis=1, keepdims=True)
-        scale_factors = mx.exp(out_max - global_max)
-        scaled_acc = mx.sum(out_acc * scale_factors, axis=1)
-        scaled_sum = mx.sum(out_sum * scale_factors, axis=1)
-        out_rotated = (scaled_acc / mx.maximum(scaled_sum, _EPS)).reshape(B, H, R, val_dim)
+        out_sum = out_sum.reshape(B * H, num_tok_tiles, R)
+        out_max = out_max.reshape(B * H, num_tok_tiles, R)
+        global_max = mx.max(out_max, axis=1, keepdims=True)  # (BH, 1, R)
+        scale_factors = mx.exp(out_max - global_max)  # (BH, tiles, R)
+        scaled_acc = mx.sum(out_acc * scale_factors[..., None], axis=1)  # (BH, R, D)
+        denom = mx.sum(out_sum * scale_factors, axis=1)  # (BH, R)
+        out_rotated = (scaled_acc / mx.maximum(denom[..., None], _EPS)).reshape(B, H, R, val_dim)
 
         out_low = mx.matmul(out_rotated[..., :dim_low], vc.low_codec.rotation)
         out_high = mx.matmul(out_rotated[..., dim_low:], vc.high_codec.rotation)
@@ -3504,7 +3537,8 @@ class TurboQuantKVCache(_BaseCache):
             tok_tile_size = 1024
             num_val_tiles = (D + 31) // 32
             num_tok_tiles = (T + tok_tile_size - 1) // tok_tile_size
-            tile_shape = (B * H * num_tok_tiles, R, D)
+            acc_shape = (B * H * num_tok_tiles, R, D)
+            sm_shape = (B * H * num_tok_tiles * R,)
 
             out_acc, out_sum, out_max = kernel(
                 inputs=[
@@ -3527,19 +3561,19 @@ class TurboQuantKVCache(_BaseCache):
                 ],
                 grid=(32, num_val_tiles, B * H * num_tok_tiles),
                 threadgroup=(32, 1, 1),
-                output_shapes=[tile_shape, tile_shape, tile_shape],
+                output_shapes=[acc_shape, sm_shape, sm_shape],
                 output_dtypes=[mx.float32, mx.float32, mx.float32],
             )
 
-            # Cross-tile reduction
+            # Cross-tile reduction with scalar sum/max
             out_acc = out_acc.reshape(B * H, num_tok_tiles, R, D)
-            out_sum = out_sum.reshape(B * H, num_tok_tiles, R, D)
-            out_max = out_max.reshape(B * H, num_tok_tiles, R, D)
+            out_sum = out_sum.reshape(B * H, num_tok_tiles, R)
+            out_max = out_max.reshape(B * H, num_tok_tiles, R)
             global_max = mx.max(out_max, axis=1, keepdims=True)
             scale_factors = mx.exp(out_max - global_max)
-            scaled_acc = mx.sum(out_acc * scale_factors, axis=1)
-            scaled_sum = mx.sum(out_sum * scale_factors, axis=1)
-            out_rotated = (scaled_acc / mx.maximum(scaled_sum, _EPS)).reshape(B, H, R, D)
+            scaled_acc = mx.sum(out_acc * scale_factors[..., None], axis=1)
+            denom = mx.sum(out_sum * scale_factors, axis=1)
+            out_rotated = (scaled_acc / mx.maximum(denom[..., None], _EPS)).reshape(B, H, R, D)
 
             output = mx.matmul(out_rotated, self.value_codec.rotation)
             return mx.expand_dims(output, axis=3)
