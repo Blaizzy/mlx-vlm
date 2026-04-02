@@ -1728,16 +1728,15 @@ def _fused_integer_decode_kernel(bits: int, repeat_count: int, key_mse_bits: int
 
 @lru_cache(maxsize=None)
 def _single_tile_value_weighted_sum_kernel(bits: int, repeat_count: int, dims_per_lane: int):
-    """Single-tile value weighted sum: each lane handles multiple value dims.
-    Reads precomputed scores + packed values, outputs weighted accumulations.
-    Much faster than the multi-tile value kernel at large D (e.g. D=256)."""
+    """Single-tile value weighted sum with threadgroup=Dim for maximum occupancy.
+    One thread per value dim — no simd needed, 8x better latency hiding than TG=32."""
     if not _metal_available() or repeat_count < 1:
         return None
 
     val_mask = (1 << bits) - 1
 
     lines = [
-        "        auto lane = thread_position_in_grid.x;",
+        "        auto dim = thread_position_in_grid.x;",
         "        auto n = thread_position_in_grid.z;",
         "        auto token_count = norms_shape[2];",
         "        auto kv_heads = norms_shape[1];",
@@ -1752,56 +1751,39 @@ def _single_tile_value_weighted_sum_kernel(bits: int, repeat_count: int, dims_pe
         "        auto nm = norms + bh * token_count;",
         "        auto pk = packed + bh * token_count * PackedWidth;",
         "",
-        "        int v_words[DimsPerLane], v_shifts[DimsPerLane];",
-        "        bool v_valid[DimsPerLane], v_spills[DimsPerLane];",
-        "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {",
-        f"            v_valid[i] = d < Dim;",
-        f"            int bo = d * {bits};",
-        f"            v_words[i] = bo / 32;",
-        f"            v_shifts[i] = bo % 32;",
-        f"            v_spills[i] = (bo % 32 + {bits}) > 32;",
-        "        }",
+        f"        int bo = dim * {bits};",
+        f"        int v_word = bo / 32;",
+        f"        int v_shift = bo % 32;",
+        f"        bool v_spill = (bo % 32 + {bits}) > 32;",
         "",
     ]
 
     for r in range(repeat_count):
-        lines += [
-            f"        float denom_{r} = 0.0f;",
-            f"        float acc_{r}[DimsPerLane] = {{}};",
-        ]
+        lines += [f"        float denom_{r} = 0.0f, acc_{r} = 0.0f;"]
 
     lines += [
         "",
         "        for (int t = t_start; t < t_end; t++) {",
         "            auto pt = pk + t * PackedWidth;",
-        "            float norm = static_cast<float>(nm[t]);",
-        "",
-        "            float vals[DimsPerLane];",
-        "            for (int i = 0; i < DimsPerLane; i++) {",
-        "                if (v_valid[i]) {",
-        "                    uint vv = (pt[v_words[i]] >> v_shifts[i]);",
-        f"                    if (v_spills[i]) vv |= pt[v_words[i]+1] << ({bits} - (v_shifts[i]+{bits}-32));",
-        f"                    vals[i] = codebook[vv & {val_mask}u] * norm;",
-        "                }",
-        "            }",
+        "            uint vv = (pt[v_word] >> v_shift);",
+        f"            if (v_spill) vv |= pt[v_word+1] << ({bits} - (v_shift+{bits}-32));",
+        f"            float val = codebook[vv & {val_mask}u] * static_cast<float>(nm[t]);",
         "",
     ]
 
     for r in range(repeat_count):
         lines += [
-            f"            float w_{r} = exp(static_cast<float>(sc[{r} * token_count + t]) - static_cast<float>(ms[{r}]));",
+            f"            float w_{r} = exp(static_cast<float>(sc[{r}*token_count+t]) - static_cast<float>(ms[{r}]));",
             f"            denom_{r} += w_{r};",
-            f"            for (int i = 0; i < DimsPerLane; i++) acc_{r}[i] += w_{r} * vals[i];",
+            f"            acc_{r} += w_{r} * val;",
         ]
 
     lines += ["        }", ""]
 
     for r in range(repeat_count):
         lines += [
-            f"        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {{",
-            f"            if (d < Dim) out_acc[((bh*num_tok_tiles+tok_tile)*RepeatCount+{r})*Dim+d] = acc_{r}[i];",
-            f"        }}",
-            f"        if (lane == 0) out_sum[(bh*num_tok_tiles+tok_tile)*RepeatCount+{r}] = denom_{r};",
+            f"        if (dim < Dim) out_acc[((bh*num_tok_tiles+tok_tile)*RepeatCount+{r})*Dim+dim] = acc_{r};",
+            f"        if (dim == 0) out_sum[(bh*num_tok_tiles+tok_tile)*RepeatCount+{r}] = denom_{r};",
         ]
 
     return mx.fast.metal_kernel(
@@ -3687,8 +3669,9 @@ class TurboQuantKVCache(_BaseCache):
                 ("DimsPerLane", dims_per_lane),
                 ("PackedWidth", values_state.indices.shape[-1]),
             ],
-            grid=(32, 1, B * H * num_tok_tiles),
-            threadgroup=(32, 1, 1),
+            # TG=D: one thread per value dim, 8x better latency hiding than TG=32
+            grid=(D, 1, B * H * num_tok_tiles),
+            threadgroup=(D, 1, 1),
             output_shapes=[acc_shape, sum_shape],
             output_dtypes=[mx.float32, mx.float32],
         )
