@@ -15,6 +15,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
   - [Supported Models](#supported-models)
   - [Usage Examples](#usage-examples)
 - [Model-Specific Documentation](#model-specific-documentation)
+- [TurboQuant KV Cache](#turboquant-kv-cache)
 - [Fine-tuning](#fine-tuning)
 
 ## Model-Specific Documentation
@@ -445,6 +446,73 @@ mlx_vlm.video_generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tok
 
 
 These examples demonstrate how to use multiple images with MLX-VLM for more complex visual reasoning tasks.
+
+## TurboQuant KV Cache
+
+TurboQuant compresses the KV cache during generation, enabling longer context lengths with less memory while maintaining quality.
+
+### Quick Start
+
+```sh
+# 3.5-bit KV cache quantization (3-bit keys + 4-bit values)
+mlx_vlm generate \
+  --model mlx-community/Qwen3.5-4B-4bit \
+  --kv-bits 3.5 \
+  --kv-quant-scheme turboquant \
+  --prompt "Your long prompt here..."
+```
+
+```python
+from mlx_vlm import generate
+
+result = generate(
+    model, processor, prompt,
+    kv_bits=3.5,
+    kv_quant_scheme="turboquant",
+    max_tokens=256,
+)
+```
+
+### How It Works
+
+TurboQuant uses random rotation + codebook quantization ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) to compress KV cache entries from 16-bit to 2-4 bits per dimension:
+
+- **Keys**: ProdCodec (MSE codebook + QJL sign residual) for accurate attention scoring
+- **Values**: MSE codebook for reconstruction quality
+- **Fractional bits** (e.g. 3.5): uses lower bits for keys, higher for values (3-bit K + 4-bit V)
+
+Custom Metal kernels fuse score computation and value aggregation directly on packed quantized data, avoiding full dequantization during decode.
+
+### Performance
+
+Tested on Qwen3.5-4B-4bit at 128k context:
+
+| Metric | Baseline | TurboQuant 3.5-bit |
+|--------|----------|-------------------|
+| KV Memory | 4.1 GB | 0.97 GB (**76% reduction**) |
+| Peak Memory | 18.3 GB | 17.3 GB (**-1.0 GB**) |
+
+At 512k+ contexts, TurboQuant's per-layer attention is **faster than FP16 SDPA** due to reduced memory bandwidth requirements.
+
+Tested on gemma-4-31b-it at 128k context:
+
+| Metric | Baseline | TurboQuant 3.5-bit |
+|--------|----------|-------------------|
+| KV Memory | 13.3 GB | 4.9 GB (**63% reduction**) |
+| Peak Memory | 75.2 GB | 65.8 GB (**-9.4 GB**) |
+
+### Supported Bit Widths
+
+| Bits | Compression | Best For |
+|------|------------|----------|
+| 2 | ~8x | Maximum compression, some quality loss |
+| 3 | ~5x | Good balance of quality and compression |
+| 3.5 | ~4.5x | Recommended default (3-bit keys + 4-bit values) |
+| 4 | ~4x | Best quality, moderate compression |
+
+### Compatibility
+
+TurboQuant automatically quantizes `KVCache` layers (global attention). Models with `RotatingKVCache` (sliding window) or `ArraysCache` (MLA/absorbed keys) keep their native cache format for those layers since they are already memory-efficient.
 
 # Fine-tuning
 
