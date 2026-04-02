@@ -2114,8 +2114,8 @@ def _reserve_state_capacity(state, used: int, needed: int, step: int):
     capacity = _state_length(state)
     if capacity >= needed:
         return state
-    new_capacity = max(needed, max(capacity * 2, step))
-    new_capacity = ((new_capacity + step - 1) // step) * step
+    # Round up to next step boundary — avoids 2x growth spikes
+    new_capacity = ((needed + step - 1) // step) * step
     grown = _allocate_state_like(state, new_capacity)
     if used > 0:
         _write_state(grown, _slice_state(state, used), 0)
@@ -2161,12 +2161,8 @@ class _TurboQuantMSECodec:
     def quantize(self, vectors: mx.array) -> TurboQuantMSEState:
         vectors_f32 = vectors.astype(mx.float32)
         norms = mx.linalg.norm(vectors_f32, axis=-1)
-        safe_norms = mx.maximum(norms[..., None], _EPS)
-        unit_vectors = mx.where(
-            norms[..., None] > 0,
-            vectors_f32 / safe_norms,
-            mx.zeros(vectors.shape, dtype=mx.float32),
-        )
+        # safe_norms >= _EPS, so division never produces inf/nan
+        unit_vectors = vectors_f32 / mx.maximum(norms[..., None], _EPS)
         return TurboQuantMSEState(
             norms.astype(vectors.dtype),
             self._quantize_unit(unit_vectors),
@@ -2500,12 +2496,7 @@ class _TurboQuantProdCodec:
     def quantize(self, vectors: mx.array) -> TurboQuantProdState:
         vectors_f32 = vectors.astype(mx.float32)
         norms = mx.linalg.norm(vectors_f32, axis=-1)
-        safe_norms = mx.maximum(norms[..., None], _EPS)
-        unit_vectors = mx.where(
-            norms[..., None] > 0,
-            vectors_f32 / safe_norms,
-            mx.zeros(vectors.shape, dtype=mx.float32),
-        )
+        unit_vectors = vectors_f32 / mx.maximum(norms[..., None], _EPS)
 
         mse_indices, mse_unit = self.mse_codec._quantize_unit_with_estimate(
             unit_vectors
@@ -2732,6 +2723,8 @@ class TurboQuantKVCache(_BaseCache):
         self.values = None
         self.key_codec = None
         self.value_codec = None
+        self._cached_state = None
+        self._cached_state_offset = -1
 
     @classmethod
     def from_cache(
@@ -2771,6 +2764,10 @@ class TurboQuantKVCache(_BaseCache):
         _write_state(self.keys, new_keys, self.offset)
         _write_state(self.values, new_values, self.offset)
         self.offset = new_end
+        self._cached_state = None
+        self._cached_state_offset = -1
+        # Evaluate to prevent computation graph buildup during prefill
+        mx.eval(self.keys, self.values)
         return self.state
 
     def dequantize(self, keys_state=None, values_state=None):
@@ -3025,6 +3022,7 @@ class TurboQuantKVCache(_BaseCache):
             )
             normalizer = normalizer * prev_scale + chunk_denom * chunk_scale
             max_score = new_max
+            mx.eval(output, normalizer, max_score)
 
         output = output / mx.maximum(normalizer[..., None], _EPS)
         output = output.reshape(B, n_q_heads, L, value_dim)
@@ -3037,10 +3035,17 @@ class TurboQuantKVCache(_BaseCache):
     def state(self):
         if self.keys is None:
             return None, None
-        return _slice_state(self.keys, self.offset), _slice_state(self.values, self.offset)
+        if self._cached_state_offset == self.offset:
+            return self._cached_state
+        sliced = _slice_state(self.keys, self.offset), _slice_state(self.values, self.offset)
+        self._cached_state = sliced
+        self._cached_state_offset = self.offset
+        return sliced
 
     @state.setter
     def state(self, value):
+        self._cached_state = None
+        self._cached_state_offset = -1
         if value is None:
             self.keys, self.values = None, None
             self.offset = 0
@@ -3064,6 +3069,8 @@ class TurboQuantKVCache(_BaseCache):
     def trim(self, n):
         n = min(self.offset, n)
         self.offset -= n
+        self._cached_state = None
+        self._cached_state_offset = -1
         return n
 
     def make_mask(self, *args, **kwargs):
