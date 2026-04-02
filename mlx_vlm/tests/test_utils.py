@@ -79,14 +79,6 @@ class MockProcessor:
             inputs = {k: mx.array(v) for k, v in data.items()}
             inputs["pixel_values"] = mx.zeros((4, 5, 6)) if images else []
             return inputs
-        # Simulate PyTorch tensor output
-        elif return_tensors == "pt":
-            try:
-                inputs = {k: MockTorch.tensor(v) for k, v in data.items()}
-                inputs["pixel_values"] = MockTorch.tensor([4, 5, 6]) if images else []
-                return inputs
-            except ImportError:
-                raise ImportError("PyTorch is not installed")
         else:
             raise ValueError(f"Unsupported return_tensors: {return_tensors}")
 
@@ -326,40 +318,16 @@ def test_prepare_inputs():
 def test_process_inputs_with_fallback():
 
     processor = MockProcessor()
-
-    # Test MLX tensor output
-    inputs = process_inputs_with_fallback(
-        processor, images=None, audio=None, prompts="test", return_tensors="mlx"
-    )
-    assert isinstance(inputs["input_ids"], mx.array)
-    assert isinstance(inputs["attention_mask"], mx.array)
-
     try:
-        # Test PyTorch tensor output with fallback
+        # Test MLX tensor output
         inputs = process_inputs_with_fallback(
-            processor, images=None, audio=None, prompts="test", return_tensors="pt"
+            processor, images=None, audio=None, prompts="test", return_tensors="mlx"
         )
-        # Check if the tensors have PyTorch-like attributes without importing torch
-        assert hasattr(inputs["input_ids"], "numpy") and hasattr(
-            inputs["input_ids"], "detach"
-        )
-        assert hasattr(inputs["attention_mask"], "numpy") and hasattr(
-            inputs["attention_mask"], "detach"
-        )
+        assert isinstance(inputs["input_ids"], mx.array)
+        assert isinstance(inputs["attention_mask"], mx.array)
+
     except ImportError:
-        # Test PyTorch not installed scenario
-        with patch("builtins.__import__", side_effect=ImportError):
-            with pytest.raises(
-                ValueError,
-                match="Failed to process inputs with error.*PyTorch is not installed.*Please install PyTorch",
-            ):
-                process_inputs_with_fallback(
-                    processor,
-                    images=None,
-                    audio=None,
-                    prompts="test",
-                    return_tensors="pt",
-                )
+        raise ImportError("MLX is not installed")
 
 
 def test_stopping_criteria():

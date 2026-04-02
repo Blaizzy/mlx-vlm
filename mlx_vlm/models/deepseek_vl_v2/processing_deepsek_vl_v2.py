@@ -504,7 +504,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
         """
 
         Args:
-            prompt (str): the formatted prompt;
+            prompt (str or List[str]): the formatted prompt(s);
             conversations (List[Dict]): conversations with a list of messages;
             images (List[ImageType]): the list of images;
             apply_sft_format (bool): if prompt is not None, then apply the SFT format to prompt;
@@ -516,11 +516,29 @@ class DeepseekVLV2Processor(ProcessorMixin):
 
         Returns:
             outputs (BaseProcessorOutput): the output of the processor,
-                - input_ids (torch.LongTensor): [N + image tokens]
-                - images (torch.FloatTensor): [n_images, 3, H, W]
+                - input_ids (mx.array): [N + image tokens]
+                - images (mx.array): [n_images, 3, H, W]
                 - image_id (int): the id of the image token
                 - num_image_tokens (List[int]): the number of image tokens
         """
+
+        # Handle batch inputs: text is a list of prompts, images is a list of images
+        if isinstance(text, list):
+            if images is None:
+                images = [None] * len(text)
+            samples = []
+            for t, img in zip(text, images):
+                img_list = [img] if img is not None else []
+                samples.append(
+                    self.process_one(
+                        prompt=t,
+                        images=img_list,
+                        apply_sft_format=apply_sft_format,
+                        inference_mode=inference_mode,
+                        system_prompt=system_prompt,
+                    )
+                )
+            return self.batchify(samples)
 
         prepare = self.process_one(
             prompt=text,
@@ -534,3 +552,55 @@ class DeepseekVLV2Processor(ProcessorMixin):
             prepare = self.batchify([prepare])
 
         return prepare
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        import json
+        from pathlib import Path
+
+        from transformers import AutoTokenizer
+
+        kwargs.pop("use_fast", None)
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path, **kwargs
+        )
+        from ..base import load_chat_template
+
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
+
+        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
+        proc_kwargs = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+            for k in (
+                "candidate_resolutions",
+                "patch_size",
+                "downsample_ratio",
+                "image_mean",
+                "image_std",
+                "normalize",
+                "image_token",
+                "pad_token",
+                "add_special_token",
+                "sft_format",
+                "mask_prompt",
+                "ignore_id",
+            ):
+                if k in proc_cfg:
+                    proc_kwargs[k] = proc_cfg[k]
+            # Convert candidate_resolutions from list of lists to tuple of tuples
+            if "candidate_resolutions" in proc_kwargs:
+                proc_kwargs["candidate_resolutions"] = tuple(
+                    tuple(r) for r in proc_kwargs["candidate_resolutions"]
+                )
+
+        return cls(
+            tokenizer=tokenizer,
+            **proc_kwargs,
+        )
+
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("deepseek_vl_v2", DeepseekVLV2Processor)

@@ -26,12 +26,17 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | DeepSeek-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
 | DeepSeek-OCR-2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
 | DOTS-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
+| DOTS-MOCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
 | GLM-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/glm_ocr/README.md) |
 | Phi-4 Reasoning Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4_siglip/README.md) |
 | MiniCPM-o | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmo/README.md) |
 | Phi-4 Multimodal | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4mm/README.md) |
+| MolmoPoint | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/molmo_point/README.md) |
 | Moondream3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream3/README.md) |
 | Gemma 4 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
+| Falcon-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
+| Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
+| Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
 
 ## Installation
 
@@ -40,14 +45,6 @@ The easiest way to get started is to install the `mlx-vlm` package using pip:
 ```sh
 pip install -U mlx-vlm
 ```
-
-Some models (e.g., Qwen2-VL) require additional dependencies from the `torch` extra:
-
-```sh
-pip install -U mlx-vlm[torch]
-```
-
-This installs `torch`, `torchvision`, and other dependencies needed by certain model processors.
 
 ## Usage
 
@@ -190,12 +187,20 @@ Start the server:
 ```sh
 mlx_vlm.server --port 8080
 
+# Preload a model at startup (Hugging Face repo or local path)
+mlx_vlm.server --model <hf_repo_or_local_path>
+
+# Preload a model with adapter
+mlx_vlm.server --model <hf_repo_or_local_path> --adapter-path <adapter_path>
+
 # With trust remote code enabled (required for some models)
 mlx_vlm.server --trust-remote-code
 ```
 
 #### Server Options
 
+- `--model`: Preload a model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
+- `--adapter-path`: Path for adapter weights to use with the preloaded model
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
 - `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
@@ -339,6 +344,9 @@ curl -X POST "http://localhost:8080/responses" \
 - `max_tokens`: Maximum tokens to generate
 - `temperature`: Sampling temperature
 - `top_p`: Top-p sampling parameter
+- `top_k`: Top-k sampling cutoff
+- `min_p`: Min-p sampling threshold
+- `repetition_penalty`: Penalty applied to repeated tokens
 - `stream`: Enable streaming responses
 
 

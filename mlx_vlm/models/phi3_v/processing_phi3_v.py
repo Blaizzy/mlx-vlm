@@ -661,44 +661,6 @@ class Phi3VProcessor(ProcessorMixin):
         )
 
 
-# Register the processor with AutoProcessor
-from transformers import AutoProcessor
+from ..base import install_auto_processor_patch
 
-_original_auto_processor_from_pretrained = AutoProcessor.from_pretrained
-
-
-@classmethod
-def _patched_auto_processor_from_pretrained(
-    cls, pretrained_model_name_or_path, **kwargs
-):
-    """Patched from_pretrained that returns Phi3VProcessor for phi3_v models."""
-    from huggingface_hub import hf_hub_download
-
-    model_path = Path(pretrained_model_name_or_path)
-    is_local = model_path.exists() and model_path.is_dir()
-
-    # Check if this is a phi3_v model
-    is_phi3_v = False
-    try:
-        if is_local:
-            config_path = model_path / "config.json"
-        else:
-            config_path = Path(
-                hf_hub_download(pretrained_model_name_or_path, "config.json")
-            )
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-        model_type = config.get("model_type", "").lower()
-        is_phi3_v = model_type in ("phi3_v", "phi3-v", "phi3v")
-    except Exception:
-        pass
-
-    if is_phi3_v:
-        return Phi3VProcessor.from_pretrained(pretrained_model_name_or_path, **kwargs)
-
-    return _original_auto_processor_from_pretrained.__func__(
-        cls, pretrained_model_name_or_path, **kwargs
-    )
-
-
-AutoProcessor.from_pretrained = _patched_auto_processor_from_pretrained
+install_auto_processor_patch(["phi3_v", "phi3-v", "phi3v"], Phi3VProcessor)

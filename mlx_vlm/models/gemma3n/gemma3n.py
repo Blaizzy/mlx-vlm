@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
+from . import processing_gemma3n  # noqa: F401
 from .audio import AudioModel
 from .config import ModelConfig, TextConfig
 from .language import Gemma3nRMSNorm, LanguageModel

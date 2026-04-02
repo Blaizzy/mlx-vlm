@@ -12,7 +12,7 @@ PyTorch tensors. This patch ensures:
 import numpy as np
 from transformers import AutoProcessor
 
-from ..base import install_auto_processor_patch
+from ..base import install_auto_processor_patch, load_chat_template
 
 IMAGE_TOKEN_INDEX = -200
 DEFAULT_IMAGE_TOKEN = "<image>"
@@ -75,7 +75,7 @@ class Phi4SigLipProcessor:
                 images = [images]
 
             # Use the image processor (Siglip2ImageProcessor or similar)
-            # Request numpy return to avoid PyTorch dependency
+            # Request numpy return to avoid MLX dependency
             image_outputs = self.image_processor(images, return_tensors="np")
 
             # Extract and convert outputs
@@ -183,6 +183,7 @@ class Phi4SigLipProcessor:
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
 
         # Load config to determine vision tower and create image processor
         model_path = Path(pretrained_model_name_or_path)
@@ -215,6 +216,13 @@ class Phi4SigLipProcessor:
             else:
                 patch_size = 16
 
+        # Read processor_config.json for correct init kwargs
+        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
+        proc_kwargs = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
+
         # Create NaFlex-compatible image processor
         if "naflex" in vision_tower_name.lower():
             try:
@@ -245,7 +253,7 @@ class Phi4SigLipProcessor:
                 size={"height": img_size, "width": img_size}
             )
 
-        return cls(image_processor=image_processor, tokenizer=tokenizer)
+        return cls(image_processor=image_processor, tokenizer=tokenizer, **proc_kwargs)
 
 
 # Register processor patch so AutoProcessor returns our custom processor

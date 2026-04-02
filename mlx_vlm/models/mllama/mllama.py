@@ -5,6 +5,7 @@ import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
 from ..cache import KVCache
+from . import processing_mllama  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -59,8 +60,8 @@ class Model(nn.Module):
             cross_attention_states = self.multi_modal_projector(
                 cross_attention_states
             ).reshape(
+                input_ids.shape[0],
                 -1,
-                cross_attention_states.shape[-2],
                 self.config.text_config.hidden_size,
             )
 
@@ -123,8 +124,8 @@ class Model(nn.Module):
             cross_attention_states = self.multi_modal_projector(
                 cross_attention_states
             ).reshape(
+                input_ids.shape[0],
                 -1,
-                cross_attention_states.shape[-2],
                 self.config.text_config.hidden_size,
             )
 
