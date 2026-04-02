@@ -7,12 +7,13 @@ from typing import Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 from mlx_lm.models.base import (
-    create_attention_mask,
-    create_ssm_mask,
-    scaled_dot_product_attention,
+    scaled_dot_product_attention as mlx_scaled_dot_product_attention,
 )
 from PIL import Image
+
+from ..turboquant import TurboQuantKVCache
 
 
 def load_chat_template(tokenizer, model_path):
@@ -179,6 +180,55 @@ class BaseImageProcessor:
     @abstractmethod
     def preprocess(self, images):
         pass
+
+
+def scaled_dot_product_attention(
+    queries,
+    keys,
+    values,
+    cache,
+    scale: float,
+    mask: Optional[mx.array],
+    sinks: Optional[mx.array] = None,
+) -> mx.array:
+    if isinstance(cache, TurboQuantKVCache):
+        if sinks is not None:
+            raise ValueError("TurboQuant KV cache does not support attention sinks.")
+        if queries.shape[-2] == 1:
+            return cache.decode_attention(
+                queries,
+                keys_state=keys,
+                values_state=values,
+                scale=scale,
+                mask=mask,
+            )
+        result = cache.prefill_attention(
+            queries,
+            keys_state=keys,
+            values_state=values,
+            scale=scale,
+            mask=mask,
+        )
+        if result is not None:
+            return result
+        dequantized_keys, dequantized_values = cache.dequantize(keys, values)
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            dequantized_keys.astype(queries.dtype),
+            dequantized_values.astype(queries.dtype),
+            scale=scale,
+            mask=mask,
+        )
+
+    return mlx_scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        cache=cache,
+        scale=scale,
+        mask=mask,
+        sinks=sinks,
+    )
 
 
 def expand2square(pil_img, background_color):

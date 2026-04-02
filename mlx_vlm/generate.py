@@ -11,13 +11,14 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
-from mlx_lm.generate import maybe_quantize_kv_cache
+from mlx_lm.generate import maybe_quantize_kv_cache as mlx_maybe_quantize_kv_cache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
+from .turboquant import TurboQuantKVCache, turboquant_enabled
 from .utils import (
     StoppingCriteria,
     ThinkingBudgetCriteria,
@@ -38,6 +39,7 @@ DEFAULT_TOP_K = 0
 DEFAULT_MIN_P = 0.0
 DEFAULT_REPETITION_CONTEXT_SIZE = 20
 DEFAULT_KV_GROUP_SIZE = 64
+DEFAULT_KV_QUANT_SCHEME = "uniform"
 DEFAULT_COMPLETION_BATCH_SIZE = 32
 DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_THINKING_START_TOKEN = "<think>"
@@ -125,15 +127,23 @@ def parse_arguments():
     )
     parser.add_argument(
         "--kv-bits",
-        type=int,
+        type=float,
         default=None,
         help="Number of bits to quantize the KV cache to.",
+    )
+    parser.add_argument(
+        "--kv-quant-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=DEFAULT_KV_QUANT_SCHEME,
+        help="KV cache quantization backend. Fractional --kv-bits values use "
+        "TurboQuant automatically.",
     )
     parser.add_argument(
         "--kv-group-size",
         type=int,
         default=DEFAULT_KV_GROUP_SIZE,
-        help="Group size for the KV cache.",
+        help="Group size for uniform KV cache quantization.",
     )
     parser.add_argument(
         "--quantized-kv-start",
@@ -230,6 +240,52 @@ def normalize_resize_shape(
 generation_stream = mx.new_stream(mx.default_device())
 
 
+def maybe_quantize_kv_cache(
+    prompt_cache,
+    quantized_kv_start,
+    kv_group_size,
+    kv_bits,
+    kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
+):
+    if kv_bits is None:
+        return
+
+    if turboquant_enabled(kv_bits, kv_quant_scheme):
+
+        def quantize_entry(entry):
+            if isinstance(entry, TurboQuantKVCache):
+                return entry
+            # Convert standard KV caches with (B, H, T, D) state format.
+            # Skip RotatingKVCache — its sliding window is already compact
+            # and TurboQuant's overhead outweighs savings for short windows.
+            if isinstance(entry, cache.KVCache):
+                if entry.offset == 0:
+                    # Empty: replace so update_and_fetch quantizes on the fly
+                    return TurboQuantKVCache(bits=kv_bits)
+                if entry.offset < quantized_kv_start:
+                    return entry
+                return TurboQuantKVCache.from_cache(entry, bits=kv_bits)
+            if isinstance(entry, cache.CacheList):
+                entry.caches = [quantize_entry(sub_entry) for sub_entry in entry.caches]
+                return entry
+            if isinstance(entry, list):
+                return [quantize_entry(sub_entry) for sub_entry in entry]
+            if isinstance(entry, tuple):
+                return tuple(quantize_entry(sub_entry) for sub_entry in entry)
+            return entry
+
+        for index, layer_cache in enumerate(prompt_cache):
+            prompt_cache[index] = quantize_entry(layer_cache)
+        return
+
+    mlx_maybe_quantize_kv_cache(
+        prompt_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=int(kv_bits),
+    )
+
+
 @contextlib.contextmanager
 def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
     """
@@ -297,8 +353,9 @@ def generate_step(
     logit_bias: Optional[Dict[int, float]] = None,
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
-    kv_bits: Optional[int] = None,
+    kv_bits: Optional[float] = None,
     kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
+    kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
@@ -327,8 +384,9 @@ def generate_step(
         logit_bias (dictionary, optional): Additive logit bias.
         prompt_cache (list, optional): Pre-existing KV cache for the prompt.
         max_kv_size (int, optional): Maximum KV cache size.
-        kv_bits (int, optional): Number of bits for KV cache quantization.
-        kv_group_size (int): Group size for KV cache quantization.
+        kv_bits (float, optional): Number of bits for KV cache quantization.
+        kv_group_size (int): Group size for uniform KV cache quantization.
+        kv_quant_scheme (str): KV cache quantization backend.
         quantized_kv_start (int): Start index for quantized KV cache.
         sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
           token from a vector of log probabilities.
@@ -349,6 +407,7 @@ def generate_step(
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
+        kv_quant_scheme=kv_quant_scheme,
     )
 
     if sampler is None:
@@ -1461,6 +1520,9 @@ def main():
             "max_kv_size": args.max_kv_size,
             "kv_bits": args.kv_bits,
             "kv_group_size": args.kv_group_size,
+            "kv_quant_scheme": getattr(
+                args, "kv_quant_scheme", DEFAULT_KV_QUANT_SCHEME
+            ),
             "quantized_kv_start": args.quantized_kv_start,
             **kwargs,
         }

@@ -23,6 +23,7 @@ from typing_extensions import Required, TypeAlias, TypedDict
 
 from .generate import (
     DEFAULT_KV_GROUP_SIZE,
+    DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL_PATH,
     DEFAULT_PREFILL_STEP_SIZE,
@@ -49,7 +50,7 @@ def get_prefill_step_size():
 
 
 def get_quantized_kv_bits(model: str):
-    kv_bits = int(os.environ.get("KV_BITS", 0))
+    kv_bits = float(os.environ.get("KV_BITS", 0))
     if kv_bits == 0:
         return None
     if "qat" in model:
@@ -62,6 +63,10 @@ def get_quantized_kv_bits(model: str):
 
 def get_kv_group_size():
     return int(os.environ.get("KV_GROUP_SIZE", DEFAULT_KV_GROUP_SIZE))
+
+
+def get_kv_quant_scheme():
+    return os.environ.get("KV_QUANT_SCHEME", DEFAULT_KV_QUANT_SCHEME)
 
 
 def get_max_kv_size(model: str):
@@ -630,6 +635,7 @@ def build_generation_kwargs(
         "prefill_step_size": get_prefill_step_size(),
         "kv_bits": get_quantized_kv_bits(request.model),
         "kv_group_size": get_kv_group_size(),
+        "kv_quant_scheme": get_kv_quant_scheme(),
         "max_kv_size": get_max_kv_size(request.model),
         "quantized_kv_start": get_quantized_kv_start(),
         **request.generation_kwargs(),
@@ -1393,15 +1399,23 @@ def main():
     )
     parser.add_argument(
         "--kv-bits",
-        type=int,
+        type=float,
         default=0,
         help="Number of bits for KV cache quantization.",
+    )
+    parser.add_argument(
+        "--kv-quant-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=DEFAULT_KV_QUANT_SCHEME,
+        help="KV cache quantization backend. Fractional --kv-bits values use "
+        "TurboQuant automatically.",
     )
     parser.add_argument(
         "--kv-group-size",
         type=int,
         default=DEFAULT_KV_GROUP_SIZE,
-        help="Group size for KV cache quantization.",
+        help="Group size for uniform KV cache quantization.",
     )
     parser.add_argument(
         "--max-kv-size",
@@ -1433,6 +1447,7 @@ def main():
     os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["KV_BITS"] = str(args.kv_bits)
     os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
+    os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
 
