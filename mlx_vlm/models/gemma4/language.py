@@ -1,9 +1,9 @@
 from functools import partial
-from mlx.nn import RMSNorm
 from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn import RMSNorm
 
 from ..base import (
     LanguageModelOutput,

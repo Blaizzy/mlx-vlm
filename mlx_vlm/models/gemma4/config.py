@@ -24,7 +24,6 @@ class AudioConfig(BaseModelConfig):
     output_proj_dims: Optional[int] = 1536
 
 
-
 @dataclass
 class VisionConfig(BaseModelConfig):
     model_type: str = "gemma4_vision"

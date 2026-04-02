@@ -182,13 +182,24 @@ class AudioRelativePositionEmbedding(nn.Module):
         return signal.astype(dtype)
 
     def _relative_shift(
-        self, term_bd, batch_size, num_heads, num_blocks, block_size, context_size, max_span_plus_1
+        self,
+        term_bd,
+        batch_size,
+        num_heads,
+        num_blocks,
+        block_size,
+        context_size,
+        max_span_plus_1,
     ):
         pad_amount = (context_size + 1) - max_span_plus_1
         term_bd = mx.pad(term_bd, [(0, 0), (0, 0), (0, 0), (0, 0), (0, pad_amount)])
-        term_bd = term_bd.reshape(batch_size, num_heads, num_blocks, block_size * (context_size + 1))
+        term_bd = term_bd.reshape(
+            batch_size, num_heads, num_blocks, block_size * (context_size + 1)
+        )
         term_bd = term_bd[:, :, :, : block_size * context_size]
-        term_bd = term_bd.reshape(batch_size, num_heads, num_blocks, block_size, context_size)
+        term_bd = term_bd.reshape(
+            batch_size, num_heads, num_blocks, block_size, context_size
+        )
         return term_bd
 
     def __call__(self, queries: mx.array, keys: mx.array) -> mx.array:
@@ -251,15 +262,15 @@ class AudioAttention(nn.Module):
         self.v_proj = ClippableLinear(
             self.hidden_size, self.num_heads * self.head_dim, bias=False
         )
-        self.post = ClippableLinear(
-            self.hidden_size, self.hidden_size, bias=False
-        )
+        self.post = ClippableLinear(self.hidden_size, self.hidden_size, bias=False)
 
         self.q_scale = (self.head_dim**-0.5) / math.log(2)
         self.k_scale = math.log(1 + math.e) / math.log(2)
 
         # Relative position embedding internals (reusing AudioRelativePositionEmbedding logic)
-        self._rel_pos = AudioRelativePositionEmbedding.__new__(AudioRelativePositionEmbedding)
+        self._rel_pos = AudioRelativePositionEmbedding.__new__(
+            AudioRelativePositionEmbedding
+        )
         self._rel_pos.num_heads = self.num_heads
         self._rel_pos.channels = self.hidden_size
         self._rel_pos.head_dim = self.head_dim
@@ -454,9 +465,7 @@ class AudioEncoder(nn.Module):
         self.config = config
 
         self.subsample_conv_projection = SubSampleConvProjection(config)
-        self.layers = [
-            ConformerBlock(config) for _ in range(config.num_hidden_layers)
-        ]
+        self.layers = [ConformerBlock(config) for _ in range(config.num_hidden_layers)]
 
         if config.output_proj_dims is not None:
             self.output_proj = nn.Linear(
