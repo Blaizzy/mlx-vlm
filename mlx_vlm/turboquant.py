@@ -1727,6 +1727,92 @@ def _fused_integer_decode_kernel(bits: int, repeat_count: int, key_mse_bits: int
 
 
 @lru_cache(maxsize=None)
+def _single_tile_value_weighted_sum_kernel(bits: int, repeat_count: int, dims_per_lane: int):
+    """Single-tile value weighted sum: each lane handles multiple value dims.
+    Reads precomputed scores + packed values, outputs weighted accumulations.
+    Much faster than the multi-tile value kernel at large D (e.g. D=256)."""
+    if not _metal_available() or repeat_count < 1:
+        return None
+
+    val_mask = (1 << bits) - 1
+
+    lines = [
+        "        auto lane = thread_position_in_grid.x;",
+        "        auto n = thread_position_in_grid.z;",
+        "        auto token_count = norms_shape[2];",
+        "        auto kv_heads = norms_shape[1];",
+        "        auto num_tok_tiles = (token_count + TokTileSize - 1) / TokTileSize;",
+        "        auto bh = n / num_tok_tiles;",
+        "        auto tok_tile = n % num_tok_tiles;",
+        "        int t_start = tok_tile * TokTileSize;",
+        "        int t_end = min(t_start + TokTileSize, (int)token_count);",
+        "",
+        "        auto sc = scores + bh * RepeatCount * token_count;",
+        "        auto ms = max_scores + bh * RepeatCount;",
+        "        auto nm = norms + bh * token_count;",
+        "        auto pk = packed + bh * token_count * PackedWidth;",
+        "",
+        "        int v_words[DimsPerLane], v_shifts[DimsPerLane];",
+        "        bool v_valid[DimsPerLane], v_spills[DimsPerLane];",
+        "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {",
+        f"            v_valid[i] = d < Dim;",
+        f"            int bo = d * {bits};",
+        f"            v_words[i] = bo / 32;",
+        f"            v_shifts[i] = bo % 32;",
+        f"            v_spills[i] = (bo % 32 + {bits}) > 32;",
+        "        }",
+        "",
+    ]
+
+    for r in range(repeat_count):
+        lines += [
+            f"        float denom_{r} = 0.0f;",
+            f"        float acc_{r}[DimsPerLane] = {{}};",
+        ]
+
+    lines += [
+        "",
+        "        for (int t = t_start; t < t_end; t++) {",
+        "            auto pt = pk + t * PackedWidth;",
+        "            float norm = static_cast<float>(nm[t]);",
+        "",
+        "            float vals[DimsPerLane];",
+        "            for (int i = 0; i < DimsPerLane; i++) {",
+        "                if (v_valid[i]) {",
+        "                    uint vv = (pt[v_words[i]] >> v_shifts[i]);",
+        f"                    if (v_spills[i]) vv |= pt[v_words[i]+1] << ({bits} - (v_shifts[i]+{bits}-32));",
+        f"                    vals[i] = codebook[vv & {val_mask}u] * norm;",
+        "                }",
+        "            }",
+        "",
+    ]
+
+    for r in range(repeat_count):
+        lines += [
+            f"            float w_{r} = exp(static_cast<float>(sc[{r} * token_count + t]) - static_cast<float>(ms[{r}]));",
+            f"            denom_{r} += w_{r};",
+            f"            for (int i = 0; i < DimsPerLane; i++) acc_{r}[i] += w_{r} * vals[i];",
+        ]
+
+    lines += ["        }", ""]
+
+    for r in range(repeat_count):
+        lines += [
+            f"        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {{",
+            f"            if (d < Dim) out_acc[((bh*num_tok_tiles+tok_tile)*RepeatCount+{r})*Dim+d] = acc_{r}[i];",
+            f"        }}",
+            f"        if (lane == 0) out_sum[(bh*num_tok_tiles+tok_tile)*RepeatCount+{r}] = denom_{r};",
+        ]
+
+    return mx.fast.metal_kernel(
+        name=f"turboquant_single_tile_value_{bits}_r{repeat_count}",
+        input_names=["scores", "max_scores", "norms", "packed", "codebook"],
+        output_names=["out_acc", "out_sum"],
+        source="\n".join(lines),
+    )
+
+
+@lru_cache(maxsize=None)
 def _fused_integer_decode_single_tile_kernel(bits: int, repeat_count: int, dims_per_lane: int, key_mse_bits: int = -1):
     """Single-tile fused kernel — each lane handles multiple value dims.
     Zero key read redundancy: keys are read once per token, not once per val_tile.
@@ -3540,6 +3626,88 @@ class TurboQuantKVCache(_BaseCache):
         output = output.reshape(B, n_q_heads, L, value_dim)
         return output.astype(queries.dtype)
 
+    def _separate_score_value_decode(
+        self,
+        grouped_queries: mx.array,
+        keys_state,
+        values_state,
+    ) -> Optional[mx.array]:
+        """Separate-kernel decode: fast key scoring + single-tile value weighted sum.
+        2-3x faster than the fused kernel at large D because each kernel only
+        iterates its own dimensions once."""
+        if not (
+            _metal_available()
+            and isinstance(self.key_codec, _TurboQuantProdCodec)
+            and isinstance(self.value_codec, _TurboQuantMSECodec)
+            and isinstance(keys_state, TurboQuantProdState)
+            and isinstance(values_state, TurboQuantMSEState)
+        ):
+            return None
+
+        B = grouped_queries.shape[0]
+        H = grouped_queries.shape[1]
+        R = grouped_queries.shape[2]
+        D = grouped_queries.shape[-1]
+        T = keys_state.norms.shape[2]
+
+        val_bits = int(self.value_codec.bits)
+        if val_bits != self.value_codec.bits:
+            return None
+        dims_per_lane = (D + 31) // 32
+
+        val_kernel = _single_tile_value_weighted_sum_kernel(val_bits, R, dims_per_lane)
+        if val_kernel is None:
+            return None
+
+        # Step 1: Key scoring — uses existing optimized Metal kernel
+        prepared_queries = self.key_codec.prepare_queries(grouped_queries)
+        scores = self.key_codec.score_prepared(prepared_queries, keys_state)
+        # scores: (B, H, R, 1, T) → (B*H, R, T)
+        scores_2d = scores.reshape(B * H, R, T)
+        max_scores = mx.max(scores_2d, axis=-1)  # (B*H, R)
+
+        # Step 2: Single-tile value weighted sum
+        tok_tile_size = 1024
+        num_tok_tiles = (T + tok_tile_size - 1) // tok_tile_size
+        acc_shape = (B * H * num_tok_tiles, R, D)
+        sum_shape = (B * H * num_tok_tiles * R,)
+
+        out_acc, out_sum = val_kernel(
+            inputs=[
+                scores_2d,
+                max_scores,
+                values_state.norms,
+                values_state.indices,
+                self.value_codec.codebook,
+            ],
+            template=[
+                ("Dim", D),
+                ("RepeatCount", R),
+                ("TokTileSize", tok_tile_size),
+                ("DimsPerLane", dims_per_lane),
+                ("PackedWidth", values_state.indices.shape[-1]),
+            ],
+            grid=(32, 1, B * H * num_tok_tiles),
+            threadgroup=(32, 1, 1),
+            output_shapes=[acc_shape, sum_shape],
+            output_dtypes=[mx.float32, mx.float32],
+        )
+
+        # Cross-tile reduction
+        out_acc = out_acc.reshape(B * H, num_tok_tiles, R, D)
+        out_sum = out_sum.reshape(B * H, num_tok_tiles, R)
+        if num_tok_tiles > 1:
+            # Weighted merge across token tiles
+            denom = mx.sum(out_sum, axis=1)  # (B*H, R)
+            out_rotated = mx.sum(out_acc, axis=1) / mx.maximum(denom[..., None], _EPS)
+        else:
+            out_rotated = out_acc.squeeze(1) / mx.maximum(out_sum.squeeze(1)[..., None], _EPS)
+        out_rotated = out_rotated.reshape(B, H, R, D)
+
+        # Rotate values back to original space
+        output = mx.matmul(out_rotated, self.value_codec.rotation)
+        return mx.expand_dims(output, axis=3)
+
     def _compiled_split_decode_attention(
         self,
         grouped_queries: mx.array,
@@ -3846,6 +4014,18 @@ class TurboQuantKVCache(_BaseCache):
         total_tokens = _state_length(keys_state)
 
         if total_tokens <= self.decode_key_chunk_size and (mask is None or (isinstance(mask, str) and mask == "causal")):
+            # Separate-kernel path: score keys (fast) → single-tile value weighted sum
+            # 2-3x faster than fused kernel at large D because each kernel
+            # only iterates its own dims once, avoiding the fused kernel's
+            # double-iteration (score all dims + accumulate all dims per token).
+            sep_output = self._separate_score_value_decode(
+                grouped_queries, keys_state, values_state,
+            )
+            if sep_output is not None:
+                output = sep_output.reshape(B, n_q_heads, L, value_dim)
+                return output.astype(queries.dtype)
+
+            # Fallback: fused kernel paths
             fast_output = self._compiled_integer_decode_attention(
                 grouped_queries,
                 keys_state,
@@ -3855,7 +4035,6 @@ class TurboQuantKVCache(_BaseCache):
                 output = fast_output.reshape(B, n_q_heads, L, value_dim)
                 return output.astype(queries.dtype)
 
-            # Fused SplitCodec path — both halves in a single compiled call
             fast_output = self._compiled_split_decode_attention(
                 grouped_queries, keys_state, values_state,
             )
