@@ -498,17 +498,26 @@ def generate_step(
             with tqdm(total=total_tokens, desc="Prefill", unit="tok") as pbar:
                 while inputs_embeds.shape[1] > 1:
                     n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
+                    # Slice per_layer_inputs to match the current chunk if present.
+                    # Models like Gemma4 e2b/e4b store per-layer embeddings for every
+                    # input token; passing the full-length tensor with a shorter
+                    # inputs_embeds chunk causes a broadcast shape mismatch.
+                    chunk_kwargs = dict(kwargs)
+                    if chunk_kwargs.get("per_layer_inputs") is not None:
+                        chunk_kwargs["per_layer_inputs"] = chunk_kwargs["per_layer_inputs"][:, :n_to_process]
                     model.language_model(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
                         cache=prompt_cache,
                         n_to_process=n_to_process,
-                        **kwargs,
+                        **chunk_kwargs,
                     )
                     quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
                     inputs_embeds = inputs_embeds[:, n_to_process:]
                     input_ids = input_ids[:, n_to_process:]
+                    if kwargs.get("per_layer_inputs") is not None:
+                        kwargs["per_layer_inputs"] = kwargs["per_layer_inputs"][:, n_to_process:]
                     mx.clear_cache()
                     pbar.update(n_to_process)
 
