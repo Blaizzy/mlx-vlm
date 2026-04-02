@@ -2705,7 +2705,10 @@ def _build_codec(tensor: mx.array, bits: float, mode: str, seed: int):
 
 
 class TurboQuantKVCache(_BaseCache):
-    decode_key_chunk_size = 65536
+    # Process all tokens in one pass during decode — chunking adds significant
+    # overhead from the online-softmax recombination loop. Memory is already
+    # bounded by the quantized cache itself.
+    decode_key_chunk_size = 1 << 30  # ~1B tokens, effectively no chunking
     prefill_key_chunk_size = 512
     prefill_query_block_size = 16
     cache_step = 256
