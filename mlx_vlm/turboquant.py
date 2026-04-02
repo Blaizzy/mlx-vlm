@@ -934,6 +934,10 @@ def _mse_weighted_rot_repeat_kernel(repeat_count: int):
 
 @lru_cache(maxsize=None)
 def _mse_scores_weighted_rot_repeat_kernel(repeat_count: int):
+    """Single-pass fused softmax + weighted sum kernel.
+
+    Takes precomputed max_scores to avoid a separate token-dimension pass.
+    """
     if not _metal_available() or repeat_count <= 1:
         return None
 
@@ -955,6 +959,7 @@ def _mse_scores_weighted_rot_repeat_kernel(repeat_count: int):
         "        auto scores_base = scores + ((b * kv_heads + h) * repeat_count) * token_count;",
         "        auto norms_ptr = norms + (b * kv_heads + h) * token_count;",
         "        auto packed_ptr = packed + ((b * kv_heads + h) * token_count) * PackedWidth;",
+        "        auto max_base = max_scores + (b * kv_heads + h) * repeat_count;",
         "",
         "        int bit_offset = dim_idx * Bits;",
         "        int word_idx = bit_offset / 32;",
@@ -962,23 +967,7 @@ def _mse_scores_weighted_rot_repeat_kernel(repeat_count: int):
         "",
     ]
     for r in range(repeat_count):
-        lines.append(f"        float max_{r} = -INFINITY;")
-    lines += [
-        "",
-        "        for (int t = lane; t < token_count; t += 32) {",
-    ]
-    for r in range(repeat_count):
-        lines.append(
-            f"            max_{r} = max(max_{r}, static_cast<float>(scores_base[{r} * token_count + t]));"
-        )
-    lines += [
-        "        }",
-        "",
-    ]
-    for r in range(repeat_count):
-        lines.append(f"        float max_score_{r} = simd_max(max_{r});")
-    lines += [""]
-    for r in range(repeat_count):
+        lines.append(f"        float max_score_{r} = static_cast<float>(max_base[{r}]);")
         lines.append(f"        float acc_{r} = 0.0f;")
         lines.append(f"        float denom_{r} = 0.0f;")
     lines += [
@@ -1023,7 +1012,7 @@ def _mse_scores_weighted_rot_repeat_kernel(repeat_count: int):
     source = "\n".join(lines)
     return mx.fast.metal_kernel(
         name=f"turboquant_mse_scores_weighted_rot_repeat_{repeat_count}",
-        input_names=["scores", "norms", "packed", "codebook"],
+        input_names=["scores", "norms", "packed", "codebook", "max_scores"],
         output_names=["out"],
         source=source,
     )
@@ -1031,6 +1020,10 @@ def _mse_scores_weighted_rot_repeat_kernel(repeat_count: int):
 
 @lru_cache(maxsize=None)
 def _mse_scores_weighted_rot_sum_repeat_kernel(repeat_count: int):
+    """Single-pass kernel for unnormalized weighted sum (used in chunked attention).
+
+    Takes precomputed max_scores to avoid a separate token-dimension pass.
+    """
     if not _metal_available() or repeat_count <= 1:
         return None
 
@@ -1052,6 +1045,7 @@ def _mse_scores_weighted_rot_sum_repeat_kernel(repeat_count: int):
         "        auto scores_base = scores + ((b * kv_heads + h) * repeat_count) * token_count;",
         "        auto norms_ptr = norms + (b * kv_heads + h) * token_count;",
         "        auto packed_ptr = packed + ((b * kv_heads + h) * token_count) * PackedWidth;",
+        "        auto max_base = max_scores + (b * kv_heads + h) * repeat_count;",
         "",
         "        int bit_offset = dim_idx * Bits;",
         "        int word_idx = bit_offset / 32;",
@@ -1059,21 +1053,7 @@ def _mse_scores_weighted_rot_sum_repeat_kernel(repeat_count: int):
         "",
     ]
     for r in range(repeat_count):
-        lines.append(f"        float max_{r} = -INFINITY;")
-    lines += [
-        "",
-        "        for (int t = lane; t < token_count; t += 32) {",
-    ]
-    for r in range(repeat_count):
-        lines.append(
-            f"            max_{r} = max(max_{r}, static_cast<float>(scores_base[{r} * token_count + t]));"
-        )
-    lines += [
-        "        }",
-        "",
-    ]
-    for r in range(repeat_count):
-        lines.append(f"        float max_score_{r} = simd_max(max_{r});")
+        lines.append(f"        float max_score_{r} = static_cast<float>(max_base[{r}]);")
         lines.append(f"        float acc_{r} = 0.0f;")
     lines += [
         "",
@@ -1114,7 +1094,7 @@ def _mse_scores_weighted_rot_sum_repeat_kernel(repeat_count: int):
     source = "\n".join(lines)
     return mx.fast.metal_kernel(
         name=f"turboquant_mse_scores_weighted_rot_sum_repeat_{repeat_count}",
-        input_names=["scores", "norms", "packed", "codebook"],
+        input_names=["scores", "norms", "packed", "codebook", "max_scores"],
         output_names=["out"],
         source=source,
     )
@@ -1474,6 +1454,9 @@ def _metal_mse_weighted_sum_from_scores(
     if kernel is None:
         return None
 
+    # Precompute max scores on the host to avoid a second pass in the kernel
+    max_scores = mx.max(scores_2d, axis=-1)  # (B, H, R)
+
     D = rotation.shape[0]
     weighted_rot = kernel(
         inputs=[
@@ -1481,6 +1464,7 @@ def _metal_mse_weighted_sum_from_scores(
             state.norms,
             state.indices.astype(mx.uint32),
             codebook,
+            max_scores,
         ],
         template=[
             ("Dim", D),
@@ -1502,6 +1486,7 @@ def _metal_mse_weighted_sum_sum_from_scores(
     bits: int,
     codebook: mx.array,
     rotation: mx.array,
+    max_scores: mx.array,
 ) -> Optional[mx.array]:
     if (
         bits <= 0
@@ -1526,6 +1511,7 @@ def _metal_mse_weighted_sum_sum_from_scores(
     if kernel is None:
         return None
 
+    # max_scores shape: (B, H, R) — already precomputed by caller
     D = rotation.shape[0]
     weighted_rot = kernel(
         inputs=[
@@ -1533,6 +1519,7 @@ def _metal_mse_weighted_sum_sum_from_scores(
             state.norms,
             state.indices.astype(mx.uint32),
             codebook,
+            max_scores,
         ],
         template=[
             ("Dim", D),
@@ -2241,12 +2228,17 @@ class _TurboQuantMSECodec:
         self, scores: mx.array, state: TurboQuantMSEState
     ) -> tuple[mx.array, mx.array, mx.array]:
         max_scores = mx.max(scores, axis=-1)
+        # Reshape max_scores for the kernel: (B, H, R, 1) → (B, H, R)
+        max_scores_2d = max_scores.reshape(
+            max_scores.shape[0], max_scores.shape[1], max_scores.shape[2],
+        ) if max_scores.ndim == 4 else max_scores
         fast_output = _metal_mse_weighted_sum_sum_from_scores(
             scores,
             state,
             self.bits,
             self.codebook,
             self.rotation,
+            max_scores_2d,
         )
         if fast_output is not None:
             denom = mx.sum(mx.exp(scores - max_scores[..., None]), axis=-1)
