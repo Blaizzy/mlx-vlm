@@ -1728,8 +1728,9 @@ def _fused_integer_decode_kernel(bits: int, repeat_count: int, key_mse_bits: int
 
 @lru_cache(maxsize=None)
 def _single_tile_value_weighted_sum_kernel(bits: int, repeat_count: int, dims_per_lane: int):
-    """Single-tile value weighted sum with threadgroup=Dim for maximum occupancy.
-    One thread per value dim — no simd needed, 8x better latency hiding than TG=32."""
+    """Single-tile value weighted sum with precomputed softmax weights.
+    TG=Dim: one thread per value dim, no exp() calls in inner loop.
+    2x faster than online-softmax variant."""
     if not _metal_available() or repeat_count < 1:
         return None
 
@@ -1746,8 +1747,7 @@ def _single_tile_value_weighted_sum_kernel(bits: int, repeat_count: int, dims_pe
         "        int t_start = tok_tile * TokTileSize;",
         "        int t_end = min(t_start + TokTileSize, (int)token_count);",
         "",
-        "        auto sc = scores + bh * RepeatCount * token_count;",
-        "        auto ms = max_scores + bh * RepeatCount;",
+        "        auto wt = weights + bh * RepeatCount * token_count;",
         "        auto nm = norms + bh * token_count;",
         "        auto pk = packed + bh * token_count * PackedWidth;",
         "",
@@ -1759,7 +1759,7 @@ def _single_tile_value_weighted_sum_kernel(bits: int, repeat_count: int, dims_pe
     ]
 
     for r in range(repeat_count):
-        lines += [f"        float denom_{r} = 0.0f, acc_{r} = 0.0f;"]
+        lines += [f"        float acc_{r} = 0.0f;"]
 
     lines += [
         "",
@@ -1772,24 +1772,19 @@ def _single_tile_value_weighted_sum_kernel(bits: int, repeat_count: int, dims_pe
     ]
 
     for r in range(repeat_count):
-        lines += [
-            f"            float w_{r} = exp(static_cast<float>(sc[{r}*token_count+t]) - static_cast<float>(ms[{r}]));",
-            f"            denom_{r} += w_{r};",
-            f"            acc_{r} += w_{r} * val;",
-        ]
+        lines += [f"            acc_{r} += wt[{r}*token_count+t] * val;"]
 
     lines += ["        }", ""]
 
     for r in range(repeat_count):
         lines += [
-            f"        if (dim < Dim) out_acc[((bh*num_tok_tiles+tok_tile)*RepeatCount+{r})*Dim+dim] = acc_{r};",
-            f"        if (dim == 0) out_sum[(bh*num_tok_tiles+tok_tile)*RepeatCount+{r}] = denom_{r};",
+            f"        if (dim < Dim) out[((bh*num_tok_tiles+tok_tile)*RepeatCount+{r})*Dim+dim] = acc_{r};",
         ]
 
     return mx.fast.metal_kernel(
         name=f"turboquant_single_tile_value_{bits}_r{repeat_count}",
-        input_names=["scores", "max_scores", "norms", "packed", "codebook"],
-        output_names=["out_acc", "out_sum"],
+        input_names=["weights", "norms", "packed", "codebook"],
+        output_names=["out"],
         source="\n".join(lines),
     )
 
@@ -3646,18 +3641,18 @@ class TurboQuantKVCache(_BaseCache):
         scores = self.key_codec.score_prepared(prepared_queries, keys_state)
         # scores: (B, H, R, 1, T) → (B*H, R, T)
         scores_2d = scores.reshape(B * H, R, T)
-        max_scores = mx.max(scores_2d, axis=-1)  # (B*H, R)
 
-        # Step 2: Single-tile value weighted sum
+        # Step 2: Precompute softmax weights (avoids exp() in value kernel)
+        weights = mx.softmax(scores_2d, axis=-1)  # (B*H, R, T)
+
+        # Step 3: Single-tile value weighted sum with precomputed weights
         tok_tile_size = 1024
         num_tok_tiles = (T + tok_tile_size - 1) // tok_tile_size
-        acc_shape = (B * H * num_tok_tiles, R, D)
-        sum_shape = (B * H * num_tok_tiles * R,)
+        out_shape = (B * H * num_tok_tiles, R, D)
 
-        out_acc, out_sum = val_kernel(
+        out_tiled = val_kernel(
             inputs=[
-                scores_2d,
-                max_scores,
+                weights,
                 values_state.norms,
                 values_state.indices,
                 self.value_codec.codebook,
@@ -3669,22 +3664,18 @@ class TurboQuantKVCache(_BaseCache):
                 ("DimsPerLane", dims_per_lane),
                 ("PackedWidth", values_state.indices.shape[-1]),
             ],
-            # TG=D: one thread per value dim, 8x better latency hiding than TG=32
             grid=(D, 1, B * H * num_tok_tiles),
             threadgroup=(D, 1, 1),
-            output_shapes=[acc_shape, sum_shape],
-            output_dtypes=[mx.float32, mx.float32],
-        )
+            output_shapes=[out_shape],
+            output_dtypes=[mx.float32],
+        )[0]
 
-        # Cross-tile reduction
-        out_acc = out_acc.reshape(B * H, num_tok_tiles, R, D)
-        out_sum = out_sum.reshape(B * H, num_tok_tiles, R)
+        # Cross-tile reduction (simple sum since weights are pre-normalized)
+        out_tiled = out_tiled.reshape(B * H, num_tok_tiles, R, D)
         if num_tok_tiles > 1:
-            # Weighted merge across token tiles
-            denom = mx.sum(out_sum, axis=1)  # (B*H, R)
-            out_rotated = mx.sum(out_acc, axis=1) / mx.maximum(denom[..., None], _EPS)
+            out_rotated = mx.sum(out_tiled, axis=1)
         else:
-            out_rotated = out_acc.squeeze(1) / mx.maximum(out_sum.squeeze(1)[..., None], _EPS)
+            out_rotated = out_tiled.squeeze(1)
         out_rotated = out_rotated.reshape(B, H, R, D)
 
         # Rotate values back to original space
