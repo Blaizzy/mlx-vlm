@@ -2650,13 +2650,10 @@ class _SplitCodec:
 
     def score_prepared(self, prepared_queries, state: TurboQuantSplitState) -> mx.array:
         low_queries, high_queries = prepared_queries
-        return self.low_codec.score_prepared(
-            low_queries,
-            state.low,
-        ) + self.high_codec.score_prepared(
-            high_queries,
-            state.high,
-        )
+        # Launch both sub-codec scores before any sync — enables GPU overlap
+        low_scores = self.low_codec.score_prepared(low_queries, state.low)
+        high_scores = self.high_codec.score_prepared(high_queries, state.high)
+        return low_scores + high_scores
 
     def score(self, queries: mx.array, state: TurboQuantSplitState) -> mx.array:
         return self.score_prepared(self.prepare_queries(queries), state)
@@ -2670,6 +2667,7 @@ class _SplitCodec:
     def weighted_sum_from_scores(
         self, scores: mx.array, state: TurboQuantSplitState
     ) -> mx.array:
+        # Launch both before concat to enable overlap
         low_tensor = self.low_codec.weighted_sum_from_scores(scores, state.low)
         high_tensor = self.high_codec.weighted_sum_from_scores(scores, state.high)
         merged = mx.concatenate([low_tensor, high_tensor], axis=-1)
@@ -2678,6 +2676,7 @@ class _SplitCodec:
     def weighted_sum_stats_from_scores(
         self, scores: mx.array, state: TurboQuantSplitState
     ) -> tuple[mx.array, mx.array, mx.array]:
+        # Launch both before concat to enable overlap
         low_tensor, denom, max_scores = self.low_codec.weighted_sum_stats_from_scores(
             scores, state.low
         )
