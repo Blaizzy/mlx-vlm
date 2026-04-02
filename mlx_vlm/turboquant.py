@@ -2886,21 +2886,22 @@ class _TurboQuantMSECodec:
         self, scores: mx.array, state: TurboQuantMSEState
     ) -> tuple[mx.array, mx.array, mx.array]:
         max_scores = mx.max(scores, axis=-1)
-        # Reshape max_scores for the kernel: (B, H, R, 1) → (B, H, R)
-        max_scores_2d = max_scores.reshape(
-            max_scores.shape[0], max_scores.shape[1], max_scores.shape[2],
-        ) if max_scores.ndim == 4 else max_scores
-        fast_output = _metal_mse_weighted_sum_sum_from_scores(
-            scores,
-            state,
-            self.bits,
-            self.codebook,
-            self.rotation,
-            max_scores_2d,
-        )
-        if fast_output is not None:
-            denom = mx.sum(mx.exp(scores - max_scores[..., None]), axis=-1)
-            return fast_output, denom, max_scores
+        # Metal kernel fast path: only for single-query decode (L=1)
+        if scores.ndim == 5 and scores.shape[-2] == 1:
+            max_scores_2d = max_scores.reshape(
+                max_scores.shape[0], max_scores.shape[1], max_scores.shape[2],
+            )
+            fast_output = _metal_mse_weighted_sum_sum_from_scores(
+                scores,
+                state,
+                self.bits,
+                self.codebook,
+                self.rotation,
+                max_scores_2d,
+            )
+            if fast_output is not None:
+                denom = mx.sum(mx.exp(scores - max_scores[..., None]), axis=-1)
+                return fast_output, denom, max_scores
 
         weights = mx.exp(scores - max_scores[..., None])
         output = self.weighted_sum(weights, state)
@@ -3393,7 +3394,7 @@ class TurboQuantKVCache(_BaseCache):
     # overhead from the online-softmax recombination loop. Memory is already
     # bounded by the quantized cache itself.
     decode_key_chunk_size = 1 << 30  # ~1B tokens, effectively no chunking
-    prefill_key_chunk_size = 512
+    prefill_key_chunk_size = 2048  # match DEFAULT_PREFILL_STEP_SIZE from generate.py
     prefill_query_block_size = 16
     cache_step = 256
 
@@ -3602,6 +3603,108 @@ class TurboQuantKVCache(_BaseCache):
         output = mx.concatenate(outputs, axis=3)
         output = output.reshape(B, n_q_heads, L, value_dim)
         return output.astype(queries.dtype)
+
+    def prefill_attention(
+        self,
+        queries: mx.array,
+        keys_state=None,
+        values_state=None,
+        scale: float = 1.0,
+        mask: Optional[mx.array] = None,
+    ) -> Optional[mx.array]:
+        """Fast prefill: fold L queries into R dimension, reuse decode kernels.
+        Avoids the expensive O(T×D²) dequantize rotation matmul."""
+        if keys_state is None or values_state is None:
+            keys_state, values_state = self.state
+        keys_state = self._unwrap(keys_state)
+        values_state = self._unwrap(values_state)
+
+        if not (
+            isinstance(self.key_codec, _TurboQuantProdCodec)
+            and isinstance(self.value_codec, _TurboQuantMSECodec)
+            and isinstance(keys_state, TurboQuantProdState)
+            and isinstance(values_state, TurboQuantMSEState)
+        ):
+            return None
+
+        B, n_q_heads, L, D = queries.shape
+        n_kv_heads = keys_state.norms.shape[1]
+        n_repeats = n_q_heads // n_kv_heads
+        T = keys_state.norms.shape[2]
+
+        if T == 0:
+            return None  # empty cache, let fallback handle it
+
+        val_bits = int(self.value_codec.bits)
+        if val_bits != self.value_codec.bits:
+            return None
+        dims_per_lane = (D + 31) // 32
+
+        val_kernel = _single_tile_value_weighted_sum_kernel(val_bits, n_repeats * L, dims_per_lane)
+        if val_kernel is None:
+            return None
+
+        # Fold L into R: (B, H, R, L, D) → (B, H, R*L, 1, D)
+        grouped = (queries * scale).reshape(B, n_kv_heads, n_repeats * L, 1, D)
+
+        # Score: uses existing prod_score kernel with R*L repeats
+        prepared = self.key_codec.prepare_queries(grouped)
+        scores = self.key_codec.score_prepared(prepared, keys_state)
+        # scores: (B, H, R*L, 1, T) → (B, H, R, L, T)
+        scores = scores.reshape(B, n_kv_heads, n_repeats, L, T)
+
+        # Apply mask (causal or explicit)
+        if mask is not None:
+            if isinstance(mask, mx.array):
+                if mask.ndim == scores.ndim - 1:
+                    mask = mx.expand_dims(mask, axis=2)
+                if mask.dtype == mx.bool_:
+                    scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
+                else:
+                    scores = scores + mask
+            # string masks not supported here, fall back
+            elif isinstance(mask, str):
+                return None
+
+        # Softmax + reshape for value kernel: (B*H, R*L, T)
+        weights = mx.softmax(scores, axis=-1).reshape(B * n_kv_heads, n_repeats * L, T)
+
+        # Value weighted sum using TG=D kernel
+        tok_tile_size = 1024
+        num_tok_tiles = (T + tok_tile_size - 1) // tok_tile_size
+        out_shape = (B * n_kv_heads * num_tok_tiles, n_repeats * L, D)
+
+        out_tiled = val_kernel(
+            inputs=[
+                weights,
+                values_state.norms,
+                values_state.indices,
+                self.value_codec.codebook,
+            ],
+            template=[
+                ("Dim", D),
+                ("RepeatCount", n_repeats * L),
+                ("TokTileSize", tok_tile_size),
+                ("DimsPerLane", dims_per_lane),
+                ("PackedWidth", values_state.indices.shape[-1]),
+            ],
+            grid=(D, 1, B * n_kv_heads * num_tok_tiles),
+            threadgroup=(D, 1, 1),
+            output_shapes=[out_shape],
+            output_dtypes=[mx.float32],
+        )[0]
+
+        # Reduce across tiles
+        out_tiled = out_tiled.reshape(B * n_kv_heads, num_tok_tiles, n_repeats * L, D)
+        if num_tok_tiles > 1:
+            out_rotated = mx.sum(out_tiled, axis=1)
+        else:
+            out_rotated = out_tiled.squeeze(1)
+        out_rotated = out_rotated.reshape(B, n_kv_heads, n_repeats, L, D)
+
+        # Rotate values back
+        output = mx.matmul(out_rotated, self.value_codec.rotation)
+        return output.reshape(B, n_q_heads, L, D).astype(queries.dtype)
 
     def _separate_score_value_decode(
         self,
