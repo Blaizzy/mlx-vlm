@@ -19,24 +19,36 @@ Falcon-Perception is a 1B parameter early-fusion vision-language model from TII 
 pip install mlx-vlm
 ```
 
-## Python Examples
+## CLI
+
+```bash
+python -m mlx_vlm generate \
+    --model tiiuae/Falcon-Perception \
+    --image photo.jpg \
+    --prompt "cat" \
+    --max-tokens 200
+```
+
+## Python
 
 ### Detection + Segmentation
 
-Use `generate_perception` for the full detection pipeline with coord/size/mask decoding:
-
 ```python
-from mlx_vlm import load
-from mlx_vlm.models.falcon_perception import generate_perception, plot_detections
+from mlx_vlm import load, generate
 
 model, processor = load("tiiuae/Falcon-Perception")
 
-detections = generate_perception(
-    model, processor,
+output = generate(
+    model,
+    processor,
+    "cat",
     image="photo.jpg",
-    query="cat",
-    max_new_tokens=200,
+    max_tokens=200,
+    verbose=True,
 )
+
+# Retrieve detections accumulated during generate()
+detections = model.get_detections()
 
 for det in detections:
     xy, hw = det["xy"], det["hw"]
@@ -47,8 +59,12 @@ for det in detections:
 ### Plotting Detections
 
 ```python
+from mlx_vlm.models.falcon_perception import plot_detections
+
 plot_detections("photo.jpg", detections, save_path="output.png")
 ```
+
+See [`examples/falcon_perception_demo.ipynb`](../../../examples/falcon_perception_demo.ipynb) for a complete example with visualization.
 
 ### Output Format
 
@@ -60,4 +76,4 @@ Each detection is a dict with:
 ### Notes
 
 - Segmentation masks are produced at patch resolution and upsampled via nearest-neighbor interpolation. The original PyTorch model uses AnyUp (a learned cross-attention upsampler with FlexAttention) for higher-resolution masks, which is not available in MLX.
-- The `generate_perception` function implements a custom decode loop with coord/size Fourier encoding feedback, which is required for accurate detection. Standard `generate()` will produce detection tokens but without decoded coordinates.
+- The coord/size Fourier encoding feedback is handled automatically by the `LanguageModel` during standard `generate()`. Use `model.get_detections()` after generation to retrieve results.
