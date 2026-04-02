@@ -2703,6 +2703,11 @@ class _TurboQuantMSECodec:
         self.rotation = _rotation_matrix(dim, seed)
         self.rotation_t = self.rotation.transpose() if dim > 0 else self.rotation
         self.codebook = _codebook(dim, bits)
+        # Precompute midpoints for fast comparison-based quantization
+        if bits > 0 and self.codebook.shape[0] > 1:
+            self._midpoints = (self.codebook[:-1] + self.codebook[1:]) / 2
+        else:
+            self._midpoints = mx.zeros((0,), dtype=mx.float32)
 
     def _quantize_unit_with_estimate(
         self, unit_vectors: mx.array
@@ -2714,10 +2719,13 @@ class _TurboQuantMSECodec:
             )
 
         rotated = mx.matmul(unit_vectors, self.rotation_t)
-        distances = mx.abs(rotated[..., None] - self.codebook)
-        indices = mx.argmin(distances, axis=-1).astype(mx.uint32)
+        # Use comparison-based quantization: O(T*D*bits) instead of
+        # O(T*D*2^bits) broadcast argmin. 11-28x faster.
+        indices = mx.zeros(rotated.shape, dtype=mx.uint32)
+        for m in range(self._midpoints.shape[0]):
+            indices = indices + (rotated > self._midpoints[m]).astype(mx.uint32)
         packed = _pack_lowbit(indices, self.bits)
-        estimated_rotated = mx.take(self.codebook, indices, axis=0)
+        estimated_rotated = mx.take(self.codebook, indices.astype(mx.int32), axis=0)
         return packed, mx.matmul(estimated_rotated, self.rotation)
 
     def _quantize_unit(self, unit_vectors: mx.array) -> mx.array:
@@ -3691,12 +3699,15 @@ class TurboQuantKVCache(_BaseCache):
         # Better parallelism at shorter contexts.
         multi_kernel = _fused_integer_decode_kernel(bits, R, key_mse_bits)
 
-        # Crossover: single-tile wins when key data exceeds L2 cache (~32MB)
-        # and there are enough tok_tiles for parallelism (>= ~64 threadgroups)
+        # Single-tile wins when val_tile redundancy outweighs parallelism benefit.
+        # More val_tiles (larger D) → lower crossover. With 8 val_tiles (D=256),
+        # single-tile wins even at 128k. With 5 tiles (D=160), crossover ~256k.
+        num_val_tiles = (D + 31) // 32
+        min_threadgroups = 64
         use_single = (
             single_kernel is not None
-            and T >= 262144  # 256k+
-            and num_tok_tiles * B * H >= 64
+            and num_tok_tiles * B * H >= min_threadgroups
+            and (num_val_tiles >= 8 or T >= 262144)
         )
 
         if use_single:
