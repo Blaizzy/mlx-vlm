@@ -1727,6 +1727,65 @@ def _fused_integer_decode_kernel(bits: int, repeat_count: int, key_mse_bits: int
 
 
 @lru_cache(maxsize=None)
+def _multi_query_prod_score_kernel(key_mse_bits: int, repeat_count: int, num_queries: int, dims_per_lane: int):
+    """Multi-query score kernel: unpack key data ONCE per token, loop over L queries.
+    Avoids R*L repeat explosion that causes register spill."""
+    if not _metal_available() or repeat_count < 1 or num_queries < 1:
+        return None
+
+    mse_mask = (1 << key_mse_bits) - 1
+
+    return mx.fast.metal_kernel(
+        name=f"mq_prod_score_{key_mse_bits}_r{repeat_count}_l{num_queries}",
+        input_names=["q_rot", "q_proj", "key_norms", "key_mse", "key_res_norms",
+                     "key_signs", "key_codebook", "key_scale"],
+        output_names=["out"],
+        source=f"""
+            auto lane = thread_position_in_grid.x;
+            auto ri = thread_position_in_grid.y;
+            auto n = thread_position_in_grid.z;
+            auto tc = key_norms_shape[2];
+            auto kh = key_norms_shape[1];
+            auto b = n / (kh * tc);
+            auto rem = n % (kh * tc);
+            auto h = rem / tc;
+            auto t = rem % tc;
+            if (ri >= {repeat_count}) return;
+
+            auto mt = key_mse + ((b*kh+h)*tc+t) * KMsePackedWidth;
+            auto st = key_signs + ((b*kh+h)*tc+t) * KSignPackedWidth;
+            float kn = static_cast<float>(key_norms[(b*kh+h)*tc+t]);
+            float ksr = kn * key_scale[0] * static_cast<float>(key_res_norms[(b*kh+h)*tc+t]);
+
+            // Unpack key ONCE
+            float kc[{dims_per_lane}], ksf[{dims_per_lane}];
+            for (int i=0, d=lane; d < Dim; i++, d+=32) {{
+                int bo = d * {key_mse_bits};
+                uint idx = (mt[bo>>5] >> (bo&31));
+                if (((bo&31)+{key_mse_bits}) > 32) idx |= mt[(bo>>5)+1] << ({key_mse_bits} - ((bo&31)+{key_mse_bits}-32));
+                idx &= {mse_mask}u;
+                kc[i] = key_codebook[idx];
+                uint sb = (st[d>>5] >> (d&31)) & 1u;
+                ksf[i] = sb ? 1.0f : -1.0f;
+            }}
+
+            // Loop over L queries, reusing unpacked key
+            auto bq = (b*kh+h) * {repeat_count} + ri;
+            for (int l = 0; l < {num_queries}; l++) {{
+                float ps = 0.0f;
+                for (int i=0, d=lane; d < Dim; i++, d+=32) {{
+                    ps += kn * static_cast<float>(q_rot[(bq*{num_queries}+l)*Dim+d]) * kc[i]
+                        + ksr * static_cast<float>(q_proj[(bq*{num_queries}+l)*Dim+d]) * ksf[i];
+                }}
+                float s = simd_sum(ps);
+                if (lane == 0)
+                    out[((b*kh+h)*{repeat_count}+ri)*{num_queries}*tc + l*tc + t] = s;
+            }}
+        """,
+    )
+
+
+@lru_cache(maxsize=None)
 def _single_tile_value_weighted_sum_kernel(bits: int, repeat_count: int, dims_per_lane: int):
     """Single-tile value weighted sum with precomputed softmax weights.
     TG=Dim: one thread per value dim, no exp() calls in inner loop.
@@ -3644,13 +3703,36 @@ class TurboQuantKVCache(_BaseCache):
         if val_kernel is None:
             return None
 
-        # Fold L into R: (B, H, R, L, D) → (B, H, R*L, 1, D)
-        grouped = (queries * scale).reshape(B, n_kv_heads, n_repeats * L, 1, D)
+        # Multi-query score: unpack key ONCE per token, loop over L queries
+        mq_score = _multi_query_prod_score_kernel(
+            self.key_codec.mse_codec.bits, n_repeats, L, dims_per_lane,
+        )
+        if mq_score is None:
+            return None
 
-        # Score: uses existing prod_score kernel with R*L repeats
-        prepared = self.key_codec.prepare_queries(grouped)
-        scores = self.key_codec.score_prepared(prepared, keys_state)
-        # scores: (B, H, R*L, 1, T) → (B, H, R, L, T)
+        grouped = (queries * scale).reshape(B, n_kv_heads, n_repeats, L, D)
+        qt = mx.matmul(grouped, self.key_codec.query_transform_t)
+        q_rot = qt[..., :D].reshape(B * n_kv_heads * n_repeats, L, D)
+        q_proj = qt[..., D:].reshape(B * n_kv_heads * n_repeats, L, D)
+
+        scores = mq_score(
+            inputs=[
+                q_rot, q_proj,
+                keys_state.norms, keys_state.mse_indices,
+                keys_state.residual_norms, keys_state.qjl_signs,
+                self.key_codec.mse_codec.codebook, self.key_codec.scale_array,
+            ],
+            template=[
+                ("Dim", D),
+                ("KMsePackedWidth", keys_state.mse_indices.shape[-1]),
+                ("KSignPackedWidth", keys_state.qjl_signs.shape[-1]),
+            ],
+            grid=(32, n_repeats, B * n_kv_heads * T),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(B * n_kv_heads * n_repeats, L, T)],
+            output_dtypes=[mx.float32],
+        )[0]
+        # Reshape: (B*H*R, L, T) → (B, H, R, L, T)
         scores = scores.reshape(B, n_kv_heads, n_repeats, L, T)
 
         # Apply mask (causal or explicit)
