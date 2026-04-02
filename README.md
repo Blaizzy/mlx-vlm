@@ -454,12 +454,17 @@ TurboQuant compresses the KV cache during generation, enabling longer context le
 ### Quick Start
 
 ```sh
-# 3.5-bit KV cache quantization (3-bit keys + 4-bit values)
-mlx_vlm generate \
-  --model mlx-community/Qwen3.5-4B-4bit \
-  --kv-bits 3.5 \
-  --kv-quant-scheme turboquant \
-  --prompt "Your long prompt here..."
+# 2-bit: maximum compression (~8x), some quality loss
+mlx_vlm generate --model mlx-community/Qwen3.5-4B-4bit --kv-bits 2 --kv-quant-scheme turboquant --prompt "..."
+
+# 3-bit: good balance of quality and compression (~5x)
+mlx_vlm generate --model mlx-community/Qwen3.5-4B-4bit --kv-bits 3 --kv-quant-scheme turboquant --prompt "..."
+
+# 3.5-bit (recommended): 3-bit keys + 4-bit values (~4.5x)
+mlx_vlm generate --model mlx-community/Qwen3.5-4B-4bit --kv-bits 3.5 --kv-quant-scheme turboquant --prompt "..."
+
+# 4-bit: best quality, moderate compression (~4x)
+mlx_vlm generate --model mlx-community/Qwen3.5-4B-4bit --kv-bits 4 --kv-quant-scheme turboquant --prompt "..."
 ```
 
 ```python
@@ -467,7 +472,7 @@ from mlx_vlm import generate
 
 result = generate(
     model, processor, prompt,
-    kv_bits=3.5,
+    kv_bits=3.5,           # 2, 3, 3.5, or 4
     kv_quant_scheme="turboquant",
     max_tokens=256,
 )
@@ -505,12 +510,12 @@ Tested on gemma-4-31b-it at 128k context:
 
 ### Supported Bit Widths
 
-| Bits | Compression | Best For |
-|------|------------|----------|
-| 2 | ~8x | Maximum compression, some quality loss |
-| 3 | ~5x | Good balance of quality and compression |
-| 3.5 | ~4.5x | Recommended default (3-bit keys + 4-bit values) |
-| 4 | ~4x | Best quality, moderate compression |
+| `--kv-bits` | Key Bits | Value Bits | Compression | Best For |
+|-------------|----------|------------|-------------|----------|
+| `2` | 2 | 2 | ~8x | Maximum compression, some quality loss |
+| `3` | 3 | 3 | ~5x | Good balance of quality and compression |
+| `3.5` | 3 | 4 | ~4.5x | **Recommended** — best quality/compression tradeoff |
+| `4` | 4 | 4 | ~4x | Best quality, moderate compression |
 
 ### Compatibility
 
