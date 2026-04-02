@@ -1124,7 +1124,7 @@ def _metal_mse_score(
         inputs=[
             q_rot,
             state.norms,
-            state.indices.astype(mx.uint32),
+            state.indices,
             codebook,
         ],
         template=[
@@ -1159,7 +1159,7 @@ def _metal_qjl_score(
             q_proj,
             state.norms,
             state.residual_norms,
-            state.qjl_signs.astype(mx.uint32),
+            state.qjl_signs,
             scale,
         ],
         template=[
@@ -1202,8 +1202,8 @@ def _metal_prod_score(
                     q_proj,
                     state.norms,
                     state.residual_norms,
-                    state.mse_indices.astype(mx.uint32),
-                    state.qjl_signs.astype(mx.uint32),
+                    state.mse_indices,
+                    state.qjl_signs,
                     codebook,
                     scale,
                 ],
@@ -1231,8 +1231,8 @@ def _metal_prod_score(
             q_proj,
             state.norms,
             state.residual_norms,
-            state.mse_indices.astype(mx.uint32),
-            state.qjl_signs.astype(mx.uint32),
+            state.mse_indices,
+            state.qjl_signs,
             codebook,
             scale,
         ],
@@ -1273,7 +1273,7 @@ def _metal_polar_prod_score(
     T = state.norms.shape[2]
     levels = len(level_bits)
     inputs = [q_rot, state.norms, state.polar_state.radii]
-    inputs.extend(level.astype(mx.uint32) for level in state.polar_state.level_indices)
+    inputs.extend(level for level in state.polar_state.level_indices)
     for cos_table, sin_table in zip(cos_tables, sin_tables):
         inputs.extend([cos_table, sin_table])
 
@@ -1319,11 +1319,11 @@ def _metal_polar_turbo_score(
         return None
 
     inputs = [q_rot, q_proj, state.norms, state.polar_state.radii]
-    inputs.extend(level.astype(mx.uint32) for level in state.polar_state.level_indices)
+    inputs.extend(level for level in state.polar_state.level_indices)
     inputs.extend(
         [
             state.residual_norms,
-            state.qjl_signs.astype(mx.uint32),
+            state.qjl_signs,
             scale,
         ]
     )
@@ -1382,7 +1382,7 @@ def _metal_mse_weighted_sum(
                 inputs=[
                     weights_2d,
                     state.norms,
-                    state.indices.astype(mx.uint32),
+                    state.indices,
                     codebook,
                 ],
                 template=[
@@ -1407,7 +1407,7 @@ def _metal_mse_weighted_sum(
         inputs=[
             weights_2d,
             state.norms,
-            state.indices.astype(mx.uint32),
+            state.indices,
             codebook,
         ],
         template=[
@@ -1462,7 +1462,7 @@ def _metal_mse_weighted_sum_from_scores(
         inputs=[
             scores_2d,
             state.norms,
-            state.indices.astype(mx.uint32),
+            state.indices,
             codebook,
             max_scores,
         ],
@@ -1517,7 +1517,7 @@ def _metal_mse_weighted_sum_sum_from_scores(
         inputs=[
             scores_2d,
             state.norms,
-            state.indices.astype(mx.uint32),
+            state.indices,
             codebook,
             max_scores,
         ],
@@ -1585,6 +1585,141 @@ def _compiled_integer_decode_kernel(bits: int):
 
 
 @lru_cache(maxsize=None)
+def _fused_integer_decode_kernel(bits: int, repeat_count: int):
+    """Single Metal kernel: score + online-softmax + weighted-sum for integer-bit
+    ProdCodec keys + MSECodec values. Eliminates intermediate scores tensor."""
+    if not _metal_available() or repeat_count < 1:
+        return None
+
+    mse_bits = max(bits - 1, 0)
+    mse_mask = (1 << mse_bits) - 1
+    val_mask = (1 << bits) - 1
+
+    lines = [
+        "        auto lane = thread_position_in_grid.x;",
+        "        auto val_tile = thread_position_in_grid.y;",
+        "        auto n = thread_position_in_grid.z;",
+        "",
+        "        int val_dim = val_tile * 32 + lane;",
+        "",
+        "        auto token_count = key_norms_shape[2];",
+        "        auto kv_heads = key_norms_shape[1];",
+        "        auto num_tok_tiles = (token_count + TokTileSize - 1) / TokTileSize;",
+        "        auto bh = n / num_tok_tiles;",
+        "        auto tok_tile = n % num_tok_tiles;",
+        "        auto b = bh / kv_heads;",
+        "        auto h = bh % kv_heads;",
+        "        auto base = (b * kv_heads + h);",
+        "",
+        "        int t_start = tok_tile * TokTileSize;",
+        "        int t_end = min(t_start + TokTileSize, (int)token_count);",
+        "",
+        "        auto k_norms = key_norms + base * token_count;",
+        "        auto k_mse = key_mse + base * token_count * KMsePackedWidth;",
+        "        auto k_res = key_res_norms + base * token_count;",
+        "        auto k_signs = key_signs + base * token_count * KSignPackedWidth;",
+        "        auto v_norms = val_norms + base * token_count;",
+        "        auto v_packed = val_packed + base * token_count * VPackedWidth;",
+        "",
+        "        bool v_valid = val_dim < Dim;",
+        "        int v_bo = val_dim * ValBits;",
+        "        int v_word = v_bo / 32;",
+        "        int v_off = v_bo % 32;",
+        f"        bool v_spills = (v_off + ValBits > 32);",
+        "",
+    ]
+
+    for r in range(repeat_count):
+        lines += [
+            f"        auto qr_{r} = q_rot + (base * RepeatCount + {r}) * Dim;",
+            f"        auto qp_{r} = q_proj + (base * RepeatCount + {r}) * Dim;",
+        ]
+
+    for r in range(repeat_count):
+        lines += [
+            f"        float lmax_{r} = -INFINITY;",
+            f"        float lsum_{r} = 0.0f;",
+            f"        float lacc_{r} = 0.0f;",
+        ]
+
+    lines += [
+        "",
+        "        for (int t = t_start; t < t_end; t++) {",
+        "            auto mse_t = k_mse + t * KMsePackedWidth;",
+        "            auto sign_t = k_signs + t * KSignPackedWidth;",
+        "            float kn = static_cast<float>(k_norms[t]);",
+        "            float ksr = kn * key_scale[0] * static_cast<float>(k_res[t]);",
+    ]
+
+    for r in range(repeat_count):
+        lines += [f"            float ps_{r} = 0.0f;"]
+
+    lines += [
+        f"            for (int d = lane; d < Dim; d += 32) {{",
+        f"                int bo = d * {mse_bits};",
+        f"                uint idx = (mse_t[bo >> 5] >> (bo & 31));",
+        f"                if (((bo & 31) + {mse_bits}) > 32) idx |= mse_t[(bo >> 5) + 1] << ({mse_bits} - ((bo & 31) + {mse_bits} - 32));",
+        f"                idx &= {mse_mask}u;",
+        f"                float code = key_codebook[idx];",
+        f"                uint sb = (sign_t[d >> 5] >> (d & 31)) & 1u;",
+    ]
+    for r in range(repeat_count):
+        lines += [f"                ps_{r} += kn * static_cast<float>(qr_{r}[d]) * code + ksr * (sb ? static_cast<float>(qp_{r}[d]) : -static_cast<float>(qp_{r}[d]));"]
+    lines += [
+        "            }",
+    ]
+    for r in range(repeat_count):
+        lines += [f"            float s_{r} = simd_sum(ps_{r});"]
+
+    # Value decode + online softmax
+    lines += [
+        "",
+        "            float v_code = 0.0f;",
+        "            if (v_valid) {",
+        "                auto vt = v_packed + t * VPackedWidth;",
+        "                uint vv = (vt[v_word] >> v_off);",
+        f"                if (v_spills) vv |= vt[v_word + 1] << (ValBits - (v_off + ValBits - 32));",
+        f"                v_code = val_codebook[vv & {val_mask}u] * static_cast<float>(v_norms[t]);",
+        "            }",
+    ]
+
+    for r in range(repeat_count):
+        lines += [
+            f"            float om_{r} = lmax_{r};",
+            f"            lmax_{r} = max(lmax_{r}, s_{r});",
+            f"            float rs_{r} = exp(om_{r} - lmax_{r});",
+            f"            float w_{r} = exp(s_{r} - lmax_{r});",
+            f"            lsum_{r} = lsum_{r} * rs_{r} + w_{r};",
+            f"            lacc_{r} = lacc_{r} * rs_{r} + w_{r} * v_code;",
+        ]
+
+    lines += ["        }", ""]
+
+    lines += ["        int out_stride = Dim;"]
+    for r in range(repeat_count):
+        lines += [
+            f"        if (v_valid) {{",
+            f"            int out_base = ((bh * num_tok_tiles + tok_tile) * RepeatCount + {r}) * out_stride + val_dim;",
+            f"            out_acc[out_base] = lacc_{r};",
+            f"            out_sum[out_base] = lsum_{r};",
+            f"            out_max[out_base] = lmax_{r};",
+            f"        }}",
+        ]
+
+    return mx.fast.metal_kernel(
+        name=f"turboquant_fused_integer_decode_{bits}_r{repeat_count}",
+        input_names=[
+            "q_rot", "q_proj",
+            "key_norms", "key_mse", "key_res_norms", "key_signs",
+            "val_norms", "val_packed",
+            "key_codebook", "key_scale", "val_codebook",
+        ],
+        output_names=["out_acc", "out_sum", "out_max"],
+        source="\n".join(lines),
+    )
+
+
+@lru_cache(maxsize=None)
 def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int):
     """Single Metal kernel: score + online-softmax + weighted-sum for SplitCodec.
 
@@ -1626,14 +1761,9 @@ def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int)
         "        auto token_count = key_low_norms_shape[2];",
         "        auto kv_heads = key_low_norms_shape[1];",
         "        auto num_tok_tiles = (token_count + TokTileSize - 1) / TokTileSize;",
-        "        auto tok_tile = n / kv_heads;",
-        "        auto remaining = n % kv_heads;",
-        "        auto b = remaining / kv_heads;",
-        "        // Flatten: n = b * kv_heads * num_tok_tiles + h * num_tok_tiles + tok_tile",
-        "        // Recompute properly:",
         "        auto bh = n / num_tok_tiles;",
-        "        tok_tile = n % num_tok_tiles;",
-        "        b = bh / kv_heads;",
+        "        auto tok_tile = n % num_tok_tiles;",
+        "        auto b = bh / kv_heads;",
         "        auto h = bh % kv_heads;",
         "        auto base = (b * kv_heads + h);",
         "",
@@ -1687,16 +1817,16 @@ def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int)
         "        for (int t = t_start; t < t_end; t++) {",
     ]
 
-    # Score: 32 lanes split key dims, simd_sum
     for r in range(repeat_count):
         lines += [f"            float ps_{r} = 0.0f;"]
 
+    # Low half scoring — hoisted ksr, conditional negate
     lines += [
         "            {",
         "                auto mse_t = kl_mse + t * KLMsePackedWidth;",
         "                auto sign_t = kl_signs + t * KLSignPackedWidth;",
         "                float kn = static_cast<float>(kl_norms[t]);",
-        "                float kr = static_cast<float>(kl_res[t]);",
+        "                float ksr = kn * key_low_scale[0] * static_cast<float>(kl_res[t]);",
         f"                for (int d = lane; d < DimLow; d += 32) {{",
         f"                    int bo = d * {low_mse_bits};",
         f"                    uint idx = (mse_t[bo >> 5] >> (bo & 31));",
@@ -1704,18 +1834,20 @@ def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int)
         f"                    idx &= {low_mse_mask}u;",
         f"                    float code = key_low_codebook[idx];",
         f"                    uint sb = (sign_t[d >> 5] >> (d & 31)) & 1u;",
-        f"                    float sign = sb ? 1.0f : -1.0f;",
     ]
     for r in range(repeat_count):
-        lines += [f"                    ps_{r} += kn * (static_cast<float>(qrl_{r}[d]) * code + key_low_scale[0] * kr * static_cast<float>(qpl_{r}[d]) * sign);"]
+        lines += [f"                    ps_{r} += kn * static_cast<float>(qrl_{r}[d]) * code + ksr * (sb ? static_cast<float>(qpl_{r}[d]) : -static_cast<float>(qpl_{r}[d]));"]
     lines += [
         "                }",
         "            }",
+    ]
+    # High half scoring
+    lines += [
         "            {",
         "                auto mse_t = kh_mse + t * KHMsePackedWidth;",
         "                auto sign_t = kh_signs + t * KHSignPackedWidth;",
         "                float kn = static_cast<float>(kh_norms[t]);",
-        "                float kr = static_cast<float>(kh_res[t]);",
+        "                float ksr = kn * key_high_scale[0] * static_cast<float>(kh_res[t]);",
         f"                for (int d = lane; d < DimHigh; d += 32) {{",
         f"                    int bo = d * {high_mse_bits};",
         f"                    uint idx = (mse_t[bo >> 5] >> (bo & 31));",
@@ -1723,10 +1855,9 @@ def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int)
         f"                    idx &= {high_mse_mask}u;",
         f"                    float code = key_high_codebook[idx];",
         f"                    uint sb = (sign_t[d >> 5] >> (d & 31)) & 1u;",
-        f"                    float sign = sb ? 1.0f : -1.0f;",
     ]
     for r in range(repeat_count):
-        lines += [f"                    ps_{r} += kn * (static_cast<float>(qrh_{r}[d]) * code + key_high_scale[0] * kr * static_cast<float>(qph_{r}[d]) * sign);"]
+        lines += [f"                    ps_{r} += kn * static_cast<float>(qrh_{r}[d]) * code + ksr * (sb ? static_cast<float>(qph_{r}[d]) : -static_cast<float>(qph_{r}[d]));"]
     lines += [
         "                }",
         "            }",
@@ -1766,7 +1897,6 @@ def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int)
 
     lines += ["        }", ""]
 
-    # Output per-tile partial results: (val_acc, sum_exp, max_score) for cross-tile reduction
     lines += [f"        int out_stride = ({val_dim_total});"]
     for r in range(repeat_count):
         lines += [
@@ -3283,9 +3413,9 @@ class TurboQuantKVCache(_BaseCache):
         high_mse_bits = max(high_bits - 1, 0)
         val_dim = dim_low + dim_high
 
-        # Single fused kernel: score + online-softmax + weighted_sum
-        # Tiled in BOTH val_dim and token dimensions for parallelism.
-        tok_tile_size = 1024  # tokens per threadgroup — tune for GPU occupancy
+        # Single fused kernel: score + online-softmax + weighted_sum.
+        # Token-tiled for GPU parallelism, with lightweight cross-tile reduction.
+        tok_tile_size = 1024
         num_val_tiles = (val_dim + 31) // 32
         num_tok_tiles = (T + tok_tile_size - 1) // tok_tile_size
 
@@ -3293,12 +3423,12 @@ class TurboQuantKVCache(_BaseCache):
         out_acc, out_sum, out_max = kernel(
             inputs=[
                 q_rot_low, q_proj_low, q_rot_high, q_proj_high,
-                keys_state.low.norms, keys_state.low.mse_indices.astype(mx.uint32),
-                keys_state.low.residual_norms, keys_state.low.qjl_signs.astype(mx.uint32),
-                keys_state.high.norms, keys_state.high.mse_indices.astype(mx.uint32),
-                keys_state.high.residual_norms, keys_state.high.qjl_signs.astype(mx.uint32),
-                values_state.low.norms, values_state.low.indices.astype(mx.uint32),
-                values_state.high.norms, values_state.high.indices.astype(mx.uint32),
+                keys_state.low.norms, keys_state.low.mse_indices,
+                keys_state.low.residual_norms, keys_state.low.qjl_signs,
+                keys_state.high.norms, keys_state.high.mse_indices,
+                keys_state.high.residual_norms, keys_state.high.qjl_signs,
+                values_state.low.norms, values_state.low.indices,
+                values_state.high.norms, values_state.high.indices,
                 kc.low_codec.mse_codec.codebook, kc.high_codec.mse_codec.codebook,
                 kc.low_codec.scale_array, kc.high_codec.scale_array,
                 vc.low_codec.codebook, vc.high_codec.codebook,
@@ -3323,20 +3453,16 @@ class TurboQuantKVCache(_BaseCache):
             output_dtypes=[mx.float32, mx.float32, mx.float32],
         )
 
-        # Cross-tile online-softmax reduction: combine (acc, sum, max) across token tiles
-        # Reshape: (B*H*num_tok_tiles, R, val_dim) → (B*H, num_tok_tiles, R, val_dim)
+        # Cross-tile online-softmax reduction + rotation + reorder
         out_acc = out_acc.reshape(B * H, num_tok_tiles, R, val_dim)
         out_sum = out_sum.reshape(B * H, num_tok_tiles, R, val_dim)
         out_max = out_max.reshape(B * H, num_tok_tiles, R, val_dim)
-
-        # Reduce across token tiles (dim 1) with online softmax
-        global_max = mx.max(out_max, axis=1, keepdims=True)  # (BH, 1, R, D)
-        scale_factors = mx.exp(out_max - global_max)  # (BH, tiles, R, D)
-        scaled_acc = mx.sum(out_acc * scale_factors, axis=1)  # (BH, R, D)
-        scaled_sum = mx.sum(out_sum * scale_factors, axis=1)  # (BH, R, D)
+        global_max = mx.max(out_max, axis=1, keepdims=True)
+        scale_factors = mx.exp(out_max - global_max)
+        scaled_acc = mx.sum(out_acc * scale_factors, axis=1)
+        scaled_sum = mx.sum(out_sum * scale_factors, axis=1)
         out_rotated = (scaled_acc / mx.maximum(scaled_sum, _EPS)).reshape(B, H, R, val_dim)
 
-        # Apply value rotation and reorder: (B, H, R, dim_low+dim_high)
         out_low = mx.matmul(out_rotated[..., :dim_low], vc.low_codec.rotation)
         out_high = mx.matmul(out_rotated[..., dim_low:], vc.high_codec.rotation)
         merged = mx.concatenate([out_low, out_high], axis=-1)
@@ -3364,6 +3490,61 @@ class TurboQuantKVCache(_BaseCache):
         if bits != self.value_codec.bits:
             return None
 
+        B, H, R = grouped_queries.shape[0], grouped_queries.shape[1], grouped_queries.shape[2]
+        D = grouped_queries.shape[-1]
+        T = keys_state.norms.shape[2]
+
+        # Try fused kernel first (single Metal dispatch, no intermediate scores)
+        kernel = _fused_integer_decode_kernel(bits, R)
+        if kernel is not None:
+            qt = mx.matmul(grouped_queries, self.key_codec.query_transform_t)
+            q_rot = qt[..., :D].reshape(B, H, R, D)
+            q_proj = qt[..., D:].reshape(B, H, R, D)
+
+            tok_tile_size = 1024
+            num_val_tiles = (D + 31) // 32
+            num_tok_tiles = (T + tok_tile_size - 1) // tok_tile_size
+            tile_shape = (B * H * num_tok_tiles, R, D)
+
+            out_acc, out_sum, out_max = kernel(
+                inputs=[
+                    q_rot, q_proj,
+                    keys_state.norms, keys_state.mse_indices,
+                    keys_state.residual_norms, keys_state.qjl_signs,
+                    values_state.norms, values_state.indices,
+                    self.key_codec.mse_codec.codebook,
+                    self.key_codec.scale_array,
+                    self.value_codec.codebook,
+                ],
+                template=[
+                    ("Dim", D),
+                    ("RepeatCount", R),
+                    ("TokTileSize", tok_tile_size),
+                    ("KMsePackedWidth", keys_state.mse_indices.shape[-1]),
+                    ("KSignPackedWidth", keys_state.qjl_signs.shape[-1]),
+                    ("VPackedWidth", values_state.indices.shape[-1]),
+                    ("ValBits", bits),
+                ],
+                grid=(32, num_val_tiles, B * H * num_tok_tiles),
+                threadgroup=(32, 1, 1),
+                output_shapes=[tile_shape, tile_shape, tile_shape],
+                output_dtypes=[mx.float32, mx.float32, mx.float32],
+            )
+
+            # Cross-tile reduction
+            out_acc = out_acc.reshape(B * H, num_tok_tiles, R, D)
+            out_sum = out_sum.reshape(B * H, num_tok_tiles, R, D)
+            out_max = out_max.reshape(B * H, num_tok_tiles, R, D)
+            global_max = mx.max(out_max, axis=1, keepdims=True)
+            scale_factors = mx.exp(out_max - global_max)
+            scaled_acc = mx.sum(out_acc * scale_factors, axis=1)
+            scaled_sum = mx.sum(out_sum * scale_factors, axis=1)
+            out_rotated = (scaled_acc / mx.maximum(scaled_sum, _EPS)).reshape(B, H, R, D)
+
+            output = mx.matmul(out_rotated, self.value_codec.rotation)
+            return mx.expand_dims(output, axis=3)
+
+        # Fallback: compiled two-dispatch path
         decode = _compiled_integer_decode_kernel(bits)
         return decode(
             grouped_queries,
