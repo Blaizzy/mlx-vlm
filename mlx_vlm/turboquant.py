@@ -2389,10 +2389,14 @@ def _beta_pdf(grid: np.ndarray, dim: int) -> np.ndarray:
     if dim <= 1:
         pdf = np.ones_like(grid)
     else:
-        coeff = math.gamma(dim / 2) / (
-            math.sqrt(math.pi) * math.gamma((dim - 1) / 2)
+        # Use lgamma to avoid overflow for large dim (e.g. dim=512)
+        log_coeff = (
+            math.lgamma(dim / 2)
+            - 0.5 * math.log(math.pi)
+            - math.lgamma((dim - 1) / 2)
         )
-        pdf = coeff * np.power(np.clip(1.0 - grid**2, 0.0, None), (dim - 3) / 2)
+        log_pdf = log_coeff + ((dim - 3) / 2) * np.log(np.clip(1.0 - grid**2, 1e-30, None))
+        pdf = np.exp(log_pdf - np.max(log_pdf))  # normalize to avoid overflow
     pdf_sum = pdf.sum()
     if pdf_sum == 0:
         return np.full_like(grid, 1.0 / len(grid))
