@@ -1727,6 +1727,148 @@ def _fused_integer_decode_kernel(bits: int, repeat_count: int):
 
 
 @lru_cache(maxsize=None)
+def _fused_integer_decode_single_tile_kernel(bits: int, repeat_count: int, dims_per_lane: int):
+    """Single-tile fused kernel — each lane handles multiple value dims.
+    Zero key read redundancy: keys are read once per token, not once per val_tile.
+    Faster than multi-tile at long contexts (256k+) where memory bandwidth dominates.
+    """
+    if not _metal_available() or repeat_count < 1:
+        return None
+
+    mse_bits = max(bits - 1, 0)
+    mse_mask = (1 << mse_bits) - 1
+    val_mask = (1 << bits) - 1
+
+    lines = [
+        "        auto lane = thread_position_in_grid.x;",
+        "        auto n = thread_position_in_grid.z;",
+        "        auto token_count = key_norms_shape[2];",
+        "        auto kv_heads = key_norms_shape[1];",
+        "        auto num_tok_tiles = (token_count + TokTileSize - 1) / TokTileSize;",
+        "        auto bh = n / num_tok_tiles;",
+        "        auto tok_tile = n % num_tok_tiles;",
+        "        auto b = bh / kv_heads;",
+        "        auto h = bh % kv_heads;",
+        "        auto base = (b * kv_heads + h);",
+        "        int t_start = tok_tile * TokTileSize;",
+        "        int t_end = min(t_start + TokTileSize, (int)token_count);",
+        "",
+        "        auto k_norms = key_norms + base * token_count;",
+        "        auto k_mse = key_mse + base * token_count * KMsePackedWidth;",
+        "        auto k_res = key_res_norms + base * token_count;",
+        "        auto k_signs = key_signs + base * token_count * KSignPackedWidth;",
+        "        auto v_norms = val_norms + base * token_count;",
+        "        auto v_packed = val_packed + base * token_count * VPackedWidth;",
+        "",
+        "        // Precompute value bit offsets for all dims this lane handles",
+        "        int v_words[DimsPerLane], v_offs[DimsPerLane];",
+        "        bool v_spills[DimsPerLane], v_valids[DimsPerLane];",
+        "        for (int i = 0, vd = lane; i < DimsPerLane; i++, vd += 32) {",
+        f"            v_valids[i] = vd < Dim;",
+        f"            int vbo = vd * {bits};",
+        f"            v_words[i] = vbo / 32;",
+        f"            v_offs[i] = vbo % 32;",
+        f"            v_spills[i] = (vbo % 32 + {bits}) > 32;",
+        "        }",
+        "",
+    ]
+
+    for r in range(repeat_count):
+        lines += [
+            f"        auto qr_{r} = q_rot + (base * RepeatCount + {r}) * Dim;",
+            f"        auto qp_{r} = q_proj + (base * RepeatCount + {r}) * Dim;",
+        ]
+
+    for r in range(repeat_count):
+        lines += [
+            f"        float lmax_{r} = -INFINITY, lsum_{r} = 0.0f;",
+            f"        float lacc_{r}[DimsPerLane] = {{}};",
+        ]
+
+    lines += [
+        "",
+        "        for (int t = t_start; t < t_end; t++) {",
+        "            auto mse_t = k_mse + t * KMsePackedWidth;",
+        "            auto sign_t = k_signs + t * KSignPackedWidth;",
+        "            float kn = static_cast<float>(k_norms[t]);",
+        "            float ksr = kn * key_scale[0] * static_cast<float>(k_res[t]);",
+        "",
+    ]
+
+    # Score
+    for r in range(repeat_count):
+        lines += [f"            float ps_{r} = 0.0f;"]
+
+    lines += [
+        f"            for (int d = lane; d < Dim; d += 32) {{",
+        f"                int bo = d * {mse_bits};",
+        f"                uint idx = (mse_t[bo >> 5] >> (bo & 31));",
+        f"                if (((bo & 31) + {mse_bits}) > 32) idx |= mse_t[(bo >> 5) + 1] << ({mse_bits} - ((bo & 31) + {mse_bits} - 32));",
+        f"                idx &= {mse_mask}u;",
+        f"                float code = key_codebook[idx];",
+        f"                uint sb = (sign_t[d >> 5] >> (d & 31)) & 1u;",
+    ]
+    for r in range(repeat_count):
+        lines += [f"                ps_{r} += kn * static_cast<float>(qr_{r}[d]) * code + ksr * (sb ? static_cast<float>(qp_{r}[d]) : -static_cast<float>(qp_{r}[d]));"]
+    lines += ["            }"]
+
+    for r in range(repeat_count):
+        lines += [f"            float s_{r} = simd_sum(ps_{r});"]
+
+    # Online softmax + multi-dim value accumulation
+    lines += [
+        "",
+        "            auto vt = v_packed + t * VPackedWidth;",
+        "            float vnorm = static_cast<float>(v_norms[t]);",
+    ]
+
+    for r in range(repeat_count):
+        lines += [
+            f"            {{ float om = lmax_{r};",
+            f"              lmax_{r} = max(lmax_{r}, s_{r});",
+            f"              float rs = exp(om - lmax_{r});",
+            f"              float w = exp(s_{r} - lmax_{r});",
+            f"              lsum_{r} = lsum_{r} * rs + w;",
+            f"              for (int i = 0; i < DimsPerLane; i++) {{",
+            f"                  lacc_{r}[i] *= rs;",
+            f"                  if (v_valids[i]) {{",
+            f"                      uint vv = (vt[v_words[i]] >> v_offs[i]);",
+            f"                      if (v_spills[i]) vv |= vt[v_words[i]+1] << ({bits} - (v_offs[i]+{bits}-32));",
+            f"                      lacc_{r}[i] += w * val_codebook[vv & {val_mask}u] * vnorm;",
+            f"                  }}",
+            f"              }}",
+            f"            }}",
+        ]
+
+    lines += ["        }", ""]
+
+    # Write unnormalized acc + scalar sum/max for cross-tile reduction
+    for r in range(repeat_count):
+        lines += [
+            f"        for (int i = 0, vd = lane; i < DimsPerLane; i++, vd += 32) {{",
+            f"            if (vd < Dim) out_acc[((bh*num_tok_tiles+tok_tile)*RepeatCount+{r})*Dim+vd] = lacc_{r}[i];",
+            f"        }}",
+            f"        if (lane == 0) {{",
+            f"            int sm_base = (bh*num_tok_tiles+tok_tile)*RepeatCount+{r};",
+            f"            out_sum[sm_base] = lsum_{r};",
+            f"            out_max[sm_base] = lmax_{r};",
+            f"        }}",
+        ]
+
+    return mx.fast.metal_kernel(
+        name=f"turboquant_fused_integer_single_tile_{bits}_r{repeat_count}",
+        input_names=[
+            "q_rot", "q_proj",
+            "key_norms", "key_mse", "key_res_norms", "key_signs",
+            "val_norms", "val_packed",
+            "key_codebook", "key_scale", "val_codebook",
+        ],
+        output_names=["out_acc", "out_sum", "out_max"],
+        source="\n".join(lines),
+    )
+
+
+@lru_cache(maxsize=None)
 def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int):
     """Single Metal kernel: score + online-softmax + weighted-sum for SplitCodec.
 
@@ -3527,20 +3669,79 @@ class TurboQuantKVCache(_BaseCache):
         D = grouped_queries.shape[-1]
         T = keys_state.norms.shape[2]
 
-        # Try fused kernel first (single Metal dispatch, no intermediate scores)
-        kernel = _fused_integer_decode_kernel(bits, R)
-        if kernel is not None:
-            qt = mx.matmul(grouped_queries, self.key_codec.query_transform_t)
-            q_rot = qt[..., :D].reshape(B, H, R, D)
-            q_proj = qt[..., D:].reshape(B, H, R, D)
+        # Try fused kernel — choose single-tile (zero key redundancy) for
+        # long contexts where memory bandwidth dominates, multi-tile for
+        # shorter contexts where parallelism matters more.
+        qt = mx.matmul(grouped_queries, self.key_codec.query_transform_t)
+        q_rot = qt[..., :D].reshape(B, H, R, D)
+        q_proj = qt[..., D:].reshape(B, H, R, D)
+        tok_tile_size = 1024
+        num_tok_tiles = (T + tok_tile_size - 1) // tok_tile_size
+        dims_per_lane = (D + 31) // 32
 
-            tok_tile_size = 1024
-            num_val_tiles = (D + 31) // 32
-            num_tok_tiles = (T + tok_tile_size - 1) // tok_tile_size
+        # Single-tile path: each lane handles all its value dims.
+        # Zero key read redundancy — faster at 256k+ where bandwidth dominates.
+        single_kernel = _fused_integer_decode_single_tile_kernel(bits, R, dims_per_lane)
+        # Multi-tile path: one val_dim per lane, multiple tiles read keys redundantly.
+        # Better parallelism at shorter contexts.
+        multi_kernel = _fused_integer_decode_kernel(bits, R)
+
+        # Crossover: single-tile wins when key data exceeds L2 cache (~32MB)
+        # and there are enough tok_tiles for parallelism (>= ~64 threadgroups)
+        use_single = (
+            single_kernel is not None
+            and T >= 262144  # 256k+
+            and num_tok_tiles * B * H >= 64
+        )
+
+        if use_single:
             acc_shape = (B * H * num_tok_tiles, R, D)
             sm_shape = (B * H * num_tok_tiles * R,)
 
-            out_acc, out_sum, out_max = kernel(
+            out_acc, out_sum, out_max = single_kernel(
+                inputs=[
+                    q_rot, q_proj,
+                    keys_state.norms, keys_state.mse_indices,
+                    keys_state.residual_norms, keys_state.qjl_signs,
+                    values_state.norms, values_state.indices,
+                    self.key_codec.mse_codec.codebook,
+                    self.key_codec.scale_array,
+                    self.value_codec.codebook,
+                ],
+                template=[
+                    ("Dim", D),
+                    ("RepeatCount", R),
+                    ("TokTileSize", tok_tile_size),
+                    ("DimsPerLane", dims_per_lane),
+                    ("KMsePackedWidth", keys_state.mse_indices.shape[-1]),
+                    ("KSignPackedWidth", keys_state.qjl_signs.shape[-1]),
+                    ("VPackedWidth", values_state.indices.shape[-1]),
+                ],
+                grid=(32, 1, B * H * num_tok_tiles),
+                threadgroup=(32, 1, 1),
+                output_shapes=[acc_shape, sm_shape, sm_shape],
+                output_dtypes=[mx.float32, mx.float32, mx.float32],
+            )
+
+            # Same cross-tile reduction as multi-tile
+            out_acc = out_acc.reshape(B * H, num_tok_tiles, R, D)
+            out_sum = out_sum.reshape(B * H, num_tok_tiles, R)
+            out_max = out_max.reshape(B * H, num_tok_tiles, R)
+            global_max = mx.max(out_max, axis=1, keepdims=True)
+            scale_factors = mx.exp(out_max - global_max)
+            scaled_acc = mx.sum(out_acc * scale_factors[..., None], axis=1)
+            denom = mx.sum(out_sum * scale_factors, axis=1)
+            out_rotated = (scaled_acc / mx.maximum(denom[..., None], _EPS)).reshape(B, H, R, D)
+
+            output = mx.matmul(out_rotated, self.value_codec.rotation)
+            return mx.expand_dims(output, axis=3)
+
+        elif multi_kernel is not None:
+            num_val_tiles = (D + 31) // 32
+            acc_shape = (B * H * num_tok_tiles, R, D)
+            sm_shape = (B * H * num_tok_tiles * R,)
+
+            out_acc, out_sum, out_max = multi_kernel(
                 inputs=[
                     q_rot, q_proj,
                     keys_state.norms, keys_state.mse_indices,
