@@ -513,7 +513,10 @@ def generate_step(
                         **chunk_kwargs,
                     )
                     quantize_cache_fn(prompt_cache)
-                    mx.eval([c.state for c in prompt_cache])
+                    # Skip caches whose keys are not yet populated (e.g. KV-shared
+                    # layers in Gemma4 e2b/e4b that never call update_and_fetch).
+                    mx.eval([c.state for c in prompt_cache
+                             if getattr(c, "keys", None) is not None])
                     inputs_embeds = inputs_embeds[:, n_to_process:]
                     input_ids = input_ids[:, n_to_process:]
                     if kwargs.get("per_layer_inputs") is not None:
