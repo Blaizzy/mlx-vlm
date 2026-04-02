@@ -2164,7 +2164,7 @@ class _TurboQuantMSECodec:
         # safe_norms >= _EPS, so division never produces inf/nan
         unit_vectors = vectors_f32 / mx.maximum(norms[..., None], _EPS)
         return TurboQuantMSEState(
-            norms.astype(vectors.dtype),
+            norms.astype(mx.float16),
             self._quantize_unit(unit_vectors),
         )
 
@@ -2374,12 +2374,7 @@ class _TurboQuantPolarProdCodec:
     def quantize(self, vectors: mx.array) -> TurboQuantPolarProdState:
         vectors_f32 = vectors.astype(mx.float32)
         norms = mx.linalg.norm(vectors_f32, axis=-1)
-        safe_norms = mx.maximum(norms[..., None], _EPS)
-        unit_vectors = mx.where(
-            norms[..., None] > 0,
-            vectors_f32 / safe_norms,
-            mx.zeros(vectors.shape, dtype=mx.float32),
-        )
+        unit_vectors = vectors_f32 / mx.maximum(norms[..., None], _EPS)
 
         polar_state, approx_unit = self.polar_codec.quantize_unit_with_estimate(
             unit_vectors,
@@ -2391,9 +2386,9 @@ class _TurboQuantPolarProdCodec:
         signs = mx.where(projected >= 0, 1, 0).astype(mx.uint32)
 
         return TurboQuantPolarProdState(
-            norms.astype(vectors.dtype),
+            norms.astype(mx.float16),
             polar_state,
-            residual_norms.astype(vectors.dtype),
+            residual_norms.astype(mx.float16),
             _pack_lowbit(signs, 1),
         )
 
@@ -2507,9 +2502,9 @@ class _TurboQuantProdCodec:
         signs = mx.where(projected >= 0, 1, 0).astype(mx.uint32)
 
         return TurboQuantProdState(
-            norms.astype(vectors.dtype),
+            norms.astype(mx.float16),
             mse_indices,
-            residual_norms.astype(vectors.dtype),
+            residual_norms.astype(mx.float16),
             _pack_lowbit(signs, 1),
         )
 
@@ -2763,11 +2758,14 @@ class TurboQuantKVCache(_BaseCache):
 
         _write_state(self.keys, new_keys, self.offset)
         _write_state(self.values, new_values, self.offset)
+        n_new = keys.shape[2]
         self.offset = new_end
         self._cached_state = None
         self._cached_state_offset = -1
-        # Evaluate to prevent computation graph buildup during prefill
-        mx.eval(self.keys, self.values)
+        # Only eval during prefill (multiple tokens) to prevent graph buildup.
+        # Single-token decode steps have a tiny graph — eval would stall the pipeline.
+        if n_new > 1:
+            mx.eval(self.keys, self.values)
         return self.state
 
     def dequantize(self, keys_state=None, values_state=None):
