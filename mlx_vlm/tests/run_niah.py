@@ -20,10 +20,8 @@ from pathlib import Path
 
 import mlx.core as mx
 
-from mlx_vlm.generate import generate, GenerationResult, maybe_quantize_kv_cache
-from mlx_vlm.models import cache as cache_mod
+from mlx_vlm.generate import generate
 from mlx_vlm.prompt_utils import apply_chat_template
-from mlx_vlm.turboquant import TurboQuantKVCache, _state_nbytes
 from mlx_vlm.utils import load
 
 NIAH_DIR = Path(__file__).parent / "niah"
@@ -39,6 +37,7 @@ def score_answer(expected: str, generated: str) -> bool:
 def strip_thinking(text: str) -> str:
     """Remove <think>...</think> blocks from model output."""
     import re
+
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
@@ -48,8 +47,11 @@ def estimate_kv_size_gb(model, n_tokens: int, kv_bits: float | None = None) -> f
     # Extract dimensions from config
     text_config = getattr(config, "text_config", config)
     n_layers = getattr(text_config, "num_hidden_layers", 28)
-    n_kv_heads = getattr(text_config, "num_key_value_heads",
-                         getattr(text_config, "num_attention_heads", 4))
+    n_kv_heads = getattr(
+        text_config,
+        "num_key_value_heads",
+        getattr(text_config, "num_attention_heads", 4),
+    )
     head_dim = getattr(text_config, "head_dim", None)
     if head_dim is None:
         hidden = getattr(text_config, "hidden_size", 2048)
@@ -66,18 +68,26 @@ def estimate_kv_size_gb(model, n_tokens: int, kv_bits: float | None = None) -> f
         # Plus norms overhead: ~16 bits per token per head (shared across dims)
         norms_bits_per_token = 16 * 3  # norms + residual_norms + value_norms
         bytes_per_token_per_layer = (
-            n_kv_heads * (head_dim * effective_bits_per_dim + norms_bits_per_token) / 8 * 2  # K+V
+            n_kv_heads
+            * (head_dim * effective_bits_per_dim + norms_bits_per_token)
+            / 8
+            * 2  # K+V
         )
     else:
         # FP16: 2 bytes per element, K+V
         bytes_per_token_per_layer = n_kv_heads * head_dim * 2 * 2  # 2 bytes * 2 (K+V)
 
     total_bytes = bytes_per_token_per_layer * n_layers * n_tokens
-    return total_bytes / (1024 ** 3)
+    return total_bytes / (1024**3)
 
 
 def run_single(
-    model, processor, config, tests, gen_kwargs, context_filter,
+    model,
+    processor,
+    config,
+    tests,
+    gen_kwargs,
+    context_filter,
     enable_thinking=False,
 ) -> list[dict]:
     results = []
@@ -92,7 +102,9 @@ def run_single(
         print(f"{'='*60}")
 
         prompt = apply_chat_template(
-            processor, config, test["prompt"],
+            processor,
+            config,
+            test["prompt"],
             enable_thinking=enable_thinking,
         )
 
@@ -104,7 +116,9 @@ def run_single(
         raw_text = result.text
         clean_text = strip_thinking(raw_text)
         correct = score_answer(test["expected_answer"], clean_text)
-        kv_gb = estimate_kv_size_gb(model, result.prompt_tokens, gen_kwargs.get("kv_bits"))
+        kv_gb = estimate_kv_size_gb(
+            model, result.prompt_tokens, gen_kwargs.get("kv_bits")
+        )
 
         entry = {
             "dataset": "single_needle",
@@ -130,7 +144,9 @@ def run_single(
         status = "PASS" if correct else "FAIL"
         print(f"  Answer: {clean_text[:200]}")
         print(f"  Expected: {test['expected_answer']}")
-        print(f"  [{status}]  prefill={result.prompt_tps:.1f} tok/s  gen={result.generation_tps:.1f} tok/s  active={active_mem_gb:.1f}GB  kv={kv_gb:.2f}GB  time={elapsed:.1f}s")
+        print(
+            f"  [{status}]  prefill={result.prompt_tps:.1f} tok/s  gen={result.generation_tps:.1f} tok/s  active={active_mem_gb:.1f}GB  kv={kv_gb:.2f}GB  time={elapsed:.1f}s"
+        )
 
         mx.clear_cache()
         gc.collect()
@@ -139,7 +155,12 @@ def run_single(
 
 
 def run_multi(
-    model, processor, config, tests, gen_kwargs, context_filter,
+    model,
+    processor,
+    config,
+    tests,
+    gen_kwargs,
+    context_filter,
     enable_thinking=False,
 ) -> list[dict]:
     results = []
@@ -154,7 +175,9 @@ def run_multi(
         print(f"{'='*60}")
 
         prompt = apply_chat_template(
-            processor, config, test["prompt"],
+            processor,
+            config,
+            test["prompt"],
             enable_thinking=enable_thinking,
         )
 
@@ -165,17 +188,21 @@ def run_multi(
         raw_text = result.text
         clean_text = strip_thinking(raw_text)
         active_mem_gb = round(mx.get_active_memory() / 1e9, 2)
-        kv_gb = estimate_kv_size_gb(model, result.prompt_tokens, gen_kwargs.get("kv_bits"))
+        kv_gb = estimate_kv_size_gb(
+            model, result.prompt_tokens, gen_kwargs.get("kv_bits")
+        )
 
         needle_results = []
         for needle in test["needles"]:
             found = score_answer(needle["answer"], clean_text)
-            needle_results.append({
-                "id": needle["id"],
-                "question": needle["question"],
-                "expected_answer": needle["answer"],
-                "found": found,
-            })
+            needle_results.append(
+                {
+                    "id": needle["id"],
+                    "question": needle["question"],
+                    "expected_answer": needle["answer"],
+                    "found": found,
+                }
+            )
 
         n_found = sum(1 for nr in needle_results if nr["found"])
 
@@ -203,7 +230,9 @@ def run_multi(
         for nr in needle_results:
             s = "PASS" if nr["found"] else "FAIL"
             print(f"    [{s}] {nr['expected_answer']}")
-        print(f"  prefill={result.prompt_tps:.1f} tok/s  gen={result.generation_tps:.1f} tok/s  active={active_mem_gb:.1f}GB  kv={kv_gb:.2f}GB  time={elapsed:.1f}s")
+        print(
+            f"  prefill={result.prompt_tps:.1f} tok/s  gen={result.generation_tps:.1f} tok/s  active={active_mem_gb:.1f}GB  kv={kv_gb:.2f}GB  time={elapsed:.1f}s"
+        )
 
         mx.clear_cache()
         gc.collect()
@@ -221,7 +250,9 @@ def print_summary(results: list[dict]):
 
     if single:
         print("\nSingle Needle:")
-        print(f"  {'Context':<8} {'Depth':<6} {'Status':<6} {'Prefill':<12} {'Gen':<10} {'KV':<8} {'Active':<8} {'Time':<8}")
+        print(
+            f"  {'Context':<8} {'Depth':<6} {'Status':<6} {'Prefill':<12} {'Gen':<10} {'KV':<8} {'Active':<8} {'Time':<8}"
+        )
         print(f"  {'-'*66}")
         for r in single:
             s = "PASS" if r["correct"] else "FAIL"
@@ -237,7 +268,9 @@ def print_summary(results: list[dict]):
 
     if multi:
         print("\nMulti Needle:")
-        print(f"  {'Context':<8} {'Found':<10} {'Prefill':<12} {'Gen':<10} {'KV':<8} {'Active':<8} {'Time':<8}")
+        print(
+            f"  {'Context':<8} {'Found':<10} {'Prefill':<12} {'Gen':<10} {'KV':<8} {'Active':<8} {'Time':<8}"
+        )
         print(f"  {'-'*64}")
         for r in multi:
             print(
@@ -254,17 +287,23 @@ def print_summary(results: list[dict]):
 def main():
     parser = argparse.ArgumentParser(description="Run NIAH evaluation")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--dataset", choices=["single", "multi", "both"], default="both")
-    parser.add_argument("--context-lengths", nargs="*", default=None,
-                        help="e.g. 2k 8k 32k")
+    parser.add_argument(
+        "--dataset", choices=["single", "multi", "both"], default="both"
+    )
+    parser.add_argument(
+        "--context-lengths", nargs="*", default=None, help="e.g. 2k 8k 32k"
+    )
     parser.add_argument("--kv-bits", type=float, default=None)
     parser.add_argument("--kv-quant-scheme", type=str, default="uniform")
     parser.add_argument("--kv-group-size", type=int, default=64)
     parser.add_argument("--quantized-kv-start", type=int, default=5000)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--prefill-step-size", type=int, default=2048)
-    parser.add_argument("--enable-thinking", action="store_true",
-                        help="Enable model thinking (default: disabled for efficiency)")
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="Enable model thinking (default: disabled for efficiency)",
+    )
     parser.add_argument("--output", type=str, default="niah_results.json")
     args = parser.parse_args()
 
@@ -299,16 +338,30 @@ def main():
         with open(NIAH_DIR / "niah_single_needle.json") as f:
             single_tests = json.load(f)
         all_results.extend(
-            run_single(model, processor, config, single_tests, gen_kwargs,
-                       context_filter, enable_thinking=args.enable_thinking)
+            run_single(
+                model,
+                processor,
+                config,
+                single_tests,
+                gen_kwargs,
+                context_filter,
+                enable_thinking=args.enable_thinking,
+            )
         )
 
     if args.dataset in ("multi", "both"):
         with open(NIAH_DIR / "niah_multi_needle.json") as f:
             multi_tests = json.load(f)
         all_results.extend(
-            run_multi(model, processor, config, multi_tests, gen_kwargs,
-                      context_filter, enable_thinking=args.enable_thinking)
+            run_multi(
+                model,
+                processor,
+                config,
+                multi_tests,
+                gen_kwargs,
+                context_filter,
+                enable_thinking=args.enable_thinking,
+            )
         )
 
     print_summary(all_results)

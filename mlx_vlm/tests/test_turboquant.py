@@ -6,9 +6,9 @@ from mlx_vlm.models.base import scaled_dot_product_attention
 from mlx_vlm.models.cache import ArraysCache, KVCache
 from mlx_vlm.turboquant import (
     TurboQuantKVCache,
+    _build_codec,
     _TurboQuantMSECodec,
     _TurboQuantProdCodec,
-    _build_codec,
     turboquant_enabled,
 )
 
@@ -290,7 +290,9 @@ def test_turboquant_decode_attention_integer_fast_path_skips_prepare(monkeypatch
     turbo_keys, turbo_values = turbo_cache.state
 
     def fail(*args, **kwargs):
-        raise AssertionError("integer TurboQuant decode fast path should bypass prepare_queries")
+        raise AssertionError(
+            "integer TurboQuant decode fast path should bypass prepare_queries"
+        )
 
     monkeypatch.setattr(turbo_cache.key_codec, "prepare_queries", fail)
     output = scaled_dot_product_attention(

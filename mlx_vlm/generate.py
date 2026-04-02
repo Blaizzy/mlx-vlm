@@ -18,6 +18,7 @@ from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
+from .turboquant import TurboQuantKVCache, turboquant_enabled
 from .utils import (
     StoppingCriteria,
     ThinkingBudgetCriteria,
@@ -25,7 +26,6 @@ from .utils import (
     load,
     prepare_inputs,
 )
-from .turboquant import TurboQuantKVCache, turboquant_enabled
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
@@ -251,6 +251,7 @@ def maybe_quantize_kv_cache(
         return
 
     if turboquant_enabled(kv_bits, kv_quant_scheme):
+
         def quantize_entry(entry):
             if isinstance(entry, TurboQuantKVCache):
                 return entry

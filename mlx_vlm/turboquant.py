@@ -658,14 +658,8 @@ def _polar_prod_score_kernel(level_bits: tuple[int, ...]):
 
 
 @lru_cache(maxsize=None)
-def _polar_turbo_score_repeat_kernel(
-    level_bits: tuple[int, ...], repeat_count: int
-):
-    if (
-        not _metal_available()
-        or len(level_bits) != 4
-        or repeat_count <= 0
-    ):
+def _polar_turbo_score_repeat_kernel(level_bits: tuple[int, ...], repeat_count: int):
+    if not _metal_available() or len(level_bits) != 4 or repeat_count <= 0:
         return None
 
     bits1, bits2, bits3, bits4 = level_bits
@@ -967,7 +961,9 @@ def _mse_scores_weighted_rot_repeat_kernel(repeat_count: int):
         "",
     ]
     for r in range(repeat_count):
-        lines.append(f"        float max_score_{r} = static_cast<float>(max_base[{r}]);")
+        lines.append(
+            f"        float max_score_{r} = static_cast<float>(max_base[{r}]);"
+        )
         lines.append(f"        float acc_{r} = 0.0f;")
         lines.append(f"        float denom_{r} = 0.0f;")
     lines += [
@@ -1053,7 +1049,9 @@ def _mse_scores_weighted_rot_sum_repeat_kernel(repeat_count: int):
         "",
     ]
     for r in range(repeat_count):
-        lines.append(f"        float max_score_{r} = static_cast<float>(max_base[{r}]);")
+        lines.append(
+            f"        float max_score_{r} = static_cast<float>(max_base[{r}]);"
+        )
         lines.append(f"        float acc_{r} = 0.0f;")
     lines += [
         "",
@@ -1277,7 +1275,11 @@ def _metal_polar_prod_score(
     for cos_table, sin_table in zip(cos_tables, sin_tables):
         inputs.extend([cos_table, sin_table])
 
-    template = [("Dim", D), ("Levels", levels), ("BlockCount", state.polar_state.radii.shape[-1])]
+    template = [
+        ("Dim", D),
+        ("Levels", levels),
+        ("BlockCount", state.polar_state.radii.shape[-1]),
+    ]
     for level_idx, level in enumerate(state.polar_state.level_indices, start=1):
         template.append((f"PackedWidth{level_idx}", level.shape[-1]))
 
@@ -1559,7 +1561,9 @@ def _compiled_integer_decode_kernel(bits: int):
         q_rot = query_transformed[..., :dim]
         q_proj = query_transformed[..., dim:]
         scores = _metal_prod_score(
-            q_rot.reshape(q_rot.shape[0], q_rot.shape[1], q_rot.shape[2], q_rot.shape[-1]),
+            q_rot.reshape(
+                q_rot.shape[0], q_rot.shape[1], q_rot.shape[2], q_rot.shape[-1]
+            ),
             q_proj.reshape(
                 q_proj.shape[0], q_proj.shape[1], q_proj.shape[2], q_proj.shape[-1]
             ),
@@ -1669,7 +1673,9 @@ def _fused_integer_decode_kernel(bits: int, repeat_count: int, key_mse_bits: int
         f"                uint sb = (sign_t[d >> 5] >> (d & 31)) & 1u;",
     ]
     for r in range(repeat_count):
-        lines += [f"                ps_{r} += kn * static_cast<float>(qr_{r}[d]) * code + ksr * (sb ? static_cast<float>(qp_{r}[d]) : -static_cast<float>(qp_{r}[d]));"]
+        lines += [
+            f"                ps_{r} += kn * static_cast<float>(qr_{r}[d]) * code + ksr * (sb ? static_cast<float>(qp_{r}[d]) : -static_cast<float>(qp_{r}[d]));"
+        ]
     lines += [
         "            }",
     ]
@@ -1716,10 +1722,17 @@ def _fused_integer_decode_kernel(bits: int, repeat_count: int, key_mse_bits: int
     return mx.fast.metal_kernel(
         name=f"turboquant_fused_integer_decode_{bits}_r{repeat_count}",
         input_names=[
-            "q_rot", "q_proj",
-            "key_norms", "key_mse", "key_res_norms", "key_signs",
-            "val_norms", "val_packed",
-            "key_codebook", "key_scale", "val_codebook",
+            "q_rot",
+            "q_proj",
+            "key_norms",
+            "key_mse",
+            "key_res_norms",
+            "key_signs",
+            "val_norms",
+            "val_packed",
+            "key_codebook",
+            "key_scale",
+            "val_codebook",
         ],
         output_names=["out_acc", "out_sum", "out_max"],
         source="\n".join(lines),
@@ -1727,7 +1740,9 @@ def _fused_integer_decode_kernel(bits: int, repeat_count: int, key_mse_bits: int
 
 
 @lru_cache(maxsize=None)
-def _multi_query_prod_score_kernel(key_mse_bits: int, repeat_count: int, num_queries: int, dims_per_lane: int):
+def _multi_query_prod_score_kernel(
+    key_mse_bits: int, repeat_count: int, num_queries: int, dims_per_lane: int
+):
     """Multi-query score kernel: unpack key data ONCE per token, loop over L queries.
     Avoids R*L repeat explosion that causes register spill."""
     if not _metal_available() or repeat_count < 1 or num_queries < 1:
@@ -1737,8 +1752,16 @@ def _multi_query_prod_score_kernel(key_mse_bits: int, repeat_count: int, num_que
 
     return mx.fast.metal_kernel(
         name=f"mq_prod_score_{key_mse_bits}_r{repeat_count}_l{num_queries}",
-        input_names=["q_rot", "q_proj", "key_norms", "key_mse", "key_res_norms",
-                     "key_signs", "key_codebook", "key_scale"],
+        input_names=[
+            "q_rot",
+            "q_proj",
+            "key_norms",
+            "key_mse",
+            "key_res_norms",
+            "key_signs",
+            "key_codebook",
+            "key_scale",
+        ],
         output_names=["out"],
         source=f"""
             auto lane = thread_position_in_grid.x;
@@ -1786,7 +1809,9 @@ def _multi_query_prod_score_kernel(key_mse_bits: int, repeat_count: int, num_que
 
 
 @lru_cache(maxsize=None)
-def _single_tile_value_weighted_sum_kernel(bits: int, repeat_count: int, dims_per_lane: int):
+def _single_tile_value_weighted_sum_kernel(
+    bits: int, repeat_count: int, dims_per_lane: int
+):
     """Single-tile value weighted sum with precomputed softmax weights.
     TG=Dim: one thread per value dim, no exp() calls in inner loop.
     2x faster than online-softmax variant."""
@@ -1849,7 +1874,9 @@ def _single_tile_value_weighted_sum_kernel(bits: int, repeat_count: int, dims_pe
 
 
 @lru_cache(maxsize=None)
-def _fused_integer_decode_single_tile_kernel(bits: int, repeat_count: int, dims_per_lane: int, key_mse_bits: int = -1):
+def _fused_integer_decode_single_tile_kernel(
+    bits: int, repeat_count: int, dims_per_lane: int, key_mse_bits: int = -1
+):
     """Single-tile fused kernel — each lane handles multiple value dims.
     Zero key read redundancy: keys are read once per token, not once per val_tile.
     Faster than multi-tile at long contexts (256k+) where memory bandwidth dominates.
@@ -1931,7 +1958,9 @@ def _fused_integer_decode_single_tile_kernel(bits: int, repeat_count: int, dims_
         f"                uint sb = (sign_t[d >> 5] >> (d & 31)) & 1u;",
     ]
     for r in range(repeat_count):
-        lines += [f"                ps_{r} += kn * static_cast<float>(qr_{r}[d]) * code + ksr * (sb ? static_cast<float>(qp_{r}[d]) : -static_cast<float>(qp_{r}[d]));"]
+        lines += [
+            f"                ps_{r} += kn * static_cast<float>(qr_{r}[d]) * code + ksr * (sb ? static_cast<float>(qp_{r}[d]) : -static_cast<float>(qp_{r}[d]));"
+        ]
     lines += ["            }"]
 
     for r in range(repeat_count):
@@ -1980,10 +2009,17 @@ def _fused_integer_decode_single_tile_kernel(bits: int, repeat_count: int, dims_
     return mx.fast.metal_kernel(
         name=f"turboquant_fused_integer_single_tile_{bits}_r{repeat_count}",
         input_names=[
-            "q_rot", "q_proj",
-            "key_norms", "key_mse", "key_res_norms", "key_signs",
-            "val_norms", "val_packed",
-            "key_codebook", "key_scale", "val_codebook",
+            "q_rot",
+            "q_proj",
+            "key_norms",
+            "key_mse",
+            "key_res_norms",
+            "key_signs",
+            "val_norms",
+            "val_packed",
+            "key_codebook",
+            "key_scale",
+            "val_codebook",
         ],
         output_names=["out_acc", "out_sum", "out_max"],
         source="\n".join(lines),
@@ -2107,7 +2143,9 @@ def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int)
         f"                    uint sb = (sign_t[d >> 5] >> (d & 31)) & 1u;",
     ]
     for r in range(repeat_count):
-        lines += [f"                    ps_{r} += kn * static_cast<float>(qrl_{r}[d]) * code + ksr * (sb ? static_cast<float>(qpl_{r}[d]) : -static_cast<float>(qpl_{r}[d]));"]
+        lines += [
+            f"                    ps_{r} += kn * static_cast<float>(qrl_{r}[d]) * code + ksr * (sb ? static_cast<float>(qpl_{r}[d]) : -static_cast<float>(qpl_{r}[d]));"
+        ]
     lines += [
         "                }",
         "            }",
@@ -2128,7 +2166,9 @@ def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int)
         f"                    uint sb = (sign_t[d >> 5] >> (d & 31)) & 1u;",
     ]
     for r in range(repeat_count):
-        lines += [f"                    ps_{r} += kn * static_cast<float>(qrh_{r}[d]) * code + ksr * (sb ? static_cast<float>(qph_{r}[d]) : -static_cast<float>(qph_{r}[d]));"]
+        lines += [
+            f"                    ps_{r} += kn * static_cast<float>(qrh_{r}[d]) * code + ksr * (sb ? static_cast<float>(qph_{r}[d]) : -static_cast<float>(qph_{r}[d]));"
+        ]
     lines += [
         "                }",
         "            }",
@@ -2186,14 +2226,28 @@ def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int)
     source = "\n".join(lines)
 
     input_names = [
-        "q_rot_low", "q_proj_low", "q_rot_high", "q_proj_high",
-        "key_low_norms", "key_low_mse", "key_low_res_norms", "key_low_signs",
-        "key_high_norms", "key_high_mse", "key_high_res_norms", "key_high_signs",
-        "val_low_norms", "val_low_packed",
-        "val_high_norms", "val_high_packed",
-        "key_low_codebook", "key_high_codebook",
-        "key_low_scale", "key_high_scale",
-        "val_low_codebook", "val_high_codebook",
+        "q_rot_low",
+        "q_proj_low",
+        "q_rot_high",
+        "q_proj_high",
+        "key_low_norms",
+        "key_low_mse",
+        "key_low_res_norms",
+        "key_low_signs",
+        "key_high_norms",
+        "key_high_mse",
+        "key_high_res_norms",
+        "key_high_signs",
+        "val_low_norms",
+        "val_low_packed",
+        "val_high_norms",
+        "val_high_packed",
+        "key_low_codebook",
+        "key_high_codebook",
+        "key_low_scale",
+        "key_high_scale",
+        "val_low_codebook",
+        "val_high_codebook",
     ]
 
     return mx.fast.metal_kernel(
@@ -2255,20 +2309,42 @@ def _compiled_split_decode_kernel(low_bits: int, high_bits: int):
         qt_low = mx.matmul(q_low, key_low_transform_t)
         d_low = q_low.shape[-1]
         scores_low = _metal_prod_score(
-            qt_low[..., :d_low].reshape(qt_low.shape[0], qt_low.shape[1], qt_low.shape[2], d_low),
-            qt_low[..., d_low:].reshape(qt_low.shape[0], qt_low.shape[1], qt_low.shape[2], d_low),
-            TurboQuantProdState(key_low_norms, key_low_mse_indices, key_low_residual_norms, key_low_qjl_signs),
-            low_mse_bits, key_low_codebook, key_low_scale,
+            qt_low[..., :d_low].reshape(
+                qt_low.shape[0], qt_low.shape[1], qt_low.shape[2], d_low
+            ),
+            qt_low[..., d_low:].reshape(
+                qt_low.shape[0], qt_low.shape[1], qt_low.shape[2], d_low
+            ),
+            TurboQuantProdState(
+                key_low_norms,
+                key_low_mse_indices,
+                key_low_residual_norms,
+                key_low_qjl_signs,
+            ),
+            low_mse_bits,
+            key_low_codebook,
+            key_low_scale,
         )
 
         # Score high half
         qt_high = mx.matmul(q_high, key_high_transform_t)
         d_high = q_high.shape[-1]
         scores_high = _metal_prod_score(
-            qt_high[..., :d_high].reshape(qt_high.shape[0], qt_high.shape[1], qt_high.shape[2], d_high),
-            qt_high[..., d_high:].reshape(qt_high.shape[0], qt_high.shape[1], qt_high.shape[2], d_high),
-            TurboQuantProdState(key_high_norms, key_high_mse_indices, key_high_residual_norms, key_high_qjl_signs),
-            high_mse_bits, key_high_codebook, key_high_scale,
+            qt_high[..., :d_high].reshape(
+                qt_high.shape[0], qt_high.shape[1], qt_high.shape[2], d_high
+            ),
+            qt_high[..., d_high:].reshape(
+                qt_high.shape[0], qt_high.shape[1], qt_high.shape[2], d_high
+            ),
+            TurboQuantProdState(
+                key_high_norms,
+                key_high_mse_indices,
+                key_high_residual_norms,
+                key_high_qjl_signs,
+            ),
+            high_mse_bits,
+            key_high_codebook,
+            key_high_scale,
         )
 
         # Combined scores
@@ -2276,14 +2352,20 @@ def _compiled_split_decode_kernel(low_bits: int, high_bits: int):
 
         # Weighted sum of low values
         out_low = _metal_mse_weighted_sum_from_scores(
-            scores, TurboQuantMSEState(value_low_norms, value_low_indices),
-            low_bits, value_low_codebook, value_low_rotation,
+            scores,
+            TurboQuantMSEState(value_low_norms, value_low_indices),
+            low_bits,
+            value_low_codebook,
+            value_low_rotation,
         )
 
         # Weighted sum of high values
         out_high = _metal_mse_weighted_sum_from_scores(
-            scores, TurboQuantMSEState(value_high_norms, value_high_indices),
-            high_bits, value_high_codebook, value_high_rotation,
+            scores,
+            TurboQuantMSEState(value_high_norms, value_high_indices),
+            high_bits,
+            value_high_codebook,
+            value_high_rotation,
         )
 
         # Merge and reorder
@@ -2391,11 +2473,11 @@ def _beta_pdf(grid: np.ndarray, dim: int) -> np.ndarray:
     else:
         # Use lgamma to avoid overflow for large dim (e.g. dim=512)
         log_coeff = (
-            math.lgamma(dim / 2)
-            - 0.5 * math.log(math.pi)
-            - math.lgamma((dim - 1) / 2)
+            math.lgamma(dim / 2) - 0.5 * math.log(math.pi) - math.lgamma((dim - 1) / 2)
         )
-        log_pdf = log_coeff + ((dim - 3) / 2) * np.log(np.clip(1.0 - grid**2, 1e-30, None))
+        log_pdf = log_coeff + ((dim - 3) / 2) * np.log(
+            np.clip(1.0 - grid**2, 1e-30, None)
+        )
         pdf = np.exp(log_pdf - np.max(log_pdf))  # normalize to avoid overflow
     pdf_sum = pdf.sum()
     if pdf_sum == 0:
@@ -2952,7 +3034,9 @@ class _TurboQuantMSECodec:
         # Metal kernel fast path: only for single-query decode (L=1)
         if scores.ndim == 5 and scores.shape[-2] == 1:
             max_scores_2d = max_scores.reshape(
-                max_scores.shape[0], max_scores.shape[1], max_scores.shape[2],
+                max_scores.shape[0],
+                max_scores.shape[1],
+                max_scores.shape[2],
             )
             fast_output = _metal_mse_weighted_sum_sum_from_scores(
                 scores,
@@ -2975,7 +3059,9 @@ class _TurboQuantMSECodec:
 class _PolarQuantUnitCodec:
     def __init__(self, dim: int, bits: int, seed: int):
         if not _is_power_of_two(dim):
-            raise ValueError(f"PolarQuant requires a power-of-two dimension, got {dim}.")
+            raise ValueError(
+                f"PolarQuant requires a power-of-two dimension, got {dim}."
+            )
         self.dim = dim
         self.bits = bits
         self.level_bits = _polar_level_bits(dim, bits)
@@ -3074,9 +3160,7 @@ class _TurboQuantPolarProdCodec:
         self.bits = bits
         self.polar_codec = _PolarQuantUnitCodec(dim, bits, seed)
         self.projection = _projection_matrix(dim, seed + 1)
-        self.projection_t = (
-            self.projection.transpose() if dim > 0 else self.projection
-        )
+        self.projection_t = self.projection.transpose() if dim > 0 else self.projection
         self.query_transform_t = (
             mx.concatenate([self.polar_codec.rotation_t, self.projection_t], axis=-1)
             if dim > 0
@@ -3110,9 +3194,11 @@ class _TurboQuantPolarProdCodec:
         polar_unit = self.polar_codec.dequantize_unit(state.polar_state)
         sign_bits = _unpack_lowbit(state.qjl_signs, 1, self.dim).astype(mx.float32)
         signs = sign_bits * 2.0 - 1.0
-        qjl_unit = self.scale * state.residual_norms[..., None].astype(
-            mx.float32
-        ) * mx.matmul(signs, self.projection)
+        qjl_unit = (
+            self.scale
+            * state.residual_norms[..., None].astype(mx.float32)
+            * mx.matmul(signs, self.projection)
+        )
         return state.norms[..., None].astype(mx.float32) * (polar_unit + qjl_unit)
 
     def prepare_queries(self, queries: mx.array) -> tuple[mx.array, mx.array]:
@@ -3170,12 +3256,14 @@ class _TurboQuantPolarProdCodec:
 
         sign_bits = _unpack_lowbit(state.qjl_signs, 1, self.dim).astype(mx.float32)
         signs = sign_bits * 2.0 - 1.0
-        qjl_score = self.scale * state.residual_norms.astype(mx.float32)[
-            :, :, None, None, :
-        ] * mx.einsum(
-            "bhmld,bhtd->bhmlt",
-            proj_queries,
-            signs,
+        qjl_score = (
+            self.scale
+            * state.residual_norms.astype(mx.float32)[:, :, None, None, :]
+            * mx.einsum(
+                "bhmld,bhtd->bhmlt",
+                proj_queries,
+                signs,
+            )
         )
 
         norms = state.norms.astype(mx.float32)[:, :, None, None, :]
@@ -3191,9 +3279,7 @@ class _TurboQuantProdCodec:
         self.bits = bits
         self.mse_codec = _TurboQuantMSECodec(dim, max(bits - 1, 0), seed)
         self.projection = _projection_matrix(dim, seed + 1)
-        self.projection_t = (
-            self.projection.transpose() if dim > 0 else self.projection
-        )
+        self.projection_t = self.projection.transpose() if dim > 0 else self.projection
         self.query_transform_t = (
             mx.concatenate([self.mse_codec.rotation_t, self.projection_t], axis=-1)
             if dim > 0
@@ -3226,9 +3312,11 @@ class _TurboQuantProdCodec:
         mse_unit = self.mse_codec._dequantize_unit(state.mse_indices)
         sign_bits = _unpack_lowbit(state.qjl_signs, 1, self.dim).astype(mx.float32)
         signs = sign_bits * 2.0 - 1.0
-        qjl_unit = self.scale * state.residual_norms[..., None].astype(
-            mx.float32
-        ) * mx.matmul(signs, self.projection)
+        qjl_unit = (
+            self.scale
+            * state.residual_norms[..., None].astype(mx.float32)
+            * mx.matmul(signs, self.projection)
+        )
         return state.norms[..., None].astype(mx.float32) * (mse_unit + qjl_unit)
 
     def prepare_queries(self, queries: mx.array) -> tuple[mx.array, mx.array]:
@@ -3296,12 +3384,14 @@ class _TurboQuantProdCodec:
 
         sign_bits = _unpack_lowbit(state.qjl_signs, 1, self.dim).astype(mx.float32)
         signs = sign_bits * 2.0 - 1.0
-        qjl_score = self.scale * state.residual_norms.astype(mx.float32)[
-            :, :, None, None, :
-        ] * mx.einsum(
-            "bhmld,bhtd->bhmlt",
-            proj_queries,
-            signs,
+        qjl_score = (
+            self.scale
+            * state.residual_norms.astype(mx.float32)[:, :, None, None, :]
+            * mx.einsum(
+                "bhmld,bhtd->bhmlt",
+                proj_queries,
+                signs,
+            )
         )
 
         norms = state.norms.astype(mx.float32)[:, :, None, None, :]
@@ -3311,7 +3401,9 @@ class _TurboQuantProdCodec:
         return self.score_prepared(self.prepare_queries(queries), state)
 
 
-def _select_outlier_indices(tensor: mx.array, avg_bits: float) -> tuple[np.ndarray, np.ndarray]:
+def _select_outlier_indices(
+    tensor: mx.array, avg_bits: float
+) -> tuple[np.ndarray, np.ndarray]:
     lower_bits = math.floor(avg_bits)
     upper_bits = math.ceil(avg_bits)
     if lower_bits == upper_bits:
@@ -3356,9 +3448,15 @@ class _SplitCodec:
             dh = len(high_idx)
             combined = mx.zeros((dim, 2 * dl + 2 * dh), dtype=mx.float32)
             combined[self.low_idx, :dl] = self.low_codec.query_transform_t[:, :dl]
-            combined[self.low_idx, dl:2*dl] = self.low_codec.query_transform_t[:, dl:]
-            combined[self.high_idx, 2*dl:2*dl+dh] = self.high_codec.query_transform_t[:, :dh]
-            combined[self.high_idx, 2*dl+dh:] = self.high_codec.query_transform_t[:, dh:]
+            combined[self.low_idx, dl : 2 * dl] = self.low_codec.query_transform_t[
+                :, dl:
+            ]
+            combined[self.high_idx, 2 * dl : 2 * dl + dh] = (
+                self.high_codec.query_transform_t[:, :dh]
+            )
+            combined[self.high_idx, 2 * dl + dh :] = self.high_codec.query_transform_t[
+                :, dh:
+            ]
             self.combined_query_transform_t = combined
         else:
             self.combined_query_transform_t = None
@@ -3438,6 +3536,7 @@ class _QuantizedStateProxy:
     Some models access keys.shape[-2] after cache.update_and_fetch() to slice
     masks. This proxy makes that work without dequantization.
     """
+
     __slots__ = ("_state", "shape")
 
     def __init__(self, state, n_tokens: int, n_heads: int):
@@ -3487,10 +3586,18 @@ class TurboQuantKVCache(_BaseCache):
             # For fractional bits (e.g. 3.5), use lower bits for keys and higher
             # for values instead of SplitCodec. Both stay as fast integer codecs
             # with single-tile kernel support. Values benefit more from extra bits.
-            key_bits = math.floor(self.bits) if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6) else self.bits
+            key_bits = (
+                math.floor(self.bits)
+                if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
+                else self.bits
+            )
             self.key_codec = _build_codec(keys, key_bits, mode="prod", seed=self.seed)
         if self.value_codec is None:
-            val_bits = math.ceil(self.bits) if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6) else self.bits
+            val_bits = (
+                math.ceil(self.bits)
+                if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
+                else self.bits
+            )
             self.value_codec = _build_codec(
                 values, val_bits, mode="mse", seed=self.seed + 1
             )
@@ -3588,9 +3695,11 @@ class TurboQuantKVCache(_BaseCache):
         values_state = self._unwrap(values_state)
 
         B, n_q_heads, L, D = queries.shape
-        n_kv_heads = keys_state.low.norms.shape[1] if isinstance(
-            keys_state, TurboQuantSplitState
-        ) else keys_state.norms.shape[1]
+        n_kv_heads = (
+            keys_state.low.norms.shape[1]
+            if isinstance(keys_state, TurboQuantSplitState)
+            else keys_state.norms.shape[1]
+        )
         n_repeats = n_q_heads // n_kv_heads
 
         grouped_queries = (queries * scale).reshape(
@@ -3703,13 +3812,18 @@ class TurboQuantKVCache(_BaseCache):
             return None
         dims_per_lane = (D + 31) // 32
 
-        val_kernel = _single_tile_value_weighted_sum_kernel(val_bits, n_repeats * L, dims_per_lane)
+        val_kernel = _single_tile_value_weighted_sum_kernel(
+            val_bits, n_repeats * L, dims_per_lane
+        )
         if val_kernel is None:
             return None
 
         # Multi-query score: unpack key ONCE per token, loop over L queries
         mq_score = _multi_query_prod_score_kernel(
-            self.key_codec.mse_codec.bits, n_repeats, L, dims_per_lane,
+            self.key_codec.mse_codec.bits,
+            n_repeats,
+            L,
+            dims_per_lane,
         )
         if mq_score is None:
             return None
@@ -3721,10 +3835,14 @@ class TurboQuantKVCache(_BaseCache):
 
         scores = mq_score(
             inputs=[
-                q_rot, q_proj,
-                keys_state.norms, keys_state.mse_indices,
-                keys_state.residual_norms, keys_state.qjl_signs,
-                self.key_codec.mse_codec.codebook, self.key_codec.scale_array,
+                q_rot,
+                q_proj,
+                keys_state.norms,
+                keys_state.mse_indices,
+                keys_state.residual_norms,
+                keys_state.qjl_signs,
+                self.key_codec.mse_codec.codebook,
+                self.key_codec.scale_array,
             ],
             template=[
                 ("Dim", D),
@@ -3915,8 +4033,8 @@ class TurboQuantKVCache(_BaseCache):
             dl2 = dim_low * 2
             q_rot_low = qt[..., :dim_low].reshape(B, H, R, dim_low)
             q_proj_low = qt[..., dim_low:dl2].reshape(B, H, R, dim_low)
-            q_rot_high = qt[..., dl2:dl2+dim_high].reshape(B, H, R, dim_high)
-            q_proj_high = qt[..., dl2+dim_high:].reshape(B, H, R, dim_high)
+            q_rot_high = qt[..., dl2 : dl2 + dim_high].reshape(B, H, R, dim_high)
+            q_proj_high = qt[..., dl2 + dim_high :].reshape(B, H, R, dim_high)
         else:
             q_low = mx.take(grouped_queries, kc.low_idx, axis=-1)
             q_high = mx.take(grouped_queries, kc.high_idx, axis=-1)
@@ -3939,16 +4057,28 @@ class TurboQuantKVCache(_BaseCache):
         sm_shape = (B * H * num_tok_tiles * R,)  # scalar per (bh, tile, repeat)
         out_acc, out_sum, out_max = kernel(
             inputs=[
-                q_rot_low, q_proj_low, q_rot_high, q_proj_high,
-                keys_state.low.norms, keys_state.low.mse_indices,
-                keys_state.low.residual_norms, keys_state.low.qjl_signs,
-                keys_state.high.norms, keys_state.high.mse_indices,
-                keys_state.high.residual_norms, keys_state.high.qjl_signs,
-                values_state.low.norms, values_state.low.indices,
-                values_state.high.norms, values_state.high.indices,
-                kc.low_codec.mse_codec.codebook, kc.high_codec.mse_codec.codebook,
-                kc.low_codec.scale_array, kc.high_codec.scale_array,
-                vc.low_codec.codebook, vc.high_codec.codebook,
+                q_rot_low,
+                q_proj_low,
+                q_rot_high,
+                q_proj_high,
+                keys_state.low.norms,
+                keys_state.low.mse_indices,
+                keys_state.low.residual_norms,
+                keys_state.low.qjl_signs,
+                keys_state.high.norms,
+                keys_state.high.mse_indices,
+                keys_state.high.residual_norms,
+                keys_state.high.qjl_signs,
+                values_state.low.norms,
+                values_state.low.indices,
+                values_state.high.norms,
+                values_state.high.indices,
+                kc.low_codec.mse_codec.codebook,
+                kc.high_codec.mse_codec.codebook,
+                kc.low_codec.scale_array,
+                kc.high_codec.scale_array,
+                vc.low_codec.codebook,
+                vc.high_codec.codebook,
             ],
             template=[
                 ("DimLow", dim_low),
@@ -3978,7 +4108,9 @@ class TurboQuantKVCache(_BaseCache):
         scale_factors = mx.exp(out_max - global_max)  # (BH, tiles, R)
         scaled_acc = mx.sum(out_acc * scale_factors[..., None], axis=1)  # (BH, R, D)
         denom = mx.sum(out_sum * scale_factors, axis=1)  # (BH, R)
-        out_rotated = (scaled_acc / mx.maximum(denom[..., None], _EPS)).reshape(B, H, R, val_dim)
+        out_rotated = (scaled_acc / mx.maximum(denom[..., None], _EPS)).reshape(
+            B, H, R, val_dim
+        )
 
         out_low = mx.matmul(out_rotated[..., :dim_low], vc.low_codec.rotation)
         out_high = mx.matmul(out_rotated[..., dim_low:], vc.high_codec.rotation)
@@ -4006,7 +4138,11 @@ class TurboQuantKVCache(_BaseCache):
         if bits != self.value_codec.bits:
             return None
 
-        B, H, R = grouped_queries.shape[0], grouped_queries.shape[1], grouped_queries.shape[2]
+        B, H, R = (
+            grouped_queries.shape[0],
+            grouped_queries.shape[1],
+            grouped_queries.shape[2],
+        )
         D = grouped_queries.shape[-1]
         T = keys_state.norms.shape[2]
 
@@ -4025,7 +4161,9 @@ class TurboQuantKVCache(_BaseCache):
 
         # Single-tile path: each lane handles all its value dims.
         # Zero key read redundancy — faster at 256k+ where bandwidth dominates.
-        single_kernel = _fused_integer_decode_single_tile_kernel(bits, R, dims_per_lane, key_mse_bits)
+        single_kernel = _fused_integer_decode_single_tile_kernel(
+            bits, R, dims_per_lane, key_mse_bits
+        )
         # Multi-tile path: one val_dim per lane, multiple tiles read keys redundantly.
         # Better parallelism at shorter contexts.
         multi_kernel = _fused_integer_decode_kernel(bits, R, key_mse_bits)
@@ -4047,10 +4185,14 @@ class TurboQuantKVCache(_BaseCache):
 
             out_acc, out_sum, out_max = single_kernel(
                 inputs=[
-                    q_rot, q_proj,
-                    keys_state.norms, keys_state.mse_indices,
-                    keys_state.residual_norms, keys_state.qjl_signs,
-                    values_state.norms, values_state.indices,
+                    q_rot,
+                    q_proj,
+                    keys_state.norms,
+                    keys_state.mse_indices,
+                    keys_state.residual_norms,
+                    keys_state.qjl_signs,
+                    values_state.norms,
+                    values_state.indices,
                     self.key_codec.mse_codec.codebook,
                     self.key_codec.scale_array,
                     self.value_codec.codebook,
@@ -4078,7 +4220,9 @@ class TurboQuantKVCache(_BaseCache):
             scale_factors = mx.exp(out_max - global_max)
             scaled_acc = mx.sum(out_acc * scale_factors[..., None], axis=1)
             denom = mx.sum(out_sum * scale_factors, axis=1)
-            out_rotated = (scaled_acc / mx.maximum(denom[..., None], _EPS)).reshape(B, H, R, D)
+            out_rotated = (scaled_acc / mx.maximum(denom[..., None], _EPS)).reshape(
+                B, H, R, D
+            )
 
             output = mx.matmul(out_rotated, self.value_codec.rotation)
             return mx.expand_dims(output, axis=3)
@@ -4090,10 +4234,14 @@ class TurboQuantKVCache(_BaseCache):
 
             out_acc, out_sum, out_max = multi_kernel(
                 inputs=[
-                    q_rot, q_proj,
-                    keys_state.norms, keys_state.mse_indices,
-                    keys_state.residual_norms, keys_state.qjl_signs,
-                    values_state.norms, values_state.indices,
+                    q_rot,
+                    q_proj,
+                    keys_state.norms,
+                    keys_state.mse_indices,
+                    keys_state.residual_norms,
+                    keys_state.qjl_signs,
+                    values_state.norms,
+                    values_state.indices,
                     self.key_codec.mse_codec.codebook,
                     self.key_codec.scale_array,
                     self.value_codec.codebook,
@@ -4121,7 +4269,9 @@ class TurboQuantKVCache(_BaseCache):
             scale_factors = mx.exp(out_max - global_max)
             scaled_acc = mx.sum(out_acc * scale_factors[..., None], axis=1)
             denom = mx.sum(out_sum * scale_factors, axis=1)
-            out_rotated = (scaled_acc / mx.maximum(denom[..., None], _EPS)).reshape(B, H, R, D)
+            out_rotated = (scaled_acc / mx.maximum(denom[..., None], _EPS)).reshape(
+                B, H, R, D
+            )
 
             output = mx.matmul(out_rotated, self.value_codec.rotation)
             return mx.expand_dims(output, axis=3)
@@ -4157,12 +4307,16 @@ class TurboQuantKVCache(_BaseCache):
         values_state = self._unwrap(values_state)
 
         if queries.shape[-2] != 1:
-            raise ValueError("TurboQuant decode attention expects a single query token.")
+            raise ValueError(
+                "TurboQuant decode attention expects a single query token."
+            )
 
         B, n_q_heads, L, D = queries.shape
-        n_kv_heads = keys_state.low.norms.shape[1] if isinstance(
-            keys_state, TurboQuantSplitState
-        ) else keys_state.norms.shape[1]
+        n_kv_heads = (
+            keys_state.low.norms.shape[1]
+            if isinstance(keys_state, TurboQuantSplitState)
+            else keys_state.norms.shape[1]
+        )
         n_repeats = n_q_heads // n_kv_heads
 
         grouped_queries = (queries * scale).reshape(
@@ -4176,13 +4330,17 @@ class TurboQuantKVCache(_BaseCache):
         value_dim = self.value_codec.dim
         total_tokens = _state_length(keys_state)
 
-        if total_tokens <= self.decode_key_chunk_size and (mask is None or (isinstance(mask, str) and mask == "causal")):
+        if total_tokens <= self.decode_key_chunk_size and (
+            mask is None or (isinstance(mask, str) and mask == "causal")
+        ):
             # Separate-kernel path: score keys (fast) → single-tile value weighted sum
             # 2-3x faster than fused kernel at large D because each kernel
             # only iterates its own dims once, avoiding the fused kernel's
             # double-iteration (score all dims + accumulate all dims per token).
             sep_output = self._separate_score_value_decode(
-                grouped_queries, keys_state, values_state,
+                grouped_queries,
+                keys_state,
+                values_state,
             )
             if sep_output is not None:
                 output = sep_output.reshape(B, n_q_heads, L, value_dim)
@@ -4199,7 +4357,9 @@ class TurboQuantKVCache(_BaseCache):
                 return output.astype(queries.dtype)
 
             fast_output = self._compiled_split_decode_attention(
-                grouped_queries, keys_state, values_state,
+                grouped_queries,
+                keys_state,
+                values_state,
             )
             if fast_output is not None:
                 output = fast_output.reshape(B, n_q_heads, L, value_dim)
@@ -4246,8 +4406,7 @@ class TurboQuantKVCache(_BaseCache):
             chunk_scale = mx.exp(chunk_max - new_max)
 
             output = (
-                output * prev_scale[..., None]
-                + chunk_output * chunk_scale[..., None]
+                output * prev_scale[..., None] + chunk_output * chunk_scale[..., None]
             )
             normalizer = normalizer * prev_scale + chunk_denom * chunk_scale
             max_score = new_max
@@ -4266,7 +4425,9 @@ class TurboQuantKVCache(_BaseCache):
             return None, None
         if self._cached_state_offset == self.offset:
             return self._cached_state
-        sliced = _slice_state(self.keys, self.offset), _slice_state(self.values, self.offset)
+        sliced = _slice_state(self.keys, self.offset), _slice_state(
+            self.values, self.offset
+        )
         self._cached_state = sliced
         self._cached_state_offset = self.offset
         return sliced

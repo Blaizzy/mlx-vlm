@@ -7,9 +7,8 @@ from typing import Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 from mlx_lm.models.base import (
-    create_attention_mask,
-    create_ssm_mask,
     scaled_dot_product_attention as mlx_scaled_dot_product_attention,
 )
 from PIL import Image
@@ -204,7 +203,11 @@ def scaled_dot_product_attention(
                 mask=mask,
             )
         result = cache.prefill_attention(
-            queries, keys_state=keys, values_state=values, scale=scale, mask=mask,
+            queries,
+            keys_state=keys,
+            values_state=values,
+            scale=scale,
+            mask=mask,
         )
         if result is not None:
             return result

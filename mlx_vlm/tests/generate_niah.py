@@ -12,7 +12,6 @@ Each file contains test cases across context lengths:
 import json
 import os
 import random
-import textwrap
 
 CHARS_PER_TOKEN = 4  # conservative estimate for English text
 
@@ -171,9 +170,7 @@ def insert_needles_at_depths(
                 "needle": needle_rec["needle"],
                 "question": needle_rec["question"],
                 "answer": needle_rec["answer"],
-                "approximate_depth": round(
-                    idx / max(len(paragraphs) - 1, 1), 3
-                ),
+                "approximate_depth": round(idx / max(len(paragraphs) - 1, 1), 3),
             }
         )
 
@@ -193,9 +190,7 @@ def generate_single_needle_tests() -> list[dict]:
         haystack = build_haystack(haystack_chars)
 
         for depth in DEPTHS:
-            context = insert_needle_at_depth(
-                haystack, needle_def["needle"], depth
-            )
+            context = insert_needle_at_depth(haystack, needle_def["needle"], depth)
             # Trim to target
             if len(context) > target_chars:
                 # Trim from the end but keep needle intact
@@ -241,9 +236,7 @@ def generate_multi_needle_tests() -> list[dict]:
     for ctx_len in CONTEXT_LENGTHS:
         target_chars = ctx_len * CHARS_PER_TOKEN
         n_needles = needle_counts[ctx_len]
-        total_needle_chars = sum(
-            len(n["needle"]) for n in MULTI_NEEDLE_SET[:n_needles]
-        )
+        total_needle_chars = sum(len(n["needle"]) for n in MULTI_NEEDLE_SET[:n_needles])
         haystack_chars = target_chars - total_needle_chars - 400
         haystack = build_haystack(haystack_chars)
 
@@ -256,9 +249,7 @@ def generate_multi_needle_tests() -> list[dict]:
 
         questions = [n["question"] for n in placed_needles]
         answers = [n["answer"] for n in placed_needles]
-        questions_text = "\n".join(
-            f"{i + 1}. {q}" for i, q in enumerate(questions)
-        )
+        questions_text = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
 
         tests.append(
             {

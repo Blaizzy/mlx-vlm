@@ -94,8 +94,10 @@ def evaluate_ppl(
             break
 
     kv_label = f" kv={kv_bits}-bit {kv_quant_scheme}" if kv_bits else ""
-    print(f"  Tokens: {total_tokens:,} | stride={stride} | "
-          f"max_length={max_length}{kv_label} | chunks={n_total_chunks}")
+    print(
+        f"  Tokens: {total_tokens:,} | stride={stride} | "
+        f"max_length={max_length}{kv_label} | chunks={n_total_chunks}"
+    )
 
     # Same partial as generate_step line 398-404
     quantize_cache_fn = functools.partial(
@@ -111,9 +113,13 @@ def evaluate_ppl(
     t0 = time.perf_counter()
 
     desc = f"PPL ({kv_bits}-bit {kv_quant_scheme})" if kv_bits else "PPL (baseline)"
-    pbar = tqdm(total=n_total_chunks, desc=desc, unit="chunk",
-                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} "
-                           "[{elapsed}<{remaining}, {rate_fmt}] ppl={postfix}")
+    pbar = tqdm(
+        total=n_total_chunks,
+        desc=desc,
+        unit="chunk",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} "
+        "[{elapsed}<{remaining}, {rate_fmt}] ppl={postfix}",
+    )
     pbar.set_postfix_str("...")
 
     prev_end = 0
@@ -129,8 +135,11 @@ def evaluate_ppl(
             # Step 2: prefill context with chunked prefill + quantization
             context_ids = mx.array(encodings[begin : begin + context_len])[None, :]
             _prefill_and_quantize(
-                model, context_ids, prompt_cache,
-                quantize_cache_fn, prefill_step_size,
+                model,
+                context_ids,
+                prompt_cache,
+                quantize_cache_fn,
+                prefill_step_size,
             )
 
             # Step 3: forward scoring tokens through (quantized) cache
@@ -189,14 +198,22 @@ def evaluate_ppl(
 def main():
     parser = argparse.ArgumentParser(description="Perplexity evaluation on WikiText-2")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--max-length", type=int, default=2048,
-                        help="Context window size")
-    parser.add_argument("--stride", type=int, default=512,
-                        help="Sliding window stride")
-    parser.add_argument("--kv-bits", type=float, default=None,
-                        help="KV cache quantization bits (enables TurboQuant)")
-    parser.add_argument("--kv-quant-scheme", type=str, default="turboquant",
-                        choices=("uniform", "turboquant"))
+    parser.add_argument(
+        "--max-length", type=int, default=2048, help="Context window size"
+    )
+    parser.add_argument("--stride", type=int, default=512, help="Sliding window stride")
+    parser.add_argument(
+        "--kv-bits",
+        type=float,
+        default=None,
+        help="KV cache quantization bits (enables TurboQuant)",
+    )
+    parser.add_argument(
+        "--kv-quant-scheme",
+        type=str,
+        default="turboquant",
+        choices=("uniform", "turboquant"),
+    )
     parser.add_argument("--kv-group-size", type=int, default=64)
     parser.add_argument("--quantized-kv-start", type=int, default=0)
     parser.add_argument("--prefill-step-size", type=int, default=2048)
@@ -224,7 +241,9 @@ def main():
     print("Model loaded.\n")
 
     result = evaluate_ppl(
-        model, tokenizer, text,
+        model,
+        tokenizer,
+        text,
         stride=args.stride,
         max_length=args.max_length,
         kv_bits=args.kv_bits,
@@ -234,7 +253,9 @@ def main():
         prefill_step_size=args.prefill_step_size,
     )
 
-    kv_label = f" (KV {args.kv_bits}-bit {args.kv_quant_scheme})" if args.kv_bits else ""
+    kv_label = (
+        f" (KV {args.kv_bits}-bit {args.kv_quant_scheme})" if args.kv_bits else ""
+    )
     print(f"\n{'='*50}")
     print(f"RESULTS — {args.model}{kv_label}")
     print(f"{'='*50}")

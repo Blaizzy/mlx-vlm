@@ -14,8 +14,9 @@ def plot_single_needle(results: list[dict], model: str, kv_bits, ax=None):
     if not single:
         return
 
-    contexts = sorted(set(r["context_length"] for r in single),
-                      key=lambda x: int(x.replace("k", "")))
+    contexts = sorted(
+        set(r["context_length"] for r in single), key=lambda x: int(x.replace("k", ""))
+    )
     depths = sorted(set(r["depth"] for r in single))
 
     # Build accuracy grid: rows=depths (top=1.0, bottom=0.0), cols=contexts
@@ -30,7 +31,9 @@ def plot_single_needle(results: list[dict], model: str, kv_bits, ax=None):
     depths_display = depths[::-1]
 
     if ax is None:
-        fig, ax = plt.subplots(figsize=(max(8, len(contexts) * 1.2), max(5, len(depths) * 0.9)))
+        fig, ax = plt.subplots(
+            figsize=(max(8, len(contexts) * 1.2), max(5, len(depths) * 0.9))
+        )
     else:
         fig = ax.figure
 
@@ -43,8 +46,16 @@ def plot_single_needle(results: list[dict], model: str, kv_bits, ax=None):
             val = grid[i, j]
             if not np.isnan(val):
                 color = "white" if val < 50 else "black"
-                ax.text(j, i, f"{val:.0f}%", ha="center", va="center",
-                        fontsize=12, fontweight="bold", color=color)
+                ax.text(
+                    j,
+                    i,
+                    f"{val:.0f}%",
+                    ha="center",
+                    va="center",
+                    fontsize=12,
+                    fontweight="bold",
+                    color=color,
+                )
 
     ax.set_xticks(range(len(contexts)))
     ax.set_xticklabels(contexts, fontsize=11)
@@ -67,8 +78,9 @@ def plot_multi_needle(results: list[dict], model: str, kv_bits, ax=None):
     if not multi:
         return
 
-    contexts = sorted(set(r["context_length"] for r in multi),
-                      key=lambda x: int(x.replace("k", "")))
+    contexts = sorted(
+        set(r["context_length"] for r in multi), key=lambda x: int(x.replace("k", ""))
+    )
 
     # Build grid: rows=needle_id, cols=context
     all_needle_ids = []
@@ -89,7 +101,9 @@ def plot_multi_needle(results: list[dict], model: str, kv_bits, ax=None):
     needle_labels = [nid.replace("needle_", "Needle ") for nid in all_needle_ids]
 
     if ax is None:
-        fig, ax = plt.subplots(figsize=(max(8, len(contexts) * 1.2), max(4, len(all_needle_ids) * 0.8)))
+        fig, ax = plt.subplots(
+            figsize=(max(8, len(contexts) * 1.2), max(4, len(all_needle_ids) * 0.8))
+        )
     else:
         fig = ax.figure
 
@@ -101,11 +115,18 @@ def plot_multi_needle(results: list[dict], model: str, kv_bits, ax=None):
             val = grid[i, j]
             if not np.isnan(val):
                 color = "white" if val < 50 else "black"
-                ax.text(j, i, f"{val:.0f}%", ha="center", va="center",
-                        fontsize=12, fontweight="bold", color=color)
+                ax.text(
+                    j,
+                    i,
+                    f"{val:.0f}%",
+                    ha="center",
+                    va="center",
+                    fontsize=12,
+                    fontweight="bold",
+                    color=color,
+                )
             else:
-                ax.text(j, i, "—", ha="center", va="center",
-                        fontsize=11, color="gray")
+                ax.text(j, i, "—", ha="center", va="center", fontsize=11, color="gray")
 
     ax.set_xticks(range(len(contexts)))
     ax.set_xticklabels(contexts, fontsize=11)
@@ -126,8 +147,12 @@ def plot_multi_needle(results: list[dict], model: str, kv_bits, ax=None):
 def main():
     parser = argparse.ArgumentParser(description="Plot NIAH heatmaps")
     parser.add_argument("results_json", help="Path to NIAH results JSON")
-    parser.add_argument("--output", "-o", default=None,
-                        help="Output image path (default: show interactively)")
+    parser.add_argument(
+        "--output",
+        "-o",
+        default=None,
+        help="Output image path (default: show interactively)",
+    )
     args = parser.parse_args()
 
     with open(args.results_json) as f:
