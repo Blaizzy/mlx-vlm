@@ -254,7 +254,13 @@ def maybe_quantize_kv_cache(
         def quantize_entry(entry):
             if isinstance(entry, TurboQuantKVCache):
                 return entry
+            # Convert standard KV caches with (B, H, T, D) state format.
+            # Skip RotatingKVCache — its sliding window is already compact
+            # and TurboQuant's overhead outweighs savings for short windows.
             if isinstance(entry, cache.KVCache):
+                if entry.offset == 0:
+                    # Empty: replace so update_and_fetch quantizes on the fly
+                    return TurboQuantKVCache(bits=kv_bits)
                 if entry.offset < quantized_kv_start:
                     return entry
                 return TurboQuantKVCache.from_cache(entry, bits=kv_bits)

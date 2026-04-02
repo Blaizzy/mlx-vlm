@@ -99,6 +99,7 @@ def run_single(
         t0 = time.perf_counter()
         result = generate(model, processor, prompt, verbose=True, **gen_kwargs)
         elapsed = time.perf_counter() - t0
+        active_mem_gb = round(mx.get_active_memory() / 1e9, 2)
 
         raw_text = result.text
         clean_text = strip_thinking(raw_text)
@@ -119,6 +120,7 @@ def run_single(
             "generation_tokens": result.generation_tokens,
             "prompt_tps": round(result.prompt_tps, 1),
             "generation_tps": round(result.generation_tps, 1),
+            "active_memory_gb": active_mem_gb,
             "peak_memory_gb": round(result.peak_memory, 2),
             "kv_size_gb": round(kv_gb, 2),
             "elapsed_seconds": round(elapsed, 1),
@@ -128,7 +130,7 @@ def run_single(
         status = "PASS" if correct else "FAIL"
         print(f"  Answer: {clean_text[:200]}")
         print(f"  Expected: {test['expected_answer']}")
-        print(f"  [{status}]  prefill={result.prompt_tps:.1f} tok/s  gen={result.generation_tps:.1f} tok/s  mem={result.peak_memory:.1f}GB  kv={kv_gb:.2f}GB  time={elapsed:.1f}s")
+        print(f"  [{status}]  prefill={result.prompt_tps:.1f} tok/s  gen={result.generation_tps:.1f} tok/s  active={active_mem_gb:.1f}GB  kv={kv_gb:.2f}GB  time={elapsed:.1f}s")
 
         mx.clear_cache()
         gc.collect()
@@ -162,6 +164,7 @@ def run_multi(
 
         raw_text = result.text
         clean_text = strip_thinking(raw_text)
+        active_mem_gb = round(mx.get_active_memory() / 1e9, 2)
         kv_gb = estimate_kv_size_gb(model, result.prompt_tokens, gen_kwargs.get("kv_bits"))
 
         needle_results = []
@@ -188,6 +191,7 @@ def run_multi(
             "generation_tokens": result.generation_tokens,
             "prompt_tps": round(result.prompt_tps, 1),
             "generation_tps": round(result.generation_tps, 1),
+            "active_memory_gb": active_mem_gb,
             "peak_memory_gb": round(result.peak_memory, 2),
             "kv_size_gb": round(kv_gb, 2),
             "elapsed_seconds": round(elapsed, 1),
@@ -199,7 +203,7 @@ def run_multi(
         for nr in needle_results:
             s = "PASS" if nr["found"] else "FAIL"
             print(f"    [{s}] {nr['expected_answer']}")
-        print(f"  prefill={result.prompt_tps:.1f} tok/s  gen={result.generation_tps:.1f} tok/s  mem={result.peak_memory:.1f}GB  kv={kv_gb:.2f}GB  time={elapsed:.1f}s")
+        print(f"  prefill={result.prompt_tps:.1f} tok/s  gen={result.generation_tps:.1f} tok/s  active={active_mem_gb:.1f}GB  kv={kv_gb:.2f}GB  time={elapsed:.1f}s")
 
         mx.clear_cache()
         gc.collect()
@@ -217,15 +221,15 @@ def print_summary(results: list[dict]):
 
     if single:
         print("\nSingle Needle:")
-        print(f"  {'Context':<8} {'Depth':<6} {'Status':<6} {'Prefill':<12} {'Gen':<10} {'KV Size':<10} {'Memory':<8} {'Time':<8}")
-        print(f"  {'-'*68}")
+        print(f"  {'Context':<8} {'Depth':<6} {'Status':<6} {'Prefill':<12} {'Gen':<10} {'KV':<8} {'Active':<8} {'Time':<8}")
+        print(f"  {'-'*66}")
         for r in single:
             s = "PASS" if r["correct"] else "FAIL"
             print(
                 f"  {r['context_length']:<8} {r['depth']:<6} {s:<6} "
                 f"{r['prompt_tps']:<12.1f} {r['generation_tps']:<10.1f} "
-                f"{r['kv_size_gb']:<10.2f} "
-                f"{r['peak_memory_gb']:<8.1f} {r['elapsed_seconds']:<8.1f}"
+                f"{r['kv_size_gb']:<8.2f} "
+                f"{r['active_memory_gb']:<8.1f} {r['elapsed_seconds']:<8.1f}"
             )
         total = len(single)
         passed = sum(1 for r in single if r["correct"])
@@ -233,14 +237,14 @@ def print_summary(results: list[dict]):
 
     if multi:
         print("\nMulti Needle:")
-        print(f"  {'Context':<8} {'Found':<10} {'Prefill':<12} {'Gen':<10} {'KV Size':<10} {'Memory':<8} {'Time':<8}")
-        print(f"  {'-'*66}")
+        print(f"  {'Context':<8} {'Found':<10} {'Prefill':<12} {'Gen':<10} {'KV':<8} {'Active':<8} {'Time':<8}")
+        print(f"  {'-'*64}")
         for r in multi:
             print(
                 f"  {r['context_length']:<8} {r['needles_found']}/{r['num_needles']:<8} "
                 f"{r['prompt_tps']:<12.1f} {r['generation_tps']:<10.1f} "
-                f"{r['kv_size_gb']:<10.2f} "
-                f"{r['peak_memory_gb']:<8.1f} {r['elapsed_seconds']:<8.1f}"
+                f"{r['kv_size_gb']:<8.2f} "
+                f"{r['active_memory_gb']:<8.1f} {r['elapsed_seconds']:<8.1f}"
             )
         total_n = sum(r["num_needles"] for r in multi)
         found_n = sum(r["needles_found"] for r in multi)

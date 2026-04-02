@@ -1584,6 +1584,310 @@ def _compiled_integer_decode_kernel(bits: int):
     return _decode
 
 
+@lru_cache(maxsize=None)
+def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int):
+    """Single Metal kernel: score + online-softmax + weighted-sum for SplitCodec.
+
+    Grid: (32, ValDim, B*H) — for each token: 32 lanes cooperate on key-dim
+    reduction (simd_sum) to produce a scalar score, then each lane unpacks+
+    accumulates its value dim weighted by the softmax weight. Uses online
+    softmax across tokens with a cross-lane reduction at the end.
+    """
+    if not _metal_available() or repeat_count < 1:
+        return None
+
+    low_mse_bits = max(low_bits - 1, 0)
+    high_mse_bits = max(high_bits - 1, 0)
+    low_mse_mask = (1 << low_mse_bits) - 1
+    high_mse_mask = (1 << high_mse_bits) - 1
+
+    # Architecture: 32 SIMD lanes cooperate on BOTH key scoring (simd_sum across
+    # key dims) AND value accumulation (each lane handles its own value dim).
+    #
+    # Grid: (32, NumTiles, B*H) — NumTiles = ceil(ValDim/32).
+    # Each tile's 32 lanes handle 32 value dims. The score is computed ONCE
+    # per token per tile (not once per value dim), eliminating 32x redundancy.
+    #
+    # Per token:
+    #   1. 32 lanes split key dims → partial scores → simd_sum → scalar score
+    #   2. Each lane unpacks its value dim, applies online softmax weight
+    #
+    # Cross-lane score is free (simd_sum broadcasts to all lanes).
+
+    val_dim_total = "DimLow + DimHigh"
+
+    lines = [
+        "        auto lane = thread_position_in_grid.x;",
+        "        auto val_tile = thread_position_in_grid.y;",
+        "        auto n = thread_position_in_grid.z;",
+        "",
+        f"        int val_dim = val_tile * 32 + lane;",
+        "",
+        "        auto token_count = key_low_norms_shape[2];",
+        "        auto kv_heads = key_low_norms_shape[1];",
+        "        auto num_tok_tiles = (token_count + TokTileSize - 1) / TokTileSize;",
+        "        auto tok_tile = n / kv_heads;",
+        "        auto remaining = n % kv_heads;",
+        "        auto b = remaining / kv_heads;",
+        "        // Flatten: n = b * kv_heads * num_tok_tiles + h * num_tok_tiles + tok_tile",
+        "        // Recompute properly:",
+        "        auto bh = n / num_tok_tiles;",
+        "        tok_tile = n % num_tok_tiles;",
+        "        b = bh / kv_heads;",
+        "        auto h = bh % kv_heads;",
+        "        auto base = (b * kv_heads + h);",
+        "",
+        "        int t_start = tok_tile * TokTileSize;",
+        "        int t_end = min(t_start + TokTileSize, (int)token_count);",
+        "",
+        "        auto kl_norms = key_low_norms + base * token_count;",
+        "        auto kl_mse = key_low_mse + base * token_count * KLMsePackedWidth;",
+        "        auto kl_res = key_low_res_norms + base * token_count;",
+        "        auto kl_signs = key_low_signs + base * token_count * KLSignPackedWidth;",
+        "        auto kh_norms = key_high_norms + base * token_count;",
+        "        auto kh_mse = key_high_mse + base * token_count * KHMsePackedWidth;",
+        "        auto kh_res = key_high_res_norms + base * token_count;",
+        "        auto kh_signs = key_high_signs + base * token_count * KHSignPackedWidth;",
+        "",
+        "        auto vl_norms = val_low_norms + base * token_count;",
+        "        auto vl_packed = val_low_packed + base * token_count * VLPackedWidth;",
+        "        auto vh_norms = val_high_norms + base * token_count;",
+        "        auto vh_packed = val_high_packed + base * token_count * VHPackedWidth;",
+        "",
+        "        // Value bit offset for this lane's dim",
+        f"        bool is_low_val = val_dim < DimLow;",
+        f"        int vd_local = is_low_val ? val_dim : (val_dim - DimLow);",
+        f"        int v_bits = is_low_val ? VLBits : VHBits;",
+        f"        int v_bo = vd_local * v_bits;",
+        f"        int v_word = v_bo / 32;",
+        f"        int v_off = v_bo % 32;",
+        f"        uint v_mask = (1u << v_bits) - 1u;",
+        f"        bool v_spills = (v_off + v_bits > 32);",
+        f"        bool v_valid = val_dim < ({val_dim_total});",
+        "",
+    ]
+
+    for r in range(repeat_count):
+        lines += [
+            f"        auto qrl_{r} = q_rot_low + (base * RepeatCount + {r}) * DimLow;",
+            f"        auto qpl_{r} = q_proj_low + (base * RepeatCount + {r}) * DimLow;",
+            f"        auto qrh_{r} = q_rot_high + (base * RepeatCount + {r}) * DimHigh;",
+            f"        auto qph_{r} = q_proj_high + (base * RepeatCount + {r}) * DimHigh;",
+        ]
+
+    for r in range(repeat_count):
+        lines += [
+            f"        float lmax_{r} = -INFINITY;",
+            f"        float lsum_{r} = 0.0f;",
+            f"        float lacc_{r} = 0.0f;",
+        ]
+
+    lines += [
+        "",
+        "        for (int t = t_start; t < t_end; t++) {",
+    ]
+
+    # Score: 32 lanes split key dims, simd_sum
+    for r in range(repeat_count):
+        lines += [f"            float ps_{r} = 0.0f;"]
+
+    lines += [
+        "            {",
+        "                auto mse_t = kl_mse + t * KLMsePackedWidth;",
+        "                auto sign_t = kl_signs + t * KLSignPackedWidth;",
+        "                float kn = static_cast<float>(kl_norms[t]);",
+        "                float kr = static_cast<float>(kl_res[t]);",
+        f"                for (int d = lane; d < DimLow; d += 32) {{",
+        f"                    int bo = d * {low_mse_bits};",
+        f"                    uint idx = (mse_t[bo >> 5] >> (bo & 31));",
+        f"                    if (((bo & 31) + {low_mse_bits}) > 32) idx |= mse_t[(bo >> 5) + 1] << ({low_mse_bits} - ((bo & 31) + {low_mse_bits} - 32));",
+        f"                    idx &= {low_mse_mask}u;",
+        f"                    float code = key_low_codebook[idx];",
+        f"                    uint sb = (sign_t[d >> 5] >> (d & 31)) & 1u;",
+        f"                    float sign = sb ? 1.0f : -1.0f;",
+    ]
+    for r in range(repeat_count):
+        lines += [f"                    ps_{r} += kn * (static_cast<float>(qrl_{r}[d]) * code + key_low_scale[0] * kr * static_cast<float>(qpl_{r}[d]) * sign);"]
+    lines += [
+        "                }",
+        "            }",
+        "            {",
+        "                auto mse_t = kh_mse + t * KHMsePackedWidth;",
+        "                auto sign_t = kh_signs + t * KHSignPackedWidth;",
+        "                float kn = static_cast<float>(kh_norms[t]);",
+        "                float kr = static_cast<float>(kh_res[t]);",
+        f"                for (int d = lane; d < DimHigh; d += 32) {{",
+        f"                    int bo = d * {high_mse_bits};",
+        f"                    uint idx = (mse_t[bo >> 5] >> (bo & 31));",
+        f"                    if (((bo & 31) + {high_mse_bits}) > 32) idx |= mse_t[(bo >> 5) + 1] << ({high_mse_bits} - ((bo & 31) + {high_mse_bits} - 32));",
+        f"                    idx &= {high_mse_mask}u;",
+        f"                    float code = key_high_codebook[idx];",
+        f"                    uint sb = (sign_t[d >> 5] >> (d & 31)) & 1u;",
+        f"                    float sign = sb ? 1.0f : -1.0f;",
+    ]
+    for r in range(repeat_count):
+        lines += [f"                    ps_{r} += kn * (static_cast<float>(qrh_{r}[d]) * code + key_high_scale[0] * kr * static_cast<float>(qph_{r}[d]) * sign);"]
+    lines += [
+        "                }",
+        "            }",
+    ]
+
+    for r in range(repeat_count):
+        lines += [f"            float s_{r} = simd_sum(ps_{r});"]
+
+    # Value decode + online softmax accumulation
+    lines += [
+        "",
+        "            float v_code = 0.0f;",
+        "            if (v_valid) {",
+        "                if (is_low_val) {",
+        "                    auto vt = vl_packed + t * VLPackedWidth;",
+        "                    uint vv = (vt[v_word] >> v_off);",
+        "                    if (v_spills) vv |= vt[v_word + 1] << (v_bits - (v_off + v_bits - 32));",
+        "                    v_code = val_low_codebook[vv & v_mask] * static_cast<float>(vl_norms[t]);",
+        "                } else {",
+        "                    auto vt = vh_packed + t * VHPackedWidth;",
+        "                    uint vv = (vt[v_word] >> v_off);",
+        "                    if (v_spills) vv |= vt[v_word + 1] << (v_bits - (v_off + v_bits - 32));",
+        "                    v_code = val_high_codebook[vv & v_mask] * static_cast<float>(vh_norms[t]);",
+        "                }",
+        "            }",
+    ]
+
+    for r in range(repeat_count):
+        lines += [
+            f"            float om_{r} = lmax_{r};",
+            f"            lmax_{r} = max(lmax_{r}, s_{r});",
+            f"            float rs_{r} = exp(om_{r} - lmax_{r});",
+            f"            float w_{r} = exp(s_{r} - lmax_{r});",
+            f"            lsum_{r} = lsum_{r} * rs_{r} + w_{r};",
+            f"            lacc_{r} = lacc_{r} * rs_{r} + w_{r} * v_code;",
+        ]
+
+    lines += ["        }", ""]
+
+    # Output per-tile partial results: (val_acc, sum_exp, max_score) for cross-tile reduction
+    lines += [f"        int out_stride = ({val_dim_total});"]
+    for r in range(repeat_count):
+        lines += [
+            f"        if (v_valid) {{",
+            f"            int out_base = ((bh * num_tok_tiles + tok_tile) * RepeatCount + {r}) * out_stride + val_dim;",
+            f"            out_acc[out_base] = lacc_{r};",
+            f"            out_sum[out_base] = lsum_{r};",
+            f"            out_max[out_base] = lmax_{r};",
+            f"        }}",
+        ]
+
+    source = "\n".join(lines)
+
+    input_names = [
+        "q_rot_low", "q_proj_low", "q_rot_high", "q_proj_high",
+        "key_low_norms", "key_low_mse", "key_low_res_norms", "key_low_signs",
+        "key_high_norms", "key_high_mse", "key_high_res_norms", "key_high_signs",
+        "val_low_norms", "val_low_packed",
+        "val_high_norms", "val_high_packed",
+        "key_low_codebook", "key_high_codebook",
+        "key_low_scale", "key_high_scale",
+        "val_low_codebook", "val_high_codebook",
+    ]
+
+    return mx.fast.metal_kernel(
+        name=f"turboquant_fused_split_decode_{low_bits}_{high_bits}_r{repeat_count}",
+        input_names=input_names,
+        output_names=["out_acc", "out_sum", "out_max"],
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _compiled_split_decode_kernel(low_bits: int, high_bits: int):
+    """Fused decode kernel for SplitCodec — handles both halves in a single
+    compiled function, avoiding double dispatch and intermediate allocations."""
+    low_mse_bits = max(low_bits - 1, 0)
+    high_mse_bits = max(high_bits - 1, 0)
+
+    @mx.compile
+    def _decode(
+        grouped_queries: mx.array,
+        # Low key state
+        key_low_norms: mx.array,
+        key_low_mse_indices: mx.array,
+        key_low_residual_norms: mx.array,
+        key_low_qjl_signs: mx.array,
+        # High key state
+        key_high_norms: mx.array,
+        key_high_mse_indices: mx.array,
+        key_high_residual_norms: mx.array,
+        key_high_qjl_signs: mx.array,
+        # Low value state
+        value_low_norms: mx.array,
+        value_low_indices: mx.array,
+        # High value state
+        value_high_norms: mx.array,
+        value_high_indices: mx.array,
+        # Codec params
+        key_low_transform_t: mx.array,
+        key_high_transform_t: mx.array,
+        key_low_codebook: mx.array,
+        key_high_codebook: mx.array,
+        key_low_scale: mx.array,
+        key_high_scale: mx.array,
+        value_low_codebook: mx.array,
+        value_high_codebook: mx.array,
+        value_low_rotation: mx.array,
+        value_high_rotation: mx.array,
+        # Split indices
+        low_idx: mx.array,
+        high_idx: mx.array,
+        restore_order: mx.array,
+    ) -> mx.array:
+        dim = grouped_queries.shape[-1]
+        # Split queries by dimension
+        q_low = mx.take(grouped_queries, low_idx, axis=-1)
+        q_high = mx.take(grouped_queries, high_idx, axis=-1)
+
+        # Score low half
+        qt_low = mx.matmul(q_low, key_low_transform_t)
+        d_low = q_low.shape[-1]
+        scores_low = _metal_prod_score(
+            qt_low[..., :d_low].reshape(qt_low.shape[0], qt_low.shape[1], qt_low.shape[2], d_low),
+            qt_low[..., d_low:].reshape(qt_low.shape[0], qt_low.shape[1], qt_low.shape[2], d_low),
+            TurboQuantProdState(key_low_norms, key_low_mse_indices, key_low_residual_norms, key_low_qjl_signs),
+            low_mse_bits, key_low_codebook, key_low_scale,
+        )
+
+        # Score high half
+        qt_high = mx.matmul(q_high, key_high_transform_t)
+        d_high = q_high.shape[-1]
+        scores_high = _metal_prod_score(
+            qt_high[..., :d_high].reshape(qt_high.shape[0], qt_high.shape[1], qt_high.shape[2], d_high),
+            qt_high[..., d_high:].reshape(qt_high.shape[0], qt_high.shape[1], qt_high.shape[2], d_high),
+            TurboQuantProdState(key_high_norms, key_high_mse_indices, key_high_residual_norms, key_high_qjl_signs),
+            high_mse_bits, key_high_codebook, key_high_scale,
+        )
+
+        # Combined scores
+        scores = scores_low + scores_high
+
+        # Weighted sum of low values
+        out_low = _metal_mse_weighted_sum_from_scores(
+            scores, TurboQuantMSEState(value_low_norms, value_low_indices),
+            low_bits, value_low_codebook, value_low_rotation,
+        )
+
+        # Weighted sum of high values
+        out_high = _metal_mse_weighted_sum_from_scores(
+            scores, TurboQuantMSEState(value_high_norms, value_high_indices),
+            high_bits, value_high_codebook, value_high_rotation,
+        )
+
+        # Merge and reorder
+        merged = mx.concatenate([out_low, out_high], axis=-1)
+        return mx.take(merged, restore_order, axis=-1)
+
+    return _decode
+
+
 class TurboQuantMSEState(NamedTuple):
     norms: mx.array
     indices: mx.array
@@ -2695,6 +2999,26 @@ def _build_codec(tensor: mx.array, bits: float, mode: str, seed: int):
     return _SplitCodec(tensor, bits, mode, seed)
 
 
+class _QuantizedStateProxy:
+    """Wraps a quantized state tuple, providing .shape for model compatibility.
+
+    Some models access keys.shape[-2] after cache.update_and_fetch() to slice
+    masks. This proxy makes that work without dequantization.
+    """
+    __slots__ = ("_state", "shape")
+
+    def __init__(self, state, n_tokens: int, n_heads: int):
+        self._state = state
+        # Mimic (B, H, T, D) shape — only T is needed by downstream code
+        self.shape = (1, n_heads, n_tokens, 0)
+
+    def __getattr__(self, name):
+        return getattr(self._state, name)
+
+    def __iter__(self):
+        return iter(self._state)
+
+
 class TurboQuantKVCache(_BaseCache):
     # Process all tokens in one pass during decode — chunking adds significant
     # overhead from the online-softmax recombination loop. Memory is already
@@ -2752,19 +3076,31 @@ class TurboQuantKVCache(_BaseCache):
 
         _write_state(self.keys, new_keys, self.offset)
         _write_state(self.values, new_values, self.offset)
-        n_new = keys.shape[2]
+
+        B, n_heads = keys.shape[0], keys.shape[1]
         self.offset = new_end
         self._cached_state = None
         self._cached_state_offset = -1
+        n_new = keys.shape[2]
         # Only eval during prefill (multiple tokens) to prevent graph buildup.
-        # Single-token decode steps have a tiny graph — eval would stall the pipeline.
         if n_new > 1:
             mx.eval(self.keys, self.values)
-        return self.state
+        # Return proxied states so model code can access .shape[-2] for mask slicing
+        ks, vs = self.state
+        return (
+            _QuantizedStateProxy(ks, self.offset, n_heads),
+            _QuantizedStateProxy(vs, self.offset, n_heads),
+        )
+
+    @staticmethod
+    def _unwrap(state):
+        return state._state if isinstance(state, _QuantizedStateProxy) else state
 
     def dequantize(self, keys_state=None, values_state=None):
         if keys_state is None or values_state is None:
             keys_state, values_state = self.state
+        keys_state = self._unwrap(keys_state)
+        values_state = self._unwrap(values_state)
         keys = self.key_codec.dequantize(keys_state).astype(mx.float32)
         values = self.value_codec.dequantize(values_state).astype(mx.float32)
         return keys, values
@@ -2810,6 +3146,8 @@ class TurboQuantKVCache(_BaseCache):
     ) -> mx.array:
         if keys_state is None or values_state is None:
             keys_state, values_state = self.state
+        keys_state = self._unwrap(keys_state)
+        values_state = self._unwrap(values_state)
 
         B, n_q_heads, L, D = queries.shape
         n_kv_heads = keys_state.low.norms.shape[1] if isinstance(
@@ -2891,6 +3229,120 @@ class TurboQuantKVCache(_BaseCache):
         output = output.reshape(B, n_q_heads, L, value_dim)
         return output.astype(queries.dtype)
 
+    def _compiled_split_decode_attention(
+        self,
+        grouped_queries: mx.array,
+        keys_state,
+        values_state,
+    ) -> Optional[mx.array]:
+        """Fused decode for SplitCodec — single Metal kernel for score + softmax
+        + weighted_sum across both low/high halves."""
+        if not (
+            _metal_available()
+            and isinstance(self.key_codec, _SplitCodec)
+            and isinstance(self.value_codec, _SplitCodec)
+            and isinstance(keys_state, TurboQuantSplitState)
+            and isinstance(values_state, TurboQuantSplitState)
+            and isinstance(self.key_codec.low_codec, _TurboQuantProdCodec)
+            and isinstance(self.value_codec.low_codec, _TurboQuantMSECodec)
+        ):
+            return None
+
+        kc = self.key_codec
+        vc = self.value_codec
+        low_bits = kc.lower_bits
+        high_bits = kc.upper_bits
+
+        if kc.low_codec.mse_codec.bits <= 0 or kc.high_codec.mse_codec.bits <= 0:
+            return None
+
+        B = grouped_queries.shape[0]
+        H = grouped_queries.shape[1]
+        R = grouped_queries.shape[2]
+        dim_low = kc.low_codec.dim
+        dim_high = kc.high_codec.dim
+        T = keys_state.low.norms.shape[2]
+
+        kernel = _fused_split_decode_kernel(low_bits, high_bits, R)
+        if kernel is None:
+            return None
+
+        # Pre-transform queries for both halves
+        q_low = mx.take(grouped_queries, kc.low_idx, axis=-1)
+        q_high = mx.take(grouped_queries, kc.high_idx, axis=-1)
+
+        qt_low = mx.matmul(q_low, kc.low_codec.query_transform_t)
+        qt_high = mx.matmul(q_high, kc.high_codec.query_transform_t)
+
+        q_rot_low = qt_low[..., :dim_low].reshape(B, H, R, dim_low)
+        q_proj_low = qt_low[..., dim_low:].reshape(B, H, R, dim_low)
+        q_rot_high = qt_high[..., :dim_high].reshape(B, H, R, dim_high)
+        q_proj_high = qt_high[..., dim_high:].reshape(B, H, R, dim_high)
+
+        low_mse_bits = max(low_bits - 1, 0)
+        high_mse_bits = max(high_bits - 1, 0)
+        val_dim = dim_low + dim_high
+
+        # Single fused kernel: score + online-softmax + weighted_sum
+        # Tiled in BOTH val_dim and token dimensions for parallelism.
+        tok_tile_size = 1024  # tokens per threadgroup — tune for GPU occupancy
+        num_val_tiles = (val_dim + 31) // 32
+        num_tok_tiles = (T + tok_tile_size - 1) // tok_tile_size
+
+        tile_shape = (B * H * num_tok_tiles, R, val_dim)
+        out_acc, out_sum, out_max = kernel(
+            inputs=[
+                q_rot_low, q_proj_low, q_rot_high, q_proj_high,
+                keys_state.low.norms, keys_state.low.mse_indices.astype(mx.uint32),
+                keys_state.low.residual_norms, keys_state.low.qjl_signs.astype(mx.uint32),
+                keys_state.high.norms, keys_state.high.mse_indices.astype(mx.uint32),
+                keys_state.high.residual_norms, keys_state.high.qjl_signs.astype(mx.uint32),
+                values_state.low.norms, values_state.low.indices.astype(mx.uint32),
+                values_state.high.norms, values_state.high.indices.astype(mx.uint32),
+                kc.low_codec.mse_codec.codebook, kc.high_codec.mse_codec.codebook,
+                kc.low_codec.scale_array, kc.high_codec.scale_array,
+                vc.low_codec.codebook, vc.high_codec.codebook,
+            ],
+            template=[
+                ("DimLow", dim_low),
+                ("DimHigh", dim_high),
+                ("RepeatCount", R),
+                ("TokTileSize", tok_tile_size),
+                ("KLMsePackedWidth", keys_state.low.mse_indices.shape[-1]),
+                ("KLSignPackedWidth", keys_state.low.qjl_signs.shape[-1]),
+                ("KHMsePackedWidth", keys_state.high.mse_indices.shape[-1]),
+                ("KHSignPackedWidth", keys_state.high.qjl_signs.shape[-1]),
+                ("VLPackedWidth", values_state.low.indices.shape[-1]),
+                ("VHPackedWidth", values_state.high.indices.shape[-1]),
+                ("VLBits", vc.low_codec.bits),
+                ("VHBits", vc.high_codec.bits),
+            ],
+            grid=(32, num_val_tiles, B * H * num_tok_tiles),
+            threadgroup=(32, 1, 1),
+            output_shapes=[tile_shape, tile_shape, tile_shape],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
+        )
+
+        # Cross-tile online-softmax reduction: combine (acc, sum, max) across token tiles
+        # Reshape: (B*H*num_tok_tiles, R, val_dim) → (B*H, num_tok_tiles, R, val_dim)
+        out_acc = out_acc.reshape(B * H, num_tok_tiles, R, val_dim)
+        out_sum = out_sum.reshape(B * H, num_tok_tiles, R, val_dim)
+        out_max = out_max.reshape(B * H, num_tok_tiles, R, val_dim)
+
+        # Reduce across token tiles (dim 1) with online softmax
+        global_max = mx.max(out_max, axis=1, keepdims=True)  # (BH, 1, R, D)
+        scale_factors = mx.exp(out_max - global_max)  # (BH, tiles, R, D)
+        scaled_acc = mx.sum(out_acc * scale_factors, axis=1)  # (BH, R, D)
+        scaled_sum = mx.sum(out_sum * scale_factors, axis=1)  # (BH, R, D)
+        out_rotated = (scaled_acc / mx.maximum(scaled_sum, _EPS)).reshape(B, H, R, val_dim)
+
+        # Apply value rotation and reorder: (B, H, R, dim_low+dim_high)
+        out_low = mx.matmul(out_rotated[..., :dim_low], vc.low_codec.rotation)
+        out_high = mx.matmul(out_rotated[..., dim_low:], vc.high_codec.rotation)
+        merged = mx.concatenate([out_low, out_high], axis=-1)
+        output = mx.take(merged, vc.restore_order, axis=-1)
+        return mx.expand_dims(output, axis=3)
+
     def _compiled_integer_decode_attention(
         self,
         grouped_queries: mx.array,
@@ -2938,6 +3390,8 @@ class TurboQuantKVCache(_BaseCache):
     ) -> mx.array:
         if keys_state is None or values_state is None:
             keys_state, values_state = self.state
+        keys_state = self._unwrap(keys_state)
+        values_state = self._unwrap(values_state)
 
         if queries.shape[-2] != 1:
             raise ValueError("TurboQuant decode attention expects a single query token.")
@@ -2958,11 +3412,20 @@ class TurboQuantKVCache(_BaseCache):
 
         value_dim = self.value_codec.dim
         total_tokens = _state_length(keys_state)
-        if total_tokens <= self.decode_key_chunk_size and mask in (None, "causal"):
+
+        if total_tokens <= self.decode_key_chunk_size and (mask is None or (isinstance(mask, str) and mask == "causal")):
             fast_output = self._compiled_integer_decode_attention(
                 grouped_queries,
                 keys_state,
                 values_state,
+            )
+            if fast_output is not None:
+                output = fast_output.reshape(B, n_q_heads, L, value_dim)
+                return output.astype(queries.dtype)
+
+            # Fused SplitCodec path — both halves in a single compiled call
+            fast_output = self._compiled_split_decode_attention(
+                grouped_queries, keys_state, values_state,
             )
             if fast_output is not None:
                 output = fast_output.reshape(B, n_q_heads, L, value_dim)
