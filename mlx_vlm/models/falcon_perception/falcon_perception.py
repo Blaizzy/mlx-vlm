@@ -471,7 +471,6 @@ class Model(nn.Module):
             lm._current_det = {}
         return lm._detections
 
-
     @property
     def last_hidden_state(self) -> Optional[mx.array]:
         return self.language_model.model._last_hidden_state
