@@ -499,7 +499,7 @@ Tested on gemma-4-31b-it at 128k context:
 | Metric | Baseline | TurboQuant 3.5-bit |
 |--------|----------|-------------------|
 | KV Memory | 13.3 GB | 4.9 GB (**63% reduction**) |
-| Active Memory | 75.2 GB | 65.8 GB (**-9.4 GB**) |
+| Peak Memory | 75.2 GB | 65.8 GB (**-9.4 GB**) |
 
 ### Supported Bit Widths
 
