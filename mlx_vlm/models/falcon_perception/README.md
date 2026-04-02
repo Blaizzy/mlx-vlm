@@ -44,10 +44,9 @@ output = generate(
     "cat",
     image="photo.jpg",
     max_tokens=200,
-    verbose=True,
 )
 
-# Retrieve detections accumulated during generate()
+# Detections are decoded on the fly during generate()
 detections = model.get_detections()
 
 for det in detections:
@@ -76,4 +75,4 @@ Each detection is a dict with:
 ### Notes
 
 - Segmentation masks are produced at patch resolution and upsampled via nearest-neighbor interpolation. The original PyTorch model uses AnyUp (a learned cross-attention upsampler with FlexAttention) for higher-resolution masks, which is not available in MLX.
-- The coord/size Fourier encoding feedback is handled automatically by the `LanguageModel` during standard `generate()`. Use `model.get_detections()` after generation to retrieve results.
+- The coord/size Fourier encoding feedback is handled automatically by the `LanguageModel` during standard `generate()`. Detection values are decoded from hidden states on the fly and accumulated in the model. Use `model.get_detections()` after generation to retrieve results.
