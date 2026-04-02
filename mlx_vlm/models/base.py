@@ -203,13 +203,6 @@ def scaled_dot_product_attention(
                 scale=scale,
                 mask=mask,
             )
-        # Try fast prefill: fold L queries into R dimension, reuse decode kernels.
-        # Falls back to dequantize+SDPA if not supported.
-        result = cache.prefill_attention(
-            queries, keys_state=keys, values_state=values, scale=scale, mask=mask,
-        )
-        if result is not None:
-            return result
         dequantized_keys, dequantized_values = cache.dequantize(keys, values)
         return mx.fast.scaled_dot_product_attention(
             queries,
