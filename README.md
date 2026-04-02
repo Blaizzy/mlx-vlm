@@ -489,10 +489,8 @@ Tested on Qwen3.5-4B-4bit at 128k context:
 
 | Metric | Baseline | TurboQuant 3.5-bit |
 |--------|----------|-------------------|
-| Decode | 59 tok/s | 38 tok/s |
-| Prefill | 1,144 tok/s | 1,007 tok/s |
 | KV Memory | 4.1 GB | 0.97 GB (**76% reduction**) |
-| NIAH Accuracy | 5/5 | 5/5 |
+| Peak Memory | 18.3 GB | 17.3 GB (**-1.0 GB**) |
 
 At 512k+ contexts, TurboQuant's per-layer attention is **faster than FP16 SDPA** due to reduced memory bandwidth requirements.
 
