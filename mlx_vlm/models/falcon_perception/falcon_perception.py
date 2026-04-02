@@ -89,6 +89,15 @@ class Model(nn.Module):
         # Weak-ish ref for segm features (stored on Model, not a module)
         object.__setattr__(lm, "_parent_model_ref", self)
 
+        # Initialize segm state so LM forward works before get_input_embeddings
+        self._segm_features_computed = False
+        self._segm_features = None
+        self._orig_hw = None
+        self._prefill_hidden_state = None
+        self._prefill_pixel_values = None
+        self._prefill_grid_hw = None
+        self._prefill_input_ids = None
+
     def get_input_embeddings(
         self,
         input_ids: Optional[mx.array] = None,

@@ -2643,6 +2643,62 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
+    def test_falcon_perception(self):
+        from mlx_vlm.models import falcon_perception
+
+        text_config = falcon_perception.TextConfig(
+            model_type="falcon_perception",
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            head_dim=16,
+            num_key_value_heads=2,
+            vocab_size=256,
+            intermediate_size=128,
+            rms_norm_eps=1e-5,
+            max_position_embeddings=512,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+        )
+
+        vision_config = falcon_perception.VisionConfig(
+            model_type="falcon_perception",
+            spatial_patch_size=4,
+            temporal_patch_size=1,
+            channel_size=3,
+        )
+
+        config = falcon_perception.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="falcon_perception",
+            vocab_size=256,
+            img_id=227,
+            image_cls_token_id=244,
+            img_end_id=230,
+            coord_token_id=240,
+            size_token_id=241,
+            seg_token_id=262,
+            coord_enc_dim=64,
+            coord_dec_dim=128,
+            coord_out_dim=256,
+            size_enc_dim=64,
+            size_dec_dim=128,
+            size_out_dim=256,
+            do_segmentation=False,
+            segm_out_dim=64,
+            num_segm_layers=1,
+        )
+
+        model = falcon_perception.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
     def test_granite_vision(self):
         from mlx_vlm.models import granite_vision
 
@@ -3353,6 +3409,52 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "falcon_ocr")
+
+    def test_falcon_perception_input_embeddings(self):
+        from mlx_vlm.models import falcon_perception
+
+        model = falcon_perception.Model(
+            falcon_perception.ModelConfig(
+                text_config=falcon_perception.TextConfig(
+                    model_type="falcon_perception",
+                    hidden_size=64,
+                    num_hidden_layers=2,
+                    num_attention_heads=4,
+                    head_dim=16,
+                    num_key_value_heads=2,
+                    vocab_size=256,
+                    intermediate_size=128,
+                    rms_norm_eps=1e-5,
+                    max_position_embeddings=512,
+                    rope_theta=10000.0,
+                    tie_word_embeddings=False,
+                ),
+                vision_config=falcon_perception.VisionConfig(
+                    model_type="falcon_perception",
+                    spatial_patch_size=4,
+                    temporal_patch_size=1,
+                    channel_size=3,
+                ),
+                model_type="falcon_perception",
+                vocab_size=256,
+                img_id=227,
+                image_cls_token_id=244,
+                img_end_id=230,
+                coord_token_id=240,
+                size_token_id=241,
+                seg_token_id=262,
+                coord_enc_dim=64,
+                coord_dec_dim=128,
+                coord_out_dim=256,
+                size_enc_dim=64,
+                size_dec_dim=128,
+                size_out_dim=256,
+                do_segmentation=False,
+                segm_out_dim=64,
+                num_segm_layers=1,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "falcon_perception")
 
     def test_fastvlm_input_embeddings(self):
         from mlx_vlm.models import fastvlm
