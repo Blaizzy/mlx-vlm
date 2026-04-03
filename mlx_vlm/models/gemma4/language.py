@@ -602,7 +602,9 @@ class LanguageModel(nn.Module):
         def predicate(path, m):
             if not hasattr(m, "to_quantized"):
                 return False
-            if path.endswith("router.proj"):
+            if "router" in path:
+                return {"group_size": 64, "bits": 8}
+            if path.endswith(("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")):
                 return {"group_size": 64, "bits": 8}
             return True
 
