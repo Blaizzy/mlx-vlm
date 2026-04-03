@@ -1095,12 +1095,19 @@ async def chat_completions_endpoint(request: ChatRequest):
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
+        thinking_start = None
+        thinking_end = None
         if hasattr(tokenizer, "chat_template"):
             tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
             if tool_parser_type is not None:
                 tool_module = importlib.import_module(
                     f"mlx_lm.tool_parsers.{tool_parser_type}"
                 )
+            # Detect model-specific thinking tokens
+            chat_tmpl = tokenizer.chat_template or ""
+            if "<|channel>" in chat_tmpl and "<channel|>" in chat_tmpl:
+                thinking_start = "<|channel>"
+                thinking_end = "<channel|>"
         template_kwargs = request.template_kwargs()
         formatted_prompt = apply_chat_template(
             processor,
@@ -1130,12 +1137,38 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                     output_text = ""
                     request_id = f"chatcmpl-{uuid.uuid4()}"
+                    thinking_buffer = ""
+                    in_thinking = False
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
                             print("Warning: Received unexpected chunk format:", chunk)
                             continue
 
                         output_text += chunk.text
+
+                        # Strip model-specific thinking blocks from streamed output
+                        visible_text = chunk.text
+                        if thinking_start is not None:
+                            thinking_buffer += chunk.text
+                            visible_text = ""
+                            while thinking_buffer:
+                                if in_thinking:
+                                    end_idx = thinking_buffer.find(thinking_end)
+                                    if end_idx == -1:
+                                        thinking_buffer = thinking_buffer[-len(thinking_end):]
+                                        break
+                                    thinking_buffer = thinking_buffer[end_idx + len(thinking_end):]
+                                    in_thinking = False
+                                else:
+                                    start_idx = thinking_buffer.find(thinking_start)
+                                    if start_idx == -1:
+                                        safe_len = max(0, len(thinking_buffer) - len(thinking_start))
+                                        visible_text += thinking_buffer[:safe_len]
+                                        thinking_buffer = thinking_buffer[safe_len:]
+                                        break
+                                    visible_text += thinking_buffer[:start_idx]
+                                    thinking_buffer = thinking_buffer[start_idx + len(thinking_start):]
+                                    in_thinking = True
 
                         # Yield chunks in Server-Sent Events (SSE) format
                         usage_stats = {
@@ -1150,7 +1183,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                         choices = [
                             ChatStreamChoice(
-                                delta=ChatMessage(role="assistant", content=chunk.text)
+                                delta=ChatMessage(role="assistant", content=visible_text)
                             )
                         ]
                         chunk_data = ChatStreamChunk(
@@ -1244,16 +1277,27 @@ async def chat_completions_endpoint(request: ChatRequest):
                     peak_memory=gen_result.peak_memory,
                 )
 
+                # Strip thinking blocks from non-streaming output
+                clean_text = gen_result.text
+                if thinking_start is not None and thinking_end is not None:
+                    import re as _re
+                    clean_text = _re.sub(
+                        _re.escape(thinking_start) + r".*?" + _re.escape(thinking_end),
+                        "",
+                        clean_text,
+                        flags=_re.DOTALL,
+                    ).strip()
+
                 if tool_parser_type is not None:
                     tool_calls = process_tool_calls(
-                        model_output=gen_result.text,
+                        model_output=clean_text,
                         tool_module=tool_module,
                         tools=tools,
                     )
                 else:
                     tool_calls = {}
                     tool_calls["calls"] = []
-                    tool_calls["remaining_text"] = gen_result.text
+                    tool_calls["remaining_text"] = clean_text
 
                 choices = [
                     ChatChoice(
