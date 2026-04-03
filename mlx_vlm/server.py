@@ -49,6 +49,25 @@ def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
 
+def _infer_thinking_tokens(chat_template: str):
+    """Infer model-specific thinking block delimiters from the chat template.
+
+    Returns (start_token, end_token) if thinking tokens are detected,
+    otherwise returns (None, None).
+    """
+    if not isinstance(chat_template, str):
+        return None, None
+    # Gemma4: <|channel>thought ... <channel|>
+    if "<|channel>" in chat_template and "<channel|>" in chat_template:
+        return "<|channel>", "<channel|>"
+    return None, None
+
+
+def _strip_thinking(text: str, start: str, end: str) -> str:
+    """Remove all thinking blocks delimited by *start* / *end* from *text*."""
+    return re.sub(re.escape(start) + r".*?" + re.escape(end), "", text, flags=re.DOTALL).strip()
+
+
 def get_quantized_kv_bits(model: str):
     kv_bits = float(os.environ.get("KV_BITS", 0))
     if kv_bits == 0:
@@ -1103,11 +1122,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                 tool_module = importlib.import_module(
                     f"mlx_lm.tool_parsers.{tool_parser_type}"
                 )
-            # Detect model-specific thinking tokens
-            chat_tmpl = tokenizer.chat_template or ""
-            if "<|channel>" in chat_tmpl and "<channel|>" in chat_tmpl:
-                thinking_start = "<|channel>"
-                thinking_end = "<channel|>"
+            thinking_start, thinking_end = _infer_thinking_tokens(
+                tokenizer.chat_template or ""
+            )
         template_kwargs = request.template_kwargs()
         formatted_prompt = apply_chat_template(
             processor,
@@ -1280,13 +1297,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 # Strip thinking blocks from non-streaming output
                 clean_text = gen_result.text
                 if thinking_start is not None and thinking_end is not None:
-                    import re as _re
-                    clean_text = _re.sub(
-                        _re.escape(thinking_start) + r".*?" + _re.escape(thinking_end),
-                        "",
-                        clean_text,
-                        flags=_re.DOTALL,
-                    ).strip()
+                    clean_text = _strip_thinking(clean_text, thinking_start, thinking_end)
 
                 if tool_parser_type is not None:
                     tool_calls = process_tool_calls(
