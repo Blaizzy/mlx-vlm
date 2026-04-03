@@ -12,6 +12,7 @@ from ..base import (
 )
 from ..cache import KVCache, RotatingKVCache
 from .config import TextConfig
+from .rope_utils import initialize_rope
 
 
 class RMSNormNoScale(nn.Module):
@@ -173,13 +174,13 @@ class Attention(nn.Module):
         layer_key = "sliding_attention" if self.is_sliding else "full_attention"
         rope_params = config.rope_parameters.get(layer_key, {})
         rope_theta = rope_params.get("rope_theta", 10000.0)
-        partial_rotary_factor = rope_params.get("partial_rotary_factor", 1.0)
-        rope_dims = int(self.head_dim * partial_rotary_factor)
 
-        self.rope = nn.RoPE(
-            rope_dims,
+        self.rope = initialize_rope(
+            dims=self.head_dim,
             traditional=config.rope_traditional,
             base=rope_theta,
+            scaling_config=rope_params,
+            max_position_embeddings=config.max_position_embeddings,
         )
 
         # KV sharing (2B/4B models)
