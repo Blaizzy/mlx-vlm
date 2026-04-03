@@ -2845,123 +2845,207 @@ def _metal_butterfly_wht_inverse(shared_name: str, sign_name: str, temp_name: st
 
 
 @lru_cache(maxsize=None)
+@lru_cache(maxsize=None)
+def _fused_kv_quantize_kernel(key_bits: int, val_bits: int):
+    """Fused key+value quantize in 1 dispatch. Grid.y=0 does keys, grid.y=1 does values.
+    Halves dispatch count vs separate key/value quantize calls."""
+    if not _metal_available() or key_bits <= 0 or val_bits <= 0:
+        return None
+
+    k_midpoints = (1 << key_bits) - 1
+    v_midpoints = (1 << val_bits) - 1
+    k_mask = (1 << key_bits) - 1
+    v_mask = (1 << val_bits) - 1
+
+    source = f"""
+        auto d = thread_position_in_threadgroup.x;
+        auto bh = threadgroup_position_in_grid.x;
+        auto is_val = threadgroup_position_in_grid.y;  // 0=key, 1=value
+        auto sg_id = simdgroup_index_in_threadgroup;
+        auto sg_lid = thread_index_in_simdgroup;
+
+        // Select key or value params based on grid.y
+        int bits = is_val ? {val_bits} : {key_bits};
+        int n_mid = is_val ? {v_midpoints} : {k_midpoints};
+        uint idx_mask = is_val ? {v_mask}u : {k_mask}u;
+        int pw = is_val ? VPackedWidth : KPackedWidth;
+
+        // Step 1: Load vector element
+        float v;
+        if (is_val)
+            v = (d < Dim) ? static_cast<float>(val_vectors[bh * Dim + d]) : 0.0f;
+        else
+            v = (d < Dim) ? static_cast<float>(key_vectors[bh * Dim + d]) : 0.0f;
+
+        // Compute norm (2-stage cross-simdgroup reduction)
+        float sq = v * v;
+        float sg_sum = simd_sum(sq);
+        threadgroup float sg_norms[8];
+        if (sg_lid == 0) sg_norms[sg_id] = sg_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_sq = (sg_id == 0 && sg_lid < 8) ? sg_norms[sg_lid] : 0.0f;
+        total_sq = simd_sum(total_sq);
+        if (sg_id == 0 && sg_lid == 0) sg_norms[0] = total_sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float norm = sqrt(sg_norms[0]);
+        float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+        if (d == 0) {{
+            if (is_val) out_val_norms[bh] = half(norm);
+            else out_key_norms[bh] = half(norm);
+        }}
+
+        // Step 2: Unit vector → shared
+        threadgroup float shared[Dim];
+        if (d < Dim) shared[d] = v * inv_norm;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step 3: Rotate (1 dim per thread, 256 FMAs)
+        float rotated = 0.0f;
+        if (d < Dim) {{
+            auto row = is_val ? (val_rotation + d * Dim) : (key_rotation + d * Dim);
+            for (int j = 0; j < (int)Dim; j++)
+                rotated += shared[j] * row[j];
+        }}
+
+        // Step 4: Comparison-based quantize
+        threadgroup uint shared_idx[Dim];
+        uint idx = 0;
+        if (d < Dim) {{
+            if (is_val) {{
+                for (int m = 0; m < n_mid; m++)
+                    idx += (rotated > val_midpoints[m]) ? 1u : 0u;
+            }} else {{
+                for (int m = 0; m < n_mid; m++)
+                    idx += (rotated > key_midpoints[m]) ? 1u : 0u;
+            }}
+            shared_idx[d] = idx;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step 5: Pack indices
+        threadgroup uint packed_shared[Dim];  // oversized but safe
+        if (d < pw) packed_shared[d] = 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (d < Dim) {{
+            uint idx_val = shared_idx[d] & idx_mask;
+            int bo = d * bits;
+            int w = bo >> 5;
+            int shift = bo & 31;
+            packed_shared[w] |= idx_val << shift;
+            if (shift + bits > 32)
+                packed_shared[w + 1] |= idx_val >> (32 - shift);
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (d < pw) {{
+            if (is_val)
+                out_val_packed[bh * pw + d] = packed_shared[d];
+            else
+                out_key_packed[bh * pw + d] = packed_shared[d];
+        }}
+    """
+
+    return mx.fast.metal_kernel(
+        name=f"turboquant_fused_kv_quantize_k{key_bits}_v{val_bits}",
+        input_names=[
+            "key_vectors", "val_vectors",
+            "key_rotation", "val_rotation",
+            "key_midpoints", "val_midpoints",
+        ],
+        output_names=[
+            "out_key_norms", "out_key_packed",
+            "out_val_norms", "out_val_packed",
+        ],
+        source=source,
+    )
+
+
 def _fused_mse_quantize_kernel(bits: int, use_rht: bool = False):
     """Fused MSE quantize: norm + rotate + comparison-quantize + pack in 1 dispatch.
-    Replaces ~(3 + 3*num_midpoints) = ~48 dispatches for 4-bit quantization."""
+    TG=Dim (256 threads): 1 thread per dimension for 8× faster rotation."""
     if not _metal_available() or bits <= 0:
         return None
     num_entries = 1 << bits
     num_midpoints = num_entries - 1
     mask = num_entries - 1
 
-    lines = [
-        "        auto lane = thread_position_in_threadgroup.x;",
-        "        auto bh = thread_position_in_grid.z;",
-        "        auto vec_ptr = vectors + bh * Dim;",
-        "",
-        "        // Step 1: Load & compute norm",
-        "        float v[DimsPerLane];",
-        "        float partial_sq = 0.0f;",
-        "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {",
-        "            float x = (d < Dim) ? static_cast<float>(vec_ptr[d]) : 0.0f;",
-        "            v[i] = x;",
-        "            partial_sq += x * x;",
-        "        }",
-        "        float norm = sqrt(simd_sum(partial_sq));",
-        "        float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;",
-        "        if (lane == 0) out_norms[bh] = half(norm);",
-        "",
-    ]
+    source = f"""
+        auto d = thread_position_in_threadgroup.x;  // 0..Dim-1, one dim per thread
+        auto bh = threadgroup_position_in_grid.x;
+        auto sg_id = simdgroup_index_in_threadgroup;
+        auto sg_lid = thread_index_in_simdgroup;
+        auto vec_ptr = vectors + bh * Dim;
 
-    if use_rht:
-        # RHT path: sign flip + butterfly WHT in shared memory
-        lines += [
-            "        // Step 2: Unit vector → shared (padded to DimPadded)",
-            "        threadgroup float shared[DimPadded];",
-            "        for (int i = 0, d = lane; i < DimsPerLanePadded; d += 32, i++)",
-            "            shared[d < Dim ? d : 0] = (d < Dim) ? v[i] * inv_norm : 0.0f;",
-            "        if (lane < (DimPadded - Dim) && (Dim + lane) < DimPadded)",
-            "            shared[Dim + lane] = 0.0f;",
-            "        threadgroup_barrier(mem_flags::mem_threadgroup);",
-            "",
-        ]
-        lines += _metal_butterfly_wht_forward("shared", "sign_vec", "v", "DimsPerLanePadded")
-        lines += [
-            "",
-            "        // Read rotated values",
-            "        float rotated[DimsPerLane];",
-            "        for (int i = 0, d = lane; i < DimsPerLane; d += 32, i++)",
-            "            rotated[i] = (d < Dim) ? shared[d] * rht_scale : 0.0f;",
-        ]
-    else:
-        # Dense rotation path
-        lines += [
-            "        // Step 2: Unit vector → shared for rotation",
-            "        threadgroup float shared[Dim];",
-            "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32)",
-            "            if (d < Dim) shared[d] = v[i] * inv_norm;",
-            "        threadgroup_barrier(mem_flags::mem_threadgroup);",
-            "",
-            "        // Step 3: Rotate (dense matmul)",
-            "        float rotated[DimsPerLane];",
-            "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {",
-            "            float sum = 0.0f;",
-            "            if (d < Dim) {",
-            "                auto row = rotation + d * Dim;",
-            "                for (int j = 0; j < (int)Dim; j++)",
-            "                    sum += shared[j] * row[j];",
-            "            }",
-            "            rotated[i] = sum;",
-            "        }",
-        ]
+        // Step 1: Load & compute norm (2-stage cross-simdgroup reduction)
+        float val = (d < Dim) ? static_cast<float>(vec_ptr[d]) : 0.0f;
+        float sq = val * val;
+        float sg_sum = simd_sum(sq);
 
-    # Steps 4-5 are the same for both paths
-    shared_decl = "" if use_rht else ""
-    lines += [
-        "",
-        "        // Step 4: Comparison-based quantize + write indices to shared",
-        "        threadgroup uint shared_idx[Dim];",
-        "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {",
-        "            uint idx = 0;",
-        f"            if (d < Dim) {{",
-        f"                for (int m = 0; m < {num_midpoints}; m++)",
-        f"                    idx += (rotated[i] > midpoints[m]) ? 1u : 0u;",
-        f"            }}",
-        "            if (d < Dim) shared_idx[d] = idx;",
-        "        }",
-        "        threadgroup_barrier(mem_flags::mem_threadgroup);",
-        "",
-        "        // Step 5: Pack indices — per-dim write handles word-spanning",
-        "        threadgroup uint packed_shared[PackedWidth];",
-        "        for (int w = lane; w < PackedWidth; w += 32)",
-        "            packed_shared[w] = 0;",
-        "        threadgroup_barrier(mem_flags::mem_threadgroup);",
-        "",
-        "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {",
-        f"            if (d < Dim) {{",
-        f"                uint idx = shared_idx[d] & {mask}u;",
-        f"                int bo = d * {bits};",
-        f"                int w = bo >> 5;",
-        f"                int shift = bo & 31;",
-        f"                packed_shared[w] |= idx << shift;",
-        f"                if (shift + {bits} > 32)",
-        f"                    packed_shared[w + 1] |= idx >> (32 - shift);",
-        f"            }}",
-        "        }",
-        "        threadgroup_barrier(mem_flags::mem_threadgroup);",
-        "",
-        "        for (int w = lane; w < PackedWidth; w += 32)",
-        "            out_packed[bh * PackedWidth + w] = packed_shared[w];",
-    ]
+        threadgroup float sg_norms[8];
+        if (sg_lid == 0) sg_norms[sg_id] = sg_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    input_names = ["vectors", "sign_vec" if use_rht else "rotation", "midpoints"]
-    name_suffix = f"_rht" if use_rht else ""
+        float total_sq = (sg_id == 0 && sg_lid < 8) ? sg_norms[sg_lid] : 0.0f;
+        total_sq = simd_sum(total_sq);
+        // Broadcast norm to all threads
+        if (sg_id == 0 && sg_lid == 0) sg_norms[0] = total_sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float norm = sqrt(sg_norms[0]);
+        float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+        if (d == 0) out_norms[bh] = half(norm);
+
+        // Step 2: Unit vector → shared for rotation
+        threadgroup float shared[Dim];
+        if (d < Dim) shared[d] = val * inv_norm;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step 3: Rotate — 1 dim per thread, 256 FMAs (was 2048 at TG=32)
+        float rotated = 0.0f;
+        if (d < Dim) {{
+            auto row = rotation + d * Dim;
+            for (int j = 0; j < (int)Dim; j++)
+                rotated += shared[j] * row[j];
+        }}
+
+        // Step 4: Comparison-based quantize
+        threadgroup uint shared_idx[Dim];
+        uint idx = 0;
+        if (d < Dim) {{
+            for (int m = 0; m < {num_midpoints}; m++)
+                idx += (rotated > midpoints[m]) ? 1u : 0u;
+            shared_idx[d] = idx;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step 5: Pack indices — per-dim write handles word-spanning
+        threadgroup uint packed_shared[PackedWidth];
+        // Zero packed buffer (use all threads, stride by Dim)
+        if (d < PackedWidth) packed_shared[d] = 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (d < Dim) {{
+            uint idx_val = shared_idx[d] & {mask}u;
+            int bo = d * {bits};
+            int w = bo >> 5;
+            int shift = bo & 31;
+            packed_shared[w] |= idx_val << shift;
+            if (shift + {bits} > 32)
+                packed_shared[w + 1] |= idx_val >> (32 - shift);
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (d < PackedWidth)
+            out_packed[bh * PackedWidth + d] = packed_shared[d];
+    """
 
     return mx.fast.metal_kernel(
-        name=f"turboquant_fused_mse_quantize_{bits}{name_suffix}",
-        input_names=input_names,
+        name=f"turboquant_fused_mse_quantize_v2_{bits}",
+        input_names=["vectors", "rotation", "midpoints"],
         output_names=["out_norms", "out_packed"],
-        source="\n".join(lines),
+        source=source,
     )
 
 
@@ -4152,8 +4236,8 @@ class _TurboQuantMSECodec:
                 norms, packed = kernel(
                     inputs=[flat, rot_input, self._midpoints],
                     template=template,
-                    grid=(32, 1, BH),
-                    threadgroup=(32, 1, 1),
+                    grid=(D * BH, 1, 1),
+                    threadgroup=(D, 1, 1),
                     output_shapes=[(BH,), (BH, packed_width)],
                     output_dtypes=[mx.float16, mx.uint32],
                 )
@@ -4895,10 +4979,62 @@ class TurboQuantKVCache(_BaseCache):
                 values, val_bits, mode="mse", seed=self.seed + 1
             )
 
+    def _try_fused_kv_quantize(self, keys, values):
+        """Fused key+value quantize in 1 dispatch. Returns (key_state, val_state) or (None, None)."""
+        if (
+            keys.shape[-2] != 1
+            or not isinstance(self.key_codec, _TurboQuantMSECodec)
+            or not isinstance(self.value_codec, _TurboQuantMSECodec)
+        ):
+            return None, None
+
+        key_bits = int(self.key_codec.bits)
+        val_bits = int(self.value_codec.bits)
+        kernel = _fused_kv_quantize_kernel(key_bits, val_bits)
+        if kernel is None:
+            return None, None
+
+        D = keys.shape[-1]
+        k_flat = keys.reshape(-1, D)
+        v_flat = values.reshape(-1, D)
+        BH = k_flat.shape[0]
+        k_pw = (D * key_bits + 31) // 32
+        v_pw = (D * val_bits + 31) // 32
+
+        k_norms, k_packed, v_norms, v_packed = kernel(
+            inputs=[
+                k_flat, v_flat,
+                self.key_codec.rotation, self.value_codec.rotation,
+                self.key_codec._midpoints, self.value_codec._midpoints,
+            ],
+            template=[
+                ("Dim", D),
+                ("KPackedWidth", k_pw),
+                ("VPackedWidth", v_pw),
+            ],
+            grid=(D * BH, 2, 1),
+            threadgroup=(D, 1, 1),
+            output_shapes=[
+                (BH,), (BH, k_pw),
+                (BH,), (BH, v_pw),
+            ],
+            output_dtypes=[mx.float16, mx.uint32, mx.float16, mx.uint32],
+        )
+
+        orig = keys.shape[:-1]
+        return (
+            TurboQuantMSEState(k_norms.reshape(orig), k_packed.reshape(*orig, k_pw)),
+            TurboQuantMSEState(v_norms.reshape(orig), v_packed.reshape(*orig, v_pw)),
+        )
+
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         self._ensure_codecs(keys, values)
-        new_keys = self.key_codec.quantize(keys)
-        new_values = self.value_codec.quantize(values)
+
+        # Try fused key+value quantize (1 dispatch instead of 2)
+        new_keys, new_values = self._try_fused_kv_quantize(keys, values)
+        if new_keys is None:
+            new_keys = self.key_codec.quantize(keys)
+            new_values = self.value_codec.quantize(values)
 
         new_end = self.offset + keys.shape[2]
         if self.keys is None:
