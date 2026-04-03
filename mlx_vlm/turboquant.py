@@ -2467,11 +2467,11 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int):
         // Shared memory for cross-simdgroup reduction
         threadgroup U max_scores[BN];
         threadgroup U sum_exp_scores[BN];
-        threadgroup U outputs[BN * BD];
+        threadgroup U shared[BN * BD];
 
-        // Preload query into registers (scaled)
+        // Preload pre-rotated query into registers
         thread U q[qk_per_thread];
-        auto qr = q_rot + bqh * Dim + simd_lid * qk_per_thread;
+        auto qr = queries + bqh * Dim + simd_lid * qk_per_thread;
         for (int i = 0; i < qk_per_thread; i++)
             q[i] = static_cast<U>(qr[i]);
 
@@ -2536,14 +2536,14 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int):
 
         // 4. Transpose-reduce outputs through shared memory
         for (int i = 0; i < v_per_thread; i++) {{
-            outputs[simd_lid * BD + simd_gid] = o[i] * my_factor;
+            shared[simd_lid * BD + simd_gid] = o[i] * my_factor;
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+            o[i] = simd_sum(shared[simd_gid * BD + simd_lid]);
             o[i] = total_sum > 0 ? o[i] / total_sum : 0;
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }}
 
-        // Write output (simd_gid partitions output dims, lane 0 writes)
+        // Write output (in rotated space — caller applies inverse rotation)
         if (simd_lid == 0) {{
             for (int i = 0; i < v_per_thread; i++) {{
                 out[bqh * Dim + simd_gid * v_per_thread + i] = static_cast<U>(o[i]);
@@ -2554,9 +2554,199 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int):
     return mx.fast.metal_kernel(
         name=f"turboquant_fused_mse_sdpa_k{key_bits}_v{val_bits}",
         input_names=[
-            "q_rot", "key_norms", "key_packed", "key_codebook",
+            "queries", "key_norms", "key_packed", "key_codebook",
             "val_norms", "val_packed", "val_codebook",
         ],
+        output_names=["out"],
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int):
+    """Pass 1: Block-parallel quantized attention. Each TG = 1 simdgroup per
+    q_head (GQA packed via threadgroup y-dim). Grid.z = blocks splits KV seq.
+    Matches MLX sdpa_vector_2pass_1 architecture."""
+    if not _metal_available() or key_bits <= 0 or val_bits <= 0:
+        return None
+
+    k_mask = (1 << key_bits) - 1
+    v_mask = (1 << val_bits) - 1
+
+    source = f"""
+        constexpr int BD = 32;
+        constexpr int qk_per_thread = Dim / BD;
+        constexpr int v_per_thread = Dim / BD;
+        constexpr uint k_mask = {k_mask}u;
+        constexpr uint v_mask = {v_mask}u;
+        constexpr int k_bits = {key_bits};
+        constexpr int v_bits = {val_bits};
+        typedef float U;
+
+        // Thread identity — matches sdpa_vector_2pass_1 layout
+        auto kv_head_idx = threadgroup_position_in_grid.x;
+        auto batch_idx = threadgroup_position_in_grid.y;
+        auto block_idx = threadgroup_position_in_grid.z;
+        auto simd_lid = thread_index_in_simdgroup;
+        auto gqa_idx = thread_position_in_threadgroup.y;  // which q_head within kv_head
+
+        auto token_count = key_norms_shape[2];
+        auto kv_heads = key_norms_shape[1];
+        auto bh = batch_idx * kv_heads + kv_head_idx;
+        auto bqh = batch_idx * kv_heads * RepeatCount + kv_head_idx * RepeatCount + gqa_idx;
+
+        auto k_nm = key_norms + bh * token_count;
+        auto k_pk = key_packed + bh * token_count * KPackedWidth;
+        auto v_nm = val_norms + bh * token_count;
+        auto v_pk = val_packed + bh * token_count * VPackedWidth;
+
+        // Load pre-rotated query
+        thread U q[qk_per_thread];
+        auto qr = queries + bqh * Dim + simd_lid * qk_per_thread;
+        for (int i = 0; i < qk_per_thread; i++)
+            q[i] = static_cast<U>(qr[i]);
+
+        thread U o[v_per_thread] = {{}};
+        U max_score = -INFINITY;
+        U sum_exp_score = 0;
+
+        // KV loop: stride by blocks (each block handles a different subset)
+        for (int t = block_idx; t < (int)token_count; t += Blocks) {{
+            auto kt = k_pk + t * KPackedWidth;
+            U kn = static_cast<U>(k_nm[t]);
+
+            U score = 0;
+            for (int i = 0; i < qk_per_thread; i++) {{
+                int d = simd_lid * qk_per_thread + i;
+                int bo = d * k_bits;
+                uint kv = (kt[bo >> 5] >> (bo & 31));
+                if (((bo & 31) + k_bits) > 32)
+                    kv |= kt[(bo >> 5)+1] << (k_bits - ((bo & 31)+k_bits-32));
+                score += q[i] * key_codebook[kv & k_mask];
+            }}
+            score = simd_sum(score) * kn;
+
+            auto vt = v_pk + t * VPackedWidth;
+            U vn = static_cast<U>(v_nm[t]);
+
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+
+            for (int i = 0; i < v_per_thread; i++) {{
+                int d = simd_lid * v_per_thread + i;
+                int bo = d * v_bits;
+                uint vv = (vt[bo >> 5] >> (bo & 31));
+                if (((bo & 31) + v_bits) > 32)
+                    vv |= vt[(bo >> 5)+1] << (v_bits - ((bo & 31)+v_bits-32));
+                o[i] = o[i] * factor + exp_score * val_codebook[vv & v_mask] * vn;
+            }}
+        }}
+
+        // Write partial results for this block
+        if (simd_lid == 0) {{
+            out_sums[bqh * Blocks + block_idx] = sum_exp_score;
+            out_maxs[bqh * Blocks + block_idx] = max_score;
+        }}
+        for (int i = 0; i < v_per_thread; i++)
+            out_acc[(bqh * Blocks + block_idx) * Dim + simd_lid * v_per_thread + i] =
+                static_cast<U>(o[i]);
+    """
+
+    return mx.fast.metal_kernel(
+        name=f"turboquant_mse_sdpa_2pass1_k{key_bits}_v{val_bits}",
+        input_names=[
+            "queries", "key_norms", "key_packed", "key_codebook",
+            "val_norms", "val_packed", "val_codebook",
+        ],
+        output_names=["out_acc", "out_sums", "out_maxs"],
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _fused_mse_decode_2pass_2_kernel():
+    """Pass 2: Reduce partial block results via cross-block online softmax.
+    TG = 1024 (32 simdgroups × 32 lanes). Grid = (B*H_q, 1, 1).
+    Matches MLX sdpa_vector_2pass_2 architecture."""
+    if not _metal_available():
+        return None
+
+    source = """
+        constexpr int BN = 32;
+        constexpr int BD = 32;
+        constexpr int elem_per_thread = Dim / BD;
+        typedef float U;
+
+        thread U o[elem_per_thread] = {};
+        threadgroup U outputs[BN * BD];
+
+        auto head_idx = threadgroup_position_in_grid.x;
+        auto simd_gid = simdgroup_index_in_threadgroup;
+        auto simd_lid = thread_index_in_simdgroup;
+
+        auto p = partials + head_idx * Blocks * Dim + simd_gid * Dim +
+                 simd_lid * elem_per_thread;
+        auto s = sums + head_idx * Blocks;
+        auto m = maxs + head_idx * Blocks;
+
+        U max_score = -INFINITY;
+        U sum_exp_score = 0;
+
+        // Each simdgroup handles a subset of blocks (stride BN)
+        for (int b = simd_gid; b < Blocks; b += BN) {
+            U block_max = m[b];
+            U block_sum = s[b];
+
+            U new_max = max(max_score, block_max);
+            U factor = fast::exp(max_score - new_max);
+            U block_factor = fast::exp(block_max - new_max);
+
+            sum_exp_score = sum_exp_score * factor + block_sum * block_factor;
+            for (int i = 0; i < elem_per_thread; i++) {
+                o[i] = o[i] * factor +
+                    partials[(head_idx * Blocks + b) * Dim +
+                             simd_lid * elem_per_thread + i] * block_factor;
+            }
+            max_score = new_max;
+        }
+
+        // Cross-simdgroup reduction (same as sdpa_vector_2pass_2)
+        threadgroup U sg_maxs[BN];
+        threadgroup U sg_sums[BN];
+        if (simd_lid == 0) {
+            sg_maxs[simd_gid] = max_score;
+            sg_sums[simd_gid] = sum_exp_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        U sg_max = sg_maxs[simd_lid];
+        U new_max = simd_max(sg_max);
+        U factor = fast::exp(sg_max - new_max);
+        U total_sum = simd_sum(sg_sums[simd_lid] * factor);
+
+        U my_factor = fast::exp(max_score - new_max);
+
+        for (int i = 0; i < elem_per_thread; i++) {
+            outputs[simd_lid * BD + simd_gid] = o[i] * my_factor;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+            o[i] = total_sum > 0 ? o[i] / total_sum : 0;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (simd_lid == 0) {
+            for (int i = 0; i < elem_per_thread; i++)
+                out[head_idx * Dim + simd_gid * elem_per_thread + i] =
+                    static_cast<U>(o[i]);
+        }
+    """
+
+    return mx.fast.metal_kernel(
+        name="turboquant_mse_sdpa_2pass2",
+        input_names=["partials", "sums", "maxs"],
         output_names=["out"],
         source=source,
     )
@@ -5439,8 +5629,7 @@ class TurboQuantKVCache(_BaseCache):
         if total_tokens <= self.decode_key_chunk_size and (
             mask is None or (isinstance(mask, str) and mask == "causal")
         ):
-            # Fused quantized SDPA: 32 simdgroups × 32 lanes = 1024 threads/TG.
-            # Matches MLX SDPA architecture. Grid = B*H_q. No tiling/merge.
+            # Fused quantized SDPA matching MLX architecture.
             if (
                 isinstance(self.key_codec, _TurboQuantMSECodec)
                 and isinstance(self.value_codec, _TurboQuantMSECodec)
@@ -5449,30 +5638,81 @@ class TurboQuantKVCache(_BaseCache):
             ):
                 key_bits = int(self.key_codec.bits)
                 val_bits = int(self.value_codec.bits)
-                dims_per_lane = (D + 31) // 32
-                fused_kernel = _fused_mse_decode_kernel(key_bits, val_bits)
-                if fused_kernel is not None:
-                    dtype = queries.dtype
-                    q_rot = self.key_codec.prepare_queries(grouped_queries)
-                    q_rot_flat = q_rot.reshape(B * n_kv_heads * n_repeats, D)
-                    BQH = B * n_q_heads
+                dtype = queries.dtype
+                q_rot = self.key_codec.prepare_queries(grouped_queries)
+                q_rot_flat = q_rot.reshape(B * n_kv_heads * n_repeats, D)
+                BQH = B * n_q_heads
 
-                    out = fused_kernel(
+                if total_tokens <= 2048:
+                    # Single-pass: 32 simdgroups cooperate per q_head
+                    fused_kernel = _fused_mse_decode_kernel(key_bits, val_bits)
+                    if fused_kernel is not None:
+                        out = fused_kernel(
+                            inputs=[
+                                q_rot_flat,
+                                keys_state.norms, keys_state.indices,
+                                self.key_codec.codebook,
+                                values_state.norms, values_state.indices,
+                                self.value_codec.codebook,
+                            ],
+                            template=[
+                                ("Dim", D), ("RepeatCount", n_repeats),
+                                ("KPackedWidth", keys_state.indices.shape[-1]),
+                                ("VPackedWidth", values_state.indices.shape[-1]),
+                            ],
+                            grid=(BQH * 1024, 1, 1),
+                            threadgroup=(1024, 1, 1),
+                            output_shapes=[(BQH, D)],
+                            output_dtypes=[mx.float32],
+                        )[0]
+                        out_rotated = out.reshape(B, n_kv_heads, n_repeats, D)
+                        output = self.value_codec._rotate_inverse(out_rotated)
+                        return output.reshape(
+                            B, n_q_heads, L, value_dim
+                        ).astype(dtype)
+
+                # 2-pass: split KV across blocks for GPU saturation
+                pass1 = _fused_mse_decode_2pass_1_kernel(key_bits, val_bits)
+                pass2 = _fused_mse_decode_2pass_2_kernel()
+                if pass1 is not None and pass2 is not None:
+                    if total_tokens <= 8192:
+                        num_blocks = 64
+                    elif total_tokens <= 32768:
+                        num_blocks = 128
+                    elif total_tokens <= 65536:
+                        num_blocks = 256
+                    else:
+                        num_blocks = 512
+
+                    acc_shape = (BQH * num_blocks, D)
+                    sm_shape = (BQH * num_blocks,)
+                    out_acc, out_sums, out_maxs = pass1(
                         inputs=[
                             q_rot_flat,
-                            keys_state.norms,
-                            keys_state.indices,
+                            keys_state.norms, keys_state.indices,
                             self.key_codec.codebook,
-                            values_state.norms,
-                            values_state.indices,
+                            values_state.norms, values_state.indices,
                             self.value_codec.codebook,
                         ],
                         template=[
-                            ("Dim", D),
-                            ("RepeatCount", n_repeats),
+                            ("Dim", D), ("RepeatCount", n_repeats),
+                            ("Blocks", num_blocks),
                             ("KPackedWidth", keys_state.indices.shape[-1]),
                             ("VPackedWidth", values_state.indices.shape[-1]),
                         ],
+                        grid=(
+                            n_kv_heads * 32,
+                            B * n_repeats,
+                            num_blocks,
+                        ),
+                        threadgroup=(32, n_repeats, 1),
+                        output_shapes=[acc_shape, sm_shape, sm_shape],
+                        output_dtypes=[mx.float32, mx.float32, mx.float32],
+                    )
+
+                    out = pass2(
+                        inputs=[out_acc, out_sums, out_maxs],
+                        template=[("Dim", D), ("Blocks", num_blocks)],
                         grid=(BQH * 1024, 1, 1),
                         threadgroup=(1024, 1, 1),
                         output_shapes=[(BQH, D)],
