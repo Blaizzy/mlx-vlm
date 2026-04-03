@@ -35,7 +35,7 @@ python -m mlx_vlm.generate \
   --model google/gemma-4-e4b-it \
   --prompt "What is the capital of France?" \
   --max-tokens 500 \
-  --temperature 0
+  --temperature 1.0 --top-p 0.95 --top-k 64
 ```
 
 ### Image understanding
@@ -46,7 +46,7 @@ python -m mlx_vlm.generate \
   --image path/to/image.jpg \
   --prompt "Describe this image." \
   --max-tokens 500 \
-  --temperature 0
+  --temperature 1.0 --top-p 0.95 --top-k 64
 ```
 
 ### Audio understanding (2B/4B only)
@@ -57,7 +57,7 @@ python -m mlx_vlm.generate \
   --audio path/to/audio.wav \
   --prompt "Transcribe this audio" \
   --max-tokens 500 \
-  --temperature 0
+  --temperature 1.0 --top-p 0.95 --top-k 64
 ```
 
 ### Thinking mode (chain-of-thought)
@@ -68,7 +68,7 @@ python -m mlx_vlm.generate \
   --prompt "I want to do a car wash that is 50 meters away, should I walk or drive?" \
   --enable-thinking \
   --max-tokens 2000 \
-  --temperature 0
+  --temperature 1.0 --top-p 0.95 --top-k 64
 ```
 
 ### Image + thinking
@@ -80,7 +80,7 @@ python -m mlx_vlm.generate \
   --prompt "Describe this image." \
   --enable-thinking \
   --max-tokens 2000 \
-  --temperature 0
+  --temperature 1.0 --top-p 0.95 --top-k 64
 ```
 
 ### Thinking with budget
@@ -92,7 +92,7 @@ python -m mlx_vlm.generate \
   --enable-thinking \
   --thinking-budget 512 \
   --max-tokens 2000 \
-  --temperature 0
+  --temperature 1.0 --top-p 0.95 --top-k 64
 ```
 
 ## Python
@@ -114,7 +114,8 @@ result = generate(
     processor=processor,
     prompt=prompt,
     max_tokens=500,
-    temperature=0.0,
+    temperature=1.0,
+    top_p=0.95,
 )
 print(result)
 ```
@@ -139,7 +140,8 @@ result = generate(
     prompt=prompt,
     image=image,
     max_tokens=500,
-    temperature=0.0,
+    temperature=1.0,
+    top_p=0.95,
 )
 print(result)
 ```
@@ -163,7 +165,8 @@ result = generate(
     prompt=prompt,
     audio=["path/to/audio.wav"],
     max_tokens=500,
-    temperature=0.0,
+    temperature=1.0,
+    top_p=0.95,
 )
 print(result)
 ```
@@ -187,7 +190,8 @@ result = generate(
     processor=processor,
     prompt=prompt,
     max_tokens=2000,
-    temperature=0.0,
+    temperature=1.0,
+    top_p=0.95,
 )
 print(result)
 ```
