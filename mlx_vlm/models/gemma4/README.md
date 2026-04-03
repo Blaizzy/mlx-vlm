@@ -116,6 +116,7 @@ result = generate(
     max_tokens=500,
     temperature=1.0,
     top_p=0.95,
+    top_k=64,
 )
 print(result)
 ```
@@ -142,6 +143,7 @@ result = generate(
     max_tokens=500,
     temperature=1.0,
     top_p=0.95,
+    top_k=64,
 )
 print(result)
 ```
@@ -167,6 +169,7 @@ result = generate(
     max_tokens=500,
     temperature=1.0,
     top_p=0.95,
+    top_k=64,
 )
 print(result)
 ```
@@ -192,6 +195,7 @@ result = generate(
     max_tokens=2000,
     temperature=1.0,
     top_p=0.95,
+    top_k=64,
 )
 print(result)
 ```
