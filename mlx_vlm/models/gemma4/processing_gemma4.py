@@ -407,6 +407,10 @@ class Gemma4Processor(ProcessorMixin):
             data=to_mlx({**text_inputs, **image_inputs, **audio_inputs})
         )
 
+    def apply_chat_template(self, messages, **kwargs):
+        kwargs.setdefault("enable_thinking", False)
+        return self.tokenizer.apply_chat_template(messages, **kwargs)
+
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)
 
