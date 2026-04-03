@@ -2961,6 +2961,61 @@ def _fused_kv_quantize_kernel(key_bits: int, val_bits: int):
     )
 
 
+@lru_cache(maxsize=None)
+def _fused_norot_quantize_kernel(bits: int):
+    """Quantize pre-rotated vectors: comparison + pack. No rotation inside.
+    Used with mx.hadamard_transform for external rotation. TG=Dim."""
+    if not _metal_available() or bits <= 0:
+        return None
+
+    num_midpoints = (1 << bits) - 1
+    mask = (1 << bits) - 1
+
+    source = f"""
+        auto d = thread_position_in_threadgroup.x;
+        auto bh = threadgroup_position_in_grid.x;
+
+        // Read pre-rotated, pre-normalized value
+        float val = (d < Dim) ? static_cast<float>(rotated[bh * Dim + d]) : 0.0f;
+
+        // Comparison-based quantize
+        threadgroup uint shared_idx[Dim];
+        uint idx = 0;
+        if (d < Dim) {{
+            for (int m = 0; m < {num_midpoints}; m++)
+                idx += (val > midpoints[m]) ? 1u : 0u;
+            shared_idx[d] = idx;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Pack indices (word-spanning)
+        threadgroup uint packed_shared[PackedWidth];
+        if (d < PackedWidth) packed_shared[d] = 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (d < Dim) {{
+            uint idx_val = shared_idx[d] & {mask}u;
+            int bo = d * {bits};
+            int w = bo >> 5;
+            int shift = bo & 31;
+            packed_shared[w] |= idx_val << shift;
+            if (shift + {bits} > 32)
+                packed_shared[w + 1] |= idx_val >> (32 - shift);
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (d < PackedWidth)
+            out[bh * PackedWidth + d] = packed_shared[d];
+    """
+
+    return mx.fast.metal_kernel(
+        name=f"turboquant_norot_quantize_{bits}",
+        input_names=["rotated", "midpoints"],
+        output_names=["out"],
+        source=source,
+    )
+
+
 def _fused_mse_quantize_kernel(bits: int, use_rht: bool = False):
     """Fused MSE quantize: norm + rotate + comparison-quantize + pack in 1 dispatch.
     TG=Dim (256 threads): 1 thread per dimension for 8× faster rotation."""
@@ -4194,12 +4249,39 @@ class _TurboQuantMSECodec:
         return self._rotate_inverse(rotated)
 
     def quantize(self, vectors: mx.array) -> TurboQuantMSEState:
-        # Fused Metal kernel for single-token decode (all bit widths)
+        # Fast path for single-token decode: Hadamard rotation + fused quantize
+        if vectors.shape[-2] == 1 and self.bits > 0 and self.use_rht:
+            D = self.dim
+            flat = vectors.reshape(-1, D).astype(mx.float32)
+            BH = flat.shape[0]
+            norms = mx.linalg.norm(flat, axis=-1)
+            unit = flat / mx.maximum(norms[..., None], _EPS)
+            rotated = self._rotate_forward(unit)  # mx.hadamard_transform (1 dispatch)
+            # Fused quantize kernel on pre-rotated data (1 dispatch)
+            packed_width = (D * self.bits + 31) // 32
+            kernel = _fused_norot_quantize_kernel(self.bits)
+            if kernel is not None:
+                packed = kernel(
+                    inputs=[rotated, self._midpoints],
+                    template=[("Dim", D), ("PackedWidth", packed_width)],
+                    grid=(D * BH, 1, 1),
+                    threadgroup=(D, 1, 1),
+                    output_shapes=[(BH, packed_width)],
+                    output_dtypes=[mx.uint32],
+                )[0]
+                orig = vectors.shape[:-1]
+                return TurboQuantMSEState(
+                    norms.astype(mx.float16).reshape(orig),
+                    packed.reshape(*orig, packed_width),
+                )
+
+        # Fused Metal kernel with rotation inside (dense rotation path)
         if (
             vectors.shape[-2] == 1
             and self.bits > 0
+            and not self.use_rht
         ):
-            kernel = _fused_mse_quantize_kernel(self.bits, use_rht=self.use_rht)
+            kernel = _fused_mse_quantize_kernel(self.bits, use_rht=False)
             if kernel is not None:
                 D = self.dim
                 D_padded = _rht_padded_dim(D) if self.use_rht else D
