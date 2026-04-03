@@ -407,6 +407,29 @@ class Gemma4Processor(ProcessorMixin):
             data=to_mlx({**text_inputs, **image_inputs, **audio_inputs})
         )
 
+    def save_pretrained(self, save_directory, **kwargs):
+        import json
+        from pathlib import Path
+
+        super().save_pretrained(save_directory, **kwargs)
+
+        config_path = Path(save_directory) / "processor_config.json"
+        if config_path.exists() and self.feature_extractor is not None:
+            config = json.loads(config_path.read_text())
+            if "feature_extractor" not in config:
+                fe = self.feature_extractor
+                config["feature_extractor"] = {
+                    "feature_extractor_type": type(fe).__name__,
+                    "sampling_rate": getattr(fe, "sampling_rate", 16000),
+                    "num_mel_filters": getattr(fe, "num_mel_filters", 128),
+                    "fft_length": getattr(fe, "fft_length", 512),
+                    "hop_length": getattr(fe, "hop_length", 160),
+                    "chunk_duration": getattr(fe, "chunk_duration", 8.0),
+                    "overlap_duration": getattr(fe, "overlap_duration", 1.0),
+                }
+                config.setdefault("audio_ms_per_token", self.audio_ms_per_token)
+                config_path.write_text(json.dumps(config, indent=2))
+
     def apply_chat_template(self, messages, **kwargs):
         kwargs.setdefault("enable_thinking", False)
         return self.tokenizer.apply_chat_template(messages, **kwargs)

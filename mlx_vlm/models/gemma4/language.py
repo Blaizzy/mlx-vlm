@@ -470,10 +470,10 @@ class Gemma4TextModel(nn.Module):
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
+            h = h * self.embed_scale
         else:
-            h = inputs_embeds
 
-        h = h * self.embed_scale
+            h = inputs_embeds
 
         if self.hidden_size_per_layer_input:
             if inputs is not None and per_layer_inputs is None:
