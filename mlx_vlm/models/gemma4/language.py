@@ -388,9 +388,7 @@ class Gemma4TextModel(nn.Module):
         self.layer_idx_to_cache_idx = list(range(self.first_kv_shared_layer_idx))
         if self.first_kv_shared_layer_idx < config.num_hidden_layers:
             shared_full_idx = (
-                len(concrete_layers)
-                - 1
-                - concrete_layers[::-1].index("full_attention")
+                len(concrete_layers) - 1 - concrete_layers[::-1].index("full_attention")
             )
             shared_sliding_idx = (
                 len(concrete_layers)
@@ -494,9 +492,7 @@ class Gemma4TextModel(nn.Module):
                     )
                     max_start = max(per_layer_inputs.shape[1] - target_len, 0)
                     start = min(cache_offset, max_start)
-                    per_layer_inputs = per_layer_inputs[
-                        :, start : start + target_len
-                    ]
+                    per_layer_inputs = per_layer_inputs[:, start : start + target_len]
             if per_layer_inputs is not None or inputs is not None:
                 per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
 
@@ -506,15 +502,19 @@ class Gemma4TextModel(nn.Module):
         if mask is None:
             global_mask = create_attention_mask(
                 h,
-                cache[self.first_full_cache_idx]
-                if self.first_full_cache_idx < len(cache)
-                else None,
+                (
+                    cache[self.first_full_cache_idx]
+                    if self.first_full_cache_idx < len(cache)
+                    else None
+                ),
             )
             sliding_window_mask = create_attention_mask(
                 h,
-                cache[self.first_sliding_cache_idx]
-                if self.first_sliding_cache_idx < len(cache)
-                else None,
+                (
+                    cache[self.first_sliding_cache_idx]
+                    if self.first_sliding_cache_idx < len(cache)
+                    else None
+                ),
                 window_size=self.window_size,
             )
 
