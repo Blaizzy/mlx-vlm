@@ -1306,7 +1306,11 @@ def _metal_mse_score(
 
     # Fallback: non-tiled repeat kernel
     if R > 1:
-        repeat_kernel = _mse_score_repeat_kernel(R) if hasattr(_mse_score_tiled_kernel, '__wrapped__') else None
+        repeat_kernel = (
+            _mse_score_repeat_kernel(R)
+            if hasattr(_mse_score_tiled_kernel, "__wrapped__")
+            else None
+        )
     else:
         repeat_kernel = None
 
@@ -2219,7 +2223,10 @@ def _fused_integer_decode_single_tile_kernel(
 
 @lru_cache(maxsize=None)
 def _fully_fused_decode_kernel(
-    bits: int, repeat_count: int, dims_per_lane: int, key_mse_bits: int = -1,
+    bits: int,
+    repeat_count: int,
+    dims_per_lane: int,
+    key_mse_bits: int = -1,
     use_rht: bool = False,
 ):
     """Fully fused decode: score + online softmax + value + normalize + rotation
@@ -2486,7 +2493,7 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int):
     k_mask = (1 << key_bits) - 1
     v_mask = (1 << val_bits) - 1
 
-    import re
+
     source = f"""
         constexpr int BN = 32;  // simdgroups per threadgroup
         constexpr int BD = 32;  // lanes per simdgroup
@@ -2593,8 +2600,13 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int):
     return mx.fast.metal_kernel(
         name=f"turboquant_fused_mse_sdpa_k{key_bits}_v{val_bits}",
         input_names=[
-            "queries", "key_norms", "key_packed", "key_codebook",
-            "val_norms", "val_packed", "val_codebook",
+            "queries",
+            "key_norms",
+            "key_packed",
+            "key_codebook",
+            "val_norms",
+            "val_packed",
+            "val_codebook",
         ],
         output_names=["out"],
         source=source,
@@ -2687,8 +2699,13 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int):
     return mx.fast.metal_kernel(
         name=f"turboquant_mse_sdpa_2pass1_k{key_bits}_v{val_bits}",
         input_names=[
-            "queries", "key_norms", "key_packed", "key_codebook",
-            "val_norms", "val_packed", "val_codebook",
+            "queries",
+            "key_norms",
+            "key_packed",
+            "key_codebook",
+            "val_norms",
+            "val_packed",
+            "val_codebook",
         ],
         output_names=["out_acc", "out_sums", "out_maxs"],
         source=source,
@@ -2781,8 +2798,12 @@ def _fused_mse_decode_2pass_2_kernel():
     )
 
 
-def _metal_butterfly_wht_forward(shared_name: str, sign_name: str, temp_name: str,
-                                  dims_per_lane_padded: str = "DimsPerLanePadded"):
+def _metal_butterfly_wht_forward(
+    shared_name: str,
+    sign_name: str,
+    temp_name: str,
+    dims_per_lane_padded: str = "DimsPerLanePadded",
+):
     """Generate Metal code for in-place RHT forward in shared memory.
     RHT forward = WHT(signs * x) / sqrt(DimPadded).
     Requires: shared[DimPadded], sign_vec[Dim], temp[DimsPerLanePadded] (thread-local).
@@ -2813,8 +2834,12 @@ def _metal_butterfly_wht_forward(shared_name: str, sign_name: str, temp_name: st
     ]
 
 
-def _metal_butterfly_wht_inverse(shared_name: str, sign_name: str, temp_name: str,
-                                  dims_per_lane_padded: str = "DimsPerLanePadded"):
+def _metal_butterfly_wht_inverse(
+    shared_name: str,
+    sign_name: str,
+    temp_name: str,
+    dims_per_lane_padded: str = "DimsPerLanePadded",
+):
     """Generate Metal code for in-place RHT inverse in shared memory.
     RHT inverse = signs * WHT(x) / sqrt(DimPadded).
     Same butterfly as forward, then multiply by signs."""
@@ -2949,13 +2974,18 @@ def _fused_kv_quantize_kernel(key_bits: int, val_bits: int):
     return mx.fast.metal_kernel(
         name=f"turboquant_fused_kv_quantize_k{key_bits}_v{val_bits}",
         input_names=[
-            "key_vectors", "val_vectors",
-            "key_rotation", "val_rotation",
-            "key_midpoints", "val_midpoints",
+            "key_vectors",
+            "val_vectors",
+            "key_rotation",
+            "val_rotation",
+            "key_midpoints",
+            "val_midpoints",
         ],
         output_names=[
-            "out_key_norms", "out_key_packed",
-            "out_val_norms", "out_val_packed",
+            "out_key_norms",
+            "out_key_packed",
+            "out_val_norms",
+            "out_val_packed",
         ],
         source=source,
     )
@@ -3142,7 +3172,9 @@ def _fused_prod_quantize_kernel(mse_bits: int, use_rht: bool = False):
             "        threadgroup_barrier(mem_flags::mem_threadgroup);",
             "",
         ]
-        lines += _metal_butterfly_wht_forward("shared", "sign_vec", "v", "DimsPerLanePadded")
+        lines += _metal_butterfly_wht_forward(
+            "shared", "sign_vec", "v", "DimsPerLanePadded"
+        )
         lines += [
             "",
             "        float rotated[DimsPerLane];",
@@ -3703,7 +3735,6 @@ def _rht_sign_vector(dim: int, seed: int) -> mx.array:
     rng = np.random.default_rng(seed + dim * 7919)
     signs = rng.choice([-1.0, 1.0], size=dim).astype(np.float32)
     return mx.array(signs)
-
 
 
 def _rht_forward(x: mx.array, signs: mx.array) -> mx.array:
@@ -4276,11 +4307,7 @@ class _TurboQuantMSECodec:
                 )
 
         # Fused Metal kernel with rotation inside (dense rotation path)
-        if (
-            vectors.shape[-2] == 1
-            and self.bits > 0
-            and not self.use_rht
-        ):
+        if vectors.shape[-2] == 1 and self.bits > 0 and not self.use_rht:
             kernel = _fused_mse_quantize_kernel(self.bits, use_rht=False)
             if kernel is not None:
                 D = self.dim
@@ -4666,11 +4693,7 @@ class _TurboQuantProdCodec:
         mse_bits = self.mse_codec.bits
         use_rht = self.mse_codec.use_rht
         # Fused Metal kernel for single-token decode
-        if (
-            vectors.shape[-2] == 1
-            and mse_bits > 0
-            and 32 % mse_bits == 0
-        ):
+        if vectors.shape[-2] == 1 and mse_bits > 0 and 32 % mse_bits == 0:
             kernel = _fused_prod_quantize_kernel(mse_bits, use_rht=use_rht)
             if kernel is not None:
                 D = self.dim
@@ -5070,9 +5093,12 @@ class TurboQuantKVCache(_BaseCache):
 
         k_norms, k_packed, v_norms, v_packed = kernel(
             inputs=[
-                k_flat, v_flat,
-                self.key_codec.rotation, self.value_codec.rotation,
-                self.key_codec._midpoints, self.value_codec._midpoints,
+                k_flat,
+                v_flat,
+                self.key_codec.rotation,
+                self.value_codec.rotation,
+                self.key_codec._midpoints,
+                self.value_codec._midpoints,
             ],
             template=[
                 ("Dim", D),
@@ -5082,8 +5108,10 @@ class TurboQuantKVCache(_BaseCache):
             grid=(D * BH, 2, 1),
             threadgroup=(D, 1, 1),
             output_shapes=[
-                (BH,), (BH, k_pw),
-                (BH,), (BH, v_pw),
+                (BH,),
+                (BH, k_pw),
+                (BH,),
+                (BH, v_pw),
             ],
             output_dtypes=[mx.float16, mx.uint32, mx.float16, mx.uint32],
         )
@@ -5424,8 +5452,11 @@ class TurboQuantKVCache(_BaseCache):
             _metal_available()
             and (key_is_prod or key_is_mse)
             and isinstance(self.value_codec, _TurboQuantMSECodec)
-            and (isinstance(keys_state, TurboQuantProdState) if key_is_prod
-                 else isinstance(keys_state, TurboQuantMSEState))
+            and (
+                isinstance(keys_state, TurboQuantProdState)
+                if key_is_prod
+                else isinstance(keys_state, TurboQuantMSEState)
+            )
             and isinstance(values_state, TurboQuantMSEState)
         ):
             return None
@@ -5657,7 +5688,11 @@ class TurboQuantKVCache(_BaseCache):
             ff_kernel = _fully_fused_decode_kernel(
                 # Dense rotation for decode kernel — butterfly WHT barriers
                 # outweigh the D² compute savings at small threadgroup counts.
-                bits, R, dims_per_lane, key_mse_bits, use_rht=False,
+                bits,
+                R,
+                dims_per_lane,
+                key_mse_bits,
+                use_rht=False,
             )
             if ff_kernel is not None:
                 q_rot, q_proj = self.key_codec.prepare_queries(grouped_queries)
@@ -5900,13 +5935,16 @@ class TurboQuantKVCache(_BaseCache):
                         out = fused_kernel(
                             inputs=[
                                 q_rot_flat,
-                                keys_state.norms, keys_state.indices,
+                                keys_state.norms,
+                                keys_state.indices,
                                 self.key_codec.codebook,
-                                values_state.norms, values_state.indices,
+                                values_state.norms,
+                                values_state.indices,
                                 self.value_codec.codebook,
                             ],
                             template=[
-                                ("Dim", D), ("RepeatCount", n_repeats),
+                                ("Dim", D),
+                                ("RepeatCount", n_repeats),
                                 ("KPackedWidth", keys_state.indices.shape[-1]),
                                 ("VPackedWidth", values_state.indices.shape[-1]),
                             ],
@@ -5917,9 +5955,7 @@ class TurboQuantKVCache(_BaseCache):
                         )[0]
                         out_rotated = out.reshape(B, n_kv_heads, n_repeats, D)
                         output = self.value_codec._rotate_inverse(out_rotated)
-                        return output.reshape(
-                            B, n_q_heads, L, value_dim
-                        ).astype(dtype)
+                        return output.reshape(B, n_q_heads, L, value_dim).astype(dtype)
 
                 # 2-pass: split KV across blocks for GPU saturation
                 pass1 = _fused_mse_decode_2pass_1_kernel(key_bits, val_bits)
@@ -5939,13 +5975,16 @@ class TurboQuantKVCache(_BaseCache):
                     out_acc, out_sums, out_maxs = pass1(
                         inputs=[
                             q_rot_flat,
-                            keys_state.norms, keys_state.indices,
+                            keys_state.norms,
+                            keys_state.indices,
                             self.key_codec.codebook,
-                            values_state.norms, values_state.indices,
+                            values_state.norms,
+                            values_state.indices,
                             self.value_codec.codebook,
                         ],
                         template=[
-                            ("Dim", D), ("RepeatCount", n_repeats),
+                            ("Dim", D),
+                            ("RepeatCount", n_repeats),
                             ("Blocks", num_blocks),
                             ("KPackedWidth", keys_state.indices.shape[-1]),
                             ("VPackedWidth", values_state.indices.shape[-1]),
@@ -5971,9 +6010,7 @@ class TurboQuantKVCache(_BaseCache):
 
                     out_rotated = out.reshape(B, n_kv_heads, n_repeats, D)
                     output = self.value_codec._rotate_inverse(out_rotated)
-                    return output.reshape(
-                        B, n_q_heads, L, value_dim
-                    ).astype(dtype)
+                    return output.reshape(B, n_q_heads, L, value_dim).astype(dtype)
 
             # Separate-kernel path fallback
             sep_output = self._separate_score_value_decode(
