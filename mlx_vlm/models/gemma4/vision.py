@@ -356,6 +356,11 @@ class VisionPooler(nn.Module):
     def __call__(
         self, hidden_states, patch_positions, padding_positions, output_length=None
     ):
+        # Zero out padding tokens before pooling (matches HF's masked_fill)
+        hidden_states = mx.where(
+            mx.expand_dims(padding_positions, -1), 0.0, hidden_states
+        )
+
         length = output_length or self.default_output_length
         if hidden_states.shape[1] == length:
             mask = padding_positions
