@@ -1,6 +1,5 @@
 import argparse
 import gc
-import importlib
 import json
 import os
 import re
@@ -17,7 +16,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
-from mlx_lm.tokenizer_utils import _infer_tool_parser
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
@@ -38,6 +36,7 @@ from .generate import (
     stream_generate,
 )
 from .prompt_utils import apply_chat_template
+from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load
 from .version import __version__
 
@@ -1098,9 +1097,7 @@ async def chat_completions_endpoint(request: ChatRequest):
         if hasattr(tokenizer, "chat_template"):
             tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
             if tool_parser_type is not None:
-                tool_module = importlib.import_module(
-                    f"mlx_lm.tool_parsers.{tool_parser_type}"
-                )
+                tool_module = load_tool_module(tool_parser_type)
         template_kwargs = request.template_kwargs()
         formatted_prompt = apply_chat_template(
             processor,

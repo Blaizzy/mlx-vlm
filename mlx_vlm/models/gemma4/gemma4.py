@@ -27,11 +27,11 @@ class MultimodalEmbedder(nn.Module):
         self.embedding_projection = nn.Linear(
             embedding_dim, text_hidden_size, bias=False
         )
-        self.embedding_post_projection_norm = RMSNormNoScale(text_hidden_size, eps=eps)
+        self.embedding_pre_projection_norm = RMSNormNoScale(embedding_dim, eps=eps)
 
     def __call__(self, inputs_embeds: mx.array) -> mx.array:
-        proj = self.embedding_projection(inputs_embeds)
-        return self.embedding_post_projection_norm(proj)
+        normed = self.embedding_pre_projection_norm(inputs_embeds)
+        return self.embedding_projection(normed)
 
 
 class Model(nn.Module):
@@ -82,6 +82,7 @@ class Model(nn.Module):
         if input_features_mask is not None and audio_mask is None:
             audio_mask = ~input_features_mask.astype(mx.bool_)
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+        inputs_embeds = inputs_embeds * self.language_model.model.embed_scale
 
         per_layer_inputs = None
         if self.language_model.model.hidden_size_per_layer_input:
@@ -219,6 +220,10 @@ class Model(nn.Module):
 
             sanitized[new_key] = v
         return sanitized
+
+    @property
+    def quant_predicate(self):
+        return self.language_model.quant_predicate
 
     @property
     def layers(self):
