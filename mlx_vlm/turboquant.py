@@ -4065,8 +4065,14 @@ class _TurboQuantMSECodec:
         return packed, self._rotate_inverse(estimated_rotated)
 
     def _quantize_unit(self, unit_vectors: mx.array) -> mx.array:
-        packed, _ = self._quantize_unit_with_estimate(unit_vectors)
-        return packed
+        """Quantize without computing the estimate (no wasted D×D rotation)."""
+        if self.bits == 0:
+            return mx.zeros((*unit_vectors.shape[:-1], 0), dtype=mx.uint32)
+        rotated = self._rotate_forward(unit_vectors)
+        indices = mx.zeros(rotated.shape, dtype=mx.uint32)
+        for m in range(self._midpoints.shape[0]):
+            indices = indices + (rotated > self._midpoints[m]).astype(mx.uint32)
+        return _pack_lowbit(indices, self.bits)
 
     def _dequantize_unit(self, packed_indices: mx.array) -> mx.array:
         if self.bits == 0:
