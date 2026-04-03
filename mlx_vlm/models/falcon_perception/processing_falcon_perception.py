@@ -379,6 +379,11 @@ def generate_perception(
         h_last = h_state[:, -1:, :] if h_state is not None else None
 
         if token_id == coord_token_id and h_last is not None:
+            # Commit previous detection before starting a new one
+            if "xy" in current_det and "hw" in current_det:
+                detections.append(current_det)
+                current_det = {}
+
             coord_logits = model.decode_coords(h_last.reshape(-1, h_last.shape[-1]))
             num_bins = coord_logits.shape[-1]
             pred_bins = mx.argmax(coord_logits, axis=-1)
