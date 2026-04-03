@@ -2483,7 +2483,6 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int):
     k_mask = (1 << key_bits) - 1
     v_mask = (1 << val_bits) - 1
 
-
     source = f"""
         constexpr int BN = 32;  // simdgroups per threadgroup
         constexpr int BD = 32;  // lanes per simdgroup
