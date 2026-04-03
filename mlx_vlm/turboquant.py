@@ -2662,7 +2662,6 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int):
             U score = {_gen_unrolled_score(key_bits, 8)};
             score = simd_sum(score) * kn;
 
-            // Value accumulation — unrolled byte extraction
             auto vb = (const device uint8_t*)(v_pk + t * VPackedWidth) + v_byte_base;
             U vn = static_cast<U>(v_nm[t]);
 
@@ -3651,49 +3650,33 @@ def _rht_sign_vector(dim: int, seed: int) -> mx.array:
     return mx.array(signs)
 
 
-def _fast_walsh_hadamard(x: mx.array) -> mx.array:
-    """Walsh-Hadamard transform along the last axis. Last dim must be power of 2."""
-    D = x.shape[-1]
-    h = 1
-    while h < D:
-        # Reshape to (..., D/(2h), 2, h), compute butterfly, reshape back
-        shape = x.shape[:-1] + (D // (2 * h), 2, h)
-        x = x.reshape(shape)
-        even = x[..., 0, :]
-        odd = x[..., 1, :]
-        x = mx.stack([even + odd, even - odd], axis=-2).reshape(
-            *x.shape[:-3], D
-        )
-        h *= 2
-    return x
-
 
 def _rht_forward(x: mx.array, signs: mx.array) -> mx.array:
-    """RHT forward: hadamard(signs * x) / sqrt(D_padded). O(D log D)."""
+    """RHT forward: hadamard(signs * x) / sqrt(D). Uses mx.hadamard_transform (1 dispatch)."""
     dim = signs.shape[0]
     D_padded = _rht_padded_dim(dim)
     y = x * signs
     if D_padded > dim:
         pad_width = [(0, 0)] * (y.ndim - 1) + [(0, D_padded - dim)]
         y = mx.pad(y, pad_width)
-    y = _fast_walsh_hadamard(y)
+    y = mx.hadamard_transform(y, scale=1.0 / math.sqrt(D_padded))
     if D_padded > dim:
         y = y[..., :dim]
-    return y * (1.0 / math.sqrt(D_padded))
+    return y
 
 
 def _rht_inverse(x: mx.array, signs: mx.array) -> mx.array:
-    """RHT inverse: signs * hadamard(x) / sqrt(D_padded). O(D log D)."""
+    """RHT inverse: signs * hadamard(x) / sqrt(D). Uses mx.hadamard_transform (1 dispatch)."""
     dim = signs.shape[0]
     D_padded = _rht_padded_dim(dim)
     y = x
     if D_padded > dim:
         pad_width = [(0, 0)] * (y.ndim - 1) + [(0, D_padded - dim)]
         y = mx.pad(y, pad_width)
-    y = _fast_walsh_hadamard(y)
+    y = mx.hadamard_transform(y, scale=1.0 / math.sqrt(D_padded))
     if D_padded > dim:
         y = y[..., :dim]
-    return y * (signs / math.sqrt(D_padded))
+    return y * signs
 
 
 @lru_cache(maxsize=None)
@@ -4149,7 +4132,9 @@ class _TurboQuantMSECodec:
         # RHT butterfly infrastructure available but disabled — barrier overhead
         # in Metal kernels (16 barriers for D=256) outweighs compute savings
         # over dense matmul at small threadgroup counts (TG=32).
-        self.use_rht = False
+        # Use mx.hadamard_transform (built-in optimized Metal kernel) for RHT
+        # when D is power of 2. Replaces D×D matmul with O(D log D) in 1 dispatch.
+        self.use_rht = dim > 0 and (dim & (dim - 1)) == 0
         if self.use_rht:
             self.signs = _rht_sign_vector(dim, seed)
         else:
