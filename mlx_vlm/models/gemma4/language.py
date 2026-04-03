@@ -597,6 +597,17 @@ class LanguageModel(nn.Module):
     def n_kv_heads(self):
         return self.config.num_key_value_heads
 
+    @property
+    def quant_predicate(self):
+        def predicate(path, m):
+            if not hasattr(m, "to_quantized"):
+                return False
+            if path.endswith("router.proj"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
+
     def make_cache(self):
         caches = []
         for layer_type in self.config.layer_types[
