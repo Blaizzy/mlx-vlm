@@ -1,12 +1,13 @@
 # Falcon-Perception
 
-Falcon-Perception is a 1B parameter early-fusion vision-language model from TII for object detection and segmentation. It generates bounding box coordinates, sizes, and segmentation masks for objects matching a text query, using a single Transformer that processes image patches and text tokens in a shared parameter space.
+Falcon-Perception is an early-fusion vision-language model family from TII for object detection and segmentation. It generates bounding box coordinates, sizes, and segmentation masks for objects matching a text query, using a single Transformer that processes image patches and text tokens in a shared parameter space.
 
-## Model
+## Models
 
-- **Model ID**: `tiiuae/Falcon-Perception`
-- **Parameters**: ~1B
-- **Tasks**: Object detection (bounding boxes), referring expression segmentation (masks)
+| Model ID | Parameters | Detection | Segmentation |
+|----------|-----------|-----------|-------------|
+| `tiiuae/Falcon-Perception` | ~0.6B | Yes | Yes |
+| `tiiuae/Falcon-Perception-300M` | ~0.3B | Yes | No |
 
 ### Links
 
@@ -19,40 +20,41 @@ Falcon-Perception is a 1B parameter early-fusion vision-language model from TII 
 pip install mlx-vlm
 ```
 
-## CLI
-
-```bash
-python -m mlx_vlm generate \
-    --model tiiuae/Falcon-Perception \
-    --image photo.jpg \
-    --prompt "cat" \
-    --max-tokens 200
-```
-
 ## Python
 
 ### Detection + Segmentation
 
 ```python
-from mlx_vlm import load, generate
+from mlx_vlm import load
 
 model, processor = load("tiiuae/Falcon-Perception")
 
-output = generate(
-    model,
+detections = model.generate_perception(
     processor,
-    "cat",
     image="photo.jpg",
-    max_tokens=200,
+    query="cat",
+    max_new_tokens=512,
 )
-
-# Detections are decoded on the fly during generate()
-detections = model.get_detections()
 
 for det in detections:
     xy, hw = det["xy"], det["hw"]
     has_mask = "mask" in det
     print(f"Center: ({xy['x']:.3f}, {xy['y']:.3f}), Size: ({hw['h']:.3f}, {hw['w']:.3f}), Mask: {has_mask}")
+```
+
+### Detection Only (300M)
+
+```python
+from mlx_vlm import load
+
+model, processor = load("tiiuae/Falcon-Perception-300M")
+
+detections = model.generate_perception(
+    processor,
+    image="photo.jpg",
+    query="cats",
+    max_new_tokens=512,
+)
 ```
 
 ### Plotting Detections
@@ -70,9 +72,4 @@ See [`examples/falcon_perception_demo.ipynb`](../../../examples/falcon_perceptio
 Each detection is a dict with:
 - `xy` -- center coordinates `{"x": float, "y": float}` normalized to `[0, 1]`
 - `hw` -- bounding box size `{"h": float, "w": float}` as fraction of image dimensions
-- `mask` -- `(H, W)` binary `mx.array` segmentation mask (present when `<|seg|>` token is decoded)
-
-### Notes
-
-- Segmentation masks are produced at patch resolution and upsampled via nearest-neighbor interpolation. The original PyTorch model uses AnyUp (a learned cross-attention upsampler with FlexAttention) for higher-resolution masks, which is not available in MLX.
-- The coord/size Fourier encoding feedback is handled automatically by the `LanguageModel` during standard `generate()`. Detection values are decoded from hidden states on the fly and accumulated in the model. Use `model.get_detections()` after generation to retrieve results.
+- `mask` -- `(H, W)` binary `mx.array` segmentation mask (only on the 0.6B model)
