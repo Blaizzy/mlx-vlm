@@ -2426,114 +2426,138 @@ def _fully_fused_decode_kernel(
 
 @lru_cache(maxsize=None)
 def _fused_mse_decode_kernel(key_bits: int, val_bits: int):
-    """Fully fused MSE-only decode: score + online softmax + value in 1 dispatch.
-    One repeat per threadgroup (grid = B*H*R). No QJL, much simpler than ProdCodec.
-    Processes ALL tokens — no tiling, no cross-tile merge."""
+    """Fused MSE decode matching MLX SDPA architecture.
+    32 simdgroups × 32 lanes = 1024 threads per TG.
+    Grid = (B*H_q, 1, 1). No tiling, no cross-tile merge.
+    Simdgroups cooperatively tile across KV tokens (stride 32).
+    Cross-simdgroup reduction via shared memory (1 barrier)."""
     if not _metal_available() or key_bits <= 0 or val_bits <= 0:
         return None
 
     k_mask = (1 << key_bits) - 1
     v_mask = (1 << val_bits) - 1
 
-    source = """
-        auto lane = thread_position_in_grid.x;
-        auto n = thread_position_in_grid.z;
+    import re
+    source = f"""
+        constexpr int BN = 32;  // simdgroups per threadgroup
+        constexpr int BD = 32;  // lanes per simdgroup
+        constexpr int qk_per_thread = Dim / BD;
+        constexpr int v_per_thread = Dim / BD;
+        constexpr uint k_mask = {k_mask}u;
+        constexpr uint v_mask = {v_mask}u;
+        constexpr int k_bits = {key_bits};
+        constexpr int v_bits = {val_bits};
+
+        typedef float U;
+
+        // Thread identity — grid is total threads, so use threadgroup position
+        auto bqh = threadgroup_position_in_grid.x;  // batch*q_head index
+        auto simd_gid = simdgroup_index_in_threadgroup;
+        auto simd_lid = thread_index_in_simdgroup;
+
         auto token_count = key_norms_shape[2];
         auto kv_heads = key_norms_shape[1];
-        auto q_heads = kv_heads * RepeatCount;
-        auto num_tok_tiles = (token_count + TokTileSize - 1) / TokTileSize;
-        auto bqh_tile = n;  // = b * q_heads * num_tiles + qh * num_tiles + tile
-        auto bqh = bqh_tile / num_tok_tiles;
-        auto tok_tile = bqh_tile % num_tok_tiles;
-        int t_start = tok_tile * TokTileSize;
-        int t_end = min(t_start + TokTileSize, (int)token_count);
-        // Map query head to KV head: bh = b * kv_heads + qh / R
-        auto b = bqh / q_heads;
-        auto qh = bqh % q_heads;
-        auto bh = b * kv_heads + qh / RepeatCount;
+        auto bh = bqh / RepeatCount;  // map q_head -> kv_head
 
         auto k_nm = key_norms + bh * token_count;
         auto k_pk = key_packed + bh * token_count * KPackedWidth;
         auto v_nm = val_norms + bh * token_count;
         auto v_pk = val_packed + bh * token_count * VPackedWidth;
-        auto qr = q_rot + bqh * Dim;
 
-        // Preload query into registers (constant across all tokens)
-        float q[DimsPerLane];
-        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32)
-            q[i] = (d < Dim) ? static_cast<float>(qr[d]) : 0.0f;
+        // Shared memory for cross-simdgroup reduction
+        threadgroup U max_scores[BN];
+        threadgroup U sum_exp_scores[BN];
+        threadgroup U outputs[BN * BD];
 
-        // Precompute bit offsets
-        int kw[DimsPerLane], ko[DimsPerLane]; bool ks[DimsPerLane];
-        int vw[DimsPerLane], vo[DimsPerLane]; bool vs[DimsPerLane];
-        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {
-            int kb = d * KBits; kw[i] = kb/32; ko[i] = kb%32; ks[i] = (kb%32+KBits)>32;
-            int vb = d * VBits; vw[i] = vb/32; vo[i] = vb%32; vs[i] = (vb%32+VBits)>32;
-        }
+        // Preload query into registers (scaled)
+        thread U q[qk_per_thread];
+        auto qr = q_rot + bqh * Dim + simd_lid * qk_per_thread;
+        for (int i = 0; i < qk_per_thread; i++)
+            q[i] = static_cast<U>(qr[i]);
 
-        float lmax = -INFINITY, lsum = 0.0f;
-        float lacc[DimsPerLane] = {};
+        // Initialize accumulators
+        thread U o[v_per_thread] = {{}};
+        U max_score = -INFINITY;
+        U sum_exp_score = 0;
 
-        for (int t = t_start; t < t_end; t++) {
+        // KV loop: each simdgroup handles tokens simd_gid, simd_gid+32, ...
+        for (int t = simd_gid; t < (int)token_count; t += BN) {{
             auto kt = k_pk + t * KPackedWidth;
-            float kn = static_cast<float>(k_nm[t]);
+            U kn = static_cast<U>(k_nm[t]);
 
-            // MSE score: dot(q_rot, codebook[key_idx]) * key_norm
-            float ps = 0.0f;
-            for (int i = 0; i < DimsPerLane; i++) {
-                uint kv = (kt[kw[i]] >> ko[i]);
-                if (ks[i]) kv |= kt[kw[i]+1] << (KBits - (ko[i]+KBits-32));
-                ps += q[i] * key_codebook[kv & KMASK];
-            }
-            float score = simd_sum(ps) * kn;
+            // Score: dot(q_rot, codebook[key_idx]) * key_norm
+            U score = 0;
+            for (int i = 0; i < qk_per_thread; i++) {{
+                int d = simd_lid * qk_per_thread + i;
+                int bo = d * k_bits;
+                uint kv = (kt[bo >> 5] >> (bo & 31));
+                if (((bo & 31) + k_bits) > 32)
+                    kv |= kt[(bo >> 5)+1] << (k_bits - ((bo & 31)+k_bits-32));
+                score += q[i] * key_codebook[kv & k_mask];
+            }}
+            score = simd_sum(score) * kn;
 
-            // Branched online softmax + value accumulation
+            // Online softmax + value accumulation
             auto vt = v_pk + t * VPackedWidth;
-            float vn = static_cast<float>(v_nm[t]);
+            U vn = static_cast<U>(v_nm[t]);
 
-            if (score > lmax) {
-                float rs = exp2((lmax - score) * 1.4426950408889634f);
-                lmax = score;
-                lsum = lsum * rs + 1.0f;
-                for (int i = 0; i < DimsPerLane; i++) {
-                    lacc[i] *= rs;
-                    uint vv = (vt[vw[i]] >> vo[i]);
-                    if (vs[i]) vv |= vt[vw[i]+1] << (VBits - (vo[i]+VBits-32));
-                    lacc[i] += val_codebook[vv & VMASK] * vn;
-                }
-            } else {
-                float w = exp2((score - lmax) * 1.4426950408889634f);
-                lsum += w;
-                for (int i = 0; i < DimsPerLane; i++) {
-                    uint vv = (vt[vw[i]] >> vo[i]);
-                    if (vs[i]) vv |= vt[vw[i]+1] << (VBits - (vo[i]+VBits-32));
-                    lacc[i] += w * val_codebook[vv & VMASK] * vn;
-                }
-            }
-        }
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
 
-        // Write unnormalized output + softmax stats for cross-tile merge
-        auto tile_idx = bqh * num_tok_tiles + tok_tile;
-        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32)
-            if (d < Dim) out_acc[tile_idx * Dim + d] = lacc[i];
-        if (lane == 0) {
-            out_sum[tile_idx] = lsum;
-            out_max[tile_idx] = lmax;
-        }
+            for (int i = 0; i < v_per_thread; i++) {{
+                int d = simd_lid * v_per_thread + i;
+                int bo = d * v_bits;
+                uint vv = (vt[bo >> 5] >> (bo & 31));
+                if (((bo & 31) + v_bits) > 32)
+                    vv |= vt[(bo >> 5)+1] << (v_bits - ((bo & 31)+v_bits-32));
+                o[i] = o[i] * factor + exp_score * val_codebook[vv & v_mask] * vn;
+            }}
+        }}
+
+        // Cross-simdgroup reduction (matches MLX SDPA pattern)
+        // 1. Communicate max and sum_exp across simdgroups
+        if (simd_lid == 0) {{
+            max_scores[simd_gid] = max_score;
+            sum_exp_scores[simd_gid] = sum_exp_score;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2. Reduce max and sum across all simdgroups
+        U sg_max = max_scores[simd_lid];
+        U new_max = simd_max(sg_max);
+        U factor = fast::exp(sg_max - new_max);
+        U total_sum = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+        // 3. Rescale this simdgroup's factor for the global max
+        U my_factor = fast::exp(max_score - new_max);
+
+        // 4. Transpose-reduce outputs through shared memory
+        for (int i = 0; i < v_per_thread; i++) {{
+            outputs[simd_lid * BD + simd_gid] = o[i] * my_factor;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+            o[i] = total_sum > 0 ? o[i] / total_sum : 0;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        // Write output (simd_gid partitions output dims, lane 0 writes)
+        if (simd_lid == 0) {{
+            for (int i = 0; i < v_per_thread; i++) {{
+                out[bqh * Dim + simd_gid * v_per_thread + i] = static_cast<U>(o[i]);
+            }}
+        }}
     """
 
-    source = source.replace("KMASK", f"{k_mask}u")
-    source = source.replace("VMASK", f"{v_mask}u")
-    source = source.replace("KBits", str(key_bits))
-    source = source.replace("VBits", str(val_bits))
-
     return mx.fast.metal_kernel(
-        name=f"turboquant_fused_mse_decode_k{key_bits}_v{val_bits}",
+        name=f"turboquant_fused_mse_sdpa_k{key_bits}_v{val_bits}",
         input_names=[
             "q_rot", "key_norms", "key_packed", "key_codebook",
             "val_norms", "val_packed", "val_codebook",
         ],
-        output_names=["out_acc", "out_sum", "out_max"],
+        output_names=["out"],
         source=source,
     )
 
@@ -4597,8 +4621,6 @@ class TurboQuantKVCache(_BaseCache):
         self.value_codec = None
         self._cached_state = None
         self._cached_state_offset = -1
-        # FP16 shadow cache in rotated space for SDPA-based decode.
-        # Built incrementally (1 token per decode step) — O(1) per step.
         self._shadow_keys = None
         self._shadow_values = None
 
@@ -4660,45 +4682,13 @@ class TurboQuantKVCache(_BaseCache):
         D = keys.shape[-1]
         n_new = keys.shape[2]
 
-        # Build FP16 shadow cache incrementally (rotated space, no D×D matmul).
-        # Pre-allocated buffer with slice write — no concatenation overhead.
-        if isinstance(self.key_codec, _TurboQuantMSECodec) and isinstance(
-            self.value_codec, _TurboQuantMSECodec
-        ):
-            k_shadow = _fast_mse_dequant_rotated(
-                new_keys, self.key_codec.bits, self.key_codec.codebook, D,
-                keys.dtype,
-            )
-            v_shadow = _fast_mse_dequant_rotated(
-                new_values, self.value_codec.bits, self.value_codec.codebook, D,
-                values.dtype,
-            )
-            if self._shadow_keys is None:
-                # Pre-allocate with capacity
-                cap = max(new_end, self.cache_step)
-                self._shadow_keys = mx.zeros((B, n_heads, cap, D), dtype=keys.dtype)
-                self._shadow_values = mx.zeros((B, n_heads, cap, D), dtype=values.dtype)
-            elif self._shadow_keys.shape[2] < new_end:
-                # Grow capacity
-                new_cap = max(new_end, self._shadow_keys.shape[2] + self.cache_step)
-                new_sk = mx.zeros((B, n_heads, new_cap, D), dtype=keys.dtype)
-                new_sv = mx.zeros((B, n_heads, new_cap, D), dtype=values.dtype)
-                new_sk[..., :self.offset, :] = self._shadow_keys[..., :self.offset, :]
-                new_sv[..., :self.offset, :] = self._shadow_values[..., :self.offset, :]
-                self._shadow_keys = new_sk
-                self._shadow_values = new_sv
-            self._shadow_keys[..., self.offset:new_end, :] = k_shadow
-            self._shadow_values[..., self.offset:new_end, :] = v_shadow
-
         self.offset = new_end
         self._cached_state = None
         self._cached_state_offset = -1
-        # Only eval during prefill (multiple tokens) to prevent graph buildup.
-        if n_new > 1:
-            eval_list = [self.keys, self.values]
-            if self._shadow_keys is not None:
-                eval_list += [self._shadow_keys, self._shadow_values]
-            mx.eval(*eval_list)
+        # Eval during prefill (many tokens) and periodically during decode
+        # to prevent graph buildup. Avoid per-token eval — it creates sync points.
+        if n_new > 1 or (self.offset % 50 == 0):
+            mx.eval(self.keys, self.values)
         # Return proxied states so model code can access .shape[-2] for mask slicing
         ks, vs = self.state
         return (
@@ -5449,28 +5439,51 @@ class TurboQuantKVCache(_BaseCache):
         if total_tokens <= self.decode_key_chunk_size and (
             mask is None or (isinstance(mask, str) and mask == "causal")
         ):
-            # Shadow cache SDPA: use incrementally-built FP16 K/V in rotated
-            # space with the built-in fused SDPA. Matches baseline speed
-            # because SDPA is identical — only the cache storage differs.
-            if self._shadow_keys is not None and (
+            # Fused quantized SDPA: 32 simdgroups × 32 lanes = 1024 threads/TG.
+            # Matches MLX SDPA architecture. Grid = B*H_q. No tiling/merge.
+            if (
                 isinstance(self.key_codec, _TurboQuantMSECodec)
                 and isinstance(self.value_codec, _TurboQuantMSECodec)
+                and isinstance(keys_state, TurboQuantMSEState)
+                and isinstance(values_state, TurboQuantMSEState)
             ):
-                dtype = queries.dtype
-                q_rot = (queries * scale).reshape(B, n_kv_heads, n_repeats, L, D)
-                q_rot = self.key_codec._rotate_forward(q_rot)
-                q_rot = q_rot.reshape(B, n_q_heads, L, D).astype(dtype)
+                key_bits = int(self.key_codec.bits)
+                val_bits = int(self.value_codec.bits)
+                dims_per_lane = (D + 31) // 32
+                fused_kernel = _fused_mse_decode_kernel(key_bits, val_bits)
+                if fused_kernel is not None:
+                    dtype = queries.dtype
+                    q_rot = self.key_codec.prepare_queries(grouped_queries)
+                    q_rot_flat = q_rot.reshape(B * n_kv_heads * n_repeats, D)
+                    BQH = B * n_q_heads
 
-                output_rot = mx.fast.scaled_dot_product_attention(
-                    q_rot,
-                    self._shadow_keys[..., :total_tokens, :].astype(dtype),
-                    self._shadow_values[..., :total_tokens, :].astype(dtype),
-                    scale=1.0,
-                    mask=mask,
-                )
-                out = output_rot.reshape(B, n_kv_heads, n_repeats, L, D)
-                out = self.value_codec._rotate_inverse(out)
-                return out.reshape(B, n_q_heads, L, value_dim).astype(dtype)
+                    out = fused_kernel(
+                        inputs=[
+                            q_rot_flat,
+                            keys_state.norms,
+                            keys_state.indices,
+                            self.key_codec.codebook,
+                            values_state.norms,
+                            values_state.indices,
+                            self.value_codec.codebook,
+                        ],
+                        template=[
+                            ("Dim", D),
+                            ("RepeatCount", n_repeats),
+                            ("KPackedWidth", keys_state.indices.shape[-1]),
+                            ("VPackedWidth", values_state.indices.shape[-1]),
+                        ],
+                        grid=(BQH * 1024, 1, 1),
+                        threadgroup=(1024, 1, 1),
+                        output_shapes=[(BQH, D)],
+                        output_dtypes=[mx.float32],
+                    )[0]
+
+                    out_rotated = out.reshape(B, n_kv_heads, n_repeats, D)
+                    output = self.value_codec._rotate_inverse(out_rotated)
+                    return output.reshape(
+                        B, n_q_heads, L, value_dim
+                    ).astype(dtype)
 
             # Separate-kernel path fallback
             sep_output = self._separate_score_value_decode(
