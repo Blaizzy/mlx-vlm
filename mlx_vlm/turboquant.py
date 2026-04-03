@@ -1304,16 +1304,6 @@ def _metal_mse_score(
         )[0]
         return mx.expand_dims(scores, axis=3)
 
-    # Fallback: non-tiled repeat kernel
-    if R > 1:
-        repeat_kernel = (
-            _mse_score_repeat_kernel(R)
-            if hasattr(_mse_score_tiled_kernel, "__wrapped__")
-            else None
-        )
-    else:
-        repeat_kernel = None
-
     kernel = _mse_score_kernel()
     if kernel is None:
         return None
