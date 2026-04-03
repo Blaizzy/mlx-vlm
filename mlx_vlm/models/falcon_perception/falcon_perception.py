@@ -622,9 +622,7 @@ class Model(nn.Module):
                     detections.append(current_det)
                     current_det = {}
 
-                coord_logits = self.decode_coords(
-                    h_last.reshape(-1, h_last.shape[-1])
-                )
+                coord_logits = self.decode_coords(h_last.reshape(-1, h_last.shape[-1]))
                 num_bins = coord_logits.shape[-1]
                 pred_bins = mx.argmax(coord_logits, axis=-1)
                 pred_x = pred_bins[0, 0].item() / (num_bins - 1)
@@ -633,9 +631,7 @@ class Model(nn.Module):
                 current_det["xy"] = {"x": pred_x, "y": pred_y}
 
             elif token_id == size_token_id and h_last is not None:
-                size_logits = self.decode_sizes(
-                    h_last.reshape(-1, h_last.shape[-1])
-                )
+                size_logits = self.decode_sizes(h_last.reshape(-1, h_last.shape[-1]))
                 hw_pred = self.process_sizes(size_logits)
                 pred_h = hw_pred[0, 0].item()
                 pred_w = hw_pred[0, 1].item()
