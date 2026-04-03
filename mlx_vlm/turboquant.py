@@ -2931,15 +2931,27 @@ def _fused_mse_quantize_kernel(bits: int, use_rht: bool = False):
         "        }",
         "        threadgroup_barrier(mem_flags::mem_threadgroup);",
         "",
-        "        // Step 5: Pack indices into uint32 words",
-        "        for (int w = lane; w < PackedWidth; w += 32) {",
-        "            uint word = 0;",
-        f"            for (int b = 0; b < 32; b += {bits}) {{",
-        f"                int dim = (w * 32 + b) / {bits};",
-        f"                if (dim < Dim) word |= (shared_idx[dim] & {mask}u) << b;",
+        "        // Step 5: Pack indices — per-dim write handles word-spanning",
+        "        threadgroup uint packed_shared[PackedWidth];",
+        "        for (int w = lane; w < PackedWidth; w += 32)",
+        "            packed_shared[w] = 0;",
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+        "",
+        "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {",
+        f"            if (d < Dim) {{",
+        f"                uint idx = shared_idx[d] & {mask}u;",
+        f"                int bo = d * {bits};",
+        f"                int w = bo >> 5;",
+        f"                int shift = bo & 31;",
+        f"                packed_shared[w] |= idx << shift;",
+        f"                if (shift + {bits} > 32)",
+        f"                    packed_shared[w + 1] |= idx >> (32 - shift);",
         f"            }}",
-        "            out_packed[bh * PackedWidth + w] = word;",
         "        }",
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+        "",
+        "        for (int w = lane; w < PackedWidth; w += 32)",
+        "            out_packed[bh * PackedWidth + w] = packed_shared[w];",
     ]
 
     input_names = ["vectors", "sign_vec" if use_rht else "rotation", "midpoints"]
@@ -4113,11 +4125,10 @@ class _TurboQuantMSECodec:
         return self._rotate_inverse(rotated)
 
     def quantize(self, vectors: mx.array) -> TurboQuantMSEState:
-        # Fused Metal kernel for single-token decode
+        # Fused Metal kernel for single-token decode (all bit widths)
         if (
             vectors.shape[-2] == 1
             and self.bits > 0
-            and 32 % self.bits == 0
         ):
             kernel = _fused_mse_quantize_kernel(self.bits, use_rht=self.use_rht)
             if kernel is not None:
