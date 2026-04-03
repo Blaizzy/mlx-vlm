@@ -2424,6 +2424,55 @@ def _fully_fused_decode_kernel(
     )
 
 
+def _gen_unrolled_extract(bits: int, n_elems: int, codebook_name: str) -> list:
+    """Generate MLX-style fully-unrolled byte extraction for n_elems packed at `bits` bits.
+    Returns list of Metal expressions for each extracted codebook value."""
+    exprs = []
+    for i in range(n_elems):
+        bit_offset = i * bits
+        byte_idx = bit_offset // 8
+        bit_in_byte = bit_offset % 8
+        mask = (1 << bits) - 1
+
+        if bit_in_byte + bits <= 8:
+            # Fits within one byte
+            if bit_in_byte == 0:
+                expr = f"{codebook_name}[kb[{byte_idx}] & {mask}u]"
+            else:
+                expr = f"{codebook_name}[(kb[{byte_idx}] >> {bit_in_byte}) & {mask}u]"
+        else:
+            # Crosses byte boundary
+            low_bits = 8 - bit_in_byte
+            low_mask = (1 << low_bits) - 1
+            high_bits = bits - low_bits
+            high_mask = (1 << high_bits) - 1
+            expr = (
+                f"{codebook_name}[((kb[{byte_idx}] >> {bit_in_byte}) & {low_mask}u)"
+                f" | ((kb[{byte_idx + 1}] & {high_mask}u) << {low_bits})]"
+            )
+        exprs.append(expr)
+    return exprs
+
+
+def _gen_unrolled_score(bits: int, n_elems: int) -> str:
+    """Generate score accumulation with unrolled key extraction."""
+    exprs = _gen_unrolled_extract(bits, n_elems, "key_codebook")
+    terms = [f"q[{i}] * {expr}" for i, expr in enumerate(exprs)]
+    return "\n                + ".join(terms)
+
+
+def _gen_unrolled_value(bits: int, n_elems: int) -> str:
+    """Generate value accumulation with unrolled extraction."""
+    # Use 'vb' as the byte pointer (set by caller)
+    exprs = _gen_unrolled_extract(bits, n_elems, "val_codebook")
+    # Replace 'kb' with 'vb' in expressions
+    exprs = [e.replace("kb[", "vb[") for e in exprs]
+    lines = []
+    for i, expr in enumerate(exprs):
+        lines.append(f"            o[{i}] = o[{i}] * factor + exp_score * {expr} * vn;")
+    return "\n".join(lines)
+
+
 @lru_cache(maxsize=None)
 def _fused_mse_decode_kernel(key_bits: int, val_bits: int):
     """Fused MSE decode matching MLX SDPA architecture.
@@ -2480,25 +2529,21 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int):
         U max_score = -INFINITY;
         U sum_exp_score = 0;
 
+        // Byte base offset for this lane (constant across all tokens)
+        int k_byte_base = (simd_lid * qk_per_thread * k_bits) >> 3;
+        int v_byte_base = (simd_lid * v_per_thread * v_bits) >> 3;
+
         // KV loop: each simdgroup handles tokens simd_gid, simd_gid+32, ...
         for (int t = simd_gid; t < (int)token_count; t += BN) {{
-            auto kt = k_pk + t * KPackedWidth;
             U kn = static_cast<U>(k_nm[t]);
 
-            // Score: dot(q_rot, codebook[key_idx]) * key_norm
-            U score = 0;
-            for (int i = 0; i < qk_per_thread; i++) {{
-                int d = simd_lid * qk_per_thread + i;
-                int bo = d * k_bits;
-                uint kv = (kt[bo >> 5] >> (bo & 31));
-                if (((bo & 31) + k_bits) > 32)
-                    kv |= kt[(bo >> 5)+1] << (k_bits - ((bo & 31)+k_bits-32));
-                score += q[i] * key_codebook[kv & k_mask];
-            }}
+            // Key score — MLX-style unrolled byte extraction
+            auto kb = (const device uint8_t*)(k_pk + t * KPackedWidth) + k_byte_base;
+            U score = {_gen_unrolled_score(key_bits, 8)};
             score = simd_sum(score) * kn;
 
-            // Online softmax + value accumulation
-            auto vt = v_pk + t * VPackedWidth;
+            // Online softmax
+            auto vb = (const device uint8_t*)(v_pk + t * VPackedWidth) + v_byte_base;
             U vn = static_cast<U>(v_nm[t]);
 
             U new_max = max(max_score, score);
@@ -2507,14 +2552,8 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int):
             max_score = new_max;
             sum_exp_score = sum_exp_score * factor + exp_score;
 
-            for (int i = 0; i < v_per_thread; i++) {{
-                int d = simd_lid * v_per_thread + i;
-                int bo = d * v_bits;
-                uint vv = (vt[bo >> 5] >> (bo & 31));
-                if (((bo & 31) + v_bits) > 32)
-                    vv |= vt[(bo >> 5)+1] << (v_bits - ((bo & 31)+v_bits-32));
-                o[i] = o[i] * factor + exp_score * val_codebook[vv & v_mask] * vn;
-            }}
+            // Value accumulation — MLX-style unrolled byte extraction
+            {_gen_unrolled_value(val_bits, 8)}
         }}
 
         // Cross-simdgroup reduction (matches MLX SDPA pattern)
@@ -2610,23 +2649,21 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int):
         U max_score = -INFINITY;
         U sum_exp_score = 0;
 
+        // Byte base offset for this lane (constant across all tokens)
+        int k_byte_base = (simd_lid * qk_per_thread * k_bits) >> 3;
+        int v_byte_base = (simd_lid * v_per_thread * v_bits) >> 3;
+
         // KV loop: stride by blocks (each block handles a different subset)
         for (int t = block_idx; t < (int)token_count; t += Blocks) {{
-            auto kt = k_pk + t * KPackedWidth;
             U kn = static_cast<U>(k_nm[t]);
 
-            U score = 0;
-            for (int i = 0; i < qk_per_thread; i++) {{
-                int d = simd_lid * qk_per_thread + i;
-                int bo = d * k_bits;
-                uint kv = (kt[bo >> 5] >> (bo & 31));
-                if (((bo & 31) + k_bits) > 32)
-                    kv |= kt[(bo >> 5)+1] << (k_bits - ((bo & 31)+k_bits-32));
-                score += q[i] * key_codebook[kv & k_mask];
-            }}
+            // Key score — unrolled byte extraction
+            auto kb = (const device uint8_t*)(k_pk + t * KPackedWidth) + k_byte_base;
+            U score = {_gen_unrolled_score(key_bits, 8)};
             score = simd_sum(score) * kn;
 
-            auto vt = v_pk + t * VPackedWidth;
+            // Value accumulation — unrolled byte extraction
+            auto vb = (const device uint8_t*)(v_pk + t * VPackedWidth) + v_byte_base;
             U vn = static_cast<U>(v_nm[t]);
 
             U new_max = max(max_score, score);
@@ -2635,14 +2672,7 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int):
             max_score = new_max;
             sum_exp_score = sum_exp_score * factor + exp_score;
 
-            for (int i = 0; i < v_per_thread; i++) {{
-                int d = simd_lid * v_per_thread + i;
-                int bo = d * v_bits;
-                uint vv = (vt[bo >> 5] >> (bo & 31));
-                if (((bo & 31) + v_bits) > 32)
-                    vv |= vt[(bo >> 5)+1] << (v_bits - ((bo & 31)+v_bits-32));
-                o[i] = o[i] * factor + exp_score * val_codebook[vv & v_mask] * vn;
-            }}
+            {_gen_unrolled_value(val_bits, 8)}
         }}
 
         // Write partial results for this block
