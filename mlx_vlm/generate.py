@@ -95,6 +95,8 @@ def resolve_generation_config(
         resolved["max_kv_size"] = None
 
     return resolved
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Generate text from an image using a model."
