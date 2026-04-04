@@ -6,7 +6,6 @@ expensive re-computation when the same image is discussed across turns.
 """
 
 import hashlib
-import time
 from collections import OrderedDict
 from typing import Any, Optional
 
@@ -20,16 +19,18 @@ class VisionFeatureCache:
     hashes (for PIL images). Cached values are mx.array features after
     vision_tower + embed_vision, ready for masked_scatter.
 
+    Cleanup is handled by three mechanisms:
+    - **LRU eviction**: oldest entry is dropped when max_size is exceeded.
+    - **Model unload**: server calls clear() when the model is swapped.
+    - **Process exit**: in-memory cache is freed automatically.
+
     Args:
         max_size: Maximum number of cached image features. Default 8.
-        ttl: Time-to-live in seconds. Entries older than this are treated as
-            expired and evicted on access. None means no expiry (default).
     """
 
-    def __init__(self, max_size: int = 8, ttl: Optional[float] = None):
+    def __init__(self, max_size: int = 8):
         self.max_size = max_size
-        self.ttl = ttl
-        self._cache: OrderedDict[str, tuple] = OrderedDict()
+        self._cache: OrderedDict[str, mx.array] = OrderedDict()
 
     def _make_key(self, image_source: Any) -> str:
         """Derive a cache key from an image source.
@@ -49,19 +50,12 @@ class VisionFeatureCache:
             return f"obj:{id(image_source)}"
 
     def get(self, image_source: Any) -> Optional[mx.array]:
-        """Look up cached features. Returns None on miss or expiry."""
+        """Look up cached features. Returns None on miss."""
         key = self._make_key(image_source)
-        if key not in self._cache:
-            return None
-
-        features, ts = self._cache[key]
-
-        if self.ttl is not None and (time.monotonic() - ts) > self.ttl:
-            del self._cache[key]
-            return None
-
-        self._cache.move_to_end(key)
-        return features
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        return None
 
     def put(self, image_source: Any, features: mx.array) -> None:
         """Store features in the cache, evicting LRU if full."""
@@ -71,7 +65,7 @@ class VisionFeatureCache:
         else:
             if len(self._cache) >= self.max_size:
                 self._cache.popitem(last=False)
-        self._cache[key] = (features, time.monotonic())
+        self._cache[key] = features
 
     def clear(self) -> None:
         """Clear all cached features."""

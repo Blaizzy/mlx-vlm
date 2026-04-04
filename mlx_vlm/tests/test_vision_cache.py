@@ -77,50 +77,15 @@ class TestVisionFeatureCache:
         cache = VisionFeatureCache()
         assert cache.max_size == 8
 
-    def test_default_ttl_is_none(self):
+    def test_clear_releases_all(self):
         cache = VisionFeatureCache()
-        assert cache.ttl is None
-
-    def test_ttl_expiry(self):
-        cache = VisionFeatureCache(ttl=0.1)
-        cache.put("a.jpg", mx.ones((1, 10, 64)))
-        assert cache.get("a.jpg") is not None
-
-        import time
-
-        time.sleep(0.15)
-        assert cache.get("a.jpg") is None, "Entry should expire after TTL"
+        for i in range(5):
+            cache.put(f"img{i}.jpg", mx.ones((1, 10, 64)) * i)
+        assert len(cache) == 5
+        cache.clear()
         assert len(cache) == 0
-
-    def test_ttl_refresh_on_put(self):
-        import time
-
-        cache = VisionFeatureCache(ttl=0.2)
-        cache.put("a.jpg", mx.ones((1, 10, 64)))
-        time.sleep(0.1)
-        # Re-put refreshes the timestamp
-        cache.put("a.jpg", mx.ones((1, 10, 64)) * 2)
-        time.sleep(0.15)
-        # Should still be alive (0.15s since re-put, TTL=0.2s)
-        result = cache.get("a.jpg")
-        assert result is not None
-
-    def test_ttl_none_means_no_expiry(self):
-        cache = VisionFeatureCache(ttl=None)
-        cache.put("a.jpg", mx.ones((1, 10, 64)))
-        # No sleep needed — with ttl=None, it should never expire
-        assert cache.get("a.jpg") is not None
-
-    def test_ttl_only_evicts_expired_entry(self):
-        import time
-
-        cache = VisionFeatureCache(ttl=0.1)
-        cache.put("a.jpg", mx.ones((1, 10, 64)))
-        time.sleep(0.15)
-        cache.put("b.jpg", mx.ones((1, 10, 64)))
-        # a expired, b still fresh
-        assert cache.get("a.jpg") is None
-        assert cache.get("b.jpg") is not None
+        for i in range(5):
+            assert cache.get(f"img{i}.jpg") is None
 
 
 class TestCachedImageFeaturesKwarg:

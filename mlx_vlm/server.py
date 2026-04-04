@@ -185,7 +185,7 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
         "model": model,
         "processor": processor,
         "config": config,
-        "vision_cache": VisionFeatureCache(ttl=300),
+        "vision_cache": VisionFeatureCache(),
     }
 
     return model, processor, config
@@ -200,7 +200,9 @@ def unload_model_sync():
     print(
         f"Unloading model: {model_cache.get('model_path')}, Adapter: {model_cache.get('adapter_path')}"
     )
-    # Clear references
+    # Clear vision cache before dropping references
+    if "vision_cache" in model_cache:
+        model_cache["vision_cache"].clear()
     model_cache = {}
     # Force garbage collection
     gc.collect()
