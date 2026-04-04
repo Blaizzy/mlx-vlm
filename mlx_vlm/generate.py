@@ -591,6 +591,7 @@ def stream_generate(
 
     resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
     image_token_index = getattr(model.config, "image_token_index", None)
+    vision_cache = kwargs.pop("vision_cache", None)
 
     if kwargs.get("input_ids", None) is not None:
         input_ids = kwargs.pop("input_ids")
@@ -616,6 +617,17 @@ def stream_generate(
             if k not in ["input_ids", "pixel_values", "attention_mask"]
         }
         kwargs.update(data_kwargs)
+
+    # Vision feature caching: reuse cached image features across turns
+    if vision_cache is not None and image is not None and pixel_values is not None:
+        cached = vision_cache.get(image)
+        if cached is not None:
+            kwargs["cached_image_features"] = cached
+        elif hasattr(model, "encode_image"):
+            features = model.encode_image(pixel_values)
+            mx.eval(features)
+            vision_cache.put(image, features)
+            kwargs["cached_image_features"] = features
 
     if thinking_budget is not None:
         thinking_start_token_id = tokenizer.encode(
@@ -1476,6 +1488,9 @@ def main():
             kwargs["thinking_start_token"] = args.thinking_start_token
 
     if args.chat:
+        from .vision_cache import VisionFeatureCache
+
+        vision_cache = VisionFeatureCache()
         chat = []
         if args.system:
             chat.append({"role": "system", "content": args.system})
@@ -1489,6 +1504,7 @@ def main():
             stream_kwargs = {
                 "max_tokens": args.max_tokens,
                 "temperature": args.temperature,
+                "vision_cache": vision_cache,
                 **kwargs,
             }
             if args.resize_shape is not None:

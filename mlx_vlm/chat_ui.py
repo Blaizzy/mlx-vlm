@@ -17,6 +17,7 @@ from mlx_vlm import load
 from .generate import stream_generate
 from .prompt_utils import get_chat_template, get_message_json
 from .utils import load_config, load_image_processor
+from .vision_cache import VisionFeatureCache
 
 
 def parse_arguments():
@@ -40,6 +41,7 @@ class ModelState:
         self.config = None
         self.image_processor = None
         self.current_model_name = None
+        self.vision_cache = VisionFeatureCache()
 
     def load(self, model_name):
         """Load a model, clearing previous one from memory."""
@@ -59,6 +61,7 @@ class ModelState:
         )
         self.image_processor = load_image_processor(model_name)
         self.current_model_name = model_name
+        self.vision_cache.clear()
 
 
 state = ModelState()
@@ -290,6 +293,7 @@ def chat(
     gen_kwargs = {
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "vision_cache": state.vision_cache,
     }
 
     if top_p < 1.0:

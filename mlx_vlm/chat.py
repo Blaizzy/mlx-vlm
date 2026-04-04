@@ -15,6 +15,7 @@ from mlx_vlm import load
 from mlx_vlm.generate import generate_step
 from mlx_vlm.prompt_utils import get_message_json
 from mlx_vlm.utils import load_image
+from mlx_vlm.vision_cache import VisionFeatureCache
 
 
 class MLXVisionChat:
@@ -31,6 +32,8 @@ class MLXVisionChat:
         self.max_tokens = max_tokens
         self.history: List[Dict] = []
         self.current_image = None
+        self.current_image_path = None
+        self.vision_cache = VisionFeatureCache()
 
         with self.console.status("[bold green]Loading model..."):
             self.model, self.processor = load(model_path)
@@ -60,6 +63,7 @@ class MLXVisionChat:
                 return False
 
             self.current_image = load_image(image_path)
+            self.current_image_path = image_path
             rprint(f"[bold blue]Loaded image:[/bold blue] {image_path}")
             return True
         except Exception as e:
@@ -105,6 +109,18 @@ class MLXVisionChat:
         input_ids = mx.array(inputs["input_ids"])
         mask = mx.array(inputs["attention_mask"])
 
+        # Use cached image features if available
+        extra_kwargs = {}
+        if self.current_image_path is not None:
+            cached = self.vision_cache.get(self.current_image_path)
+            if cached is not None:
+                extra_kwargs["cached_image_features"] = cached
+            elif hasattr(self.model, "encode_image"):
+                features = self.model.encode_image(pixel_values)
+                mx.eval(features)
+                self.vision_cache.put(self.current_image_path, features)
+                extra_kwargs["cached_image_features"] = features
+
         detokenizer = self.processor.detokenizer
         detokenizer.reset()
 
@@ -116,6 +132,7 @@ class MLXVisionChat:
             pixel_values,
             mask,
             temperature=self.temperature,
+            **extra_kwargs,
         )
 
         # Use print instead of rprint to avoid rich console's automatic newlines
