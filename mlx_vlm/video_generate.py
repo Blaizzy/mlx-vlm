@@ -465,6 +465,12 @@ def main():
     print(f"\033[32mLoading model:\033[0m {args.model}")
     model, processor = load(args.model)
 
+    # Ensure processor has chat_template (may only be on tokenizer)
+    if getattr(processor, "chat_template", None) is None and hasattr(
+        processor, "tokenizer"
+    ):
+        processor.chat_template = getattr(processor.tokenizer, "chat_template", None)
+
     # Validate the model
     if not is_video_model(model):
         logger.warning(
