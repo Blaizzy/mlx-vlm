@@ -25,10 +25,10 @@ class VisionFeatureCache:
     - **Process exit**: in-memory cache is freed automatically.
 
     Args:
-        max_size: Maximum number of cached image features. Default 8.
+        max_size: Maximum number of cached image features. Default 20.
     """
 
-    def __init__(self, max_size: int = 8):
+    def __init__(self, max_size: int = 20):
         self.max_size = max_size
         self._cache: OrderedDict[str, mx.array] = OrderedDict()
 

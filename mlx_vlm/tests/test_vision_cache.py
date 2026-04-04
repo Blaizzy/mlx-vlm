@@ -75,7 +75,7 @@ class TestVisionFeatureCache:
 
     def test_default_max_size(self):
         cache = VisionFeatureCache()
-        assert cache.max_size == 8
+        assert cache.max_size == 20
 
     def test_clear_releases_all(self):
         cache = VisionFeatureCache()
