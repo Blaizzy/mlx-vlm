@@ -120,8 +120,18 @@ def resolve_request_config(
     if max_tokens_field != "max_tokens" and max_tokens_field in request_data:
         request_data["max_tokens"] = request_data.pop(max_tokens_field)
 
-    model_path = request.model
+    request_model = getattr(request, "model", None)
+    model_path = request_model or os.environ.get("PRELOAD_MODEL")
+    if model_path is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing model. Provide a request model or start the server with --model.",
+        )
+
     adapter_path = getattr(request, "adapter_path", None)
+    if request_model is None and adapter_path is None:
+        adapter_path = os.environ.get("PRELOAD_ADAPTER") or None
+
     generation = {
         **load_server_generation_defaults(),
         **filter_generation_config(request_data),
@@ -371,7 +381,10 @@ class OpenAIRequest(GenerationParams, TemplateParams):
     input: Union[str, List[ChatMessage]] = Field(
         ..., description="Input text or list of chat messages."
     )
-    model: str = Field(..., description="The model to use for generation.")
+    model: Optional[str] = Field(
+        None,
+        description="Hugging Face repo or local MLX model path. If omitted, uses server default model if configured.",
+    )
     max_output_tokens: int = Field(
         DEFAULT_MAX_TOKENS,
         description="Maximum number of tokens to generate.",
@@ -539,9 +552,9 @@ StreamEvent = Union[
 
 
 class VLMRequest(GenerationParams, TemplateParams):
-    model: str = Field(
-        ...,
-        description="The path to the local model directory or Hugging Face repo.",
+    model: Optional[str] = Field(
+        None,
+        description="Hugging Face repo or local MLX model path. If omitted, uses server default model if configured.",
     )
     adapter_path: Optional[str] = Field(
         None, description="The path to the adapter weights."

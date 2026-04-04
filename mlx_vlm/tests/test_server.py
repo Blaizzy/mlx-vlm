@@ -78,16 +78,17 @@ def test_chat_request_schema_allows_one_or_two_resize_shape_values():
         ("/chat/completions", {"messages": [{"role": "user", "content": "Hello"}]}),
     ],
 )
-def test_generation_endpoints_require_model(client, path, payload):
+def test_generation_endpoints_require_model_when_no_server_default(client, path, payload):
     response = client.post(path, json=payload)
 
-    assert response.status_code == 422
+    assert response.status_code == 400
     assert "model" in response.text.lower()
 
 
 def test_responses_endpoint_uses_server_generation_defaults_in_metadata(
     client, monkeypatch
 ):
+    monkeypatch.setenv("PRELOAD_MODEL", "server-model")
     monkeypatch.setenv("MLX_VLM_SERVER_MAX_TOKENS", "64")
     monkeypatch.setenv("MLX_VLM_SERVER_TOP_P", "0.85")
     monkeypatch.setenv("MLX_VLM_SERVER_TOP_K", "20")
@@ -100,7 +101,7 @@ def test_responses_endpoint_uses_server_generation_defaults_in_metadata(
     with (
         patch.object(
             server, "get_cached_model", return_value=(model, processor, config)
-        ),
+        ) as mock_get_cached_model,
         patch.object(server, "apply_chat_template", return_value="prompt"),
         patch.object(
             server, "generate", return_value=make_response_result()
@@ -109,7 +110,6 @@ def test_responses_endpoint_uses_server_generation_defaults_in_metadata(
         response = client.post(
             "/responses",
             json={
-                "model": "server-model",
                 "input": "Hello",
                 "max_output_tokens": 12,
                 "temperature": 0.9,
@@ -117,6 +117,7 @@ def test_responses_endpoint_uses_server_generation_defaults_in_metadata(
         )
 
     assert response.status_code == 200
+    mock_get_cached_model.assert_called_once_with("server-model", None)
     assert mock_generate.call_args.kwargs["max_tokens"] == 12
     assert mock_generate.call_args.kwargs["temperature"] == pytest.approx(0.9)
     assert mock_generate.call_args.kwargs["top_p"] == pytest.approx(0.85)
