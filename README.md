@@ -462,9 +462,12 @@ The cache holds up to 8 entries (configurable) and uses LRU eviction.
 
 ### CLI
 
-Both chat modes use `VisionFeatureCache` automatically:
+All chat interfaces use `VisionFeatureCache` automatically:
 
 ```sh
+# Gradio chat UI
+python -m mlx_vlm.chat_ui --model google/gemma-4-26b-a4b-it
+
 # Interactive chat with Rich UI (load images with /image command)
 python -m mlx_vlm.chat --model google/gemma-4-26b-a4b-it
 
