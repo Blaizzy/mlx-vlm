@@ -15,7 +15,7 @@ import mlx.core as mx
 from mlx_vlm import load
 
 from .generate import stream_generate
-from .prompt_utils import get_chat_template, get_message_json
+from .prompt_utils import apply_chat_template, get_chat_template, get_message_json
 from .utils import load_config, load_image_processor
 from .vision_cache import VisionFeatureCache
 
@@ -219,6 +219,7 @@ def chat(
 
     image_file = extract_image_from_message(message)
     num_images = 1 if image_file else 0
+    image = [image_file] if image_file else None
 
     if state.config["model_type"] != "paligemma":
         chat_history = []
@@ -265,27 +266,15 @@ def chat(
             {"role": "user", "content": extract_text_from_message(message)}
         )
 
-        messages = []
-        for i, m in enumerate(chat_history):
-            skip_token = True
-            if i == len(chat_history) - 1 and m["role"] == "user" and image_file:
-                skip_token = False
-            messages.append(
-                get_message_json(
-                    state.config["model_type"],
-                    m["content"],
-                    role=m["role"],
-                    skip_image_token=skip_token,
-                    num_images=num_images if not skip_token else 0,
-                )
-            )
-
-        messages = get_chat_template(
-            state.processor, messages, add_generation_prompt=True
+        prompt = apply_chat_template(
+            state.processor,
+            state.config,
+            chat_history,
+            num_images=num_images,
         )
 
     else:
-        messages = extract_text_from_message(message)
+        prompt = extract_text_from_message(message)
 
     response = ""
     last_chunk = None
@@ -304,8 +293,8 @@ def chat(
     for chunk in stream_generate(
         state.model,
         state.processor,
-        messages,
-        image=image_file,
+        prompt,
+        image=image,
         **gen_kwargs,
     ):
         if stop_generation.is_set():
@@ -320,7 +309,7 @@ def chat(
     if last_chunk is not None:
         stats = (
             f"\n\n---\n"
-            f"<sub>📊 Prompt: {last_chunk.prompt_tokens} tokens @ {last_chunk.prompt_tps:.1f} t/s | "
+            f"<sub>Prompt: {last_chunk.prompt_tokens} tokens @ {last_chunk.prompt_tps:.1f} t/s | "
             f"Generation: {last_chunk.generation_tokens} tokens @ {last_chunk.generation_tps:.1f} t/s | "
             f"Peak memory: {last_chunk.peak_memory:.2f} GB</sub>"
         )
