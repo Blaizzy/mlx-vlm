@@ -255,9 +255,8 @@ def maybe_quantize_kv_cache(
         def quantize_entry(entry):
             if isinstance(entry, TurboQuantKVCache):
                 return entry
-            # Convert standard KV caches with (B, H, T, D) state format.
-            # Skip RotatingKVCache — its sliding window is already compact
-            # and TurboQuant's overhead outweighs savings for short windows.
+            if isinstance(entry, cache.RotatingKVCache):
+                return entry
             if isinstance(entry, cache.KVCache):
                 if entry.offset == 0:
                     # Empty: replace so update_and_fetch quantizes on the fly
@@ -269,12 +268,19 @@ def maybe_quantize_kv_cache(
                 entry.caches = [quantize_entry(sub_entry) for sub_entry in entry.caches]
                 return entry
             if isinstance(entry, list):
-                return [quantize_entry(sub_entry) for sub_entry in entry]
+                for i, sub_entry in enumerate(entry):
+                    entry[i] = quantize_entry(sub_entry)
+                return entry
             if isinstance(entry, tuple):
                 return tuple(quantize_entry(sub_entry) for sub_entry in entry)
             return entry
 
+        # Skip the last layer (before final norm/LM head) — it's highly
+        # sensitive to quantization in deep models (e.g. gemma-4-31b).
+        last_idx = len(prompt_cache) - 1 if len(prompt_cache) > 2 else -1
         for index, layer_cache in enumerate(prompt_cache):
+            if index == last_idx:
+                continue
             prompt_cache[index] = quantize_entry(layer_cache)
         return
 

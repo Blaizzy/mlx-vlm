@@ -263,7 +263,8 @@ def test_turboquant_decode_attention_4bit_uses_paper_prod_key_codec():
     turbo_cache = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
     turbo_keys, turbo_values = turbo_cache.state
 
-    assert type(turbo_cache.key_codec).__name__ == "_TurboQuantProdCodec"
+    # Keys now use MSE-only codec (QJL/Prod dropped for speed+quality)
+    assert type(turbo_cache.key_codec).__name__ == "_TurboQuantMSECodec"
     output = scaled_dot_product_attention(
         queries,
         turbo_keys,
