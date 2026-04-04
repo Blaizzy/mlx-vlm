@@ -2212,48 +2212,73 @@ def _fully_fused_decode_kernel(
     )
 
 
-def _gen_unrolled_extract(bits: int, n_elems: int, codebook_name: str) -> list:
-    """Generate MLX-style fully-unrolled byte extraction for n_elems packed at `bits` bits.
-    Returns list of Metal expressions for each extracted codebook value."""
-    exprs = []
-    for i in range(n_elems):
-        bit_offset = i * bits
-        byte_idx = bit_offset // 8
-        bit_in_byte = bit_offset % 8
-        mask = (1 << bits) - 1
+def _gen_unrolled_extract(
+    bits: int, n_elems: int, codebook_name: str, bit_off_var: str = ""
+) -> list:
+    """Generate fully-unrolled byte extraction for n_elems packed at `bits` bits.
 
-        if bit_in_byte + bits <= 8:
-            # Fits within one byte
-            if bit_in_byte == 0:
-                expr = f"{codebook_name}[kb[{byte_idx}] & {mask}u]"
+    When *bit_off_var* is empty the extraction assumes element 0 starts at bit 0
+    of the byte pointer (fast path — compile-time constant offsets, works when
+    ``n_elems * bits % 8 == 0``).
+
+    When *bit_off_var* names a Metal ``int`` variable (e.g. ``"k_bit_off"``),
+    each element's bit position is computed as ``bit_off_var + i * bits`` at
+    runtime, still fully unrolled (one expression per element, no loops).
+    """
+    mask = (1 << bits) - 1
+    exprs: list[str] = []
+
+    if not bit_off_var:
+        # --- Fast path: compile-time constant offsets ---
+        for i in range(n_elems):
+            bit_offset = i * bits
+            byte_idx = bit_offset // 8
+            bit_in_byte = bit_offset % 8
+
+            if bit_in_byte + bits <= 8:
+                if bit_in_byte == 0:
+                    expr = f"{codebook_name}[kb[{byte_idx}] & {mask}u]"
+                else:
+                    expr = f"{codebook_name}[(kb[{byte_idx}] >> {bit_in_byte}) & {mask}u]"
             else:
-                expr = f"{codebook_name}[(kb[{byte_idx}] >> {bit_in_byte}) & {mask}u]"
-        else:
-            # Crosses byte boundary
-            low_bits = 8 - bit_in_byte
-            low_mask = (1 << low_bits) - 1
-            high_bits = bits - low_bits
-            high_mask = (1 << high_bits) - 1
+                low_bits = 8 - bit_in_byte
+                high_mask = (1 << (bits - low_bits)) - 1
+                expr = (
+                    f"{codebook_name}[((kb[{byte_idx}] >> {bit_in_byte}) & {(1 << low_bits) - 1}u)"
+                    f" | ((kb[{byte_idx + 1}] & {high_mask}u) << {low_bits})]"
+                )
+            exprs.append(expr)
+    else:
+        # --- General path: runtime bit offset, still fully unrolled ---
+        for i in range(n_elems):
+            bo = f"({bit_off_var} + {i * bits})" if i else bit_off_var
+            by = f"({bo} >> 3)"
+            bi = f"({bo} & 7)"
             expr = (
-                f"{codebook_name}[((kb[{byte_idx}] >> {bit_in_byte}) & {low_mask}u)"
-                f" | ((kb[{byte_idx + 1}] & {high_mask}u) << {low_bits})]"
+                f"{codebook_name}["
+                f"(({bi} + {bits} <= 8)"
+                f" ? (kb[{by}] >> {bi})"
+                f" : ((kb[{by}] >> {bi}) | (kb[{by} + 1] << (8 - {bi}))))"
+                f" & {mask}u]"
             )
-        exprs.append(expr)
+            exprs.append(expr)
     return exprs
 
 
-def _gen_unrolled_score(bits: int, n_elems: int) -> str:
+def _gen_unrolled_score(
+    bits: int, n_elems: int, bit_off_var: str = ""
+) -> str:
     """Generate score accumulation with unrolled key extraction."""
-    exprs = _gen_unrolled_extract(bits, n_elems, "key_codebook")
+    exprs = _gen_unrolled_extract(bits, n_elems, "key_codebook", bit_off_var)
     terms = [f"q[{i}] * {expr}" for i, expr in enumerate(exprs)]
     return "\n                + ".join(terms)
 
 
-def _gen_unrolled_value(bits: int, n_elems: int) -> str:
+def _gen_unrolled_value(
+    bits: int, n_elems: int, bit_off_var: str = ""
+) -> str:
     """Generate value accumulation with unrolled extraction."""
-    # Use 'vb' as the byte pointer (set by caller)
-    exprs = _gen_unrolled_extract(bits, n_elems, "val_codebook")
-    # Replace 'kb' with 'vb' in expressions
+    exprs = _gen_unrolled_extract(bits, n_elems, "val_codebook", bit_off_var)
     exprs = [e.replace("kb[", "vb[") for e in exprs]
     lines = []
     for i, expr in enumerate(exprs):
@@ -2262,7 +2287,7 @@ def _gen_unrolled_value(bits: int, n_elems: int) -> str:
 
 
 @lru_cache(maxsize=None)
-def _fused_mse_decode_kernel(key_bits: int, val_bits: int):
+def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
     """Fused MSE decode matching MLX SDPA architecture.
     32 simdgroups × 32 lanes = 1024 threads per TG.
     Grid = (B*H_q, 1, 1). No tiling, no cross-tile merge.
@@ -2270,9 +2295,12 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int):
     Cross-simdgroup reduction via shared memory (1 barrier)."""
     if not _metal_available() or key_bits <= 0 or val_bits <= 0:
         return None
+    if dim < 32 or dim % 32 != 0:
+        return None  # dim must be a multiple of 32 SIMD lanes
 
     k_mask = (1 << key_bits) - 1
     v_mask = (1 << val_bits) - 1
+    elems_per_lane = dim // 32
 
     source = f"""
         constexpr int BN = 32;  // simdgroups per threadgroup
@@ -2316,17 +2344,21 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int):
         U max_score = -INFINITY;
         U sum_exp_score = 0;
 
-        // Byte base offset for this lane (constant across all tokens)
-        int k_byte_base = (simd_lid * qk_per_thread * k_bits) >> 3;
-        int v_byte_base = (simd_lid * v_per_thread * v_bits) >> 3;
+        // Byte/bit offset for this lane's first element (constant across all tokens)
+        int k_bit_start = simd_lid * qk_per_thread * k_bits;
+        int v_bit_start = simd_lid * v_per_thread * v_bits;
+        int k_byte_base = k_bit_start >> 3;
+        int v_byte_base = v_bit_start >> 3;
+        {"int k_bit_off = k_bit_start & 7;" if (elems_per_lane * key_bits) % 8 else ""}
+        {"int v_bit_off = v_bit_start & 7;" if (elems_per_lane * val_bits) % 8 else ""}
 
         // KV loop: each simdgroup handles tokens simd_gid, simd_gid+32, ...
         for (int t = simd_gid; t < (int)token_count; t += BN) {{
             U kn = static_cast<U>(k_nm[t]);
 
-            // Key score — MLX-style unrolled byte extraction
+            // Key score — unrolled byte extraction
             auto kb = (const device uint8_t*)(k_pk + t * KPackedWidth) + k_byte_base;
-            U score = {_gen_unrolled_score(key_bits, 8)};
+            U score = {_gen_unrolled_score(key_bits, elems_per_lane, "k_bit_off" if (elems_per_lane * key_bits) % 8 else "")};
             score = simd_sum(score) * kn;
 
             // Online softmax
@@ -2339,8 +2371,8 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int):
             max_score = new_max;
             sum_exp_score = sum_exp_score * factor + exp_score;
 
-            // Value accumulation — MLX-style unrolled byte extraction
-            {_gen_unrolled_value(val_bits, 8)}
+            // Value accumulation — unrolled byte extraction
+            {_gen_unrolled_value(val_bits, elems_per_lane, "v_bit_off" if (elems_per_lane * val_bits) % 8 else "")}
         }}
 
         // Cross-simdgroup reduction (matches MLX SDPA pattern)
@@ -2378,7 +2410,7 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int):
     """
 
     return mx.fast.metal_kernel(
-        name=f"turboquant_fused_mse_sdpa_k{key_bits}_v{val_bits}",
+        name=f"turboquant_fused_mse_sdpa_k{key_bits}_v{val_bits}_d{dim}",
         input_names=[
             "queries",
             "key_norms",
@@ -2394,15 +2426,18 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int):
 
 
 @lru_cache(maxsize=None)
-def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int):
+def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 256):
     """Pass 1: Block-parallel quantized attention. Each TG = 1 simdgroup per
     q_head (GQA packed via threadgroup y-dim). Grid.z = blocks splits KV seq.
     Matches MLX sdpa_vector_2pass_1 architecture."""
     if not _metal_available() or key_bits <= 0 or val_bits <= 0:
         return None
+    if dim < 32 or dim % 32 != 0:
+        return None
 
     k_mask = (1 << key_bits) - 1
     v_mask = (1 << val_bits) - 1
+    elems_per_lane = dim // 32
 
     source = f"""
         constexpr int BD = 32;
@@ -2441,9 +2476,13 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int):
         U max_score = -INFINITY;
         U sum_exp_score = 0;
 
-        // Byte base offset for this lane (constant across all tokens)
-        int k_byte_base = (simd_lid * qk_per_thread * k_bits) >> 3;
-        int v_byte_base = (simd_lid * v_per_thread * v_bits) >> 3;
+        // Byte/bit offset for this lane's first element (constant across all tokens)
+        int k_bit_start = simd_lid * qk_per_thread * k_bits;
+        int v_bit_start = simd_lid * v_per_thread * v_bits;
+        int k_byte_base = k_bit_start >> 3;
+        int v_byte_base = v_bit_start >> 3;
+        {"int k_bit_off = k_bit_start & 7;" if (elems_per_lane * key_bits) % 8 else ""}
+        {"int v_bit_off = v_bit_start & 7;" if (elems_per_lane * val_bits) % 8 else ""}
 
         // KV loop: stride by blocks (each block handles a different subset)
         for (int t = block_idx; t < (int)token_count; t += Blocks) {{
@@ -2451,7 +2490,7 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int):
 
             // Key score — unrolled byte extraction
             auto kb = (const device uint8_t*)(k_pk + t * KPackedWidth) + k_byte_base;
-            U score = {_gen_unrolled_score(key_bits, 8)};
+            U score = {_gen_unrolled_score(key_bits, elems_per_lane, "k_bit_off" if (elems_per_lane * key_bits) % 8 else "")};
             score = simd_sum(score) * kn;
 
             auto vb = (const device uint8_t*)(v_pk + t * VPackedWidth) + v_byte_base;
@@ -2463,7 +2502,7 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int):
             max_score = new_max;
             sum_exp_score = sum_exp_score * factor + exp_score;
 
-            {_gen_unrolled_value(val_bits, 8)}
+            {_gen_unrolled_value(val_bits, elems_per_lane, "v_bit_off" if (elems_per_lane * val_bits) % 8 else "")}
         }}
 
         // Write partial results for this block
@@ -2477,7 +2516,7 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int):
     """
 
     return mx.fast.metal_kernel(
-        name=f"turboquant_mse_sdpa_2pass1_k{key_bits}_v{val_bits}",
+        name=f"turboquant_mse_sdpa_2pass1_k{key_bits}_v{val_bits}_d{dim}",
         input_names=[
             "queries",
             "key_norms",
@@ -5710,7 +5749,7 @@ class TurboQuantKVCache(_BaseCache):
 
                 if total_tokens <= 2048:
                     # Single-pass: 32 simdgroups cooperate per q_head
-                    fused_kernel = _fused_mse_decode_kernel(key_bits, val_bits)
+                    fused_kernel = _fused_mse_decode_kernel(key_bits, val_bits, D)
                     if fused_kernel is not None:
                         out = fused_kernel(
                             inputs=[
@@ -5738,7 +5777,7 @@ class TurboQuantKVCache(_BaseCache):
                         return output.reshape(B, n_q_heads, L, value_dim).astype(dtype)
 
                 # 2-pass: split KV across blocks for GPU saturation
-                pass1 = _fused_mse_decode_2pass_1_kernel(key_bits, val_bits)
+                pass1 = _fused_mse_decode_2pass_1_kernel(key_bits, val_bits, D)
                 pass2 = _fused_mse_decode_2pass_2_kernel()
                 if pass1 is not None and pass2 is not None:
                     if total_tokens <= 8192:
