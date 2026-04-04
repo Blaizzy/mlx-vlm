@@ -973,7 +973,10 @@ class Batch:
             self.logits_processors.extend(other.logits_processors)
         elif other.logits_processors is not None:
             self.logits_processors = other.logits_processors
-        if self.state_machine_states is not None and other.state_machine_states is not None:
+        if (
+            self.state_machine_states is not None
+            and other.state_machine_states is not None
+        ):
             self.state_machine_states.extend(other.state_machine_states)
         elif other.state_machine_states is not None:
             self.state_machine_states = other.state_machine_states
@@ -1104,12 +1107,18 @@ class BatchGenerator:
                 inputs = inputs[:, n_to_process:]
                 mx.clear_cache()
 
-        batch_samplers = list(per_samplers) if any(s is not None for s in per_samplers) else None
+        batch_samplers = (
+            list(per_samplers) if any(s is not None for s in per_samplers) else None
+        )
         batch_lps = list(per_lps) if any(lp is not None for lp in per_lps) else None
 
         y, logprobs = self._step(
-            inputs, prompt_cache, inputs_embeds=inputs_embeds,
-            samplers=batch_samplers, logits_processors=batch_lps, **kwargs
+            inputs,
+            prompt_cache,
+            inputs_embeds=inputs_embeds,
+            samplers=batch_samplers,
+            logits_processors=batch_lps,
+            **kwargs,
         )
 
         mx.async_eval(y, logprobs)
@@ -1204,7 +1213,8 @@ class BatchGenerator:
         batch = self.active_batch
         y, logprobs = batch.y, batch.logprobs
         batch.y, batch.logprobs = self._step(
-            y[:, None], batch.cache,
+            y[:, None],
+            batch.cache,
             samplers=batch.samplers,
             logits_processors=batch.logits_processors,
         )

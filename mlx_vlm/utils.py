@@ -1424,9 +1424,7 @@ class StoppingCriteria:
                     resolved.append(token)
                 else:
                     resolved.append(
-                        self.tokenizer.encode(
-                            " " + token, add_special_tokens=False
-                        )[-1]
+                        self.tokenizer.encode(" " + token, add_special_tokens=False)[-1]
                     )
             self.eos_token_ids.extend(resolved)
 
