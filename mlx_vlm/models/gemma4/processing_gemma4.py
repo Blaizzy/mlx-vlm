@@ -7,6 +7,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/ge
 
 import math
 import re
+from pathlib import Path
 from typing import List, Optional, Union
 
 import numpy as np
@@ -27,6 +28,15 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..base import load_chat_template, to_mlx
+
+# Load the bundled Gemma 4 chat template as a fallback for models that
+# don't ship their own (e.g. mlx-community quantised conversions).
+_GEMMA4_CHAT_TEMPLATE_PATH = Path(__file__).parent / "chat_template.jinja"
+_GEMMA4_CHAT_TEMPLATE = (
+    _GEMMA4_CHAT_TEMPLATE_PATH.read_text()
+    if _GEMMA4_CHAT_TEMPLATE_PATH.exists()
+    else None
+)
 
 _SUPPORTED_SOFT_TOKENS = (70, 140, 280, 560, 1120)
 
@@ -433,7 +443,12 @@ class Gemma4Processor(ProcessorMixin):
     def apply_chat_template(self, messages, **kwargs):
         kwargs.setdefault("enable_thinking", False)
         kwargs.setdefault("tokenize", False)
-        return self.tokenizer.apply_chat_template(messages, **kwargs)
+        result = self.tokenizer.apply_chat_template(messages, **kwargs)
+        # Strip thinking channel markers when thinking is disabled —
+        # many quantised models loop on these tokens instead of generating.
+        if not kwargs.get("enable_thinking") and isinstance(result, str):
+            result = result.replace("<|channel>thought\n<channel|>", "")
+        return result
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)
@@ -467,6 +482,9 @@ class Gemma4Processor(ProcessorMixin):
             local_files_only=is_local,
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
+
+        if getattr(tokenizer, "chat_template", None) is None and _GEMMA4_CHAT_TEMPLATE:
+            tokenizer.chat_template = _GEMMA4_CHAT_TEMPLATE
 
         # Load processor config (contains image_processor and feature_extractor settings)
         proc_config = {}
