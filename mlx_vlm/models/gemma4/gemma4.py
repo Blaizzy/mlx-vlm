@@ -11,12 +11,27 @@ from .vision import VisionModel
 
 
 def masked_scatter(input_tensor, mask, source):
-    mask_flat = mask.flatten().astype(mx.int32)
-    indices = mx.cumsum(mask_flat) - 1
-    aligned = source.flatten()[indices % source.size]
-    return mx.where(mask_flat, aligned, input_tensor.flatten()).reshape(
-        input_tensor.shape
-    )
+    B = input_tensor.shape[0]
+    if B == 1:
+        mask_flat = mask.flatten().astype(mx.int32)
+        indices = mx.cumsum(mask_flat) - 1
+        aligned = source.flatten()[indices % source.size]
+        return mx.where(mask_flat, aligned, input_tensor.flatten()).reshape(
+            input_tensor.shape
+        )
+    # Per-batch scatter to avoid cross-batch index contamination
+    results = []
+    for i in range(B):
+        inp_i = input_tensor[i]  # (seq_len, dim)
+        mask_i = mask[i]  # (seq_len, dim)
+        src_i = source[i] if source.shape[0] > 1 else source[0]  # (n_tokens, dim)
+        mask_flat = mask_i.flatten().astype(mx.int32)
+        indices = mx.cumsum(mask_flat) - 1
+        aligned = src_i.flatten()[indices % src_i.size]
+        results.append(
+            mx.where(mask_flat, aligned, inp_i.flatten()).reshape(inp_i.shape)
+        )
+    return mx.stack(results)
 
 
 class MultimodalEmbedder(nn.Module):

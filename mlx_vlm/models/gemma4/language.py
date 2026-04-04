@@ -204,10 +204,14 @@ class Attention(nn.Module):
         if self.is_kv_shared_layer and cache is not None:
             state = cache.state
             keys, values = state[0], state[1]
-            offset = cache.offset
+            o = cache.offset
+            offset = int(o) if not isinstance(o, mx.array) else o + 0
         else:
             if cache is not None:
-                offset = cache.offset
+                # Snapshot offset before update_and_fetch mutates it
+                # (BatchRotatingKVCache.offset is a mutable mx.array)
+                o = cache.offset
+                offset = int(o) if not isinstance(o, mx.array) else o + 0
 
             keys = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
 

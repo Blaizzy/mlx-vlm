@@ -488,15 +488,19 @@ class VisionModel(nn.Module):
         else:
             valid_mask = ~pool_mask
 
-        # For single batch (typical VLM case), count valid tokens and slice
-        # Since pooling produces contiguous valid tokens followed by padding,
-        # we can simply count valid tokens and take that many
-        all_real = []
-        for i in range(B):
-            n_valid = int(valid_mask[i].astype(mx.int32).sum().item())
-            all_real.append(pooled[i, :n_valid])
+        # Strip padding tokens: count valid tokens per image and slice
+        valid_counts = [
+            int(valid_mask[i].astype(mx.int32).sum().item()) for i in range(B)
+        ]
+        max_valid = max(valid_counts)
 
-        hidden_states = mx.concatenate(all_real, axis=0)[None]  # [1, total_real, dim]
+        if B == 1:
+            # Single image: no padding needed
+            hidden_states = pooled[:, :max_valid]
+        else:
+            # Batch: slice each image to max_valid tokens (same-shape images
+            # produce the same count; different-shape images get zero-padded)
+            hidden_states = pooled[:, :max_valid]
 
         if self.config.standardize:
             hidden_states = (hidden_states - self.std_bias) * self.std_scale
