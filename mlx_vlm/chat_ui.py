@@ -14,7 +14,7 @@ import mlx.core as mx
 
 from mlx_vlm import load
 
-from .generate import stream_generate
+from .generate import PromptCacheState, stream_generate
 from .prompt_utils import get_chat_template, get_message_json
 from .utils import load_config, load_image_processor
 from .vision_cache import VisionFeatureCache
@@ -42,6 +42,8 @@ class ModelState:
         self.image_processor = None
         self.current_model_name = None
         self.vision_cache = VisionFeatureCache()
+        self.prompt_cache_state = PromptCacheState()
+        self.last_image = None
 
     def load(self, model_name):
         """Load a model, clearing previous one from memory."""
@@ -62,6 +64,8 @@ class ModelState:
         self.image_processor = load_image_processor(model_name)
         self.current_model_name = model_name
         self.vision_cache.clear()
+        self.prompt_cache_state = PromptCacheState()
+        self.last_image = None
 
 
 state = ModelState()
@@ -292,10 +296,16 @@ def chat(
     response = ""
     last_chunk = None
 
+    # Reset prompt cache when image changes (token positions shift)
+    if image_file and image_file != state.last_image:
+        state.prompt_cache_state = PromptCacheState()
+        state.last_image = image_file
+
     gen_kwargs = {
         "max_tokens": max_tokens,
         "temperature": temperature,
         "vision_cache": state.vision_cache,
+        "prompt_cache_state": state.prompt_cache_state,
     }
 
     if top_p < 1.0:
