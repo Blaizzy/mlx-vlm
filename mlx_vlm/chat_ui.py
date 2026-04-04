@@ -266,11 +266,24 @@ def chat(
             {"role": "user", "content": extract_text_from_message(message)}
         )
 
-        prompt = apply_chat_template(
-            state.processor,
-            state.config,
-            chat_history,
-            num_images=num_images,
+        # Build messages with image token only on the last user message
+        messages = []
+        for i, m in enumerate(chat_history):
+            skip_token = True
+            if i == len(chat_history) - 1 and m["role"] == "user" and image_file:
+                skip_token = False
+            messages.append(
+                get_message_json(
+                    state.config["model_type"],
+                    m["content"],
+                    role=m["role"],
+                    skip_image_token=skip_token,
+                    num_images=num_images if not skip_token else 0,
+                )
+            )
+
+        prompt = get_chat_template(
+            state.processor, messages, add_generation_prompt=True
         )
 
     else:
