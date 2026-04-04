@@ -126,29 +126,33 @@ class Model(nn.Module):
         if pixel_values is None:
             return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
-        # Get the ouptut hidden states from the vision model
-        *_, hidden_states = self.vision_tower(
-            pixel_values, output_hidden_states=True, spatial_shapes=spatial_shapes
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
+        else:
+            # Get the ouptut hidden states from the vision model
+            *_, hidden_states = self.vision_tower(
+                pixel_values, output_hidden_states=True, spatial_shapes=spatial_shapes
+            )
 
-        img_feature_lengths = pixel_attention_mask.sum(axis=1).tolist()
-        image_features = []
+            img_feature_lengths = pixel_attention_mask.sum(axis=1).tolist()
+            image_features = []
 
-        for img_idx in range(hidden_states.shape[0]):
-            feature = hidden_states[img_idx]
+            for img_idx in range(hidden_states.shape[0]):
+                feature = hidden_states[img_idx]
 
-            feature = feature[: img_feature_lengths[img_idx], :][None, ...]
+                feature = feature[: img_feature_lengths[img_idx], :][None, ...]
 
-            feature_org_h, feature_org_w = spatial_shapes[img_idx]
-            feature = feature.reshape(1, feature_org_h, feature_org_w, -1)
-            feature = self.pixel_unshuffle(feature)
+                feature_org_h, feature_org_w = spatial_shapes[img_idx]
+                feature = feature.reshape(1, feature_org_h, feature_org_w, -1)
+                feature = self.pixel_unshuffle(feature)
 
-            img_embedding = self.multi_modal_projector(feature)
+                img_embedding = self.multi_modal_projector(feature)
 
-            img_embedding = img_embedding.reshape(-1, img_embedding.shape[-1])
-            image_features.append(img_embedding)
+                img_embedding = img_embedding.reshape(-1, img_embedding.shape[-1])
+                image_features.append(img_embedding)
 
-        image_features = mx.concatenate(image_features, axis=0)
+            image_features = mx.concatenate(image_features, axis=0)
 
         final_inputs_embeds = self.merge_input_ids_with_image_features(
             image_features, inputs_embeds, input_ids, self.config.image_token_index

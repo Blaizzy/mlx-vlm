@@ -39,6 +39,7 @@ from .prompt_utils import apply_chat_template
 from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load
 from .version import __version__
+from .vision_cache import VisionFeatureCache
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -184,6 +185,7 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
         "model": model,
         "processor": processor,
         "config": config,
+        "vision_cache": VisionFeatureCache(),
     }
 
     return model, processor, config
@@ -198,7 +200,9 @@ def unload_model_sync():
     print(
         f"Unloading model: {model_cache.get('model_path')}, Adapter: {model_cache.get('adapter_path')}"
     )
-    # Clear references
+    # Clear vision cache before dropping references
+    if "vision_cache" in model_cache:
+        model_cache["vision_cache"].clear()
     model_cache = {}
     # Force garbage collection
     gc.collect()
@@ -900,6 +904,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                         processor=processor,
                         prompt=formatted_prompt,
                         image=images,
+                        vision_cache=model_cache.get("vision_cache"),
                         **generation_kwargs,
                     )
 
@@ -1075,9 +1080,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                         # Only extract images/audio from user messages
                         if message.role == "user":
                             if item["type"] == "input_image":
-                                images.append(item["image_url"])
+                                images = [item["image_url"]]
                             elif item["type"] == "image_url":
-                                images.append(item["image_url"]["url"])
+                                images = [item["image_url"]["url"]]
                             elif item["type"] == "input_audio":
                                 audio.append(item["input_audio"]["data"])
                         if item["type"] in ("text", "input_text"):
@@ -1122,6 +1127,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         prompt=formatted_prompt,
                         image=images,
                         audio=audio,
+                        vision_cache=model_cache.get("vision_cache"),
                         **generation_kwargs,
                     )
 
@@ -1225,6 +1231,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     image=images,
                     audio=audio,
                     verbose=False,  # Keep API output clean
+                    vision_cache=model_cache.get("vision_cache"),
                     **generation_kwargs,
                 )
                 # Clean up resources

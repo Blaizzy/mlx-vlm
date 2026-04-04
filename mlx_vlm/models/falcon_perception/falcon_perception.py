@@ -120,7 +120,11 @@ class Model(nn.Module):
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        hidden_states = self._patchify_and_project(pixel_values)
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            hidden_states = cached
+        else:
+            hidden_states = self._patchify_and_project(pixel_values)
 
         final_embeds = self._merge_image_features(
             self.config.img_id,

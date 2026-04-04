@@ -68,30 +68,34 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the output hidden states from the vision model
-        *_, hidden_states = self.vision_tower(
-            pixel_values[0].transpose(0, 2, 3, 1), output_hidden_states=True
-        )
-
-        # Select the hidden states from the desired layer(s)
-        if isinstance(self.vision_feature_layer, int):
-            selected_image_feature = hidden_states[self.vision_feature_layer]
-
-            if self.vision_feature_select_strategy == "default":
-                selected_image_feature = selected_image_feature[:, 1:]
-            elif self.vision_feature_select_strategy != "full":
-                raise ValueError(
-                    "Unexpected feature selection strategy: "
-                    f"{self.vision_feature_select_strategy}"
-                )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            selected_image_feature = cached
         else:
-            # Multi-layer: concatenate features from multiple layers
-            hs_pool = [
-                hidden_states[layer_idx] for layer_idx in self.vision_feature_layer
-            ]
-            if self.vision_feature_select_strategy == "default":
-                hs_pool = [hs[:, 1:] for hs in hs_pool]
-            selected_image_feature = mx.concatenate(hs_pool, axis=-1)
+            # Get the output hidden states from the vision model
+            *_, hidden_states = self.vision_tower(
+                pixel_values[0].transpose(0, 2, 3, 1), output_hidden_states=True
+            )
+
+            # Select the hidden states from the desired layer(s)
+            if isinstance(self.vision_feature_layer, int):
+                selected_image_feature = hidden_states[self.vision_feature_layer]
+
+                if self.vision_feature_select_strategy == "default":
+                    selected_image_feature = selected_image_feature[:, 1:]
+                elif self.vision_feature_select_strategy != "full":
+                    raise ValueError(
+                        "Unexpected feature selection strategy: "
+                        f"{self.vision_feature_select_strategy}"
+                    )
+            else:
+                # Multi-layer: concatenate features from multiple layers
+                hs_pool = [
+                    hidden_states[layer_idx] for layer_idx in self.vision_feature_layer
+                ]
+                if self.vision_feature_select_strategy == "default":
+                    hs_pool = [hs[:, 1:] for hs in hs_pool]
+                selected_image_feature = mx.concatenate(hs_pool, axis=-1)
 
         # Pass image features through the multi-modal projector
         image_features = self.multi_modal_projector(selected_image_feature)

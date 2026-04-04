@@ -58,34 +58,40 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the ouptut hidden states from the vision model
-        *_, hidden_states = self.vision_tower(
-            pixel_values[0].transpose(0, 2, 3, 1), output_hidden_states=True
-        )
-
-        # Select the hidden states from the desired layer
-        selected_image_feature = hidden_states[self.vision_feature_layer]
-
-        if self.vision_feature_select_strategy == "default":
-            selected_image_feature = selected_image_feature[:, 1:]
-        elif self.vision_feature_select_strategy == "full":
-            selected_image_feature = selected_image_feature
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached.astype(inputs_embeds.dtype)
         else:
-            raise ValueError(
-                "Unexpected feature selection strategy: "
-                f"{self.vision_feature_select_strategy}"
+            # Get the ouptut hidden states from the vision model
+            *_, hidden_states = self.vision_tower(
+                pixel_values[0].transpose(0, 2, 3, 1), output_hidden_states=True
             )
 
-        # Pass image features through the multi-modal projector
-        image_features = self.multi_modal_projector(selected_image_feature)
+            # Select the hidden states from the desired layer
+            selected_image_feature = hidden_states[self.vision_feature_layer]
 
-        # Add a newline token to the image features
-        if self.image_newline is not None:
-            newline = np.array(self.image_newline)[None, None, :]
-            newline = np.broadcast_to(newline, image_features.shape)
-            image_features = mx.concatenate([image_features, mx.array(newline)], axis=0)
+            if self.vision_feature_select_strategy == "default":
+                selected_image_feature = selected_image_feature[:, 1:]
+            elif self.vision_feature_select_strategy == "full":
+                selected_image_feature = selected_image_feature
+            else:
+                raise ValueError(
+                    "Unexpected feature selection strategy: "
+                    f"{self.vision_feature_select_strategy}"
+                )
 
-        image_features = image_features.astype(inputs_embeds.dtype)
+            # Pass image features through the multi-modal projector
+            image_features = self.multi_modal_projector(selected_image_feature)
+
+            # Add a newline token to the image features
+            if self.image_newline is not None:
+                newline = np.array(self.image_newline)[None, None, :]
+                newline = np.broadcast_to(newline, image_features.shape)
+                image_features = mx.concatenate(
+                    [image_features, mx.array(newline)], axis=0
+                )
+
+            image_features = image_features.astype(inputs_embeds.dtype)
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self._merge_input_ids_with_image_features(
