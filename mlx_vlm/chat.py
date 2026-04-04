@@ -95,7 +95,7 @@ class MLXVisionChat:
             )
 
         text_prompt = self.processor.apply_chat_template(
-            messages, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True
         )
 
         inputs = self.processor(
