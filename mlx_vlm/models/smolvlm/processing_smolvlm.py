@@ -157,6 +157,10 @@ class SmolVLMProcessor(ProcessorMixin):
         if text is None and images is None and videos is None:
             raise ValueError("You must provide one of `text`, `images` or `videos`.")
 
+        # Treat video frames as images
+        if videos is not None and images is None:
+            images = videos
+
         if text is not None:
             if isinstance(text, str):
                 text = [text]
@@ -253,6 +257,11 @@ class SmolVLMProcessor(ProcessorMixin):
             **ip_overrides,
             **kwargs,
         )
+        if "chat_template" not in proc_kwargs:
+            chat_template = getattr(tokenizer, "chat_template", None)
+            if chat_template is not None:
+                proc_kwargs["chat_template"] = chat_template
+
         return cls(
             image_processor=image_processor,
             tokenizer=tokenizer,

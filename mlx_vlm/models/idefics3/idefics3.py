@@ -112,8 +112,8 @@ class Model(nn.Module):
 
         if pixel_attention_mask is None:
             pixel_attention_mask = mx.ones(
-                (pixel_values.size(0), pixel_values.size(2), pixel_values.size(3)),
-                dtype=mx.bool,
+                (pixel_values.shape[0], pixel_values.shape[2], pixel_values.shape[3]),
+                dtype=mx.bool_,
             )
         else:
             # Remove padding images from the mask

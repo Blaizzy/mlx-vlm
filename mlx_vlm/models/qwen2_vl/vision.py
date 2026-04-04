@@ -155,6 +155,7 @@ class Attention(nn.Module):
                 q, k, v, scale=self.scale, mask=None
             )
             attn_outputs.append(output)
+        output = mx.concatenate(attn_outputs, axis=2)
         output = output.transpose(0, 2, 1, 3)
         output = output.reshape(seq_length, -1)
         return self.proj(output)
