@@ -185,7 +185,7 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
         "model": model,
         "processor": processor,
         "config": config,
-        "vision_cache": VisionFeatureCache(),
+        "vision_cache": VisionFeatureCache(ttl=300),
     }
 
     return model, processor, config
