@@ -1047,6 +1047,14 @@ async def responses_endpoint(openai_request: OpenAIRequest):
         )
 
 
+_THINKING_CHANNEL_RE = re.compile(r"<\|channel>thought\s*\n?<channel\|>\s*")
+
+
+def _strip_thinking_markers(text: str) -> str:
+    """Remove Gemma 4 thinking-channel markers from generated text."""
+    return _THINKING_CHANNEL_RE.sub("", text)
+
+
 @app.post(
     "/chat/completions", response_model=None
 )  # Response model handled dynamically based on stream flag
@@ -1138,7 +1146,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                             print("Warning: Received unexpected chunk format:", chunk)
                             continue
 
-                        output_text += chunk.text
+                        cleaned_text = _strip_thinking_markers(chunk.text)
+                        output_text += cleaned_text
 
                         # Yield chunks in Server-Sent Events (SSE) format
                         usage_stats = {
@@ -1153,7 +1162,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                         choices = [
                             ChatStreamChoice(
-                                delta=ChatMessage(role="assistant", content=chunk.text)
+                                delta=ChatMessage(role="assistant", content=cleaned_text)
                             )
                         ]
                         chunk_data = ChatStreamChunk(
@@ -1257,14 +1266,14 @@ async def chat_completions_endpoint(request: ChatRequest):
                 else:
                     tool_calls = {}
                     tool_calls["calls"] = []
-                    tool_calls["remaining_text"] = gen_result.text
+                    tool_calls["remaining_text"] = _strip_thinking_markers(gen_result.text)
 
                 choices = [
                     ChatChoice(
                         finish_reason="stop",
                         message=ChatMessage(
                             role="assistant",
-                            content=tool_calls["remaining_text"],
+                            content=_strip_thinking_markers(tool_calls["remaining_text"]),
                             tool_calls=tool_calls["calls"],
                         ),
                     )
