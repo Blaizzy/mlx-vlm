@@ -462,9 +462,13 @@ The cache holds up to 8 entries (configurable) and uses LRU eviction.
 
 ### CLI
 
-The `--chat` mode uses `VisionFeatureCache` automatically:
+Both chat modes use `VisionFeatureCache` automatically:
 
 ```sh
+# Interactive chat with Rich UI (load images with /image command)
+python -m mlx_vlm.chat --model google/gemma-4-26b-a4b-it
+
+# Inline chat mode
 python -m mlx_vlm.generate \
   --model google/gemma-4-26b-a4b-it \
   --image path/to/image.jpg \
