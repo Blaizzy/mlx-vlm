@@ -142,7 +142,12 @@ class MLXVisionChat:
                 prompt_time = time.perf_counter() - tic
                 tic = time.perf_counter()
 
-            if token == self.processor.tokenizer.eos_token_id and n > 0:
+            eos = self.model.config.eos_token_id
+            if isinstance(eos, list):
+                is_eos = token in eos
+            else:
+                is_eos = token == eos
+            if is_eos and n > 0:
                 break
 
             detokenizer.add_token(token)
