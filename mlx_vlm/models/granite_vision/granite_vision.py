@@ -91,8 +91,7 @@ class Model(nn.Module):
             else:
                 # Multi-layer: concatenate features from multiple layers
                 hs_pool = [
-                    hidden_states[layer_idx]
-                    for layer_idx in self.vision_feature_layer
+                    hidden_states[layer_idx] for layer_idx in self.vision_feature_layer
                 ]
                 if self.vision_feature_select_strategy == "default":
                     hs_pool = [hs[:, 1:] for hs in hs_pool]

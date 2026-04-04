@@ -1,5 +1,5 @@
-import pytest
 import mlx.core as mx
+import pytest
 
 from mlx_vlm.vision_cache import VisionFeatureCache
 
@@ -161,9 +161,9 @@ class TestCachedImageFeaturesKwarg:
                 target_cls = obj
                 break
 
-        assert target_cls is not None, (
-            f"No class with get_input_embeddings in {model_module}"
-        )
+        assert (
+            target_cls is not None
+        ), f"No class with get_input_embeddings in {model_module}"
 
         source = inspect.getsource(target_cls.get_input_embeddings)
         assert "cached_image_features" in source, (

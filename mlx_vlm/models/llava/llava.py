@@ -71,8 +71,7 @@ class Model(nn.Module):
 
             else:
                 hs_pool = [
-                    hidden_states[layer_idx]
-                    for layer_idx in self.vision_feature_layer
+                    hidden_states[layer_idx] for layer_idx in self.vision_feature_layer
                 ]
                 # For default; crop CLS from each hidden state in the hidden state pool
                 if self.vision_feature_select_strategy == "default":

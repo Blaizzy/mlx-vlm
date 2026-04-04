@@ -57,9 +57,7 @@ class Model(nn.Module):
         if cached is not None:
             image_features = cached
         else:
-            _, image_features, _ = self.vision_tower(
-                pixel_values.transpose(0, 2, 3, 1)
-            )
+            _, image_features, _ = self.vision_tower(pixel_values.transpose(0, 2, 3, 1))
             B, H, W, C = image_features.shape
             image_features = image_features.reshape(B, H * W, C)
             image_features = self.mm_projector(image_features)
