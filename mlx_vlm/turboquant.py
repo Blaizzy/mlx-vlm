@@ -1566,13 +1566,7 @@ def _compiled_integer_decode_kernel(bits: int):
 
 @lru_cache(maxsize=None)
 def _fused_integer_decode_kernel(bits: int, repeat_count: int, key_mse_bits: int = -1):
-    """Single Metal kernel: score + online-softmax + weighted-sum for integer-bit
-    ProdCodec keys + MSECodec values. Eliminates intermediate scores tensor.
-
-    Grid: (32, num_val_tiles, B*H*num_tok_tiles) with threadgroup=(32,1,1).
-    32 SIMD lanes cooperate on scoring (simd_sum across dims) and each lane
-    accumulates one value dim with online softmax.
-    """
+    """Fused integer decode: score + online-softmax + weighted-sum."""
     if not _metal_available() or repeat_count < 1:
         return None
 
@@ -2286,11 +2280,7 @@ def _gen_unrolled_value(bits: int, n_elems: int, bit_off_var: str = "") -> str:
 
 @lru_cache(maxsize=None)
 def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
-    """Fused MSE decode matching MLX SDPA architecture.
-    32 simdgroups × 32 lanes = 1024 threads per TG.
-    Grid = (B*H_q, 1, 1). No tiling, no cross-tile merge.
-    Simdgroups cooperatively tile across KV tokens (stride 32).
-    Cross-simdgroup reduction via shared memory (1 barrier)."""
+    """Fused MSE decode: 32 simdgroups × 32 lanes, online softmax + weighted sum."""
     if not _metal_available() or key_bits <= 0 or val_bits <= 0:
         return None
     if dim < 32 or dim % 32 != 0:
@@ -2425,9 +2415,7 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
 
 @lru_cache(maxsize=None)
 def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 256):
-    """Pass 1: Block-parallel quantized attention. Each TG = 1 simdgroup per
-    q_head (GQA packed via threadgroup y-dim). Grid.z = blocks splits KV seq.
-    Matches MLX sdpa_vector_2pass_1 architecture."""
+    """2-pass decode pass 1: block-parallel quantized attention."""
     if not _metal_available() or key_bits <= 0 or val_bits <= 0:
         return None
     if dim < 32 or dim % 32 != 0:
@@ -2531,9 +2519,7 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 25
 
 @lru_cache(maxsize=None)
 def _fused_mse_decode_2pass_2_kernel():
-    """Pass 2: Reduce partial block results via cross-block online softmax.
-    TG = 1024 (32 simdgroups × 32 lanes). Grid = (B*H_q, 1, 1).
-    Matches MLX sdpa_vector_2pass_2 architecture."""
+    """2-pass decode pass 2: reduce partial block results."""
     if not _metal_available():
         return None
 
@@ -2686,10 +2672,8 @@ def _metal_butterfly_wht_inverse(
 
 
 @lru_cache(maxsize=None)
-@lru_cache(maxsize=None)
 def _fused_kv_quantize_kernel(key_bits: int, val_bits: int):
-    """Fused key+value quantize in 1 dispatch. Grid.y=0 does keys, grid.y=1 does values.
-    Halves dispatch count vs separate key/value quantize calls."""
+    """Fused key+value quantize in 1 dispatch."""
     if not _metal_available() or key_bits <= 0 or val_bits <= 0:
         return None
 
@@ -2864,8 +2848,7 @@ def _fused_norot_quantize_kernel(bits: int):
 
 
 def _fused_mse_quantize_kernel(bits: int, use_rht: bool = False):
-    """Fused MSE quantize: norm + rotate + comparison-quantize + pack in 1 dispatch.
-    TG=Dim (256 threads): 1 thread per dimension for 8× faster rotation."""
+    """Fused MSE quantize: norm + rotate + quantize + pack in 1 dispatch."""
     if not _metal_available() or bits <= 0:
         return None
     num_entries = 1 << bits
@@ -2952,8 +2935,7 @@ def _fused_mse_quantize_kernel(bits: int, use_rht: bool = False):
 
 @lru_cache(maxsize=None)
 def _fused_prod_quantize_kernel(mse_bits: int, use_rht: bool = False):
-    """Fused Prod quantize: norm + rotate + MSE quantize + residual + QJL projection
-    + sign pack, all in 1 dispatch. Replaces ~30 dispatches per key quantize."""
+    """Fused Prod quantize: norm + rotate + MSE quantize + residual + QJL in 1 dispatch."""
     if not _metal_available() or mse_bits <= 0:
         return None
     num_entries = 1 << mse_bits
@@ -3105,13 +3087,7 @@ def _fused_prod_quantize_kernel(mse_bits: int, use_rht: bool = False):
 
 @lru_cache(maxsize=None)
 def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int):
-    """Single Metal kernel: score + online-softmax + weighted-sum for SplitCodec.
-
-    Grid: (32, ValDim, B*H) — for each token: 32 lanes cooperate on key-dim
-    reduction (simd_sum) to produce a scalar score, then each lane unpacks+
-    accumulates its value dim weighted by the softmax weight. Uses online
-    softmax across tokens with a cross-lane reduction at the end.
-    """
+    """Fused SplitCodec decode: score + online-softmax + weighted-sum."""
     if not _metal_available() or repeat_count < 1:
         return None
 
@@ -3119,19 +3095,6 @@ def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int)
     high_mse_bits = max(high_bits - 1, 0)
     low_mse_mask = (1 << low_mse_bits) - 1
     high_mse_mask = (1 << high_mse_bits) - 1
-
-    # Architecture: 32 SIMD lanes cooperate on BOTH key scoring (simd_sum across
-    # key dims) AND value accumulation (each lane handles its own value dim).
-    #
-    # Grid: (32, NumTiles, B*H) — NumTiles = ceil(ValDim/32).
-    # Each tile's 32 lanes handle 32 value dims. The score is computed ONCE
-    # per token per tile (not once per value dim), eliminating 32x redundancy.
-    #
-    # Per token:
-    #   1. 32 lanes split key dims → partial scores → simd_sum → scalar score
-    #   2. Each lane unpacks its value dim, applies online softmax weight
-    #
-    # Cross-lane score is free (simd_sum broadcasts to all lanes).
 
     val_dim_total = "DimLow + DimHigh"
 
@@ -3337,8 +3300,7 @@ def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int)
 
 @lru_cache(maxsize=None)
 def _compiled_split_decode_kernel(low_bits: int, high_bits: int):
-    """Fused decode kernel for SplitCodec — handles both halves in a single
-    compiled function, avoiding double dispatch and intermediate allocations."""
+    """Compiled SplitCodec decode handling both halves."""
     low_mse_bits = max(low_bits - 1, 0)
     high_mse_bits = max(high_bits - 1, 0)
 
@@ -3555,7 +3517,7 @@ def _rht_sign_vector(dim: int, seed: int) -> mx.array:
 
 
 def _rht_forward(x: mx.array, signs: mx.array) -> mx.array:
-    """RHT forward: hadamard(signs * x) / sqrt(D). Uses mx.hadamard_transform (1 dispatch)."""
+    """RHT forward: hadamard(signs * x) / sqrt(D)."""
     dim = signs.shape[0]
     D_padded = _rht_padded_dim(dim)
     y = x * signs
@@ -3569,7 +3531,7 @@ def _rht_forward(x: mx.array, signs: mx.array) -> mx.array:
 
 
 def _rht_inverse(x: mx.array, signs: mx.array) -> mx.array:
-    """RHT inverse: signs * hadamard(x) / sqrt(D). Uses mx.hadamard_transform (1 dispatch)."""
+    """RHT inverse: signs * hadamard(x) / sqrt(D)."""
     dim = signs.shape[0]
     D_padded = _rht_padded_dim(dim)
     y = x
@@ -4032,11 +3994,7 @@ class _TurboQuantMSECodec:
     def __init__(self, dim: int, bits: int, seed: int):
         self.dim = dim
         self.bits = bits
-        # RHT butterfly infrastructure available but disabled — barrier overhead
-        # in Metal kernels (16 barriers for D=256) outweighs compute savings
-        # over dense matmul at small threadgroup counts (TG=32).
-        # Use mx.hadamard_transform (built-in optimized Metal kernel) for RHT
-        # when D is power of 2. Replaces D×D matmul with O(D log D) in 1 dispatch.
+        # Use mx.hadamard_transform for power-of-2 dims (O(D log D), 1 dispatch).
         self.use_rht = dim > 0 and (dim & (dim - 1)) == 0
         if self.use_rht:
             self.signs = _rht_sign_vector(dim, seed)
@@ -4160,7 +4118,6 @@ class _TurboQuantMSECodec:
 
         vectors_f32 = vectors.astype(mx.float32)
         norms = mx.linalg.norm(vectors_f32, axis=-1)
-        # safe_norms >= _EPS, so division never produces inf/nan
         unit_vectors = vectors_f32 / mx.maximum(norms[..., None], _EPS)
         return TurboQuantMSEState(
             norms.astype(mx.float16),
@@ -4831,11 +4788,8 @@ class _QuantizedStateProxy:
 
 
 class TurboQuantKVCache(_BaseCache):
-    # Process all tokens in one pass during decode — chunking adds significant
-    # overhead from the online-softmax recombination loop. Memory is already
-    # bounded by the quantized cache itself.
-    decode_key_chunk_size = 1 << 30  # ~1B tokens, effectively no chunking
-    prefill_key_chunk_size = 2048  # match DEFAULT_PREFILL_STEP_SIZE from generate.py
+    decode_key_chunk_size = 1 << 30
+    prefill_key_chunk_size = 2048
     prefill_query_block_size = 16
     cache_step = 256
 
@@ -4872,9 +4826,6 @@ class TurboQuantKVCache(_BaseCache):
                 if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
                 else self.bits
             )
-            # Use pure MSE codec for keys (full bit-width, no QJL).
-            # llama.cpp turboquant found QJL hurts quality (+0.22% PPL)
-            # and costs 9% decode speed vs direct MSE at full bits.
             self.key_codec = _build_codec(keys, key_bits, mode="mse", seed=self.seed)
         if self.value_codec is None:
             val_bits = (
@@ -4970,11 +4921,8 @@ class TurboQuantKVCache(_BaseCache):
         self.offset = new_end
         self._cached_state = None
         self._cached_state_offset = -1
-        # Eval during prefill (many tokens) and periodically during decode
-        # to prevent graph buildup. Avoid per-token eval — it creates sync points.
         if n_new > 1 or (self.offset % 50 == 0):
             mx.eval(self.keys, self.values)
-        # Return proxied states so model code can access .shape[-2] for mask slicing
         ks, vs = self.state
         return (
             _QuantizedStateProxy(ks, self.offset, n_heads),
