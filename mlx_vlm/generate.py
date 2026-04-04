@@ -584,7 +584,7 @@ def stream_generate(
     )
 
     add_special_tokens = (
-        not hasattr(processor, "chat_template")
+        getattr(processor, "chat_template", None) is None
         if model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
         else True
     )
@@ -1362,7 +1362,7 @@ def _generate_batch(
     ]
 
     add_special_tokens = (
-        not hasattr(processor, "chat_template")
+        getattr(processor, "chat_template", None) is None
         if model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
         else True
     )
