@@ -468,20 +468,24 @@ def train(
 
         # Save checkpoint
         if it % args.steps_per_save == 0 and rank == 0:
-            save_adapter(model, args.adapter_file)
+            adapter_file = args.adapter_file or "adapters.safetensors"
+            Path(adapter_file).parent.mkdir(parents=True, exist_ok=True)
+            save_adapter(model, adapter_file)
             checkpoint = (
-                Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
+                Path(adapter_file).parent / f"{it:07d}_adapters.safetensors"
             )
             save_adapter(model, checkpoint)
             print(
                 f"{Colors.OKBLUE}Iter {it}: Saved adapter weights to "
-                f"{args.adapter_file} and {checkpoint}.{Colors.ENDC}",
+                f"{adapter_file} and {checkpoint}.{Colors.ENDC}",
                 flush=True,
             )
 
     # Save final weights
     if rank == 0:
-        save_adapter(model, args.adapter_file)
+        adapter_file = args.adapter_file or "adapters.safetensors"
+        Path(adapter_file).parent.mkdir(parents=True, exist_ok=True)
+        save_adapter(model, adapter_file)
         print(
-            f"{Colors.OKGREEN}Saved final adapter weights to {args.adapter_file}.{Colors.ENDC}"
+            f"{Colors.OKGREEN}Saved final adapter weights to {adapter_file}.{Colors.ENDC}"
         )
