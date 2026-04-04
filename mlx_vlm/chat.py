@@ -20,6 +20,7 @@ from mlx_vlm.generate import (
     DEFAULT_TEMPERATURE,
     DEFAULT_THINKING_END_TOKEN,
     DEFAULT_THINKING_START_TOKEN,
+    PromptCacheState,
     stream_generate,
 )
 from mlx_vlm.prompt_utils import apply_chat_template
@@ -45,6 +46,7 @@ class MLXVisionChat:
         self.current_image_path = None
         self.image_paths: List[str] = []
         self.vision_cache = VisionFeatureCache()
+        self.prompt_cache_state = PromptCacheState()
         self.stream_kwargs = kwargs
 
         with self.console.status("[bold green]Loading model..."):
@@ -76,6 +78,7 @@ class MLXVisionChat:
 
             self.current_image = load_image(image_path)
             self.current_image_path = image_path
+            self.prompt_cache_state = PromptCacheState()  # new image invalidates cache
             if image_path not in self.image_paths:
                 self.image_paths.append(image_path)
             rprint(f"[bold blue]Loaded image:[/bold blue] {image_path}")
@@ -118,6 +121,7 @@ class MLXVisionChat:
             max_tokens=self.max_tokens,
             temperature=self.temperature,
             vision_cache=self.vision_cache,
+            prompt_cache_state=self.prompt_cache_state,
             **self.stream_kwargs,
         ):
             text += chunk.text
@@ -136,6 +140,7 @@ class MLXVisionChat:
         elif command == "/clear":
             self.history.clear()
             self.image_paths.clear()
+            self.prompt_cache_state = PromptCacheState()
             rprint("[bold blue]Conversation history cleared.[/bold blue]")
         elif command == "/image":
             if not args:

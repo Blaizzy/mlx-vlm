@@ -8,6 +8,7 @@ from .generate import (
     BatchResponse,
     BatchStats,
     GenerationResult,
+    PromptCacheState,
     batch_generate,
     generate,
     stream_generate,

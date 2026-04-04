@@ -337,6 +337,34 @@ class GenerationResult:
     peak_memory: float = 0.0
 
 
+class PromptCacheState:
+    """Holds KV cache and token history across conversation turns.
+
+    Pass this to stream_generate via the ``prompt_cache_state`` kwarg to
+    reuse the KV cache from previous turns.  Only the new tokens (after
+    the common prefix) are processed, avoiding redundant prefill.
+    """
+
+    def __init__(self):
+        self.cache: Optional[List[Any]] = None
+        self.token_ids: Optional[List[int]] = None
+
+    def find_prefix_length(self, new_ids: list) -> int:
+        """Return the number of leading tokens that match the cached ids."""
+        if self.token_ids is None:
+            return 0
+        max_len = min(len(self.token_ids), len(new_ids))
+        for i in range(max_len):
+            if self.token_ids[i] != new_ids[i]:
+                return i
+        return max_len
+
+    def update(self, token_ids: list, kv_cache: list):
+        """Store the full token sequence and corresponding KV cache."""
+        self.token_ids = list(token_ids)
+        self.cache = kv_cache
+
+
 def generate_step(
     input_ids: mx.array,
     model: nn.Module,
@@ -629,6 +657,33 @@ def stream_generate(
             vision_cache.put(image, features)
             kwargs["cached_image_features"] = features
 
+    # Prompt cache reuse: skip common prefix from previous turn
+    prompt_cache_state = kwargs.pop("prompt_cache_state", None)
+    reused_prefix_len = 0
+    full_input_ids_list = input_ids.flatten().tolist()
+
+    if prompt_cache_state is not None and prompt_cache_state.cache is not None:
+        prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
+        if prefix_len > 0 and prefix_len < input_ids.shape[1]:
+            reused_prefix_len = prefix_len
+            # Trim to only new tokens
+            input_ids = input_ids[:, prefix_len:]
+            # Image features are already in the KV cache, skip vision
+            pixel_values = None
+            kwargs.pop("cached_image_features", None)
+            # Reuse the saved KV cache (trimmed to prefix length)
+            kv_cache = prompt_cache_state.cache
+            # Trim cache to prefix_len in case it includes generated tokens
+            for c in kv_cache:
+                if hasattr(c, "keys") and c.keys is not None:
+                    cached_len = c.keys.shape[2]
+                    if cached_len > prefix_len:
+                        c.keys = c.keys[:, :, :prefix_len, :]
+                        c.values = c.values[:, :, :prefix_len, :]
+                        if hasattr(c, "offset"):
+                            c.offset = prefix_len
+            kwargs["prompt_cache"] = kv_cache
+
     if thinking_budget is not None:
         thinking_start_token_id = tokenizer.encode(
             thinking_start_token, add_special_tokens=False
@@ -647,6 +702,16 @@ def stream_generate(
     else:
         tokenizer.thinking_budget_criteria = None
 
+    # Ensure we have a prompt_cache we can track for reuse
+    if "prompt_cache" not in kwargs:
+        kwargs["prompt_cache"] = cache.make_prompt_cache(
+            model.language_model,
+            max_kv_size=kwargs.get("max_kv_size", None),
+        )
+    tracked_cache = kwargs["prompt_cache"]
+
+    total_prompt_tokens = reused_prefix_len + input_ids.size
+
     with wired_limit(model, [generation_stream]):
         detokenizer = processor.detokenizer
         detokenizer.reset()
@@ -654,11 +719,14 @@ def stream_generate(
         gen = generate_step(input_ids, model, pixel_values, mask, **kwargs)
         tic = time.perf_counter()
 
+        generated_tokens = []
         for n, (token, logprobs) in enumerate(gen):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
-                prompt_tps = input_ids.size / prompt_time
+                prompt_tps = total_prompt_tokens / prompt_time
                 tic = time.perf_counter()
+
+            generated_tokens.append(token)
 
             # Check thinking budget and force token if needed
             if thinking_criteria is not None:
@@ -675,9 +743,9 @@ def stream_generate(
                 text=detokenizer.last_segment,
                 token=token,
                 logprobs=logprobs,
-                prompt_tokens=input_ids.size,
+                prompt_tokens=total_prompt_tokens,
                 generation_tokens=n + 1,
-                total_tokens=input_ids.size + n + 1,
+                total_tokens=total_prompt_tokens + n + 1,
                 prompt_tps=prompt_tps,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
@@ -688,13 +756,20 @@ def stream_generate(
             text=detokenizer.last_segment,
             token=token,
             logprobs=logprobs,
-            prompt_tokens=input_ids.size,
+            prompt_tokens=total_prompt_tokens,
             generation_tokens=n + 1,
-            total_tokens=input_ids.size + n + 1,
+            total_tokens=total_prompt_tokens + n + 1,
             prompt_tps=prompt_tps,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
         )
+
+        # Save cache state for potential reuse on next turn
+        if prompt_cache_state is not None:
+            all_ids = full_input_ids_list + [
+                t.item() if hasattr(t, "item") else t for t in generated_tokens
+            ]
+            prompt_cache_state.update(all_ids, tracked_cache)
 
         # Cleanup after generation
         mx.clear_cache()
