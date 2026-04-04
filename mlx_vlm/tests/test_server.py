@@ -78,7 +78,9 @@ def test_chat_request_schema_allows_one_or_two_resize_shape_values():
         ("/chat/completions", {"messages": [{"role": "user", "content": "Hello"}]}),
     ],
 )
-def test_generation_endpoints_require_model_when_no_server_default(client, path, payload):
+def test_generation_endpoints_require_model_when_no_server_default(
+    client, path, payload
+):
     response = client.post(path, json=payload)
 
     assert response.status_code == 400
