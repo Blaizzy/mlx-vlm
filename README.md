@@ -503,6 +503,16 @@ for chunk in stream_generate(model, processor, prompt2, image=[image],
     print(chunk.text, end="")
 ```
 
+### Server
+
+The server caches vision features automatically across requests for the same image. No configuration needed -- the cache is created when a model loads and cleared on unload.
+
+```sh
+mlx_vlm.server --model google/gemma-4-26b-a4b-it
+```
+
+Multi-turn conversations via `/v1/chat/completions` (streaming and non-streaming) and `/responses` all benefit. The same image sent across multiple requests will only be encoded once.
+
 ### Performance
 
 Tested on `google/gemma-4-26b-a4b-it` over 10 multi-turn conversation turns:
