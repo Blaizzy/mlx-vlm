@@ -919,6 +919,11 @@ class Batch:
     max_tokens: List[int]
     num_tokens: List[int]
     cache: List[Any]
+    tokens: Optional[List[List[int]]] = None
+    samplers: Optional[List[Callable[[mx.array], mx.array]]] = None
+    logits_processors: Optional[
+        List[List[Callable[[mx.array, mx.array], mx.array]]]
+    ] = None
 
     def __len__(self):
         return len(self.uids)
@@ -927,6 +932,12 @@ class Batch:
         self.uids = [self.uids[k] for k in keep_idx]
         self.max_tokens = [self.max_tokens[k] for k in keep_idx]
         self.num_tokens = [self.num_tokens[k] for k in keep_idx]
+        if self.tokens is not None:
+            self.tokens = [self.tokens[k] for k in keep_idx]
+        if self.samplers is not None:
+            self.samplers = [self.samplers[k] for k in keep_idx]
+        if self.logits_processors is not None:
+            self.logits_processors = [self.logits_processors[k] for k in keep_idx]
         keep_idx = mx.array(keep_idx, mx.int32)
         self.y = self.y[keep_idx]
         self.logprobs = self.logprobs[keep_idx]
@@ -939,6 +950,16 @@ class Batch:
         self.logprobs = mx.concatenate([self.logprobs, other.logprobs])
         self.num_tokens.extend(other.num_tokens)
         self.max_tokens.extend(other.max_tokens)
+        if self.tokens is not None and other.tokens is not None:
+            self.tokens.extend(other.tokens)
+        if self.samplers is not None and other.samplers is not None:
+            self.samplers.extend(other.samplers)
+        elif other.samplers is not None:
+            self.samplers = other.samplers
+        if self.logits_processors is not None and other.logits_processors is not None:
+            self.logits_processors.extend(other.logits_processors)
+        elif other.logits_processors is not None:
+            self.logits_processors = other.logits_processors
         for c, o in zip(self.cache, other.cache):
             c.extend(o)
 
@@ -982,14 +1003,24 @@ class BatchGenerator:
 
         self.active_batch = None
 
-    def insert(self, prompts, max_tokens: Union[List[int], int, None] = None):
+    def insert(
+        self,
+        prompts,
+        max_tokens: Union[List[int], int, None] = None,
+        samplers: Optional[List[Callable[[mx.array], mx.array]]] = None,
+        logits_processors: Optional[
+            List[List[Callable[[mx.array, mx.array], mx.array]]]
+        ] = None,
+    ):
         uids = []
 
         if max_tokens is None or isinstance(max_tokens, int):
             max_tokens = [max_tokens or self.max_tokens] * len(prompts)
 
-        for p, m in zip(prompts, max_tokens):
-            self.unprocessed_prompts.append((self.uid_count, p, m))
+        for i, (p, m) in enumerate(zip(prompts, max_tokens)):
+            s = samplers[i] if samplers is not None else None
+            lp = logits_processors[i] if logits_processors is not None else None
+            self.unprocessed_prompts.append((self.uid_count, p, m, s, lp))
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
@@ -999,7 +1030,7 @@ class BatchGenerator:
         return uids
 
     def _process_prompts(self, prompts, **kwargs) -> Batch:
-        uids, inputs, max_tokens = zip(*prompts)
+        uids, inputs, max_tokens, per_samplers, per_lps = zip(*prompts)
         lengths = [len(p) for p in inputs]
         max_length = max(lengths)
 
@@ -1045,23 +1076,53 @@ class BatchGenerator:
                 inputs = inputs[:, n_to_process:]
                 mx.clear_cache()
 
+        batch_samplers = list(per_samplers) if any(s is not None for s in per_samplers) else None
+        batch_lps = list(per_lps) if any(lp is not None for lp in per_lps) else None
+
         y, logprobs = self._step(
-            inputs, prompt_cache, inputs_embeds=inputs_embeds, **kwargs
+            inputs, prompt_cache, inputs_embeds=inputs_embeds,
+            samplers=batch_samplers, logits_processors=batch_lps, **kwargs
         )
 
         mx.async_eval(y, logprobs)
         mx.clear_cache()
         return Batch(
-            list(uids), y, logprobs, list(max_tokens), [0] * len(uids), prompt_cache
+            uids=list(uids),
+            y=y,
+            logprobs=logprobs,
+            max_tokens=list(max_tokens),
+            num_tokens=[0] * len(uids),
+            cache=prompt_cache,
+            tokens=[[] for _ in uids],
+            samplers=batch_samplers,
+            logits_processors=batch_lps,
         )
 
     def _step(self, input_tokens: mx.array, prompt_cache: List[Any], **kwargs):
+        samplers = kwargs.pop("samplers", None)
+        logits_processors = kwargs.pop("logits_processors", None)
+
         output = self.model(input_tokens, cache=prompt_cache, **kwargs)
         logits = output.logits[:, -1, :]
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        sampled = self.sampler(logprobs)
 
-        # TODO: Add KV cache quantization if specified
+        # Apply per-sequence logits processors if provided
+        if logits_processors is not None:
+            for i, lps in enumerate(logits_processors):
+                if lps is not None:
+                    for lp in lps:
+                        logprobs[i] = lp(input_tokens[i], logprobs[i])
+
+        # Apply per-sequence samplers or fallback to shared sampler
+        if samplers is not None and any(s is not None for s in samplers):
+            sampled = []
+            for i, s in enumerate(samplers):
+                fn = s if s is not None else self.sampler
+                sampled.append(fn(logprobs[i]))
+            sampled = mx.stack(sampled)
+        else:
+            sampled = self.sampler(logprobs)
+
         return sampled, logprobs
 
     def stats(self):
@@ -1111,10 +1172,18 @@ class BatchGenerator:
 
         batch = self.active_batch
         y, logprobs = batch.y, batch.logprobs
-        batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
+        batch.y, batch.logprobs = self._step(
+            y[:, None], batch.cache,
+            samplers=batch.samplers,
+            logits_processors=batch.logits_processors,
+        )
         mx.async_eval(batch.y, batch.logprobs)
 
         y = y.tolist()
+        # Track generated tokens per sequence
+        if batch.tokens is not None:
+            for i, t in enumerate(y):
+                batch.tokens[i].append(t)
         toc = time.perf_counter()
         if prompt_processing:
             self._stats.prompt_time += toc - tic

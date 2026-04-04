@@ -172,6 +172,15 @@ class SlidingWindowCache(_BaseCache):
     def trim(self, n):
         return 0
 
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
+
+    def empty(self):
+        return self.keys is None
+
 
 class StaticKVCache(_BaseCache):
     """A static cache that grows to accommodate all tokens."""
@@ -237,3 +246,12 @@ class StaticKVCache(_BaseCache):
         n = min(self.offset, n)
         self.offset -= n
         return n
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
+
+    def empty(self):
+        return self.keys is None
