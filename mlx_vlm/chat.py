@@ -97,15 +97,17 @@ class MLXVisionChat:
             "enable_thinking": self.stream_kwargs.get("enable_thinking", False),
         }
 
+        num_images = 1 if self.current_image_path else 0
+
         prompt = apply_chat_template(
             self.processor,
             self.model.config,
             self.history,
-            num_images=len(self.image_paths),
+            num_images=num_images,
             **chat_template_kwargs,
         )
 
-        image = self.image_paths if self.image_paths else None
+        image = [self.current_image_path] if self.current_image_path else None
 
         rprint("[bold green]Assistant:[/bold green]", end=" ", flush=True)
 
