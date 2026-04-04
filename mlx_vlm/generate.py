@@ -673,9 +673,7 @@ def stream_generate(
                 model.config, "image_token_index", None
             )
             new_ids = input_ids.flatten().tolist()
-            has_image_in_new = (
-                image_token_id is not None and image_token_id in new_ids
-            )
+            has_image_in_new = image_token_id is not None and image_token_id in new_ids
             if not has_image_in_new:
                 pixel_values = None
                 kwargs.pop("cached_image_features", None)

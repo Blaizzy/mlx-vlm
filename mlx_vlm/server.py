@@ -1080,9 +1080,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                         # Only extract images/audio from user messages
                         if message.role == "user":
                             if item["type"] == "input_image":
-                                images.append(item["image_url"])
+                                images = [item["image_url"]]
                             elif item["type"] == "image_url":
-                                images.append(item["image_url"]["url"])
+                                images = [item["image_url"]["url"]]
                             elif item["type"] == "input_audio":
                                 audio.append(item["input_audio"]["data"])
                         if item["type"] in ("text", "input_text"):
