@@ -93,9 +93,6 @@ class MLXVisionChat:
 
     def generate_response(self) -> str:
         """Generate a response from the model based on the conversation history."""
-        if self.current_image is None:
-            return "Please load an image first using the /image command."
-
         chat_template_kwargs = {
             "enable_thinking": self.stream_kwargs.get("enable_thinking", False),
         }
@@ -163,13 +160,6 @@ class MLXVisionChat:
                     if not self.handle_command(command, args):
                         break
                     continue
-                # Handle regular chat input
-                if self.current_image is None:
-                    rprint(
-                        "[bold yellow]Please load an image first using the /image command[/bold yellow]"
-                    )
-                    continue
-
                 self.add_to_history("user", user_input)
                 response = self.generate_response()
 
