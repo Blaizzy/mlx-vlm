@@ -39,6 +39,7 @@ from .prompt_utils import apply_chat_template
 from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load
 from .version import __version__
+from .vision_cache import VisionFeatureCache
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -184,6 +185,7 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
         "model": model,
         "processor": processor,
         "config": config,
+        "vision_cache": VisionFeatureCache(),
     }
 
     return model, processor, config
@@ -900,6 +902,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                         processor=processor,
                         prompt=formatted_prompt,
                         image=images,
+                        vision_cache=model_cache.get("vision_cache"),
                         **generation_kwargs,
                     )
 
@@ -1122,6 +1125,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         prompt=formatted_prompt,
                         image=images,
                         audio=audio,
+                        vision_cache=model_cache.get("vision_cache"),
                         **generation_kwargs,
                     )
 
@@ -1225,6 +1229,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     image=images,
                     audio=audio,
                     verbose=False,  # Keep API output clean
+                    vision_cache=model_cache.get("vision_cache"),
                     **generation_kwargs,
                 )
                 # Clean up resources
