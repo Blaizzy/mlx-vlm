@@ -12,7 +12,6 @@ if __name__ == "__main__":
         "chat_ui",
         "server",
         "video_generate",
-        "smolvlm_video_generate",
     }
 
     if len(sys.argv) < 2:
