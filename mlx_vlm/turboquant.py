@@ -2239,7 +2239,9 @@ def _gen_unrolled_extract(
                 if bit_in_byte == 0:
                     expr = f"{codebook_name}[kb[{byte_idx}] & {mask}u]"
                 else:
-                    expr = f"{codebook_name}[(kb[{byte_idx}] >> {bit_in_byte}) & {mask}u]"
+                    expr = (
+                        f"{codebook_name}[(kb[{byte_idx}] >> {bit_in_byte}) & {mask}u]"
+                    )
             else:
                 low_bits = 8 - bit_in_byte
                 high_mask = (1 << (bits - low_bits)) - 1
@@ -2265,18 +2267,14 @@ def _gen_unrolled_extract(
     return exprs
 
 
-def _gen_unrolled_score(
-    bits: int, n_elems: int, bit_off_var: str = ""
-) -> str:
+def _gen_unrolled_score(bits: int, n_elems: int, bit_off_var: str = "") -> str:
     """Generate score accumulation with unrolled key extraction."""
     exprs = _gen_unrolled_extract(bits, n_elems, "key_codebook", bit_off_var)
     terms = [f"q[{i}] * {expr}" for i, expr in enumerate(exprs)]
     return "\n                + ".join(terms)
 
 
-def _gen_unrolled_value(
-    bits: int, n_elems: int, bit_off_var: str = ""
-) -> str:
+def _gen_unrolled_value(bits: int, n_elems: int, bit_off_var: str = "") -> str:
     """Generate value accumulation with unrolled extraction."""
     exprs = _gen_unrolled_extract(bits, n_elems, "val_codebook", bit_off_var)
     exprs = [e.replace("kb[", "vb[") for e in exprs]
