@@ -11,6 +11,7 @@ from mlx_lm.models.cache import (
     KVCache,
     RotatingKVCache,
     _BaseCache,
+    dynamic_roll,
 )
 
 

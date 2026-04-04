@@ -2,6 +2,7 @@ import argparse
 import codecs
 import contextlib
 import functools
+import importlib
 import json
 import time
 from collections.abc import Sequence
@@ -15,6 +16,9 @@ from mlx_lm.generate import maybe_quantize_kv_cache as mlx_maybe_quantize_kv_cac
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
+
+_mlx_lm_generate = importlib.import_module("mlx_lm.generate")
+SequenceStateMachine = _mlx_lm_generate.SequenceStateMachine
 
 from .models import cache
 from .prompt_utils import apply_chat_template
@@ -835,6 +839,12 @@ def _left_pad_prompts(prompts, max_length=None):
     return mx.array([[0] * (max_length - len(p)) + p for p in prompts])
 
 
+def _right_pad_prompts(prompts, max_length=None):
+    if max_length is None:
+        max_length = max(len(p) for p in prompts)
+    return mx.array([p + [0] * (max_length - len(p)) for p in prompts])
+
+
 def _make_cache(model, left_padding):
     """
     Convert a list of regular caches into their corresponding
@@ -924,6 +934,7 @@ class Batch:
     logits_processors: Optional[
         List[List[Callable[[mx.array, mx.array], mx.array]]]
     ] = None
+    state_machine_states: Optional[List[Any]] = None
 
     def __len__(self):
         return len(self.uids)
@@ -938,6 +949,8 @@ class Batch:
             self.samplers = [self.samplers[k] for k in keep_idx]
         if self.logits_processors is not None:
             self.logits_processors = [self.logits_processors[k] for k in keep_idx]
+        if self.state_machine_states is not None:
+            self.state_machine_states = [self.state_machine_states[k] for k in keep_idx]
         keep_idx = mx.array(keep_idx, mx.int32)
         self.y = self.y[keep_idx]
         self.logprobs = self.logprobs[keep_idx]
@@ -960,6 +973,10 @@ class Batch:
             self.logits_processors.extend(other.logits_processors)
         elif other.logits_processors is not None:
             self.logits_processors = other.logits_processors
+        if self.state_machine_states is not None and other.state_machine_states is not None:
+            self.state_machine_states.extend(other.state_machine_states)
+        elif other.state_machine_states is not None:
+            self.state_machine_states = other.state_machine_states
         for c, o in zip(self.cache, other.cache):
             c.extend(o)
 
@@ -999,6 +1016,17 @@ class BatchGenerator:
         self.prompt_cache = prompt_cache
         self._stats = BatchStats()
 
+        # Build SequenceStateMachine for stop token matching
+        stop_seqs = []
+        if stop_tokens is not None:
+            for t in stop_tokens:
+                stop_seqs.append(([t] if isinstance(t, int) else list(t), None))
+        self._default_state_machine = SequenceStateMachine(
+            {"normal": stop_seqs} if stop_seqs else {},
+            initial="normal",
+        )
+
+        # Keep legacy stopping_criteria for backward compat
         self.tokenizer.stopping_criteria.add_eos_token_ids(stop_tokens)
 
         self.active_batch = None
@@ -1096,6 +1124,9 @@ class BatchGenerator:
             tokens=[[] for _ in uids],
             samplers=batch_samplers,
             logits_processors=batch_lps,
+            state_machine_states=[
+                self._default_state_machine.make_state() for _ in uids
+            ],
         )
 
     def _step(self, input_tokens: mx.array, prompt_cache: List[Any], **kwargs):
@@ -1198,7 +1229,19 @@ class BatchGenerator:
         ):
             num_tok += 1
             batch.num_tokens[e] = num_tok
-            if self.tokenizer.stopping_criteria(t):
+
+            # Use SequenceStateMachine for stop detection (supports multi-token sequences)
+            is_stop = False
+            if batch.state_machine_states is not None:
+                state = batch.state_machine_states[e]
+                new_state, matched_seq, next_name = SequenceStateMachine.match(state, t)
+                batch.state_machine_states[e] = new_state
+                if next_name is None and matched_seq is not None:
+                    is_stop = True
+            else:
+                is_stop = self.tokenizer.stopping_criteria(t)
+
+            if is_stop:
                 finish_reason = "stop"
                 end_idx.append(e)
             elif num_tok >= max_tok:
@@ -1450,6 +1493,16 @@ def _generate_batch(
     if getattr(model, "no_chunked_prefill", False):
         kwargs.pop("prefill_step_size", None)
         kwargs["prefill_step_size"] = None
+
+    # Ensure stop tokens are passed to BatchGenerator
+    if "stop_tokens" not in kwargs:
+        eos_ids = getattr(model.config, "eos_token_id", None)
+        if eos_ids is not None:
+            if isinstance(eos_ids, int):
+                eos_ids = {eos_ids}
+            elif isinstance(eos_ids, list):
+                eos_ids = set(eos_ids)
+            kwargs["stop_tokens"] = eos_ids
 
     # Use batch_size for prefill and completion to ensure consistent processing
     gen = BatchGenerator(
