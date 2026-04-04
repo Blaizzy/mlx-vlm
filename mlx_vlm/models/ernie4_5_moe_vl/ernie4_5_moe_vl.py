@@ -192,10 +192,14 @@ class Model(nn.Module):
         pixel_values = pixel_values.astype(dtype)
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
-        hidden_states = self.vision_tower(
-            pixel_values, grid_thw, output_hidden_states=False
-        )
-        image_features = self.resampler_model(hidden_states, image_grid_thw)
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
+        else:
+            hidden_states = self.vision_tower(
+                pixel_values, grid_thw, output_hidden_states=False
+            )
+            image_features = self.resampler_model(hidden_states, image_grid_thw)
         final_inputs_embeds = self._merge_input_ids_with_image_features(
             image_features,
             inputs_embeds,

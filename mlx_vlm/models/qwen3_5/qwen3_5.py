@@ -46,8 +46,12 @@ class Model(Qwen3VLModel):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the ouptut hidden states from the vision model
-        hidden_states, _ = self.vision_tower(pixel_values, grid_thw)
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            hidden_states = cached
+        else:
+            # Get the ouptut hidden states from the vision model
+            hidden_states, _ = self.vision_tower(pixel_values, grid_thw)
 
         # Insert special image tokens in the input_ids
         inputs_embeds, _ = self.merge_input_ids_with_image_features(

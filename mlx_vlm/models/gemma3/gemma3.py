@@ -97,12 +97,16 @@ class Model(nn.Module):
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        hidden_state, _, _ = self.vision_tower(
-            pixel_values.transpose(0, 2, 3, 1).astype(inputs_embeds.dtype),
-            output_hidden_states=True,
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
+        else:
+            hidden_state, _, _ = self.vision_tower(
+                pixel_values.transpose(0, 2, 3, 1).astype(inputs_embeds.dtype),
+                output_hidden_states=True,
+            )
 
-        image_features = self.multi_modal_projector(hidden_state)
+            image_features = self.multi_modal_projector(hidden_state)
 
         final_inputs_embeds, final_attention_mask_4d = (
             self.prepare_inputs_for_multimodal(

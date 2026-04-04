@@ -76,3 +76,97 @@ class TestVisionFeatureCache:
     def test_default_max_size(self):
         cache = VisionFeatureCache()
         assert cache.max_size == 8
+
+
+class TestCachedImageFeaturesKwarg:
+    """Verify that cached_image_features kwarg is respected by model
+    get_input_embeddings without loading weights — tests the code path only."""
+
+    def _make_mock_model_class(self, model_module_name):
+        """Import a model module and inspect its Model class for the
+        cached_image_features kwarg in get_input_embeddings source."""
+        import importlib
+        import inspect
+
+        mod = importlib.import_module(f"mlx_vlm.models.{model_module_name}")
+        model_cls = None
+        for name, obj in inspect.getmembers(mod, inspect.isclass):
+            if name == "Model":
+                model_cls = obj
+                break
+        return model_cls
+
+    # Verify that the cached_image_features kwarg path exists in source code
+    # for a representative set of models — no weights needed
+    @pytest.mark.parametrize(
+        "model_module",
+        [
+            "llava.llava",
+            "llava_bunny.llava_bunny",
+            "llava_next.llava_next",
+            "gemma3.gemma3",
+            "gemma4.gemma4",
+            "paligemma.paligemma",
+            "qwen2_5_vl.qwen2_5_vl",
+            "qwen2_vl.qwen2_vl",
+            "qwen3_vl.qwen3_vl",
+            "qwen3_5.qwen3_5",
+            "qwen3_vl_moe.qwen3_vl_moe",
+            "internvl_chat.internvl_chat",
+            "mistral3.mistral3",
+            "pixtral.pixtral",
+            "aya_vision.aya_vision",
+            "fastvlm.fastvlm",
+            "glm4v.glm4v",
+            "glm4v_moe.glm4v_moe",
+            "glm_ocr.glm_ocr",
+            "kimi_vl.kimi_vl",
+            "dots_ocr.dots_ocr",
+            "hunyuan_vl.hunyuan_vl",
+            "paddleocr_vl.paddleocr_vl",
+            "ernie4_5_moe_vl.ernie4_5_moe_vl",
+            "mllama.mllama",
+            "granite_vision.granite_vision",
+            "granite4_vision.granite4_vision",
+            "deepseek_vl_v2.deepseek_vl_v2",
+            "multi_modality.multi_modality",
+            "lfm2_vl.lfm2_vl",
+            "idefics2.idefics2",
+            "idefics3.idefics3",
+            "phi4mm.phi4mm",
+            "falcon_ocr.falcon_ocr",
+            "falcon_perception.falcon_perception",
+            "florence2.florence2",
+            "molmo.molmo",
+            "molmo2.molmo2",
+            "moondream3.moondream3",
+            "gemma3n.gemma3n",
+            "phi3_v.phi3_v",
+            "minicpmo.minicpmo",
+            "jina_vlm.jina_vlm",
+            "qwen3_omni_moe.thinker",
+        ],
+    )
+    def test_cached_image_features_in_source(self, model_module):
+        """Verify cached_image_features kwarg appears in get_input_embeddings source."""
+        import importlib
+        import inspect
+
+        mod = importlib.import_module(f"mlx_vlm.models.{model_module}")
+
+        # Find the class that has get_input_embeddings
+        target_cls = None
+        for name, obj in inspect.getmembers(mod, inspect.isclass):
+            if hasattr(obj, "get_input_embeddings") and obj.__module__ == mod.__name__:
+                target_cls = obj
+                break
+
+        assert target_cls is not None, (
+            f"No class with get_input_embeddings in {model_module}"
+        )
+
+        source = inspect.getsource(target_cls.get_input_embeddings)
+        assert "cached_image_features" in source, (
+            f"{model_module}.{target_cls.__name__}.get_input_embeddings "
+            f"missing cached_image_features check"
+        )

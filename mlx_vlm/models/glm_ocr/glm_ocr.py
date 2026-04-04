@@ -40,24 +40,28 @@ class Model(nn.Module):
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        hidden_states = self.vision_tower(
-            pixel_values, grid_thw, output_hidden_states=False
-        )
-
-        split_sizes = (
-            image_grid_thw.prod(-1) // self.vision_tower.spatial_merge_size**2
-        ).tolist()
-
-        if len(split_sizes) > 1:
-            split_indices = []
-            cumsum = 0
-            for size in split_sizes[:-1]:
-                cumsum += size
-                split_indices.append(cumsum)
-            hidden_states = mx.split(hidden_states, split_indices, axis=0)
-            hidden_states = mx.concatenate(hidden_states, axis=0).astype(
-                hidden_states[0].dtype
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            hidden_states = cached
+        else:
+            hidden_states = self.vision_tower(
+                pixel_values, grid_thw, output_hidden_states=False
             )
+
+            split_sizes = (
+                image_grid_thw.prod(-1) // self.vision_tower.spatial_merge_size**2
+            ).tolist()
+
+            if len(split_sizes) > 1:
+                split_indices = []
+                cumsum = 0
+                for size in split_sizes[:-1]:
+                    cumsum += size
+                    split_indices.append(cumsum)
+                hidden_states = mx.split(hidden_states, split_indices, axis=0)
+                hidden_states = mx.concatenate(hidden_states, axis=0).astype(
+                    hidden_states[0].dtype
+                )
 
         final_inputs_embeds = self.merge_input_ids_with_image_features(
             self.config.image_token_id,
