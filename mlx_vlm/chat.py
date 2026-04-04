@@ -2,10 +2,8 @@ import argparse
 import codecs
 import os
 import sys
-import time
 from typing import Dict, List
 
-import mlx.core as mx
 from rich import print as rprint
 from rich.console import Console
 from rich.markdown import Markdown

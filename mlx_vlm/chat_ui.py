@@ -15,7 +15,7 @@ import mlx.core as mx
 from mlx_vlm import load
 
 from .generate import stream_generate
-from .prompt_utils import apply_chat_template, get_chat_template, get_message_json
+from .prompt_utils import get_chat_template, get_message_json
 from .utils import load_config, load_image_processor
 from .vision_cache import VisionFeatureCache
 
