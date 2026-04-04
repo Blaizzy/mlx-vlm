@@ -46,8 +46,55 @@ DEFAULT_THINKING_START_TOKEN = "<think>"
 DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
+DEFAULT_GENERATION_CONFIG = {
+    "max_tokens": DEFAULT_MAX_TOKENS,
+    "temperature": DEFAULT_TEMPERATURE,
+    "top_p": DEFAULT_TOP_P,
+    "min_p": DEFAULT_MIN_P,
+    "top_k": DEFAULT_TOP_K,
+    "repetition_penalty": None,
+    "logit_bias": None,
+    "resize_shape": None,
+    "prefill_step_size": DEFAULT_PREFILL_STEP_SIZE,
+    "max_kv_size": None,
+    "kv_bits": None,
+    "kv_group_size": DEFAULT_KV_GROUP_SIZE,
+    "kv_quant_scheme": DEFAULT_KV_QUANT_SCHEME,
+    "quantized_kv_start": DEFAULT_QUANTIZED_KV_START,
+}
+GENERATION_KWARG_KEYS = frozenset(DEFAULT_GENERATION_CONFIG)
 
 
+def filter_generation_config(values: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if not values:
+        return {}
+    return {
+        key: value
+        for key, value in values.items()
+        if key in GENERATION_KWARG_KEYS and value is not None
+    }
+
+
+def resolve_generation_config(
+    generation: Optional[dict[str, Any]],
+    model_name: Optional[str] = None,
+) -> dict[str, Any]:
+    resolved = DEFAULT_GENERATION_CONFIG.copy()
+    resolved.update(filter_generation_config(generation))
+
+    resolved["resize_shape"] = normalize_resize_shape(resolved["resize_shape"])
+
+    if resolved["kv_bits"] == 0:
+        resolved["kv_bits"] = None
+    if resolved["max_kv_size"] == 0:
+        resolved["max_kv_size"] = None
+
+    if model_name and "qat" in model_name.lower() and resolved["kv_bits"] is not None:
+        resolved["kv_bits"] = None
+    if resolved["kv_bits"] is not None and resolved["max_kv_size"] is not None:
+        resolved["max_kv_size"] = None
+
+    return resolved
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Generate text from an image using a model."

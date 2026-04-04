@@ -20,19 +20,16 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
 from .generate import (
-    DEFAULT_KV_GROUP_SIZE,
-    DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_MAX_TOKENS,
-    DEFAULT_MODEL_PATH,
-    DEFAULT_PREFILL_STEP_SIZE,
-    DEFAULT_QUANTIZED_KV_START,
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_THINKING_END_TOKEN,
     DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
+    filter_generation_config,
     generate,
     normalize_resize_shape,
+    resolve_generation_config,
     stream_generate,
 )
 from .prompt_utils import apply_chat_template
@@ -42,51 +39,33 @@ from .version import __version__
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
+_SERVER_GENERATION_ENV = {
+    "max_tokens": ("MLX_VLM_SERVER_MAX_TOKENS", int),
+    "temperature": ("MLX_VLM_SERVER_TEMPERATURE", float),
+    "top_p": ("MLX_VLM_SERVER_TOP_P", float),
+    "top_k": ("MLX_VLM_SERVER_TOP_K", int),
+    "min_p": ("MLX_VLM_SERVER_MIN_P", float),
+    "prefill_step_size": ("PREFILL_STEP_SIZE", int),
+    "kv_bits": ("KV_BITS", float),
+    "kv_group_size": ("KV_GROUP_SIZE", int),
+    "kv_quant_scheme": ("KV_QUANT_SCHEME", str),
+    "max_kv_size": ("MAX_KV_SIZE", int),
+    "quantized_kv_start": ("QUANTIZED_KV_START", int),
+}
 
 
-def get_prefill_step_size():
-    return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
-
-
-def get_quantized_kv_bits(model: str):
-    kv_bits = float(os.environ.get("KV_BITS", 0))
-    if kv_bits == 0:
-        return None
-    if "qat" in model:
-        print(
-            f"Model {model} is quantization aware, (Rotating)KVCache cache will not be quantized to {kv_bits} bits, use --max-kv-size [tokens] instead."
-        )
-        return None
-    return kv_bits
-
-
-def get_kv_group_size():
-    return int(os.environ.get("KV_GROUP_SIZE", DEFAULT_KV_GROUP_SIZE))
-
-
-def get_kv_quant_scheme():
-    return os.environ.get("KV_QUANT_SCHEME", DEFAULT_KV_QUANT_SCHEME)
-
-
-def get_max_kv_size(model: str):
-    max_kv_tokens = int(os.environ.get("MAX_KV_SIZE", 0))
-    if max_kv_tokens == 0:
-        return None
-    if get_quantized_kv_bits(model) is not None:
-        print(
-            f"Model {model} uses QuantizedKVCache cache, can't set max KV size, use --kv-bits [bits] instead."
-        )
-        return None
-    return max_kv_tokens
-
-
-def get_quantized_kv_start():
-    return int(os.environ.get("QUANTIZED_KV_START", DEFAULT_QUANTIZED_KV_START))
+def load_server_generation_defaults() -> dict[str, Any]:
+    generation = {}
+    for key, (env_name, cast) in _SERVER_GENERATION_ENV.items():
+        raw = os.environ.get(env_name)
+        if raw is None:
+            continue
+        generation[key] = cast(raw)
+    return filter_generation_config(generation)
 
 
 @asynccontextmanager
 async def lifespan(app):
-    # Startup
     model_path = os.environ.get("PRELOAD_MODEL")
     adapter_path = os.environ.get("PRELOAD_ADAPTER") or None
     if model_path:
@@ -131,7 +110,30 @@ class FlexibleBaseModel(BaseModel):
         return self.model_dump(include=set(fields), exclude_none=True)
 
 
-def load_model_resources(model_path: str, adapter_path: Optional[str]):
+def resolve_request_config(
+    request: Any,
+    *,
+    max_tokens_field: str = "max_tokens",
+) -> tuple[str, Optional[str], dict[str, Any]]:
+    request_data = request.model_dump(exclude_none=True, exclude_unset=True)
+    if max_tokens_field != "max_tokens" and max_tokens_field in request_data:
+        request_data["max_tokens"] = request_data.pop(max_tokens_field)
+
+    model_path = request.model
+    adapter_path = getattr(request, "adapter_path", None)
+    generation = {
+        **load_server_generation_defaults(),
+        **filter_generation_config(request_data),
+    }
+    resolved_generation = resolve_generation_config(generation, model_name=model_path)
+    return model_path, adapter_path, resolved_generation
+
+
+def load_model_resources(
+    model_path: str,
+    adapter_path: Optional[str],
+    trust_remote_code: bool,
+):
     """
     Loads model, processor, and config based on paths.
     Handles potential loading errors.
@@ -140,10 +142,6 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         print(f"Loading model from: {model_path}")
         if adapter_path:
             print(f"Loading adapter from: {adapter_path}")
-        # Use the load function from utils.py which handles path resolution and loading
-        trust_remote_code = (
-            os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
-        )
         model, processor = load(
             model_path, adapter_path, trust_remote_code=trust_remote_code
         )
@@ -156,13 +154,20 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         raise HTTPException(status_code=500, detail=f"Failed to load model: {e}")
 
 
-def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
+def get_cached_model(
+    model_path: str,
+    adapter_path: Optional[str] = None,
+):
     """
     Factory function to get or load the appropriate model resources from cache or by loading.
     """
     global model_cache
 
-    cache_key = (model_path, adapter_path)
+    trust_remote_code = (
+        os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
+    )
+
+    cache_key = (model_path, adapter_path, trust_remote_code)
 
     # Return from cache if already loaded and matches the requested paths
     if model_cache.get("cache_key") == cache_key:
@@ -175,12 +180,17 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
         unload_model_sync()  # Use a synchronous version for internal call
 
     # Load the model resources
-    model, processor, config = load_model_resources(model_path, adapter_path)
+    model, processor, config = load_model_resources(
+        model_path,
+        adapter_path,
+        trust_remote_code=trust_remote_code,
+    )
 
     model_cache = {
         "cache_key": cache_key,
         "model_path": model_path,
         "adapter_path": adapter_path,
+        "trust_remote_code": trust_remote_code,
         "model": model,
         "processor": processor,
         "config": config,
@@ -321,16 +331,6 @@ class GenerationParams(FlexibleBaseModel):
         None, description="Additive logit bias keyed by token id."
     )
 
-    def shared_generation_kwargs(self) -> dict[str, Any]:
-        return self.dump_kwargs(
-            "temperature",
-            "top_p",
-            "top_k",
-            "min_p",
-            "repetition_penalty",
-            "logit_bias",
-        )
-
 
 class TemplateParams(FlexibleBaseModel):
     enable_thinking: Optional[bool] = Field(
@@ -378,11 +378,6 @@ class OpenAIRequest(GenerationParams, TemplateParams):
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
-
-    def generation_kwargs(self) -> dict[str, Any]:
-        kwargs = self.dump_kwargs("max_output_tokens")
-        kwargs["max_tokens"] = kwargs.pop("max_output_tokens")
-        return {**kwargs, **self.shared_generation_kwargs()}
 
 
 class OpenAIUsage(BaseModel):
@@ -544,7 +539,7 @@ StreamEvent = Union[
 
 class VLMRequest(GenerationParams, TemplateParams):
     model: str = Field(
-        DEFAULT_MODEL_PATH,
+        ...,
         description="The path to the local model directory or Hugging Face repo.",
     )
     adapter_path: Optional[str] = Field(
@@ -564,12 +559,6 @@ class VLMRequest(GenerationParams, TemplateParams):
     @classmethod
     def normalize_resize_shape_field(cls, value):
         return normalize_resize_shape(value)
-
-    def generation_kwargs(self) -> dict[str, Any]:
-        return {
-            **self.dump_kwargs("max_tokens", "resize_shape"),
-            **self.shared_generation_kwargs(),
-        }
 
 
 class GenerationRequest(VLMRequest):
@@ -624,22 +613,6 @@ class ChatStreamChunk(BaseModel):
     model: str
     choices: List[ChatStreamChoice]
     usage: Optional[UsageStats]
-
-
-def build_generation_kwargs(
-    request: Any,
-    template_kwargs: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        "prefill_step_size": get_prefill_step_size(),
-        "kv_bits": get_quantized_kv_bits(request.model),
-        "kv_group_size": get_kv_group_size(),
-        "kv_quant_scheme": get_kv_quant_scheme(),
-        "max_kv_size": get_max_kv_size(request.model),
-        "quantized_kv_start": get_quantized_kv_start(),
-        **request.generation_kwargs(),
-        **template_kwargs,
-    }
 
 
 def process_tool_calls(model_output: str, tool_module, tools):
@@ -761,8 +734,12 @@ async def responses_endpoint(openai_request: OpenAIRequest):
     """
 
     try:
-        # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(openai_request.model)
+        model_path, adapter_path, resolved_generation = resolve_request_config(
+            openai_request,
+            max_tokens_field="max_output_tokens",
+        )
+
+        model, processor, config = get_cached_model(model_path, adapter_path)
 
         chat_messages = []
         images = []
@@ -841,7 +818,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
             num_images=len(images),
             **template_kwargs,
         )
-        generation_kwargs = build_generation_kwargs(openai_request, template_kwargs)
+        generation_kwargs = {**resolved_generation, **template_kwargs}
 
         generated_at = datetime.now().timestamp()
         response_id = f"resp_{uuid.uuid4().hex}"
@@ -859,12 +836,12 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                         created_at=int(generated_at),
                         status="in_progress",
                         instructions=instructions,
-                        max_output_tokens=openai_request.max_output_tokens,
-                        model=openai_request.model,
+                        max_output_tokens=resolved_generation["max_tokens"],
+                        model=model_path,
                         output=[],
                         output_text="",
-                        temperature=openai_request.temperature,
-                        top_p=openai_request.top_p,
+                        temperature=resolved_generation["temperature"],
+                        top_p=resolved_generation["top_p"],
                         usage={
                             "input_tokens": 0,  # get prompt tokens
                             "output_tokens": 0,
@@ -997,8 +974,8 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     created_at=int(generated_at),
                     status="completed",
                     instructions=instructions,
-                    max_output_tokens=openai_request.max_output_tokens,
-                    model=openai_request.model,
+                    max_output_tokens=resolved_generation["max_tokens"],
+                    model=model_path,
                     output=[
                         {
                             "role": "assistant",
@@ -1011,8 +988,8 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                         }
                     ],
                     output_text=result.text,
-                    temperature=openai_request.temperature,
-                    top_p=openai_request.top_p,
+                    temperature=resolved_generation["temperature"],
+                    top_p=resolved_generation["top_p"],
                     usage={
                         "input_tokens": result.prompt_tokens,
                         "output_tokens": result.generation_tokens,
@@ -1055,8 +1032,8 @@ async def chat_completions_endpoint(request: ChatRequest):
     """
 
     try:
-        # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(request.model, request.adapter_path)
+        model_path, adapter_path, resolved_generation = resolve_request_config(request)
+        model, processor, config = get_cached_model(model_path, adapter_path)
 
         images = []
         audio = []
@@ -1108,7 +1085,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             tools=tools,
             **template_kwargs,
         )
-        generation_kwargs = build_generation_kwargs(request, template_kwargs)
+        generation_kwargs = {**resolved_generation, **template_kwargs}
 
         if request.stream:
             # Streaming response
@@ -1153,7 +1130,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         chunk_data = ChatStreamChunk(
                             id=request_id,
                             created=int(time.time()),
-                            model=request.model,
+                            model=model_path,
                             usage=usage_stats,
                             choices=choices,
                         )
@@ -1185,7 +1162,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     chunk_data = ChatStreamChunk(
                         id=request_id,
                         created=int(time.time()),
-                        model=request.model,
+                        model=model_path,
                         usage=usage_stats,
                         choices=choices,
                     )
@@ -1264,7 +1241,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 ]
 
                 result = ChatResponse(
-                    model=request.model, usage=usage_stats, choices=choices
+                    model=model_path, usage=usage_stats, choices=choices
                 )
 
                 return result
@@ -1384,12 +1361,45 @@ def main():
     parser.add_argument(
         "--trust-remote-code",
         action="store_true",
+        default=None,
         help="Trust remote code when loading models from Hugging Face Hub.",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Server default for the maximum number of tokens to generate.",
+    )
+    parser.add_argument(
+        "--temperature",
+        "--temp",
+        dest="temperature",
+        type=float,
+        default=None,
+        help="Server default for the sampling temperature.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Server default for top-p sampling.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="Server default for top-k sampling.",
+    )
+    parser.add_argument(
+        "--min-p",
+        type=float,
+        default=None,
+        help="Server default for min-p sampling.",
     )
     parser.add_argument(
         "--prefill-step-size",
         type=int,
-        default=DEFAULT_PREFILL_STEP_SIZE,
+        default=None,
         help="Number of tokens to process per prefill step. "
         "Lower values reduce peak memory usage but may be slower. "
         "Try 512 or 256 if you hit GPU memory errors during prefill.",
@@ -1397,33 +1407,33 @@ def main():
     parser.add_argument(
         "--kv-bits",
         type=float,
-        default=0,
+        default=None,
         help="Number of bits for KV cache quantization.",
     )
     parser.add_argument(
         "--kv-quant-scheme",
         type=str,
         choices=("uniform", "turboquant"),
-        default=DEFAULT_KV_QUANT_SCHEME,
+        default=None,
         help="KV cache quantization backend. Fractional --kv-bits values use "
         "TurboQuant automatically.",
     )
     parser.add_argument(
         "--kv-group-size",
         type=int,
-        default=DEFAULT_KV_GROUP_SIZE,
+        default=None,
         help="Group size for uniform KV cache quantization.",
     )
     parser.add_argument(
         "--max-kv-size",
         type=int,
-        default=0,
+        default=None,
         help="Maximum KV size for the prompt cache (tokens).",
     )
     parser.add_argument(
         "--quantized-kv-start",
         type=int,
-        default=DEFAULT_QUANTIZED_KV_START,
+        default=None,
         help="Start index (of token) for the quantized KV cache.",
     )
     parser.add_argument(
@@ -1441,12 +1451,10 @@ def main():
         os.environ["PRELOAD_MODEL"] = args.model
     if args.adapter_path:
         os.environ["PRELOAD_ADAPTER"] = args.adapter_path
-    os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
-    os.environ["KV_BITS"] = str(args.kv_bits)
-    os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
-    os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
-    os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
-    os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    for key, (env_name, _) in _SERVER_GENERATION_ENV.items():
+        value = getattr(args, key, None)
+        if value is not None:
+            os.environ[env_name] = str(value)
 
     uvicorn.run(
         "mlx_vlm.server:app",

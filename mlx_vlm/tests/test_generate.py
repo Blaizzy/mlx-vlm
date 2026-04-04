@@ -17,6 +17,7 @@ from mlx_vlm.generate import (
     GenerationResult,
     _left_pad_prompts,
     normalize_resize_shape,
+    resolve_generation_config,
 )
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
@@ -1042,6 +1043,25 @@ def test_normalize_resize_shape_accepts_two_values():
 def test_normalize_resize_shape_rejects_invalid_values(value):
     with pytest.raises(ValueError, match="resize_shape must contain 1 or 2 integers"):
         normalize_resize_shape(value)
+
+
+@pytest.mark.parametrize(
+    ("model_name", "expected_kv_bits", "expected_max_kv_size"),
+    [
+        ("mlx-community/demo-qat", None, 256),
+        ("mlx-community/demo", pytest.approx(3.5), None),
+    ],
+)
+def test_resolve_generation_config_applies_kv_conflict_rules(
+    model_name, expected_kv_bits, expected_max_kv_size
+):
+    resolved = resolve_generation_config(
+        {"kv_bits": 3.5, "max_kv_size": 256},
+        model_name=model_name,
+    )
+
+    assert resolved["kv_bits"] == expected_kv_bits
+    assert resolved["max_kv_size"] == expected_max_kv_size
 
 
 def test_generate_cli_smoke(capsys):
