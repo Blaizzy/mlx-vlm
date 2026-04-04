@@ -12,8 +12,8 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 
 from mlx_vlm import load
-from mlx_vlm.generate import generate_step
-from mlx_vlm.prompt_utils import get_message_json
+from mlx_vlm.generate import stream_generate
+from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_image
 from mlx_vlm.vision_cache import VisionFeatureCache
 
@@ -80,83 +80,33 @@ class MLXVisionChat:
         if self.current_image is None:
             return "Please load an image first using the /image command."
 
-        messages = []
-        for i, message in enumerate(self.history):
-            skip_token = True
-            if i == len(self.history) - 1 and message["role"] == "user":
-                skip_token = False
-            messages.append(
-                get_message_json(
-                    self.model.config.model_type,
-                    message["content"][0]["text"],
-                    role=message["role"],
-                    skip_image_token=skip_token,
-                )
-            )
-
-        text_prompt = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        prompt = apply_chat_template(
+            self.processor,
+            self.model.config,
+            self.history,
+            num_images=1,
         )
 
-        inputs = self.processor(
-            text=[text_prompt],
-            images=[self.current_image],
-            padding=True,
-            return_tensors="np",
-        )
+        image = [self.current_image_path] if self.current_image_path else None
 
-        pixel_values = mx.array(inputs["pixel_values"])
-        input_ids = mx.array(inputs["input_ids"])
-        mask = mx.array(inputs["attention_mask"])
-
-        # Use cached image features if available
-        extra_kwargs = {}
-        if self.current_image_path is not None:
-            cached = self.vision_cache.get(self.current_image_path)
-            if cached is not None:
-                extra_kwargs["cached_image_features"] = cached
-            elif hasattr(self.model, "encode_image"):
-                features = self.model.encode_image(pixel_values)
-                mx.eval(features)
-                self.vision_cache.put(self.current_image_path, features)
-                extra_kwargs["cached_image_features"] = features
-
-        detokenizer = self.processor.detokenizer
-        detokenizer.reset()
-
-        tic = time.perf_counter()
-
-        generator = generate_step(
-            input_ids,
-            self.model,
-            pixel_values,
-            mask,
-            temperature=self.temperature,
-            **extra_kwargs,
-        )
-
-        # Use print instead of rprint to avoid rich console's automatic newlines
         rprint("[bold green]Assistant:[/bold green]", end=" ", flush=True)
-        for (token, prob), n in zip(generator, range(self.max_tokens)):
-            if n == 0:
-                prompt_time = time.perf_counter() - tic
-                tic = time.perf_counter()
 
-            eos = self.model.config.eos_token_id
-            if isinstance(eos, list):
-                is_eos = token in eos
-            else:
-                is_eos = token == eos
-            if is_eos and n > 0:
-                break
-
-            detokenizer.add_token(token)
-
+        text = ""
+        tic = time.perf_counter()
+        for chunk in stream_generate(
+            self.model,
+            self.processor,
+            prompt,
+            image=image,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            vision_cache=self.vision_cache,
+        ):
+            text += chunk.text
             if self.verbose:
-                rprint(detokenizer.last_segment, end="", flush=True)
+                rprint(chunk.text, end="", flush=True)
 
-        detokenizer.finalize()
-        return detokenizer.text
+        return text
 
     def handle_command(self, command: str, args: str) -> bool:
         """Handle special commands. Returns True if should continue chat, False if should exit."""
