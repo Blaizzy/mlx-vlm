@@ -17,9 +17,7 @@ logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler())
 
 
-def extract_video_frames(
-    video_path: str, max_frames: int = 50
-) -> List[Image.Image]:
+def extract_video_frames(video_path: str, max_frames: int = 50) -> List[Image.Image]:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError(f"Could not open video: {video_path}")
