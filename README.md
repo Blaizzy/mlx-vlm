@@ -205,6 +205,8 @@ mlx_vlm.server --trust-remote-code
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
 - `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
+- `--kv-bits`: Number of bits for KV cache quantization (e.g. `3.5` for TurboQuant)
+- `--kv-quant-scheme`: KV cache quantization backend (`uniform` or `turboquant`)
 
 You can also set trust remote code via environment variable:
 ```sh
@@ -473,12 +475,19 @@ result = generate(
 )
 ```
 
+```sh
+# Server with TurboQuant
+mlx_vlm server \
+  --model google/gemma-4-26b-a4b-it \
+  --kv-bits 3.5 \
+  --kv-quant-scheme turboquant
+```
+
 ### How It Works
 
 TurboQuant uses random rotation + codebook quantization ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) to compress KV cache entries from 16-bit to 2-4 bits per dimension:
 
-- **Keys**: ProdCodec (MSE codebook + QJL sign residual) for accurate attention scoring
-- **Values**: MSE codebook for reconstruction quality
+- **Keys & Values**: MSE codebook quantization with Hadamard rotation
 - **Fractional bits** (e.g. 3.5): uses lower bits for keys, higher for values (3-bit K + 4-bit V)
 
 Custom Metal kernels fuse score computation and value aggregation directly on packed quantized data, avoiding full dequantization during decode.
