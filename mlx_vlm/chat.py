@@ -33,6 +33,7 @@ class MLXVisionChat:
         self.history: List[Dict] = []
         self.current_image = None
         self.current_image_path = None
+        self.image_paths: List[str] = []
         self.vision_cache = VisionFeatureCache()
 
         with self.console.status("[bold green]Loading model..."):
@@ -64,6 +65,8 @@ class MLXVisionChat:
 
             self.current_image = load_image(image_path)
             self.current_image_path = image_path
+            if image_path not in self.image_paths:
+                self.image_paths.append(image_path)
             rprint(f"[bold blue]Loaded image:[/bold blue] {image_path}")
             return True
         except Exception as e:
@@ -84,10 +87,10 @@ class MLXVisionChat:
             self.processor,
             self.model.config,
             self.history,
-            num_images=1,
+            num_images=len(self.image_paths),
         )
 
-        image = [self.current_image_path] if self.current_image_path else None
+        image = self.image_paths if self.image_paths else None
 
         rprint("[bold green]Assistant:[/bold green]", end=" ", flush=True)
 
@@ -117,6 +120,7 @@ class MLXVisionChat:
             self.print_help()
         elif command == "/clear":
             self.history.clear()
+            self.image_paths.clear()
             rprint("[bold blue]Conversation history cleared.[/bold blue]")
         elif command == "/image":
             if not args:
