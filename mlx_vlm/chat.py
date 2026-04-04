@@ -1,4 +1,5 @@
 import argparse
+import codecs
 import os
 import sys
 import time
@@ -12,7 +13,17 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 
 from mlx_vlm import load
-from mlx_vlm.generate import stream_generate
+from mlx_vlm.generate import (
+    DEFAULT_KV_GROUP_SIZE,
+    DEFAULT_KV_QUANT_SCHEME,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_PREFILL_STEP_SIZE,
+    DEFAULT_QUANTIZED_KV_START,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_THINKING_END_TOKEN,
+    DEFAULT_THINKING_START_TOKEN,
+    stream_generate,
+)
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_image
 from mlx_vlm.vision_cache import VisionFeatureCache
@@ -25,6 +36,7 @@ class MLXVisionChat:
         temperature: float = 0.7,
         max_tokens: int = 1000,
         verbose: bool = False,
+        **kwargs,
     ):
         self.console = Console()
         self.verbose = verbose
@@ -35,6 +47,7 @@ class MLXVisionChat:
         self.current_image_path = None
         self.image_paths: List[str] = []
         self.vision_cache = VisionFeatureCache()
+        self.stream_kwargs = kwargs
 
         with self.console.status("[bold green]Loading model..."):
             self.model, self.processor = load(model_path)
@@ -83,11 +96,16 @@ class MLXVisionChat:
         if self.current_image is None:
             return "Please load an image first using the /image command."
 
+        chat_template_kwargs = {
+            "enable_thinking": self.stream_kwargs.get("enable_thinking", False),
+        }
+
         prompt = apply_chat_template(
             self.processor,
             self.model.config,
             self.history,
             num_images=len(self.image_paths),
+            **chat_template_kwargs,
         )
 
         image = self.image_paths if self.image_paths else None
@@ -95,7 +113,6 @@ class MLXVisionChat:
         rprint("[bold green]Assistant:[/bold green]", end=" ", flush=True)
 
         text = ""
-        tic = time.perf_counter()
         for chunk in stream_generate(
             self.model,
             self.processor,
@@ -104,6 +121,7 @@ class MLXVisionChat:
             max_tokens=self.max_tokens,
             temperature=self.temperature,
             vision_cache=self.vision_cache,
+            **self.stream_kwargs,
         ):
             text += chunk.text
             if self.verbose:
@@ -182,16 +200,136 @@ def main():
     )
     parser.add_argument("--verbose", action="store_false", help="Enable verbose output")
     parser.add_argument(
-        "--temperature", type=float, default=0.7, help="Temperature for the model"
+        "--temperature",
+        type=float,
+        default=DEFAULT_TEMPERATURE,
+        help="Temperature for sampling.",
     )
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=1000,
-        help="Maximum number of new tokens to generate",
+        default=DEFAULT_MAX_TOKENS,
+        help="Maximum number of tokens to generate.",
+    )
+    parser.add_argument(
+        "--resize-shape",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Resize shape for the image.",
+    )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=DEFAULT_PREFILL_STEP_SIZE,
+        help="Number of tokens to process per prefill step.",
+    )
+    parser.add_argument(
+        "--max-kv-size",
+        type=int,
+        default=None,
+        help="Maximum KV size for the prompt cache.",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=float,
+        default=None,
+        help="Number of bits to quantize the KV cache to.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=DEFAULT_KV_GROUP_SIZE,
+        help="Group size for uniform KV cache quantization.",
+    )
+    parser.add_argument(
+        "--kv-quant-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=DEFAULT_KV_QUANT_SCHEME,
+        help="KV cache quantization backend.",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=DEFAULT_QUANTIZED_KV_START,
+        help="Start index for the quantized KV cache.",
+    )
+    parser.add_argument(
+        "--eos-tokens",
+        type=str,
+        nargs="+",
+        default=None,
+        help="EOS tokens to add to the tokenizer.",
+    )
+    parser.add_argument(
+        "--skip-special-tokens",
+        action="store_true",
+        help="Skip special tokens in the detokenizer.",
+    )
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="Enable thinking mode in the chat template.",
+    )
+    parser.add_argument(
+        "--thinking-budget",
+        type=int,
+        default=None,
+        help="Maximum number of thinking tokens before forcing end-of-thinking.",
+    )
+    parser.add_argument(
+        "--thinking-start-token",
+        type=str,
+        default=DEFAULT_THINKING_START_TOKEN,
+        help="Token that marks the start of a thinking block.",
+    )
+    parser.add_argument(
+        "--thinking-end-token",
+        type=str,
+        default=DEFAULT_THINKING_END_TOKEN,
+        help="Token that marks the end of a thinking block.",
     )
 
     args = parser.parse_args()
+
+    # Build stream_generate kwargs matching generate.py's main()
+    kwargs = {}
+
+    if args.eos_tokens is not None:
+        eos_tokens = []
+        for token in args.eos_tokens:
+            try:
+                decoded_token = codecs.decode(token, "unicode_escape")
+                eos_tokens.append(decoded_token)
+            except (UnicodeDecodeError, UnicodeError):
+                eos_tokens.append(token)
+        kwargs["eos_tokens"] = eos_tokens
+
+    if args.skip_special_tokens:
+        kwargs["skip_special_tokens"] = args.skip_special_tokens
+
+    # Thinking kwargs
+    kwargs["enable_thinking"] = args.enable_thinking
+    if args.thinking_budget is not None:
+        kwargs["thinking_budget"] = args.thinking_budget
+        kwargs["thinking_end_token"] = args.thinking_end_token
+        if args.thinking_start_token is not None:
+            kwargs["thinking_start_token"] = args.thinking_start_token
+
+    # KV cache kwargs
+    if args.max_kv_size is not None:
+        kwargs["max_kv_size"] = args.max_kv_size
+    if args.kv_bits is not None:
+        kwargs["kv_bits"] = args.kv_bits
+        kwargs["kv_group_size"] = args.kv_group_size
+        kwargs["kv_quant_scheme"] = args.kv_quant_scheme
+        kwargs["quantized_kv_start"] = args.quantized_kv_start
+
+    if args.resize_shape is not None:
+        kwargs["resize_shape"] = args.resize_shape
+    if args.prefill_step_size is not None:
+        kwargs["prefill_step_size"] = args.prefill_step_size
 
     try:
         chat = MLXVisionChat(
@@ -199,6 +337,7 @@ def main():
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             verbose=args.verbose,
+            **kwargs,
         )
         chat.chat_loop()
     except Exception as e:
