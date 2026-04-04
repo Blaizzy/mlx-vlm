@@ -5,26 +5,10 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
-
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
-from .processing_ernie4_5_moe_vl import (
-    Ernie4_5_VLProcessor,
-    Ernie4_5_VLTokenizer,
-    ImageProcessor,
-)
 from .vision import VisionModel
-
-# Register custom processor classes for ernie4_5_moe_vl model type
-MODEL_TYPE = "ernie4_5_moe_vl"
-try:
-    AutoImageProcessor.register(MODEL_TYPE, slow_image_processor_class=ImageProcessor)
-    AutoTokenizer.register(MODEL_TYPE, slow_tokenizer_class=Ernie4_5_VLTokenizer)
-    AutoProcessor.register(MODEL_TYPE, Ernie4_5_VLProcessor)
-except Exception:
-    pass  # Already registered or registration not needed
 
 
 class TokenType:
