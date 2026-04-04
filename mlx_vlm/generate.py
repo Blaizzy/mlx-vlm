@@ -668,9 +668,17 @@ def stream_generate(
             reused_prefix_len = prefix_len
             # Trim to only new tokens
             input_ids = input_ids[:, prefix_len:]
-            # Image features are already in the KV cache, skip vision
-            pixel_values = None
-            kwargs.pop("cached_image_features", None)
+            # Only skip vision if no image tokens in the new (trimmed) tokens
+            image_token_id = getattr(model.config, "image_token_id", None) or getattr(
+                model.config, "image_token_index", None
+            )
+            new_ids = input_ids.flatten().tolist()
+            has_image_in_new = (
+                image_token_id is not None and image_token_id in new_ids
+            )
+            if not has_image_in_new:
+                pixel_values = None
+                kwargs.pop("cached_image_features", None)
             # Reuse the saved KV cache (trimmed to prefix length)
             kv_cache = prompt_cache_state.cache
             # Trim cache to prefix_len in case it includes generated tokens

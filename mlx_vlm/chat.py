@@ -98,6 +98,7 @@ class MLXVisionChat:
         }
 
         num_images = 1 if self.current_image_path else 0
+        image = [self.current_image_path] if self.current_image_path else None
 
         prompt = apply_chat_template(
             self.processor,
@@ -106,8 +107,6 @@ class MLXVisionChat:
             num_images=num_images,
             **chat_template_kwargs,
         )
-
-        image = [self.current_image_path] if self.current_image_path else None
 
         rprint("[bold green]Assistant:[/bold green]", end=" ", flush=True)
 
