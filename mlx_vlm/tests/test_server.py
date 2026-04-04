@@ -92,6 +92,7 @@ def test_responses_endpoint_uses_server_generation_defaults_in_metadata(
     monkeypatch.setenv("MLX_VLM_SERVER_TOP_P", "0.85")
     monkeypatch.setenv("MLX_VLM_SERVER_TOP_K", "20")
     monkeypatch.setenv("MLX_VLM_SERVER_MIN_P", "0.05")
+    monkeypatch.setenv("MLX_VLM_SERVER_REPETITION_PENALTY", "1.1")
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
@@ -121,6 +122,7 @@ def test_responses_endpoint_uses_server_generation_defaults_in_metadata(
     assert mock_generate.call_args.kwargs["top_p"] == pytest.approx(0.85)
     assert mock_generate.call_args.kwargs["top_k"] == 20
     assert mock_generate.call_args.kwargs["min_p"] == pytest.approx(0.05)
+    assert mock_generate.call_args.kwargs["repetition_penalty"] == pytest.approx(1.1)
     assert response.json()["model"] == "server-model"
     assert response.json()["max_output_tokens"] == 12
     assert response.json()["temperature"] == pytest.approx(0.9)

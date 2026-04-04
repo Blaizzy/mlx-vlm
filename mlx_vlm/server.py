@@ -45,6 +45,7 @@ _SERVER_GENERATION_ENV = {
     "top_p": ("MLX_VLM_SERVER_TOP_P", float),
     "top_k": ("MLX_VLM_SERVER_TOP_K", int),
     "min_p": ("MLX_VLM_SERVER_MIN_P", float),
+    "repetition_penalty": ("MLX_VLM_SERVER_REPETITION_PENALTY", float),
     "prefill_step_size": ("PREFILL_STEP_SIZE", int),
     "kv_bits": ("KV_BITS", float),
     "kv_group_size": ("KV_GROUP_SIZE", int),
@@ -1395,6 +1396,12 @@ def main():
         type=float,
         default=None,
         help="Server default for min-p sampling.",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=None,
+        help="Server default for repetition penalty.",
     )
     parser.add_argument(
         "--prefill-step-size",
