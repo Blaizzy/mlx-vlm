@@ -7,7 +7,7 @@ expensive re-computation when the same image is discussed across turns.
 
 import hashlib
 from collections import OrderedDict
-from typing import Any, List, Optional, Union
+from typing import Any, Optional
 
 import mlx.core as mx
 
