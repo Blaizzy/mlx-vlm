@@ -78,7 +78,6 @@ class MLXVisionChat:
 
             self.current_image = load_image(image_path)
             self.current_image_path = image_path
-            self.prompt_cache_state = PromptCacheState()  # new image invalidates cache
             if image_path not in self.image_paths:
                 self.image_paths.append(image_path)
             rprint(f"[bold blue]Loaded image:[/bold blue] {image_path}")
