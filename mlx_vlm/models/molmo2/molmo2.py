@@ -280,7 +280,11 @@ class Model(nn.Module):
 
             dtype = self.vision_tower.image_vit.patch_embedding.weight.dtype
             pixel_values = pixel_values.astype(dtype)
-            image_features = self.vision_tower(pixel_values, token_pooling)
+            cached = kwargs.get("cached_image_features", None)
+            if cached is not None:
+                image_features = cached
+            else:
+                image_features = self.vision_tower(pixel_values, token_pooling)
             is_image_patch = mx.reshape(input_ids, (-1,)) == self.config.image_patch_id
             if int(is_image_patch.sum().item()) != image_features.shape[0]:
                 raise ValueError(

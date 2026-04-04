@@ -54,11 +54,15 @@ class Model(nn.Module):
         dtype = inputs_embeds.dtype
         pixel_values = pixel_values.astype(dtype)
 
-        image_features = self.vision(
-            pixel_values,
-            num_crops=num_crops,
-            crop_layouts=crop_layouts,
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
+        else:
+            image_features = self.vision(
+                pixel_values,
+                num_crops=num_crops,
+                crop_layouts=crop_layouts,
+            )
 
         B = inputs.shape[0]
         bos_embed = inputs_embeds[:, :1, :]

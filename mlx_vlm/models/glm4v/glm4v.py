@@ -51,21 +51,25 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the ouptut hidden states from the vision model
-        hidden_states = self.vision_tower(
-            pixel_values, grid_thw, output_hidden_states=False
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            hidden_states = cached
+        else:
+            # Get the ouptut hidden states from the vision model
+            hidden_states = self.vision_tower(
+                pixel_values, grid_thw, output_hidden_states=False
+            )
 
-        split_sizes = (
-            image_grid_thw.prod(-1) // self.vision_tower.spatial_merge_size**2
-        ).tolist()
-        hidden_states = mx.split(
-            hidden_states, [split_sizes[0], sum(split_sizes[:2])], axis=0
-        )
+            split_sizes = (
+                image_grid_thw.prod(-1) // self.vision_tower.spatial_merge_size**2
+            ).tolist()
+            hidden_states = mx.split(
+                hidden_states, [split_sizes[0], sum(split_sizes[:2])], axis=0
+            )
 
-        hidden_states = mx.concatenate(hidden_states, axis=0).astype(
-            hidden_states[0].dtype
-        )
+            hidden_states = mx.concatenate(hidden_states, axis=0).astype(
+                hidden_states[0].dtype
+            )
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self.merge_input_ids_with_image_features(

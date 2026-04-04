@@ -687,16 +687,24 @@ def apply_chat_template(
             )
         )
     elif isinstance(prompt, list):
-        # List of prompts
+        # List of prompts — find the last user message to place image/audio tokens
+        last_user_idx = -1
         for i, p in enumerate(prompt):
             if isinstance(p, str):
-                is_first = i == 0
+                last_user_idx = i
+            elif (rc := _get_role_content(p)) is not None:
+                if rc[0] not in ("system", "assistant"):
+                    last_user_idx = i
+
+        for i, p in enumerate(prompt):
+            if isinstance(p, str):
+                is_target = i == last_user_idx
                 messages.append(
                     get_message_json(
                         model_type,
                         p,
-                        skip_image_token=not is_first,
-                        skip_audio_token=not is_first,
+                        skip_image_token=not is_target,
+                        skip_audio_token=not is_target,
                         num_images=num_images,
                         num_audios=num_audios,
                         **kwargs,
@@ -706,15 +714,15 @@ def apply_chat_template(
                 role, content = role_content
                 # Handle multimodal content: extract only text, skip image/audio URLs
                 content = extract_text_from_content(content)
-                is_first = i == 0 or (i == 1 and role not in ["system", "assistant"])
+                is_target = i == last_user_idx
                 messages.append(
                     get_message_json(
                         model_type,
                         content,
                         role,
-                        skip_image_token=not is_first
+                        skip_image_token=not is_target
                         or role in ["system", "assistant"],
-                        skip_audio_token=not is_first
+                        skip_audio_token=not is_target
                         or role in ["system", "assistant"],
                         num_images=num_images,
                         num_audios=num_audios,
