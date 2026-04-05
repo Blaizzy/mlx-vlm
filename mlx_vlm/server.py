@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import gc
 import json
 import os
@@ -1176,10 +1177,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                         tool_calls = {}
                         tool_calls["calls"] = []
 
-                    # Signal stream end
+                    # Signal stream end with correct finish_reason
+                    stream_finish = "tool_calls" if tool_calls.get("calls") else "stop"
                     choices = [
                         ChatStreamChoice(
-                            finish_reason="stop",
+                            finish_reason=stream_finish,
                             delta=ChatMessage(
                                 role="assistant",
                                 content="",
@@ -1259,9 +1261,10 @@ async def chat_completions_endpoint(request: ChatRequest):
                     tool_calls["calls"] = []
                     tool_calls["remaining_text"] = gen_result.text
 
+                finish = "tool_calls" if tool_calls.get("calls") else "stop"
                 choices = [
                     ChatChoice(
-                        finish_reason="stop",
+                        finish_reason=finish,
                         message=ChatMessage(
                             role="assistant",
                             content=tool_calls["remaining_text"],

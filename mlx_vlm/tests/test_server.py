@@ -130,3 +130,97 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["repetition_penalty"] == 1.15
     assert mock_generate.call_args.kwargs["logit_bias"] == {12: -1.5}
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
+
+
+# ---------------------------------------------------------------------------
+# finish_reason tests
+# ---------------------------------------------------------------------------
+
+
+def _mock_result(text="Hello!", **overrides):
+    defaults = dict(
+        text=text,
+        prompt_tokens=10,
+        generation_tokens=5,
+        total_tokens=15,
+        prompt_tps=100.0,
+        generation_tps=50.0,
+        peak_memory=1.0,
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+def _base_mocks(result=None):
+    """Return context managers for model, template, and generate mocks."""
+    if result is None:
+        result = _mock_result()
+    model = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=""))
+    config = SimpleNamespace(model_type="test")
+    return (
+        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result),
+    )
+
+
+def test_chat_completions_finish_reason_stop_without_tools(client):
+    """finish_reason should be 'stop' for plain text responses."""
+    m1, m2, m3 = _base_mocks()
+    with m1, m2, m3:
+        resp = client.post(
+            "/chat/completions",
+            json={"model": "demo", "messages": [{"role": "user", "content": "hello"}]},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["finish_reason"] == "stop"
+
+
+def test_chat_completions_finish_reason_tool_calls(client):
+    """finish_reason should be 'tool_calls' when tool calls are detected."""
+    result = _mock_result()
+    m1, m2, m3 = _base_mocks(result)
+
+    fake_tool_calls = {
+        "calls": [{"type": "function", "id": "call_1", "function": {"name": "search", "arguments": "{}"}}],
+        "remaining_text": "",
+    }
+
+    with m1, m2, m3, \
+         patch.object(server, "_infer_tool_parser", return_value="qwen3_coder"), \
+         patch.object(server, "load_tool_module", return_value=SimpleNamespace()), \
+         patch.object(server, "process_tool_calls", return_value=fake_tool_calls):
+        resp = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "search for test"}],
+                "tools": [{"type": "function", "function": {"name": "search", "parameters": {}}}],
+            },
+        )
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_chat_completions_finish_reason_stop_with_tools_no_calls(client):
+    """finish_reason should be 'stop' when tools defined but model doesn't call any."""
+    result = _mock_result(text="I don't need tools for this.")
+    m1, m2, m3 = _base_mocks(result)
+
+    no_calls = {"calls": [], "remaining_text": "I don't need tools for this."}
+
+    with m1, m2, m3, \
+         patch.object(server, "_infer_tool_parser", return_value="qwen3_coder"), \
+         patch.object(server, "load_tool_module", return_value=SimpleNamespace()), \
+         patch.object(server, "process_tool_calls", return_value=no_calls):
+        resp = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{"type": "function", "function": {"name": "search", "parameters": {}}}],
+            },
+        )
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["finish_reason"] == "stop"
