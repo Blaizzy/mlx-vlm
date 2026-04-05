@@ -602,11 +602,31 @@ class UsageStats(OpenAIUsage):
 
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
+    logprobs: Optional[bool] = Field(
+        None, description="Whether to return log probabilities."
+    )
+    top_logprobs: Optional[int] = Field(
+        None,
+        ge=0,
+        le=20,
+        description="Number of most likely tokens to return at each position.",
+    )
+
+
+class TokenLogprob(BaseModel):
+    token: str
+    logprob: float
+    bytes: Optional[List[int]] = None
+
+
+class ChoiceLogprobs(BaseModel):
+    content: Optional[List[TokenLogprob]] = None
 
 
 class ChatChoice(BaseModel):
     finish_reason: str
     message: ChatMessage
+    logprobs: Optional[ChoiceLogprobs] = None
 
 
 class ChatResponse(BaseModel):
@@ -619,6 +639,7 @@ class ChatStreamChoice(BaseModel):
     index: int = 0
     finish_reason: Optional[str] = None
     delta: ChatMessage
+    logprobs: Optional[ChoiceLogprobs] = None
 
 
 class ChatStreamChunk(BaseModel):
@@ -1133,6 +1154,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                     output_text = ""
                     request_id = f"chatcmpl-{uuid.uuid4()}"
+                    want_logprobs = getattr(request, "logprobs", None)
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
                             print("Warning: Received unexpected chunk format:", chunk)
@@ -1151,9 +1173,24 @@ async def chat_completions_endpoint(request: ChatRequest):
                             "peak_memory": chunk.peak_memory,
                         }
 
+                        chunk_logprobs = None
+                        if want_logprobs and chunk.token is not None and chunk.logprobs is not None:
+                            token_text = tokenizer.decode([chunk.token])
+                            chosen_logprob = float(chunk.logprobs[chunk.token])
+                            chunk_logprobs = ChoiceLogprobs(
+                                content=[
+                                    TokenLogprob(
+                                        token=token_text,
+                                        logprob=chosen_logprob,
+                                        bytes=list(token_text.encode("utf-8")),
+                                    )
+                                ]
+                            )
+
                         choices = [
                             ChatStreamChoice(
-                                delta=ChatMessage(role="assistant", content=chunk.text)
+                                delta=ChatMessage(role="assistant", content=chunk.text),
+                                logprobs=chunk_logprobs,
                             )
                         ]
                         chunk_data = ChatStreamChunk(
@@ -1223,17 +1260,51 @@ async def chat_completions_endpoint(request: ChatRequest):
         else:
             # Non-streaming response
             try:
-                # Use generate from generate.py
-                gen_result = generate(
-                    model=model,
-                    processor=processor,
-                    prompt=formatted_prompt,
-                    image=images,
-                    audio=audio,
-                    verbose=False,  # Keep API output clean
-                    vision_cache=model_cache.get("vision_cache"),
-                    **generation_kwargs,
-                )
+                want_logprobs = getattr(request, "logprobs", None)
+
+                if want_logprobs:
+                    # Use stream_generate to collect per-token logprobs
+                    token_logprobs = []
+                    full_text = ""
+                    gen_result = None
+                    for chunk in stream_generate(
+                        model=model,
+                        processor=processor,
+                        prompt=formatted_prompt,
+                        image=images,
+                        audio=audio,
+                        vision_cache=model_cache.get("vision_cache"),
+                        **generation_kwargs,
+                    ):
+                        if chunk is None or not hasattr(chunk, "text"):
+                            continue
+                        full_text += chunk.text
+                        if chunk.token is not None and chunk.logprobs is not None:
+                            token_text = tokenizer.decode([chunk.token])
+                            chosen_logprob = float(chunk.logprobs[chunk.token])
+                            token_logprobs.append(
+                                TokenLogprob(
+                                    token=token_text,
+                                    logprob=chosen_logprob,
+                                    bytes=list(token_text.encode("utf-8")),
+                                )
+                            )
+                        gen_result = chunk
+                    # Override text with full accumulated text
+                    gen_result.text = full_text
+                else:
+                    # Use generate from generate.py
+                    gen_result = generate(
+                        model=model,
+                        processor=processor,
+                        prompt=formatted_prompt,
+                        image=images,
+                        audio=audio,
+                        verbose=False,  # Keep API output clean
+                        vision_cache=model_cache.get("vision_cache"),
+                        **generation_kwargs,
+                    )
+
                 # Clean up resources
                 mx.clear_cache()
                 gc.collect()
@@ -1259,6 +1330,10 @@ async def chat_completions_endpoint(request: ChatRequest):
                     tool_calls["calls"] = []
                     tool_calls["remaining_text"] = gen_result.text
 
+                choice_logprobs = None
+                if want_logprobs and token_logprobs:
+                    choice_logprobs = ChoiceLogprobs(content=token_logprobs)
+
                 choices = [
                     ChatChoice(
                         finish_reason="stop",
@@ -1267,6 +1342,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             content=tool_calls["remaining_text"],
                             tool_calls=tool_calls["calls"],
                         ),
+                        logprobs=choice_logprobs,
                     )
                 ]
 
