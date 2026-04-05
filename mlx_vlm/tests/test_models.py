@@ -1927,6 +1927,11 @@ class TestModels(unittest.TestCase):
 
     def test_gemma4(self):
         from mlx_vlm.models import gemma4
+        from mlx_lm.utils import quantize_model
+        from mlx_vlm.utils import load_model, save_config, save_weights
+
+        import tempfile
+        from pathlib import Path
 
         text_config = gemma4.TextConfig(
             model_type="gemma4_text",
@@ -1998,6 +2003,50 @@ class TestModels(unittest.TestCase):
         pixel_values = mx.random.uniform(shape=(1, 3, 64, 64))
         output = model(input_ids_with_img, pixel_values=pixel_values)
         self.assertEqual(output.logits.shape, (1, 6, config.text_config.vocab_size))
+
+        # Quantized save/load regression for per-layer projection.
+        quant_model = gemma4.Model(config)
+
+        def quantize_per_layer_projection(path: str, _module: nn.Module):
+            return path == "language_model.model.per_layer_model_projection"
+
+        quant_model, quantized_config = quantize_model(
+            quant_model,
+            {
+                "model_type": "gemma4",
+                "vocab_size": config.vocab_size,
+                "image_token_id": config.image_token_id,
+                "audio_config": None,
+                "text_config": vars(text_config).copy(),
+                "vision_config": vars(vision_config).copy(),
+            },
+            group_size=32,
+            bits=4,
+            quant_predicate=quantize_per_layer_projection,
+        )
+        self.assertTrue(
+            hasattr(quant_model.language_model.model.per_layer_model_projection, "scales")
+        )
+        quantized_config["quantization"][
+            "language_model.model.per_layer_model_projection"
+        ] = {
+            "group_size": 32,
+            "bits": 4,
+            "mode": "affine",
+        }
+
+        with tempfile.TemporaryDirectory() as model_dir:
+            model_path = Path(model_dir)
+            save_weights(model_path, quant_model)
+            save_config(quantized_config, model_path / "config.json")
+            loaded = load_model(model_path)
+
+        self.assertTrue(
+            hasattr(loaded.language_model.model.per_layer_model_projection, "scales")
+        )
+        logits = loaded(mx.array([[1, 2, 3]], dtype=mx.int32)).logits
+        mx.eval(logits)
+        self.assertEqual(logits.shape, (1, 3, config.vocab_size))
 
         # Full model forward: text + audio tokens
         audio_config = gemma4.AudioConfig(
