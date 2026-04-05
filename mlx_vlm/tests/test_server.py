@@ -130,3 +130,149 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["repetition_penalty"] == 1.15
     assert mock_generate.call_args.kwargs["logit_bias"] == {12: -1.5}
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
+
+
+# ---------------------------------------------------------------------------
+# Context tracking tests
+# ---------------------------------------------------------------------------
+
+
+def test_check_context_length_within_limit():
+    """Should not raise when within limit."""
+    fake_proc = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda s, add_special_tokens=False: list(range(10))),
+    )
+    server.check_context_length("short", fake_proc, 100)  # No exception
+
+
+def test_check_context_length_exceeds_limit():
+    """Should raise HTTPException when exceeding limit."""
+    from fastapi import HTTPException as _HTTPException
+
+    fake_proc = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda s, add_special_tokens=False: list(range(200))),
+    )
+    with pytest.raises(_HTTPException) as exc_info:
+        server.check_context_length("long", fake_proc, 100)
+    assert exc_info.value.status_code == 400
+    assert "200 tokens" in exc_info.value.detail
+
+
+def test_check_context_length_zero_unlimited():
+    """max_context=0 should skip check entirely."""
+    server.check_context_length("anything", None, 0)  # No exception
+
+
+def test_get_max_context_tokens_default():
+    """Default should be 0 (unlimited)."""
+    import os
+    os.environ.pop("MAX_CONTEXT_TOKENS", None)
+    assert server.get_max_context_tokens() == 0
+
+
+def test_get_max_context_tokens_from_env():
+    """Should read from MAX_CONTEXT_TOKENS env var."""
+    import os
+    os.environ["MAX_CONTEXT_TOKENS"] = "16384"
+    assert server.get_max_context_tokens() == 16384
+    os.environ.pop("MAX_CONTEXT_TOKENS")
+
+
+# ---------------------------------------------------------------------------
+# JSON mode / response_format tests
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_response_format_json_adds_instruction():
+    msgs = [{"role": "user", "content": "hi"}]
+    result = server.resolve_response_format(msgs, {"type": "json_object"})
+    assert result[0]["role"] == "system"
+    assert "json" in result[0]["content"].lower()
+    assert len(result) == 2
+
+
+def test_resolve_response_format_text_no_change():
+    msgs = [{"role": "user", "content": "hi"}]
+    result = server.resolve_response_format(msgs, {"type": "text"})
+    assert len(result) == 1
+
+
+def test_resolve_response_format_none_no_change():
+    msgs = [{"role": "user", "content": "hi"}]
+    result = server.resolve_response_format(msgs, None)
+    assert len(result) == 1
+
+
+def test_chat_completions_json_mode_accepted(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text='{"answer": 42}',
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Give me JSON"}],
+                "response_format": {"type": "json_object"},
+            },
+        )
+
+    assert response.status_code == 200
+    # The first message passed to apply_chat_template should be the injected system msg
+    chat_messages = mock_template.call_args.args[2]
+    assert chat_messages[0]["role"] == "system"
+    assert "json" in chat_messages[0]["content"].lower()
+
+
+def test_responses_json_mode_accepted(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text='{"answer": 42}',
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/responses",
+            json={
+                "model": "demo",
+                "input": "Give me JSON",
+                "response_format": {"type": "json_object"},
+            },
+        )
+
+    assert response.status_code == 200
+    # The first message passed to apply_chat_template should be the injected system msg
+    chat_messages = mock_template.call_args.args[2]
+    assert chat_messages[0]["role"] == "system"
+    assert "json" in chat_messages[0]["content"].lower()
