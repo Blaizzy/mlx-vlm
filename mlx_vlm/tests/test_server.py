@@ -1,3 +1,4 @@
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -130,3 +131,98 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["repetition_penalty"] == 1.15
     assert mock_generate.call_args.kwargs["logit_bias"] == {12: -1.5}
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
+
+
+# --- Request cancellation tests ---
+
+
+def test_get_request_timeout_default():
+    """Default timeout should be 300 seconds when env var is unset."""
+    os.environ.pop("REQUEST_TIMEOUT", None)
+    assert server.get_request_timeout() == 300
+
+
+def test_get_request_timeout_from_env():
+    """REQUEST_TIMEOUT env var should override the default."""
+    os.environ["REQUEST_TIMEOUT"] = "60"
+    try:
+        assert server.get_request_timeout() == 60
+    finally:
+        os.environ.pop("REQUEST_TIMEOUT", None)
+
+
+def test_default_request_timeout_constant():
+    """DEFAULT_REQUEST_TIMEOUT constant should be 300."""
+    assert server.DEFAULT_REQUEST_TIMEOUT == 300
+
+
+def test_non_streaming_responses_timeout(client):
+    """Non-streaming /responses should return 504 when generation exceeds timeout."""
+    import asyncio
+
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    def slow_generate(**kwargs):
+        import time
+        time.sleep(5)
+        return SimpleNamespace(
+            text="done", prompt_tokens=8, generation_tokens=4, total_tokens=12
+        )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", side_effect=slow_generate),
+        patch.object(server, "get_request_timeout", return_value=0.1),
+    ):
+        response = client.post(
+            "/responses",
+            json={"model": "demo", "input": "Hello", "max_output_tokens": 12},
+        )
+
+    assert response.status_code == 504
+    assert "timed out" in response.json()["detail"]
+
+
+def test_non_streaming_chat_completions_timeout(client):
+    """Non-streaming /chat/completions should return 504 when generation exceeds timeout."""
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    def slow_generate(**kwargs):
+        import time
+        time.sleep(5)
+        return SimpleNamespace(
+            text="done",
+            prompt_tokens=8,
+            generation_tokens=4,
+            total_tokens=12,
+            prompt_tps=10.0,
+            generation_tps=5.0,
+            peak_memory=0.1,
+        )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", side_effect=slow_generate),
+        patch.object(server, "get_request_timeout", return_value=0.1),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 12,
+            },
+        )
+
+    assert response.status_code == 504
+    assert "timed out" in response.json()["detail"]

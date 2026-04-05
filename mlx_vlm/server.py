@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import gc
 import json
 import os
@@ -12,7 +13,7 @@ from typing import Any, List, Literal, Optional, Union
 
 import mlx.core as mx
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
@@ -43,10 +44,34 @@ from .vision_cache import VisionFeatureCache
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
+DEFAULT_REQUEST_TIMEOUT = 300
+
+
+def get_request_timeout():
+    return int(os.environ.get("REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT))
 
 
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
+
+
+def get_max_context_tokens() -> int:
+    """Maximum prompt tokens before rejecting a request. 0 means no limit."""
+    return int(os.environ.get("MAX_CONTEXT_TOKENS", 0))
+
+
+def check_context_length(prompt: str, processor, max_context: int) -> None:
+    """Raise HTTP 400 if the tokenized prompt exceeds *max_context* tokens."""
+    if max_context <= 0:
+        return
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    token_count = len(tokenizer.encode(prompt, add_special_tokens=False))
+    if token_count > max_context:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Prompt length ({token_count} tokens) exceeds maximum context "
+            f"window ({max_context} tokens). Reduce your prompt or increase --max-context-tokens.",
+        )
 
 
 def get_quantized_kv_bits(model: str):
@@ -382,6 +407,10 @@ class OpenAIRequest(GenerationParams, TemplateParams):
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
+    response_format: Optional[dict] = Field(
+        None,
+        description='Output format: {"type": "text"} or {"type": "json_object"}.',
+    )
 
     def generation_kwargs(self) -> dict[str, Any]:
         kwargs = self.dump_kwargs("max_output_tokens")
@@ -602,6 +631,10 @@ class UsageStats(OpenAIUsage):
 
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
+    response_format: Optional[dict] = Field(
+        None,
+        description='Output format: {"type": "text"} or {"type": "json_object"}.',
+    )
 
 
 class ChatChoice(BaseModel):
@@ -628,6 +661,20 @@ class ChatStreamChunk(BaseModel):
     model: str
     choices: List[ChatStreamChoice]
     usage: Optional[UsageStats]
+
+
+def resolve_response_format(messages, response_format):
+    """Inject JSON instruction if json_object format requested."""
+    if not response_format:
+        return messages
+    fmt_type = response_format.get("type", "text")
+    if fmt_type == "json_object":
+        json_instruction = (
+            "You must respond with valid JSON only. "
+            "Do not include any text outside the JSON object."
+        )
+        messages.insert(0, {"role": "system", "content": json_instruction})
+    return messages
 
 
 def build_generation_kwargs(
@@ -709,7 +756,7 @@ class ModelsResponse(BaseModel):
 
 @app.post("/responses")
 @app.post("/v1/responses", include_in_schema=False)
-async def responses_endpoint(openai_request: OpenAIRequest):
+async def responses_endpoint(openai_request: OpenAIRequest, raw_request: Request):
     """
     OpenAI-compatible endpoint for generating text based on a prompt and optional images.
 
@@ -837,6 +884,10 @@ async def responses_endpoint(openai_request: OpenAIRequest):
             print("no input")
             raise HTTPException(status_code=400, detail="Missing input.")
 
+        chat_messages = resolve_response_format(
+            chat_messages, openai_request.response_format
+        )
+
         template_kwargs = openai_request.template_kwargs()
         formatted_prompt = apply_chat_template(
             processor,
@@ -845,6 +896,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
             num_images=len(images),
             **template_kwargs,
         )
+        check_context_length(formatted_prompt, processor, get_max_context_tokens())
         generation_kwargs = build_generation_kwargs(openai_request, template_kwargs)
 
         generated_at = datetime.now().timestamp()
@@ -910,6 +962,12 @@ async def responses_endpoint(openai_request: OpenAIRequest):
 
                     full_text = ""
                     for chunk in token_iterator:
+                        if await raw_request.is_disconnected():
+                            print("[cancellation] Client disconnected during /responses streaming, aborting generation.")
+                            if token_iterator is not None:
+                                token_iterator.close()
+                            return
+
                         if chunk is None or not hasattr(chunk, "text"):
                             continue
 
@@ -958,6 +1016,12 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     )
                     yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
 
+                except asyncio.CancelledError:
+                    print("[cancellation] /responses stream cancelled (client disconnect).")
+                    if token_iterator is not None:
+                        token_iterator.close()
+                    raise
+
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
@@ -982,15 +1046,32 @@ async def responses_endpoint(openai_request: OpenAIRequest):
         else:
             # Non-streaming response
             try:
-                # Use generate from generate.py
-                result = generate(
-                    model=model,
-                    processor=processor,
-                    prompt=formatted_prompt,
-                    image=images,
-                    verbose=False,  # stats are passed in the response
-                    **generation_kwargs,
-                )
+                # Use generate from generate.py, with request timeout
+                timeout = get_request_timeout()
+                loop = asyncio.get_event_loop()
+                try:
+                    result = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda: generate(
+                                model=model,
+                                processor=processor,
+                                prompt=formatted_prompt,
+                                image=images,
+                                verbose=False,
+                                **generation_kwargs,
+                            ),
+                        ),
+                        timeout=timeout,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"[cancellation] /responses generation timed out after {timeout}s.")
+                    mx.clear_cache()
+                    gc.collect()
+                    raise HTTPException(
+                        status_code=504,
+                        detail=f"Generation timed out after {timeout} seconds.",
+                    )
                 # Clean up resources
                 mx.clear_cache()
                 gc.collect()
@@ -1026,6 +1107,8 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                 )
                 return response
 
+            except HTTPException:
+                raise
             except Exception as e:
                 print(f"Error during generation: {e}")
                 traceback.print_exc()
@@ -1034,7 +1117,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
     except HTTPException as http_exc:
-        # Re-raise HTTP exceptions (like model loading failure)
+        # Re-raise HTTP exceptions (like model loading failure or timeout)
         raise http_exc
     except Exception as e:
         # Catch unexpected errors
@@ -1051,7 +1134,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
     "/chat/completions", response_model=None
 )  # Response model handled dynamically based on stream flag
 @app.post("/v1/chat/completions", response_model=None, include_in_schema=False)
-async def chat_completions_endpoint(request: ChatRequest):
+async def chat_completions_endpoint(request: ChatRequest, raw_request: Request):
     """
     Generate text based on a prompt and optional images.
     Prompt must be a list of chat messages, including system, user, and assistant messages.
@@ -1103,6 +1186,9 @@ async def chat_completions_endpoint(request: ChatRequest):
             tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
             if tool_parser_type is not None:
                 tool_module = load_tool_module(tool_parser_type)
+        processed_messages = resolve_response_format(
+            processed_messages, request.response_format
+        )
         template_kwargs = request.template_kwargs()
         formatted_prompt = apply_chat_template(
             processor,
@@ -1113,6 +1199,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             tools=tools,
             **template_kwargs,
         )
+        check_context_length(formatted_prompt, processor, get_max_context_tokens())
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
 
         if request.stream:
@@ -1134,6 +1221,13 @@ async def chat_completions_endpoint(request: ChatRequest):
                     output_text = ""
                     request_id = f"chatcmpl-{uuid.uuid4()}"
                     for chunk in token_iterator:
+                        # Check if client disconnected
+                        if await raw_request.is_disconnected():
+                            print("[cancellation] Client disconnected during /chat/completions streaming, aborting generation.")
+                            if token_iterator is not None:
+                                token_iterator.close()
+                            return
+
                         if chunk is None or not hasattr(chunk, "text"):
                             print("Warning: Received unexpected chunk format:", chunk)
                             continue
@@ -1199,6 +1293,12 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                     yield "data: [DONE]\n\n"
 
+                except asyncio.CancelledError:
+                    print("[cancellation] /chat/completions stream cancelled (client disconnect).")
+                    if token_iterator is not None:
+                        token_iterator.close()
+                    raise
+
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
@@ -1223,17 +1323,34 @@ async def chat_completions_endpoint(request: ChatRequest):
         else:
             # Non-streaming response
             try:
-                # Use generate from generate.py
-                gen_result = generate(
-                    model=model,
-                    processor=processor,
-                    prompt=formatted_prompt,
-                    image=images,
-                    audio=audio,
-                    verbose=False,  # Keep API output clean
-                    vision_cache=model_cache.get("vision_cache"),
-                    **generation_kwargs,
-                )
+                # Use generate from generate.py, with request timeout
+                timeout = get_request_timeout()
+                loop = asyncio.get_event_loop()
+                try:
+                    gen_result = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda: generate(
+                                model=model,
+                                processor=processor,
+                                prompt=formatted_prompt,
+                                image=images,
+                                audio=audio,
+                                verbose=False,
+                                vision_cache=model_cache.get("vision_cache"),
+                                **generation_kwargs,
+                            ),
+                        ),
+                        timeout=timeout,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"[cancellation] /chat/completions generation timed out after {timeout}s.")
+                    mx.clear_cache()
+                    gc.collect()
+                    raise HTTPException(
+                        status_code=504,
+                        detail=f"Generation timed out after {timeout} seconds.",
+                    )
                 # Clean up resources
                 mx.clear_cache()
                 gc.collect()
@@ -1276,6 +1393,8 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                 return result
 
+            except HTTPException:
+                raise
             except Exception as e:
                 print(f"Error during generation: {e}")
                 traceback.print_exc()
@@ -1284,7 +1403,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
     except HTTPException as http_exc:
-        # Re-raise HTTP exceptions (like model loading failure)
+        # Re-raise HTTP exceptions (like model loading failure or timeout)
         raise http_exc
     except Exception as e:
         # Catch unexpected errors
@@ -1434,6 +1553,21 @@ def main():
         help="Start index (of token) for the quantized KV cache.",
     )
     parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=0,
+        help="Maximum context window in tokens. Requests exceeding this are rejected. "
+        "0 means no limit. (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=int,
+        default=DEFAULT_REQUEST_TIMEOUT,
+        help="Maximum seconds for a single non-streaming generation request. "
+        "Streaming requests use client disconnect detection instead. "
+        "(default: %(default)s)",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -1454,6 +1588,8 @@ def main():
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    os.environ["MAX_CONTEXT_TOKENS"] = str(args.max_context_tokens)
+    os.environ["REQUEST_TIMEOUT"] = str(args.request_timeout)
 
     uvicorn.run(
         "mlx_vlm.server:app",
