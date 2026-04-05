@@ -596,3 +596,217 @@ class TestPromptCache:
             state_b = server.get_prompt_cache_state("model-b")
 
         assert state_a is not state_b, "Different models must have separate cache states"
+
+    def test_cache_state_has_correct_interface(self, client):
+        """PromptCacheState should expose find_prefix_length and update methods."""
+        state = server.get_prompt_cache_state("test-model")
+        assert hasattr(state, "find_prefix_length")
+        assert hasattr(state, "update")
+        assert hasattr(state, "cache")
+        assert hasattr(state, "token_ids")
+        # Initially empty
+        assert state.cache is None
+        assert state.token_ids is None
+        assert state.find_prefix_length([1, 2, 3]) == 0
+
+    def test_cache_state_cleared_on_unload(self, client):
+        """Unloading a model should clear all prompt cache states."""
+        server._prompt_cache_states["some-model"] = server.PromptCacheState()
+        assert "some-model" in server._prompt_cache_states
+        # Simulate unload
+        with patch.object(server, "model_cache", {"model_path": "x"}):
+            server.unload_model_sync()
+        assert len(server._prompt_cache_states) == 0
+
+    def test_cache_state_prefix_matching(self):
+        """PromptCacheState.find_prefix_length should find common prefix."""
+        state = server.PromptCacheState()
+        state.token_ids = [10, 20, 30, 40, 50]
+        assert state.find_prefix_length([10, 20, 30, 40, 50]) == 5
+        assert state.find_prefix_length([10, 20, 30, 99, 50]) == 3
+        assert state.find_prefix_length([99, 20, 30]) == 0
+        assert state.find_prefix_length([10, 20]) == 2
+        assert state.find_prefix_length([]) == 0
+
+
+# =========================================================================
+# F. Concurrency Guard Tests
+# =========================================================================
+
+
+@_skip_no_mlx
+class TestConcurrencyGuard:
+    """Verify concurrency guard serializes Metal GPU access."""
+
+    def test_semaphore_exists_and_is_semaphore(self):
+        """get_generation_semaphore should return an asyncio.Semaphore."""
+        import asyncio
+        sem = server.get_generation_semaphore()
+        assert isinstance(sem, asyncio.Semaphore)
+
+    def test_semaphore_default_value_is_one(self):
+        """Default semaphore should allow exactly 1 concurrent request."""
+        import asyncio, os
+        # Reset to force re-creation with default
+        server._generation_semaphore = None
+        os.environ.pop("MAX_CONCURRENT_REQUESTS", None)
+        sem = server.get_generation_semaphore()
+        assert sem._value == 1
+        # Reset for other tests
+        server._generation_semaphore = None
+
+    def test_semaphore_respects_env_var(self):
+        """MAX_CONCURRENT_REQUESTS env var should configure semaphore value."""
+        import os
+        server._generation_semaphore = None
+        os.environ["MAX_CONCURRENT_REQUESTS"] = "3"
+        sem = server.get_generation_semaphore()
+        assert sem._value == 3
+        # Cleanup
+        os.environ["MAX_CONCURRENT_REQUESTS"] = "1"
+        server._generation_semaphore = None
+
+    def test_semaphore_singleton(self):
+        """Repeated calls should return the same semaphore instance."""
+        server._generation_semaphore = None
+        sem1 = server.get_generation_semaphore()
+        sem2 = server.get_generation_semaphore()
+        assert sem1 is sem2
+        server._generation_semaphore = None
+
+    def test_responses_non_streaming_acquires_semaphore(self, client):
+        """Non-streaming /responses should acquire and release the semaphore."""
+        import asyncio
+        acquired = []
+        released = []
+        real_sem = server.get_generation_semaphore()
+
+        original_acquire = real_sem.acquire
+        original_release = real_sem.release
+
+        async def mock_acquire():
+            acquired.append(True)
+            return await original_acquire()
+
+        def mock_release():
+            released.append(True)
+            return original_release()
+
+        with _patch_model(), _patch_template(), _patch_generate(), \
+             patch.object(real_sem, "acquire", side_effect=mock_acquire), \
+             patch.object(real_sem, "release", side_effect=mock_release):
+            resp = client.post("/responses", json={"model": "demo", "input": "hi"})
+
+        assert resp.status_code == 200
+        assert len(acquired) >= 1, "Semaphore should be acquired"
+        assert len(released) >= 1, "Semaphore should be released"
+
+    def test_concurrent_requests_both_succeed(self, client):
+        """Two sequential requests should both succeed (semaphore serializes)."""
+        with _patch_model(), _patch_template(), _patch_generate():
+            r1 = client.post("/responses", json={"model": "demo", "input": "first"})
+            r2 = client.post("/responses", json={"model": "demo", "input": "second"})
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+
+
+# =========================================================================
+# G. finish_reason Tests
+# =========================================================================
+
+
+@_skip_no_mlx
+class TestFinishReason:
+    """Verify finish_reason is set correctly based on tool call detection."""
+
+    def test_chat_completions_finish_reason_stop_no_tools(self, client):
+        """finish_reason='stop' when no tools provided."""
+        with _patch_model(), _patch_template(), _patch_generate():
+            resp = client.post(
+                "/chat/completions",
+                json={"model": "demo", "messages": [{"role": "user", "content": "hi"}]},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["choices"][0]["finish_reason"] == "stop"
+
+    def test_chat_completions_finish_reason_tool_calls(self, client):
+        """finish_reason='tool_calls' when tool calls detected."""
+        fake_calls = {
+            "calls": [{"type": "function", "id": "c1", "function": {"name": "search", "arguments": "{}"}}],
+            "remaining_text": "",
+        }
+        with _patch_model(), _patch_template(), _patch_generate(), \
+             patch.object(server, "_infer_tool_parser", return_value="qwen3_coder"), \
+             patch.object(server, "load_tool_module", return_value=SimpleNamespace()), \
+             patch.object(server, "process_tool_calls", return_value=fake_calls):
+            resp = client.post(
+                "/chat/completions",
+                json={
+                    "model": "demo",
+                    "messages": [{"role": "user", "content": "search"}],
+                    "tools": [{"type": "function", "function": {"name": "search", "parameters": {}}}],
+                },
+            )
+        assert resp.status_code == 200
+        assert resp.json()["choices"][0]["finish_reason"] == "tool_calls"
+
+    def test_chat_completions_finish_reason_stop_tools_no_calls(self, client):
+        """finish_reason='stop' when tools defined but model doesn't call any."""
+        no_calls = {"calls": [], "remaining_text": "Just text, no tools."}
+        with _patch_model(), _patch_template(), _patch_generate(), \
+             patch.object(server, "_infer_tool_parser", return_value="qwen3_coder"), \
+             patch.object(server, "load_tool_module", return_value=SimpleNamespace()), \
+             patch.object(server, "process_tool_calls", return_value=no_calls):
+            resp = client.post(
+                "/chat/completions",
+                json={
+                    "model": "demo",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "tools": [{"type": "function", "function": {"name": "search", "parameters": {}}}],
+                },
+            )
+        assert resp.status_code == 200
+        assert resp.json()["choices"][0]["finish_reason"] == "stop"
+
+    def test_chat_completions_streaming_finish_reason_tool_calls(self, client):
+        """Streaming finish_reason should be 'tool_calls' when tools detected."""
+        fake_calls = {
+            "calls": [{"type": "function", "id": "c1", "function": {"name": "search", "arguments": "{}"}}],
+            "remaining_text": "",
+        }
+        chunks = [
+            SimpleNamespace(
+                text="calling", prompt_tokens=10, generation_tokens=1,
+                prompt_tps=100.0, generation_tps=50.0, peak_memory=1.0,
+            ),
+        ]
+
+        def mock_stream(**kwargs):
+            return iter(chunks)
+
+        with _patch_model(), _patch_template(), \
+             patch.object(server, "stream_generate", side_effect=mock_stream), \
+             patch.object(server, "_infer_tool_parser", return_value="qwen3_coder"), \
+             patch.object(server, "load_tool_module", return_value=SimpleNamespace()), \
+             patch.object(server, "process_tool_calls", return_value=fake_calls):
+            resp = client.post(
+                "/chat/completions",
+                json={
+                    "model": "demo",
+                    "messages": [{"role": "user", "content": "search"}],
+                    "tools": [{"type": "function", "function": {"name": "search", "parameters": {}}}],
+                    "stream": True,
+                },
+            )
+        assert resp.status_code == 200
+        import json as json_mod
+        lines = [l for l in resp.text.strip().split("\n") if l.startswith("data:") and "[DONE]" not in l]
+        last_data = json_mod.loads(lines[-1].replace("data: ", ""))
+        assert last_data["choices"][0]["finish_reason"] == "tool_calls"
+
+    def test_responses_status_completed_no_tools(self, client):
+        """Responses endpoint status='completed' for normal text."""
+        with _patch_model(), _patch_template(), _patch_generate():
+            resp = client.post("/responses", json={"model": "demo", "input": "hi"})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "completed"
