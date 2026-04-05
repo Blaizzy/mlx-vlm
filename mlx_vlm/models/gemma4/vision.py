@@ -414,89 +414,121 @@ class VisionModel(nn.Module):
             self.std_bias = mx.zeros((config.hidden_size,))
             self.std_scale = mx.ones((config.hidden_size,))
 
-    def _patch_positions(self, pixel_values):
-        B, C, H, W = pixel_values.shape
+    def _patch_positions_single(self, H, W):
+        """Compute patch positions and padding mask for a single image."""
         pH = H // self.patch_size
         pW = W // self.patch_size
         num_patches = pH * pW
-        num_padding = self.max_patches - num_patches
 
-        # Create position grid
         grid_x = np.arange(pW)
         grid_y = np.arange(pH)
         gx, gy = np.meshgrid(grid_x, grid_y, indexing="xy")
         real_positions = np.stack([gx.flatten(), gy.flatten()], axis=-1)
-        real_positions = np.tile(real_positions[None], (B, 1, 1))
 
+        num_padding = self.max_patches - num_patches
         if num_padding > 0:
-            pad_positions = np.full((B, num_padding, 2), -1, dtype=np.int64)
-            patch_positions = np.concatenate([real_positions, pad_positions], axis=1)
+            pad_positions = np.full((num_padding, 2), -1, dtype=np.int64)
+            patch_positions = np.concatenate([real_positions, pad_positions], axis=0)
         else:
-            patch_positions = real_positions
+            patch_positions = real_positions[:self.max_patches]
 
-        padding_positions = np.zeros((B, self.max_patches), dtype=bool)
+        padding_mask = np.zeros(self.max_patches, dtype=bool)
         if num_padding > 0:
-            padding_positions[:, num_patches:] = True
+            padding_mask[num_patches:] = True
 
-        return mx.array(patch_positions.astype(np.int32)), mx.array(padding_positions)
+        return patch_positions.astype(np.int32), padding_mask, num_patches
 
-    def __call__(self, pixel_values: mx.array) -> mx.array:
+    def __call__(self, pixel_values) -> mx.array:
+        # Handle list of different-sized images: process each individually
         if isinstance(pixel_values, list):
-            pixel_values = mx.concatenate(pixel_values, axis=0)
+            all_real = []
+            for img in pixel_values:
+                if not isinstance(img, mx.array):
+                    img = mx.array(img)
+                if img.ndim == 3:
+                    img = img[None]
+                result = self(img)
+                all_real.append(result[0])  # remove batch dim
+            return mx.concatenate(all_real, axis=0)[None]
+
+        if not isinstance(pixel_values, mx.array):
+            pixel_values = mx.array(pixel_values)
 
         B, C, H, W = pixel_values.shape
-        num_real = (H // self.patch_size) * (W // self.patch_size)
-        patch_positions, padding_positions = self._patch_positions(pixel_values)
+        all_same_size = True
 
-        # Patchify and embed
-        inputs_embeds = self.patch_embedder(
-            pixel_values,
-            patch_positions[:, :num_real],
-            padding_positions[:, :num_real],
-        )
+        if all_same_size:
+            num_real = (H // self.patch_size) * (W // self.patch_size)
+            num_real = min(num_real, self.max_patches)
+            positions, padding_mask, _ = self._patch_positions_single(H, W)
+            # Tile for batch
+            patch_positions = mx.array(np.tile(positions[None], (B, 1, 1)))
+            padding_positions = mx.array(np.tile(padding_mask[None], (B, 1)))
 
-        # Pad to max_patches
-        num_padding = self.max_patches - num_real
-        if num_padding > 0:
-            pad_embeds = mx.zeros(
-                (B, num_padding, inputs_embeds.shape[-1]), dtype=inputs_embeds.dtype
+            inputs_embeds = self.patch_embedder(
+                pixel_values,
+                patch_positions[:, :num_real],
+                padding_positions[:, :num_real],
             )
-            inputs_embeds = mx.concatenate([inputs_embeds, pad_embeds], axis=1)
+
+            num_padding = self.max_patches - num_real
+            if num_padding > 0:
+                pad_embeds = mx.zeros(
+                    (B, num_padding, inputs_embeds.shape[-1]), dtype=inputs_embeds.dtype
+                )
+                inputs_embeds = mx.concatenate([inputs_embeds, pad_embeds], axis=1)
+        else:
+            # Per-image processing for different sizes (shouldn't happen with padding)
+            all_embeds = []
+            all_positions = []
+            all_padding = []
+            for i in range(B):
+                img = pixel_values[i:i+1]
+                _, _, h, w = img.shape
+                pos, pad_mask, n_real = self._patch_positions_single(h, w)
+                pos_mx = mx.array(pos[None])
+                pad_mx = mx.array(pad_mask[None])
+                n_real = min(n_real, self.max_patches)
+
+                emb = self.patch_embedder(img, pos_mx[:, :n_real], pad_mx[:, :n_real])
+                n_pad = self.max_patches - n_real
+                if n_pad > 0:
+                    pad_emb = mx.zeros((1, n_pad, emb.shape[-1]), dtype=emb.dtype)
+                    emb = mx.concatenate([emb, pad_emb], axis=1)
+                all_embeds.append(emb)
+                all_positions.append(pos_mx)
+                all_padding.append(pad_mx)
+
+            inputs_embeds = mx.concatenate(all_embeds, axis=0)
+            patch_positions = mx.concatenate(all_positions, axis=0)
+            padding_positions = mx.concatenate(all_padding, axis=0)
 
         # Build bidirectional attention mask [B, 1, L, L] for SDPA
-        valid_mask = ~padding_positions  # True = valid
+        valid_mask = ~padding_positions
         attn_mask = mx.expand_dims(valid_mask, 1) * mx.expand_dims(valid_mask, 2)
         neg_inf = mx.array(float("-inf"), dtype=inputs_embeds.dtype)
         attn_mask = mx.where(
             attn_mask, mx.array(0.0, dtype=inputs_embeds.dtype), neg_inf
         )
-        attn_mask = mx.expand_dims(attn_mask, 1)  # [B, 1, L, L] for head broadcasting
+        attn_mask = mx.expand_dims(attn_mask, 1)
 
-        # Run transformer layers
         hidden_states = self.encoder(inputs_embeds, patch_positions, attn_mask)
 
-        # Pool
         pooled, pool_mask = self.pooler(
             hidden_states, patch_positions, padding_positions
         )
 
-        # Strip padding tokens using mask multiplication (MLX lacks boolean indexing)
-        # Multiply by mask to zero out padding, then use compact representation
         if pool_mask.shape[1] == self.default_output_length:
-            # From avg_pool_by_positions: mask is True=valid
             valid_mask = pool_mask
         else:
             valid_mask = ~pool_mask
 
-        # For single batch (typical VLM case), count valid tokens and slice
-        # Since pooling produces contiguous valid tokens followed by padding,
-        # we can simply count valid tokens and take that many
         all_real = []
         for i in range(B):
             n_valid = int(valid_mask[i].astype(mx.int32).sum().item())
             all_real.append(pooled[i, :n_valid])
 
-        hidden_states = mx.concatenate(all_real, axis=0)[None]  # [1, total_real, dim]
+        hidden_states = mx.concatenate(all_real, axis=0)[None]
 
         if self.config.standardize:
             hidden_states = (hidden_states - self.std_bias) * self.std_scale
