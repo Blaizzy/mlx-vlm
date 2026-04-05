@@ -7,7 +7,6 @@ from mlx.utils import tree_map
 
 
 class TestModels(unittest.TestCase):
-
     def language_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(model.model_type, model_type)
         self.assertEqual(len(model.layers), num_layers)
@@ -103,7 +102,6 @@ class TestModels(unittest.TestCase):
             # Check vision hidden feature layer's shape matches the expected hidden size
             if channel_first:
                 if model_type == "llama4_vision_model":
-
                     self.assertEqual(hidden_states.shape[1], vision_hidden_size)
                 else:
                     self.assertEqual(hidden_states.shape[1], vision_hidden_size)
@@ -1926,12 +1924,13 @@ class TestModels(unittest.TestCase):
         )
 
     def test_gemma4(self):
-        from mlx_vlm.models import gemma4
-        from mlx_lm.utils import quantize_model
-        from mlx_vlm.utils import load_model, save_config, save_weights
-
         import tempfile
         from pathlib import Path
+
+        from mlx_lm.utils import quantize_model
+
+        from mlx_vlm.models import gemma4
+        from mlx_vlm.utils import load_model, save_config, save_weights
 
         text_config = gemma4.TextConfig(
             model_type="gemma4_text",
@@ -2025,7 +2024,9 @@ class TestModels(unittest.TestCase):
             quant_predicate=quantize_per_layer_projection,
         )
         self.assertTrue(
-            hasattr(quant_model.language_model.model.per_layer_model_projection, "scales")
+            hasattr(
+                quant_model.language_model.model.per_layer_model_projection, "scales"
+            )
         )
         quantized_config["quantization"][
             "language_model.model.per_layer_model_projection"
@@ -4815,7 +4816,6 @@ class TestChunkedPrefillRoPE(unittest.TestCase):
 
 
 class TestMiniCPMO(unittest.TestCase):
-
     @staticmethod
     def _tiny_config():
         from mlx_vlm.models import minicpmo
@@ -4922,7 +4922,6 @@ class TestMiniCPMO(unittest.TestCase):
 
 
 class TestPhi4MM(unittest.TestCase):
-
     @staticmethod
     def _tiny_config():
         from mlx_vlm.models.phi4mm.config import ModelConfig, TextConfig, VisionConfig
@@ -5099,7 +5098,6 @@ class TestPhi4MM(unittest.TestCase):
 
 
 class TestSam3(unittest.TestCase):
-
     # ─── SAM3 Tests ────────────────────────────────────────────
 
     def test_sam3_config(self):
