@@ -5384,5 +5384,189 @@ class TestSam3(unittest.TestCase):
         self.assertEqual(sin.shape, (64, 64))
 
 
+class TestOWLv2(unittest.TestCase):
+
+    # ─── OWLv2 Tests ────────────────────────────────────────────
+
+    def test_owlv2_config(self):
+        """Config parses vision and text sub-configs."""
+        from mlx_vlm.models.owlv2.config import ModelConfig
+
+        config = ModelConfig()
+        self.assertEqual(config.model_type, "owlv2")
+        self.assertEqual(config.vision_config.hidden_size, 768)
+        self.assertEqual(config.vision_config.num_hidden_layers, 12)
+        self.assertEqual(config.vision_config.image_size, 960)
+        self.assertEqual(config.vision_config.patch_size, 16)
+        self.assertEqual(config.text_config.hidden_size, 512)
+        self.assertEqual(config.text_config.num_hidden_layers, 12)
+        self.assertEqual(config.text_config.vocab_size, 49408)
+        self.assertEqual(config.projection_dim, 512)
+
+    def test_owlv2_vision_encoder(self):
+        """Vision encoder produces correct output shapes."""
+        from mlx_vlm.models.owlv2.config import VisionConfig
+        from mlx_vlm.models.owlv2.vision import VisionTransformer
+
+        cfg = VisionConfig(
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            intermediate_size=128,
+            image_size=32,
+            patch_size=8,
+        )
+        encoder = VisionTransformer(cfg)
+
+        x = mx.random.normal((1, 32, 32, 3))
+        out = encoder(x)
+        # 32/8 = 4 patches per side, 16 patches + 1 CLS = 17 tokens
+        self.assertEqual(out.shape, (1, 17, 64))
+
+    def test_owlv2_text_encoder(self):
+        """Text encoder produces correct output shapes."""
+        from mlx_vlm.models.owlv2.config import TextConfig
+        from mlx_vlm.models.owlv2.text_encoder import TextTransformer
+
+        cfg = TextConfig(
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            intermediate_size=128,
+            vocab_size=100,
+            max_position_embeddings=16,
+        )
+        encoder = TextTransformer(cfg)
+
+        input_ids = mx.array([[1, 2, 3, 4, 0, 0]])
+        out = encoder(input_ids)
+        self.assertEqual(out.shape, (1, 6, 64))
+
+    def test_owlv2_detection_heads(self):
+        """Detection heads produce correct output shapes."""
+        from mlx_vlm.models.owlv2.owlv2 import (
+            BoxPredictionHead,
+            ClassPredictionHead,
+            ObjectnessHead,
+        )
+
+        hidden_size = 64
+        projection_dim = 32
+        B, N, nq = 1, 16, 3
+
+        class_head = ClassPredictionHead(hidden_size, projection_dim)
+        box_head = BoxPredictionHead(hidden_size)
+        obj_head = ObjectnessHead(hidden_size)
+
+        image_embeds = mx.random.normal((B, N, hidden_size))
+        query_embeds = mx.random.normal((B, nq, projection_dim))
+
+        logits = class_head(image_embeds, query_embeds)
+        self.assertEqual(logits.shape, (B, N, nq))
+
+        boxes = box_head(image_embeds)
+        self.assertEqual(boxes.shape, (B, N, 4))
+
+        objectness = obj_head(image_embeds)
+        self.assertEqual(objectness.shape, (B, N, 1))
+
+    def test_owlv2_full_model(self):
+        """Full model forward pass with small config."""
+        from mlx_vlm.models.owlv2.config import ModelConfig, TextConfig, VisionConfig
+        from mlx_vlm.models.owlv2.owlv2 import Model
+
+        config = ModelConfig(
+            projection_dim=32,
+            vision_config=VisionConfig(
+                hidden_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                intermediate_size=128,
+                image_size=32,
+                patch_size=8,
+            ),
+            text_config=TextConfig(
+                hidden_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                intermediate_size=128,
+                vocab_size=100,
+                max_position_embeddings=8,
+            ),
+        )
+        model = Model(config)
+
+        pixel_values = mx.random.normal((1, 32, 32, 3))
+        input_ids = mx.array([[1, 2, 3, 0, 0, 0, 0, 0], [4, 5, 6, 0, 0, 0, 0, 0]])
+        attention_mask = mx.array([[1, 1, 1, 0, 0, 0, 0, 0], [1, 1, 1, 0, 0, 0, 0, 0]])
+
+        outputs = model(pixel_values, input_ids, attention_mask)
+        mx.eval(
+            outputs["pred_logits"], outputs["pred_boxes"], outputs["objectness_logits"]
+        )
+
+        num_patches = (32 // 8) ** 2  # 16
+        self.assertEqual(outputs["pred_logits"].shape, (1, num_patches, 2))
+        self.assertEqual(outputs["pred_boxes"].shape, (1, num_patches, 4))
+        self.assertEqual(outputs["objectness_logits"].shape, (1, num_patches, 1))
+
+        # Boxes should be in [0, 1] after sigmoid
+        boxes = outputs["pred_boxes"]
+        self.assertTrue(mx.all(boxes >= 0).item())
+        self.assertTrue(mx.all(boxes <= 1).item())
+
+    def test_owlv2_sanitize(self):
+        """Weight sanitization strips prefix and transposes conv weights."""
+        from mlx_vlm.models.owlv2.owlv2 import Model
+
+        weights = {
+            "owlv2.vision_model.encoder.layers.0.mlp.fc1.weight": mx.zeros((64, 32)),
+            "owlv2.text_model.embeddings.position_ids": mx.zeros((1, 16)),
+            "owlv2.vision_model.embeddings.patch_embedding.weight": mx.zeros(
+                (64, 3, 16, 16)
+            ),
+            "box_head.dense0.weight": mx.zeros((64, 64)),
+        }
+        sanitized = Model.sanitize(weights)
+
+        # "owlv2." prefix removed
+        self.assertIn("vision_model.encoder.layers.0.mlp.fc1.weight", sanitized)
+        # position_ids skipped
+        self.assertNotIn("text_model.embeddings.position_ids", sanitized)
+        # Conv transposed from (out, in, kH, kW) -> (out, kH, kW, in)
+        conv_w = sanitized["vision_model.embeddings.patch_embedding.weight"]
+        self.assertEqual(conv_w.shape, (64, 16, 16, 3))
+        # Non-prefixed keys kept as-is
+        self.assertIn("box_head.dense0.weight", sanitized)
+
+    def test_owlv2_postprocess(self):
+        """Postprocessing converts model outputs to detections."""
+        from mlx_vlm.models.owlv2.generate import postprocess
+
+        num_patches = 16
+        num_queries = 2
+        outputs = {
+            "pred_logits": mx.array(
+                [[[2.0, -5.0]] * 5 + [[-5.0, -5.0]] * (num_patches - 5)]
+            ),
+            "pred_boxes": mx.array([[[0.5, 0.5, 0.2, 0.2]] * num_patches]),
+            "objectness_logits": mx.array([[[1.0]] * num_patches]),
+        }
+
+        result = postprocess(
+            outputs,
+            original_size=(100, 200),
+            query_labels=["cat", "dog"],
+            score_threshold=0.5,
+            nms_threshold=1.0,
+        )
+
+        self.assertGreater(len(result.scores), 0)
+        self.assertEqual(result.class_names[0], "cat")
+        # Boxes should be in pixel coordinates
+        self.assertTrue(all(result.boxes[:, 2] <= 200))  # x <= width
+        self.assertTrue(all(result.boxes[:, 3] <= 100))  # y <= height
+
+
 if __name__ == "__main__":
     unittest.main()
