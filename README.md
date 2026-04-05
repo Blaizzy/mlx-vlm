@@ -1,6 +1,8 @@
 [![Upload Python Package](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml/badge.svg)](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml)
 # MLX-VLM
 
+**[English](README.md)** | **[简体中文](README_CN.md)**
+
 MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX.
 
 ## Table of Contents
