@@ -357,3 +357,46 @@ class TestExtractTextFromContentEdgeCases:
         ]
         result = extract_text_from_content(content)
         assert result == "Actual content"
+
+
+class TestModelSpecificPromptContracts:
+    """Guard model-specific multimodal message formats from regressions."""
+
+    def test_ernie4_5_vl_uses_image_url_before_text(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "ernie4_5_moe_vl"},
+            "Describe this image.",
+            return_messages=True,
+            num_images=1,
+        )
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert [item["type"] for item in result[0]["content"]] == [
+            "image_url",
+            "text",
+        ]
+        assert result[0]["content"][1]["text"] == "Describe this image."
+
+    def test_paddleocr_vl_uses_image_before_text(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "paddleocr_vl"},
+            "OCR:",
+            return_messages=True,
+            num_images=2,
+        )
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert [item["type"] for item in result[0]["content"]] == [
+            "image",
+            "image",
+            "text",
+        ]
+        assert result[0]["content"][-1]["text"] == "OCR:"
