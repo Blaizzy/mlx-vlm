@@ -206,13 +206,14 @@ def get_cliff_condition(
     H, W = image_shape
 
     if focal_length is None:
-        focal_length = H / (2 * math.tan(math.radians(30.0)))
+        # PyTorch default: image diagonal
+        focal_length = math.sqrt(H**2 + W**2)
 
     cx = (bbox[0] + bbox[2]) / 2.0
     cy = (bbox[1] + bbox[3]) / 2.0
     bw = bbox[2] - bbox[0]
-    bh = bbox[3] - bbox[1]
-    bbox_scale = max(bw, bh) * 1.2
+    # PyTorch uses bbox_width * padding (1.25), not max(w,h) * 1.2
+    bbox_scale = bw * 1.25
 
     cx_norm = (cx - W / 2.0) / focal_length
     cy_norm = (cy - H / 2.0) / focal_length

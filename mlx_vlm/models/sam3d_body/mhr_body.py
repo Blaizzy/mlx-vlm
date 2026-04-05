@@ -151,8 +151,8 @@ class MHRBodyModel(nn.Module):
         # translation = joint_translation_offsets + local_trans
         trans = self.joint_translation_offsets[None, :, :] + local_trans  # (B, 127, 3)
 
-        # Scale factor (1 + local_scale, since 0 = no change)
-        scale = 1.0 + local_scale  # (B, 127, 1)
+        # Scale factor: exp(dof * ln(2)) = 2^dof (matches PyTorch JIT convention)
+        scale = mx.exp(local_scale * 0.6931471824645996)  # (B, 127, 1)
 
         # FK chain: iterate joints in parent order
         parents = self.joint_parents  # (127,)
@@ -333,6 +333,44 @@ class MHRBodyModel(nn.Module):
             )
         return verts
 
+    def _pose_features_from_joint_dofs(self, joint_dofs: mx.array) -> mx.array:
+        """Convert 889D joint DOFs to 750D pose features for correctives.
+
+        Matches PyTorch's _pose_features_from_joint_params:
+        1. Reshape to (B, 127, 7)
+        2. Skip joints 0,1 → take euler angles (B, 125, 3)
+        3. Convert to 6D rotation (first two columns of rotation matrix)
+        4. Subtract identity (elements 0 and 4)
+        5. Flatten to (B, 750)
+        """
+        B = joint_dofs.shape[0]
+        jd = joint_dofs.reshape(B, self.num_joints, 7)  # (B, 127, 7)
+        euler = jd[:, 2:, 3:6]  # (B, 125, 3) — skip root and joint 1
+
+        # Build rotation matrix columns from euler XYZ (R = Rz @ Ry @ Rx)
+        cx = mx.cos(euler[..., 0])
+        sx = mx.sin(euler[..., 0])
+        cy = mx.cos(euler[..., 1])
+        sy = mx.sin(euler[..., 1])
+        cz = mx.cos(euler[..., 2])
+        sz = mx.sin(euler[..., 2])
+
+        # 6D = [R00, R10, R20, R01, R11, R21]
+        r00 = cy * cz
+        r10 = cy * sz
+        r20 = -sy
+        r01 = -cx * sz + sx * sy * cz
+        r11 = cx * cz + sx * sy * sz
+        r21 = sx * cy
+
+        feat = mx.stack([r00, r10, r20, r01, r11, r21], axis=-1)  # (B, 125, 6)
+
+        # Subtract identity: R00 - 1 and R11 - 1
+        identity_sub = mx.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+        feat = feat - identity_sub
+
+        return feat.reshape(B, -1)  # (B, 750)
+
     def _pose_correctives(
         self,
         joint_dofs: mx.array,
@@ -340,33 +378,31 @@ class MHRBodyModel(nn.Module):
     ) -> mx.array:
         """Compute pose-dependent vertex corrections.
 
-        Uses a sparse linear layer followed by a dense linear layer.
-        joint_dofs: (B, 889)
-        Returns: (B, num_verts, 3) or (B, V, 3) where V <= num_verts
+        Pipeline: joint_dofs → 6D pose features (750D) → sparse → ReLU → dense
         """
         B = joint_dofs.shape[0]
 
+        # Convert joint DOFs to 6D pose features (matches PyTorch preprocessing)
+        pose_feats = self._pose_features_from_joint_dofs(joint_dofs)  # (B, 750)
+
         # Sparse layer: indices (2, K), weights (K,)
-        # indices[0] = output index, indices[1] = input index
-        # This is a sparse matrix multiply: out = sparse_mat @ input
         out_indices = self.pc_sparse_indices[0]  # (K,)
         in_indices = self.pc_sparse_indices[1]  # (K,)
         weights = self.pc_sparse_weight  # (K,)
 
-        # Gather input values
-        input_vals = joint_dofs[:, in_indices]  # (B, K)
+        # Gather input values from pose features
+        input_vals = pose_feats[:, in_indices]  # (B, K)
         weighted = input_vals * weights[None, :]  # (B, K)
 
         # Scatter-add into sparse output
-        # Determine output size from max index
-        out_size = 3000  # matches dense layer input size
+        out_size = 3000
         sparse_out_list = []
         for b in range(B):
             col = _scatter_add_1d(weighted[b], out_indices, out_size)
             sparse_out_list.append(col)
         sparse_out = mx.stack(sparse_out_list, axis=0)  # (B, 3000)
 
-        # ReLU activation (layer 1 in the sequential is ReLU)
+        # ReLU
         sparse_out = nn.relu(sparse_out)
 
         # Dense layer: (55317, 3000) -> (B, 55317)
@@ -394,10 +430,9 @@ class MHRBodyModel(nn.Module):
             skinned_verts: (B, 18439, 3)
             skel_state: (B, 127, 8) [x, y, z, qx, qy, qz, qw, scale]
         """
-        # 1. Apply parameter limits
-        model_params = self._apply_parameter_limits(model_params)
-
-        # 2. Parameter transform: 204 -> 889 joint DOFs
+        # 1. Parameter transform: 204 -> 889 joint DOFs
+        # NOTE: parameter_limits is NOT applied during inference.
+        # The JIT model skips it entirely in its forward pass.
         joint_dofs = self._parameter_transform(model_params)
 
         # 3. Blend shapes

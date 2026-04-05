@@ -56,7 +56,7 @@ class SAM3DPredictor:
             bbox = [0, 0, w, h]
 
         if cam_int is None:
-            focal = h / (2 * math.tan(math.radians(30.0)))
+            focal = math.sqrt(h**2 + w**2)  # image diagonal (PyTorch default)
             cam_int = np.array([
                 [focal, 0, w / 2],
                 [0, focal, h / 2],

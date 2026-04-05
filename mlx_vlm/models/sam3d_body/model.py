@@ -286,14 +286,14 @@ class SAM3DBody(nn.Module):
 
         return result
 
-    def _perspective_projection(self, kp3d, pred_cam, bbox, img_size, fov_deg=60.0):
+    def _perspective_projection(self, kp3d, pred_cam, bbox, img_size, cam_int=None):
         """Project 3D keypoints to 2D crop-normalized coordinates.
 
         kp3d: (B, N, 3) 3D keypoints
         pred_cam: (B, 3) camera params [scale, tx, ty]
         bbox: [x1, y1, x2, y2]
         img_size: (img_h, img_w)
-        fov_deg: field of view
+        cam_int: (3, 3) camera intrinsics, or None for default
 
         Returns: (B, N, 2) keypoints in [-1, 1] range (grid_sample compatible)
         """
@@ -305,7 +305,10 @@ class SAM3DBody(nn.Module):
         tx = pred_cam[:, 1:2]
         ty = -pred_cam[:, 2:3]
 
-        focal_length = img_h / (2 * math.tan(math.radians(fov_deg / 2)))
+        if cam_int is not None:
+            focal_length = float(cam_int[0, 0])
+        else:
+            focal_length = math.sqrt(img_h**2 + img_w**2)
 
         bbox_center_x = (bbox[0] + bbox[2]) / 2
         bbox_center_y = (bbox[1] + bbox[3]) / 2
@@ -462,7 +465,7 @@ class SAM3DBody(nn.Module):
             if bbox is not None and img_size is not None:
                 # Project 3D keypoints to 2D crop coordinates
                 kp2d_norm = self._perspective_projection(
-                    kp3d, pred_cam, bbox, img_size
+                    kp3d, pred_cam, bbox, img_size, cam_int=cam_int
                 )  # (B, 70, 2)
 
                 # New position embeddings from predicted 2D coords
@@ -488,11 +491,8 @@ class SAM3DBody(nn.Module):
                 ], axis=1)
 
             # --- Update 3D keypoint tokens ---
-            # Pelvis-normalize: subtract midpoint of pelvis joints
-            # Pelvis joints are typically indices 1 and 2 in the joint set
-            joint_coords = body_output["pred_joint_coords"]  # (B, 127, 3)
-            # Use root joint (index 0) as pelvis reference
-            pelvis = joint_coords[:, 0:1, :]  # (B, 1, 3)
+            # Pelvis-normalize: average of left_hip (9) and right_hip (10)
+            pelvis = (kp3d[:, 9:10, :] + kp3d[:, 10:11, :]) / 2  # (B, 1, 3)
             kp3d_centered = kp3d - pelvis  # (B, 70, 3)
 
             # New position embeddings from predicted 3D coords
