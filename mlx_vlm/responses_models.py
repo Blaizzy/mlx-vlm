@@ -270,6 +270,10 @@ class ResponsesRequest(GenerationParams, TemplateParams):
     metadata: Optional[dict] = Field(
         None, description="Up to 16 key-value pairs of metadata."
     )
+    stop: Optional[Union[str, List[str]]] = Field(
+        None,
+        description="Up to 4 sequences where the API will stop generating further tokens.",
+    )
 
     def generation_kwargs(self) -> dict[str, Any]:
         kwargs = self.dump_kwargs("max_output_tokens")

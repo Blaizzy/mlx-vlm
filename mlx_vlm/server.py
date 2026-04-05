@@ -720,6 +720,46 @@ def resolve_stop_tokens(
     return token_ids if token_ids else None
 
 
+def resolve_tool_choice(
+    tools: Optional[list],
+    tool_choice: Optional[Any],
+) -> tuple[Optional[list], Optional[str]]:
+    """Apply tool_choice policy to the tools list.
+
+    Args:
+        tools: The original tools list from the request.
+        tool_choice: ``"none"``, ``"auto"``, ``"required"``, or a dict
+            specifying a particular tool.
+
+    Returns:
+        Tuple of ``(filtered_tools, system_instruction)``.
+    """
+    if not tools or tool_choice is None or tool_choice == "auto":
+        return tools, None
+
+    if tool_choice == "none":
+        return None, None
+
+    if tool_choice == "required":
+        return tools, "You must call one of the available tools to answer this request."
+
+    if isinstance(tool_choice, dict):
+        func = tool_choice.get("function", {})
+        name = func.get("name") if isinstance(func, dict) else None
+        if name:
+            filtered = [
+                t for t in tools
+                if (t.get("function", {}) or {}).get("name") == name
+                or t.get("name") == name
+            ]
+            return (
+                filtered or tools,
+                f'You must call the "{name}" tool to answer this request.',
+            )
+
+    return tools, None
+
+
 def build_generation_kwargs(
     request: Any,
     template_kwargs: dict[str, Any],
@@ -1037,8 +1077,13 @@ async def responses_endpoint(request: ResponsesRequest):
             previous_response_id=request.previous_response_id,
         )
 
-        # Set up tool parser
+        # Set up tool parser (apply tool_choice policy)
         tools = request.tools
+        tool_choice_val = getattr(request, "tool_choice", "auto")
+        tools, tool_instruction = resolve_tool_choice(tools, tool_choice_val)
+        if tool_instruction:
+            chat_messages.insert(0, {"role": "system", "content": tool_instruction})
+
         tool_parser_type = None
         tool_module = None
         tokenizer = (
@@ -1464,6 +1509,12 @@ async def chat_completions_endpoint(request: ChatRequest):
         tools = None
         if hasattr(request, "tools"):
             tools = request.tools
+
+        # Apply tool_choice policy
+        tool_choice = getattr(request, "tool_choice", None)
+        tools, tool_instruction = resolve_tool_choice(tools, tool_choice)
+        if tool_instruction:
+            processed_messages.insert(0, {"role": "system", "content": tool_instruction})
 
         tool_parser_type = None
         tokenizer = (
