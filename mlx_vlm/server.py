@@ -45,6 +45,10 @@ DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 
 
+def get_default_max_tokens():
+    return int(os.environ.get("DEFAULT_MAX_TOKENS", DEFAULT_MAX_TOKENS))
+
+
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
@@ -376,7 +380,7 @@ class OpenAIRequest(GenerationParams, TemplateParams):
     )
     model: str = Field(..., description="The model to use for generation.")
     max_output_tokens: int = Field(
-        DEFAULT_MAX_TOKENS,
+        default_factory=get_default_max_tokens,
         description="Maximum number of tokens to generate.",
     )
     stream: bool = Field(
@@ -555,7 +559,7 @@ class VLMRequest(GenerationParams, TemplateParams):
         None, description="The path to the adapter weights."
     )
     max_tokens: int = Field(
-        DEFAULT_MAX_TOKENS,
+        default_factory=get_default_max_tokens,
         description="Maximum number of tokens to generate.",
     )
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
@@ -1434,6 +1438,13 @@ def main():
         help="Start index (of token) for the quantized KV cache.",
     )
     parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help="Default maximum number of tokens to generate when not specified "
+        "in the request (default: %(default)s).",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -1454,6 +1465,7 @@ def main():
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    os.environ["DEFAULT_MAX_TOKENS"] = str(args.max_tokens)
 
     uvicorn.run(
         "mlx_vlm.server:app",
