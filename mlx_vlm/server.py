@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import gc
 import json
 import os
@@ -121,6 +122,23 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 # Loading/unloading utilities
 
 model_cache = {}
+
+# Concurrency guard: MLX generation is single-threaded on Metal.
+# Concurrent requests would corrupt shared GPU state. The semaphore
+# serializes access to the generation pipeline.
+_generation_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def get_max_concurrent_requests() -> int:
+    return int(os.environ.get("MAX_CONCURRENT_REQUESTS", 1))
+
+
+def get_generation_semaphore() -> asyncio.Semaphore:
+    """Get or create the generation semaphore."""
+    global _generation_semaphore
+    if _generation_semaphore is None:
+        _generation_semaphore = asyncio.Semaphore(get_max_concurrent_requests())
+    return _generation_semaphore
 
 
 class FlexibleBaseModel(BaseModel):
@@ -854,6 +872,8 @@ async def responses_endpoint(openai_request: OpenAIRequest):
         if openai_request.stream:
             # Streaming response
             async def stream_generator():
+                sem = get_generation_semaphore()
+                await sem.acquire()
                 token_iterator = None
                 try:
                     # Create base response object (to match the openai pipeline)
@@ -968,6 +988,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     mx.clear_cache()
                     gc.collect()
                     print("Stream finished, cleared cache.")
+                    sem.release()
 
             return StreamingResponse(
                 stream_generator(),
@@ -981,6 +1002,8 @@ async def responses_endpoint(openai_request: OpenAIRequest):
 
         else:
             # Non-streaming response
+            sem = get_generation_semaphore()
+            await sem.acquire()
             try:
                 # Use generate from generate.py
                 result = generate(
@@ -1032,6 +1055,8 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                 mx.clear_cache()
                 gc.collect()
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+            finally:
+                sem.release()
 
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions (like model loading failure)
@@ -1118,6 +1143,8 @@ async def chat_completions_endpoint(request: ChatRequest):
         if request.stream:
             # Streaming response
             async def stream_generator():
+                sem = get_generation_semaphore()
+                await sem.acquire()
                 token_iterator = None
                 try:
                     # Use stream_generate from utils
@@ -1209,6 +1236,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     mx.clear_cache()
                     gc.collect()
                     print("Stream finished, cleared cache.")
+                    sem.release()
 
             return StreamingResponse(
                 stream_generator(),
@@ -1222,6 +1250,8 @@ async def chat_completions_endpoint(request: ChatRequest):
 
         else:
             # Non-streaming response
+            sem = get_generation_semaphore()
+            await sem.acquire()
             try:
                 # Use generate from generate.py
                 gen_result = generate(
@@ -1282,6 +1312,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                 mx.clear_cache()
                 gc.collect()
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+            finally:
+                sem.release()
 
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions (like model loading failure)
@@ -1434,6 +1466,14 @@ def main():
         help="Start index (of token) for the quantized KV cache.",
     )
     parser.add_argument(
+        "--max-concurrent-requests",
+        type=int,
+        default=1,
+        help="Maximum number of concurrent generation requests. "
+        "MLX runs single-threaded on Metal; values > 1 may cause GPU errors. "
+        "(default: %(default)s)",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -1454,6 +1494,7 @@ def main():
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    os.environ["MAX_CONCURRENT_REQUESTS"] = str(args.max_concurrent_requests)
 
     uvicorn.run(
         "mlx_vlm.server:app",
