@@ -430,7 +430,7 @@ class VisionModel(nn.Module):
             pad_positions = np.full((num_padding, 2), -1, dtype=np.int64)
             patch_positions = np.concatenate([real_positions, pad_positions], axis=0)
         else:
-            patch_positions = real_positions[:self.max_patches]
+            patch_positions = real_positions[: self.max_patches]
 
         padding_mask = np.zeros(self.max_patches, dtype=bool)
         if num_padding > 0:
@@ -483,7 +483,7 @@ class VisionModel(nn.Module):
             all_positions = []
             all_padding = []
             for i in range(B):
-                img = pixel_values[i:i+1]
+                img = pixel_values[i : i + 1]
                 _, _, h, w = img.shape
                 pos, pad_mask, n_real = self._patch_positions_single(h, w)
                 pos_mx = mx.array(pos[None])
