@@ -55,7 +55,12 @@ class Model(nn.Module):
                 else None
             )
 
-        image_features, cls_embed = self.vision_tower(pixel_values, image_masks)
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
+            cls_embed = None
+        else:
+            image_features, cls_embed = self.vision_tower(pixel_values, image_masks)
 
         # Insert image features into the input embeddings
         num_image, num_patch = image_features.shape[1:3]
