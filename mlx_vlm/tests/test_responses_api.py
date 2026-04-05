@@ -257,6 +257,9 @@ def _mock_result(text="Hello world!", prompt_tokens=10, gen_tokens=5):
         prompt_tokens=prompt_tokens,
         generation_tokens=gen_tokens,
         total_tokens=prompt_tokens + gen_tokens,
+        prompt_tps=100.0,
+        generation_tps=50.0,
+        peak_memory=1.0,
     )
 
 
@@ -474,3 +477,122 @@ class TestResponsesStreaming:
         # The last meaningful event should be response.completed
         lines = [l for l in body.strip().split("\n") if l.startswith("event:")]
         assert lines[-1] == "event: response.completed"
+
+
+# =========================================================================
+# E. Prompt Cache Tests
+# =========================================================================
+
+
+@_skip_no_mlx
+class TestPromptCache:
+    """Verify prompt_cache_state is wired into all generation entry points."""
+
+    def test_responses_non_streaming_passes_cache_state(self, client):
+        """Non-streaming /responses should pass prompt_cache_state to generate."""
+        captured = {}
+
+        def capture_generate(**kwargs):
+            captured["prompt_cache_state"] = kwargs.get("prompt_cache_state")
+            return _mock_result()
+
+        with _patch_model(), _patch_template(), \
+             patch.object(server, "generate", side_effect=capture_generate):
+            resp = client.post("/responses", json={"model": "demo", "input": "hi"})
+        assert resp.status_code == 200
+        assert captured.get("prompt_cache_state") is not None
+        assert hasattr(captured["prompt_cache_state"], "find_prefix_length")
+
+    def test_responses_streaming_passes_cache_state(self, client):
+        """Streaming /responses should pass prompt_cache_state to stream_generate."""
+        captured = {}
+
+        def capture_stream(**kwargs):
+            captured["prompt_cache_state"] = kwargs.get("prompt_cache_state")
+            return iter([
+                SimpleNamespace(text="Hi", prompt_tokens=5, generation_tokens=1),
+            ])
+
+        with _patch_model(), _patch_template(), \
+             patch.object(server, "stream_generate", side_effect=capture_stream):
+            resp = client.post(
+                "/responses", json={"model": "demo", "input": "hi", "stream": True},
+            )
+        assert resp.status_code == 200
+        assert captured.get("prompt_cache_state") is not None
+
+    def test_chat_completions_non_streaming_passes_cache_state(self, client):
+        """Non-streaming /chat/completions should pass prompt_cache_state."""
+        captured = {}
+
+        def capture_generate(**kwargs):
+            captured["prompt_cache_state"] = kwargs.get("prompt_cache_state")
+            return _mock_result()
+
+        with _patch_model(), _patch_template(), \
+             patch.object(server, "generate", side_effect=capture_generate):
+            resp = client.post(
+                "/chat/completions",
+                json={
+                    "model": "demo",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+        assert resp.status_code == 200
+        assert captured.get("prompt_cache_state") is not None
+
+    def test_chat_completions_streaming_passes_cache_state(self, client):
+        """Streaming /chat/completions should pass prompt_cache_state."""
+        captured = {}
+
+        def capture_stream(**kwargs):
+            captured["prompt_cache_state"] = kwargs.get("prompt_cache_state")
+            return iter([
+                SimpleNamespace(text="Hi", prompt_tokens=5, generation_tokens=1),
+            ])
+
+        with _patch_model(), _patch_template(), \
+             patch.object(server, "stream_generate", side_effect=capture_stream):
+            resp = client.post(
+                "/chat/completions",
+                json={
+                    "model": "demo",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+        assert resp.status_code == 200
+        assert captured.get("prompt_cache_state") is not None
+
+    def test_cache_state_persists_across_requests(self, client):
+        """The same PromptCacheState should be reused for the same model."""
+        states = []
+
+        def capture_generate(**kwargs):
+            states.append(kwargs.get("prompt_cache_state"))
+            return _mock_result()
+
+        with _patch_model(), _patch_template(), \
+             patch.object(server, "generate", side_effect=capture_generate):
+            client.post("/responses", json={"model": "demo", "input": "first"})
+            client.post("/responses", json={"model": "demo", "input": "second"})
+
+        assert len(states) == 2
+        assert states[0] is states[1], "Same model should reuse the same cache state"
+
+    def test_cache_state_isolated_per_model(self, client):
+        """Different models should get different PromptCacheState instances."""
+        states = {}
+
+        def capture_generate(**kwargs):
+            return _mock_result()
+
+        # We need to capture from the store directly
+        with _patch_model(), _patch_template(), \
+             patch.object(server, "generate", side_effect=capture_generate):
+            client.post("/responses", json={"model": "model-a", "input": "hi"})
+            state_a = server.get_prompt_cache_state("model-a")
+            client.post("/responses", json={"model": "model-b", "input": "hi"})
+            state_b = server.get_prompt_cache_state("model-b")
+
+        assert state_a is not state_b, "Different models must have separate cache states"
