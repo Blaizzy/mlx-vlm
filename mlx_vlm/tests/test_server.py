@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -130,3 +131,147 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["repetition_penalty"] == 1.15
     assert mock_generate.call_args.kwargs["logit_bias"] == {12: -1.5}
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
+
+
+# --- Logprobs helpers ---
+
+def _make_logprobs_array(chosen_token_id, logprob_value, vocab_size=100):
+    """Create a fake logprobs object that supports indexing by token id."""
+    arr = [float("-inf")] * vocab_size
+    arr[chosen_token_id] = logprob_value
+    return arr
+
+
+def _make_stream_chunks():
+    """Return a list of SimpleNamespace chunks mimicking stream_generate output."""
+    return [
+        SimpleNamespace(
+            text="Hello",
+            token=15,
+            logprobs=_make_logprobs_array(15, -0.5),
+            prompt_tokens=8,
+            generation_tokens=1,
+            total_tokens=9,
+            prompt_tps=10.0,
+            generation_tps=5.0,
+            peak_memory=0.1,
+        ),
+        SimpleNamespace(
+            text=" world",
+            token=42,
+            logprobs=_make_logprobs_array(42, -0.3),
+            prompt_tokens=8,
+            generation_tokens=2,
+            total_tokens=10,
+            prompt_tps=10.0,
+            generation_tps=5.0,
+            peak_memory=0.1,
+        ),
+    ]
+
+
+def _mock_tokenizer():
+    """Return a mock tokenizer with a decode method."""
+    class _Tok:
+        def decode(self, ids):
+            mapping = {15: "Hello", 42: " world"}
+            return "".join(mapping.get(i, "?") for i in ids)
+    return _Tok()
+
+
+def _patch_for_logprobs(client, *, logprobs, stream=False):
+    """Helper that patches the server and posts a chat request."""
+    model = SimpleNamespace()
+    tokenizer = _mock_tokenizer()
+    processor = SimpleNamespace(tokenizer=tokenizer)
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    patches = [
+        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "stream_generate", return_value=iter(_make_stream_chunks())),
+    ]
+    if not logprobs:
+        # When logprobs is not requested, the non-streaming path uses generate()
+        result = SimpleNamespace(
+            text="Hello world",
+            token=42,
+            logprobs=None,
+            prompt_tokens=8,
+            generation_tokens=2,
+            total_tokens=10,
+            prompt_tps=10.0,
+            generation_tps=5.0,
+            peak_memory=0.1,
+        )
+        patches.append(patch.object(server, "generate", return_value=result))
+
+    body = {
+        "model": "demo",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": stream,
+    }
+    if logprobs:
+        body["logprobs"] = True
+
+    import contextlib
+    with contextlib.ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        response = client.post("/chat/completions", json=body)
+    return response
+
+
+def test_chat_completions_logprobs_returned_when_requested(client):
+    response = _patch_for_logprobs(client, logprobs=True)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["choices"][0]["logprobs"] is not None
+    assert data["choices"][0]["logprobs"]["content"] is not None
+    assert len(data["choices"][0]["logprobs"]["content"]) == 2
+
+
+def test_chat_completions_logprobs_absent_by_default(client):
+    response = _patch_for_logprobs(client, logprobs=False)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["choices"][0]["logprobs"] is None
+
+
+def test_chat_completions_logprobs_format(client):
+    response = _patch_for_logprobs(client, logprobs=True)
+    data = response.json()
+    content = data["choices"][0]["logprobs"]["content"]
+
+    first = content[0]
+    assert first["token"] == "Hello"
+    assert abs(first["logprob"] - (-0.5)) < 1e-6
+    assert first["bytes"] == list("Hello".encode("utf-8"))
+
+    second = content[1]
+    assert second["token"] == " world"
+    assert abs(second["logprob"] - (-0.3)) < 1e-6
+    assert second["bytes"] == list(" world".encode("utf-8"))
+
+
+def test_chat_completions_streaming_logprobs(client):
+    response = _patch_for_logprobs(client, logprobs=True, stream=True)
+    assert response.status_code == 200
+
+    chunks = []
+    for line in response.text.strip().split("\n"):
+        line = line.strip()
+        if line.startswith("data: ") and line != "data: [DONE]":
+            chunks.append(json.loads(line[len("data: "):]))
+
+    # At least one content chunk should have logprobs
+    logprob_chunks = [
+        c for c in chunks
+        if c["choices"][0].get("logprobs") is not None
+    ]
+    assert len(logprob_chunks) >= 1
+
+    first_lp = logprob_chunks[0]["choices"][0]["logprobs"]["content"][0]
+    assert "token" in first_lp
+    assert "logprob" in first_lp
+    assert "bytes" in first_lp
