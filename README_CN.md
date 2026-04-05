@@ -27,20 +27,20 @@ MLX-VLM 是一个在 Mac 上使用 MLX 进行视觉语言模型（VLMs）和 Omn
 
 | 模型 | 文档 |
 |-------|---------------|
-| DeepSeek-OCR | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
-| DeepSeek-OCR-2 | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
-| DOTS-OCR | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
-| DOTS-MOCR | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
-| GLM-OCR | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/glm_ocr/README.md) |
-| Phi-4 Reasoning Vision | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4_siglip/README.md) |
-| MiniCPM-o | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmo/README.md) |
-| Phi-4 Multimodal | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4mm/README.md) |
-| MolmoPoint | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/molmo_point/README.md) |
-| Moondream3 | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream3/README.md) |
-| Gemma 4 | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
-| Falcon-OCR | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
-| Granite Vision 3.2 | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
-| Granite 4.0 Vision | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
+| DeepSeek-OCR | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README_CN.md) |
+| DeepSeek-OCR-2 | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README_CN.md) |
+| DOTS-OCR | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README_CN.md) |
+| DOTS-MOCR | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README_CN.md) |
+| GLM-OCR | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/glm_ocr/README_CN.md) |
+| Phi-4 Reasoning Vision | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4_siglip/README_CN.md) |
+| MiniCPM-o | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmo/README_CN.md) |
+| Phi-4 Multimodal | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4mm/README_CN.md) |
+| MolmoPoint | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/molmo_point/README_CN.md) |
+| Moondream3 | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream3/README_CN.md) |
+| Gemma 4 | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README_CN.md) |
+| Falcon-OCR | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README_CN.md) |
+| Granite Vision 3.2 | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README_CN.md) |
+| Granite 4.0 Vision | [文档](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README_CN.md) |
 
 ## 安装
 
