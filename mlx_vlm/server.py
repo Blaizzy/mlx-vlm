@@ -438,6 +438,10 @@ class OpenAIRequest(GenerationParams, TemplateParams):
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
+    stop: Optional[Union[str, List[str]]] = Field(
+        None,
+        description="Up to 4 sequences where the API will stop generating further tokens.",
+    )
 
     def generation_kwargs(self) -> dict[str, Any]:
         kwargs = self.dump_kwargs("max_output_tokens")
@@ -615,6 +619,10 @@ class VLMRequest(GenerationParams, TemplateParams):
         description="Maximum number of tokens to generate.",
     )
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
+    stop: Optional[Union[str, List[str]]] = Field(
+        None,
+        description="Up to 4 sequences where the API will stop generating further tokens.",
+    )
     resize_shape: Optional[ResizeShapeInput] = Field(
         None,
         description="Resize shape for the image. Provide one integer for a square resize or two integers for (height, width).",
@@ -684,6 +692,32 @@ class ChatStreamChunk(BaseModel):
     model: str
     choices: List[ChatStreamChoice]
     usage: Optional[UsageStats]
+
+
+def resolve_stop_tokens(
+    stop: Optional[Union[str, list]],
+    processor: Any,
+) -> Optional[set]:
+    """Convert stop string(s) to token IDs for the stopping criteria.
+
+    Args:
+        stop: A single stop string or list of stop strings, or None.
+        processor: The tokenizer/processor for encoding.
+
+    Returns:
+        A set of token IDs, or None if no stop sequences provided.
+    """
+    if not stop:
+        return None
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    if isinstance(stop, str):
+        stop = [stop]
+    token_ids = set()
+    for seq in stop[:4]:  # OpenAI limits to 4 stop sequences
+        ids = tokenizer.encode(seq, add_special_tokens=False)
+        if ids:
+            token_ids.add(ids[-1])  # Use last token as stop trigger
+    return token_ids if token_ids else None
 
 
 def build_generation_kwargs(
@@ -1028,6 +1062,13 @@ async def responses_endpoint(request: ResponsesRequest):
             **template_kwargs,
         )
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
+
+        # Resolve stop sequences to token IDs
+        stop_tokens = resolve_stop_tokens(
+            getattr(request, "stop", None), processor,
+        )
+        if stop_tokens:
+            generation_kwargs["eos_tokens"] = stop_tokens
 
         generated_at = int(time.time())
         response_id = f"resp_{uuid.uuid4().hex[:24]}"
@@ -1443,6 +1484,13 @@ async def chat_completions_endpoint(request: ChatRequest):
             **template_kwargs,
         )
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
+
+        # Resolve stop sequences to token IDs
+        stop_tokens = resolve_stop_tokens(
+            getattr(request, "stop", None), processor,
+        )
+        if stop_tokens:
+            generation_kwargs["eos_tokens"] = stop_tokens
 
         if request.stream:
             # Streaming response
