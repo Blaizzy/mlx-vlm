@@ -1066,7 +1066,11 @@ async def responses_endpoint(request: ResponsesRequest):
                     )
 
                     full_text = ""
+                    visible_text = ""
                     usage_stats = {"input_tokens": 0, "output_tokens": 0}
+                    in_tool_call = False
+                    tool_call_start_tag = tool_module.tool_call_start if tool_module else "<tool_call>"
+
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
                             continue
@@ -1078,6 +1082,23 @@ async def responses_endpoint(request: ResponsesRequest):
                             "output_tokens": chunk.generation_tokens,
                         }
 
+                        # Suppress tool call tokens from being streamed as text
+                        if not in_tool_call and tool_call_start_tag in full_text:
+                            in_tool_call = True
+                        if in_tool_call:
+                            continue
+
+                        # Check if this delta starts a tool call tag
+                        # (partial match: buffer might end with "<tool" before "_call>")
+                        if tools and tool_call_start_tag[:1] in delta:
+                            pending = full_text[-(len(delta) + len(tool_call_start_tag)):]
+                            if any(
+                                tool_call_start_tag[:i] == pending[-i:]
+                                for i in range(2, len(tool_call_start_tag) + 1)
+                            ):
+                                continue
+
+                        visible_text += delta
                         yield _evt(
                             "response.output_text.delta",
                             ResponsesOutputTextDeltaEvent(
@@ -1090,16 +1111,19 @@ async def responses_endpoint(request: ResponsesRequest):
                     is_length = usage_stats["output_tokens"] >= max_tok
                     status = "incomplete" if is_length else "completed"
 
+                    # Use visible_text (sans tool call markup) for text events
+                    display_text = visible_text.strip()
+
                     # output_text.done
                     yield _evt(
                         "response.output_text.done",
                         ResponsesOutputTextDoneEvent(
-                            item_id=message_id, output_index=0, content_index=0, text=full_text,
+                            item_id=message_id, output_index=0, content_index=0, text=display_text,
                         ),
                     )
 
                     # content_part.done
-                    final_part = ResponseContentPartOutputText(text=full_text)
+                    final_part = ResponseContentPartOutputText(text=display_text)
                     yield _evt(
                         "response.content_part.done",
                         ResponsesContentPartDoneEvent(
