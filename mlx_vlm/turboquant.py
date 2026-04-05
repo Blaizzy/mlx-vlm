@@ -71,6 +71,101 @@ def _mse_score_kernel():
 
 
 @lru_cache(maxsize=None)
+def _mse_score_tiled_kernel(repeat_count: int):
+    """Tiled MSE score: preload R queries into registers, loop over tokens.
+    Processes TokTileSize tokens per threadgroup instead of 1.
+    Reduces threadgroup count by TokTileSize×, amortizing dispatch overhead."""
+    if not _metal_available() or repeat_count < 1:
+        return None
+
+    lines = [
+        "        auto lane = thread_position_in_grid.x;",
+        "        auto n = thread_position_in_grid.z;",
+        "",
+        "        auto token_count = norms_shape[2];",
+        "        auto kv_heads = norms_shape[1];",
+        "        auto num_tok_tiles = (token_count + TokTileSize - 1) / TokTileSize;",
+        "        auto bh = n / num_tok_tiles;",
+        "        auto tok_tile = n % num_tok_tiles;",
+        "        int t_start = tok_tile * TokTileSize;",
+        "        int t_end = min(t_start + TokTileSize, (int)token_count);",
+        "",
+        "        auto q_base = q_rot + (bh * RepeatCount) * Dim;",
+        "        auto pk = packed + bh * token_count * PackedWidth;",
+        "        auto nm = norms + bh * token_count;",
+        "",
+        "        // Preload query values into registers (constant across all tokens)",
+    ]
+
+    for r in range(repeat_count):
+        lines += [
+            f"        float qr_{r}[DimsPerLane];",
+            f"        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32)",
+            f"            qr_{r}[i] = (d < Dim) ? static_cast<float>(q_base[{r} * Dim + d]) : 0.0f;",
+        ]
+
+    lines += [
+        "",
+        "        // Precompute bit offsets for key unpacking",
+        "        int k_words[DimsPerLane], k_offs[DimsPerLane];",
+        "        bool k_spills[DimsPerLane];",
+        "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {",
+        "            int bo = d * Bits;",
+        "            k_words[i] = bo / 32;",
+        "            k_offs[i] = bo % 32;",
+        "            k_spills[i] = (bo % 32 + Bits) > 32;",
+        "        }",
+        "        constexpr uint mask = (1u << Bits) - 1u;",
+        "",
+        "        // Token loop: key data changes, queries stay in registers",
+        "        for (int t = t_start; t < t_end; t++) {",
+        "            auto pt = pk + t * PackedWidth;",
+        "            float kn = static_cast<float>(nm[t]);",
+        "",
+    ]
+
+    for r in range(repeat_count):
+        lines += [f"            float ps_{r} = 0.0f;"]
+
+    lines += [
+        "            for (int i = 0; i < DimsPerLane; i++) {",
+        "                uint vv = (pt[k_words[i]] >> k_offs[i]);",
+        "                if (k_spills[i]) vv |= pt[k_words[i]+1] << (Bits - (k_offs[i]+Bits-32));",
+        "                float code = codebook[vv & mask];",
+    ]
+
+    for r in range(repeat_count):
+        lines += [f"                ps_{r} += qr_{r}[i] * code;"]
+
+    lines += [
+        "            }",
+        "",
+    ]
+
+    for r in range(repeat_count):
+        lines += [f"            float s_{r} = simd_sum(ps_{r});"]
+
+    lines += [
+        "            if (thread_index_in_simdgroup == 0) {",
+    ]
+    for r in range(repeat_count):
+        lines += [
+            f"                out[(bh * RepeatCount + {r}) * token_count + t] = kn * s_{r};",
+        ]
+    lines += [
+        "            }",
+        "        }",
+    ]
+
+    return mx.fast.metal_kernel(
+        name=f"turboquant_mse_score_tiled_{repeat_count}",
+        input_names=["q_rot", "norms", "packed", "codebook"],
+        output_names=["out"],
+        source="\n".join(lines),
+    )
+
+
+@lru_cache(maxsize=None)
 def _pack_lowbit_kernel():
     if not _metal_available():
         return None
@@ -275,90 +370,6 @@ def _prod_score_kernel():
 
 
 @lru_cache(maxsize=None)
-def _prod_score_multi_kernel():
-    if not _metal_available():
-        return None
-
-    source = r"""
-        auto lane = thread_position_in_grid.x;
-        auto n = thread_position_in_grid.z;
-
-        auto token_count = norms_shape[2];
-        auto kv_heads = norms_shape[1];
-
-        auto b = n / (kv_heads * token_count);
-        auto rem = n % (kv_heads * token_count);
-        auto h = rem / token_count;
-        auto t = rem % token_count;
-
-        auto q_rot_base = q_rot + ((b * kv_heads + h) * RepeatCount) * Dim;
-        auto q_proj_base = q_proj + ((b * kv_heads + h) * RepeatCount) * Dim;
-        auto mse_ptr = mse_packed + ((b * kv_heads + h) * token_count + t) * MsePackedWidth;
-        auto sign_ptr = signs + ((b * kv_heads + h) * token_count + t) * SignPackedWidth;
-
-        float mse_acc[RepeatCount];
-        float qjl_acc[RepeatCount];
-        for (int r = 0; r < RepeatCount; ++r) {
-            mse_acc[r] = 0.0f;
-            qjl_acc[r] = 0.0f;
-        }
-
-        for (int d = lane; d < Dim; d += 32) {
-            int bit_offset = d * MseBits;
-            int word_idx = bit_offset / 32;
-            int offset = bit_offset % 32;
-            uint value = mse_ptr[word_idx] >> offset;
-            int spill = offset + MseBits - 32;
-            if (spill > 0) {
-                value |= mse_ptr[word_idx + 1] << (MseBits - spill);
-            }
-            value &= ((1u << MseBits) - 1u);
-            float code = codebook[value];
-
-            int sign_word = d / 32;
-            int sign_offset = d % 32;
-            uint bit = (sign_ptr[sign_word] >> sign_offset) & 1u;
-            float sign = bit ? 1.0f : -1.0f;
-
-            for (int r = 0; r < RepeatCount; ++r) {
-                mse_acc[r] += static_cast<float>(q_rot_base[r * Dim + d]) * code;
-                qjl_acc[r] += static_cast<float>(q_proj_base[r * Dim + d]) * sign;
-            }
-        }
-
-        for (int r = 0; r < RepeatCount; ++r) {
-            mse_acc[r] = simd_sum(mse_acc[r]);
-            qjl_acc[r] = simd_sum(qjl_acc[r]);
-        }
-
-        if (thread_index_in_simdgroup == 0) {
-            auto idx = (b * kv_heads + h) * token_count + t;
-            float norm = static_cast<float>(norms[idx]);
-            float residual_norm = static_cast<float>(residual_norms[idx]);
-            for (int r = 0; r < RepeatCount; ++r) {
-                out[((b * kv_heads + h) * RepeatCount + r) * token_count + t] =
-                    norm * (mse_acc[r] + scale[0] * residual_norm * qjl_acc[r]);
-            }
-        }
-    """
-    return mx.fast.metal_kernel(
-        name="turboquant_prod_score_multi",
-        input_names=[
-            "q_rot",
-            "q_proj",
-            "norms",
-            "residual_norms",
-            "mse_packed",
-            "signs",
-            "codebook",
-            "scale",
-        ],
-        output_names=["out"],
-        source=source,
-    )
-
-
-@lru_cache(maxsize=None)
 def _mse_weighted_rot_kernel():
     if not _metal_available():
         return None
@@ -415,77 +426,13 @@ def _mse_weighted_rot_kernel():
 
 
 @lru_cache(maxsize=None)
-def _mse_weighted_rot_multi_kernel():
-    if not _metal_available():
-        return None
-
-    source = r"""
-        auto lane = thread_position_in_grid.x;
-        auto dim_idx = thread_position_in_grid.y;
-        auto n = thread_position_in_grid.z;
-
-        if (dim_idx >= Dim) {
-            return;
-        }
-
-        auto token_count = norms_shape[2];
-        auto kv_heads = norms_shape[1];
-        auto b = n / kv_heads;
-        auto h = n % kv_heads;
-
-        auto weights_base =
-            weights + ((b * kv_heads + h) * RepeatCount) * token_count;
-        auto norms_ptr = norms + (b * kv_heads + h) * token_count;
-        auto packed_ptr = packed + ((b * kv_heads + h) * token_count) * PackedWidth;
-
-        float acc[RepeatCount];
-        for (int r = 0; r < RepeatCount; ++r) {
-            acc[r] = 0.0f;
-        }
-
-        int bit_offset = dim_idx * Bits;
-        int word_idx = bit_offset / 32;
-        int offset = bit_offset % 32;
-
-        for (int t = lane; t < token_count; t += 32) {
-            auto token_ptr = packed_ptr + t * PackedWidth;
-            uint value = token_ptr[word_idx] >> offset;
-            int spill = offset + Bits - 32;
-            if (spill > 0) {
-                value |= token_ptr[word_idx + 1] << (Bits - spill);
-            }
-            value &= ((1u << Bits) - 1u);
-            float code = codebook[value];
-            float norm = static_cast<float>(norms_ptr[t]);
-            for (int r = 0; r < RepeatCount; ++r) {
-                acc[r] += static_cast<float>(weights_base[r * token_count + t]) * norm * code;
-            }
-        }
-
-        for (int r = 0; r < RepeatCount; ++r) {
-            acc[r] = simd_sum(acc[r]);
-        }
-
-        if (thread_index_in_simdgroup == 0) {
-            for (int r = 0; r < RepeatCount; ++r) {
-                out[((b * kv_heads + h) * RepeatCount + r) * Dim + dim_idx] =
-                    acc[r];
-            }
-        }
-    """
-    return mx.fast.metal_kernel(
-        name="turboquant_mse_weighted_rot_multi",
-        input_names=["weights", "norms", "packed", "codebook"],
-        output_names=["out"],
-        source=source,
-    )
-
-
-@lru_cache(maxsize=None)
 def _prod_score_repeat_kernel(repeat_count: int):
     if not _metal_available() or repeat_count <= 1:
         return None
 
+    # Group-by-codebook-entry scoring: accumulate q_rot by index, then
+    # dot with codebook after the dim loop. Removes codebook multiply from
+    # the inner loop (D additions instead of D FMAs, then 2^b FMAs).
     lines = [
         "        auto lane = thread_position_in_grid.x;",
         "        auto n = thread_position_in_grid.z;",
@@ -493,6 +440,8 @@ def _prod_score_repeat_kernel(repeat_count: int):
         "        auto token_count = norms_shape[2];",
         "        auto kv_heads = norms_shape[1];",
         "        auto repeat_count = q_rot_shape[2];",
+        "        constexpr uint mse_mask = (1u << MseBits) - 1u;",
+        "        constexpr int num_entries = 1 << MseBits;",
         "",
         "        auto b = n / (kv_heads * token_count);",
         "        auto rem = n % (kv_heads * token_count);",
@@ -509,8 +458,9 @@ def _prod_score_repeat_kernel(repeat_count: int):
         "        float residual_norm = static_cast<float>(residual_norms[idx]);",
         "",
     ]
+    # Per-repeat group accumulators and QJL accumulators
     for r in range(repeat_count):
-        lines.append(f"        float mse_acc_{r} = 0.0f;")
+        lines.append(f"        float grp_{r}[num_entries] = {{}};")
         lines.append(f"        float qjl_acc_{r} = 0.0f;")
     lines += [
         "",
@@ -523,8 +473,7 @@ def _prod_score_repeat_kernel(repeat_count: int):
         "            if (spill > 0) {",
         "                value |= mse_ptr[word_idx + 1] << (MseBits - spill);",
         "            }",
-        "            value &= ((1u << MseBits) - 1u);",
-        "            float code = codebook[value];",
+        "            value &= mse_mask;",
         "",
         "            int sign_word = d / 32;",
         "            int sign_offset = d % 32;",
@@ -532,9 +481,10 @@ def _prod_score_repeat_kernel(repeat_count: int):
         "            float sign = bit ? 1.0f : -1.0f;",
         "",
     ]
+    # Group q_rot by codebook index (no multiply in inner loop)
     for r in range(repeat_count):
         lines.append(
-            f"            mse_acc_{r} += static_cast<float>(q_rot_base[{r} * Dim + d]) * code;"
+            f"            grp_{r}[value] += static_cast<float>(q_rot_base[{r} * Dim + d]);"
         )
         lines.append(
             f"            qjl_acc_{r} += static_cast<float>(q_proj_base[{r} * Dim + d]) * sign;"
@@ -542,7 +492,14 @@ def _prod_score_repeat_kernel(repeat_count: int):
     lines += [
         "        }",
         "",
+        "        // Dot product: group sums × codebook entries",
     ]
+    for r in range(repeat_count):
+        lines.append(f"        float mse_acc_{r} = 0.0f;")
+        lines.append(f"        for (int k = 0; k < num_entries; k++)")
+        lines.append(f"            mse_acc_{r} += grp_{r}[k] * codebook[k];")
+
+    lines.append("")
     for r in range(repeat_count):
         lines.append(f"        float mse_sum_{r} = simd_sum(mse_acc_{r});")
         lines.append(f"        float qjl_sum_{r} = simd_sum(qjl_acc_{r});")
@@ -1112,19 +1069,38 @@ def _metal_mse_score(
     ):
         return None
 
+    B, H, R, D = q_rot.shape
+    T = state.norms.shape[2]
+    dims_per_lane = (D + 31) // 32
+
+    # Tiled kernel: preload queries into registers, loop over token tiles.
+    tiled_kernel = _mse_score_tiled_kernel(R)
+    if tiled_kernel is not None:
+        tok_tile_size = 64
+        num_tok_tiles = (T + tok_tile_size - 1) // tok_tile_size
+        scores = tiled_kernel(
+            inputs=[q_rot, state.norms, state.indices, codebook],
+            template=[
+                ("Dim", D),
+                ("DimsPerLane", dims_per_lane),
+                ("Bits", bits),
+                ("PackedWidth", state.indices.shape[-1]),
+                ("RepeatCount", R),
+                ("TokTileSize", tok_tile_size),
+            ],
+            grid=(32, 1, B * H * num_tok_tiles),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(B, H, R, T)],
+            output_dtypes=[mx.float32],
+        )[0]
+        return mx.expand_dims(scores, axis=3)
+
     kernel = _mse_score_kernel()
     if kernel is None:
         return None
 
-    B, H, R, D = q_rot.shape
-    T = state.norms.shape[2]
     scores = kernel(
-        inputs=[
-            q_rot,
-            state.norms,
-            state.indices,
-            codebook,
-        ],
+        inputs=[q_rot, state.norms, state.indices, codebook],
         template=[
             ("Dim", D),
             ("Bits", bits),
@@ -1590,13 +1566,7 @@ def _compiled_integer_decode_kernel(bits: int):
 
 @lru_cache(maxsize=None)
 def _fused_integer_decode_kernel(bits: int, repeat_count: int, key_mse_bits: int = -1):
-    """Single Metal kernel: score + online-softmax + weighted-sum for integer-bit
-    ProdCodec keys + MSECodec values. Eliminates intermediate scores tensor.
-
-    Grid: (32, num_val_tiles, B*H*num_tok_tiles) with threadgroup=(32,1,1).
-    32 SIMD lanes cooperate on scoring (simd_sum across dims) and each lane
-    accumulates one value dim with online softmax.
-    """
+    """Fused integer decode: score + online-softmax + weighted-sum."""
     if not _metal_available() or repeat_count < 1:
         return None
 
@@ -2027,14 +1997,1097 @@ def _fused_integer_decode_single_tile_kernel(
 
 
 @lru_cache(maxsize=None)
-def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int):
-    """Single Metal kernel: score + online-softmax + weighted-sum for SplitCodec.
+def _fully_fused_decode_kernel(
+    bits: int,
+    repeat_count: int,
+    dims_per_lane: int,
+    key_mse_bits: int = -1,
+    use_rht: bool = False,
+):
+    """Fully fused decode: score + online softmax + value + normalize + rotation
+    in a single Metal dispatch. Processes ALL tokens (no tiling), outputs in
+    original space. Reduces dispatch count from 7 to 1."""
+    if not _metal_available() or repeat_count < 1:
+        return None
 
-    Grid: (32, ValDim, B*H) — for each token: 32 lanes cooperate on key-dim
-    reduction (simd_sum) to produce a scalar score, then each lane unpacks+
-    accumulates its value dim weighted by the softmax weight. Uses online
-    softmax across tokens with a cross-lane reduction at the end.
+    mse_bits = key_mse_bits if key_mse_bits >= 0 else max(bits - 1, 0)
+    mse_mask = (1 << mse_bits) - 1
+    val_mask = (1 << bits) - 1
+    num_mse_entries = 1 << mse_bits
+
+    lines = [
+        "        auto lane = thread_position_in_grid.x;",
+        "        auto bh = thread_position_in_grid.z;",
+        "        auto token_count = key_norms_shape[2];",
+        "        auto kv_heads = key_norms_shape[1];",
+        "        auto b = bh / kv_heads;",
+        "        auto h = bh % kv_heads;",
+        "        auto base = (b * kv_heads + h);",
+        "",
+        "        auto k_norms = key_norms + base * token_count;",
+        "        auto k_mse = key_mse + base * token_count * KMsePackedWidth;",
+        "        auto k_res = key_res_norms + base * token_count;",
+        "        auto k_signs = key_signs + base * token_count * KSignPackedWidth;",
+        "        auto v_norms = val_norms + base * token_count;",
+        "        auto v_packed = val_packed + base * token_count * VPackedWidth;",
+        "",
+        "        // Precompute value bit offsets",
+        "        int v_words[DimsPerLane], v_offs[DimsPerLane];",
+        "        bool v_spills[DimsPerLane], v_valids[DimsPerLane];",
+        "        for (int i = 0, vd = lane; i < DimsPerLane; i++, vd += 32) {",
+        f"            v_valids[i] = vd < Dim;",
+        f"            int vbo = vd * {bits};",
+        f"            v_words[i] = vbo / 32;",
+        f"            v_offs[i] = vbo % 32;",
+        f"            v_spills[i] = (vbo % 32 + {bits}) > 32;",
+        "        }",
+        "",
+    ]
+
+    for r in range(repeat_count):
+        lines += [
+            f"        auto qr_{r} = q_rot + (base * RepeatCount + {r}) * Dim;",
+            f"        auto qp_{r} = q_proj + (base * RepeatCount + {r}) * Dim;",
+        ]
+
+    for r in range(repeat_count):
+        lines += [
+            f"        float lmax_{r} = -INFINITY, lsum_{r} = 0.0f;",
+            f"        float lacc_{r}[DimsPerLane] = {{}};",
+        ]
+
+    # Token loop: score + online softmax + value accumulation
+    lines += [
+        "",
+        "        for (int t = 0; t < (int)token_count; t++) {",
+        "            auto mse_t = k_mse + t * KMsePackedWidth;",
+        "            auto sign_t = k_signs + t * KSignPackedWidth;",
+        "            float kn = static_cast<float>(k_norms[t]);",
+        "            float ksr = kn * key_scale[0] * static_cast<float>(k_res[t]);",
+        "",
+    ]
+
+    # Score with grouped codebook optimization
+    for r in range(repeat_count):
+        lines += [f"            float ps_{r} = 0.0f;"]
+
+    lines += [
+        f"            for (int d = lane; d < Dim; d += 32) {{",
+        f"                int bo = d * {mse_bits};",
+        f"                uint idx = (mse_t[bo >> 5] >> (bo & 31));",
+        f"                if (((bo & 31) + {mse_bits}) > 32) idx |= mse_t[(bo >> 5) + 1] << ({mse_bits} - ((bo & 31) + {mse_bits} - 32));",
+        f"                idx &= {mse_mask}u;",
+        f"                float code = key_codebook[idx];",
+        f"                uint sb = (sign_t[d >> 5] >> (d & 31)) & 1u;",
+    ]
+    for r in range(repeat_count):
+        lines += [
+            f"                ps_{r} += kn * static_cast<float>(qr_{r}[d]) * code + ksr * (sb ? static_cast<float>(qp_{r}[d]) : -static_cast<float>(qp_{r}[d]));"
+        ]
+    lines += ["            }"]
+
+    for r in range(repeat_count):
+        lines += [f"            float s_{r} = simd_sum(ps_{r});"]
+
+    # Online softmax + value accumulation
+    lines += [
+        "",
+        "            auto vt = v_packed + t * VPackedWidth;",
+        "            float vnorm = static_cast<float>(v_norms[t]);",
+    ]
+
+    for r in range(repeat_count):
+        lines += [
+            f"            {{ float om = lmax_{r};",
+            f"              lmax_{r} = max(lmax_{r}, s_{r});",
+            f"              float rs = exp(om - lmax_{r});",
+            f"              float w = exp(s_{r} - lmax_{r});",
+            f"              lsum_{r} = lsum_{r} * rs + w;",
+            f"              for (int i = 0; i < DimsPerLane; i++) {{",
+            f"                  lacc_{r}[i] *= rs;",
+            f"                  if (v_valids[i]) {{",
+            f"                      uint vv = (vt[v_words[i]] >> v_offs[i]);",
+            f"                      if (v_spills[i]) vv |= vt[v_words[i]+1] << ({bits} - (v_offs[i]+{bits}-32));",
+            f"                      lacc_{r}[i] += w * val_codebook[vv & {val_mask}u] * vnorm;",
+            f"                  }}",
+            f"              }}",
+            f"            }}",
+        ]
+
+    lines += ["        }", ""]
+
+    # Normalize by softmax sum
+    for r in range(repeat_count):
+        lines += [
+            f"        float inv_sum_{r} = 1.0f / lsum_{r};",
+            f"        for (int i = 0; i < DimsPerLane; i++)",
+            f"            lacc_{r}[i] *= inv_sum_{r};",
+        ]
+
+    # Fuse rotation via shared memory
+    if use_rht:
+        # RHT inverse: butterfly WHT on each repeat's accumulated values
+        # Process one repeat at a time to reuse shared memory
+        lines += [
+            "",
+            f"        threadgroup float shared_rot[DimPadded];",
+            f"        float wht_tmp[DimsPerLanePadded];",
+        ]
+        for r in range(repeat_count):
+            lines += [
+                f"        // RHT inverse for repeat {r}",
+                f"        for (int i = 0, vd = lane; i < DimsPerLanePadded; vd += 32, i++)",
+                f"            shared_rot[vd < Dim ? vd : 0] = (vd < Dim) ? lacc_{r}[i] : 0.0f;",
+            ]
+            if repeat_count > 1 or True:
+                # Zero padding region
+                lines += [
+                    f"        if (lane < (DimPadded - Dim) && (Dim + lane) < DimPadded)",
+                    f"            shared_rot[Dim + lane] = 0.0f;",
+                    f"        threadgroup_barrier(mem_flags::mem_threadgroup);",
+                ]
+            lines += _metal_butterfly_wht_inverse(
+                "shared_rot", "sign_vec", "wht_tmp", "DimsPerLanePadded"
+            )
+            lines += [
+                f"        for (int i = 0, vd = lane; i < DimsPerLane; vd += 32, i++)",
+                f"            if (vd < Dim) out[(bh * RepeatCount + {r}) * Dim + vd] = shared_rot[vd];",
+                f"",
+            ]
+    else:
+        # Dense rotation via shared memory matmul
+        lines += [
+            "",
+            f"        threadgroup float shared_rot[{repeat_count} * Dim];",
+        ]
+        for r in range(repeat_count):
+            lines += [
+                f"        for (int i = 0, vd = lane; i < DimsPerLane; i++, vd += 32)",
+                f"            if (vd < Dim) shared_rot[{r} * Dim + vd] = lacc_{r}[i];",
+            ]
+        lines += [
+            "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "",
+            "        // Apply dense rotation: output in original space",
+        ]
+        for r in range(repeat_count):
+            lines += [
+                f"        for (int i = 0, vd = lane; i < DimsPerLane; i++, vd += 32) {{",
+                f"            if (vd < Dim) {{",
+                f"                float rot_val = 0.0f;",
+                f"                auto rot_row = rotation_t + vd * Dim;",
+                f"                for (int j = 0; j < (int)Dim; j++)",
+                f"                    rot_val += shared_rot[{r} * Dim + j] * rot_row[j];",
+                f"                out[(bh * RepeatCount + {r}) * Dim + vd] = rot_val;",
+                f"            }}",
+                f"        }}",
+            ]
+
+    name_suffix = "_rht" if use_rht else ""
+    rotation_input = "sign_vec" if use_rht else "rotation_t"
+    return mx.fast.metal_kernel(
+        name=f"turboquant_fully_fused_{bits}_r{repeat_count}{name_suffix}",
+        input_names=[
+            "q_rot",
+            "q_proj",
+            "key_norms",
+            "key_mse",
+            "key_res_norms",
+            "key_signs",
+            "val_norms",
+            "val_packed",
+            "key_codebook",
+            "key_scale",
+            "val_codebook",
+            rotation_input,
+        ],
+        output_names=["out"],
+        source="\n".join(lines),
+    )
+
+
+def _gen_unrolled_extract(
+    bits: int, n_elems: int, codebook_name: str, bit_off_var: str = ""
+) -> list:
+    """Generate fully-unrolled byte extraction for n_elems packed at `bits` bits.
+
+    When *bit_off_var* is empty the extraction assumes element 0 starts at bit 0
+    of the byte pointer (fast path — compile-time constant offsets, works when
+    ``n_elems * bits % 8 == 0``).
+
+    When *bit_off_var* names a Metal ``int`` variable (e.g. ``"k_bit_off"``),
+    each element's bit position is computed as ``bit_off_var + i * bits`` at
+    runtime, still fully unrolled (one expression per element, no loops).
     """
+    mask = (1 << bits) - 1
+    exprs: list[str] = []
+
+    if not bit_off_var:
+        # --- Fast path: compile-time constant offsets ---
+        for i in range(n_elems):
+            bit_offset = i * bits
+            byte_idx = bit_offset // 8
+            bit_in_byte = bit_offset % 8
+
+            if bit_in_byte + bits <= 8:
+                if bit_in_byte == 0:
+                    expr = f"{codebook_name}[kb[{byte_idx}] & {mask}u]"
+                else:
+                    expr = (
+                        f"{codebook_name}[(kb[{byte_idx}] >> {bit_in_byte}) & {mask}u]"
+                    )
+            else:
+                low_bits = 8 - bit_in_byte
+                high_mask = (1 << (bits - low_bits)) - 1
+                expr = (
+                    f"{codebook_name}[((kb[{byte_idx}] >> {bit_in_byte}) & {(1 << low_bits) - 1}u)"
+                    f" | ((kb[{byte_idx + 1}] & {high_mask}u) << {low_bits})]"
+                )
+            exprs.append(expr)
+    else:
+        # --- General path: runtime bit offset, still fully unrolled ---
+        for i in range(n_elems):
+            bo = f"({bit_off_var} + {i * bits})" if i else bit_off_var
+            by = f"({bo} >> 3)"
+            bi = f"({bo} & 7)"
+            expr = (
+                f"{codebook_name}["
+                f"(({bi} + {bits} <= 8)"
+                f" ? (kb[{by}] >> {bi})"
+                f" : ((kb[{by}] >> {bi}) | (kb[{by} + 1] << (8 - {bi}))))"
+                f" & {mask}u]"
+            )
+            exprs.append(expr)
+    return exprs
+
+
+def _gen_unrolled_score(bits: int, n_elems: int, bit_off_var: str = "") -> str:
+    """Generate score accumulation with unrolled key extraction."""
+    exprs = _gen_unrolled_extract(bits, n_elems, "key_codebook", bit_off_var)
+    terms = [f"q[{i}] * {expr}" for i, expr in enumerate(exprs)]
+    return "\n                + ".join(terms)
+
+
+def _gen_unrolled_value(bits: int, n_elems: int, bit_off_var: str = "") -> str:
+    """Generate value accumulation with unrolled extraction."""
+    exprs = _gen_unrolled_extract(bits, n_elems, "val_codebook", bit_off_var)
+    exprs = [e.replace("kb[", "vb[") for e in exprs]
+    lines = []
+    for i, expr in enumerate(exprs):
+        lines.append(f"            o[{i}] = o[{i}] * factor + exp_score * {expr} * vn;")
+    return "\n".join(lines)
+
+
+@lru_cache(maxsize=None)
+def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
+    """Fused MSE decode: 32 simdgroups × 32 lanes, online softmax + weighted sum."""
+    if not _metal_available() or key_bits <= 0 or val_bits <= 0:
+        return None
+    if dim < 32 or dim % 32 != 0:
+        return None  # dim must be a multiple of 32 SIMD lanes
+
+    k_mask = (1 << key_bits) - 1
+    v_mask = (1 << val_bits) - 1
+    elems_per_lane = dim // 32
+
+    source = f"""
+        constexpr int BN = 32;  // simdgroups per threadgroup
+        constexpr int BD = 32;  // lanes per simdgroup
+        constexpr int qk_per_thread = Dim / BD;
+        constexpr int v_per_thread = Dim / BD;
+        constexpr uint k_mask = {k_mask}u;
+        constexpr uint v_mask = {v_mask}u;
+        constexpr int k_bits = {key_bits};
+        constexpr int v_bits = {val_bits};
+
+        typedef float U;
+
+        // Thread identity — grid is total threads, so use threadgroup position
+        auto bqh = threadgroup_position_in_grid.x;  // batch*q_head index
+        auto simd_gid = simdgroup_index_in_threadgroup;
+        auto simd_lid = thread_index_in_simdgroup;
+
+        auto token_count = key_norms_shape[2];
+        auto kv_heads = key_norms_shape[1];
+        auto bh = bqh / RepeatCount;  // map q_head -> kv_head
+
+        auto k_nm = key_norms + bh * token_count;
+        auto k_pk = key_packed + bh * token_count * KPackedWidth;
+        auto v_nm = val_norms + bh * token_count;
+        auto v_pk = val_packed + bh * token_count * VPackedWidth;
+
+        // Shared memory for cross-simdgroup reduction
+        threadgroup U max_scores[BN];
+        threadgroup U sum_exp_scores[BN];
+        threadgroup U shared[BN * BD];
+
+        // Preload pre-rotated query into registers
+        thread U q[qk_per_thread];
+        auto qr = queries + bqh * Dim + simd_lid * qk_per_thread;
+        for (int i = 0; i < qk_per_thread; i++)
+            q[i] = static_cast<U>(qr[i]);
+
+        // Initialize accumulators
+        thread U o[v_per_thread] = {{}};
+        U max_score = -INFINITY;
+        U sum_exp_score = 0;
+
+        // Byte/bit offset for this lane's first element (constant across all tokens)
+        int k_bit_start = simd_lid * qk_per_thread * k_bits;
+        int v_bit_start = simd_lid * v_per_thread * v_bits;
+        int k_byte_base = k_bit_start >> 3;
+        int v_byte_base = v_bit_start >> 3;
+        {"int k_bit_off = k_bit_start & 7;" if (elems_per_lane * key_bits) % 8 else ""}
+        {"int v_bit_off = v_bit_start & 7;" if (elems_per_lane * val_bits) % 8 else ""}
+
+        // KV loop: each simdgroup handles tokens simd_gid, simd_gid+32, ...
+        for (int t = simd_gid; t < (int)token_count; t += BN) {{
+            U kn = static_cast<U>(k_nm[t]);
+
+            // Key score — unrolled byte extraction
+            auto kb = (const device uint8_t*)(k_pk + t * KPackedWidth) + k_byte_base;
+            U score = {_gen_unrolled_score(key_bits, elems_per_lane, "k_bit_off" if (elems_per_lane * key_bits) % 8 else "")};
+            score = simd_sum(score) * kn;
+
+            // Online softmax
+            auto vb = (const device uint8_t*)(v_pk + t * VPackedWidth) + v_byte_base;
+            U vn = static_cast<U>(v_nm[t]);
+
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+
+            // Value accumulation — unrolled byte extraction
+            {_gen_unrolled_value(val_bits, elems_per_lane, "v_bit_off" if (elems_per_lane * val_bits) % 8 else "")}
+        }}
+
+        // Cross-simdgroup reduction (matches MLX SDPA pattern)
+        // 1. Communicate max and sum_exp across simdgroups
+        if (simd_lid == 0) {{
+            max_scores[simd_gid] = max_score;
+            sum_exp_scores[simd_gid] = sum_exp_score;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2. Reduce max and sum across all simdgroups
+        U sg_max = max_scores[simd_lid];
+        U new_max = simd_max(sg_max);
+        U factor = fast::exp(sg_max - new_max);
+        U total_sum = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+        // 3. Rescale this simdgroup's factor for the global max
+        U my_factor = fast::exp(max_score - new_max);
+
+        // 4. Transpose-reduce outputs through shared memory
+        for (int i = 0; i < v_per_thread; i++) {{
+            shared[simd_lid * BD + simd_gid] = o[i] * my_factor;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            o[i] = simd_sum(shared[simd_gid * BD + simd_lid]);
+            o[i] = total_sum > 0 ? o[i] / total_sum : 0;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        // Write output (in rotated space — caller applies inverse rotation)
+        if (simd_lid == 0) {{
+            for (int i = 0; i < v_per_thread; i++) {{
+                out[bqh * Dim + simd_gid * v_per_thread + i] = static_cast<U>(o[i]);
+            }}
+        }}
+    """
+
+    return mx.fast.metal_kernel(
+        name=f"turboquant_fused_mse_sdpa_k{key_bits}_v{val_bits}_d{dim}",
+        input_names=[
+            "queries",
+            "key_norms",
+            "key_packed",
+            "key_codebook",
+            "val_norms",
+            "val_packed",
+            "val_codebook",
+        ],
+        output_names=["out"],
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 256):
+    """2-pass decode pass 1: block-parallel quantized attention."""
+    if not _metal_available() or key_bits <= 0 or val_bits <= 0:
+        return None
+    if dim < 32 or dim % 32 != 0:
+        return None
+
+    k_mask = (1 << key_bits) - 1
+    v_mask = (1 << val_bits) - 1
+    elems_per_lane = dim // 32
+
+    source = f"""
+        constexpr int BD = 32;
+        constexpr int qk_per_thread = Dim / BD;
+        constexpr int v_per_thread = Dim / BD;
+        constexpr uint k_mask = {k_mask}u;
+        constexpr uint v_mask = {v_mask}u;
+        constexpr int k_bits = {key_bits};
+        constexpr int v_bits = {val_bits};
+        typedef float U;
+
+        // Thread identity — matches sdpa_vector_2pass_1 layout
+        auto kv_head_idx = threadgroup_position_in_grid.x;
+        auto batch_idx = threadgroup_position_in_grid.y;
+        auto block_idx = threadgroup_position_in_grid.z;
+        auto simd_lid = thread_index_in_simdgroup;
+        auto gqa_idx = thread_position_in_threadgroup.y;  // which q_head within kv_head
+
+        auto token_count = key_norms_shape[2];
+        auto kv_heads = key_norms_shape[1];
+        auto bh = batch_idx * kv_heads + kv_head_idx;
+        auto bqh = batch_idx * kv_heads * RepeatCount + kv_head_idx * RepeatCount + gqa_idx;
+
+        auto k_nm = key_norms + bh * token_count;
+        auto k_pk = key_packed + bh * token_count * KPackedWidth;
+        auto v_nm = val_norms + bh * token_count;
+        auto v_pk = val_packed + bh * token_count * VPackedWidth;
+
+        // Load pre-rotated query
+        thread U q[qk_per_thread];
+        auto qr = queries + bqh * Dim + simd_lid * qk_per_thread;
+        for (int i = 0; i < qk_per_thread; i++)
+            q[i] = static_cast<U>(qr[i]);
+
+        thread U o[v_per_thread] = {{}};
+        U max_score = -INFINITY;
+        U sum_exp_score = 0;
+
+        // Byte/bit offset for this lane's first element (constant across all tokens)
+        int k_bit_start = simd_lid * qk_per_thread * k_bits;
+        int v_bit_start = simd_lid * v_per_thread * v_bits;
+        int k_byte_base = k_bit_start >> 3;
+        int v_byte_base = v_bit_start >> 3;
+        {"int k_bit_off = k_bit_start & 7;" if (elems_per_lane * key_bits) % 8 else ""}
+        {"int v_bit_off = v_bit_start & 7;" if (elems_per_lane * val_bits) % 8 else ""}
+
+        // KV loop: stride by blocks (each block handles a different subset)
+        for (int t = block_idx; t < (int)token_count; t += Blocks) {{
+            U kn = static_cast<U>(k_nm[t]);
+
+            // Key score — unrolled byte extraction
+            auto kb = (const device uint8_t*)(k_pk + t * KPackedWidth) + k_byte_base;
+            U score = {_gen_unrolled_score(key_bits, elems_per_lane, "k_bit_off" if (elems_per_lane * key_bits) % 8 else "")};
+            score = simd_sum(score) * kn;
+
+            auto vb = (const device uint8_t*)(v_pk + t * VPackedWidth) + v_byte_base;
+            U vn = static_cast<U>(v_nm[t]);
+
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+
+            {_gen_unrolled_value(val_bits, elems_per_lane, "v_bit_off" if (elems_per_lane * val_bits) % 8 else "")}
+        }}
+
+        // Write partial results for this block
+        if (simd_lid == 0) {{
+            out_sums[bqh * Blocks + block_idx] = sum_exp_score;
+            out_maxs[bqh * Blocks + block_idx] = max_score;
+        }}
+        for (int i = 0; i < v_per_thread; i++)
+            out_acc[(bqh * Blocks + block_idx) * Dim + simd_lid * v_per_thread + i] =
+                static_cast<U>(o[i]);
+    """
+
+    return mx.fast.metal_kernel(
+        name=f"turboquant_mse_sdpa_2pass1_k{key_bits}_v{val_bits}_d{dim}",
+        input_names=[
+            "queries",
+            "key_norms",
+            "key_packed",
+            "key_codebook",
+            "val_norms",
+            "val_packed",
+            "val_codebook",
+        ],
+        output_names=["out_acc", "out_sums", "out_maxs"],
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _fused_mse_decode_2pass_2_kernel():
+    """2-pass decode pass 2: reduce partial block results."""
+    if not _metal_available():
+        return None
+
+    source = """
+        constexpr int BN = 32;
+        constexpr int BD = 32;
+        constexpr int elem_per_thread = Dim / BD;
+        typedef float U;
+
+        thread U o[elem_per_thread] = {};
+        threadgroup U outputs[BN * BD];
+
+        auto head_idx = threadgroup_position_in_grid.x;
+        auto simd_gid = simdgroup_index_in_threadgroup;
+        auto simd_lid = thread_index_in_simdgroup;
+
+        auto p = partials + head_idx * Blocks * Dim + simd_gid * Dim +
+                 simd_lid * elem_per_thread;
+        auto s = sums + head_idx * Blocks;
+        auto m = maxs + head_idx * Blocks;
+
+        U max_score = -INFINITY;
+        U sum_exp_score = 0;
+
+        // Each simdgroup handles a subset of blocks (stride BN)
+        for (int b = simd_gid; b < Blocks; b += BN) {
+            U block_max = m[b];
+            U block_sum = s[b];
+
+            U new_max = max(max_score, block_max);
+            U factor = fast::exp(max_score - new_max);
+            U block_factor = fast::exp(block_max - new_max);
+
+            sum_exp_score = sum_exp_score * factor + block_sum * block_factor;
+            for (int i = 0; i < elem_per_thread; i++) {
+                o[i] = o[i] * factor +
+                    partials[(head_idx * Blocks + b) * Dim +
+                             simd_lid * elem_per_thread + i] * block_factor;
+            }
+            max_score = new_max;
+        }
+
+        // Cross-simdgroup reduction (same as sdpa_vector_2pass_2)
+        threadgroup U sg_maxs[BN];
+        threadgroup U sg_sums[BN];
+        if (simd_lid == 0) {
+            sg_maxs[simd_gid] = max_score;
+            sg_sums[simd_gid] = sum_exp_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        U sg_max = sg_maxs[simd_lid];
+        U new_max = simd_max(sg_max);
+        U factor = fast::exp(sg_max - new_max);
+        U total_sum = simd_sum(sg_sums[simd_lid] * factor);
+
+        U my_factor = fast::exp(max_score - new_max);
+
+        for (int i = 0; i < elem_per_thread; i++) {
+            outputs[simd_lid * BD + simd_gid] = o[i] * my_factor;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+            o[i] = total_sum > 0 ? o[i] / total_sum : 0;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (simd_lid == 0) {
+            for (int i = 0; i < elem_per_thread; i++)
+                out[head_idx * Dim + simd_gid * elem_per_thread + i] =
+                    static_cast<U>(o[i]);
+        }
+    """
+
+    return mx.fast.metal_kernel(
+        name="turboquant_mse_sdpa_2pass2",
+        input_names=["partials", "sums", "maxs"],
+        output_names=["out"],
+        source=source,
+    )
+
+
+def _metal_butterfly_wht_forward(
+    shared_name: str,
+    sign_name: str,
+    temp_name: str,
+    dims_per_lane_padded: str = "DimsPerLanePadded",
+):
+    """Generate Metal code for in-place RHT forward in shared memory.
+    RHT forward = WHT(signs * x) / sqrt(DimPadded).
+    Requires: shared[DimPadded], sign_vec[Dim], temp[DimsPerLanePadded] (thread-local).
+    Returns list of Metal source lines."""
+    return [
+        f"        // RHT forward: apply signs, butterfly WHT, scale",
+        f"        for (int i = 0, d = lane; i < {dims_per_lane_padded}; d += 32, i++)",
+        f"            if (d < Dim) {shared_name}[d] *= {sign_name}[d];",
+        f"        threadgroup_barrier(mem_flags::mem_threadgroup);",
+        f"",
+        f"        for (int stride = 1; stride < DimPadded; stride *= 2) {{",
+        f"            for (int i = 0, d = lane; i < {dims_per_lane_padded}; d += 32, i++) {{",
+        f"                if (d < DimPadded) {{",
+        f"                    int pair = d ^ stride;",
+        f"                    float a = {shared_name}[min(d, pair)];",
+        f"                    float b = {shared_name}[max(d, pair)];",
+        f"                    {temp_name}[i] = (d < pair) ? (a + b) : (a - b);",
+        f"                }}",
+        f"            }}",
+        f"            threadgroup_barrier(mem_flags::mem_threadgroup);",
+        f"            for (int i = 0, d = lane; i < {dims_per_lane_padded}; d += 32, i++)",
+        f"                if (d < DimPadded) {shared_name}[d] = {temp_name}[i];",
+        f"            threadgroup_barrier(mem_flags::mem_threadgroup);",
+        f"        }}",
+        f"",
+        f"        // Scale by 1/sqrt(DimPadded)",
+        f"        float rht_scale = 1.0f / sqrt((float)DimPadded);",
+    ]
+
+
+def _metal_butterfly_wht_inverse(
+    shared_name: str,
+    sign_name: str,
+    temp_name: str,
+    dims_per_lane_padded: str = "DimsPerLanePadded",
+):
+    """Generate Metal code for in-place RHT inverse in shared memory.
+    RHT inverse = signs * WHT(x) / sqrt(DimPadded).
+    Same butterfly as forward, then multiply by signs."""
+    return [
+        f"        // RHT inverse: butterfly WHT, then apply signs and scale",
+        f"        for (int stride = 1; stride < DimPadded; stride *= 2) {{",
+        f"            for (int i = 0, d = lane; i < {dims_per_lane_padded}; d += 32, i++) {{",
+        f"                if (d < DimPadded) {{",
+        f"                    int pair = d ^ stride;",
+        f"                    float a = {shared_name}[min(d, pair)];",
+        f"                    float b = {shared_name}[max(d, pair)];",
+        f"                    {temp_name}[i] = (d < pair) ? (a + b) : (a - b);",
+        f"                }}",
+        f"            }}",
+        f"            threadgroup_barrier(mem_flags::mem_threadgroup);",
+        f"            for (int i = 0, d = lane; i < {dims_per_lane_padded}; d += 32, i++)",
+        f"                if (d < DimPadded) {shared_name}[d] = {temp_name}[i];",
+        f"            threadgroup_barrier(mem_flags::mem_threadgroup);",
+        f"        }}",
+        f"",
+        f"        // Scale and apply signs",
+        f"        float rht_scale = 1.0f / sqrt((float)DimPadded);",
+        f"        for (int i = 0, d = lane; i < {dims_per_lane_padded}; d += 32, i++)",
+        f"            if (d < Dim) {shared_name}[d] *= rht_scale * {sign_name}[d];",
+        f"        threadgroup_barrier(mem_flags::mem_threadgroup);",
+    ]
+
+
+@lru_cache(maxsize=None)
+def _fused_kv_quantize_kernel(key_bits: int, val_bits: int):
+    """Fused key+value quantize in 1 dispatch."""
+    if not _metal_available() or key_bits <= 0 or val_bits <= 0:
+        return None
+
+    k_midpoints = (1 << key_bits) - 1
+    v_midpoints = (1 << val_bits) - 1
+    k_mask = (1 << key_bits) - 1
+    v_mask = (1 << val_bits) - 1
+
+    source = f"""
+        auto d = thread_position_in_threadgroup.x;
+        auto bh = threadgroup_position_in_grid.x;
+        auto is_val = threadgroup_position_in_grid.y;  // 0=key, 1=value
+        auto sg_id = simdgroup_index_in_threadgroup;
+        auto sg_lid = thread_index_in_simdgroup;
+
+        // Select key or value params based on grid.y
+        int bits = is_val ? {val_bits} : {key_bits};
+        int n_mid = is_val ? {v_midpoints} : {k_midpoints};
+        uint idx_mask = is_val ? {v_mask}u : {k_mask}u;
+        int pw = is_val ? VPackedWidth : KPackedWidth;
+
+        // Step 1: Load vector element
+        float v;
+        if (is_val)
+            v = (d < Dim) ? static_cast<float>(val_vectors[bh * Dim + d]) : 0.0f;
+        else
+            v = (d < Dim) ? static_cast<float>(key_vectors[bh * Dim + d]) : 0.0f;
+
+        // Compute norm (2-stage cross-simdgroup reduction)
+        float sq = v * v;
+        float sg_sum = simd_sum(sq);
+        threadgroup float sg_norms[8];
+        if (sg_lid == 0) sg_norms[sg_id] = sg_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total_sq = (sg_id == 0 && sg_lid < 8) ? sg_norms[sg_lid] : 0.0f;
+        total_sq = simd_sum(total_sq);
+        if (sg_id == 0 && sg_lid == 0) sg_norms[0] = total_sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float norm = sqrt(sg_norms[0]);
+        float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+        if (d == 0) {{
+            if (is_val) out_val_norms[bh] = half(norm);
+            else out_key_norms[bh] = half(norm);
+        }}
+
+        // Step 2: Unit vector → shared
+        threadgroup float shared[Dim];
+        if (d < Dim) shared[d] = v * inv_norm;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step 3: Rotate (1 dim per thread, 256 FMAs)
+        float rotated = 0.0f;
+        if (d < Dim) {{
+            auto row = is_val ? (val_rotation + d * Dim) : (key_rotation + d * Dim);
+            for (int j = 0; j < (int)Dim; j++)
+                rotated += shared[j] * row[j];
+        }}
+
+        // Step 4: Comparison-based quantize
+        threadgroup uint shared_idx[Dim];
+        uint idx = 0;
+        if (d < Dim) {{
+            if (is_val) {{
+                for (int m = 0; m < n_mid; m++)
+                    idx += (rotated > val_midpoints[m]) ? 1u : 0u;
+            }} else {{
+                for (int m = 0; m < n_mid; m++)
+                    idx += (rotated > key_midpoints[m]) ? 1u : 0u;
+            }}
+            shared_idx[d] = idx;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step 5: Pack indices
+        threadgroup uint packed_shared[Dim];  // oversized but safe
+        if (d < pw) packed_shared[d] = 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (d < Dim) {{
+            uint idx_val = shared_idx[d] & idx_mask;
+            int bo = d * bits;
+            int w = bo >> 5;
+            int shift = bo & 31;
+            packed_shared[w] |= idx_val << shift;
+            if (shift + bits > 32)
+                packed_shared[w + 1] |= idx_val >> (32 - shift);
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (d < pw) {{
+            if (is_val)
+                out_val_packed[bh * pw + d] = packed_shared[d];
+            else
+                out_key_packed[bh * pw + d] = packed_shared[d];
+        }}
+    """
+
+    return mx.fast.metal_kernel(
+        name=f"turboquant_fused_kv_quantize_k{key_bits}_v{val_bits}",
+        input_names=[
+            "key_vectors",
+            "val_vectors",
+            "key_rotation",
+            "val_rotation",
+            "key_midpoints",
+            "val_midpoints",
+        ],
+        output_names=[
+            "out_key_norms",
+            "out_key_packed",
+            "out_val_norms",
+            "out_val_packed",
+        ],
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _fused_norot_quantize_kernel(bits: int):
+    """Quantize pre-rotated vectors: comparison + pack. No rotation inside.
+    Used with mx.hadamard_transform for external rotation. TG=Dim."""
+    if not _metal_available() or bits <= 0:
+        return None
+
+    num_midpoints = (1 << bits) - 1
+    mask = (1 << bits) - 1
+
+    source = f"""
+        auto d = thread_position_in_threadgroup.x;
+        auto bh = threadgroup_position_in_grid.x;
+
+        // Read pre-rotated, pre-normalized value
+        float val = (d < Dim) ? static_cast<float>(rotated[bh * Dim + d]) : 0.0f;
+
+        // Comparison-based quantize
+        threadgroup uint shared_idx[Dim];
+        uint idx = 0;
+        if (d < Dim) {{
+            for (int m = 0; m < {num_midpoints}; m++)
+                idx += (val > midpoints[m]) ? 1u : 0u;
+            shared_idx[d] = idx;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Pack indices (word-spanning)
+        threadgroup uint packed_shared[PackedWidth];
+        if (d < PackedWidth) packed_shared[d] = 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (d < Dim) {{
+            uint idx_val = shared_idx[d] & {mask}u;
+            int bo = d * {bits};
+            int w = bo >> 5;
+            int shift = bo & 31;
+            packed_shared[w] |= idx_val << shift;
+            if (shift + {bits} > 32)
+                packed_shared[w + 1] |= idx_val >> (32 - shift);
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (d < PackedWidth)
+            out[bh * PackedWidth + d] = packed_shared[d];
+    """
+
+    return mx.fast.metal_kernel(
+        name=f"turboquant_norot_quantize_{bits}",
+        input_names=["rotated", "midpoints"],
+        output_names=["out"],
+        source=source,
+    )
+
+
+def _fused_mse_quantize_kernel(bits: int, use_rht: bool = False):
+    """Fused MSE quantize: norm + rotate + quantize + pack in 1 dispatch."""
+    if not _metal_available() or bits <= 0:
+        return None
+    num_entries = 1 << bits
+    num_midpoints = num_entries - 1
+    mask = num_entries - 1
+
+    source = f"""
+        auto d = thread_position_in_threadgroup.x;  // 0..Dim-1, one dim per thread
+        auto bh = threadgroup_position_in_grid.x;
+        auto sg_id = simdgroup_index_in_threadgroup;
+        auto sg_lid = thread_index_in_simdgroup;
+        auto vec_ptr = vectors + bh * Dim;
+
+        // Step 1: Load & compute norm (2-stage cross-simdgroup reduction)
+        float val = (d < Dim) ? static_cast<float>(vec_ptr[d]) : 0.0f;
+        float sq = val * val;
+        float sg_sum = simd_sum(sq);
+
+        threadgroup float sg_norms[8];
+        if (sg_lid == 0) sg_norms[sg_id] = sg_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float total_sq = (sg_id == 0 && sg_lid < 8) ? sg_norms[sg_lid] : 0.0f;
+        total_sq = simd_sum(total_sq);
+        // Broadcast norm to all threads
+        if (sg_id == 0 && sg_lid == 0) sg_norms[0] = total_sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float norm = sqrt(sg_norms[0]);
+        float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+        if (d == 0) out_norms[bh] = half(norm);
+
+        // Step 2: Unit vector → shared for rotation
+        threadgroup float shared[Dim];
+        if (d < Dim) shared[d] = val * inv_norm;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step 3: Rotate — 1 dim per thread, 256 FMAs (was 2048 at TG=32)
+        float rotated = 0.0f;
+        if (d < Dim) {{
+            auto row = rotation + d * Dim;
+            for (int j = 0; j < (int)Dim; j++)
+                rotated += shared[j] * row[j];
+        }}
+
+        // Step 4: Comparison-based quantize
+        threadgroup uint shared_idx[Dim];
+        uint idx = 0;
+        if (d < Dim) {{
+            for (int m = 0; m < {num_midpoints}; m++)
+                idx += (rotated > midpoints[m]) ? 1u : 0u;
+            shared_idx[d] = idx;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step 5: Pack indices — per-dim write handles word-spanning
+        threadgroup uint packed_shared[PackedWidth];
+        // Zero packed buffer (use all threads, stride by Dim)
+        if (d < PackedWidth) packed_shared[d] = 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (d < Dim) {{
+            uint idx_val = shared_idx[d] & {mask}u;
+            int bo = d * {bits};
+            int w = bo >> 5;
+            int shift = bo & 31;
+            packed_shared[w] |= idx_val << shift;
+            if (shift + {bits} > 32)
+                packed_shared[w + 1] |= idx_val >> (32 - shift);
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (d < PackedWidth)
+            out_packed[bh * PackedWidth + d] = packed_shared[d];
+    """
+
+    return mx.fast.metal_kernel(
+        name=f"turboquant_fused_mse_quantize_v2_{bits}",
+        input_names=["vectors", "rotation", "midpoints"],
+        output_names=["out_norms", "out_packed"],
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _fused_prod_quantize_kernel(mse_bits: int, use_rht: bool = False):
+    """Fused Prod quantize: norm + rotate + MSE quantize + residual + QJL in 1 dispatch."""
+    if not _metal_available() or mse_bits <= 0:
+        return None
+    num_entries = 1 << mse_bits
+    num_midpoints = num_entries - 1
+    mse_mask = num_entries - 1
+
+    lines = [
+        "        auto lane = thread_position_in_threadgroup.x;",
+        "        auto bh = thread_position_in_grid.z;",
+        "        auto vec_ptr = vectors + bh * Dim;",
+        "",
+        "        // Step 1: Load & compute norm",
+        "        float v[DimsPerLane];",
+        "        float partial_sq = 0.0f;",
+        "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {",
+        "            float x = (d < Dim) ? static_cast<float>(vec_ptr[d]) : 0.0f;",
+        "            v[i] = x;",
+        "            partial_sq += x * x;",
+        "        }",
+        "        float norm = sqrt(simd_sum(partial_sq));",
+        "        float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;",
+        "        if (lane == 0) out_norms[bh] = half(norm);",
+        "",
+    ]
+
+    if use_rht:
+        lines += [
+            "        threadgroup float shared[DimPadded];",
+            "        for (int i = 0, d = lane; i < DimsPerLanePadded; d += 32, i++)",
+            "            shared[d < Dim ? d : 0] = (d < Dim) ? v[i] * inv_norm : 0.0f;",
+            "        if (lane < (DimPadded - Dim) && (Dim + lane) < DimPadded)",
+            "            shared[Dim + lane] = 0.0f;",
+            "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "",
+        ]
+        lines += _metal_butterfly_wht_forward(
+            "shared", "sign_vec", "v", "DimsPerLanePadded"
+        )
+        lines += [
+            "",
+            "        float rotated[DimsPerLane];",
+            "        for (int i = 0, d = lane; i < DimsPerLane; d += 32, i++)",
+            "            rotated[i] = (d < Dim) ? shared[d] * rht_scale : 0.0f;",
+        ]
+    else:
+        lines += [
+            "        threadgroup float shared[Dim];",
+            "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32)",
+            "            if (d < Dim) shared[d] = v[i] * inv_norm;",
+            "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "",
+            "        float rotated[DimsPerLane];",
+            "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {",
+            "            float sum = 0.0f;",
+            "            if (d < Dim) {",
+            "                auto row = mse_rotation + d * Dim;",
+            "                for (int j = 0; j < (int)Dim; j++)",
+            "                    sum += shared[j] * row[j];",
+            "            }",
+            "            rotated[i] = sum;",
+            "        }",
+        ]
+
+    # Steps 4-8 are the same for both paths
+    lines += [
+        "",
+        "        // Step 4: MSE quantize + compute rotated residual",
+        "        float rot_residual[DimsPerLane];",
+        "        threadgroup uint shared_mse_idx[Dim];",
+        "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {",
+        "            uint idx = 0;",
+        f"            if (d < Dim) {{",
+        f"                for (int m = 0; m < {num_midpoints}; m++)",
+        f"                    idx += (rotated[i] > midpoints[m]) ? 1u : 0u;",
+        f"            }}",
+        "            float estimate = codebook[idx];",
+        "            rot_residual[i] = rotated[i] - estimate;",
+        "            if (d < Dim) shared_mse_idx[d] = idx;",
+        "        }",
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+        "",
+        "        // Step 5: Pack MSE indices",
+        "        for (int w = lane; w < MsePackedWidth; w += 32) {",
+        "            uint word = 0;",
+        f"            for (int b = 0; b < 32; b += {mse_bits}) {{",
+        f"                int dim = (w * 32 + b) / {mse_bits};",
+        f"                if (dim < Dim) word |= (shared_mse_idx[dim] & {mse_mask}u) << b;",
+        f"            }}",
+        "            out_mse_packed[bh * MsePackedWidth + w] = word;",
+        "        }",
+        "",
+        "        // Step 6: Residual norm",
+        "        float res_sq = 0.0f;",
+        "        for (int i = 0; i < DimsPerLane; i++)",
+        "            res_sq += rot_residual[i] * rot_residual[i];",
+        "        float res_norm = sqrt(simd_sum(res_sq));",
+        "        if (lane == 0) out_res_norms[bh] = half(res_norm);",
+        "",
+        "        // Step 7: QJL projection (rotated_residual @ combined_proj_t)",
+        "        //   combined_proj_t = (mse_rotation @ projection_t).T",
+        "        //   so row d gives the projection for output dim d",
+        "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32)",
+        "            if (d < Dim) shared[d] = rot_residual[i];",
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+        "",
+        "        threadgroup uint shared_signs[Dim];",
+        "        for (int i = 0, d = lane; i < DimsPerLane; i++, d += 32) {",
+        "            float proj = 0.0f;",
+        "            if (d < Dim) {",
+        "                auto row = combined_proj_t + d * Dim;",
+        "                for (int j = 0; j < (int)Dim; j++)",
+        "                    proj += shared[j] * row[j];",
+        "            }",
+        "            shared_signs[d < Dim ? d : 0] = (proj >= 0.0f) ? 1u : 0u;",
+        "        }",
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+        "",
+        "        // Step 8: Pack sign bits (1 bit per dim)",
+        "        for (int w = lane; w < SignPackedWidth; w += 32) {",
+        "            uint word = 0;",
+        "            for (int b = 0; b < 32; b++) {",
+        "                int dim = w * 32 + b;",
+        "                if (dim < Dim) word |= shared_signs[dim] << b;",
+        "            }",
+        "            out_signs[bh * SignPackedWidth + w] = word;",
+        "        }",
+    ]
+
+    name_suffix = "_rht" if use_rht else ""
+    rotation_input = "sign_vec" if use_rht else "mse_rotation"
+    return mx.fast.metal_kernel(
+        name=f"turboquant_fused_prod_quantize_{mse_bits}{name_suffix}",
+        input_names=[
+            "vectors",
+            rotation_input,
+            "midpoints",
+            "codebook",
+            "combined_proj_t",
+        ],
+        output_names=[
+            "out_norms",
+            "out_mse_packed",
+            "out_res_norms",
+            "out_signs",
+        ],
+        source="\n".join(lines),
+    )
+
+
+@lru_cache(maxsize=None)
+def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int):
+    """Fused SplitCodec decode: score + online-softmax + weighted-sum."""
     if not _metal_available() or repeat_count < 1:
         return None
 
@@ -2042,19 +3095,6 @@ def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int)
     high_mse_bits = max(high_bits - 1, 0)
     low_mse_mask = (1 << low_mse_bits) - 1
     high_mse_mask = (1 << high_mse_bits) - 1
-
-    # Architecture: 32 SIMD lanes cooperate on BOTH key scoring (simd_sum across
-    # key dims) AND value accumulation (each lane handles its own value dim).
-    #
-    # Grid: (32, NumTiles, B*H) — NumTiles = ceil(ValDim/32).
-    # Each tile's 32 lanes handle 32 value dims. The score is computed ONCE
-    # per token per tile (not once per value dim), eliminating 32x redundancy.
-    #
-    # Per token:
-    #   1. 32 lanes split key dims → partial scores → simd_sum → scalar score
-    #   2. Each lane unpacks its value dim, applies online softmax weight
-    #
-    # Cross-lane score is free (simd_sum broadcasts to all lanes).
 
     val_dim_total = "DimLow + DimHigh"
 
@@ -2260,8 +3300,7 @@ def _fused_split_decode_kernel(low_bits: int, high_bits: int, repeat_count: int)
 
 @lru_cache(maxsize=None)
 def _compiled_split_decode_kernel(low_bits: int, high_bits: int):
-    """Fused decode kernel for SplitCodec — handles both halves in a single
-    compiled function, avoiding double dispatch and intermediate allocations."""
+    """Compiled SplitCodec decode handling both halves."""
     low_mse_bits = max(low_bits - 1, 0)
     high_mse_bits = max(high_bits - 1, 0)
 
@@ -2456,6 +3495,53 @@ def _rotation_matrix(dim: int, seed: int) -> mx.array:
     q, r = np.linalg.qr(matrix)
     q *= np.sign(np.diag(r))
     return mx.array(q.astype(np.float32))
+
+
+def _next_power_of_two(n: int) -> int:
+    return 1 << (n - 1).bit_length() if n > 1 else 1
+
+
+@lru_cache(maxsize=None)
+def _rht_padded_dim(dim: int) -> int:
+    return _next_power_of_two(dim)
+
+
+@lru_cache(maxsize=None)
+def _rht_sign_vector(dim: int, seed: int) -> mx.array:
+    """Deterministic random sign vector for Randomized Hadamard Transform."""
+    if dim <= 0:
+        return mx.zeros((0,), dtype=mx.float32)
+    rng = np.random.default_rng(seed + dim * 7919)
+    signs = rng.choice([-1.0, 1.0], size=dim).astype(np.float32)
+    return mx.array(signs)
+
+
+def _rht_forward(x: mx.array, signs: mx.array) -> mx.array:
+    """RHT forward: hadamard(signs * x) / sqrt(D)."""
+    dim = signs.shape[0]
+    D_padded = _rht_padded_dim(dim)
+    y = x * signs
+    if D_padded > dim:
+        pad_width = [(0, 0)] * (y.ndim - 1) + [(0, D_padded - dim)]
+        y = mx.pad(y, pad_width)
+    y = mx.hadamard_transform(y, scale=1.0 / math.sqrt(D_padded))
+    if D_padded > dim:
+        y = y[..., :dim]
+    return y
+
+
+def _rht_inverse(x: mx.array, signs: mx.array) -> mx.array:
+    """RHT inverse: signs * hadamard(x) / sqrt(D)."""
+    dim = signs.shape[0]
+    D_padded = _rht_padded_dim(dim)
+    y = x
+    if D_padded > dim:
+        pad_width = [(0, 0)] * (y.ndim - 1) + [(0, D_padded - dim)]
+        y = mx.pad(y, pad_width)
+    y = mx.hadamard_transform(y, scale=1.0 / math.sqrt(D_padded))
+    if D_padded > dim:
+        y = y[..., :dim]
+    return y * signs
 
 
 @lru_cache(maxsize=None)
@@ -2908,14 +3994,30 @@ class _TurboQuantMSECodec:
     def __init__(self, dim: int, bits: int, seed: int):
         self.dim = dim
         self.bits = bits
+        # Use mx.hadamard_transform for power-of-2 dims (O(D log D), 1 dispatch).
+        self.use_rht = dim > 0 and (dim & (dim - 1)) == 0
+        if self.use_rht:
+            self.signs = _rht_sign_vector(dim, seed)
+        else:
+            self.signs = None
+        # Dense rotation always available (needed for Metal helper fallbacks)
         self.rotation = _rotation_matrix(dim, seed)
         self.rotation_t = self.rotation.transpose() if dim > 0 else self.rotation
         self.codebook = _codebook(dim, bits)
-        # Precompute midpoints for fast comparison-based quantization
         if bits > 0 and self.codebook.shape[0] > 1:
             self._midpoints = (self.codebook[:-1] + self.codebook[1:]) / 2
         else:
             self._midpoints = mx.zeros((0,), dtype=mx.float32)
+
+    def _rotate_forward(self, x: mx.array) -> mx.array:
+        if self.use_rht:
+            return _rht_forward(x, self.signs)
+        return mx.matmul(x, self.rotation_t)
+
+    def _rotate_inverse(self, x: mx.array) -> mx.array:
+        if self.use_rht:
+            return _rht_inverse(x, self.signs)
+        return mx.matmul(x, self.rotation)
 
     def _quantize_unit_with_estimate(
         self, unit_vectors: mx.array
@@ -2926,19 +4028,23 @@ class _TurboQuantMSECodec:
                 mx.zeros(unit_vectors.shape, dtype=mx.float32),
             )
 
-        rotated = mx.matmul(unit_vectors, self.rotation_t)
-        # Use comparison-based quantization: O(T*D*bits) instead of
-        # O(T*D*2^bits) broadcast argmin. 11-28x faster.
+        rotated = self._rotate_forward(unit_vectors)
         indices = mx.zeros(rotated.shape, dtype=mx.uint32)
         for m in range(self._midpoints.shape[0]):
             indices = indices + (rotated > self._midpoints[m]).astype(mx.uint32)
         packed = _pack_lowbit(indices, self.bits)
         estimated_rotated = mx.take(self.codebook, indices.astype(mx.int32), axis=0)
-        return packed, mx.matmul(estimated_rotated, self.rotation)
+        return packed, self._rotate_inverse(estimated_rotated)
 
     def _quantize_unit(self, unit_vectors: mx.array) -> mx.array:
-        packed, _ = self._quantize_unit_with_estimate(unit_vectors)
-        return packed
+        """Quantize without computing the estimate (no wasted D×D rotation)."""
+        if self.bits == 0:
+            return mx.zeros((*unit_vectors.shape[:-1], 0), dtype=mx.uint32)
+        rotated = self._rotate_forward(unit_vectors)
+        indices = mx.zeros(rotated.shape, dtype=mx.uint32)
+        for m in range(self._midpoints.shape[0]):
+            indices = indices + (rotated > self._midpoints[m]).astype(mx.uint32)
+        return _pack_lowbit(indices, self.bits)
 
     def _dequantize_unit(self, packed_indices: mx.array) -> mx.array:
         if self.bits == 0:
@@ -2946,12 +4052,72 @@ class _TurboQuantMSECodec:
 
         indices = _unpack_lowbit(packed_indices, self.bits, self.dim).astype(mx.int32)
         rotated = mx.take(self.codebook, indices, axis=0)
-        return mx.matmul(rotated, self.rotation)
+        return self._rotate_inverse(rotated)
 
     def quantize(self, vectors: mx.array) -> TurboQuantMSEState:
+        # Fast path for single-token decode: Hadamard rotation + fused quantize
+        if vectors.shape[-2] == 1 and self.bits > 0 and self.use_rht:
+            D = self.dim
+            flat = vectors.reshape(-1, D).astype(mx.float32)
+            BH = flat.shape[0]
+            norms = mx.linalg.norm(flat, axis=-1)
+            unit = flat / mx.maximum(norms[..., None], _EPS)
+            rotated = self._rotate_forward(unit)  # mx.hadamard_transform (1 dispatch)
+            # Fused quantize kernel on pre-rotated data (1 dispatch)
+            packed_width = (D * self.bits + 31) // 32
+            kernel = _fused_norot_quantize_kernel(self.bits)
+            if kernel is not None:
+                packed = kernel(
+                    inputs=[rotated, self._midpoints],
+                    template=[("Dim", D), ("PackedWidth", packed_width)],
+                    grid=(D * BH, 1, 1),
+                    threadgroup=(D, 1, 1),
+                    output_shapes=[(BH, packed_width)],
+                    output_dtypes=[mx.uint32],
+                )[0]
+                orig = vectors.shape[:-1]
+                return TurboQuantMSEState(
+                    norms.astype(mx.float16).reshape(orig),
+                    packed.reshape(*orig, packed_width),
+                )
+
+        # Fused Metal kernel with rotation inside (dense rotation path)
+        if vectors.shape[-2] == 1 and self.bits > 0 and not self.use_rht:
+            kernel = _fused_mse_quantize_kernel(self.bits, use_rht=False)
+            if kernel is not None:
+                D = self.dim
+                D_padded = _rht_padded_dim(D) if self.use_rht else D
+                flat = vectors.reshape(-1, D)
+                BH = flat.shape[0]
+                dims_per_lane = (D + 31) // 32
+                packed_width = (D * self.bits + 31) // 32
+                rot_input = self.signs if self.use_rht else self.rotation
+                template = [
+                    ("Dim", D),
+                    ("DimsPerLane", dims_per_lane),
+                    ("PackedWidth", packed_width),
+                ]
+                if self.use_rht:
+                    template += [
+                        ("DimPadded", D_padded),
+                        ("DimsPerLanePadded", (D_padded + 31) // 32),
+                    ]
+                norms, packed = kernel(
+                    inputs=[flat, rot_input, self._midpoints],
+                    template=template,
+                    grid=(D * BH, 1, 1),
+                    threadgroup=(D, 1, 1),
+                    output_shapes=[(BH,), (BH, packed_width)],
+                    output_dtypes=[mx.float16, mx.uint32],
+                )
+                orig_shape = vectors.shape[:-1]
+                return TurboQuantMSEState(
+                    norms.reshape(orig_shape),
+                    packed.reshape(*orig_shape, packed_width),
+                )
+
         vectors_f32 = vectors.astype(mx.float32)
         norms = mx.linalg.norm(vectors_f32, axis=-1)
-        # safe_norms >= _EPS, so division never produces inf/nan
         unit_vectors = vectors_f32 / mx.maximum(norms[..., None], _EPS)
         return TurboQuantMSEState(
             norms.astype(mx.float16),
@@ -2963,7 +4129,7 @@ class _TurboQuantMSECodec:
         return state.norms[..., None].astype(unit_vectors.dtype) * unit_vectors
 
     def prepare_queries(self, queries: mx.array) -> mx.array:
-        return mx.matmul(queries, self.rotation_t)
+        return self._rotate_forward(queries)
 
     def score_prepared(
         self, prepared_queries: mx.array, state: TurboQuantMSEState
@@ -3011,20 +4177,21 @@ class _TurboQuantMSECodec:
             state.norms.astype(mx.float32),
             rotated,
         )
-        return mx.matmul(weighted_rot, self.rotation)
+        return self._rotate_inverse(weighted_rot)
 
     def weighted_sum_from_scores(
         self, scores: mx.array, state: TurboQuantMSEState
     ) -> mx.array:
-        fast_output = _metal_mse_weighted_sum_from_scores(
-            scores,
-            state,
-            self.bits,
-            self.codebook,
-            self.rotation,
-        )
-        if fast_output is not None:
-            return fast_output
+        if not self.use_rht:
+            fast_output = _metal_mse_weighted_sum_from_scores(
+                scores,
+                state,
+                self.bits,
+                self.codebook,
+                self.rotation,
+            )
+            if fast_output is not None:
+                return fast_output
         return self.weighted_sum(mx.softmax(scores, axis=-1), state)
 
     def weighted_sum_stats_from_scores(
@@ -3287,8 +4454,73 @@ class _TurboQuantProdCodec:
         )
         self.scale = math.sqrt(math.pi / 2) / dim if dim > 0 else 0.0
         self.scale_array = mx.array([self.scale], dtype=mx.float32)
+        # Precompute for fused quantize: project rotated residual directly
+        # combined_proj_t = (rotation @ projection_t).T = projection @ rotation_t
+        if dim > 0:
+            self._combined_proj_t = mx.matmul(
+                self.projection, self.mse_codec.rotation_t
+            )
+        else:
+            self._combined_proj_t = mx.zeros((0, 0), dtype=mx.float32)
 
     def quantize(self, vectors: mx.array) -> TurboQuantProdState:
+        mse_bits = self.mse_codec.bits
+        use_rht = self.mse_codec.use_rht
+        # Fused Metal kernel for single-token decode
+        if vectors.shape[-2] == 1 and mse_bits > 0 and 32 % mse_bits == 0:
+            kernel = _fused_prod_quantize_kernel(mse_bits, use_rht=use_rht)
+            if kernel is not None:
+                D = self.dim
+                D_padded = _rht_padded_dim(D) if use_rht else D
+                flat = vectors.reshape(-1, D)
+                BH = flat.shape[0]
+                dims_per_lane = (D + 31) // 32
+                mse_packed_width = (D * mse_bits + 31) // 32
+                sign_packed_width = (D + 31) // 32
+                rot_input = self.mse_codec.signs if use_rht else self.mse_codec.rotation
+                template = [
+                    ("Dim", D),
+                    ("DimsPerLane", dims_per_lane),
+                    ("MsePackedWidth", mse_packed_width),
+                    ("SignPackedWidth", sign_packed_width),
+                ]
+                if use_rht:
+                    template += [
+                        ("DimPadded", D_padded),
+                        ("DimsPerLanePadded", (D_padded + 31) // 32),
+                    ]
+                norms, mse_packed, res_norms, signs = kernel(
+                    inputs=[
+                        flat,
+                        rot_input,
+                        self.mse_codec._midpoints,
+                        self.mse_codec.codebook,
+                        self._combined_proj_t,
+                    ],
+                    template=template,
+                    grid=(32, 1, BH),
+                    threadgroup=(32, 1, 1),
+                    output_shapes=[
+                        (BH,),
+                        (BH, mse_packed_width),
+                        (BH,),
+                        (BH, sign_packed_width),
+                    ],
+                    output_dtypes=[
+                        mx.float16,
+                        mx.uint32,
+                        mx.float16,
+                        mx.uint32,
+                    ],
+                )
+                orig_shape = vectors.shape[:-1]  # (B, H, 1)
+                return TurboQuantProdState(
+                    norms.reshape(orig_shape),
+                    mse_packed.reshape(*orig_shape, mse_packed_width),
+                    res_norms.reshape(orig_shape),
+                    signs.reshape(*orig_shape, sign_packed_width),
+                )
+
         vectors_f32 = vectors.astype(mx.float32)
         norms = mx.linalg.norm(vectors_f32, axis=-1)
         unit_vectors = vectors_f32 / mx.maximum(norms[..., None], _EPS)
@@ -3320,6 +4552,10 @@ class _TurboQuantProdCodec:
         return state.norms[..., None].astype(mx.float32) * (mse_unit + qjl_unit)
 
     def prepare_queries(self, queries: mx.array) -> tuple[mx.array, mx.array]:
+        if self.mse_codec.use_rht:
+            q_rot = self.mse_codec._rotate_forward(queries)
+            q_proj = mx.matmul(queries, self.projection_t)
+            return q_rot, q_proj
         transformed = mx.matmul(queries, self.query_transform_t)
         return transformed[..., : self.dim], transformed[..., self.dim :]
 
@@ -3552,11 +4788,8 @@ class _QuantizedStateProxy:
 
 
 class TurboQuantKVCache(_BaseCache):
-    # Process all tokens in one pass during decode — chunking adds significant
-    # overhead from the online-softmax recombination loop. Memory is already
-    # bounded by the quantized cache itself.
-    decode_key_chunk_size = 1 << 30  # ~1B tokens, effectively no chunking
-    prefill_key_chunk_size = 2048  # match DEFAULT_PREFILL_STEP_SIZE from generate.py
+    decode_key_chunk_size = 1 << 30
+    prefill_key_chunk_size = 2048
     prefill_query_block_size = 16
     cache_step = 256
 
@@ -3570,6 +4803,8 @@ class TurboQuantKVCache(_BaseCache):
         self.value_codec = None
         self._cached_state = None
         self._cached_state_offset = -1
+        self._shadow_keys = None
+        self._shadow_values = None
 
     @classmethod
     def from_cache(
@@ -3591,7 +4826,7 @@ class TurboQuantKVCache(_BaseCache):
                 if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
                 else self.bits
             )
-            self.key_codec = _build_codec(keys, key_bits, mode="prod", seed=self.seed)
+            self.key_codec = _build_codec(keys, key_bits, mode="mse", seed=self.seed)
         if self.value_codec is None:
             val_bits = (
                 math.ceil(self.bits)
@@ -3602,10 +4837,67 @@ class TurboQuantKVCache(_BaseCache):
                 values, val_bits, mode="mse", seed=self.seed + 1
             )
 
+    def _try_fused_kv_quantize(self, keys, values):
+        """Fused key+value quantize in 1 dispatch. Returns (key_state, val_state) or (None, None)."""
+        if (
+            keys.shape[-2] != 1
+            or not isinstance(self.key_codec, _TurboQuantMSECodec)
+            or not isinstance(self.value_codec, _TurboQuantMSECodec)
+        ):
+            return None, None
+
+        key_bits = int(self.key_codec.bits)
+        val_bits = int(self.value_codec.bits)
+        kernel = _fused_kv_quantize_kernel(key_bits, val_bits)
+        if kernel is None:
+            return None, None
+
+        D = keys.shape[-1]
+        k_flat = keys.reshape(-1, D)
+        v_flat = values.reshape(-1, D)
+        BH = k_flat.shape[0]
+        k_pw = (D * key_bits + 31) // 32
+        v_pw = (D * val_bits + 31) // 32
+
+        k_norms, k_packed, v_norms, v_packed = kernel(
+            inputs=[
+                k_flat,
+                v_flat,
+                self.key_codec.rotation,
+                self.value_codec.rotation,
+                self.key_codec._midpoints,
+                self.value_codec._midpoints,
+            ],
+            template=[
+                ("Dim", D),
+                ("KPackedWidth", k_pw),
+                ("VPackedWidth", v_pw),
+            ],
+            grid=(D * BH, 2, 1),
+            threadgroup=(D, 1, 1),
+            output_shapes=[
+                (BH,),
+                (BH, k_pw),
+                (BH,),
+                (BH, v_pw),
+            ],
+            output_dtypes=[mx.float16, mx.uint32, mx.float16, mx.uint32],
+        )
+
+        orig = keys.shape[:-1]
+        return (
+            TurboQuantMSEState(k_norms.reshape(orig), k_packed.reshape(*orig, k_pw)),
+            TurboQuantMSEState(v_norms.reshape(orig), v_packed.reshape(*orig, v_pw)),
+        )
+
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         self._ensure_codecs(keys, values)
-        new_keys = self.key_codec.quantize(keys)
-        new_values = self.value_codec.quantize(values)
+
+        # Try fused key+value quantize (1 dispatch instead of 2)
+        new_keys, new_values = self._try_fused_kv_quantize(keys, values)
+        if new_keys is None:
+            new_keys = self.key_codec.quantize(keys)
+            new_values = self.value_codec.quantize(values)
 
         new_end = self.offset + keys.shape[2]
         if self.keys is None:
@@ -3623,14 +4915,14 @@ class TurboQuantKVCache(_BaseCache):
         _write_state(self.values, new_values, self.offset)
 
         B, n_heads = keys.shape[0], keys.shape[1]
+        D = keys.shape[-1]
+        n_new = keys.shape[2]
+
         self.offset = new_end
         self._cached_state = None
         self._cached_state_offset = -1
-        n_new = keys.shape[2]
-        # Only eval during prefill (multiple tokens) to prevent graph buildup.
-        if n_new > 1:
+        if n_new > 1 or (self.offset % 50 == 0):
             mx.eval(self.keys, self.values)
-        # Return proxied states so model code can access .shape[-2] for mask slicing
         ks, vs = self.state
         return (
             _QuantizedStateProxy(ks, self.offset, n_heads),
@@ -3907,7 +5199,7 @@ class TurboQuantKVCache(_BaseCache):
         out_rotated = out_rotated.reshape(B, n_kv_heads, n_repeats, L, D)
 
         # Rotate values back
-        output = mx.matmul(out_rotated, self.value_codec.rotation)
+        output = self.value_codec._rotate_inverse(out_rotated)
         return output.reshape(B, n_q_heads, L, D).astype(queries.dtype)
 
     def _separate_score_value_decode(
@@ -3919,11 +5211,17 @@ class TurboQuantKVCache(_BaseCache):
         """Separate-kernel decode: fast key scoring + single-tile value weighted sum.
         2-3x faster than the fused kernel at large D because each kernel only
         iterates its own dimensions once."""
+        key_is_prod = isinstance(self.key_codec, _TurboQuantProdCodec)
+        key_is_mse = isinstance(self.key_codec, _TurboQuantMSECodec)
         if not (
             _metal_available()
-            and isinstance(self.key_codec, _TurboQuantProdCodec)
+            and (key_is_prod or key_is_mse)
             and isinstance(self.value_codec, _TurboQuantMSECodec)
-            and isinstance(keys_state, TurboQuantProdState)
+            and (
+                isinstance(keys_state, TurboQuantProdState)
+                if key_is_prod
+                else isinstance(keys_state, TurboQuantMSEState)
+            )
             and isinstance(values_state, TurboQuantMSEState)
         ):
             return None
@@ -3943,7 +5241,7 @@ class TurboQuantKVCache(_BaseCache):
         if val_kernel is None:
             return None
 
-        # Step 1: Key scoring — uses existing optimized Metal kernel
+        # Step 1: Key scoring — polymorphic (works for both Prod and MSE keys)
         prepared_queries = self.key_codec.prepare_queries(grouped_queries)
         scores = self.key_codec.score_prepared(prepared_queries, keys_state)
         # scores: (B, H, R, 1, T) → (B*H, R, T)
@@ -3986,7 +5284,7 @@ class TurboQuantKVCache(_BaseCache):
         out_rotated = out_rotated.reshape(B, H, R, D)
 
         # Rotate values back to original space
-        output = mx.matmul(out_rotated, self.value_codec.rotation)
+        output = self.value_codec._rotate_inverse(out_rotated)
         return mx.expand_dims(output, axis=3)
 
     def _compiled_split_decode_attention(
@@ -4146,18 +5444,66 @@ class TurboQuantKVCache(_BaseCache):
         D = grouped_queries.shape[-1]
         T = keys_state.norms.shape[2]
 
-        # Try fused kernel — choose single-tile (zero key redundancy) for
-        # long contexts where memory bandwidth dominates, multi-tile for
-        # shorter contexts where parallelism matters more.
+        dims_per_lane = (D + 31) // 32
+        key_mse_bits = self.key_codec.mse_codec.bits
+        use_rht = self.value_codec.use_rht
+
+        # Fully fused path: score + softmax + value + rotation in 1 dispatch.
+        if T <= 32768:
+            ff_kernel = _fully_fused_decode_kernel(
+                # Dense rotation for decode kernel — butterfly WHT barriers
+                # outweigh the D² compute savings at small threadgroup counts.
+                bits,
+                R,
+                dims_per_lane,
+                key_mse_bits,
+                use_rht=False,
+            )
+            if ff_kernel is not None:
+                q_rot, q_proj = self.key_codec.prepare_queries(grouped_queries)
+                q_rot = q_rot.reshape(B, H, R, D)
+                q_proj = q_proj.reshape(B, H, R, D)
+
+                rot_input = self.value_codec.rotation_t
+                template = [
+                    ("Dim", D),
+                    ("RepeatCount", R),
+                    ("DimsPerLane", dims_per_lane),
+                    ("KMsePackedWidth", keys_state.mse_indices.shape[-1]),
+                    ("KSignPackedWidth", keys_state.qjl_signs.shape[-1]),
+                    ("VPackedWidth", values_state.indices.shape[-1]),
+                ]
+
+                out = ff_kernel(
+                    inputs=[
+                        q_rot,
+                        q_proj,
+                        keys_state.norms,
+                        keys_state.mse_indices,
+                        keys_state.residual_norms,
+                        keys_state.qjl_signs,
+                        values_state.norms,
+                        values_state.indices,
+                        self.key_codec.mse_codec.codebook,
+                        self.key_codec.scale_array,
+                        self.value_codec.codebook,
+                        rot_input,
+                    ],
+                    template=template,
+                    grid=(32, 1, B * H),
+                    threadgroup=(32, 1, 1),
+                    output_shapes=[(B * H, R, D)],
+                    output_dtypes=[mx.float32],
+                )[0]
+                output = out.reshape(B, H, R, D)
+                return mx.expand_dims(output, axis=3)
+
+        # Tiled fused paths for longer contexts
         qt = mx.matmul(grouped_queries, self.key_codec.query_transform_t)
         q_rot = qt[..., :D].reshape(B, H, R, D)
         q_proj = qt[..., D:].reshape(B, H, R, D)
         tok_tile_size = 1024
         num_tok_tiles = (T + tok_tile_size - 1) // tok_tile_size
-        dims_per_lane = (D + 31) // 32
-
-        # Key MSE bits may differ from value bits (e.g. 3-bit keys + 4-bit values)
-        key_mse_bits = self.key_codec.mse_codec.bits
 
         # Single-tile path: each lane handles all its value dims.
         # Zero key read redundancy — faster at 256k+ where bandwidth dominates.
@@ -4224,7 +5570,7 @@ class TurboQuantKVCache(_BaseCache):
                 B, H, R, D
             )
 
-            output = mx.matmul(out_rotated, self.value_codec.rotation)
+            output = self.value_codec._rotate_inverse(out_rotated)
             return mx.expand_dims(output, axis=3)
 
         elif multi_kernel is not None:
@@ -4273,7 +5619,7 @@ class TurboQuantKVCache(_BaseCache):
                 B, H, R, D
             )
 
-            output = mx.matmul(out_rotated, self.value_codec.rotation)
+            output = self.value_codec._rotate_inverse(out_rotated)
             return mx.expand_dims(output, axis=3)
 
         # Fallback: compiled two-dispatch path
@@ -4333,10 +5679,105 @@ class TurboQuantKVCache(_BaseCache):
         if total_tokens <= self.decode_key_chunk_size and (
             mask is None or (isinstance(mask, str) and mask == "causal")
         ):
-            # Separate-kernel path: score keys (fast) → single-tile value weighted sum
-            # 2-3x faster than fused kernel at large D because each kernel
-            # only iterates its own dims once, avoiding the fused kernel's
-            # double-iteration (score all dims + accumulate all dims per token).
+            # Fused quantized SDPA matching MLX architecture.
+            if (
+                isinstance(self.key_codec, _TurboQuantMSECodec)
+                and isinstance(self.value_codec, _TurboQuantMSECodec)
+                and isinstance(keys_state, TurboQuantMSEState)
+                and isinstance(values_state, TurboQuantMSEState)
+            ):
+                key_bits = int(self.key_codec.bits)
+                val_bits = int(self.value_codec.bits)
+                dtype = queries.dtype
+                q_rot = self.key_codec.prepare_queries(grouped_queries)
+                q_rot_flat = q_rot.reshape(B * n_kv_heads * n_repeats, D)
+                BQH = B * n_q_heads
+
+                if total_tokens <= 2048:
+                    # Single-pass: 32 simdgroups cooperate per q_head
+                    fused_kernel = _fused_mse_decode_kernel(key_bits, val_bits, D)
+                    if fused_kernel is not None:
+                        out = fused_kernel(
+                            inputs=[
+                                q_rot_flat,
+                                keys_state.norms,
+                                keys_state.indices,
+                                self.key_codec.codebook,
+                                values_state.norms,
+                                values_state.indices,
+                                self.value_codec.codebook,
+                            ],
+                            template=[
+                                ("Dim", D),
+                                ("RepeatCount", n_repeats),
+                                ("KPackedWidth", keys_state.indices.shape[-1]),
+                                ("VPackedWidth", values_state.indices.shape[-1]),
+                            ],
+                            grid=(BQH * 1024, 1, 1),
+                            threadgroup=(1024, 1, 1),
+                            output_shapes=[(BQH, D)],
+                            output_dtypes=[mx.float32],
+                        )[0]
+                        out_rotated = out.reshape(B, n_kv_heads, n_repeats, D)
+                        output = self.value_codec._rotate_inverse(out_rotated)
+                        return output.reshape(B, n_q_heads, L, value_dim).astype(dtype)
+
+                # 2-pass: split KV across blocks for GPU saturation
+                pass1 = _fused_mse_decode_2pass_1_kernel(key_bits, val_bits, D)
+                pass2 = _fused_mse_decode_2pass_2_kernel()
+                if pass1 is not None and pass2 is not None:
+                    if total_tokens <= 8192:
+                        num_blocks = 64
+                    elif total_tokens <= 32768:
+                        num_blocks = 128
+                    elif total_tokens <= 65536:
+                        num_blocks = 256
+                    else:
+                        num_blocks = 512
+
+                    acc_shape = (BQH * num_blocks, D)
+                    sm_shape = (BQH * num_blocks,)
+                    out_acc, out_sums, out_maxs = pass1(
+                        inputs=[
+                            q_rot_flat,
+                            keys_state.norms,
+                            keys_state.indices,
+                            self.key_codec.codebook,
+                            values_state.norms,
+                            values_state.indices,
+                            self.value_codec.codebook,
+                        ],
+                        template=[
+                            ("Dim", D),
+                            ("RepeatCount", n_repeats),
+                            ("Blocks", num_blocks),
+                            ("KPackedWidth", keys_state.indices.shape[-1]),
+                            ("VPackedWidth", values_state.indices.shape[-1]),
+                        ],
+                        grid=(
+                            n_kv_heads * 32,
+                            B * n_repeats,
+                            num_blocks,
+                        ),
+                        threadgroup=(32, n_repeats, 1),
+                        output_shapes=[acc_shape, sm_shape, sm_shape],
+                        output_dtypes=[mx.float32, mx.float32, mx.float32],
+                    )
+
+                    out = pass2(
+                        inputs=[out_acc, out_sums, out_maxs],
+                        template=[("Dim", D), ("Blocks", num_blocks)],
+                        grid=(BQH * 1024, 1, 1),
+                        threadgroup=(1024, 1, 1),
+                        output_shapes=[(BQH, D)],
+                        output_dtypes=[mx.float32],
+                    )[0]
+
+                    out_rotated = out.reshape(B, n_kv_heads, n_repeats, D)
+                    output = self.value_codec._rotate_inverse(out_rotated)
+                    return output.reshape(B, n_q_heads, L, value_dim).astype(dtype)
+
+            # Separate-kernel path fallback
             sep_output = self._separate_score_value_decode(
                 grouped_queries,
                 keys_state,

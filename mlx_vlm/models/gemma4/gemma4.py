@@ -97,9 +97,13 @@ class Model(nn.Module):
             )
 
         if pixel_values is not None:
-            image_features = self.vision_tower(pixel_values)
-            image_features = self.embed_vision(image_features)
-            image_features = image_features.astype(inputs_embeds.dtype)
+            cached = kwargs.get("cached_image_features", None)
+            if cached is not None:
+                image_features = cached.astype(inputs_embeds.dtype)
+            else:
+                image_features = self.vision_tower(pixel_values)
+                image_features = self.embed_vision(image_features)
+                image_features = image_features.astype(inputs_embeds.dtype)
 
             image_mask = input_ids == self.config.image_token_id
             image_mask_expanded = mx.expand_dims(image_mask, -1)
@@ -136,6 +140,16 @@ class Model(nn.Module):
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds, per_layer_inputs=per_layer_inputs
         )
+
+    def encode_image(self, pixel_values: mx.array) -> mx.array:
+        """Encode pixel_values through vision_tower + embed_vision.
+
+        Returns projected image features suitable for passing as
+        cached_image_features to get_input_embeddings.
+        """
+        image_features = self.vision_tower(pixel_values)
+        image_features = self.embed_vision(image_features)
+        return image_features
 
     def __call__(
         self,

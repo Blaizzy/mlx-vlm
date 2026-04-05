@@ -17,15 +17,17 @@ from ..base import load_chat_template, to_mlx
 
 
 class Qwen3VLProcessor(ProcessorMixin):
-    attributes = ["image_processor", "tokenizer"]
+    attributes = ["image_processor", "tokenizer", "video_processor"]
     valid_kwargs = ["chat_template"]
     image_processor_class = "AutoImageProcessor"
     tokenizer_class = "AutoTokenizer"
+    video_processor_class = "AutoVideoProcessor"
 
     def __init__(
         self,
         image_processor=None,
         tokenizer=None,
+        video_processor=None,
         chat_template=None,
         **kwargs,
     ):
@@ -49,7 +51,9 @@ class Qwen3VLProcessor(ProcessorMixin):
             if getattr(tokenizer, "video_token_id", None)
             else tokenizer.convert_tokens_to_ids(self.video_token)
         )
-        super().__init__(image_processor, tokenizer, chat_template=chat_template)
+        super().__init__(
+            image_processor, tokenizer, video_processor, chat_template=chat_template
+        )
 
         self.vision_start_token = (
             "<|vision_start|>"
@@ -96,7 +100,8 @@ class Qwen3VLProcessor(ProcessorMixin):
             image_grid_thw = None
 
         if videos is not None:
-            videos_inputs = self.image_processor(videos=videos)
+            _video_proc = self.video_processor or self.image_processor
+            videos_inputs = _video_proc(videos=videos)
             video_grid_thw = videos_inputs["video_grid_thw"]
         else:
             video_grid_thw = None
@@ -120,7 +125,8 @@ class Qwen3VLProcessor(ProcessorMixin):
                 text[i] = text[i].replace("<|placeholder|>", self.image_token)
 
         if video_grid_thw is not None:
-            merge_length = self.image_processor.merge_size**2
+            _video_proc = self.video_processor or self.image_processor
+            merge_length = _video_proc.merge_size**2
             index = 0
             for i in range(len(text)):
                 while self.video_token in text[i]:
@@ -208,10 +214,27 @@ class Qwen3VLProcessor(ProcessorMixin):
                 **ip_overrides,
                 **kwargs,
             )
+
+        video_processor = None
+        try:
+            from transformers import AutoVideoProcessor
+
+            video_processor = AutoVideoProcessor.from_pretrained(
+                pretrained_model_name_or_path, **kwargs
+            )
+        except (ImportError, ValueError, OSError):
+            pass
+
+        if "chat_template" not in proc_kwargs:
+            chat_template = getattr(tokenizer, "chat_template", None)
+            if chat_template is not None:
+                proc_kwargs["chat_template"] = chat_template
+
         return cls(
             image_processor=image_processor,
             tokenizer=tokenizer,
-            **proc_kwargs,
+            video_processor=video_processor,
+            **proc_kwargs,  # may include chat_template from processor_config.json
         )
 
 

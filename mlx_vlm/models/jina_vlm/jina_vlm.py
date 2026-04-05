@@ -227,7 +227,11 @@ class Model(nn.Module):
                     else None
                 )
 
-            image_features = self.get_image_features(pixel_values, image_masks)
+            cached = kwargs.get("cached_image_features", None)
+            if cached is not None:
+                image_features = cached
+            else:
+                image_features = self.get_image_features(pixel_values, image_masks)
 
             num_image, num_patch = image_features.shape[1:3]
 

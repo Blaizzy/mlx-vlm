@@ -90,13 +90,17 @@ class Model(nn.Module):
         # --- Process images ---
         image_features = None
         if has_images:
-            pixel_attention_mask = kwargs.get("pixel_attention_mask", None)
-            spatial_shapes = kwargs.get("spatial_shapes", None)
+            cached = kwargs.get("cached_image_features", None)
+            if cached is not None:
+                image_features = cached
+            else:
+                pixel_attention_mask = kwargs.get("pixel_attention_mask", None)
+                spatial_shapes = kwargs.get("spatial_shapes", None)
 
-            image_features = self.vision_tower(
-                pixel_values, pixel_attention_mask, spatial_shapes
-            )
-            image_features = self.apply_mm_projector(image_features)
+                image_features = self.vision_tower(
+                    pixel_values, pixel_attention_mask, spatial_shapes
+                )
+                image_features = self.apply_mm_projector(image_features)
 
         # --- Process audio ---
         audio_features = None

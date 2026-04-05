@@ -155,10 +155,14 @@ class Model(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         image_sizes = kwargs.get("image_sizes", None)
 
-        # Run vision tower once
-        *_, hidden_states = self.vision_tower(
-            pixel_values[0].transpose(0, 2, 3, 1), output_hidden_states=True
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            hidden_states = cached
+        else:
+            # Run vision tower once
+            *_, hidden_states = self.vision_tower(
+                pixel_values[0].transpose(0, 2, 3, 1), output_hidden_states=True
+            )
 
         num_patches = pixel_values[0].shape[0]
         image_num_patches = [num_patches]
