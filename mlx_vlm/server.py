@@ -694,30 +694,26 @@ class ChatStreamChunk(BaseModel):
     usage: Optional[UsageStats]
 
 
-def resolve_stop_tokens(
+def resolve_stop_sequences(
     stop: Optional[Union[str, list]],
-    processor: Any,
-) -> Optional[set]:
-    """Convert stop string(s) to token IDs for the stopping criteria.
+) -> Optional[list]:
+    """Normalize stop sequences for the generation stopping criteria.
+
+    The generation pipeline's ``add_eos_token_ids`` accepts strings
+    and handles tokenization internally.
 
     Args:
         stop: A single stop string or list of stop strings, or None.
-        processor: The tokenizer/processor for encoding.
 
     Returns:
-        A set of token IDs, or None if no stop sequences provided.
+        A list of stop strings (max 4), or None.
     """
     if not stop:
         return None
-    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     if isinstance(stop, str):
         stop = [stop]
-    token_ids = set()
-    for seq in stop[:4]:  # OpenAI limits to 4 stop sequences
-        ids = tokenizer.encode(seq, add_special_tokens=False)
-        if ids:
-            token_ids.add(ids[-1])  # Use last token as stop trigger
-    return token_ids if token_ids else None
+    sequences = [s for s in stop[:4] if isinstance(s, str) and s]
+    return sequences if sequences else None
 
 
 def resolve_tool_choice(
@@ -1109,11 +1105,9 @@ async def responses_endpoint(request: ResponsesRequest):
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
 
         # Resolve stop sequences to token IDs
-        stop_tokens = resolve_stop_tokens(
-            getattr(request, "stop", None), processor,
-        )
-        if stop_tokens:
-            generation_kwargs["eos_tokens"] = stop_tokens
+        stop_seqs = resolve_stop_sequences(getattr(request, "stop", None))
+        if stop_seqs:
+            generation_kwargs["eos_tokens"] = stop_seqs
 
         generated_at = int(time.time())
         response_id = f"resp_{uuid.uuid4().hex[:24]}"
@@ -1537,11 +1531,9 @@ async def chat_completions_endpoint(request: ChatRequest):
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
 
         # Resolve stop sequences to token IDs
-        stop_tokens = resolve_stop_tokens(
-            getattr(request, "stop", None), processor,
-        )
-        if stop_tokens:
-            generation_kwargs["eos_tokens"] = stop_tokens
+        stop_seqs = resolve_stop_sequences(getattr(request, "stop", None))
+        if stop_seqs:
+            generation_kwargs["eos_tokens"] = stop_seqs
 
         if request.stream:
             # Streaming response
