@@ -130,3 +130,141 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["repetition_penalty"] == 1.15
     assert mock_generate.call_args.kwargs["logit_bias"] == {12: -1.5}
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
+
+
+# ---------------------------------------------------------------------------
+# tool_choice tests
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_tool_choice_auto_passthrough():
+    """tool_choice='auto' should return tools unchanged."""
+    tools = [{"function": {"name": "search"}}]
+    result_tools, instruction = server.resolve_tool_choice(tools, "auto")
+    assert result_tools is tools
+    assert instruction is None
+
+
+def test_resolve_tool_choice_none_strips_tools():
+    """tool_choice='none' should return None for tools."""
+    tools = [{"function": {"name": "search"}}]
+    result_tools, instruction = server.resolve_tool_choice(tools, "none")
+    assert result_tools is None
+    assert instruction is None
+
+
+def test_resolve_tool_choice_required_adds_instruction():
+    """tool_choice='required' should keep tools and add instruction."""
+    tools = [{"function": {"name": "search"}}]
+    result_tools, instruction = server.resolve_tool_choice(tools, "required")
+    assert result_tools is tools
+    assert instruction is not None
+    assert "must call" in instruction.lower()
+
+
+def test_resolve_tool_choice_specific_function():
+    """Specific function tool_choice should filter to that tool."""
+    tools = [
+        {"function": {"name": "search"}},
+        {"function": {"name": "fetch"}},
+        {"function": {"name": "read"}},
+    ]
+    choice = {"type": "function", "function": {"name": "fetch"}}
+    result_tools, instruction = server.resolve_tool_choice(tools, choice)
+    assert len(result_tools) == 1
+    assert result_tools[0]["function"]["name"] == "fetch"
+    assert "fetch" in instruction
+
+
+def test_resolve_tool_choice_specific_unknown_falls_back():
+    """Unknown function name should fall back to all tools."""
+    tools = [{"function": {"name": "search"}}]
+    choice = {"type": "function", "function": {"name": "nonexistent"}}
+    result_tools, instruction = server.resolve_tool_choice(tools, choice)
+    assert result_tools is tools
+    assert "nonexistent" in instruction
+
+
+def test_resolve_tool_choice_none_value_passthrough():
+    """tool_choice=None should return tools unchanged."""
+    tools = [{"function": {"name": "search"}}]
+    result_tools, instruction = server.resolve_tool_choice(tools, None)
+    assert result_tools is tools
+    assert instruction is None
+
+
+def test_resolve_tool_choice_no_tools():
+    """No tools should return None regardless of tool_choice."""
+    result_tools, instruction = server.resolve_tool_choice(None, "required")
+    assert result_tools is None
+    assert instruction is None
+
+
+def test_chat_completions_tool_choice_none_strips_tools(client):
+    """tool_choice='none' should not pass tools to apply_chat_template."""
+    model = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=""))
+    config = SimpleNamespace(model_type="test")
+    result = SimpleNamespace(
+        text="Hi",
+        prompt_tokens=5,
+        generation_tokens=1,
+        total_tokens=6,
+        prompt_tps=100.0,
+        generation_tps=50.0,
+        peak_memory=1.0,
+    )
+
+    with (
+        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
+        patch.object(server, "apply_chat_template", return_value="prompt") as mock_tmpl,
+        patch.object(server, "generate", return_value=result),
+    ):
+        resp = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{"type": "function", "function": {"name": "search", "parameters": {}}}],
+                "tool_choice": "none",
+            },
+        )
+    assert resp.status_code == 200
+    # tools should be None in the template call
+    assert mock_tmpl.call_args.kwargs.get("tools") is None
+
+
+def test_chat_completions_tool_choice_required_adds_system_msg(client):
+    """tool_choice='required' should inject a system message."""
+    model = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=""))
+    config = SimpleNamespace(model_type="test")
+    result = SimpleNamespace(
+        text="Hi",
+        prompt_tokens=5,
+        generation_tokens=1,
+        total_tokens=6,
+        prompt_tps=100.0,
+        generation_tps=50.0,
+        peak_memory=1.0,
+    )
+
+    with (
+        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
+        patch.object(server, "apply_chat_template", return_value="prompt") as mock_tmpl,
+        patch.object(server, "generate", return_value=result),
+    ):
+        resp = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "search for test"}],
+                "tools": [{"type": "function", "function": {"name": "search", "parameters": {}}}],
+                "tool_choice": "required",
+            },
+        )
+    assert resp.status_code == 200
+    # Check that messages passed to template include the system instruction
+    messages_arg = mock_tmpl.call_args[0][2]  # 3rd positional arg
+    system_msgs = [m for m in messages_arg if m.get("role") == "system"]
+    assert any("must call" in m.get("content", "").lower() for m in system_msgs)
