@@ -31,6 +31,7 @@ from .generate import (
     DEFAULT_THINKING_END_TOKEN,
     DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
+    PromptCacheState,
     generate,
     normalize_resize_shape,
     stream_generate,
@@ -122,6 +123,17 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 
 model_cache = {}
 
+# Prompt cache: reuse KV state across requests with the same prompt prefix.
+# Keyed by model name — one PromptCacheState per loaded model.
+_prompt_cache_states: dict[str, PromptCacheState] = {}
+
+
+def get_prompt_cache_state(model_name: str) -> PromptCacheState:
+    """Get or create a PromptCacheState for the given model."""
+    if model_name not in _prompt_cache_states:
+        _prompt_cache_states[model_name] = PromptCacheState()
+    return _prompt_cache_states[model_name]
+
 
 class FlexibleBaseModel(BaseModel):
     """Base model that ignores/accepts any unknown OpenAI SDK fields."""
@@ -204,6 +216,8 @@ def unload_model_sync():
     if "vision_cache" in model_cache:
         model_cache["vision_cache"].clear()
     model_cache = {}
+    # Clear prompt cache states
+    _prompt_cache_states.clear()
     # Force garbage collection
     gc.collect()
     mx.clear_cache()
@@ -898,13 +912,15 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     )
                     yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=0, content_index=0, part=content_part).model_dump_json()}\n\n"
 
-                    # Stream text deltas
+                    # Stream text deltas (with prompt cache reuse)
+                    cache_state = get_prompt_cache_state(openai_request.model)
                     token_iterator = stream_generate(
                         model=model,
                         processor=processor,
                         prompt=formatted_prompt,
                         image=images,
                         vision_cache=model_cache.get("vision_cache"),
+                        prompt_cache_state=cache_state,
                         **generation_kwargs,
                     )
 
@@ -983,12 +999,14 @@ async def responses_endpoint(openai_request: OpenAIRequest):
             # Non-streaming response
             try:
                 # Use generate from generate.py
+                cache_state = get_prompt_cache_state(openai_request.model)
                 result = generate(
                     model=model,
                     processor=processor,
                     prompt=formatted_prompt,
                     image=images,
                     verbose=False,  # stats are passed in the response
+                    prompt_cache_state=cache_state,
                     **generation_kwargs,
                 )
                 # Clean up resources
@@ -1120,7 +1138,8 @@ async def chat_completions_endpoint(request: ChatRequest):
             async def stream_generator():
                 token_iterator = None
                 try:
-                    # Use stream_generate from utils
+                    # Use stream_generate with prompt cache reuse
+                    cache_state = get_prompt_cache_state(request.model)
                     token_iterator = stream_generate(
                         model=model,
                         processor=processor,
@@ -1128,6 +1147,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         image=images,
                         audio=audio,
                         vision_cache=model_cache.get("vision_cache"),
+                        prompt_cache_state=cache_state,
                         **generation_kwargs,
                     )
 
@@ -1224,6 +1244,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             # Non-streaming response
             try:
                 # Use generate from generate.py
+                cache_state = get_prompt_cache_state(request.model)
                 gen_result = generate(
                     model=model,
                     processor=processor,
@@ -1232,6 +1253,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     audio=audio,
                     verbose=False,  # Keep API output clean
                     vision_cache=model_cache.get("vision_cache"),
+                    prompt_cache_state=cache_state,
                     **generation_kwargs,
                 )
                 # Clean up resources
