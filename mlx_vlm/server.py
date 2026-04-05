@@ -7,7 +7,6 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
 from typing import Any, List, Literal, Optional, Union
 
 import mlx.core as mx
@@ -40,9 +39,34 @@ from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load
 from .version import __version__
 from .vision_cache import VisionFeatureCache
+from .responses_models import (
+    ResponsesRequest,
+    ResponseObject,
+    ResponseUsage,
+    ResponseErrorObject,
+    ResponseIncompleteDetails,
+    ResponseMessageItem,
+    ResponseFunctionCallItem,
+    ContentPartOutputText as ResponseContentPartOutputText,
+    BaseStreamEvent as ResponseBaseStreamEvent,
+    ResponseCreatedEvent as ResponsesCreatedEvent,
+    ResponseInProgressEvent as ResponsesInProgressEvent,
+    ResponseOutputItemAddedEvent as ResponsesOutputItemAddedEvent,
+    ResponseContentPartAddedEvent as ResponsesContentPartAddedEvent,
+    ResponseOutputTextDeltaEvent as ResponsesOutputTextDeltaEvent,
+    ResponseOutputTextDoneEvent as ResponsesOutputTextDoneEvent,
+    ResponseContentPartDoneEvent as ResponsesContentPartDoneEvent,
+    ResponseOutputItemDoneEvent as ResponsesOutputItemDoneEvent,
+    ResponseFunctionCallArgumentsDeltaEvent as ResponsesFunctionCallArgumentsDeltaEvent,
+    ResponseFunctionCallArgumentsDoneEvent as ResponsesFunctionCallArgumentsDoneEvent,
+    ResponseCompletedEvent as ResponsesCompletedEvent,
+)
+from .responses_store import ResponseStore
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
+
+_responses_store = ResponseStore()
 
 
 def get_prefill_step_size():
@@ -704,199 +728,332 @@ class ModelsResponse(BaseModel):
     data: List[ModelInfo]
 
 
-# OpenAI compatile endpoints
+# ---------------------------------------------------------------------------
+# Responses API helpers
+# ---------------------------------------------------------------------------
+
+
+def responses_input_to_messages(
+    input_items: Union[str, list],
+    instructions: Optional[str] = None,
+    previous_response_id: Optional[str] = None,
+) -> tuple[list[dict], list[str]]:
+    """Convert Responses API input items to chat messages and images.
+
+    Args:
+        input_items: String input or list of input items.
+        instructions: Optional system instructions to prepend.
+        previous_response_id: Optional previous response ID for context replay.
+
+    Returns:
+        Tuple of (chat_messages, image_urls).
+    """
+    chat_messages: list[dict] = []
+    images: list[str] = []
+
+    # Replay previous response context
+    if previous_response_id:
+        replayed = _responses_store.replay_input(previous_response_id)
+        if replayed is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Previous response not found: {previous_response_id}",
+            )
+        # Recursively process replayed items
+        prev_messages, prev_images = responses_input_to_messages(replayed)
+        chat_messages.extend(prev_messages)
+        images.extend(prev_images)
+
+    # Prepend instructions as system message
+    if instructions:
+        chat_messages.insert(0, {"role": "system", "content": instructions})
+
+    # Handle string input
+    if isinstance(input_items, str):
+        chat_messages.append({"role": "user", "content": input_items})
+        return chat_messages, images
+
+    # Handle list of input items
+    for item in input_items:
+        if isinstance(item, dict):
+            item_type = item.get("type", "")
+            role = item.get("role", "")
+
+            # Function call output item
+            if item_type == "function_call_output":
+                call_id = item.get("call_id", "unknown")
+                output = item.get("output", "")
+                chat_messages.append({
+                    "role": "tool",
+                    "content": output,
+                    "tool_call_id": call_id,
+                })
+                continue
+
+            # Function call item (from previous assistant turn)
+            if item_type == "function_call":
+                chat_messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": item.get("call_id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name", ""),
+                            "arguments": item.get("arguments", ""),
+                        },
+                    }],
+                })
+                continue
+
+            # Regular message with role and content
+            if role:
+                content = item.get("content", "")
+
+                # Normalize developer role to system
+                msg_role = "system" if role == "developer" else role
+
+                if isinstance(content, str):
+                    chat_messages.append({"role": msg_role, "content": content})
+                elif isinstance(content, list):
+                    # Process content items
+                    text_parts = []
+                    for ci in content:
+                        if isinstance(ci, dict):
+                            ci_type = ci.get("type", "")
+                            if ci_type in ("input_text", "text"):
+                                text_parts.append(ci.get("text", ""))
+                            elif ci_type == "input_image":
+                                images.append(ci.get("image_url", ""))
+                            elif ci_type == "image_url":
+                                img = ci.get("image_url", {})
+                                if isinstance(img, dict):
+                                    images.append(img.get("url", ""))
+                                elif isinstance(img, str):
+                                    images.append(img)
+                            elif ci_type == "output_text":
+                                # Multi-turn: previous assistant output
+                                chat_messages.append({
+                                    "role": "assistant",
+                                    "content": ci.get("text", ""),
+                                })
+                            elif ci_type == "input_audio":
+                                pass  # Audio not yet supported in responses
+                            else:
+                                pass  # Skip unsupported content types gracefully
+
+                    if text_parts:
+                        chat_messages.append({
+                            "role": msg_role,
+                            "content": "\n".join(text_parts),
+                        })
+                else:
+                    chat_messages.append({
+                        "role": msg_role,
+                        "content": str(content) if content else "",
+                    })
+                continue
+
+        # Handle Pydantic ChatMessage objects
+        elif hasattr(item, "role"):
+            role = item.role
+            msg_role = "system" if role == "developer" else role
+            content = item.content
+
+            if content is None:
+                chat_messages.append({"role": msg_role, "content": ""})
+            elif isinstance(content, str):
+                chat_messages.append({"role": msg_role, "content": content})
+            elif isinstance(content, list):
+                text_parts = []
+                for ci in content:
+                    if isinstance(ci, dict):
+                        ci_type = ci.get("type", "")
+                        if ci_type in ("input_text", "text"):
+                            text_parts.append(ci.get("text", ""))
+                        elif ci_type == "input_image":
+                            images.append(ci.get("image_url", ""))
+                        elif ci_type == "image_url":
+                            img = ci.get("image_url", {})
+                            if isinstance(img, dict):
+                                images.append(img.get("url", ""))
+                            elif isinstance(img, str):
+                                images.append(img)
+                        elif ci_type == "output_text":
+                            chat_messages.append({
+                                "role": "assistant",
+                                "content": ci.get("text", ""),
+                            })
+
+                if text_parts:
+                    chat_messages.append({
+                        "role": msg_role,
+                        "content": "\n".join(text_parts),
+                    })
+
+    return chat_messages, images
+
+
+def build_responses_output(
+    raw_text: str,
+    tool_parser_type: Optional[str],
+    tool_module: Optional[Any],
+    tools: Optional[list],
+) -> list[Union[ResponseMessageItem, ResponseFunctionCallItem]]:
+    """Build structured Responses API output items from raw model text.
+
+    Parses tool calls from the raw text if a tool parser is available,
+    creating ResponseFunctionCallItem for each detected call and a
+    ResponseMessageItem for any remaining text.
+
+    Args:
+        raw_text: The raw text output from the model.
+        tool_parser_type: The detected tool parser type (e.g., "gemma4"), or None.
+        tool_module: The loaded tool parser module, or None.
+        tools: The tool definitions from the request, or None.
+
+    Returns:
+        List of output items (message items and/or function call items).
+    """
+    output_items: list[Union[ResponseMessageItem, ResponseFunctionCallItem]] = []
+    remaining_text = raw_text
+
+    # Try to parse tool calls
+    if tool_parser_type and tool_module and tools:
+        try:
+            result = process_tool_calls(raw_text, tool_module, tools)
+            if result["calls"]:
+                for call in result["calls"]:
+                    func_info = call.get("function", {})
+                    output_items.append(
+                        ResponseFunctionCallItem(
+                            name=func_info.get("name", ""),
+                            arguments=func_info.get("arguments", "{}"),
+                            call_id=call.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+                        )
+                    )
+                remaining_text = result.get("remaining_text", "").strip()
+        except Exception:
+            # If tool parsing fails, fall through to plain text
+            remaining_text = raw_text
+
+    # Create message item for any remaining text
+    if remaining_text or not output_items:
+        msg_item = ResponseMessageItem(
+            content=[ResponseContentPartOutputText(text=remaining_text)] if remaining_text else [],
+        )
+        # Insert message before function calls (matching OpenAI ordering)
+        output_items.insert(0, msg_item)
+
+    return output_items
+
+
+# OpenAI compatible endpoints
 
 
 @app.post("/responses")
 @app.post("/v1/responses", include_in_schema=False)
-async def responses_endpoint(openai_request: OpenAIRequest):
-    """
-    OpenAI-compatible endpoint for generating text based on a prompt and optional images.
+async def responses_endpoint(request: ResponsesRequest):
+    """OpenAI-compatible Responses API endpoint.
 
-    using client.responses.create method.
-
-    example:
-
-    from openai import OpenAI
-
-    API_URL = "http://0.0.0.0:8000"
-    API_KEY = 'any'
-
-    def run_openai(prompt, img_url,system, stream=False, max_output_tokens=512, model="mlx-community/Qwen2.5-VL-3B-Instruct-8bit"):
-        ''' Calls the OpenAI API
-        '''
-
-        client = OpenAI(base_url=f"{API_URL}", api_key=API_KEY)
-
-        try :
-            response = client.responses.create(
-                model=model,
-                input=[
-                    {"role":"system",
-                    "content": f"{system}"
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": prompt},
-                            {"type": "input_image", "image_url": f"{img_url}"},
-                        ],
-                    }
-                ],
-                max_output_tokens=max_output_tokens,
-                stream=stream
-            )
-            if not stream:
-                print(response.output[0].content[0].text)
-                print(response.usage)
-            else:
-                for event in response:
-                    # Process different event types if needed
-                    if hasattr(event, 'delta') and event.delta:
-                        print(event.delta, end="", flush=True)
-                    elif event.type == 'response.completed':
-                        print("\n--- Usage ---")
-                        print(event.response.usage)
-
-        except Exception as e:
-            # building a response object to match the one returned when request is successful so that it can be processed in the same way
-            return {"model - error":str(e),"content":{}, "model":model}
-
+    Supports tool calling, multi-turn via previous_response_id, and streaming
+    with proper SSE event sequences including function_call argument events.
     """
 
     try:
         # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(openai_request.model)
+        model, processor, config = get_cached_model(request.model)
 
-        chat_messages = []
-        images = []
-        instructions = None
-        if openai_request.input:
-            if isinstance(openai_request.input, str):
-                # If input is a string, treat it as a single text message
-                chat_messages.append({"role": "user", "content": openai_request.input})
-            elif isinstance(openai_request.input, list):
-                # If input is a list, treat it as a series of chat messages
-                for message in openai_request.input:
-                    if isinstance(message, ChatMessage):
-                        if message.content is None:
-                            chat_messages.append({"role": message.role, "content": ""})
-                        elif isinstance(message.content, str):
-                            chat_messages.append(
-                                {"role": message.role, "content": message.content}
-                            )
-                            if message.role == "system":
-                                instructions = message.content
-                        elif isinstance(message.content, list):
-                            # Handle list of content items
-                            for item in message.content:
-                                if isinstance(item, dict):
-                                    if item["type"] == "input_text":
-                                        chat_messages.append(
-                                            {
-                                                "role": message.role,
-                                                "content": item["text"],
-                                            }
-                                        )
-                                        if message.role == "system":
-                                            instructions = item["text"]
-                                    # examples for multiple images (https://platform.openai.com/docs/guides/images?api-mode=responses)
-                                    elif item["type"] == "input_image":
-                                        images.append(item["image_url"])
-                                    else:
-                                        print(
-                                            f"invalid input item type: {item['type']}"
-                                        )
-                                        raise HTTPException(
-                                            status_code=400,
-                                            detail="Invalid input item type.",
-                                        )
-                                else:
-                                    print(
-                                        f"Invalid message content item format: {item}"
-                                    )
-                                    raise HTTPException(
-                                        status_code=400,
-                                        detail="Missing type in input item.",
-                                    )
-                        else:
-                            print("Invalid message content format.")
-                            raise HTTPException(
-                                status_code=400, detail="Invalid input format."
-                            )
-                    else:
-                        print("not a ChatMessage")
-                        raise HTTPException(
-                            status_code=400, detail="Invalid input format."
-                        )
-            else:
-                print("neither string not list")
-                raise HTTPException(status_code=400, detail="Invalid input format.")
+        # Convert input to chat messages
+        chat_messages, images = responses_input_to_messages(
+            request.input,
+            instructions=request.instructions,
+            previous_response_id=request.previous_response_id,
+        )
 
-        else:
-            print("no input")
-            raise HTTPException(status_code=400, detail="Missing input.")
+        # Set up tool parser
+        tools = request.tools
+        tool_parser_type = None
+        tool_module = None
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        if hasattr(tokenizer, "chat_template") and tools:
+            tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
+            if tool_parser_type is not None:
+                tool_module = load_tool_module(tool_parser_type)
 
-        template_kwargs = openai_request.template_kwargs()
+        # Build template kwargs
+        template_kwargs = request.template_kwargs()
+
+        # Apply chat template (pass tools so the template can include tool defs)
         formatted_prompt = apply_chat_template(
             processor,
             config,
             chat_messages,
             num_images=len(images),
+            tools=tools,
             **template_kwargs,
         )
-        generation_kwargs = build_generation_kwargs(openai_request, template_kwargs)
+        generation_kwargs = build_generation_kwargs(request, template_kwargs)
 
-        generated_at = datetime.now().timestamp()
-        response_id = f"resp_{uuid.uuid4().hex}"
-        message_id = f"msg_{uuid.uuid4().hex}"
+        generated_at = int(time.time())
+        response_id = f"resp_{uuid.uuid4().hex[:24]}"
+        message_id = f"msg_{uuid.uuid4().hex[:24]}"
 
-        if openai_request.stream:
+        if request.stream:
+            # ----------------------------------------------------------
             # Streaming response
-            async def stream_generator():
-                token_iterator = None
+            # ----------------------------------------------------------
+            async def stream_responses_generator():
+                seq = 0  # sequence_number counter
+
+                def _evt(event_type: str, event_obj) -> str:
+                    nonlocal seq
+                    event_obj.sequence_number = seq
+                    seq += 1
+                    return f"event: {event_type}\ndata: {event_obj.model_dump_json()}\n\n"
+
                 try:
-                    # Create base response object (to match the openai pipeline)
-                    base_response = OpenAIResponse(
+                    # Build base ResponseObject (in_progress, empty output)
+                    base_response = ResponseObject(
                         id=response_id,
-                        object="response",
-                        created_at=int(generated_at),
+                        created_at=generated_at,
                         status="in_progress",
-                        instructions=instructions,
-                        max_output_tokens=openai_request.max_output_tokens,
-                        model=openai_request.model,
+                        model=request.model,
                         output=[],
-                        output_text="",
-                        temperature=openai_request.temperature,
-                        top_p=openai_request.top_p,
-                        usage={
-                            "input_tokens": 0,  # get prompt tokens
-                            "output_tokens": 0,
-                            "total_tokens": 0,
-                        },
+                        instructions=request.instructions,
+                        max_output_tokens=request.max_output_tokens,
+                        temperature=request.temperature,
+                        top_p=request.top_p,
+                        tools=tools or [],
+                        tool_choice=request.tool_choice,
+                        parallel_tool_calls=request.parallel_tool_calls,
+                        previous_response_id=request.previous_response_id,
+                        metadata=request.metadata,
+                        usage=ResponseUsage(input_tokens=0, output_tokens=0, total_tokens=0),
                     )
 
-                    # Send response.created event  (to match the openai pipeline)
-                    yield f"event: response.created\ndata: {ResponseCreatedEvent(type='response.created', response=base_response).model_dump_json()}\n\n"
+                    # response.created
+                    yield _evt("response.created", ResponsesCreatedEvent(response=base_response))
+                    # response.in_progress
+                    yield _evt("response.in_progress", ResponsesInProgressEvent(response=base_response))
 
-                    # Send response.in_progress event  (to match the openai pipeline)
-                    yield f"event: response.in_progress\ndata: {ResponseInProgressEvent(type='response.in_progress', response=base_response).model_dump_json()}\n\n"
-
-                    # Send response.output_item.added event  (to match the openai pipeline)
-                    message_item = MessageItem(
-                        id=message_id,
-                        type="message",
-                        status="in_progress",
-                        role="assistant",
-                        content=[],
+                    # output_item.added (message)
+                    msg_item = ResponseMessageItem(id=message_id, status="in_progress", content=[])
+                    yield _evt(
+                        "response.output_item.added",
+                        ResponsesOutputItemAddedEvent(output_index=0, item=msg_item),
                     )
-                    yield f"event: response.output_item.added\ndata: {ResponseOutputItemAddedEvent(type='response.output_item.added', output_index=0, item=message_item).model_dump_json()}\n\n"
 
-                    # Send response.content_part.added event
-                    content_part = ContentPartOutputText(
-                        type="output_text", text="", annotations=[]
+                    # content_part.added
+                    empty_part = ResponseContentPartOutputText(text="")
+                    yield _evt(
+                        "response.content_part.added",
+                        ResponsesContentPartAddedEvent(
+                            item_id=message_id, output_index=0, content_index=0, part=empty_part,
+                        ),
                     )
-                    yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=0, content_index=0, part=content_part).model_dump_json()}\n\n"
 
                     # Stream text deltas
                     token_iterator = stream_generate(
@@ -909,54 +1066,141 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     )
 
                     full_text = ""
+                    usage_stats = {"input_tokens": 0, "output_tokens": 0}
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
                             continue
 
                         delta = chunk.text
                         full_text += delta
-
                         usage_stats = {
                             "input_tokens": chunk.prompt_tokens,
                             "output_tokens": chunk.generation_tokens,
                         }
 
-                        # Send response.output_text.delta event
-                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                        yield _evt(
+                            "response.output_text.delta",
+                            ResponsesOutputTextDeltaEvent(
+                                item_id=message_id, output_index=0, content_index=0, delta=delta,
+                            ),
+                        )
 
-                    # Send response.output_text.done event (to match the openai pipeline)
-                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=full_text).model_dump_json()}\n\n"
+                    # Determine finish reason
+                    max_tok = request.max_output_tokens
+                    is_length = usage_stats["output_tokens"] >= max_tok
+                    status = "incomplete" if is_length else "completed"
 
-                    # Send response.content_part.done event (to match the openai pipeline)
-                    final_content_part = ContentPartOutputText(
-                        type="output_text", text=full_text, annotations=[]
+                    # output_text.done
+                    yield _evt(
+                        "response.output_text.done",
+                        ResponsesOutputTextDoneEvent(
+                            item_id=message_id, output_index=0, content_index=0, text=full_text,
+                        ),
                     )
-                    yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=0, content_index=0, part=final_content_part).model_dump_json()}\n\n"
 
-                    # Send response.output_item.done event (to match the openai pipeline)
-                    final_message_item = MessageItem(
-                        id=message_id,
-                        type="message",
-                        status="completed",
-                        role="assistant",
-                        content=[final_content_part],
+                    # content_part.done
+                    final_part = ResponseContentPartOutputText(text=full_text)
+                    yield _evt(
+                        "response.content_part.done",
+                        ResponsesContentPartDoneEvent(
+                            item_id=message_id, output_index=0, content_index=0, part=final_part,
+                        ),
                     )
-                    yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_item).model_dump_json()}\n\n"
 
-                    # Send response.completed event (to match the openai pipeline)
+                    # output_item.done (message)
+                    final_msg = ResponseMessageItem(
+                        id=message_id, status="completed", content=[final_part],
+                    )
+                    yield _evt(
+                        "response.output_item.done",
+                        ResponsesOutputItemDoneEvent(output_index=0, item=final_msg),
+                    )
+
+                    # Collect all output items for final response
+                    all_output_items: list = [final_msg]
+
+                    # Parse tool calls from accumulated text
+                    if tool_parser_type and tool_module and tools:
+                        try:
+                            tc_result = process_tool_calls(full_text, tool_module, tools)
+                            if tc_result["calls"]:
+                                for idx, call in enumerate(tc_result["calls"]):
+                                    func_info = call.get("function", {})
+                                    fc_item = ResponseFunctionCallItem(
+                                        name=func_info.get("name", ""),
+                                        arguments=func_info.get("arguments", "{}"),
+                                        call_id=call.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+                                    )
+                                    out_idx = len(all_output_items)
+
+                                    # output_item.added (function_call)
+                                    yield _evt(
+                                        "response.output_item.added",
+                                        ResponsesOutputItemAddedEvent(output_index=out_idx, item=fc_item),
+                                    )
+
+                                    # function_call_arguments.delta (full arguments in one shot)
+                                    yield _evt(
+                                        "response.function_call_arguments.delta",
+                                        ResponsesFunctionCallArgumentsDeltaEvent(
+                                            item_id=fc_item.id,
+                                            output_index=out_idx,
+                                            delta=fc_item.arguments,
+                                        ),
+                                    )
+
+                                    # function_call_arguments.done
+                                    yield _evt(
+                                        "response.function_call_arguments.done",
+                                        ResponsesFunctionCallArgumentsDoneEvent(
+                                            item_id=fc_item.id,
+                                            output_index=out_idx,
+                                            arguments=fc_item.arguments,
+                                        ),
+                                    )
+
+                                    # output_item.done (function_call)
+                                    yield _evt(
+                                        "response.output_item.done",
+                                        ResponsesOutputItemDoneEvent(output_index=out_idx, item=fc_item),
+                                    )
+
+                                    all_output_items.append(fc_item)
+                        except Exception:
+                            pass  # Tool parsing failure is non-fatal in streaming
+
+                    # response.completed
+                    total_tokens = usage_stats["input_tokens"] + usage_stats["output_tokens"]
                     completed_response = base_response.model_copy(
                         update={
-                            "status": "completed",
-                            "output": [final_message_item],
-                            "usage": {
-                                "input_tokens": usage_stats["input_tokens"],
-                                "output_tokens": usage_stats["output_tokens"],
-                                "total_tokens": usage_stats["input_tokens"]
-                                + usage_stats["output_tokens"],
-                            },
+                            "status": status,
+                            "output": all_output_items,
+                            "incomplete_details": (
+                                ResponseIncompleteDetails(reason="max_output_tokens")
+                                if status == "incomplete"
+                                else None
+                            ),
+                            "usage": ResponseUsage(
+                                input_tokens=usage_stats["input_tokens"],
+                                output_tokens=usage_stats["output_tokens"],
+                                total_tokens=total_tokens,
+                            ),
                         }
                     )
-                    yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
+                    yield _evt("response.completed", ResponsesCompletedEvent(response=completed_response))
+
+                    # Save to store for previous_response_id
+                    _responses_store.save(
+                        response_id,
+                        request.input if isinstance(request.input, str) else [
+                            item.model_dump() if hasattr(item, "model_dump") else item
+                            for item in request.input
+                        ],
+                        [item.model_dump() for item in all_output_items],
+                    )
+
+                    # Final sentinel
+                    yield "data: [DONE]\n\n"
 
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
@@ -970,7 +1214,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     print("Stream finished, cleared cache.")
 
             return StreamingResponse(
-                stream_generator(),
+                stream_responses_generator(),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -980,51 +1224,71 @@ async def responses_endpoint(openai_request: OpenAIRequest):
             )
 
         else:
+            # ----------------------------------------------------------
             # Non-streaming response
+            # ----------------------------------------------------------
             try:
-                # Use generate from generate.py
                 result = generate(
                     model=model,
                     processor=processor,
                     prompt=formatted_prompt,
                     image=images,
-                    verbose=False,  # stats are passed in the response
+                    verbose=False,
+                    vision_cache=model_cache.get("vision_cache"),
                     **generation_kwargs,
                 )
-                # Clean up resources
                 mx.clear_cache()
                 gc.collect()
                 print("Generation finished, cleared cache.")
 
-                response = OpenAIResponse(
-                    id=response_id,
-                    object="response",
-                    created_at=int(generated_at),
-                    status="completed",
-                    instructions=instructions,
-                    max_output_tokens=openai_request.max_output_tokens,
-                    model=openai_request.model,
-                    output=[
-                        {
-                            "role": "assistant",
-                            "content": [
-                                {
-                                    "type": "output_text",
-                                    "text": result.text,
-                                }
-                            ],
-                        }
-                    ],
-                    output_text=result.text,
-                    temperature=openai_request.temperature,
-                    top_p=openai_request.top_p,
-                    usage={
-                        "input_tokens": result.prompt_tokens,
-                        "output_tokens": result.generation_tokens,
-                        "total_tokens": result.total_tokens,
-                    },
+                # Build output items (with tool call parsing)
+                output_items = build_responses_output(
+                    result.text, tool_parser_type, tool_module, tools,
                 )
-                return response
+
+                # Determine status
+                is_length = result.generation_tokens >= request.max_output_tokens
+                status = "incomplete" if is_length else "completed"
+                incomplete_details = (
+                    ResponseIncompleteDetails(reason="max_output_tokens")
+                    if status == "incomplete"
+                    else None
+                )
+
+                response_obj = ResponseObject(
+                    id=response_id,
+                    created_at=generated_at,
+                    model=request.model,
+                    output=output_items,
+                    status=status,
+                    incomplete_details=incomplete_details,
+                    instructions=request.instructions,
+                    max_output_tokens=request.max_output_tokens,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    tools=tools or [],
+                    tool_choice=request.tool_choice,
+                    parallel_tool_calls=request.parallel_tool_calls,
+                    previous_response_id=request.previous_response_id,
+                    metadata=request.metadata,
+                    usage=ResponseUsage(
+                        input_tokens=result.prompt_tokens,
+                        output_tokens=result.generation_tokens,
+                        total_tokens=result.total_tokens,
+                    ),
+                )
+
+                # Save to store for previous_response_id support
+                _responses_store.save(
+                    response_obj.id,
+                    request.input if isinstance(request.input, str) else [
+                        item.model_dump() if hasattr(item, "model_dump") else item
+                        for item in request.input
+                    ],
+                    [item.model_dump() for item in output_items],
+                )
+
+                return response_obj.model_dump()
 
             except Exception as e:
                 print(f"Error during generation: {e}")
@@ -1033,11 +1297,9 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                 gc.collect()
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
-    except HTTPException as http_exc:
-        # Re-raise HTTP exceptions (like model loading failure)
-        raise http_exc
+    except HTTPException:
+        raise
     except Exception as e:
-        # Catch unexpected errors
         print(f"Unexpected error in /responses endpoint: {e}")
         traceback.print_exc()
         mx.clear_cache()
