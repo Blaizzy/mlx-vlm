@@ -91,23 +91,18 @@ class ResponseStore:
             if isinstance(output_item, dict):
                 item_type = output_item.get("type", "")
                 if item_type == "message":
+                    # Collect all output_text parts into a single assistant message
                     content = output_item.get("content", [])
-                    for part in content:
-                        if (
-                            isinstance(part, dict)
-                            and part.get("type") == "output_text"
-                        ):
-                            items.append(
-                                {
-                                    "role": "assistant",
-                                    "content": [
-                                        {
-                                            "type": "output_text",
-                                            "text": part.get("text", ""),
-                                        }
-                                    ],
-                                }
-                            )
+                    text_parts = [
+                        {"type": "output_text", "text": part.get("text", "")}
+                        for part in content
+                        if isinstance(part, dict) and part.get("type") == "output_text"
+                    ]
+                    if text_parts:
+                        items.append({
+                            "role": "assistant",
+                            "content": text_parts,
+                        })
                 elif item_type == "function_call":
                     items.append(
                         {

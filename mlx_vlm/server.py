@@ -47,19 +47,18 @@ from .responses_models import (
     ResponseIncompleteDetails,
     ResponseMessageItem,
     ResponseFunctionCallItem,
-    ContentPartOutputText as ResponseContentPartOutputText,
-    BaseStreamEvent as ResponseBaseStreamEvent,
-    ResponseCreatedEvent as ResponsesCreatedEvent,
-    ResponseInProgressEvent as ResponsesInProgressEvent,
-    ResponseOutputItemAddedEvent as ResponsesOutputItemAddedEvent,
-    ResponseContentPartAddedEvent as ResponsesContentPartAddedEvent,
-    ResponseOutputTextDeltaEvent as ResponsesOutputTextDeltaEvent,
-    ResponseOutputTextDoneEvent as ResponsesOutputTextDoneEvent,
-    ResponseContentPartDoneEvent as ResponsesContentPartDoneEvent,
-    ResponseOutputItemDoneEvent as ResponsesOutputItemDoneEvent,
-    ResponseFunctionCallArgumentsDeltaEvent as ResponsesFunctionCallArgumentsDeltaEvent,
-    ResponseFunctionCallArgumentsDoneEvent as ResponsesFunctionCallArgumentsDoneEvent,
-    ResponseCompletedEvent as ResponsesCompletedEvent,
+    ContentPartOutputText as RespContentPartOutputText,
+    ResponseCreatedEvent as RespCreatedEvent,
+    ResponseInProgressEvent as RespInProgressEvent,
+    ResponseOutputItemAddedEvent as RespOutputItemAddedEvent,
+    ResponseContentPartAddedEvent as RespContentPartAddedEvent,
+    ResponseOutputTextDeltaEvent as RespOutputTextDeltaEvent,
+    ResponseOutputTextDoneEvent as RespOutputTextDoneEvent,
+    ResponseContentPartDoneEvent as RespContentPartDoneEvent,
+    ResponseOutputItemDoneEvent as RespOutputItemDoneEvent,
+    ResponseFunctionCallArgumentsDeltaEvent as RespFuncCallArgsDeltaEvent,
+    ResponseFunctionCallArgumentsDoneEvent as RespFuncCallArgsDoneEvent,
+    ResponseCompletedEvent as RespCompletedEvent,
 )
 from .responses_store import ResponseStore
 
@@ -733,10 +732,15 @@ class ModelsResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+_MAX_REPLAY_DEPTH = 50
+
+
 def responses_input_to_messages(
     input_items: Union[str, list],
     instructions: Optional[str] = None,
     previous_response_id: Optional[str] = None,
+    _depth: int = 0,
+    _seen: Optional[set] = None,
 ) -> tuple[list[dict], list[str]]:
     """Convert Responses API input items to chat messages and images.
 
@@ -744,23 +748,41 @@ def responses_input_to_messages(
         input_items: String input or list of input items.
         instructions: Optional system instructions to prepend.
         previous_response_id: Optional previous response ID for context replay.
+        _depth: Internal recursion depth counter.
+        _seen: Internal set of visited response IDs for cycle detection.
 
     Returns:
         Tuple of (chat_messages, image_urls).
     """
+    if _seen is None:
+        _seen = set()
+
     chat_messages: list[dict] = []
     images: list[str] = []
 
-    # Replay previous response context
+    # Replay previous response context (with depth + cycle guard)
     if previous_response_id:
+        if _depth >= _MAX_REPLAY_DEPTH:
+            raise HTTPException(
+                status_code=400,
+                detail=f"previous_response_id chain exceeds maximum depth ({_MAX_REPLAY_DEPTH}).",
+            )
+        if previous_response_id in _seen:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cycle detected in previous_response_id chain: {previous_response_id}",
+            )
+        _seen.add(previous_response_id)
+
         replayed = _responses_store.replay_input(previous_response_id)
         if replayed is None:
             raise HTTPException(
                 status_code=404,
                 detail=f"Previous response not found: {previous_response_id}",
             )
-        # Recursively process replayed items
-        prev_messages, prev_images = responses_input_to_messages(replayed)
+        prev_messages, prev_images = responses_input_to_messages(
+            replayed, _depth=_depth + 1, _seen=_seen,
+        )
         chat_messages.extend(prev_messages)
         images.extend(prev_images)
 
@@ -824,12 +846,16 @@ def responses_input_to_messages(
                             if ci_type in ("input_text", "text"):
                                 text_parts.append(ci.get("text", ""))
                             elif ci_type == "input_image":
-                                images.append(ci.get("image_url", ""))
+                                url = ci.get("image_url", "")
+                                if url:
+                                    images.append(url)
                             elif ci_type == "image_url":
                                 img = ci.get("image_url", {})
                                 if isinstance(img, dict):
-                                    images.append(img.get("url", ""))
-                                elif isinstance(img, str):
+                                    url = img.get("url", "")
+                                    if url:
+                                        images.append(url)
+                                elif isinstance(img, str) and img:
                                     images.append(img)
                             elif ci_type == "output_text":
                                 # Multi-turn: previous assistant output
@@ -872,12 +898,16 @@ def responses_input_to_messages(
                         if ci_type in ("input_text", "text"):
                             text_parts.append(ci.get("text", ""))
                         elif ci_type == "input_image":
-                            images.append(ci.get("image_url", ""))
+                            url = ci.get("image_url", "")
+                            if url:
+                                images.append(url)
                         elif ci_type == "image_url":
                             img = ci.get("image_url", {})
                             if isinstance(img, dict):
-                                images.append(img.get("url", ""))
-                            elif isinstance(img, str):
+                                url = img.get("url", "")
+                                if url:
+                                    images.append(url)
+                            elif isinstance(img, str) and img:
                                 images.append(img)
                         elif ci_type == "output_text":
                             chat_messages.append({
@@ -933,14 +963,14 @@ def build_responses_output(
                         )
                     )
                 remaining_text = result.get("remaining_text", "").strip()
-        except Exception:
-            # If tool parsing fails, fall through to plain text
+        except Exception as e:
+            print(f"Warning: tool call parsing failed: {e}")
             remaining_text = raw_text
 
     # Create message item for any remaining text
     if remaining_text or not output_items:
         msg_item = ResponseMessageItem(
-            content=[ResponseContentPartOutputText(text=remaining_text)] if remaining_text else [],
+            content=[RespContentPartOutputText(text=remaining_text)] if remaining_text else [],
         )
         # Insert message before function calls (matching OpenAI ordering)
         output_items.insert(0, msg_item)
@@ -1035,22 +1065,22 @@ async def responses_endpoint(request: ResponsesRequest):
                     )
 
                     # response.created
-                    yield _evt("response.created", ResponsesCreatedEvent(response=base_response))
+                    yield _evt("response.created", RespCreatedEvent(response=base_response))
                     # response.in_progress
-                    yield _evt("response.in_progress", ResponsesInProgressEvent(response=base_response))
+                    yield _evt("response.in_progress", RespInProgressEvent(response=base_response))
 
                     # output_item.added (message)
                     msg_item = ResponseMessageItem(id=message_id, status="in_progress", content=[])
                     yield _evt(
                         "response.output_item.added",
-                        ResponsesOutputItemAddedEvent(output_index=0, item=msg_item),
+                        RespOutputItemAddedEvent(output_index=0, item=msg_item),
                     )
 
                     # content_part.added
-                    empty_part = ResponseContentPartOutputText(text="")
+                    empty_part = RespContentPartOutputText(text="")
                     yield _evt(
                         "response.content_part.added",
-                        ResponsesContentPartAddedEvent(
+                        RespContentPartAddedEvent(
                             item_id=message_id, output_index=0, content_index=0, part=empty_part,
                         ),
                     )
@@ -1069,7 +1099,8 @@ async def responses_endpoint(request: ResponsesRequest):
                     visible_text = ""
                     usage_stats = {"input_tokens": 0, "output_tokens": 0}
                     in_tool_call = False
-                    tool_call_start_tag = tool_module.tool_call_start if tool_module else "<tool_call>"
+                    tool_call_start_tag = getattr(tool_module, "tool_call_start", "<tool_call>") if tool_module else None
+                    tool_call_end_tag = getattr(tool_module, "tool_call_end", None) if tool_module else None
 
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
@@ -1082,26 +1113,28 @@ async def responses_endpoint(request: ResponsesRequest):
                             "output_tokens": chunk.generation_tokens,
                         }
 
-                        # Suppress tool call tokens from being streamed as text
-                        if not in_tool_call and tool_call_start_tag in full_text:
-                            in_tool_call = True
-                        if in_tool_call:
-                            continue
-
-                        # Check if this delta starts a tool call tag
-                        # (partial match: buffer might end with "<tool" before "_call>")
-                        if tools and tool_call_start_tag[:1] in delta:
-                            pending = full_text[-(len(delta) + len(tool_call_start_tag)):]
-                            if any(
-                                tool_call_start_tag[:i] == pending[-i:]
-                                for i in range(2, len(tool_call_start_tag) + 1)
-                            ):
+                        # Suppress tool call markup from being streamed as text
+                        if tool_call_start_tag and tools:
+                            if not in_tool_call and tool_call_start_tag in full_text:
+                                in_tool_call = True
+                            elif in_tool_call and tool_call_end_tag and tool_call_end_tag in full_text:
+                                in_tool_call = False
+                            if in_tool_call:
                                 continue
+
+                            # Check for partial tag at end of buffer
+                            if full_text.endswith(tool_call_start_tag[:1]):
+                                tail = full_text[-(len(tool_call_start_tag)):]
+                                if any(
+                                    tool_call_start_tag[:i] == tail[-i:]
+                                    for i in range(1, len(tool_call_start_tag))
+                                ):
+                                    continue
 
                         visible_text += delta
                         yield _evt(
                             "response.output_text.delta",
-                            ResponsesOutputTextDeltaEvent(
+                            RespOutputTextDeltaEvent(
                                 item_id=message_id, output_index=0, content_index=0, delta=delta,
                             ),
                         )
@@ -1117,16 +1150,16 @@ async def responses_endpoint(request: ResponsesRequest):
                     # output_text.done
                     yield _evt(
                         "response.output_text.done",
-                        ResponsesOutputTextDoneEvent(
+                        RespOutputTextDoneEvent(
                             item_id=message_id, output_index=0, content_index=0, text=display_text,
                         ),
                     )
 
                     # content_part.done
-                    final_part = ResponseContentPartOutputText(text=display_text)
+                    final_part = RespContentPartOutputText(text=display_text)
                     yield _evt(
                         "response.content_part.done",
-                        ResponsesContentPartDoneEvent(
+                        RespContentPartDoneEvent(
                             item_id=message_id, output_index=0, content_index=0, part=final_part,
                         ),
                     )
@@ -1137,7 +1170,7 @@ async def responses_endpoint(request: ResponsesRequest):
                     )
                     yield _evt(
                         "response.output_item.done",
-                        ResponsesOutputItemDoneEvent(output_index=0, item=final_msg),
+                        RespOutputItemDoneEvent(output_index=0, item=final_msg),
                     )
 
                     # Collect all output items for final response
@@ -1160,13 +1193,13 @@ async def responses_endpoint(request: ResponsesRequest):
                                     # output_item.added (function_call)
                                     yield _evt(
                                         "response.output_item.added",
-                                        ResponsesOutputItemAddedEvent(output_index=out_idx, item=fc_item),
+                                        RespOutputItemAddedEvent(output_index=out_idx, item=fc_item),
                                     )
 
                                     # function_call_arguments.delta (full arguments in one shot)
                                     yield _evt(
                                         "response.function_call_arguments.delta",
-                                        ResponsesFunctionCallArgumentsDeltaEvent(
+                                        RespFuncCallArgsDeltaEvent(
                                             item_id=fc_item.id,
                                             output_index=out_idx,
                                             delta=fc_item.arguments,
@@ -1176,7 +1209,7 @@ async def responses_endpoint(request: ResponsesRequest):
                                     # function_call_arguments.done
                                     yield _evt(
                                         "response.function_call_arguments.done",
-                                        ResponsesFunctionCallArgumentsDoneEvent(
+                                        RespFuncCallArgsDoneEvent(
                                             item_id=fc_item.id,
                                             output_index=out_idx,
                                             arguments=fc_item.arguments,
@@ -1186,12 +1219,12 @@ async def responses_endpoint(request: ResponsesRequest):
                                     # output_item.done (function_call)
                                     yield _evt(
                                         "response.output_item.done",
-                                        ResponsesOutputItemDoneEvent(output_index=out_idx, item=fc_item),
+                                        RespOutputItemDoneEvent(output_index=out_idx, item=fc_item),
                                     )
 
                                     all_output_items.append(fc_item)
-                        except Exception:
-                            pass  # Tool parsing failure is non-fatal in streaming
+                        except Exception as e:
+                            print(f"Warning: streaming tool call parsing failed: {e}")
 
                     # response.completed
                     total_tokens = usage_stats["input_tokens"] + usage_stats["output_tokens"]
@@ -1211,7 +1244,7 @@ async def responses_endpoint(request: ResponsesRequest):
                             ),
                         }
                     )
-                    yield _evt("response.completed", ResponsesCompletedEvent(response=completed_response))
+                    yield _evt("response.completed", RespCompletedEvent(response=completed_response))
 
                     # Save to store for previous_response_id
                     _responses_store.save(
@@ -1223,13 +1256,10 @@ async def responses_endpoint(request: ResponsesRequest):
                         [item.model_dump() for item in all_output_items],
                     )
 
-                    # Final sentinel
-                    yield "data: [DONE]\n\n"
-
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
-                    error_data = json.dumps({"error": str(e)})
+                    error_data = json.dumps({"error": "Internal generation error"})
                     yield f"data: {error_data}\n\n"
 
                 finally:
