@@ -163,19 +163,23 @@ def test_check_context_length_zero_unlimited():
     server.check_context_length("anything", None, 0)  # No exception
 
 
-def test_get_max_context_tokens_default():
+def test_get_max_context_tokens_default(monkeypatch):
     """Default should be 0 (unlimited)."""
-    import os
-    os.environ.pop("MAX_CONTEXT_TOKENS", None)
+    monkeypatch.delenv("MAX_CONTEXT_TOKENS", raising=False)
     assert server.get_max_context_tokens() == 0
 
 
-def test_get_max_context_tokens_from_env():
+def test_get_max_context_tokens_from_env(monkeypatch):
     """Should read from MAX_CONTEXT_TOKENS env var."""
-    import os
-    os.environ["MAX_CONTEXT_TOKENS"] = "16384"
+    monkeypatch.setenv("MAX_CONTEXT_TOKENS", "16384")
     assert server.get_max_context_tokens() == 16384
-    os.environ.pop("MAX_CONTEXT_TOKENS")
+
+
+def test_get_max_context_tokens_rejects_negative(monkeypatch):
+    """Negative values should be rejected."""
+    monkeypatch.setenv("MAX_CONTEXT_TOKENS", "-1")
+    with pytest.raises(ValueError, match="must be >= 0"):
+        server.get_max_context_tokens()
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +193,8 @@ def test_resolve_response_format_json_adds_instruction():
     assert result[0]["role"] == "system"
     assert "json" in result[0]["content"].lower()
     assert len(result) == 2
+    # Original list should not be mutated
+    assert len(msgs) == 1
 
 
 def test_resolve_response_format_text_no_change():
@@ -201,6 +207,15 @@ def test_resolve_response_format_none_no_change():
     msgs = [{"role": "user", "content": "hi"}]
     result = server.resolve_response_format(msgs, None)
     assert len(result) == 1
+
+
+def test_resolve_response_format_unsupported_type():
+    """Unsupported response_format type should raise 400."""
+    from fastapi import HTTPException as _Exc
+    msgs = [{"role": "user", "content": "hi"}]
+    with pytest.raises(_Exc) as exc_info:
+        server.resolve_response_format(msgs, {"type": "xml"})
+    assert exc_info.value.status_code == 400
 
 
 def test_chat_completions_json_mode_accepted(client):

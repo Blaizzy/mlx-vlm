@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import gc
 import json
 import os
@@ -12,7 +13,7 @@ from typing import Any, List, Literal, Optional, Union
 
 import mlx.core as mx
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
@@ -43,6 +44,21 @@ from .vision_cache import VisionFeatureCache
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
+DEFAULT_REQUEST_TIMEOUT = 300
+
+
+def get_request_timeout() -> int:
+    """Request timeout in seconds. Must be > 0."""
+    try:
+        value = int(os.environ.get("REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT))
+    except ValueError:
+        raise ValueError(
+            f"REQUEST_TIMEOUT must be a valid integer, got: "
+            f"{os.environ.get('REQUEST_TIMEOUT')!r}"
+        )
+    if value <= 0:
+        raise ValueError(f"REQUEST_TIMEOUT must be > 0, got {value}")
+    return value
 
 
 def get_prefill_step_size():
@@ -51,7 +67,10 @@ def get_prefill_step_size():
 
 def get_max_context_tokens() -> int:
     """Maximum prompt tokens before rejecting a request. 0 means no limit."""
-    return int(os.environ.get("MAX_CONTEXT_TOKENS", 0))
+    value = int(os.environ.get("MAX_CONTEXT_TOKENS", 0))
+    if value < 0:
+        raise ValueError(f"MAX_CONTEXT_TOKENS must be >= 0, got {value}")
+    return value
 
 
 def check_context_length(prompt: str, processor, max_context: int) -> None:
@@ -658,16 +677,25 @@ class ChatStreamChunk(BaseModel):
 
 
 def resolve_response_format(messages, response_format):
-    """Inject JSON instruction if json_object format requested."""
+    """Inject JSON instruction if json_object format requested.
+
+    Returns a new list — the original messages list is not mutated.
+    """
     if not response_format:
         return messages
     fmt_type = response_format.get("type", "text")
+    if fmt_type not in ("text", "json_object"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported response_format type: '{fmt_type}'. "
+            "Supported types are 'text' and 'json_object'.",
+        )
     if fmt_type == "json_object":
         json_instruction = (
             "You must respond with valid JSON only. "
             "Do not include any text outside the JSON object."
         )
-        messages.insert(0, {"role": "system", "content": json_instruction})
+        return [{"role": "system", "content": json_instruction}] + messages
     return messages
 
 
@@ -1028,9 +1056,12 @@ async def responses_endpoint(openai_request: OpenAIRequest):
         else:
             # Non-streaming response
             try:
-                # Use generate from generate.py, with request timeout
+                # Use generate from generate.py, with request timeout.
+                # NOTE: wait_for cancels the future but cannot interrupt the
+                # sync generate() running in the thread pool. The thread will
+                # run to completion; only the await is aborted.
                 timeout = get_request_timeout()
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 try:
                     result = await asyncio.wait_for(
                         loop.run_in_executor(
@@ -1303,9 +1334,12 @@ async def chat_completions_endpoint(request: ChatRequest, raw_request: Request):
         else:
             # Non-streaming response
             try:
-                # Use generate from generate.py, with request timeout
+                # Use generate from generate.py, with request timeout.
+                # NOTE: wait_for cancels the future but cannot interrupt the
+                # sync generate() running in the thread pool. The thread will
+                # run to completion; only the await is aborted.
                 timeout = get_request_timeout()
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 try:
                     gen_result = await asyncio.wait_for(
                         loop.run_in_executor(
