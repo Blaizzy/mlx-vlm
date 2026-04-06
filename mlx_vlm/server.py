@@ -128,11 +128,20 @@ model_cache = {}
 _prompt_cache_states: dict[str, PromptCacheState] = {}
 
 
-def get_prompt_cache_state(model_name: str) -> PromptCacheState:
-    """Get or create a PromptCacheState for the given model."""
-    if model_name not in _prompt_cache_states:
-        _prompt_cache_states[model_name] = PromptCacheState()
-    return _prompt_cache_states[model_name]
+def get_prompt_cache_state(
+    model_name: str,
+    cache_key: Optional[str] = None,
+) -> PromptCacheState:
+    """Get or create a PromptCacheState for the given model and cache key.
+
+    Args:
+        model_name: The model identifier.
+        cache_key: Optional routing key (e.g., prompt_cache_key from request).
+    """
+    key = f"{model_name}::{cache_key}" if cache_key else model_name
+    if key not in _prompt_cache_states:
+        _prompt_cache_states[key] = PromptCacheState()
+    return _prompt_cache_states[key]
 
 
 class FlexibleBaseModel(BaseModel):
