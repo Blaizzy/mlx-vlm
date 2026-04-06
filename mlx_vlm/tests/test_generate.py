@@ -1036,7 +1036,7 @@ def test_generate_cli_smoke(capsys):
     import importlib
 
     generate_module = importlib.import_module("mlx_vlm.generate")
-    prompt = ["最下段の最も左の段ボールのタグは何色ですか？"]
+    prompt = ["画像の前面に積み重なっているのはどのようなアイテムですか？"]
 
     args = Namespace(
         model="demo",
