@@ -5,6 +5,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import InputEmbeddingsFeatures
 from .language import LanguageModel, TextConfig, RMSNorm
 from .vision import VisionConfig, VisionModel
 
@@ -14,6 +15,9 @@ class ModelConfig:
     text_config: TextConfig
     vision_config: VisionConfig
     model_type: str
+    bos_token_id: Optional[int] = None
+    eos_token_id: Optional[int | list[int]] = None
+    pad_token_id: Optional[int] = None
     image_token_index: int = 100002
 
     @classmethod
@@ -66,6 +70,8 @@ class MLPImageProjector(nn.Module):
 
 
 class Model(nn.Module):
+    no_chunked_prefill = True
+
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -97,10 +103,12 @@ class Model(nn.Module):
         self,
         input_ids: mx.array,
         pixel_values: Optional[mx.array] = None,
-    ) -> mx.array:
+        **kwargs,
+    ) -> InputEmbeddingsFeatures:
+        del kwargs
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         if pixel_values is None:
-            return inputs_embeds
+            return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
         pixel_values = pixel_values.astype(
             self.vision_model.vision_encoder.model.embeddings.patch_embedding.weight.dtype
@@ -111,7 +119,9 @@ class Model(nn.Module):
         image_mask = mx.expand_dims(
             input_ids == self.config.vision_config.image_token_id, -1
         )
-        return mx.where(image_mask, image_embeds, inputs_embeds)
+        return InputEmbeddingsFeatures(
+            inputs_embeds=mx.where(image_mask, image_embeds, inputs_embeds)
+        )
 
     def __call__(
         self,
@@ -122,9 +132,9 @@ class Model(nn.Module):
         **kwargs,
     ):
         del mask, kwargs
-        inputs_embeds = self.get_input_embeddings(input_ids, pixel_values)
+        embedding_output = self.get_input_embeddings(input_ids, pixel_values)
         return self.language_model(
             None,
             cache=cache,
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=embedding_output.inputs_embeds,
         )

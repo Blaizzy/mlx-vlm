@@ -2881,6 +2881,99 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
+    def test_plamo2vl_vision(self):
+        from mlx_vlm.models import plamo2vl
+
+        config = plamo2vl.VisionConfig(
+            image_feature_size=8,
+            image_proj_hidden_size=16,
+            image_token_id=42,
+            model_type="siglip_vision_model",
+            vision_encoder_hidden_act="gelu_pytorch_tanh",
+            vision_encoder_hidden_size=8,
+            vision_encoder_image_size=28,
+            vision_encoder_intermediate_size=16,
+            vision_encoder_layer_norm_eps=1e-6,
+            vision_encoder_num_attention_heads=2,
+            vision_encoder_num_channels=3,
+            vision_encoder_num_hidden_layers=1,
+            vision_encoder_patch_size=14,
+        )
+
+        model = plamo2vl.VisionModel(config)
+
+        input_ids = mx.array([[42, 42, 42, 42]])
+        pixel_values = mx.random.uniform(shape=(1, 3, 28, 28))
+
+        features = model(input_ids, pixel_values)
+
+        self.assertEqual(features.shape, (1, 4, 8))
+        self.assertEqual(
+            model.vision_encoder.model.encoder.layers[0].mlp.hidden_act,
+            "gelu_pytorch_tanh",
+        )
+
+    def test_plamo2vl_model_config_preserves_special_token_ids(self):
+        from mlx_vlm.models import plamo2vl
+
+        config = plamo2vl.ModelConfig.from_dict(
+            {
+                "text_config": {},
+                "vision_config": {},
+                "model_type": "plamo2vl",
+                "bos_token_id": 1,
+                "eos_token_id": 2,
+                "pad_token_id": 3,
+            }
+        )
+
+        self.assertEqual(config.bos_token_id, 1)
+        self.assertEqual(config.eos_token_id, 2)
+        self.assertEqual(config.pad_token_id, 3)
+
+    def test_plamo2vl_get_input_embeddings_accepts_mask(self):
+        from mlx_vlm.models import plamo2vl
+
+        text_config = plamo2vl.TextConfig(
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            hidden_size_per_head=4,
+            intermediate_size=16,
+            vocab_size=256,
+            mamba_num_heads=2,
+        )
+        vision_config = plamo2vl.VisionConfig(
+            image_feature_size=8,
+            image_proj_hidden_size=16,
+            image_token_id=42,
+            model_type="siglip_vision_model",
+            vision_encoder_hidden_act="gelu_pytorch_tanh",
+            vision_encoder_hidden_size=8,
+            vision_encoder_image_size=28,
+            vision_encoder_intermediate_size=16,
+            vision_encoder_layer_norm_eps=1e-6,
+            vision_encoder_num_attention_heads=2,
+            vision_encoder_num_channels=3,
+            vision_encoder_num_hidden_layers=1,
+            vision_encoder_patch_size=14,
+        )
+        config = plamo2vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="plamo2vl",
+        )
+        model = plamo2vl.Model(config)
+
+        output = model.get_input_embeddings(
+            mx.array([[42, 42, 42, 42]]),
+            mx.random.uniform(shape=(1, 3, 28, 28)),
+            mask=mx.ones((1, 4), dtype=mx.int32),
+        )
+
+        self.assertEqual(output.inputs_embeds.shape, (1, 4, 8))
+
     def test_moondream3(self):
         from mlx_vlm.models import moondream3
 
