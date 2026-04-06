@@ -130,3 +130,42 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["repetition_penalty"] == 1.15
     assert mock_generate.call_args.kwargs["logit_bias"] == {12: -1.5}
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
+
+
+# ---------------------------------------------------------------------------
+# Context tracking tests
+# ---------------------------------------------------------------------------
+
+
+def test_check_context_length_within_limit():
+    fake_proc = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda s, add_special_tokens=False: list(range(10))),
+    )
+    server.check_context_length("short", fake_proc, 100)
+
+
+def test_check_context_length_exceeds_limit():
+    from fastapi import HTTPException as _Exc
+    fake_proc = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda s, add_special_tokens=False: list(range(200))),
+    )
+    with pytest.raises(_Exc) as exc_info:
+        server.check_context_length("long", fake_proc, 100)
+    assert exc_info.value.status_code == 400
+
+
+def test_check_context_length_zero_unlimited():
+    server.check_context_length("anything", None, 0)
+
+
+def test_get_max_context_tokens_default():
+    import os
+    os.environ.pop("MAX_CONTEXT_TOKENS", None)
+    assert server.get_max_context_tokens() == 0
+
+
+def test_get_max_context_tokens_from_env():
+    import os
+    os.environ["MAX_CONTEXT_TOKENS"] = "16384"
+    assert server.get_max_context_tokens() == 16384
+    os.environ.pop("MAX_CONTEXT_TOKENS")

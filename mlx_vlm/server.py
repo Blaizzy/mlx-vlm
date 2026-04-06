@@ -49,6 +49,25 @@ def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
 
+def get_max_context_tokens() -> int:
+    """Maximum prompt tokens before rejecting a request. 0 = no limit."""
+    return int(os.environ.get("MAX_CONTEXT_TOKENS", 0))
+
+
+def check_context_length(prompt: str, processor, max_context: int) -> None:
+    """Raise HTTP 400 if the tokenized prompt exceeds *max_context* tokens."""
+    if max_context <= 0:
+        return
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    token_count = len(tokenizer.encode(prompt, add_special_tokens=False))
+    if token_count > max_context:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Prompt length ({token_count} tokens) exceeds maximum context "
+            f"window ({max_context} tokens).",
+        )
+
+
 def get_quantized_kv_bits(model: str):
     kv_bits = float(os.environ.get("KV_BITS", 0))
     if kv_bits == 0:
@@ -845,6 +864,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
             num_images=len(images),
             **template_kwargs,
         )
+        check_context_length(formatted_prompt, processor, get_max_context_tokens())
         generation_kwargs = build_generation_kwargs(openai_request, template_kwargs)
 
         generated_at = datetime.now().timestamp()
@@ -1113,6 +1133,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             tools=tools,
             **template_kwargs,
         )
+        check_context_length(formatted_prompt, processor, get_max_context_tokens())
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
 
         if request.stream:
@@ -1434,6 +1455,12 @@ def main():
         help="Start index (of token) for the quantized KV cache.",
     )
     parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=0,
+        help="Maximum context window in tokens. 0 = no limit. (default: %(default)s)",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -1454,6 +1481,7 @@ def main():
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    os.environ["MAX_CONTEXT_TOKENS"] = str(args.max_context_tokens)
 
     uvicorn.run(
         "mlx_vlm.server:app",
