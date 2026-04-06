@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -201,6 +202,51 @@ def test_chat_completions_finish_reason_tool_calls(client):
         )
     assert resp.status_code == 200
     assert resp.json()["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_chat_completions_streaming_finish_reason_tool_calls(client):
+    """Streaming finish_reason should be 'tool_calls' when tool calls are detected."""
+    chunks = [
+        SimpleNamespace(
+            text="calling search",
+            prompt_tokens=10,
+            generation_tokens=i + 1,
+            prompt_tps=100.0,
+            generation_tps=50.0,
+            peak_memory=1.0,
+        )
+        for i in range(2)
+    ]
+
+    fake_tool_calls = {
+        "calls": [{"type": "function", "id": "call_1", "function": {"name": "search", "arguments": "{}"}}],
+        "remaining_text": "",
+    }
+
+    model = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=""))
+    config = SimpleNamespace(model_type="test")
+
+    with patch.object(server, "get_cached_model", return_value=(model, processor, config)), \
+         patch.object(server, "apply_chat_template", return_value="prompt"), \
+         patch.object(server, "stream_generate", return_value=iter(chunks)), \
+         patch.object(server, "_infer_tool_parser", return_value="qwen3_coder"), \
+         patch.object(server, "load_tool_module", return_value=SimpleNamespace()), \
+         patch.object(server, "process_tool_calls", return_value=fake_tool_calls):
+        resp = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "search for test"}],
+                "tools": [{"type": "function", "function": {"name": "search", "parameters": {}}}],
+                "stream": True,
+            },
+        )
+    assert resp.status_code == 200
+    # Parse SSE events to find the final chunk with finish_reason
+    events = [line for line in resp.text.strip().split("\n") if line.startswith("data: ") and line != "data: [DONE]"]
+    last_event = json.loads(events[-1].removeprefix("data: "))
+    assert last_event["choices"][0]["finish_reason"] == "tool_calls"
 
 
 def test_chat_completions_finish_reason_stop_with_tools_no_calls(client):
