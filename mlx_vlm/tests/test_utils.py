@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx_vlm.utils as utils_module
 import pytest
 from mlx_lm.utils import quantize_model
 
@@ -13,6 +14,7 @@ from mlx_vlm.utils import (
     get_class_predicate,
     load,
     load_image,
+    load_processor,
     prepare_inputs,
     process_inputs_with_fallback,
     sanitize_weights,
@@ -475,3 +477,49 @@ class TestLoadImage:
     def test_nonexistent_path_object_raises(self):
         with pytest.raises(ValueError, match="Failed to load image"):
             load_image(Path("/nonexistent/path/image.png"))
+
+
+def test_load_processor_prefers_custom_processor(monkeypatch):
+    class DummyTokenizer:
+        eos_token_ids = [2]
+
+    class DummyProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer()
+
+    class DummyProcessorClass:
+        @classmethod
+        def from_pretrained(cls, model_path):
+            assert str(model_path) == "dummy-model"
+            return DummyProcessor()
+
+    class DummyArch:
+        Processor = DummyProcessorClass
+
+    class DummyDetokenizer:
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+    def fail_auto_processor(*args, **kwargs):
+        raise AssertionError("AutoProcessor.from_pretrained should not be used")
+
+    monkeypatch.setattr(
+        utils_module,
+        "load_config",
+        lambda *args, **kwargs: {"model_type": "plamo2vl"},
+    )
+    monkeypatch.setattr(
+        utils_module, "get_model_and_args", lambda config: (DummyArch, "plamo2vl")
+    )
+    monkeypatch.setattr(utils_module, "get_model_path", lambda path: Path(path))
+    monkeypatch.setattr(
+        utils_module.AutoProcessor, "from_pretrained", fail_auto_processor
+    )
+    monkeypatch.setattr(
+        utils_module, "load_tokenizer", lambda *args, **kwargs: DummyDetokenizer
+    )
+
+    processor = load_processor("dummy-model")
+
+    assert isinstance(processor, DummyProcessor)
+    assert isinstance(processor.detokenizer, DummyDetokenizer)

@@ -46,12 +46,14 @@ class VisionEncoderWrapper(nn.Module):
             image_size=config.vision_encoder_image_size,
             num_channels=config.vision_encoder_num_channels,
             layer_norm_eps=config.vision_encoder_layer_norm_eps,
+            hidden_act=config.vision_encoder_hidden_act,
         )
         self.model = ClipVisionModel(encoder_config)
 
     def __call__(self, pixel_values: mx.array) -> mx.array:
         pixel_values = pixel_values.transpose(0, 2, 3, 1)
         _, hidden_states, _ = self.model(pixel_values, output_hidden_states=False)
+        hidden_states = self.model.post_layernorm(hidden_states)
         return hidden_states.reshape(-1, hidden_states.shape[-1])
 
 

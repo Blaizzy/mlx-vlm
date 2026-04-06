@@ -81,6 +81,7 @@ MODEL_CONFIG = {
     "molmo": MessageFormat.PROMPT_ONLY,
     "moondream3": MessageFormat.PROMPT_ONLY,
     "falcon_ocr": MessageFormat.PROMPT_ONLY,
+    "plamo2vl": MessageFormat.PROMPT_ONLY,
     "paligemma": MessageFormat.PROMPT_WITH_IMAGE_TOKEN,
 }
 
@@ -422,7 +423,6 @@ class MessageFormatter:
             ],
         }
 
-
 def get_message_json(
     model_name: str,
     prompt: str,
@@ -746,5 +746,13 @@ def apply_chat_template(
     # Some models only need the last message
     if model_type in ["paligemma", "molmo", "florence2", "falcon_ocr"]:
         return messages[-1]
+
+    if config["model_type"] == "plamo2vl":
+        return processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
 
     return get_chat_template(processor, messages, add_generation_prompt, **kwargs)

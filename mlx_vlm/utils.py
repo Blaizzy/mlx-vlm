@@ -487,8 +487,17 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
+    if isinstance(model_path, str):
+        model_path = get_model_path(model_path)
 
-    processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
+    config = load_config(model_path, **kwargs) if kwargs else load_config(model_path)
+    model_class, _ = get_model_and_args(config)
+    processor_class = getattr(model_class, "Processor", None)
+
+    if processor_class is not None and hasattr(processor_class, "from_pretrained"):
+        processor = processor_class.from_pretrained(model_path)
+    else:
+        processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 

@@ -106,11 +106,12 @@ class Model(nn.Module):
             self.vision_model.vision_encoder.model.embeddings.patch_embedding.weight.dtype
         )
         image_features = self.vision_model(input_ids, pixel_values)
-        image_embeds = self.image_proj(image_features)
+        image_embeds = self.image_proj(image_features).astype(mx.float32)
+        inputs_embeds = inputs_embeds.astype(mx.float32)
         image_mask = mx.expand_dims(
             input_ids == self.config.vision_config.image_token_id, -1
         )
-        return mx.where(image_mask, image_embeds.astype(inputs_embeds.dtype), inputs_embeds)
+        return mx.where(image_mask, image_embeds, inputs_embeds)
 
     def __call__(
         self,

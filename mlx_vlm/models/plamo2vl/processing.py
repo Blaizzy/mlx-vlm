@@ -313,6 +313,39 @@ class Plamo2Tokenizer(PreTrainedTokenizer):  # type: ignore[misc]
                     print(json.dumps(token, ensure_ascii=False), file=f)
         return (out_vocab_file,)
 
+    def save_pretrained(
+        self,
+        save_directory: str | Path,
+        legacy_format: Optional[bool] = None,
+        filename_prefix: Optional[str] = None,
+        **kwargs: Any,
+    ):
+        self.init_kwargs["add_bos_token"] = self.add_bos_token
+        self.init_kwargs["add_eos_token"] = self.add_eos_token
+        files = super().save_pretrained(
+            str(save_directory),
+            legacy_format=legacy_format,
+            filename_prefix=filename_prefix,
+            **kwargs,
+        )
+
+        tokenizer_config_name = (
+            f"{filename_prefix}-tokenizer_config.json"
+            if filename_prefix
+            else "tokenizer_config.json"
+        )
+        tokenizer_config_path = Path(save_directory) / tokenizer_config_name
+        if tokenizer_config_path.exists():
+            with open(tokenizer_config_path, "r", encoding="utf-8") as f:
+                tokenizer_config = json.load(f)
+            tokenizer_config["add_bos_token"] = self.add_bos_token
+            tokenizer_config["add_eos_token"] = self.add_eos_token
+            with open(tokenizer_config_path, "w", encoding="utf-8") as f:
+                json.dump(tokenizer_config, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+
+        return files
+
 
 def _apply_ja01_template(dummy_image_token: str, text: str, image_length: int = 1) -> str:
     return "\n".join(
