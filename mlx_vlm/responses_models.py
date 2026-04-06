@@ -256,9 +256,7 @@ class ResponsesRequest(GenerationParams, TemplateParams):
     tool_choice: Optional[Any] = Field(
         "auto", description='Tool choice: "none", "auto", "required", or specific tool.'
     )
-    parallel_tool_calls: bool = Field(
-        True, description="Allow parallel tool calls."
-    )
+    parallel_tool_calls: bool = Field(True, description="Allow parallel tool calls.")
     previous_response_id: Optional[str] = Field(
         None,
         description="ID of a previous response for multi-turn context replay.",

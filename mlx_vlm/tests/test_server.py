@@ -143,12 +143,19 @@ def test_chat_completions_stop_passed_as_eos_tokens(client):
     processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=""))
     config = SimpleNamespace(model_type="test")
     result = SimpleNamespace(
-        text="Hello", prompt_tokens=5, generation_tokens=1, total_tokens=6,
-        prompt_tps=100.0, generation_tps=50.0, peak_memory=1.0,
+        text="Hello",
+        prompt_tokens=5,
+        generation_tokens=1,
+        total_tokens=6,
+        prompt_tps=100.0,
+        generation_tps=50.0,
+        peak_memory=1.0,
     )
 
     with (
-        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
         patch.object(server, "apply_chat_template", return_value="prompt"),
         patch.object(server, "generate", return_value=result) as mock_gen,
     ):
@@ -171,12 +178,19 @@ def test_chat_completions_no_stop_no_eos_tokens(client):
     processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=""))
     config = SimpleNamespace(model_type="test")
     result = SimpleNamespace(
-        text="Hi", prompt_tokens=5, generation_tokens=1, total_tokens=6,
-        prompt_tps=100.0, generation_tps=50.0, peak_memory=1.0,
+        text="Hi",
+        prompt_tokens=5,
+        generation_tokens=1,
+        total_tokens=6,
+        prompt_tps=100.0,
+        generation_tps=50.0,
+        peak_memory=1.0,
     )
 
     with (
-        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
         patch.object(server, "apply_chat_template", return_value="prompt"),
         patch.object(server, "generate", return_value=result) as mock_gen,
     ):
@@ -194,12 +208,19 @@ def test_responses_stop_passed_as_eos_tokens(client):
     processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=""))
     config = SimpleNamespace(model_type="test")
     result = SimpleNamespace(
-        text="Hello", prompt_tokens=5, generation_tokens=1, total_tokens=6,
-        prompt_tps=100.0, generation_tps=50.0, peak_memory=1.0,
+        text="Hello",
+        prompt_tokens=5,
+        generation_tokens=1,
+        total_tokens=6,
+        prompt_tps=100.0,
+        generation_tps=50.0,
+        peak_memory=1.0,
     )
 
     with (
-        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
         patch.object(server, "apply_chat_template", return_value="prompt"),
         patch.object(server, "generate", return_value=result) as mock_gen,
     ):

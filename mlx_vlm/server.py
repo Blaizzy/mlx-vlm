@@ -37,34 +37,43 @@ from .generate import (
     stream_generate,
 )
 from .prompt_utils import apply_chat_template
+from .responses_models import ContentPartOutputText as ResponseContentPartOutputText
+from .responses_models import InputTokensDetails
+from .responses_models import ResponseCompletedEvent as ResponsesCompletedEvent
+from .responses_models import (
+    ResponseContentPartAddedEvent as ResponsesContentPartAddedEvent,
+)
+from .responses_models import (
+    ResponseContentPartDoneEvent as ResponsesContentPartDoneEvent,
+)
+from .responses_models import ResponseCreatedEvent as ResponsesCreatedEvent
+from .responses_models import (
+    ResponseFunctionCallArgumentsDeltaEvent as ResponsesFunctionCallArgumentsDeltaEvent,
+)
+from .responses_models import (
+    ResponseFunctionCallArgumentsDoneEvent as ResponsesFunctionCallArgumentsDoneEvent,
+)
+from .responses_models import ResponseFunctionCallItem, ResponseIncompleteDetails
+from .responses_models import ResponseInProgressEvent as ResponsesInProgressEvent
+from .responses_models import ResponseMessageItem, ResponseObject
+from .responses_models import (
+    ResponseOutputItemAddedEvent as ResponsesOutputItemAddedEvent,
+)
+from .responses_models import (
+    ResponseOutputItemDoneEvent as ResponsesOutputItemDoneEvent,
+)
+from .responses_models import (
+    ResponseOutputTextDeltaEvent as ResponsesOutputTextDeltaEvent,
+)
+from .responses_models import (
+    ResponseOutputTextDoneEvent as ResponsesOutputTextDoneEvent,
+)
+from .responses_models import ResponsesRequest, ResponseUsage
+from .responses_store import ResponseStore
 from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load
 from .version import __version__
 from .vision_cache import VisionFeatureCache
-from .responses_models import (
-    ResponsesRequest,
-    ResponseObject,
-    ResponseUsage,
-    InputTokensDetails,
-    ResponseErrorObject,
-    ResponseIncompleteDetails,
-    ResponseMessageItem,
-    ResponseFunctionCallItem,
-    ContentPartOutputText as ResponseContentPartOutputText,
-    BaseStreamEvent as ResponseBaseStreamEvent,
-    ResponseCreatedEvent as ResponsesCreatedEvent,
-    ResponseInProgressEvent as ResponsesInProgressEvent,
-    ResponseOutputItemAddedEvent as ResponsesOutputItemAddedEvent,
-    ResponseContentPartAddedEvent as ResponsesContentPartAddedEvent,
-    ResponseOutputTextDeltaEvent as ResponsesOutputTextDeltaEvent,
-    ResponseOutputTextDoneEvent as ResponsesOutputTextDoneEvent,
-    ResponseContentPartDoneEvent as ResponsesContentPartDoneEvent,
-    ResponseOutputItemDoneEvent as ResponsesOutputItemDoneEvent,
-    ResponseFunctionCallArgumentsDeltaEvent as ResponsesFunctionCallArgumentsDeltaEvent,
-    ResponseFunctionCallArgumentsDoneEvent as ResponsesFunctionCallArgumentsDoneEvent,
-    ResponseCompletedEvent as ResponsesCompletedEvent,
-)
-from .responses_store import ResponseStore
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -793,7 +802,8 @@ def resolve_tool_choice(
         name = func.get("name") if isinstance(func, dict) else None
         if name:
             filtered = [
-                t for t in tools
+                t
+                for t in tools
                 if (t.get("function", {}) or {}).get("name") == name
                 or t.get("name") == name
             ]
@@ -814,10 +824,13 @@ def resolve_response_format(
         return messages
     fmt_type = response_format.get("type", "text")
     if fmt_type == "json_object":
-        messages.insert(0, {
-            "role": "system",
-            "content": "You must respond with valid JSON only. Do not include any text outside the JSON object.",
-        })
+        messages.insert(
+            0,
+            {
+                "role": "system",
+                "content": "You must respond with valid JSON only. Do not include any text outside the JSON object.",
+            },
+        )
     return messages
 
 
@@ -950,27 +963,33 @@ def responses_input_to_messages(
             if item_type == "function_call_output":
                 call_id = item.get("call_id", "unknown")
                 output = item.get("output", "")
-                chat_messages.append({
-                    "role": "tool",
-                    "content": output,
-                    "tool_call_id": call_id,
-                })
+                chat_messages.append(
+                    {
+                        "role": "tool",
+                        "content": output,
+                        "tool_call_id": call_id,
+                    }
+                )
                 continue
 
             # Function call item (from previous assistant turn)
             if item_type == "function_call":
-                chat_messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": item.get("call_id", ""),
-                        "type": "function",
-                        "function": {
-                            "name": item.get("name", ""),
-                            "arguments": item.get("arguments", ""),
-                        },
-                    }],
-                })
+                chat_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": item.get("call_id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": item.get("arguments", ""),
+                                },
+                            }
+                        ],
+                    }
+                )
                 continue
 
             # Regular message with role and content
@@ -1000,25 +1019,31 @@ def responses_input_to_messages(
                                     images.append(img)
                             elif ci_type == "output_text":
                                 # Multi-turn: previous assistant output
-                                chat_messages.append({
-                                    "role": "assistant",
-                                    "content": ci.get("text", ""),
-                                })
+                                chat_messages.append(
+                                    {
+                                        "role": "assistant",
+                                        "content": ci.get("text", ""),
+                                    }
+                                )
                             elif ci_type == "input_audio":
                                 pass  # Audio not yet supported in responses
                             else:
                                 pass  # Skip unsupported content types gracefully
 
                     if text_parts:
-                        chat_messages.append({
-                            "role": msg_role,
-                            "content": "\n".join(text_parts),
-                        })
+                        chat_messages.append(
+                            {
+                                "role": msg_role,
+                                "content": "\n".join(text_parts),
+                            }
+                        )
                 else:
-                    chat_messages.append({
-                        "role": msg_role,
-                        "content": str(content) if content else "",
-                    })
+                    chat_messages.append(
+                        {
+                            "role": msg_role,
+                            "content": str(content) if content else "",
+                        }
+                    )
                 continue
 
         # Handle Pydantic ChatMessage objects
@@ -1047,16 +1072,20 @@ def responses_input_to_messages(
                             elif isinstance(img, str):
                                 images.append(img)
                         elif ci_type == "output_text":
-                            chat_messages.append({
-                                "role": "assistant",
-                                "content": ci.get("text", ""),
-                            })
+                            chat_messages.append(
+                                {
+                                    "role": "assistant",
+                                    "content": ci.get("text", ""),
+                                }
+                            )
 
                 if text_parts:
-                    chat_messages.append({
-                        "role": msg_role,
-                        "content": "\n".join(text_parts),
-                    })
+                    chat_messages.append(
+                        {
+                            "role": msg_role,
+                            "content": "\n".join(text_parts),
+                        }
+                    )
 
     return chat_messages, images
 
@@ -1107,7 +1136,11 @@ def build_responses_output(
     # Create message item for any remaining text
     if remaining_text or not output_items:
         msg_item = ResponseMessageItem(
-            content=[ResponseContentPartOutputText(text=remaining_text)] if remaining_text else [],
+            content=(
+                [ResponseContentPartOutputText(text=remaining_text)]
+                if remaining_text
+                else []
+            ),
         )
         # Insert message before function calls (matching OpenAI ordering)
         output_items.insert(0, msg_item)
@@ -1191,7 +1224,9 @@ async def responses_endpoint(request: ResponsesRequest):
                     nonlocal seq
                     event_obj.sequence_number = seq
                     seq += 1
-                    return f"event: {event_type}\ndata: {event_obj.model_dump_json()}\n\n"
+                    return (
+                        f"event: {event_type}\ndata: {event_obj.model_dump_json()}\n\n"
+                    )
 
                 try:
                     # Build base ResponseObject (in_progress, empty output)
@@ -1210,16 +1245,26 @@ async def responses_endpoint(request: ResponsesRequest):
                         parallel_tool_calls=request.parallel_tool_calls,
                         previous_response_id=request.previous_response_id,
                         metadata=request.metadata,
-                        usage=ResponseUsage(input_tokens=0, output_tokens=0, total_tokens=0),
+                        usage=ResponseUsage(
+                            input_tokens=0, output_tokens=0, total_tokens=0
+                        ),
                     )
 
                     # response.created
-                    yield _evt("response.created", ResponsesCreatedEvent(response=base_response))
+                    yield _evt(
+                        "response.created",
+                        ResponsesCreatedEvent(response=base_response),
+                    )
                     # response.in_progress
-                    yield _evt("response.in_progress", ResponsesInProgressEvent(response=base_response))
+                    yield _evt(
+                        "response.in_progress",
+                        ResponsesInProgressEvent(response=base_response),
+                    )
 
                     # output_item.added (message)
-                    msg_item = ResponseMessageItem(id=message_id, status="in_progress", content=[])
+                    msg_item = ResponseMessageItem(
+                        id=message_id, status="in_progress", content=[]
+                    )
                     yield _evt(
                         "response.output_item.added",
                         ResponsesOutputItemAddedEvent(output_index=0, item=msg_item),
@@ -1230,14 +1275,19 @@ async def responses_endpoint(request: ResponsesRequest):
                     yield _evt(
                         "response.content_part.added",
                         ResponsesContentPartAddedEvent(
-                            item_id=message_id, output_index=0, content_index=0, part=empty_part,
+                            item_id=message_id,
+                            output_index=0,
+                            content_index=0,
+                            part=empty_part,
                         ),
                     )
 
                     # Stream text deltas (with prompt cache + concurrency guard)
                     sem = get_generation_semaphore()
                     await sem.acquire()
-                    cache_state = get_prompt_cache_state(request.model, getattr(request, "prompt_cache_key", None))
+                    cache_state = get_prompt_cache_state(
+                        request.model, getattr(request, "prompt_cache_key", None)
+                    )
                     token_iterator = stream_generate(
                         model=model,
                         processor=processor,
@@ -1252,7 +1302,9 @@ async def responses_endpoint(request: ResponsesRequest):
                     visible_text = ""
                     usage_stats = {"input_tokens": 0, "output_tokens": 0}
                     in_tool_call = False
-                    tool_call_start_tag = tool_module.tool_call_start if tool_module else "<tool_call>"
+                    tool_call_start_tag = (
+                        tool_module.tool_call_start if tool_module else "<tool_call>"
+                    )
 
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
@@ -1274,7 +1326,9 @@ async def responses_endpoint(request: ResponsesRequest):
                         # Check if this delta starts a tool call tag
                         # (partial match: buffer might end with "<tool" before "_call>")
                         if tools and tool_call_start_tag[:1] in delta:
-                            pending = full_text[-(len(delta) + len(tool_call_start_tag)):]
+                            pending = full_text[
+                                -(len(delta) + len(tool_call_start_tag)) :
+                            ]
                             if any(
                                 tool_call_start_tag[:i] == pending[-i:]
                                 for i in range(2, len(tool_call_start_tag) + 1)
@@ -1285,7 +1339,10 @@ async def responses_endpoint(request: ResponsesRequest):
                         yield _evt(
                             "response.output_text.delta",
                             ResponsesOutputTextDeltaEvent(
-                                item_id=message_id, output_index=0, content_index=0, delta=delta,
+                                item_id=message_id,
+                                output_index=0,
+                                content_index=0,
+                                delta=delta,
                             ),
                         )
 
@@ -1301,7 +1358,10 @@ async def responses_endpoint(request: ResponsesRequest):
                     yield _evt(
                         "response.output_text.done",
                         ResponsesOutputTextDoneEvent(
-                            item_id=message_id, output_index=0, content_index=0, text=display_text,
+                            item_id=message_id,
+                            output_index=0,
+                            content_index=0,
+                            text=display_text,
                         ),
                     )
 
@@ -1310,13 +1370,18 @@ async def responses_endpoint(request: ResponsesRequest):
                     yield _evt(
                         "response.content_part.done",
                         ResponsesContentPartDoneEvent(
-                            item_id=message_id, output_index=0, content_index=0, part=final_part,
+                            item_id=message_id,
+                            output_index=0,
+                            content_index=0,
+                            part=final_part,
                         ),
                     )
 
                     # output_item.done (message)
                     final_msg = ResponseMessageItem(
-                        id=message_id, status="completed", content=[final_part],
+                        id=message_id,
+                        status="completed",
+                        content=[final_part],
                     )
                     yield _evt(
                         "response.output_item.done",
@@ -1329,21 +1394,27 @@ async def responses_endpoint(request: ResponsesRequest):
                     # Parse tool calls from accumulated text
                     if tool_parser_type and tool_module and tools:
                         try:
-                            tc_result = process_tool_calls(full_text, tool_module, tools)
+                            tc_result = process_tool_calls(
+                                full_text, tool_module, tools
+                            )
                             if tc_result["calls"]:
                                 for idx, call in enumerate(tc_result["calls"]):
                                     func_info = call.get("function", {})
                                     fc_item = ResponseFunctionCallItem(
                                         name=func_info.get("name", ""),
                                         arguments=func_info.get("arguments", "{}"),
-                                        call_id=call.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+                                        call_id=call.get(
+                                            "id", f"call_{uuid.uuid4().hex[:24]}"
+                                        ),
                                     )
                                     out_idx = len(all_output_items)
 
                                     # output_item.added (function_call)
                                     yield _evt(
                                         "response.output_item.added",
-                                        ResponsesOutputItemAddedEvent(output_index=out_idx, item=fc_item),
+                                        ResponsesOutputItemAddedEvent(
+                                            output_index=out_idx, item=fc_item
+                                        ),
                                     )
 
                                     # function_call_arguments.delta (full arguments in one shot)
@@ -1369,7 +1440,9 @@ async def responses_endpoint(request: ResponsesRequest):
                                     # output_item.done (function_call)
                                     yield _evt(
                                         "response.output_item.done",
-                                        ResponsesOutputItemDoneEvent(output_index=out_idx, item=fc_item),
+                                        ResponsesOutputItemDoneEvent(
+                                            output_index=out_idx, item=fc_item
+                                        ),
                                     )
 
                                     all_output_items.append(fc_item)
@@ -1377,7 +1450,9 @@ async def responses_endpoint(request: ResponsesRequest):
                             pass  # Tool parsing failure is non-fatal in streaming
 
                     # response.completed
-                    total_tokens = usage_stats["input_tokens"] + usage_stats["output_tokens"]
+                    total_tokens = (
+                        usage_stats["input_tokens"] + usage_stats["output_tokens"]
+                    )
                     completed_response = base_response.model_copy(
                         update={
                             "status": status,
@@ -1394,15 +1469,26 @@ async def responses_endpoint(request: ResponsesRequest):
                             ),
                         }
                     )
-                    yield _evt("response.completed", ResponsesCompletedEvent(response=completed_response))
+                    yield _evt(
+                        "response.completed",
+                        ResponsesCompletedEvent(response=completed_response),
+                    )
 
                     # Save to store for previous_response_id
                     _responses_store.save(
                         response_id,
-                        request.input if isinstance(request.input, str) else [
-                            item.model_dump() if hasattr(item, "model_dump") else item
-                            for item in request.input
-                        ],
+                        (
+                            request.input
+                            if isinstance(request.input, str)
+                            else [
+                                (
+                                    item.model_dump()
+                                    if hasattr(item, "model_dump")
+                                    else item
+                                )
+                                for item in request.input
+                            ]
+                        ),
                         [item.model_dump() for item in all_output_items],
                     )
 
@@ -1438,7 +1524,9 @@ async def responses_endpoint(request: ResponsesRequest):
             sem = get_generation_semaphore()
             await sem.acquire()
             try:
-                cache_state = get_prompt_cache_state(request.model, getattr(request, "prompt_cache_key", None))
+                cache_state = get_prompt_cache_state(
+                    request.model, getattr(request, "prompt_cache_key", None)
+                )
                 result = generate(
                     model=model,
                     processor=processor,
@@ -1455,7 +1543,10 @@ async def responses_endpoint(request: ResponsesRequest):
 
                 # Build output items (with tool call parsing)
                 output_items = build_responses_output(
-                    result.text, tool_parser_type, tool_module, tools,
+                    result.text,
+                    tool_parser_type,
+                    tool_module,
+                    tools,
                 )
 
                 # Determine status
@@ -1496,10 +1587,14 @@ async def responses_endpoint(request: ResponsesRequest):
                 # Save to store for previous_response_id support
                 _responses_store.save(
                     response_obj.id,
-                    request.input if isinstance(request.input, str) else [
-                        item.model_dump() if hasattr(item, "model_dump") else item
-                        for item in request.input
-                    ],
+                    (
+                        request.input
+                        if isinstance(request.input, str)
+                        else [
+                            item.model_dump() if hasattr(item, "model_dump") else item
+                            for item in request.input
+                        ]
+                    ),
                     [item.model_dump() for item in output_items],
                 )
 
@@ -1578,7 +1673,9 @@ async def chat_completions_endpoint(request: ChatRequest):
         tool_choice = getattr(request, "tool_choice", None)
         tools, tool_instruction = resolve_tool_choice(tools, tool_choice)
         if tool_instruction:
-            processed_messages.insert(0, {"role": "system", "content": tool_instruction})
+            processed_messages.insert(
+                0, {"role": "system", "content": tool_instruction}
+            )
 
         tool_parser_type = None
         tokenizer = (
@@ -1615,7 +1712,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                 token_iterator = None
                 try:
                     # Use stream_generate with prompt cache reuse
-                    cache_state = get_prompt_cache_state(request.model, getattr(request, "prompt_cache_key", None))
+                    cache_state = get_prompt_cache_state(
+                        request.model, getattr(request, "prompt_cache_key", None)
+                    )
                     token_iterator = stream_generate(
                         model=model,
                         processor=processor,
@@ -1724,7 +1823,9 @@ async def chat_completions_endpoint(request: ChatRequest):
             await sem.acquire()
             try:
                 # Use generate from generate.py
-                cache_state = get_prompt_cache_state(request.model, getattr(request, "prompt_cache_key", None))
+                cache_state = get_prompt_cache_state(
+                    request.model, getattr(request, "prompt_cache_key", None)
+                )
                 gen_result = generate(
                     model=model,
                     processor=processor,

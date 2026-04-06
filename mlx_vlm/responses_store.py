@@ -93,10 +93,7 @@ class ResponseStore:
                 if item_type == "message":
                     content = output_item.get("content", [])
                     for part in content:
-                        if (
-                            isinstance(part, dict)
-                            and part.get("type") == "output_text"
-                        ):
+                        if isinstance(part, dict) and part.get("type") == "output_text":
                             items.append(
                                 {
                                     "role": "assistant",

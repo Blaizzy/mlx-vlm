@@ -14,10 +14,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Helpers: load modules without triggering mlx_vlm.__init__ (no mlx needed)
 # ---------------------------------------------------------------------------
+
 
 def _load_module(name: str, filename: str):
     """Load a sibling module by file path, bypassing package __init__."""
@@ -136,9 +136,7 @@ class TestResponsesModels:
         assert evt_default.sequence_number == 0
 
     def test_flexible_base_model_accepts_unknown_fields(self):
-        req = ResponsesRequest(
-            input="hi", model="m", some_unknown_field="surprise"
-        )
+        req = ResponsesRequest(input="hi", model="m", some_unknown_field="surprise")
         # Should not raise; extra field accessible via model_extra
         assert req.model_extra.get("some_unknown_field") == "surprise"
 
@@ -236,8 +234,9 @@ class TestResponseStore:
 _has_mlx = importlib.util.find_spec("mlx") is not None
 
 if _has_mlx:
-    import mlx_vlm.server as server  # noqa: E402
     from fastapi.testclient import TestClient  # noqa: E402
+
+    import mlx_vlm.server as server  # noqa: E402
 
 _skip_no_mlx = pytest.mark.skipif(not _has_mlx, reason="mlx not installed")
 
@@ -271,7 +270,8 @@ def client():
 
 def _patch_model():
     return patch.object(
-        server, "get_cached_model",
+        server,
+        "get_cached_model",
         return_value=(mock_model, mock_processor, mock_config),
     )
 
@@ -496,8 +496,11 @@ class TestPromptCache:
             captured["prompt_cache_state"] = kwargs.get("prompt_cache_state")
             return _mock_result()
 
-        with _patch_model(), _patch_template(), \
-             patch.object(server, "generate", side_effect=capture_generate):
+        with (
+            _patch_model(),
+            _patch_template(),
+            patch.object(server, "generate", side_effect=capture_generate),
+        ):
             resp = client.post("/responses", json={"model": "demo", "input": "hi"})
         assert resp.status_code == 200
         assert captured.get("prompt_cache_state") is not None
@@ -509,14 +512,20 @@ class TestPromptCache:
 
         def capture_stream(**kwargs):
             captured["prompt_cache_state"] = kwargs.get("prompt_cache_state")
-            return iter([
-                SimpleNamespace(text="Hi", prompt_tokens=5, generation_tokens=1),
-            ])
+            return iter(
+                [
+                    SimpleNamespace(text="Hi", prompt_tokens=5, generation_tokens=1),
+                ]
+            )
 
-        with _patch_model(), _patch_template(), \
-             patch.object(server, "stream_generate", side_effect=capture_stream):
+        with (
+            _patch_model(),
+            _patch_template(),
+            patch.object(server, "stream_generate", side_effect=capture_stream),
+        ):
             resp = client.post(
-                "/responses", json={"model": "demo", "input": "hi", "stream": True},
+                "/responses",
+                json={"model": "demo", "input": "hi", "stream": True},
             )
         assert resp.status_code == 200
         assert captured.get("prompt_cache_state") is not None
@@ -529,8 +538,11 @@ class TestPromptCache:
             captured["prompt_cache_state"] = kwargs.get("prompt_cache_state")
             return _mock_result()
 
-        with _patch_model(), _patch_template(), \
-             patch.object(server, "generate", side_effect=capture_generate):
+        with (
+            _patch_model(),
+            _patch_template(),
+            patch.object(server, "generate", side_effect=capture_generate),
+        ):
             resp = client.post(
                 "/chat/completions",
                 json={
@@ -547,12 +559,17 @@ class TestPromptCache:
 
         def capture_stream(**kwargs):
             captured["prompt_cache_state"] = kwargs.get("prompt_cache_state")
-            return iter([
-                SimpleNamespace(text="Hi", prompt_tokens=5, generation_tokens=1),
-            ])
+            return iter(
+                [
+                    SimpleNamespace(text="Hi", prompt_tokens=5, generation_tokens=1),
+                ]
+            )
 
-        with _patch_model(), _patch_template(), \
-             patch.object(server, "stream_generate", side_effect=capture_stream):
+        with (
+            _patch_model(),
+            _patch_template(),
+            patch.object(server, "stream_generate", side_effect=capture_stream),
+        ):
             resp = client.post(
                 "/chat/completions",
                 json={
@@ -572,8 +589,11 @@ class TestPromptCache:
             states.append(kwargs.get("prompt_cache_state"))
             return _mock_result()
 
-        with _patch_model(), _patch_template(), \
-             patch.object(server, "generate", side_effect=capture_generate):
+        with (
+            _patch_model(),
+            _patch_template(),
+            patch.object(server, "generate", side_effect=capture_generate),
+        ):
             client.post("/responses", json={"model": "demo", "input": "first"})
             client.post("/responses", json={"model": "demo", "input": "second"})
 
@@ -588,14 +608,19 @@ class TestPromptCache:
             return _mock_result()
 
         # We need to capture from the store directly
-        with _patch_model(), _patch_template(), \
-             patch.object(server, "generate", side_effect=capture_generate):
+        with (
+            _patch_model(),
+            _patch_template(),
+            patch.object(server, "generate", side_effect=capture_generate),
+        ):
             client.post("/responses", json={"model": "model-a", "input": "hi"})
             state_a = server.get_prompt_cache_state("model-a")
             client.post("/responses", json={"model": "model-b", "input": "hi"})
             state_b = server.get_prompt_cache_state("model-b")
 
-        assert state_a is not state_b, "Different models must have separate cache states"
+        assert (
+            state_a is not state_b
+        ), "Different models must have separate cache states"
 
     def test_cache_state_has_correct_interface(self, client):
         """PromptCacheState should expose find_prefix_length and update methods."""
@@ -641,12 +666,14 @@ class TestConcurrencyGuard:
     def test_semaphore_exists_and_is_semaphore(self):
         """get_generation_semaphore should return an asyncio.Semaphore."""
         import asyncio
+
         sem = server.get_generation_semaphore()
         assert isinstance(sem, asyncio.Semaphore)
 
     def test_semaphore_default_value_is_one(self):
         """Default semaphore should allow exactly 1 concurrent request."""
-        import asyncio, os
+        import os
+
         # Reset to force re-creation with default
         server._generation_semaphore = None
         os.environ.pop("MAX_CONCURRENT_REQUESTS", None)
@@ -658,6 +685,7 @@ class TestConcurrencyGuard:
     def test_semaphore_respects_env_var(self):
         """MAX_CONCURRENT_REQUESTS env var should configure semaphore value."""
         import os
+
         server._generation_semaphore = None
         os.environ["MAX_CONCURRENT_REQUESTS"] = "3"
         sem = server.get_generation_semaphore()
@@ -676,7 +704,7 @@ class TestConcurrencyGuard:
 
     def test_responses_non_streaming_acquires_semaphore(self, client):
         """Non-streaming /responses should acquire and release the semaphore."""
-        import asyncio
+
         acquired = []
         released = []
         real_sem = server.get_generation_semaphore()
@@ -692,9 +720,13 @@ class TestConcurrencyGuard:
             released.append(True)
             return original_release()
 
-        with _patch_model(), _patch_template(), _patch_generate(), \
-             patch.object(real_sem, "acquire", side_effect=mock_acquire), \
-             patch.object(real_sem, "release", side_effect=mock_release):
+        with (
+            _patch_model(),
+            _patch_template(),
+            _patch_generate(),
+            patch.object(real_sem, "acquire", side_effect=mock_acquire),
+            patch.object(real_sem, "release", side_effect=mock_release),
+        ):
             resp = client.post("/responses", json={"model": "demo", "input": "hi"})
 
         assert resp.status_code == 200
@@ -732,19 +764,34 @@ class TestFinishReason:
     def test_chat_completions_finish_reason_tool_calls(self, client):
         """finish_reason='tool_calls' when tool calls detected."""
         fake_calls = {
-            "calls": [{"type": "function", "id": "c1", "function": {"name": "search", "arguments": "{}"}}],
+            "calls": [
+                {
+                    "type": "function",
+                    "id": "c1",
+                    "function": {"name": "search", "arguments": "{}"},
+                }
+            ],
             "remaining_text": "",
         }
-        with _patch_model(), _patch_template(), _patch_generate(), \
-             patch.object(server, "_infer_tool_parser", return_value="qwen3_coder"), \
-             patch.object(server, "load_tool_module", return_value=SimpleNamespace()), \
-             patch.object(server, "process_tool_calls", return_value=fake_calls):
+        with (
+            _patch_model(),
+            _patch_template(),
+            _patch_generate(),
+            patch.object(server, "_infer_tool_parser", return_value="qwen3_coder"),
+            patch.object(server, "load_tool_module", return_value=SimpleNamespace()),
+            patch.object(server, "process_tool_calls", return_value=fake_calls),
+        ):
             resp = client.post(
                 "/chat/completions",
                 json={
                     "model": "demo",
                     "messages": [{"role": "user", "content": "search"}],
-                    "tools": [{"type": "function", "function": {"name": "search", "parameters": {}}}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {"name": "search", "parameters": {}},
+                        }
+                    ],
                 },
             )
         assert resp.status_code == 200
@@ -753,16 +800,25 @@ class TestFinishReason:
     def test_chat_completions_finish_reason_stop_tools_no_calls(self, client):
         """finish_reason='stop' when tools defined but model doesn't call any."""
         no_calls = {"calls": [], "remaining_text": "Just text, no tools."}
-        with _patch_model(), _patch_template(), _patch_generate(), \
-             patch.object(server, "_infer_tool_parser", return_value="qwen3_coder"), \
-             patch.object(server, "load_tool_module", return_value=SimpleNamespace()), \
-             patch.object(server, "process_tool_calls", return_value=no_calls):
+        with (
+            _patch_model(),
+            _patch_template(),
+            _patch_generate(),
+            patch.object(server, "_infer_tool_parser", return_value="qwen3_coder"),
+            patch.object(server, "load_tool_module", return_value=SimpleNamespace()),
+            patch.object(server, "process_tool_calls", return_value=no_calls),
+        ):
             resp = client.post(
                 "/chat/completions",
                 json={
                     "model": "demo",
                     "messages": [{"role": "user", "content": "hello"}],
-                    "tools": [{"type": "function", "function": {"name": "search", "parameters": {}}}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {"name": "search", "parameters": {}},
+                        }
+                    ],
                 },
             )
         assert resp.status_code == 200
@@ -771,36 +827,59 @@ class TestFinishReason:
     def test_chat_completions_streaming_finish_reason_tool_calls(self, client):
         """Streaming finish_reason should be 'tool_calls' when tools detected."""
         fake_calls = {
-            "calls": [{"type": "function", "id": "c1", "function": {"name": "search", "arguments": "{}"}}],
+            "calls": [
+                {
+                    "type": "function",
+                    "id": "c1",
+                    "function": {"name": "search", "arguments": "{}"},
+                }
+            ],
             "remaining_text": "",
         }
         chunks = [
             SimpleNamespace(
-                text="calling", prompt_tokens=10, generation_tokens=1,
-                prompt_tps=100.0, generation_tps=50.0, peak_memory=1.0,
+                text="calling",
+                prompt_tokens=10,
+                generation_tokens=1,
+                prompt_tps=100.0,
+                generation_tps=50.0,
+                peak_memory=1.0,
             ),
         ]
 
         def mock_stream(**kwargs):
             return iter(chunks)
 
-        with _patch_model(), _patch_template(), \
-             patch.object(server, "stream_generate", side_effect=mock_stream), \
-             patch.object(server, "_infer_tool_parser", return_value="qwen3_coder"), \
-             patch.object(server, "load_tool_module", return_value=SimpleNamespace()), \
-             patch.object(server, "process_tool_calls", return_value=fake_calls):
+        with (
+            _patch_model(),
+            _patch_template(),
+            patch.object(server, "stream_generate", side_effect=mock_stream),
+            patch.object(server, "_infer_tool_parser", return_value="qwen3_coder"),
+            patch.object(server, "load_tool_module", return_value=SimpleNamespace()),
+            patch.object(server, "process_tool_calls", return_value=fake_calls),
+        ):
             resp = client.post(
                 "/chat/completions",
                 json={
                     "model": "demo",
                     "messages": [{"role": "user", "content": "search"}],
-                    "tools": [{"type": "function", "function": {"name": "search", "parameters": {}}}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {"name": "search", "parameters": {}},
+                        }
+                    ],
                     "stream": True,
                 },
             )
         assert resp.status_code == 200
         import json as json_mod
-        lines = [l for l in resp.text.strip().split("\n") if l.startswith("data:") and "[DONE]" not in l]
+
+        lines = [
+            l
+            for l in resp.text.strip().split("\n")
+            if l.startswith("data:") and "[DONE]" not in l
+        ]
         last_data = json_mod.loads(lines[-1].replace("data: ", ""))
         assert last_data["choices"][0]["finish_reason"] == "tool_calls"
 
@@ -841,7 +920,11 @@ class TestJsonMode:
         with _patch_model(), _patch_template(), _patch_generate():
             resp = client.post(
                 "/responses",
-                json={"model": "demo", "input": "Give me JSON", "response_format": {"type": "json_object"}},
+                json={
+                    "model": "demo",
+                    "input": "Give me JSON",
+                    "response_format": {"type": "json_object"},
+                },
             )
         assert resp.status_code == 200
 
@@ -857,14 +940,19 @@ class TestContextTracking:
 
     def test_check_context_length_within_limit(self):
         fake_proc = SimpleNamespace(
-            tokenizer=SimpleNamespace(encode=lambda s, add_special_tokens=False: list(range(10))),
+            tokenizer=SimpleNamespace(
+                encode=lambda s, add_special_tokens=False: list(range(10))
+            ),
         )
         server.check_context_length("short", fake_proc, 100)
 
     def test_check_context_length_exceeds_limit(self):
         from fastapi import HTTPException as _Exc
+
         fake_proc = SimpleNamespace(
-            tokenizer=SimpleNamespace(encode=lambda s, add_special_tokens=False: list(range(200))),
+            tokenizer=SimpleNamespace(
+                encode=lambda s, add_special_tokens=False: list(range(200))
+            ),
         )
         with pytest.raises(_Exc) as exc_info:
             server.check_context_length("long", fake_proc, 100)
@@ -875,11 +963,13 @@ class TestContextTracking:
 
     def test_get_max_context_tokens_default(self):
         import os
+
         os.environ.pop("MAX_CONTEXT_TOKENS", None)
         assert server.get_max_context_tokens() == 0
 
     def test_get_max_context_tokens_from_env(self):
         import os
+
         os.environ["MAX_CONTEXT_TOKENS"] = "16384"
         assert server.get_max_context_tokens() == 16384
         os.environ.pop("MAX_CONTEXT_TOKENS")
@@ -896,11 +986,13 @@ class TestRequestCancellation:
 
     def test_get_request_timeout_default(self):
         import os
+
         os.environ.pop("REQUEST_TIMEOUT", None)
         assert server.get_request_timeout() == 300
 
     def test_get_request_timeout_from_env(self):
         import os
+
         os.environ["REQUEST_TIMEOUT"] = "60"
         assert server.get_request_timeout() == 60
         os.environ.pop("REQUEST_TIMEOUT")
@@ -908,13 +1000,23 @@ class TestRequestCancellation:
     def test_streaming_cleanup_on_normal_completion(self, client):
         """Streaming should complete normally and clean up."""
         chunks = [
-            SimpleNamespace(text="Hi", prompt_tokens=5, generation_tokens=1,
-                          prompt_tps=100.0, generation_tps=50.0, peak_memory=1.0),
+            SimpleNamespace(
+                text="Hi",
+                prompt_tokens=5,
+                generation_tokens=1,
+                prompt_tps=100.0,
+                generation_tps=50.0,
+                peak_memory=1.0,
+            ),
         ]
-        with _patch_model(), _patch_template(), \
-             patch.object(server, "stream_generate", return_value=iter(chunks)):
+        with (
+            _patch_model(),
+            _patch_template(),
+            patch.object(server, "stream_generate", return_value=iter(chunks)),
+        ):
             resp = client.post(
-                "/responses", json={"model": "demo", "input": "hi", "stream": True},
+                "/responses",
+                json={"model": "demo", "input": "hi", "stream": True},
             )
         assert resp.status_code == 200
         assert "response.completed" in resp.text
@@ -955,9 +1057,17 @@ class TestPromptCacheKeyRouting:
             captured["state"] = kwargs.get("prompt_cache_state")
             return _mock_result()
 
-        with _patch_model(), _patch_template(), \
-             patch.object(server, "generate", side_effect=capture_gen):
-            client.post("/responses", json={
-                "model": "demo", "input": "hi", "prompt_cache_key": "my-session",
-            })
+        with (
+            _patch_model(),
+            _patch_template(),
+            patch.object(server, "generate", side_effect=capture_gen),
+        ):
+            client.post(
+                "/responses",
+                json={
+                    "model": "demo",
+                    "input": "hi",
+                    "prompt_cache_key": "my-session",
+                },
+            )
         assert captured["state"] is server.get_prompt_cache_state("demo", "my-session")

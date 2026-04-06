@@ -671,7 +671,9 @@ def stream_generate(
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
-        cached_total = len(prompt_cache_state.token_ids) if prompt_cache_state.token_ids else 0
+        cached_total = (
+            len(prompt_cache_state.token_ids) if prompt_cache_state.token_ids else 0
+        )
         # Only reuse if a substantial prefix matches (>= 50% of cached tokens).
         # Short matches on quantized KV caches (TurboQuant) can produce
         # corrupted output because trim() only adjusts the offset without
@@ -796,7 +798,10 @@ def stream_generate(
         # polluting the cache with short probe/capability-check requests that
         # some agent frameworks send before the real request.
         _MIN_CACHE_TOKENS = 1024
-        if prompt_cache_state is not None and len(full_input_ids_list) >= _MIN_CACHE_TOKENS:
+        if (
+            prompt_cache_state is not None
+            and len(full_input_ids_list) >= _MIN_CACHE_TOKENS
+        ):
             all_ids = full_input_ids_list + [
                 t.item() if hasattr(t, "item") else t for t in generated_tokens
             ]
