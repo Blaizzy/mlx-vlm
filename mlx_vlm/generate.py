@@ -684,24 +684,23 @@ def stream_generate(
             if not has_image_in_new:
                 pixel_values = None
                 kwargs.pop("cached_image_features", None)
-            # Reuse the saved KV cache (trimmed to prefix length)
+            # Reuse the saved KV cache (trimmed to prefix length).
+            # Works with both standard KVCache (mx.array keys) and
+            # quantized caches (TurboQuant) via their trim() method.
             kv_cache = prompt_cache_state.cache
-            # Trim cache to prefix_len in case it includes generated tokens.
-            # Only trim standard KVCache layers (with mx.array keys);
-            # quantized caches (TurboQuant, etc.) don't support slicing.
             for c in kv_cache:
-                if hasattr(c, "keys") and c.keys is not None:
-                    keys = c.keys
-                    if hasattr(keys, "shape") and len(keys.shape) >= 3:
-                        cached_len = keys.shape[2]
-                        if cached_len > prefix_len:
+                if hasattr(c, "offset") and c.offset > prefix_len:
+                    trim_amount = c.offset - prefix_len
+                    if hasattr(c, "trim") and callable(c.trim):
+                        # Use trim(n) which removes the last n tokens
+                        # and invalidates internal caches properly.
+                        c.trim(trim_amount)
+                    elif hasattr(c, "keys") and c.keys is not None:
+                        keys = c.keys
+                        if hasattr(keys, "shape") and len(keys.shape) >= 3:
                             c.keys = keys[:, :, :prefix_len, :]
                             c.values = c.values[:, :, :prefix_len, :]
-                            if hasattr(c, "offset"):
-                                c.offset = prefix_len
-                    elif hasattr(c, "offset") and c.offset > prefix_len:
-                        # Quantized cache: just update offset if possible
-                        c.offset = prefix_len
+                            c.offset = prefix_len
             kwargs["prompt_cache"] = kv_cache
 
     if thinking_budget is not None:
