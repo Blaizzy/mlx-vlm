@@ -385,3 +385,24 @@ def test_turboquant_prefill_attention_matches_dequantized_attention():
     diff = mx.max(mx.abs(reference - quantized)).item()
     assert quantized.shape == reference.shape
     assert diff < 1e-4
+
+
+def test_turboquant_cache_trim_for_prefix_reuse():
+    keys = mx.random.normal((1, 2, 16, 32))
+    values = mx.random.normal((1, 2, 16, 32))
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(keys, values)
+    turbo_cache = TurboQuantKVCache.from_cache(fp_cache, bits=3.5)
+
+    assert turbo_cache.offset == 16
+
+    # Simulate prefix reuse: trim to keep first 12 tokens
+    turbo_cache.trim(4)
+    assert turbo_cache.offset == 12
+
+    # Cache should still accept new tokens after trim
+    new_keys = mx.random.normal((1, 2, 1, 32))
+    new_values = mx.random.normal((1, 2, 1, 32))
+    turbo_cache.update_and_fetch(new_keys, new_values)
+    assert turbo_cache.offset == 13
