@@ -380,11 +380,11 @@ def test_apply_chat_template_uses_plamo2vl_processor():
     result = apply_chat_template(
         DummyProcessor(),
         {"model_type": "plamo2vl"},
-        "最下段の最も左の段ボールのタグは何色ですか？",
+        "画像の前面に積み重なっているのはどのようなアイテムですか？",
         num_images=1,
     )
 
     assert result == "formatted-plamo-prompt"
-    assert captured["messages"] == ["最下段の最も左の段ボールのタグは何色ですか？"]
+    assert captured["messages"] == ["画像の前面に積み重なっているのはどのようなアイテムですか？"]
     assert captured["tokenize"] is False
     assert captured["add_generation_prompt"] is True
