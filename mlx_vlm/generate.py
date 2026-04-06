@@ -791,12 +791,19 @@ def stream_generate(
             peak_memory=mx.get_peak_memory() / 1e9,
         )
 
-        # Save cache state for potential reuse on next turn
-        if prompt_cache_state is not None:
+        # Save cache state for potential reuse on next turn.
+        # Only save if the prompt was substantial (>= 1024 tokens) to avoid
+        # polluting the cache with short probe/capability-check requests that
+        # some agent frameworks send before the real request.
+        _MIN_CACHE_TOKENS = 1024
+        if prompt_cache_state is not None and len(full_input_ids_list) >= _MIN_CACHE_TOKENS:
             all_ids = full_input_ids_list + [
                 t.item() if hasattr(t, "item") else t for t in generated_tokens
             ]
             prompt_cache_state.update(all_ids, tracked_cache)
+            print(f"[prompt-cache] saved {len(all_ids)} tokens to cache")
+        elif prompt_cache_state is not None:
+            print(f"[prompt-cache] skipped cache save ({len(full_input_ids_list)} tokens < {_MIN_CACHE_TOKENS})")
 
         # Cleanup after generation
         mx.clear_cache()
