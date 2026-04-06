@@ -671,7 +671,13 @@ def stream_generate(
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
-        if prefix_len > 0 and prefix_len < input_ids.shape[1]:
+        cached_total = len(prompt_cache_state.token_ids) if prompt_cache_state.token_ids else 0
+        # Only reuse if a substantial prefix matches (>= 50% of cached tokens).
+        # Short matches on quantized KV caches (TurboQuant) can produce
+        # corrupted output because trim() only adjusts the offset without
+        # clearing stale quantized data.
+        min_reuse = max(512, cached_total // 2)
+        if prefix_len >= min_reuse and prefix_len < input_ids.shape[1]:
             reused_prefix_len = prefix_len
             # Trim to only new tokens
             input_ids = input_ids[:, prefix_len:]
