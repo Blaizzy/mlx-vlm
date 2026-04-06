@@ -637,6 +637,10 @@ class ChatStreamChunk(BaseModel):
     usage: Optional[UsageStats]
 
 
+class InvalidToolChoiceError(ValueError):
+    """Raised when tool_choice is invalid."""
+
+
 def resolve_tool_choice(
     tools: Optional[list],
     tool_choice: Optional[Any],
@@ -653,6 +657,10 @@ def resolve_tool_choice(
         ``filtered_tools`` may be ``None`` (when choice is ``"none"``).
         ``system_instruction`` is an optional string to prepend to the
         prompt to steer the model's tool-use behavior.
+
+    Raises:
+        InvalidToolChoiceError: If tool_choice is not a recognized value
+            or references an unknown tool name.
     """
     if not tools or tool_choice is None or tool_choice == "auto":
         return tools, None
@@ -673,10 +681,20 @@ def resolve_tool_choice(
                 if (t.get("function", {}) or {}).get("name") == name
                 or t.get("name") == name
             ]
+            if not filtered:
+                raise InvalidToolChoiceError(
+                    f"Tool '{name}' not found in the provided tools list"
+                )
             return (
-                filtered or tools,
+                filtered,
                 f'You must call the "{name}" tool to answer this request.',
             )
+
+    if isinstance(tool_choice, str):
+        raise InvalidToolChoiceError(
+            f"Invalid tool_choice value: '{tool_choice}'. "
+            "Must be 'none', 'auto', 'required', or a tool specification dict."
+        )
 
     return tools, None
 
@@ -1148,7 +1166,10 @@ async def chat_completions_endpoint(request: ChatRequest):
 
         # Apply tool_choice policy
         tool_choice = getattr(request, "tool_choice", None)
-        tools, tool_instruction = resolve_tool_choice(tools, tool_choice)
+        try:
+            tools, tool_instruction = resolve_tool_choice(tools, tool_choice)
+        except InvalidToolChoiceError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         if tool_instruction:
             processed_messages.insert(0, {"role": "system", "content": tool_instruction})
 
@@ -1156,7 +1177,7 @@ async def chat_completions_endpoint(request: ChatRequest):
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
-        if hasattr(tokenizer, "chat_template"):
+        if tools and hasattr(tokenizer, "chat_template"):
             tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
             if tool_parser_type is not None:
                 tool_module = load_tool_module(tool_parser_type)

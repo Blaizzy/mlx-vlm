@@ -141,7 +141,7 @@ def test_resolve_tool_choice_auto_passthrough():
     """tool_choice='auto' should return tools unchanged."""
     tools = [{"function": {"name": "search"}}]
     result_tools, instruction = server.resolve_tool_choice(tools, "auto")
-    assert result_tools is tools
+    assert result_tools == tools
     assert instruction is None
 
 
@@ -157,7 +157,7 @@ def test_resolve_tool_choice_required_adds_instruction():
     """tool_choice='required' should keep tools and add instruction."""
     tools = [{"function": {"name": "search"}}]
     result_tools, instruction = server.resolve_tool_choice(tools, "required")
-    assert result_tools is tools
+    assert result_tools == tools
     assert instruction is not None
     assert "must call" in instruction.lower()
 
@@ -176,20 +176,26 @@ def test_resolve_tool_choice_specific_function():
     assert "fetch" in instruction
 
 
-def test_resolve_tool_choice_specific_unknown_falls_back():
-    """Unknown function name should fall back to all tools."""
+def test_resolve_tool_choice_unknown_tool_returns_400():
+    """Unknown function name should raise InvalidToolChoiceError."""
     tools = [{"function": {"name": "search"}}]
     choice = {"type": "function", "function": {"name": "nonexistent"}}
-    result_tools, instruction = server.resolve_tool_choice(tools, choice)
-    assert result_tools is tools
-    assert "nonexistent" in instruction
+    with pytest.raises(server.InvalidToolChoiceError, match="not found"):
+        server.resolve_tool_choice(tools, choice)
+
+
+def test_resolve_tool_choice_invalid_string_returns_error():
+    """Invalid string tool_choice should raise InvalidToolChoiceError."""
+    tools = [{"function": {"name": "search"}}]
+    with pytest.raises(server.InvalidToolChoiceError, match="Invalid tool_choice"):
+        server.resolve_tool_choice(tools, "bogus")
 
 
 def test_resolve_tool_choice_none_value_passthrough():
     """tool_choice=None should return tools unchanged."""
     tools = [{"function": {"name": "search"}}]
     result_tools, instruction = server.resolve_tool_choice(tools, None)
-    assert result_tools is tools
+    assert result_tools == tools
     assert instruction is None
 
 
