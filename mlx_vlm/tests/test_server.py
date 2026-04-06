@@ -172,8 +172,7 @@ def test_chat_completions_stop_string_passed_as_eos_tokens(client):
         )
     assert resp.status_code == 200
     assert "eos_tokens" in mock_gen.call_args.kwargs
-    assert isinstance(mock_gen.call_args.kwargs["eos_tokens"], set)
-    assert 42 in mock_gen.call_args.kwargs["eos_tokens"]
+    assert mock_gen.call_args.kwargs["eos_tokens"] == ["\n\n", "</s>"]
 
 
 def test_chat_completions_no_stop_no_eos_tokens(client):
@@ -235,22 +234,22 @@ def test_responses_stop_string_passed_as_eos_tokens(client):
         )
     assert resp.status_code == 200
     assert "eos_tokens" in mock_gen.call_args.kwargs
-    assert 99 in mock_gen.call_args.kwargs["eos_tokens"]
+    assert mock_gen.call_args.kwargs["eos_tokens"] == ["STOP"]
 
 
-def test_resolve_stop_tokens_single_string():
-    """resolve_stop_tokens should handle a single string."""
+def test_resolve_stop_sequences_single_string():
+    """resolve_stop_sequences should handle a single string."""
     fake_processor = SimpleNamespace(
         tokenizer=SimpleNamespace(
             encode=lambda s, add_special_tokens=False: [10, 20],
         ),
     )
-    result = server.resolve_stop_tokens("hello", fake_processor)
-    assert result == {20}  # Last token of encoded string
+    result = server.resolve_stop_sequences("hello")
+    assert result == ["hello"]
 
 
-def test_resolve_stop_tokens_list():
-    """resolve_stop_tokens should handle a list of strings."""
+def test_resolve_stop_sequences_list():
+    """resolve_stop_sequences should handle a list of strings."""
     call_count = [0]
     token_map = {0: [10], 1: [20, 30]}
 
@@ -262,18 +261,17 @@ def test_resolve_stop_tokens_list():
     fake_processor = SimpleNamespace(
         tokenizer=SimpleNamespace(encode=fake_encode),
     )
-    result = server.resolve_stop_tokens(["a", "b"], fake_processor)
-    assert 10 in result
-    assert 30 in result
+    result = server.resolve_stop_sequences(["a", "b"])
+    assert result == ["a", "b"]
 
 
-def test_resolve_stop_tokens_none():
-    """resolve_stop_tokens should return None for None input."""
-    assert server.resolve_stop_tokens(None, None) is None
+def test_resolve_stop_sequences_none():
+    """resolve_stop_sequences should return None for None input."""
+    assert server.resolve_stop_sequences(None) is None
 
 
-def test_resolve_stop_tokens_limits_to_four():
-    """resolve_stop_tokens should process at most 4 sequences."""
+def test_resolve_stop_sequences_limits_to_four():
+    """resolve_stop_sequences should process at most 4 sequences."""
     call_count = [0]
 
     def fake_encode(s, add_special_tokens=False):
@@ -283,5 +281,5 @@ def test_resolve_stop_tokens_limits_to_four():
     fake_processor = SimpleNamespace(
         tokenizer=SimpleNamespace(encode=fake_encode),
     )
-    result = server.resolve_stop_tokens(["a", "b", "c", "d", "e", "f"], fake_processor)
-    assert len(result) == 4  # Only first 4 processed
+    result = server.resolve_stop_sequences(["a", "b", "c", "d", "e", "f"])
+    assert len(result) == 4
