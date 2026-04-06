@@ -126,11 +126,16 @@ model_cache = {}
 # Concurrency guard: MLX generation is single-threaded on Metal.
 # Concurrent requests would corrupt shared GPU state. The semaphore
 # serializes access to the generation pipeline.
+# NOTE: This guard assumes uvicorn runs with workers=1 (the default).
+# Multiple workers would each have their own semaphore, bypassing the guard.
 _generation_semaphore: Optional[asyncio.Semaphore] = None
 
 
 def get_max_concurrent_requests() -> int:
-    return int(os.environ.get("MAX_CONCURRENT_REQUESTS", 1))
+    value = int(os.environ.get("MAX_CONCURRENT_REQUESTS", 1))
+    if value < 1:
+        raise ValueError(f"MAX_CONCURRENT_REQUESTS must be >= 1, got {value}")
+    return value
 
 
 def get_generation_semaphore() -> asyncio.Semaphore:
@@ -1002,61 +1007,58 @@ async def responses_endpoint(openai_request: OpenAIRequest):
 
         else:
             # Non-streaming response
-            sem = get_generation_semaphore()
-            await sem.acquire()
-            try:
-                # Use generate from generate.py
-                result = generate(
-                    model=model,
-                    processor=processor,
-                    prompt=formatted_prompt,
-                    image=images,
-                    verbose=False,  # stats are passed in the response
-                    **generation_kwargs,
-                )
-                # Clean up resources
-                mx.clear_cache()
-                gc.collect()
-                print("Generation finished, cleared cache.")
+            async with get_generation_semaphore():
+                try:
+                    # Use generate from generate.py
+                    result = generate(
+                        model=model,
+                        processor=processor,
+                        prompt=formatted_prompt,
+                        image=images,
+                        verbose=False,  # stats are passed in the response
+                        **generation_kwargs,
+                    )
+                    # Clean up resources
+                    mx.clear_cache()
+                    gc.collect()
+                    print("Generation finished, cleared cache.")
 
-                response = OpenAIResponse(
-                    id=response_id,
-                    object="response",
-                    created_at=int(generated_at),
-                    status="completed",
-                    instructions=instructions,
-                    max_output_tokens=openai_request.max_output_tokens,
-                    model=openai_request.model,
-                    output=[
-                        {
-                            "role": "assistant",
-                            "content": [
-                                {
-                                    "type": "output_text",
-                                    "text": result.text,
-                                }
-                            ],
-                        }
-                    ],
-                    output_text=result.text,
-                    temperature=openai_request.temperature,
-                    top_p=openai_request.top_p,
-                    usage={
-                        "input_tokens": result.prompt_tokens,
-                        "output_tokens": result.generation_tokens,
-                        "total_tokens": result.total_tokens,
-                    },
-                )
-                return response
+                    response = OpenAIResponse(
+                        id=response_id,
+                        object="response",
+                        created_at=int(generated_at),
+                        status="completed",
+                        instructions=instructions,
+                        max_output_tokens=openai_request.max_output_tokens,
+                        model=openai_request.model,
+                        output=[
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": result.text,
+                                    }
+                                ],
+                            }
+                        ],
+                        output_text=result.text,
+                        temperature=openai_request.temperature,
+                        top_p=openai_request.top_p,
+                        usage={
+                            "input_tokens": result.prompt_tokens,
+                            "output_tokens": result.generation_tokens,
+                            "total_tokens": result.total_tokens,
+                        },
+                    )
+                    return response
 
-            except Exception as e:
-                print(f"Error during generation: {e}")
-                traceback.print_exc()
-                mx.clear_cache()
-                gc.collect()
-                raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
-            finally:
-                sem.release()
+                except Exception as e:
+                    print(f"Error during generation: {e}")
+                    traceback.print_exc()
+                    mx.clear_cache()
+                    gc.collect()
+                    raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions (like model loading failure)
@@ -1250,70 +1252,67 @@ async def chat_completions_endpoint(request: ChatRequest):
 
         else:
             # Non-streaming response
-            sem = get_generation_semaphore()
-            await sem.acquire()
-            try:
-                # Use generate from generate.py
-                gen_result = generate(
-                    model=model,
-                    processor=processor,
-                    prompt=formatted_prompt,
-                    image=images,
-                    audio=audio,
-                    verbose=False,  # Keep API output clean
-                    vision_cache=model_cache.get("vision_cache"),
-                    **generation_kwargs,
-                )
-                # Clean up resources
-                mx.clear_cache()
-                gc.collect()
-                print("Generation finished, cleared cache.")
-
-                usage_stats = UsageStats(
-                    input_tokens=gen_result.prompt_tokens,
-                    output_tokens=gen_result.generation_tokens,
-                    total_tokens=gen_result.total_tokens,
-                    prompt_tps=gen_result.prompt_tps,
-                    generation_tps=gen_result.generation_tps,
-                    peak_memory=gen_result.peak_memory,
-                )
-
-                if tool_parser_type is not None:
-                    tool_calls = process_tool_calls(
-                        model_output=gen_result.text,
-                        tool_module=tool_module,
-                        tools=tools,
+            async with get_generation_semaphore():
+                try:
+                    # Use generate from generate.py
+                    gen_result = generate(
+                        model=model,
+                        processor=processor,
+                        prompt=formatted_prompt,
+                        image=images,
+                        audio=audio,
+                        verbose=False,  # Keep API output clean
+                        vision_cache=model_cache.get("vision_cache"),
+                        **generation_kwargs,
                     )
-                else:
-                    tool_calls = {}
-                    tool_calls["calls"] = []
-                    tool_calls["remaining_text"] = gen_result.text
+                    # Clean up resources
+                    mx.clear_cache()
+                    gc.collect()
+                    print("Generation finished, cleared cache.")
 
-                choices = [
-                    ChatChoice(
-                        finish_reason="stop",
-                        message=ChatMessage(
-                            role="assistant",
-                            content=tool_calls["remaining_text"],
-                            tool_calls=tool_calls["calls"],
-                        ),
+                    usage_stats = UsageStats(
+                        input_tokens=gen_result.prompt_tokens,
+                        output_tokens=gen_result.generation_tokens,
+                        total_tokens=gen_result.total_tokens,
+                        prompt_tps=gen_result.prompt_tps,
+                        generation_tps=gen_result.generation_tps,
+                        peak_memory=gen_result.peak_memory,
                     )
-                ]
 
-                result = ChatResponse(
-                    model=request.model, usage=usage_stats, choices=choices
-                )
+                    if tool_parser_type is not None:
+                        tool_calls = process_tool_calls(
+                            model_output=gen_result.text,
+                            tool_module=tool_module,
+                            tools=tools,
+                        )
+                    else:
+                        tool_calls = {}
+                        tool_calls["calls"] = []
+                        tool_calls["remaining_text"] = gen_result.text
 
-                return result
+                    choices = [
+                        ChatChoice(
+                            finish_reason="stop",
+                            message=ChatMessage(
+                                role="assistant",
+                                content=tool_calls["remaining_text"],
+                                tool_calls=tool_calls["calls"],
+                            ),
+                        )
+                    ]
 
-            except Exception as e:
-                print(f"Error during generation: {e}")
-                traceback.print_exc()
-                mx.clear_cache()
-                gc.collect()
-                raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
-            finally:
-                sem.release()
+                    result = ChatResponse(
+                        model=request.model, usage=usage_stats, choices=choices
+                    )
+
+                    return result
+
+                except Exception as e:
+                    print(f"Error during generation: {e}")
+                    traceback.print_exc()
+                    mx.clear_cache()
+                    gc.collect()
+                    raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions (like model loading failure)
@@ -1494,6 +1493,8 @@ def main():
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    if args.max_concurrent_requests < 1:
+        parser.error("--max-concurrent-requests must be >= 1")
     os.environ["MAX_CONCURRENT_REQUESTS"] = str(args.max_concurrent_requests)
 
     uvicorn.run(

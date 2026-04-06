@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import mlx_vlm.server as server
+from mlx_vlm.server import get_max_concurrent_requests
 
 
 @pytest.fixture
@@ -130,3 +131,45 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["repetition_penalty"] == 1.15
     assert mock_generate.call_args.kwargs["logit_bias"] == {12: -1.5}
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
+
+
+# ---------------------------------------------------------------------------
+# Concurrency guard tests
+# ---------------------------------------------------------------------------
+
+
+def test_get_max_concurrent_requests_default(monkeypatch):
+    """Default value should be 1."""
+    monkeypatch.delenv("MAX_CONCURRENT_REQUESTS", raising=False)
+    assert get_max_concurrent_requests() == 1
+
+
+def test_get_max_concurrent_requests_custom(monkeypatch):
+    """Should read from env var."""
+    monkeypatch.setenv("MAX_CONCURRENT_REQUESTS", "3")
+    assert get_max_concurrent_requests() == 3
+
+
+def test_get_max_concurrent_requests_rejects_zero(monkeypatch):
+    """Zero would deadlock the semaphore."""
+    monkeypatch.setenv("MAX_CONCURRENT_REQUESTS", "0")
+    with pytest.raises(ValueError, match="must be >= 1"):
+        get_max_concurrent_requests()
+
+
+def test_get_max_concurrent_requests_rejects_negative(monkeypatch):
+    """Negative values are invalid."""
+    monkeypatch.setenv("MAX_CONCURRENT_REQUESTS", "-1")
+    with pytest.raises(ValueError, match="must be >= 1"):
+        get_max_concurrent_requests()
+
+
+def test_generation_semaphore_is_created(monkeypatch):
+    """Semaphore should be created with correct value."""
+    monkeypatch.setenv("MAX_CONCURRENT_REQUESTS", "2")
+    # Reset the cached semaphore
+    server._generation_semaphore = None
+    sem = server.get_generation_semaphore()
+    assert sem._value == 2
+    # Cleanup
+    server._generation_semaphore = None
