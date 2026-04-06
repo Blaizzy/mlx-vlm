@@ -671,7 +671,13 @@ def stream_generate(
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
-        if prefix_len > 0 and prefix_len < input_ids.shape[1]:
+        cached_total = len(prompt_cache_state.token_ids) if prompt_cache_state.token_ids else 0
+        # Only reuse if a substantial prefix matches (>= 50% of cached tokens).
+        # Short matches on quantized KV caches (TurboQuant) can produce
+        # corrupted output because trim() only adjusts the offset without
+        # clearing stale quantized data.
+        min_reuse = max(512, cached_total // 2)
+        if prefix_len >= min_reuse and prefix_len < input_ids.shape[1]:
             reused_prefix_len = prefix_len
             # Trim to only new tokens
             input_ids = input_ids[:, prefix_len:]
@@ -684,21 +690,21 @@ def stream_generate(
             if not has_image_in_new:
                 pixel_values = None
                 kwargs.pop("cached_image_features", None)
-            # Reuse the saved KV cache (trimmed to prefix length)
+            # Reuse the saved KV cache (trimmed to prefix length).
+            # Works with both standard KVCache (mx.array keys) and
+            # quantized caches (TurboQuant) via their trim() method.
             kv_cache = prompt_cache_state.cache
-            # Trim cache to prefix_len in case it includes generated tokens.
-            # Only trim standard KVCache layers (with mx.array keys);
-            # quantized caches (TurboQuant, etc.) don't support slicing.
             for c in kv_cache:
-                if hasattr(c, "keys") and c.keys is not None:
-                    keys = c.keys
-                    if hasattr(keys, "shape") and len(keys.shape) >= 3:
-                        cached_len = keys.shape[2]
-                        if cached_len > prefix_len:
+                if hasattr(c, "offset") and c.offset > prefix_len:
+                    trim_amount = c.offset - prefix_len
+                    if hasattr(c, "trim") and callable(c.trim):
+                        c.trim(trim_amount)
+                    elif hasattr(c, "keys") and c.keys is not None:
+                        keys = c.keys
+                        if hasattr(keys, "shape") and len(keys.shape) >= 3:
                             c.keys = keys[:, :, :prefix_len, :]
                             c.values = c.values[:, :, :prefix_len, :]
-                            if hasattr(c, "offset"):
-                                c.offset = prefix_len
+                            c.offset = prefix_len
                     elif hasattr(c, "offset") and c.offset > prefix_len:
                         # Quantized cache: just update offset if possible
                         c.offset = prefix_len
@@ -786,7 +792,12 @@ def stream_generate(
         )
 
         # Save cache state for potential reuse on next turn
-        if prompt_cache_state is not None:
+        # Save cache state for potential reuse on next turn.
+        # Only save if the prompt was substantial (>= 1024 tokens) to avoid
+        # polluting the cache with short probe/capability-check requests that
+        # some agent frameworks send before the real request.
+        _MIN_CACHE_TOKENS = 1024
+        if prompt_cache_state is not None and len(full_input_ids_list) >= _MIN_CACHE_TOKENS:
             all_ids = full_input_ids_list + [
                 t.item() if hasattr(t, "item") else t for t in generated_tokens
             ]
