@@ -673,6 +673,10 @@ def stream_generate(
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
         cached_len = len(prompt_cache_state.token_ids) if prompt_cache_state.token_ids else 0
         print(f"[prompt-cache] prefix_match={prefix_len}/{cached_len}, new_input={input_ids.shape[1]}, reuse={'yes' if prefix_len > 0 and prefix_len < input_ids.shape[1] else 'no'}")
+        if prefix_len < 20 and cached_len > 0:
+            cached_start = prompt_cache_state.token_ids[:10]
+            new_start = full_input_ids_list[:10]
+            print(f"[prompt-cache] MISMATCH: cached_start={cached_start}, new_start={new_start}")
         if prefix_len > 0 and prefix_len < input_ids.shape[1]:
             reused_prefix_len = prefix_len
             # Trim to only new tokens
