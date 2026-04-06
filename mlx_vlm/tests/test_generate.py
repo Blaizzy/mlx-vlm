@@ -1036,6 +1036,7 @@ def test_generate_cli_smoke(capsys):
     import importlib
 
     generate_module = importlib.import_module("mlx_vlm.generate")
+    prompt = ["最下段の最も左の段ボールのタグは何色ですか？"]
 
     args = Namespace(
         model="demo",
@@ -1043,7 +1044,7 @@ def test_generate_cli_smoke(capsys):
         image=["image.png"],
         audio=None,
         resize_shape=[224],
-        prompt=["Describe this image."],
+        prompt=prompt,
         system=None,
         max_tokens=12,
         temperature=0.7,
@@ -1086,6 +1087,8 @@ def test_generate_cli_smoke(capsys):
     ):
         generate_module.main()
 
+    assert mock_apply_chat_template.call_args.args[2] == prompt
+    assert mock_apply_chat_template.call_args.kwargs["num_images"] == 1
     assert mock_apply_chat_template.call_args.kwargs["enable_thinking"] is False
     assert mock_generate.call_args.kwargs["enable_thinking"] is False
     assert mock_generate.call_args.kwargs["max_tokens"] == 12
