@@ -1,6 +1,6 @@
 # SAM 3D Body for MLX
 
-MLX port of [Meta's SAM 3D Body](https://github.com/nicholassmith1/SAM-3D-Body) (arXiv:2603.15603) — single-image 3D human body mesh estimation using a DINOv3 vision backbone and MHR parametric body model.
+MLX port of [Meta's SAM 3D Body](https://github.com/facebookresearch/sam-3d-body) (arXiv:2603.15603) — single-image 3D human body mesh estimation using a DINOv3 vision backbone and MHR parametric body model.
 
 > **Note:** Unlike SAM 3 / SAM 3.1 (segmentation), SAM 3D Body predicts a full 3D mesh (18,439 vertices, 36,874 faces) with 127 skeletal joints and 70 3D keypoints from a single RGB image. The entire pipeline — backbone, decoder, FK, skinning — runs in pure MLX with no PyTorch dependency at inference.
 
