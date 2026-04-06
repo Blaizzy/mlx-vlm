@@ -639,8 +639,8 @@ class ChatStreamChunk(BaseModel):
 
 
 def resolve_stop_sequences(
-    stop: Optional[Union[str, list]],
-) -> Optional[list]:
+    stop: Optional[Union[str, List[str]]],
+) -> Optional[List[str]]:
     """Normalize stop sequences for the generation stopping criteria.
 
     The generation pipeline's ``add_eos_token_ids`` accepts strings
@@ -877,7 +877,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
         )
         generation_kwargs = build_generation_kwargs(openai_request, template_kwargs)
 
-        # Resolve stop sequences to token IDs
+        # Resolve stop sequences to strings for eos_tokens
         stop_seqs = resolve_stop_sequences(getattr(openai_request, "stop", None))
         if stop_seqs:
             generation_kwargs["eos_tokens"] = stop_seqs
@@ -1150,7 +1150,7 @@ async def chat_completions_endpoint(request: ChatRequest):
         )
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
 
-        # Resolve stop sequences to token IDs
+        # Resolve stop sequences to strings for eos_tokens
         stop_seqs = resolve_stop_sequences(getattr(request, "stop", None))
         if stop_seqs:
             generation_kwargs["eos_tokens"] = stop_seqs

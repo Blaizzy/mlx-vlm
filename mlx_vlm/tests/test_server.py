@@ -137,14 +137,11 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
 # ---------------------------------------------------------------------------
 
 
-def test_chat_completions_stop_string_passed_as_eos_tokens(client):
-    """stop parameter should be resolved to eos_tokens in generate kwargs."""
+def test_chat_completions_stop_passed_as_eos_tokens(client):
+    """stop parameter should be forwarded as eos_tokens strings in generate kwargs."""
     model = SimpleNamespace()
     processor = SimpleNamespace(
-        tokenizer=SimpleNamespace(
-            chat_template="",
-            encode=lambda s, add_special_tokens=False: [42],
-        ),
+        tokenizer=SimpleNamespace(chat_template=""),
     )
     config = SimpleNamespace(model_type="test")
     result = SimpleNamespace(
@@ -203,14 +200,11 @@ def test_chat_completions_no_stop_no_eos_tokens(client):
     assert "eos_tokens" not in mock_gen.call_args.kwargs
 
 
-def test_responses_stop_string_passed_as_eos_tokens(client):
-    """stop parameter on /responses should also resolve to eos_tokens."""
+def test_responses_stop_passed_as_eos_tokens(client):
+    """stop parameter on /responses should also forward as eos_tokens strings."""
     model = SimpleNamespace()
     processor = SimpleNamespace(
-        tokenizer=SimpleNamespace(
-            chat_template="",
-            encode=lambda s, add_special_tokens=False: [99],
-        ),
+        tokenizer=SimpleNamespace(chat_template=""),
     )
     config = SimpleNamespace(model_type="test")
     result = SimpleNamespace(
@@ -238,29 +232,13 @@ def test_responses_stop_string_passed_as_eos_tokens(client):
 
 
 def test_resolve_stop_sequences_single_string():
-    """resolve_stop_sequences should handle a single string."""
-    fake_processor = SimpleNamespace(
-        tokenizer=SimpleNamespace(
-            encode=lambda s, add_special_tokens=False: [10, 20],
-        ),
-    )
+    """resolve_stop_sequences should wrap a single string in a list."""
     result = server.resolve_stop_sequences("hello")
     assert result == ["hello"]
 
 
 def test_resolve_stop_sequences_list():
-    """resolve_stop_sequences should handle a list of strings."""
-    call_count = [0]
-    token_map = {0: [10], 1: [20, 30]}
-
-    def fake_encode(s, add_special_tokens=False):
-        idx = call_count[0]
-        call_count[0] += 1
-        return token_map.get(idx, [])
-
-    fake_processor = SimpleNamespace(
-        tokenizer=SimpleNamespace(encode=fake_encode),
-    )
+    """resolve_stop_sequences should pass through a list of strings."""
     result = server.resolve_stop_sequences(["a", "b"])
     assert result == ["a", "b"]
 
@@ -271,15 +249,6 @@ def test_resolve_stop_sequences_none():
 
 
 def test_resolve_stop_sequences_limits_to_four():
-    """resolve_stop_sequences should process at most 4 sequences."""
-    call_count = [0]
-
-    def fake_encode(s, add_special_tokens=False):
-        call_count[0] += 1
-        return [call_count[0]]
-
-    fake_processor = SimpleNamespace(
-        tokenizer=SimpleNamespace(encode=fake_encode),
-    )
+    """resolve_stop_sequences should truncate to at most 4 sequences."""
     result = server.resolve_stop_sequences(["a", "b", "c", "d", "e", "f"])
     assert len(result) == 4
