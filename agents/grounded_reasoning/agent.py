@@ -509,7 +509,7 @@ def run_agent(
     fp_processor,
     vlm_client,
     max_steps=20,
-    fp_max_tokens=512,
+    fp_max_tokens=1024,
     auto_relations_max=6,
     max_corrections=2,
     verbose=True,
@@ -982,7 +982,7 @@ def main():
     parser.add_argument("--image", required=True, help="Path or URL to input image.")
     parser.add_argument("--query", required=True, help="Natural-language query.")
     parser.add_argument("--max-tokens", type=int, default=4096)
-    parser.add_argument("--fp-max-tokens", type=int, default=512)
+    parser.add_argument("--fp-max-tokens", type=int, default=1024)
     parser.add_argument("--auto-relations-max", type=int, default=6)
     parser.add_argument("--max-corrections", type=int, default=2)
     parser.add_argument("--output", default="grounded_result.png")
