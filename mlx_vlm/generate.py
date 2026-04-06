@@ -1623,6 +1623,32 @@ def main():
         if args.thinking_start_token is not None:
             kwargs["thinking_start_token"] = args.thinking_start_token
 
+    requested_generation = filter_generation_config(vars(args))
+    generation_kwargs = resolve_generation_config(
+        requested_generation,
+        model_name=args.model,
+    )
+    requested_kv_bits = requested_generation.get("kv_bits")
+    requested_max_kv_size = requested_generation.get("max_kv_size")
+    if (
+        args.model
+        and requested_kv_bits not in (None, 0)
+        and generation_kwargs["kv_bits"] is None
+        and "qat" in args.model.lower()
+    ):
+        print(
+            f"Model {args.model} is quantization aware; KV cache will not be quantized to {requested_kv_bits} bits. Use --max-kv-size [tokens] instead."
+        )
+    if (
+        requested_kv_bits not in (None, 0)
+        and requested_max_kv_size not in (None, 0)
+        and generation_kwargs["kv_bits"] is not None
+        and generation_kwargs["max_kv_size"] is None
+    ):
+        print(
+            f"KV cache quantization is active at {generation_kwargs['kv_bits']} bits; --max-kv-size is ignored. Use --kv-bits [bits] instead."
+        )
+
     if args.chat:
         from .vision_cache import VisionFeatureCache
 
@@ -1638,15 +1664,10 @@ def main():
             response = ""
             print("Assistant:", end="")
             stream_kwargs = {
-                "max_tokens": args.max_tokens,
-                "temperature": args.temperature,
-                "vision_cache": vision_cache,
                 **kwargs,
+                **generation_kwargs,
+                "vision_cache": vision_cache,
             }
-            if args.resize_shape is not None:
-                stream_kwargs["resize_shape"] = args.resize_shape
-            if args.prefill_step_size is not None:
-                stream_kwargs["prefill_step_size"] = args.prefill_step_size
 
             for chunk in stream_generate(
                 model,
@@ -1666,22 +1687,10 @@ def main():
         gen_kwargs = {
             "image": args.image,
             "audio": args.audio,
-            "temperature": args.temperature,
-            "max_tokens": args.max_tokens,
             "verbose": args.verbose,
-            "max_kv_size": args.max_kv_size,
-            "kv_bits": args.kv_bits,
-            "kv_group_size": args.kv_group_size,
-            "kv_quant_scheme": getattr(
-                args, "kv_quant_scheme", DEFAULT_KV_QUANT_SCHEME
-            ),
-            "quantized_kv_start": args.quantized_kv_start,
             **kwargs,
+            **generation_kwargs,
         }
-        if args.resize_shape is not None:
-            gen_kwargs["resize_shape"] = args.resize_shape
-        if args.prefill_step_size is not None:
-            gen_kwargs["prefill_step_size"] = args.prefill_step_size
 
         result = generate(
             model,
