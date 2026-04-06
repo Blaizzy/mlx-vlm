@@ -1,3 +1,0 @@
-mlx-vlm
-numpy
-pillow

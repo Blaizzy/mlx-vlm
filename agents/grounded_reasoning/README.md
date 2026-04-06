@@ -56,14 +56,7 @@ The VLM receives both a **Set-of-Marks image** (coloured numbered masks) and **s
 ### Installation
 
 ```bash
-pip install mlx-vlm
-```
-
-### Install dependencies
-
-```bash
-cd grounded_reasoning
-pip install -r requirements.txt
+uv pip install -U mlx-vlm
 ```
 
 ## Usage
@@ -123,7 +116,7 @@ print(baseline)
 ## File Structure
 
 ```
-grounded_reasoning/
+agents/grounded_reasoning/
 ├── agent.py          # Agent loop, LocalVLMClient, run_agent, run_baseline
 ├── fp_tools.py       # Falcon Perception interface and metadata utilities
 ├── viz.py            # Set-of-Marks rendering and crop helpers
@@ -140,7 +133,7 @@ grounded_reasoning/
 
 ## Contributing
 
-Community contributions are welcome! See the main [CONTRIBUTING.md](../CONTRIBUTING.md) for guidelines.
+Community contributions are welcome! See the main [CONTRIBUTING.md](../../CONTRIBUTING.md) for guidelines.
 
 ---
 
