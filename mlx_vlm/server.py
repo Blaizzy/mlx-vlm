@@ -45,6 +45,7 @@ from .responses_models import (
     ResponsesRequest,
     ResponseObject,
     ResponseUsage,
+    InputTokensDetails,
     ResponseErrorObject,
     ResponseIncompleteDetails,
     ResponseMessageItem,
@@ -1486,6 +1487,9 @@ async def responses_endpoint(request: ResponsesRequest):
                         input_tokens=result.prompt_tokens,
                         output_tokens=result.generation_tokens,
                         total_tokens=result.total_tokens,
+                        input_tokens_details=InputTokensDetails(
+                            cached_tokens=getattr(result, "cached_tokens", 0),
+                        ),
                     ),
                 )
 

@@ -334,12 +334,19 @@ class ResponseIncompleteDetails(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class InputTokensDetails(BaseModel):
+    """Breakdown of input token usage."""
+
+    cached_tokens: int = 0
+
+
 class ResponseUsage(BaseModel):
-    """Token usage details."""
+    """Token usage details with cache-awareness for OpenClaw/Hermes."""
 
     input_tokens: int
     output_tokens: int
     total_tokens: int
+    input_tokens_details: Optional[InputTokensDetails] = None
 
 
 class ResponseErrorObject(BaseModel):

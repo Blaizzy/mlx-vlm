@@ -338,6 +338,7 @@ class GenerationResult:
     prompt_tokens: int = 0
     generation_tokens: int = 0
     total_tokens: int = 0
+    cached_tokens: int = 0
     prompt_tps: float = 0.0
     generation_tps: float = 0.0
     peak_memory: float = 0.0
@@ -765,6 +766,7 @@ def stream_generate(
                 prompt_tokens=total_prompt_tokens,
                 generation_tokens=n + 1,
                 total_tokens=total_prompt_tokens + n + 1,
+                cached_tokens=reused_prefix_len,
                 prompt_tps=prompt_tps,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
@@ -778,6 +780,7 @@ def stream_generate(
             prompt_tokens=total_prompt_tokens,
             generation_tokens=n + 1,
             total_tokens=total_prompt_tokens + n + 1,
+            cached_tokens=reused_prefix_len,
             prompt_tps=prompt_tps,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
