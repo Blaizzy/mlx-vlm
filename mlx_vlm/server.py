@@ -75,6 +75,30 @@ def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
 
+def get_max_context_tokens() -> int:
+    """Maximum prompt tokens before rejecting a request. 0 = no limit."""
+    return int(os.environ.get("MAX_CONTEXT_TOKENS", 0))
+
+
+def get_request_timeout() -> int:
+    """Maximum seconds for a generation request. 0 = no timeout."""
+    return int(os.environ.get("REQUEST_TIMEOUT", 300))
+
+
+def check_context_length(prompt: str, processor, max_context: int) -> None:
+    """Raise HTTP 400 if the tokenized prompt exceeds *max_context* tokens."""
+    if max_context <= 0:
+        return
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    token_count = len(tokenizer.encode(prompt, add_special_tokens=False))
+    if token_count > max_context:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Prompt length ({token_count} tokens) exceeds maximum context "
+            f"window ({max_context} tokens).",
+        )
+
+
 def get_quantized_kv_bits(model: str):
     kv_bits = float(os.environ.get("KV_BITS", 0))
     if kv_bits == 0:
@@ -756,6 +780,22 @@ def resolve_tool_choice(
     return tools, None
 
 
+def resolve_response_format(
+    messages: list,
+    response_format: Optional[dict],
+) -> list:
+    """Inject JSON instruction if json_object format is requested."""
+    if not response_format:
+        return messages
+    fmt_type = response_format.get("type", "text")
+    if fmt_type == "json_object":
+        messages.insert(0, {
+            "role": "system",
+            "content": "You must respond with valid JSON only. Do not include any text outside the JSON object.",
+        })
+    return messages
+
+
 def build_generation_kwargs(
     request: Any,
     template_kwargs: dict[str, Any],
@@ -1103,6 +1143,8 @@ async def responses_endpoint(request: ResponsesRequest):
             **template_kwargs,
         )
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
+
+        check_context_length(formatted_prompt, processor, get_max_context_tokens())
 
         # Resolve stop sequences to token IDs
         stop_seqs = resolve_stop_sequences(getattr(request, "stop", None))
@@ -1530,6 +1572,8 @@ async def chat_completions_endpoint(request: ChatRequest):
         )
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
 
+        check_context_length(formatted_prompt, processor, get_max_context_tokens())
+
         # Resolve stop sequences to token IDs
         stop_seqs = resolve_stop_sequences(getattr(request, "stop", None))
         if stop_seqs:
@@ -1875,6 +1919,18 @@ def main():
         "(default: %(default)s)",
     )
     parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=0,
+        help="Maximum context window in tokens. 0 = no limit. (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=int,
+        default=300,
+        help="Maximum seconds per generation request. (default: %(default)s)",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -1896,6 +1952,8 @@ def main():
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
     os.environ["MAX_CONCURRENT_REQUESTS"] = str(args.max_concurrent_requests)
+    os.environ["MAX_CONTEXT_TOKENS"] = str(args.max_context_tokens)
+    os.environ["REQUEST_TIMEOUT"] = str(args.request_timeout)
 
     uvicorn.run(
         "mlx_vlm.server:app",

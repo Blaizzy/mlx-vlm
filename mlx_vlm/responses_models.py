@@ -274,6 +274,10 @@ class ResponsesRequest(GenerationParams, TemplateParams):
         None,
         description="Up to 4 sequences where the API will stop generating further tokens.",
     )
+    response_format: Optional[dict] = Field(
+        None,
+        description='Output format: {"type": "text"} or {"type": "json_object"}.',
+    )
 
     def generation_kwargs(self) -> dict[str, Any]:
         kwargs = self.dump_kwargs("max_output_tokens")

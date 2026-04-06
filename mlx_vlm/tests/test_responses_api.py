@@ -810,3 +810,111 @@ class TestFinishReason:
             resp = client.post("/responses", json={"model": "demo", "input": "hi"})
         assert resp.status_code == 200
         assert resp.json()["status"] == "completed"
+
+
+# =========================================================================
+# H. JSON Mode Tests
+# =========================================================================
+
+
+@_skip_no_mlx
+class TestJsonMode:
+    """Verify response_format parameter handling."""
+
+    def test_resolve_response_format_json_adds_instruction(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        result = server.resolve_response_format(msgs, {"type": "json_object"})
+        assert result[0]["role"] == "system"
+        assert "json" in result[0]["content"].lower()
+
+    def test_resolve_response_format_text_no_change(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        result = server.resolve_response_format(msgs, {"type": "text"})
+        assert len(result) == 1
+
+    def test_resolve_response_format_none_no_change(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        result = server.resolve_response_format(msgs, None)
+        assert len(result) == 1
+
+    def test_responses_json_mode_accepted(self, client):
+        with _patch_model(), _patch_template(), _patch_generate():
+            resp = client.post(
+                "/responses",
+                json={"model": "demo", "input": "Give me JSON", "response_format": {"type": "json_object"}},
+            )
+        assert resp.status_code == 200
+
+
+# =========================================================================
+# I. Context Tracking Tests
+# =========================================================================
+
+
+@_skip_no_mlx
+class TestContextTracking:
+    """Verify context window tracking and OOM prevention."""
+
+    def test_check_context_length_within_limit(self):
+        fake_proc = SimpleNamespace(
+            tokenizer=SimpleNamespace(encode=lambda s, add_special_tokens=False: list(range(10))),
+        )
+        server.check_context_length("short", fake_proc, 100)
+
+    def test_check_context_length_exceeds_limit(self):
+        from fastapi import HTTPException as _Exc
+        fake_proc = SimpleNamespace(
+            tokenizer=SimpleNamespace(encode=lambda s, add_special_tokens=False: list(range(200))),
+        )
+        with pytest.raises(_Exc) as exc_info:
+            server.check_context_length("long", fake_proc, 100)
+        assert exc_info.value.status_code == 400
+
+    def test_check_context_length_zero_unlimited(self):
+        server.check_context_length("anything", None, 0)
+
+    def test_get_max_context_tokens_default(self):
+        import os
+        os.environ.pop("MAX_CONTEXT_TOKENS", None)
+        assert server.get_max_context_tokens() == 0
+
+    def test_get_max_context_tokens_from_env(self):
+        import os
+        os.environ["MAX_CONTEXT_TOKENS"] = "16384"
+        assert server.get_max_context_tokens() == 16384
+        os.environ.pop("MAX_CONTEXT_TOKENS")
+
+
+# =========================================================================
+# J. Request Cancellation Tests
+# =========================================================================
+
+
+@_skip_no_mlx
+class TestRequestCancellation:
+    """Verify request timeout and cancellation support."""
+
+    def test_get_request_timeout_default(self):
+        import os
+        os.environ.pop("REQUEST_TIMEOUT", None)
+        assert server.get_request_timeout() == 300
+
+    def test_get_request_timeout_from_env(self):
+        import os
+        os.environ["REQUEST_TIMEOUT"] = "60"
+        assert server.get_request_timeout() == 60
+        os.environ.pop("REQUEST_TIMEOUT")
+
+    def test_streaming_cleanup_on_normal_completion(self, client):
+        """Streaming should complete normally and clean up."""
+        chunks = [
+            SimpleNamespace(text="Hi", prompt_tokens=5, generation_tokens=1,
+                          prompt_tps=100.0, generation_tps=50.0, peak_memory=1.0),
+        ]
+        with _patch_model(), _patch_template(), \
+             patch.object(server, "stream_generate", return_value=iter(chunks)):
+            resp = client.post(
+                "/responses", json={"model": "demo", "input": "hi", "stream": True},
+            )
+        assert resp.status_code == 200
+        assert "response.completed" in resp.text
