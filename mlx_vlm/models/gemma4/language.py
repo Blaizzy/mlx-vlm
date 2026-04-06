@@ -14,6 +14,24 @@ from ..cache import KVCache, RotatingKVCache
 from .config import TextConfig
 from .rope_utils import initialize_rope
 
+# ---------------------------------------------------------------------------
+# Optimization flags — toggled by optimizations.yaml via set_optimizations()
+#
+# mx.compile fuses multiple kernel dispatches into one, reducing the ~1,700
+# kernel launches per forward pass. See:
+#   - https://ml-explore.github.io/mlx/build/html/usage/compile.html
+#   - https://gist.github.com/awni/4beb1f7dfefc6f9426f3a7deee74af50
+# ---------------------------------------------------------------------------
+_OPTIMIZATIONS = {
+    "compile_mlp": False,
+    "compile_router": False,
+}
+
+
+def set_optimizations(opts: dict):
+    """Called from benchmark.py to toggle optimizations at runtime."""
+    _OPTIMIZATIONS.update(opts)
+
 
 class RMSNormNoScale(nn.Module):
     """RMSNorm without learnable scale (with_scale=False, scale_shift=0.0)."""
@@ -59,8 +77,17 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
 
-    def __call__(self, x: mx.array) -> mx.array:
+        # Compiled forward fuses gate_proj + gelu + up_proj + mul + down_proj
+        # into fewer Metal kernel dispatches.
+        self._compiled_forward = mx.compile(self._forward)
+
+    def _forward(self, x: mx.array) -> mx.array:
         return self.down_proj(nn.gelu_approx(self.gate_proj(x)) * self.up_proj(x))
+
+    def __call__(self, x: mx.array) -> mx.array:
+        if _OPTIMIZATIONS["compile_mlp"]:
+            return self._compiled_forward(x)
+        return self._forward(x)
 
 
 class Router(nn.Module):
@@ -75,7 +102,9 @@ class Router(nn.Module):
         self.per_expert_scale = mx.ones((config.num_experts,))
         self._root_size = config.hidden_size**-0.5
 
-    def __call__(self, x: mx.array):
+        self._compiled_forward = mx.compile(self._forward)
+
+    def _forward(self, x: mx.array):
         x = self.norm(x)
         x = x * self._root_size
         x = x * self.scale
@@ -91,6 +120,11 @@ class Router(nn.Module):
         top_k_weights = top_k_weights / mx.sum(top_k_weights, axis=-1, keepdims=True)
         top_k_weights = top_k_weights * self.per_expert_scale[top_k_indices]
         return top_k_indices, top_k_weights
+
+    def __call__(self, x: mx.array):
+        if _OPTIMIZATIONS["compile_router"]:
+            return self._compiled_forward(x)
+        return self._forward(x)
 
 
 class GeGLU(nn.Module):
