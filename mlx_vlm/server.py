@@ -173,7 +173,10 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 model_cache = {}
 
 # Prompt cache: reuse KV state across requests with the same prompt prefix.
-# Keyed by model name — one PromptCacheState per loaded model.
+# Keyed by (model_name, cache_key) — supports both:
+#   - OpenClaw: sends `prompt_cache_key` for per-session routing
+#   - Hermes: relies on stable system prompt prefix for automatic matching
+# When no cache_key is provided, falls back to model name only.
 _prompt_cache_states: dict[str, PromptCacheState] = {}
 
 # Concurrency guard: MLX generation is single-threaded on Metal.
@@ -194,11 +197,32 @@ def get_generation_semaphore() -> asyncio.Semaphore:
     return _generation_semaphore
 
 
-def get_prompt_cache_state(model_name: str) -> PromptCacheState:
-    """Get or create a PromptCacheState for the given model."""
-    if model_name not in _prompt_cache_states:
-        _prompt_cache_states[model_name] = PromptCacheState()
-    return _prompt_cache_states[model_name]
+def get_prompt_cache_state(
+    model_name: str,
+    cache_key: Optional[str] = None,
+) -> PromptCacheState:
+    """Get or create a PromptCacheState for the given model and cache key.
+
+    Supports two caching patterns:
+
+    **OpenClaw**: Sends ``prompt_cache_key`` per session so that requests
+    from the same conversation share a KV cache.  The system prompt prefix
+    is stable across turns, so prefix matching works.
+
+    **Hermes**: Relies on a stable system prompt and ``cache_control``
+    breakpoints.  No ``prompt_cache_key`` is sent, so we fall back to
+    a single cache per model.  The ``PromptCacheState.find_prefix_length``
+    in generate.py will still match the common system-prompt prefix.
+
+    Args:
+        model_name: The model identifier.
+        cache_key: Optional routing key (e.g., ``prompt_cache_key`` from the
+            request).  When provided, each key gets its own cache state.
+    """
+    key = f"{model_name}::{cache_key}" if cache_key else model_name
+    if key not in _prompt_cache_states:
+        _prompt_cache_states[key] = PromptCacheState()
+    return _prompt_cache_states[key]
 
 
 class FlexibleBaseModel(BaseModel):
@@ -1212,7 +1236,7 @@ async def responses_endpoint(request: ResponsesRequest):
                     # Stream text deltas (with prompt cache + concurrency guard)
                     sem = get_generation_semaphore()
                     await sem.acquire()
-                    cache_state = get_prompt_cache_state(request.model)
+                    cache_state = get_prompt_cache_state(request.model, getattr(request, "prompt_cache_key", None))
                     token_iterator = stream_generate(
                         model=model,
                         processor=processor,
@@ -1413,7 +1437,7 @@ async def responses_endpoint(request: ResponsesRequest):
             sem = get_generation_semaphore()
             await sem.acquire()
             try:
-                cache_state = get_prompt_cache_state(request.model)
+                cache_state = get_prompt_cache_state(request.model, getattr(request, "prompt_cache_key", None))
                 result = generate(
                     model=model,
                     processor=processor,
@@ -1587,7 +1611,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 token_iterator = None
                 try:
                     # Use stream_generate with prompt cache reuse
-                    cache_state = get_prompt_cache_state(request.model)
+                    cache_state = get_prompt_cache_state(request.model, getattr(request, "prompt_cache_key", None))
                     token_iterator = stream_generate(
                         model=model,
                         processor=processor,
@@ -1696,7 +1720,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             await sem.acquire()
             try:
                 # Use generate from generate.py
-                cache_state = get_prompt_cache_state(request.model)
+                cache_state = get_prompt_cache_state(request.model, getattr(request, "prompt_cache_key", None))
                 gen_result = generate(
                     model=model,
                     processor=processor,

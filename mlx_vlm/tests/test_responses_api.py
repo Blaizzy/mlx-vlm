@@ -918,3 +918,46 @@ class TestRequestCancellation:
             )
         assert resp.status_code == 200
         assert "response.completed" in resp.text
+
+
+# =========================================================================
+# K. Prompt Cache Key Routing Tests
+# =========================================================================
+
+
+@_skip_no_mlx
+class TestPromptCacheKeyRouting:
+    """Verify prompt_cache_key routes to separate cache states."""
+
+    def test_same_cache_key_same_state(self):
+        """Same model + cache_key should return the same PromptCacheState."""
+        s1 = server.get_prompt_cache_state("model-a", "session-1")
+        s2 = server.get_prompt_cache_state("model-a", "session-1")
+        assert s1 is s2
+
+    def test_different_cache_key_different_state(self):
+        """Different cache_keys should get isolated cache states."""
+        s1 = server.get_prompt_cache_state("model-a", "session-1")
+        s2 = server.get_prompt_cache_state("model-a", "session-2")
+        assert s1 is not s2
+
+    def test_no_cache_key_falls_back_to_model(self):
+        """No cache_key should fall back to model-only keying."""
+        s1 = server.get_prompt_cache_state("model-b")
+        s2 = server.get_prompt_cache_state("model-b", None)
+        assert s1 is s2
+
+    def test_cache_key_passed_from_request(self, client):
+        """prompt_cache_key from request should route to correct cache."""
+        captured = {}
+
+        def capture_gen(**kwargs):
+            captured["state"] = kwargs.get("prompt_cache_state")
+            return _mock_result()
+
+        with _patch_model(), _patch_template(), \
+             patch.object(server, "generate", side_effect=capture_gen):
+            client.post("/responses", json={
+                "model": "demo", "input": "hi", "prompt_cache_key": "my-session",
+            })
+        assert captured["state"] is server.get_prompt_cache_state("demo", "my-session")

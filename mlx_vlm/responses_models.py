@@ -278,6 +278,10 @@ class ResponsesRequest(GenerationParams, TemplateParams):
         None,
         description='Output format: {"type": "text"} or {"type": "json_object"}.',
     )
+    prompt_cache_key: Optional[str] = Field(
+        None,
+        description="Stable key for prompt cache routing across turns.",
+    )
 
     def generation_kwargs(self) -> dict[str, Any]:
         kwargs = self.dump_kwargs("max_output_tokens")
