@@ -31,6 +31,7 @@ from .generate import (
     DEFAULT_THINKING_END_TOKEN,
     DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
+    PromptCacheState,
     generate,
     normalize_resize_shape,
     stream_generate,
@@ -186,6 +187,7 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
         "processor": processor,
         "config": config,
         "vision_cache": VisionFeatureCache(),
+        "prompt_cache_state": PromptCacheState(),
     }
 
     return model, processor, config
@@ -389,12 +391,17 @@ class OpenAIRequest(GenerationParams, TemplateParams):
         return {**kwargs, **self.shared_generation_kwargs()}
 
 
+class PromptTokensDetails(BaseModel):
+    cached_tokens: int = 0
+
+
 class OpenAIUsage(BaseModel):
     """Token usage details including input tokens, output tokens, breakdown, and total tokens used."""
 
     input_tokens: int
     output_tokens: int
     total_tokens: int
+    prompt_tokens_details: Optional[PromptTokensDetails] = None
 
 
 class OpenAIErrorObject(BaseModel):
@@ -847,6 +854,14 @@ async def responses_endpoint(openai_request: OpenAIRequest):
         )
         generation_kwargs = build_generation_kwargs(openai_request, template_kwargs)
 
+        # Compute cached token count for response metadata
+        _pcs = model_cache.get("prompt_cache_state")
+        _cached_tokens = 0
+        if _pcs is not None:
+            _tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+            _input_ids = _tokenizer.encode(formatted_prompt)
+            _cached_tokens = _pcs.find_prefix_length(_input_ids)
+
         generated_at = datetime.now().timestamp()
         response_id = f"resp_{uuid.uuid4().hex}"
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -905,6 +920,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                         prompt=formatted_prompt,
                         image=images,
                         vision_cache=model_cache.get("vision_cache"),
+                        prompt_cache_state=model_cache.get("prompt_cache_state"),
                         **generation_kwargs,
                     )
 
@@ -989,6 +1005,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     prompt=formatted_prompt,
                     image=images,
                     verbose=False,  # stats are passed in the response
+                    prompt_cache_state=model_cache.get("prompt_cache_state"),
                     **generation_kwargs,
                 )
                 # Clean up resources
@@ -1115,6 +1132,14 @@ async def chat_completions_endpoint(request: ChatRequest):
         )
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
 
+        # Compute cached token count for response metadata
+        _pcs = model_cache.get("prompt_cache_state")
+        _cached_tokens = 0
+        if _pcs is not None:
+            _tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+            _input_ids = _tokenizer.encode(formatted_prompt)
+            _cached_tokens = _pcs.find_prefix_length(_input_ids)
+
         if request.stream:
             # Streaming response
             async def stream_generator():
@@ -1128,6 +1153,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         image=images,
                         audio=audio,
                         vision_cache=model_cache.get("vision_cache"),
+                        prompt_cache_state=model_cache.get("prompt_cache_state"),
                         **generation_kwargs,
                     )
 
@@ -1232,6 +1258,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     audio=audio,
                     verbose=False,  # Keep API output clean
                     vision_cache=model_cache.get("vision_cache"),
+                    prompt_cache_state=model_cache.get("prompt_cache_state"),
                     **generation_kwargs,
                 )
                 # Clean up resources
@@ -1246,6 +1273,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     prompt_tps=gen_result.prompt_tps,
                     generation_tps=gen_result.generation_tps,
                     peak_memory=gen_result.peak_memory,
+                    prompt_tokens_details=PromptTokensDetails(cached_tokens=_cached_tokens),
                 )
 
                 if tool_parser_type is not None:
