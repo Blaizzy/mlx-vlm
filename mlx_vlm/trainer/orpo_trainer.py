@@ -432,6 +432,15 @@ def train_orpo(
             tic = time.perf_counter()
 
         # Training step
+        # Pre-compute completion masks outside mx.compile boundary
+        if train_on_completions:
+            from .sft_trainer import build_completion_mask
+            for b in (chosen_batch, rejected_batch):
+                if "completion_mask" not in b:
+                    b["completion_mask"] = build_completion_mask(
+                        b["input_ids"], assistant_id, end_turn_id, user_id
+                    )
+
         lvalue, toks = step(chosen_batch, rejected_batch)
         mx.clear_cache()
         losses += lvalue
