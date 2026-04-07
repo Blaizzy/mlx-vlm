@@ -887,10 +887,20 @@ def resolve_response_format(
     return messages
 
 
+DEFAULT_REPETITION_PENALTY = 1.1
+
+
 def build_generation_kwargs(
     request: Any,
     template_kwargs: dict[str, Any],
 ) -> dict[str, Any]:
+    gen_kwargs = request.generation_kwargs()
+    # Apply server-side default repetition penalty if not specified in request.
+    # Prevents MoE models from degenerating into repetition loops.
+    if "repetition_penalty" not in gen_kwargs or gen_kwargs["repetition_penalty"] is None:
+        default_rp = float(os.environ.get("DEFAULT_REPETITION_PENALTY", DEFAULT_REPETITION_PENALTY))
+        if default_rp > 0:
+            gen_kwargs["repetition_penalty"] = default_rp
     return {
         "prefill_step_size": get_prefill_step_size(),
         "kv_bits": get_quantized_kv_bits(request.model),
@@ -898,7 +908,7 @@ def build_generation_kwargs(
         "kv_quant_scheme": get_kv_quant_scheme(),
         "max_kv_size": get_max_kv_size(request.model),
         "quantized_kv_start": get_quantized_kv_start(),
-        **request.generation_kwargs(),
+        **gen_kwargs,
         **template_kwargs,
     }
 
