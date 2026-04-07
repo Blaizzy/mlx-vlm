@@ -200,6 +200,74 @@ def main(args):
         split=args.split,
     )
 
+    # Auto-detect assistant/end-turn token IDs for train_on_completions
+    if args.train_on_completions:
+        tokenizer = getattr(processor, "tokenizer", processor)
+        if args.assistant_id is None or args.end_turn_id is None:
+            # Probe the chat template with a minimal conversation
+            probe = [
+                {"role": "user", "content": "U"},
+                {"role": "assistant", "content": "A"},
+            ]
+            try:
+                probe_text = tokenizer.apply_chat_template(
+                    probe, tokenize=False, add_generation_prompt=False
+                )
+                probe_ids = tokenizer.encode(probe_text)
+                a_ids = tokenizer.encode("A")
+                # Find the token just before the assistant content "A"
+                # by locating the last occurrence of the A token
+                a_token = a_ids[-1] if a_ids else None
+                if a_token is not None:
+                    # Walk backward from the A token to find the role marker
+                    for i in range(len(probe_ids) - 1, -1, -1):
+                        if probe_ids[i] == a_token:
+                            # The assistant marker is typically 2-3 tokens before content
+                            # Look for a recognizable role token (model, assistant, etc.)
+                            for j in range(max(0, i - 5), i):
+                                decoded = tokenizer.decode([probe_ids[j]])
+                                if decoded.strip().lower() in (
+                                    "model", "assistant", "bot",
+                                ):
+                                    if args.assistant_id is None:
+                                        args.assistant_id = probe_ids[j]
+                                        logger.info(
+                                            f"Auto-detected assistant_id: {args.assistant_id} "
+                                            f"({repr(decoded.strip())})"
+                                        )
+                                    break
+                            break
+
+                # Detect end-turn token from special tokens
+                for name in ("eos_token", ""):
+                    pass  # skip, check special tokens directly
+                # Look for turn-end markers in the probe
+                for tid in probe_ids:
+                    decoded = tokenizer.decode([tid])
+                    if decoded in ("<turn|>", "<|im_end|>", "<end_of_utterance>"):
+                        if args.end_turn_id is None:
+                            args.end_turn_id = tid
+                            logger.info(
+                                f"Auto-detected end_turn_id: {args.end_turn_id} "
+                                f"({repr(decoded)})"
+                            )
+                        break
+
+            except Exception as e:
+                logger.warning(f"Auto-detection failed: {e}")
+
+        if args.assistant_id is None:
+            args.assistant_id = 77091
+            logger.warning(
+                f"Could not auto-detect assistant_id, using default {args.assistant_id}. "
+                f"Set --assistant-id explicitly for your model."
+            )
+
+        logger.info(
+            f"train_on_completions: assistant_id={args.assistant_id}, "
+            f"end_turn_id={args.end_turn_id}"
+        )
+
     # Calculate training iterations
     if args.epochs is not None:
         iters = (len(dataset) // args.batch_size) * args.epochs
@@ -266,6 +334,7 @@ def main(args):
             args=training_args,
             train_on_completions=args.train_on_completions,
             assistant_id=args.assistant_id,
+            end_turn_id=args.end_turn_id,
         )
     else:
         training_args = TrainingArgs(
@@ -291,6 +360,7 @@ def main(args):
             args=training_args,
             train_on_completions=args.train_on_completions,
             assistant_id=args.assistant_id,
+            end_turn_id=args.end_turn_id,
         )
 
     logger.info(
@@ -334,7 +404,14 @@ if __name__ == "__main__":
     parser.add_argument("--grad-clip", type=float, default=None)
     parser.add_argument("--train-on-completions", action="store_true")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
-    parser.add_argument("--assistant-id", type=int, default=77091)
+    parser.add_argument(
+        "--assistant-id", type=int, default=None,
+        help="Token ID marking assistant turn start. Auto-detected if not set.",
+    )
+    parser.add_argument(
+        "--end-turn-id", type=int, default=None,
+        help="Token ID marking end of a turn. Auto-detected if not set.",
+    )
 
     # LoRA arguments
     parser.add_argument("--lora-alpha", type=float, default=16)

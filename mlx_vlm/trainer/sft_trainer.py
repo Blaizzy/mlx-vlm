@@ -80,8 +80,44 @@ class TrainingArgs:
     )
 
 
+def build_completion_mask(input_ids, assistant_id, end_turn_id=None):
+    """Build a per-token mask that is 1 for assistant completion tokens and 0 elsewhere.
+
+    Supports multi-turn conversations by toggling on at each assistant_id
+    occurrence and off at each end_turn_id. When end_turn_id is None, the
+    mask stays on until the next assistant_id (single-token delimiter mode).
+
+    Args:
+        input_ids: numpy array of shape (batch_size, seq_length)
+        assistant_id: token ID that marks the start of assistant turns
+        end_turn_id: optional token ID that marks the end of a turn
+
+    Returns:
+        numpy array of shape (batch_size, seq_length) with 1s on completion tokens
+    """
+    batch_size, seq_length = input_ids.shape
+    mask = np.zeros((batch_size, seq_length), dtype=np.int32)
+
+    for row_idx in range(batch_size):
+        row = input_ids[row_idx]
+        in_assistant = False
+        for col_idx in range(seq_length):
+            tid = row[col_idx]
+            if tid == assistant_id:
+                in_assistant = True
+            elif end_turn_id is not None and tid == end_turn_id:
+                if in_assistant:
+                    mask[row_idx, col_idx] = 1  # include the end token
+                in_assistant = False
+            if in_assistant:
+                mask[row_idx, col_idx] = 1
+
+    return mask
+
+
 def vision_language_loss_fn(
-    model, batch, train_on_completions=False, assistant_id=77091
+    model, batch, train_on_completions=False, assistant_id=77091,
+    end_turn_id=None,
 ):
     pixel_values = batch["pixel_values"]
     input_ids = batch["input_ids"]
@@ -90,24 +126,12 @@ def vision_language_loss_fn(
     batch_size, seq_length = input_ids.shape
 
     if train_on_completions:
-        weight_mask = mx.ones_like(attention_mask)
-
-        assistant_response_index = np.full((batch_size,), -1, dtype=np.int32)
         input_ids_np = np.array(input_ids)
-        for row_idx, row in enumerate(input_ids_np):
-            positions = np.where(row == assistant_id)[0]
-            if positions.size > 0:
-                assistant_response_index[row_idx] = positions[0]
-
-        range_matrix = mx.repeat(
-            mx.expand_dims(mx.arange(seq_length), 0), batch_size, axis=0
+        completion_mask = build_completion_mask(
+            input_ids_np, assistant_id, end_turn_id
         )
-        assistant_mask = range_matrix <= mx.array(assistant_response_index).reshape(
-            -1, 1
-        )
-        weight_mask = mx.where(assistant_mask, mx.zeros_like(weight_mask), weight_mask)[
-            :, 1:
-        ]
+        # Shift by 1 to align with labels (input_ids[:, 1:])
+        weight_mask = mx.array(completion_mask[:, 1:])
     else:
         weight_mask = None
 
@@ -240,6 +264,7 @@ def evaluate(
     loss_fn=vision_language_loss_fn,
     train_on_completions=False,
     assistant_id=77091,
+    end_turn_id=None,
 ):
     """
     Evaluate the model on validation dataset.
@@ -249,7 +274,8 @@ def evaluate(
     ntokens = mx.array(0)
 
     loss_fn_partial = partial(
-        loss_fn, train_on_completions=train_on_completions, assistant_id=assistant_id
+        loss_fn, train_on_completions=train_on_completions,
+        assistant_id=assistant_id, end_turn_id=end_turn_id,
     )
 
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
@@ -300,6 +326,7 @@ def train(
     loss_fn=vision_language_loss_fn,
     train_on_completions=False,
     assistant_id=77091,
+    end_turn_id=None,
 ):
     """
     Main training function for vision-language models.
@@ -336,7 +363,8 @@ def train(
 
     # Create loss function with partial application
     loss_fn_partial = partial(
-        loss_fn, train_on_completions=train_on_completions, assistant_id=assistant_id
+        loss_fn, train_on_completions=train_on_completions,
+        assistant_id=assistant_id, end_turn_id=end_turn_id,
     )
 
     state = [model.state, optimizer.state, mx.random.state]
@@ -407,6 +435,7 @@ def train(
                 loss_fn=loss_fn_partial,
                 train_on_completions=train_on_completions,
                 assistant_id=assistant_id,
+                end_turn_id=end_turn_id,
             )
             model.train()
             val_time = time.perf_counter() - tic_val
