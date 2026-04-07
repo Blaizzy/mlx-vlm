@@ -1227,6 +1227,11 @@ async def responses_endpoint(request: ResponsesRequest):
         # Get model, processor, config - loading if necessary
         model, processor, config = get_cached_model(request.model)
 
+        # Debug: log incoming request tool info
+        _tools_count = len(request.tools) if request.tools else 0
+        _tool_names = [t.get("name", t.get("function", {}).get("name", "?")) if isinstance(t, dict) else "?" for t in (request.tools or [])]
+        print(f"[responses] tools={_tools_count} names={_tool_names} stream={request.stream}")
+
         # Convert input to chat messages
         chat_messages, images = responses_input_to_messages(
             request.input,
@@ -1250,6 +1255,7 @@ async def responses_endpoint(request: ResponsesRequest):
             tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
             if tool_parser_type is not None:
                 tool_module = load_tool_module(tool_parser_type)
+        print(f"[responses] tool_parser={tool_parser_type} tool_module={'yes' if tool_module else 'no'} tools_after_choice={len(tools) if tools else 0}")
 
         # Build template kwargs
         template_kwargs = request.template_kwargs()
