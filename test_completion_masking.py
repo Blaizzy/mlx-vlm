@@ -93,13 +93,20 @@ class TestBuildCompletionMask(unittest.TestCase):
         expected = np.array([[0, 0, 0, 0, 0]])
         np.testing.assert_array_equal(mask, expected)
 
-    def test_multi_turn_without_end_token(self):
-        """Multi-turn without end_turn_id: mask stays on from first assistant occurrence."""
-        # Without end_turn_id, once we see MODEL, we stay on forever
-        # (same as old single-turn behavior but from MODEL onward)
+    def test_multi_turn_without_end_token_with_user_id(self):
+        """Multi-turn without end_turn_id but with user_id: toggles off at user turns."""
+        # user=50, assistant=100
+        ids = np.array([[1, 50, 60, 100, 80, 50, 60, 100, 90]])
+        mask = self.build_mask(ids, assistant_id=100, user_id=50)
+        #                      BOS USR txt ASST txt USR txt ASST txt
+        expected = np.array([[  0,  0,  0,  1,   1,  0,  0,  1,   1]])
+        np.testing.assert_array_equal(mask, expected)
+
+    def test_multi_turn_without_end_token_or_user_id(self):
+        """Without end_turn_id or user_id, mask stays on from first assistant occurrence."""
         ids = np.array([[1, 50, 60, 100, 80, 50, 60, 100, 90]])
         mask = self.build_mask(ids, assistant_id=100)
-        # Once 100 is seen, everything after is 1
+        # Once 100 is seen, everything after is 1 (no way to toggle off)
         expected = np.array([[0, 0, 0, 1, 1, 1, 1, 1, 1]])
         np.testing.assert_array_equal(mask, expected)
 

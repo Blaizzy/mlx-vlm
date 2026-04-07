@@ -80,17 +80,18 @@ class TrainingArgs:
     )
 
 
-def build_completion_mask(input_ids, assistant_id, end_turn_id=None):
+def build_completion_mask(input_ids, assistant_id, end_turn_id=None, user_id=None):
     """Build a per-token mask that is 1 for assistant completion tokens and 0 elsewhere.
 
     Supports multi-turn conversations by toggling on at each assistant_id
-    occurrence and off at each end_turn_id. When end_turn_id is None, the
-    mask stays on until the next assistant_id (single-token delimiter mode).
+    and off at each end_turn_id (or user_id if end_turn_id is not available).
 
     Args:
         input_ids: numpy array of shape (batch_size, seq_length)
         assistant_id: token ID that marks the start of assistant turns
         end_turn_id: optional token ID that marks the end of a turn
+        user_id: optional token ID that marks start of user turns (used as
+                 fallback turn boundary when end_turn_id is unavailable)
 
     Returns:
         numpy array of shape (batch_size, seq_length) with 1s on completion tokens
@@ -109,6 +110,8 @@ def build_completion_mask(input_ids, assistant_id, end_turn_id=None):
                 if in_assistant:
                     mask[row_idx, col_idx] = 1  # include the end token
                 in_assistant = False
+            elif user_id is not None and tid == user_id:
+                in_assistant = False
             if in_assistant:
                 mask[row_idx, col_idx] = 1
 
@@ -117,7 +120,7 @@ def build_completion_mask(input_ids, assistant_id, end_turn_id=None):
 
 def vision_language_loss_fn(
     model, batch, train_on_completions=False, assistant_id=77091,
-    end_turn_id=None,
+    end_turn_id=None, user_id=None,
 ):
     pixel_values = batch["pixel_values"]
     input_ids = batch["input_ids"]
@@ -128,7 +131,7 @@ def vision_language_loss_fn(
     if train_on_completions:
         input_ids_np = np.array(input_ids)
         completion_mask = build_completion_mask(
-            input_ids_np, assistant_id, end_turn_id
+            input_ids_np, assistant_id, end_turn_id, user_id
         )
         # Shift by 1 to align with labels (input_ids[:, 1:])
         weight_mask = mx.array(completion_mask[:, 1:])
@@ -264,7 +267,7 @@ def evaluate(
     loss_fn=vision_language_loss_fn,
     train_on_completions=False,
     assistant_id=77091,
-    end_turn_id=None,
+    end_turn_id=None, user_id=None,
 ):
     """
     Evaluate the model on validation dataset.
@@ -275,7 +278,7 @@ def evaluate(
 
     loss_fn_partial = partial(
         loss_fn, train_on_completions=train_on_completions,
-        assistant_id=assistant_id, end_turn_id=end_turn_id,
+        assistant_id=assistant_id, end_turn_id=end_turn_id, user_id=user_id,
     )
 
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
@@ -326,7 +329,7 @@ def train(
     loss_fn=vision_language_loss_fn,
     train_on_completions=False,
     assistant_id=77091,
-    end_turn_id=None,
+    end_turn_id=None, user_id=None,
 ):
     """
     Main training function for vision-language models.
@@ -364,7 +367,7 @@ def train(
     # Create loss function with partial application
     loss_fn_partial = partial(
         loss_fn, train_on_completions=train_on_completions,
-        assistant_id=assistant_id, end_turn_id=end_turn_id,
+        assistant_id=assistant_id, end_turn_id=end_turn_id, user_id=user_id,
     )
 
     state = [model.state, optimizer.state, mx.random.state]
@@ -435,7 +438,7 @@ def train(
                 loss_fn=loss_fn_partial,
                 train_on_completions=train_on_completions,
                 assistant_id=assistant_id,
-                end_turn_id=end_turn_id,
+                end_turn_id=end_turn_id, user_id=user_id,
             )
             model.train()
             val_time = time.perf_counter() - tic_val
