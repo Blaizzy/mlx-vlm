@@ -1227,10 +1227,12 @@ async def responses_endpoint(request: ResponsesRequest):
         # Get model, processor, config - loading if necessary
         model, processor, config = get_cached_model(request.model)
 
-        # Debug: log incoming request tool info
+        # Debug: log incoming request details
         _tools_count = len(request.tools) if request.tools else 0
         _tool_names = [t.get("name", t.get("function", {}).get("name", "?")) if isinstance(t, dict) else "?" for t in (request.tools or [])]
-        print(f"[responses] tools={_tools_count} names={_tool_names} stream={request.stream}")
+        _input_len = len(str(request.input))
+        _instructions_len = len(request.instructions) if request.instructions else 0
+        print(f"[responses] tools={_tools_count} names={_tool_names} stream={request.stream} input_chars={_input_len} instructions_chars={_instructions_len}")
 
         # Convert input to chat messages
         chat_messages, images = responses_input_to_messages(
@@ -1270,6 +1272,10 @@ async def responses_endpoint(request: ResponsesRequest):
             **template_kwargs,
         )
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
+
+        # Debug: log formatted prompt tail
+        _prompt_str = formatted_prompt if isinstance(formatted_prompt, str) else str(formatted_prompt)
+        print(f"[responses] prompt_chars={len(_prompt_str)} last_300=...{_prompt_str[-300:]!r}")
 
         check_context_length(formatted_prompt, processor, get_max_context_tokens())
 
