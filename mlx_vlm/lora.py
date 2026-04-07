@@ -215,34 +215,38 @@ def main(args):
                 )
                 probe_ids = tokenizer.encode(probe_text)
 
-                # Decode each token and look for role markers
+                # Only match role tokens after a special token (contains
+                # < and >) to avoid matching "model"/"user" in content.
                 role_keywords = {"model", "assistant", "bot"}
                 user_keywords = {"user", "human"}
+                end_turn_markers = {"<turn|>", "<|im_end|>", "<end_of_utterance>"}
 
+                prev_is_special = False
                 for idx, tid in enumerate(probe_ids):
                     decoded = tokenizer.decode([tid])
-                    stripped = decoded.strip().lower()
-                    # Strip angle brackets for tokens like <|Assistant|>
-                    cleaned = stripped.strip("<>|")
+                    stripped = decoded.strip()
+                    cleaned = stripped.lower().strip("<>|")
+                    is_special = "<" in stripped and ">" in stripped
 
-                    if cleaned in role_keywords and args.assistant_id is None:
-                        args.assistant_id = tid
-                        logger.info(
-                            f"Auto-detected assistant_id: {tid} ({repr(decoded.strip())})"
-                        )
+                    if prev_is_special and not is_special:
+                        if cleaned in role_keywords and args.assistant_id is None:
+                            args.assistant_id = tid
+                            logger.info(
+                                f"Auto-detected assistant_id: {tid} ({repr(stripped)})"
+                            )
+                        if cleaned in user_keywords and args.user_id is None:
+                            args.user_id = tid
+                            logger.info(
+                                f"Auto-detected user_id: {tid} ({repr(stripped)})"
+                            )
 
-                    if cleaned in user_keywords and args.user_id is None:
-                        args.user_id = tid
-                        logger.info(
-                            f"Auto-detected user_id: {tid} ({repr(decoded.strip())})"
-                        )
+                    prev_is_special = is_special
 
-                    # Detect end-turn markers
-                    if decoded in ("<turn|>", "<|im_end|>", "<end_of_utterance>"):
+                    if stripped in end_turn_markers:
                         if args.end_turn_id is None:
                             args.end_turn_id = tid
                             logger.info(
-                                f"Auto-detected end_turn_id: {tid} ({repr(decoded)})"
+                                f"Auto-detected end_turn_id: {tid} ({repr(stripped)})"
                             )
 
             except Exception as e:

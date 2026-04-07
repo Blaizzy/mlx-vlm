@@ -72,12 +72,11 @@ def get_logps(
     if train_on_completions:
         from .sft_trainer import build_completion_mask
 
-        input_ids_np = np.array(input_ids)
         completion_mask = build_completion_mask(
-            input_ids_np, assistant_id, end_turn_id, user_id
+            input_ids, assistant_id, end_turn_id, user_id
         )
         # Shift by 1 to align with targets (input_ids[:, 1:])
-        completion_mask_shifted = mx.array(completion_mask[:, 1:])
+        completion_mask_shifted = completion_mask[:, 1:]
         mask = base_mask * completion_mask_shifted
     else:
         mask = base_mask
@@ -347,12 +346,14 @@ def train_orpo(
                 chosen_batch,
                 train_on_completions=train_on_completions,
                 assistant_id=assistant_id,
+                end_turn_id=end_turn_id, user_id=user_id,
             )
             rejected_logps, rejected_logits_mean = get_logps(
                 model,
                 rejected_batch,
                 train_on_completions=train_on_completions,
                 assistant_id=assistant_id,
+                end_turn_id=end_turn_id, user_id=user_id,
             )
             losses, reward, num_tokens, metrics = loss_fn(
                 chosen_logps,

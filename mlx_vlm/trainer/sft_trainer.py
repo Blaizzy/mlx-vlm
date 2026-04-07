@@ -86,21 +86,29 @@ def build_completion_mask(input_ids, assistant_id, end_turn_id=None, user_id=Non
     Supports multi-turn conversations by toggling on at each assistant_id
     and off at each end_turn_id (or user_id if end_turn_id is not available).
 
+    Accepts mx.array or numpy input. Converts to numpy internally for the
+    sequential state machine, so must NOT be called inside mx.compile.
+    Pre-compute the mask before the compiled step and pass via batch dict.
+
     Args:
-        input_ids: numpy array of shape (batch_size, seq_length)
+        input_ids: array of shape (batch_size, seq_length), mx.array or numpy
         assistant_id: token ID that marks the start of assistant turns
         end_turn_id: optional token ID that marks the end of a turn
-        user_id: optional token ID that marks start of user turns (used as
-                 fallback turn boundary when end_turn_id is unavailable)
+        user_id: optional token ID that marks start of user turns
 
     Returns:
-        numpy array of shape (batch_size, seq_length) with 1s on completion tokens
+        mx.array of shape (batch_size, seq_length) with 1s on completion tokens
     """
-    batch_size, seq_length = input_ids.shape
+    if isinstance(input_ids, mx.array):
+        ids_np = np.array(input_ids)
+    else:
+        ids_np = input_ids
+
+    batch_size, seq_length = ids_np.shape
     mask = np.zeros((batch_size, seq_length), dtype=np.int32)
 
     for row_idx in range(batch_size):
-        row = input_ids[row_idx]
+        row = ids_np[row_idx]
         in_assistant = False
         for col_idx in range(seq_length):
             tid = row[col_idx]
@@ -108,14 +116,14 @@ def build_completion_mask(input_ids, assistant_id, end_turn_id=None, user_id=Non
                 in_assistant = True
             elif end_turn_id is not None and tid == end_turn_id:
                 if in_assistant:
-                    mask[row_idx, col_idx] = 1  # include the end token
+                    mask[row_idx, col_idx] = 1
                 in_assistant = False
             elif user_id is not None and tid == user_id:
                 in_assistant = False
             if in_assistant:
                 mask[row_idx, col_idx] = 1
 
-    return mask
+    return mx.array(mask)
 
 
 def vision_language_loss_fn(
@@ -129,12 +137,15 @@ def vision_language_loss_fn(
     batch_size, seq_length = input_ids.shape
 
     if train_on_completions:
-        input_ids_np = np.array(input_ids)
-        completion_mask = build_completion_mask(
-            input_ids_np, assistant_id, end_turn_id, user_id
-        )
-        # Shift by 1 to align with labels (input_ids[:, 1:])
-        weight_mask = mx.array(completion_mask[:, 1:])
+        # Use pre-computed mask from batch if available (set by training
+        # loop before the compiled step to avoid np.array inside mx.compile).
+        if "completion_mask" in batch:
+            weight_mask = batch["completion_mask"][:, 1:]
+        else:
+            completion_mask = build_completion_mask(
+                input_ids, assistant_id, end_turn_id, user_id
+            )
+            weight_mask = completion_mask[:, 1:]
     else:
         weight_mask = None
 
@@ -452,6 +463,12 @@ def train(
                 )
 
             tic = time.perf_counter()
+
+        # Pre-compute completion mask outside mx.compile boundary
+        if train_on_completions and "completion_mask" not in batch:
+            batch["completion_mask"] = build_completion_mask(
+                batch["input_ids"], assistant_id, end_turn_id, user_id
+            )
 
         # Training step
         lvalue, toks, grad_accum = step(
