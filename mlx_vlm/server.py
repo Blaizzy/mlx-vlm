@@ -1467,11 +1467,16 @@ async def responses_endpoint(request: ResponsesRequest):
                     all_output_items: list = [final_msg]
 
                     # Parse tool calls from accumulated text
+                    _has_tc_start = tool_module.tool_call_start in full_text if tool_module else False
+                    print(f"[responses-stream] full_text_len={len(full_text)} visible_text_len={len(visible_text)} has_tool_call_start={_has_tc_start} tool_parser={tool_parser_type}")
+                    if _has_tc_start:
+                        print(f"[responses-stream] tool_call_region=...{full_text[full_text.index(tool_module.tool_call_start):][:200]}")
                     if tool_parser_type and tool_module and tools:
                         try:
                             tc_result = process_tool_calls(
                                 full_text, tool_module, tools
                             )
+                            print(f"[responses-stream] tool_calls_found={len(tc_result.get('calls', []))} remaining_text_len={len(tc_result.get('remaining_text', ''))}")
                             if tc_result["calls"]:
                                 for idx, call in enumerate(tc_result["calls"]):
                                     func_info = call.get("function", {})
