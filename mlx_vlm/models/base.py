@@ -191,6 +191,17 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
+    # SWA TurboQuant cache path (custom rotating cache added in this branch).
+    # It returns dense K/V from update_and_fetch, so use standard fast SDPA.
+    if type(cache).__name__ == "TurboQuantRotatingKVCache":
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=mask,
+        )
+
     if isinstance(cache, TurboQuantKVCache):
         if sinks is not None:
             raise ValueError("TurboQuant KV cache does not support attention sinks.")

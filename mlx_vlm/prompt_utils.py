@@ -468,6 +468,7 @@ def get_chat_template(
     **kwargs,
 ) -> Any:
     """Apply chat template using processor's tokenizer."""
+    model_type = kwargs.get("model_type")
 
     def _get_image_token() -> str:
         if processor is None:
@@ -555,6 +556,18 @@ def get_chat_template(
 
         if not normalized:
             return ""
+
+        if model_type == "gemma4":
+            turns = []
+            for message in normalized:
+                role = message.get("role", "user")
+                if role not in ("system", "user", "assistant"):
+                    role = "user"
+                content = message.get("content", "")
+                turns.append(f"<|turn>{role}\n{content}<turn|>")
+            if add_generation_prompt:
+                turns.append("<|turn>assistant\n")
+            return "\n".join(turns).strip()
 
         if len(normalized) == 1 and normalized[0]["role"] == "user":
             return normalized[0]["content"]
@@ -737,4 +750,6 @@ def apply_chat_template(
     if model_type in ["paligemma", "molmo", "florence2", "falcon_ocr"]:
         return messages[-1]
 
-    return get_chat_template(processor, messages, add_generation_prompt, **kwargs)
+    return get_chat_template(
+        processor, messages, add_generation_prompt, model_type=model_type, **kwargs
+    )
