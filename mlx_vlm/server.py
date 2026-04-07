@@ -986,7 +986,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
-                    error_data = json.dumps({"error": str(e)})
+                    error_data = json.dumps({"error": "Internal generation error"})
                     yield f"data: {error_data}\n\n"
 
                 finally:
@@ -1058,7 +1058,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                 traceback.print_exc()
                 mx.clear_cache()
                 gc.collect()
-                raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+                raise HTTPException(status_code=500, detail="Generation failed. Check server logs for details.")
 
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions (like model loading failure)
@@ -1231,7 +1231,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
-                    error_data = json.dumps({"error": str(e)})
+                    error_data = json.dumps({"error": "Internal generation error"})
                     yield f"data: {error_data}\n\n"
 
                 finally:
@@ -1312,7 +1312,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 traceback.print_exc()
                 mx.clear_cache()
                 gc.collect()
-                raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+                raise HTTPException(status_code=500, detail="Generation failed. Check server logs for details.")
 
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions (like model loading failure)
