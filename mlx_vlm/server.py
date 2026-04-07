@@ -690,6 +690,38 @@ def process_tool_calls(model_output: str, tool_module, tools):
     return dict(calls=called_tools, remaining_text=remaining)
 
 
+def _streamable_prefix(text, tool_module, tools):
+    """Return the portion of ``text`` safe to include in a streamed
+    ``delta.content``.
+
+    Complete ``tool_call_start`` / ``tool_call_end`` blocks are dropped
+    (the structured ``tool_calls`` array is still built from the full
+    accumulated output in the final delta). An unclosed tool call at
+    the tail — either a start marker without its matching end, or a
+    partial prefix of the start marker — is held back so a later chunk
+    can complete it. Called per chunk from the streaming loop.
+    """
+    parsed = process_tool_calls(model_output=text, tool_module=tool_module, tools=tools)
+    cleaned = parsed["remaining_text"] if parsed["calls"] else text
+
+    tc_start = tool_module.tool_call_start
+
+    # Unclosed tool call: suppress from the start marker onwards.
+    if tc_start in cleaned:
+        cleaned = cleaned[: cleaned.index(tc_start)]
+
+    # Partial prefix of the start marker at the tail (the marker is
+    # being generated across chunks): hold it back so the next chunk
+    # can complete it without leaking half of the marker first.
+    max_partial = min(len(cleaned), len(tc_start) - 1)
+    for n in range(max_partial, 0, -1):
+        if cleaned.endswith(tc_start[:n]):
+            cleaned = cleaned[:-n]
+            break
+
+    return cleaned
+
+
 # Models for /models endpoint
 
 
@@ -1132,6 +1164,12 @@ async def chat_completions_endpoint(request: ChatRequest):
                     )
 
                     output_text = ""
+                    # Number of characters of the safe-to-stream prefix that
+                    # have already been emitted. Only the *new* portion is
+                    # put into each delta, and the running value is kept
+                    # monotonic so stripping whitespace from remaining_text
+                    # cannot cause a double-emission.
+                    streamed_len = 0
                     request_id = f"chatcmpl-{uuid.uuid4()}"
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
@@ -1151,9 +1189,30 @@ async def chat_completions_endpoint(request: ChatRequest):
                             "peak_memory": chunk.peak_memory,
                         }
 
+                        # Progressive content emission: compute the text
+                        # safe to stream up to this point, then emit only
+                        # the new portion since the last chunk. Tool-call
+                        # markup — complete blocks, unclosed blocks, and
+                        # partial prefixes of the start marker at the chunk
+                        # boundary — is filtered out so the raw parser
+                        # syntax never lands in ``delta.content``. The
+                        # structured ``tool_calls`` array is still emitted
+                        # in the final delta below, extracted from the full
+                        # accumulated ``output_text``.
+                        if tool_parser_type is not None:
+                            safe_so_far = _streamable_prefix(
+                                output_text, tool_module, tools
+                            )
+                        else:
+                            safe_so_far = output_text
+                        display_text = safe_so_far[streamed_len:]
+                        streamed_len = max(streamed_len, len(safe_so_far))
+
                         choices = [
                             ChatStreamChoice(
-                                delta=ChatMessage(role="assistant", content=chunk.text)
+                                delta=ChatMessage(
+                                    role="assistant", content=display_text
+                                )
                             )
                         ]
                         chunk_data = ChatStreamChunk(
