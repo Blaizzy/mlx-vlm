@@ -627,6 +627,36 @@ def stream_generate(
     image_token_index = getattr(model.config, "image_token_index", None)
     vision_cache = kwargs.pop("vision_cache", None)
 
+    # Apply chat template if the prompt is raw text (not already templated).
+    # The CLI path (main()) and callers like chat_ui.py/server.py apply
+    # apply_chat_template() before calling stream_generate(). The direct
+    # API path (generate()/stream_generate()) receives raw text from users.
+    # Without the template, models like Gemma 4 don't get image tokens in
+    # the input_ids and produce empty output.
+    if (image is not None or audio is not None) and not kwargs.pop(
+        "_skip_template", False
+    ):
+        # Detect if prompt is already templated by checking for any special
+        # tokens from the tokenizer (covers all model formats).
+        special_tokens = set(
+            getattr(tokenizer, "all_special_tokens", [])
+        )
+        has_template = any(tok in prompt for tok in special_tokens if len(tok) > 1)
+        if not has_template:
+            num_images = (
+                len(image) if isinstance(image, list) else (1 if image else 0)
+            )
+            num_audios = (
+                len(audio) if isinstance(audio, list) else (1 if audio else 0)
+            )
+            prompt = apply_chat_template(
+                processor,
+                model.config,
+                prompt,
+                num_images=num_images,
+                num_audios=num_audios,
+            )
+
     if kwargs.get("input_ids", None) is not None:
         input_ids = kwargs.pop("input_ids")
         pixel_values = kwargs.pop("pixel_values", None)
