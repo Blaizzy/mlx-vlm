@@ -1,5 +1,7 @@
 # anemll TBQ SWA
 
+Experimental SWA / Gemma TurboQuant support.
+
 ## Overview
 
 This branch adds TurboQuant support for Sliding Window Attention (SWA) caches by converting `RotatingKVCache` into `TurboQuantRotatingKVCache` when `--turbo-kv-bits-swa` is provided.
