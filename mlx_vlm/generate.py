@@ -776,11 +776,12 @@ def stream_generate(
     if reused_prefix_len > 0:
         try:
             for c in kwargs["prompt_cache"]:
-                if hasattr(c, "keys") and c.keys is not None:
-                    actual_seq = c.keys.shape[2] if len(c.keys.shape) >= 3 else c.offset
-                    if actual_seq != reused_prefix_len:
+                if hasattr(c, "offset"):
+                    # Use offset for all cache types (works for both standard
+                    # KVCache and quantized TurboQuant caches).
+                    if c.offset != reused_prefix_len:
                         raise ValueError(
-                            f"Cache shape mismatch: expected seq={reused_prefix_len}, got {actual_seq}"
+                            f"Cache offset mismatch: expected {reused_prefix_len}, got {c.offset}"
                         )
         except (ValueError, IndexError, AttributeError) as e:
             print(f"[prompt_cache] Cache validation failed, rebuilding: {e}")
