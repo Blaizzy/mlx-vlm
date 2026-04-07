@@ -506,7 +506,11 @@ class VisionModel(nn.Module):
         # Build bidirectional attention mask [B, 1, L, L] for SDPA
         valid_mask = ~padding_positions
         attn_mask = mx.expand_dims(valid_mask, 1) * mx.expand_dims(valid_mask, 2)
-        neg_inf = mx.array(float("-inf"), dtype=inputs_embeds.dtype)
+        # Use large finite negative instead of -inf to prevent NaN in softmax
+        # backward pass. float("-inf") causes 0 * -inf = NaN in the gradient
+        # when all-padding rows hit softmax. Use -1e4 which is safe for both
+        # float16 (max ~65504) and float32.
+        neg_inf = mx.array(-1e4, dtype=inputs_embeds.dtype)
         attn_mask = mx.where(
             attn_mask, mx.array(0.0, dtype=inputs_embeds.dtype), neg_inf
         )
@@ -523,12 +527,26 @@ class VisionModel(nn.Module):
         else:
             valid_mask = ~pool_mask
 
-        all_real = []
-        for i in range(B):
-            n_valid = int(valid_mask[i].astype(mx.int32).sum().item())
-            all_real.append(pooled[i, :n_valid])
+        # Use mask multiplication instead of .item() indexing to preserve
+        # autograd graph. .item() extracts a Python scalar which detaches
+        # the downstream slice from the computation graph.
+        valid_mask_expanded = mx.expand_dims(valid_mask, -1).astype(pooled.dtype)
+        masked_pooled = pooled * valid_mask_expanded
 
-        hidden_states = mx.concatenate(all_real, axis=0)[None]
+        n_valid_per_batch = valid_mask.astype(mx.int32).sum(axis=1)
+
+        # Slice to actual valid token count per sample. Using .item() here
+        # is safe: it only determines the slice boundary on masked_pooled
+        # (which is already the gradient-carrying tensor from mask mul above).
+        if B == 1:
+            n_valid = int(n_valid_per_batch[0].item())
+            hidden_states = masked_pooled[:, :n_valid, :]
+        else:
+            all_real = []
+            for i in range(B):
+                n_valid = int(n_valid_per_batch[i].item())
+                all_real.append(masked_pooled[i, :n_valid])
+            hidden_states = mx.concatenate(all_real, axis=0)[None]
 
         if self.config.standardize:
             hidden_states = (hidden_states - self.std_bias) * self.std_scale
