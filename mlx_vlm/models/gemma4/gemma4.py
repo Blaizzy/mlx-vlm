@@ -195,9 +195,6 @@ class Model(nn.Module):
             else:
                 new_key = k
 
-            # Only insert .model. if it's not already present (HF keys
-            # are model.language_model.model.* which already map correctly
-            # after stripping the outer model. prefix)
             if new_key.startswith("language_model.") and not new_key.startswith(
                 "language_model.model."
             ):
