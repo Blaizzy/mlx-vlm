@@ -155,8 +155,11 @@ class Gemma4AudioFeatureExtractor:
 
         # Periodic Hann window: w[n] = 0.5 - 0.5 * cos(2*pi*n / frame_length)
         # Matches HuggingFace Transformers (signal.hann_window with periodic=True)
-        self.window = (
-            0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(self.frame_length, dtype=np.float32) / self.frame_length)
+        self.window = 0.5 - 0.5 * np.cos(
+            2.0
+            * np.pi
+            * np.arange(self.frame_length, dtype=np.float32)
+            / self.frame_length
         )
 
         # Mel filter bank
@@ -212,7 +215,9 @@ class Gemma4AudioFeatureExtractor:
         # the first frame is centered at t=0, matching HuggingFace Transformers
         pad_left = self.frame_length // 2
         waveform = np.pad(waveform, ((0, 0), (pad_left, 0)), mode="constant")
-        attention_mask = np.pad(attention_mask, (pad_left, 0), mode="constant", constant_values=0)
+        attention_mask = np.pad(
+            attention_mask, (pad_left, 0), mode="constant", constant_values=0
+        )
 
         frame_size_for_unfold = self.frame_length + 1
 
