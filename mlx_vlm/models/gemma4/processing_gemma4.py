@@ -197,12 +197,12 @@ class Gemma4ImageProcessor(HFBaseImageProcessor):
             num_patches = (h // patch_size) * (w // patch_size)
             num_soft_tokens_per_image.append(num_patches // (pooling_kernel_size**2))
 
-        # Different-shaped images can't be stacked; return as a list
+        # Stack if all same shape, otherwise return as list for per-image processing
         shapes = {img.shape for img in processed}
-        if len(shapes) > 1:
-            data = {"pixel_values": processed}
-        else:
+        if len(shapes) == 1:
             data = {"pixel_values": np.stack(processed)}
+        else:
+            data = {"pixel_values": processed}
 
         return data, num_soft_tokens_per_image
 

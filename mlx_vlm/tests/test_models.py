@@ -2181,6 +2181,93 @@ class TestModels(unittest.TestCase):
         output = model(input_ids_with_img, pixel_values=pixel_values)
         self.assertEqual(output.logits.shape, (1, 6, config.text_config.vocab_size))
 
+    def test_gemma4_attention_snapshots_cache_offset(self):
+        """Gemma 4 Attention must snapshot cache.offset to prevent in-place
+        mutation aliasing under batched caches where cache.offset is an
+        mx.array. Without the snapshot, cache.update_and_fetch would mutate
+        the local offset variable between K-rope and Q-rope, producing a
+        one-position shift and a deterministic decode loop. See the equivalent
+        defense in mlx_lm/models/gemma4_text.py (offset = mx.array(cache.offset)).
+        """
+        from mlx_vlm.models.gemma4 import language
+
+        text_config = language.TextConfig(
+            model_type="gemma4_text",
+            hidden_size=32,
+            num_hidden_layers=4,
+            intermediate_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            global_head_dim=16,
+            rms_norm_eps=1e-6,
+            vocab_size=64,
+            vocab_size_per_layer_input=64,
+            hidden_size_per_layer_input=8,
+            num_kv_shared_layers=0,
+            sliding_window=32,
+            sliding_window_pattern=3,
+            final_logit_softcapping=30.0,
+        )
+        attn = language.Attention(text_config, layer_idx=0)
+
+        # Stub cache mirroring the BatchRotatingKVCache shape: cache.offset
+        # is an mx.array, update_and_fetch advances it in place via +=.
+        class _StubMxArrayCache:
+            def __init__(self, start):
+                self.offset = mx.array([start])
+                self.state = (
+                    mx.zeros((1, 1, 0, 16)),
+                    mx.zeros((1, 1, 0, 16)),
+                )
+                self.max_size = 2048
+
+            def update_and_fetch(self, keys, values):
+                self.offset += keys.shape[-2]
+                new_keys = mx.concatenate([self.state[0], keys], axis=-2)
+                new_values = mx.concatenate([self.state[1], values], axis=-2)
+                self.state = (new_keys, new_values)
+                return new_keys, new_values
+
+        cache = _StubMxArrayCache(start=21)
+        cache_offset_id = id(cache.offset)
+
+        rope_ids = []
+        rope_values = []
+        original_rope = attn.rope
+
+        def _recording_rope(x, offset=None):
+            rope_ids.append(id(offset) if offset is not None else None)
+            rope_values.append(offset.tolist() if hasattr(offset, "tolist") else offset)
+            return original_rope(x, offset=offset)
+
+        attn.rope = _recording_rope
+
+        x = mx.random.uniform(shape=(1, 1, text_config.hidden_size))
+        output = attn(x, mask=None, cache=cache)
+        mx.eval(output)
+
+        # Both K-rope and Q-rope must fire.
+        self.assertGreaterEqual(len(rope_ids), 2)
+
+        # The offset object passed to rope must not alias cache.offset;
+        # otherwise cache.update_and_fetch would mutate it between K-rope
+        # and Q-rope.
+        for i, oid in enumerate(rope_ids):
+            self.assertNotEqual(
+                oid,
+                cache_offset_id,
+                f"rope call #{i} aliased cache.offset instead of snapshotting",
+            )
+
+        # Stub advanced in place, confirming the mx.array mutation path.
+        self.assertEqual(cache.offset.tolist(), [22])
+
+        # Both rope calls must see the same pre-update value.
+        self.assertEqual(rope_values[0], [21])
+        self.assertEqual(rope_values[1], [21])
+        self.assertEqual(rope_values[0], rope_values[1])
+
     def test_gemma4_dense(self):
         """Gemma 4 dense variant: K-eq-V, no per-layer inputs, no MoE."""
         from mlx_vlm.models import gemma4
