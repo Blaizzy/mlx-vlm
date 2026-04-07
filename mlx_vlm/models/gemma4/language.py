@@ -204,10 +204,14 @@ class Attention(nn.Module):
         if self.is_kv_shared_layer and cache is not None:
             state = cache.state
             keys, values = state[0], state[1]
-            offset = cache.offset
+            # Snapshot via + 0 so cache.update_and_fetch cannot mutate this
+            # local alias under batched caches where cache.offset is an
+            # mx.array (mx.array.__iadd__ is in place; int.__iadd__ rebinds,
+            # so + 0 is safe for both).
+            offset = cache.offset + 0
         else:
             if cache is not None:
-                offset = cache.offset
+                offset = cache.offset + 0
 
             keys = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
 
