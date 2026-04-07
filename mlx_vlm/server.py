@@ -145,6 +145,16 @@ def get_quantized_kv_start():
     return int(os.environ.get("QUANTIZED_KV_START", DEFAULT_QUANTIZED_KV_START))
 
 
+async def _prompt_cache_cleanup_loop():
+    """Background task that periodically evicts stale prompt caches."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            evict_stale_prompt_caches()
+        except Exception as e:
+            print(f"[prompt_cache] Cleanup error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app):
     # Startup
@@ -157,7 +167,19 @@ async def lifespan(app):
         except Exception as e:
             print(f"Failed to preload model: {e}")
             print("Server will continue without a preloaded model.")
+
+    # Start prompt cache cleanup task
+    ttl = get_prompt_cache_ttl()
+    cleanup_task = None
+    if ttl > 0:
+        cleanup_task = asyncio.create_task(_prompt_cache_cleanup_loop())
+        print(f"[prompt_cache] Cleanup task started (TTL={ttl}s, check every 60s)")
+
     yield
+
+    # Shutdown
+    if cleanup_task is not None:
+        cleanup_task.cancel()
     unload_model_sync()
 
 
@@ -187,6 +209,14 @@ model_cache = {}
 #   - OpenClaw: sends `prompt_cache_key` for per-session routing
 #   - Hermes: relies on stable system prompt prefix for automatic matching
 # When no cache_key is provided, falls back to model name only.
+DEFAULT_PROMPT_CACHE_TTL = 300  # seconds
+
+
+def get_prompt_cache_ttl() -> int:
+    """Prompt cache TTL in seconds. 0 = no expiry."""
+    return int(os.environ.get("PROMPT_CACHE_TTL", DEFAULT_PROMPT_CACHE_TTL))
+
+
 _prompt_cache_states: dict[str, PromptCacheState] = {}
 
 # Concurrency guard: MLX generation is single-threaded on Metal.
@@ -232,7 +262,30 @@ def get_prompt_cache_state(
     key = f"{model_name}::{cache_key}" if cache_key else model_name
     if key not in _prompt_cache_states:
         _prompt_cache_states[key] = PromptCacheState()
-    return _prompt_cache_states[key]
+    state = _prompt_cache_states[key]
+    state.touch()
+    return state
+
+
+def evict_stale_prompt_caches() -> int:
+    """Remove prompt cache entries that exceed the TTL. Returns count evicted."""
+    ttl = get_prompt_cache_ttl()
+    if ttl <= 0:
+        return 0
+    now = time.time()
+    stale_keys = [
+        k for k, v in _prompt_cache_states.items()
+        if (now - v.last_used) > ttl
+    ]
+    for k in stale_keys:
+        entry = _prompt_cache_states.pop(k)
+        tokens = entry.token_count
+        entry.invalidate()
+        print(f"[prompt_cache] Evicted '{k}' ({tokens} tokens, idle {now - entry.last_used:.0f}s)")
+    if stale_keys:
+        gc.collect()
+        mx.clear_cache()
+    return len(stale_keys)
 
 
 class FlexibleBaseModel(BaseModel):
@@ -1498,7 +1551,7 @@ async def responses_endpoint(request: ResponsesRequest):
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
-                    error_data = json.dumps({"error": str(e)})
+                    error_data = json.dumps({"error": "Internal generation error"})
                     yield f"data: {error_data}\n\n"
 
                 finally:
@@ -1605,7 +1658,7 @@ async def responses_endpoint(request: ResponsesRequest):
                 traceback.print_exc()
                 mx.clear_cache()
                 gc.collect()
-                raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+                raise HTTPException(status_code=500, detail="Generation failed. Check server logs for details.")
             finally:
                 sem.release()
 
@@ -1798,7 +1851,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
-                    error_data = json.dumps({"error": str(e)})
+                    error_data = json.dumps({"error": "Internal generation error"})
                     yield f"data: {error_data}\n\n"
 
                 finally:
@@ -1885,7 +1938,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 traceback.print_exc()
                 mx.clear_cache()
                 gc.collect()
-                raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+                raise HTTPException(status_code=500, detail="Generation failed. Check server logs for details.")
             finally:
                 sem.release()
 
@@ -2060,6 +2113,14 @@ def main():
         help="Maximum seconds per generation request. (default: %(default)s)",
     )
     parser.add_argument(
+        "--prompt-cache-ttl",
+        type=int,
+        default=DEFAULT_PROMPT_CACHE_TTL,
+        help="Seconds of idle time before a prompt cache entry is evicted. "
+        "Frees GPU memory from stale KV caches. 0 = no expiry. "
+        "(default: %(default)s)",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -2083,6 +2144,7 @@ def main():
     os.environ["MAX_CONCURRENT_REQUESTS"] = str(args.max_concurrent_requests)
     os.environ["MAX_CONTEXT_TOKENS"] = str(args.max_context_tokens)
     os.environ["REQUEST_TIMEOUT"] = str(args.request_timeout)
+    os.environ["PROMPT_CACHE_TTL"] = str(args.prompt_cache_ttl)
 
     uvicorn.run(
         "mlx_vlm.server:app",
