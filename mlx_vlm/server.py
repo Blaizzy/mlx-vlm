@@ -1179,7 +1179,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                     # Signal stream end
                     choices = [
                         ChatStreamChoice(
-                            finish_reason="stop",
+                            finish_reason=(
+                                "tool_calls" if tool_calls["calls"] else "stop"
+                            ),
                             delta=ChatMessage(
                                 role="assistant",
                                 content="",
@@ -1261,7 +1263,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                 choices = [
                     ChatChoice(
-                        finish_reason="stop",
+                        finish_reason=("tool_calls" if tool_calls["calls"] else "stop"),
                         message=ChatMessage(
                             role="assistant",
                             content=tool_calls["remaining_text"],
