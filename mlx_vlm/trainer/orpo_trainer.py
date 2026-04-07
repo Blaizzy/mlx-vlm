@@ -32,7 +32,7 @@ class ORPOTrainingArgs(TrainingArgs):
 
 def get_logps(
     model, batch, train_on_completions=False, assistant_id=77091,
-    end_turn_id=None,
+    end_turn_id=None, user_id=None,
 ):
     pixel_values = batch["pixel_values"]
     input_ids = batch["input_ids"]
@@ -74,7 +74,7 @@ def get_logps(
 
         input_ids_np = np.array(input_ids)
         completion_mask = build_completion_mask(
-            input_ids_np, assistant_id, end_turn_id
+            input_ids_np, assistant_id, end_turn_id, user_id
         )
         # Shift by 1 to align with targets (input_ids[:, 1:])
         completion_mask_shifted = mx.array(completion_mask[:, 1:])
@@ -238,7 +238,7 @@ def evaluate_orpo(
     loss_fn=orpo_loss,
     train_on_completions=False,
     assistant_id=77091,
-    end_turn_id=None,
+    end_turn_id=None, user_id=None,
 ):
     """
     Evaluate the model on validation dataset.
@@ -273,14 +273,14 @@ def evaluate_orpo(
             chosen_batch,
             train_on_completions=train_on_completions,
             assistant_id=assistant_id,
-            end_turn_id=end_turn_id,
+            end_turn_id=end_turn_id, user_id=user_id,
         )
         rejected_logps, rejected_logits_mean = get_logps(
             model,
             rejected_batch,
             train_on_completions=train_on_completions,
             assistant_id=assistant_id,
-            end_turn_id=end_turn_id,
+            end_turn_id=end_turn_id, user_id=user_id,
         )
 
         losses, reward, num_tokens, metrics = loss_fn(
@@ -314,7 +314,7 @@ def train_orpo(
     loss_fn=orpo_loss,
     train_on_completions=False,
     assistant_id=77091,
-    end_turn_id=None,
+    end_turn_id=None, user_id=None,
 ):
     """
     Main training function for vision-language models.
@@ -421,7 +421,7 @@ def train_orpo(
                 loss_fn=loss_fn,
                 train_on_completions=train_on_completions,
                 assistant_id=assistant_id,
-                end_turn_id=end_turn_id,
+                end_turn_id=end_turn_id, user_id=user_id,
             )
             model.train()
             val_time = time.perf_counter() - tic_val
