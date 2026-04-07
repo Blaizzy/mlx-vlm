@@ -130,3 +130,60 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["repetition_penalty"] == 1.15
     assert mock_generate.call_args.kwargs["logit_bias"] == {12: -1.5}
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
+
+
+# ---------------------------------------------------------------------------
+# Prompt cache TTL tests
+# ---------------------------------------------------------------------------
+
+
+def test_get_prompt_cache_ttl_default(monkeypatch):
+    monkeypatch.delenv("PROMPT_CACHE_TTL", raising=False)
+    assert server.get_prompt_cache_ttl() == 300
+
+
+def test_get_prompt_cache_ttl_from_env(monkeypatch):
+    monkeypatch.setenv("PROMPT_CACHE_TTL", "600")
+    assert server.get_prompt_cache_ttl() == 600
+
+
+def test_prompt_cache_state_touch():
+    from mlx_vlm.generate import PromptCacheState
+    state = PromptCacheState()
+    old_time = state.last_used
+    import time
+    time.sleep(0.01)
+    state.touch()
+    assert state.last_used > old_time
+
+
+def test_evict_stale_prompt_caches(monkeypatch):
+    monkeypatch.setenv("PROMPT_CACHE_TTL", "1")
+    # Clear and populate
+    server._prompt_cache_states.clear()
+    state = server.get_prompt_cache_state("test-model")
+    state.last_used = 0  # Force stale (epoch = very old)
+    assert len(server._prompt_cache_states) == 1
+    evicted = server.evict_stale_prompt_caches()
+    assert evicted == 1
+    assert len(server._prompt_cache_states) == 0
+
+
+def test_evict_skips_fresh_caches(monkeypatch):
+    monkeypatch.setenv("PROMPT_CACHE_TTL", "9999")
+    server._prompt_cache_states.clear()
+    server.get_prompt_cache_state("fresh-model")
+    evicted = server.evict_stale_prompt_caches()
+    assert evicted == 0
+    assert len(server._prompt_cache_states) == 1
+    server._prompt_cache_states.clear()
+
+
+def test_evict_disabled_when_ttl_zero(monkeypatch):
+    monkeypatch.setenv("PROMPT_CACHE_TTL", "0")
+    server._prompt_cache_states.clear()
+    state = server.get_prompt_cache_state("test-model")
+    state.last_used = 0
+    evicted = server.evict_stale_prompt_caches()
+    assert evicted == 0  # TTL=0 means no expiry
+    server._prompt_cache_states.clear()

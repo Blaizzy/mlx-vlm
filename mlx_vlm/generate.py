@@ -355,6 +355,13 @@ class PromptCacheState:
     def __init__(self):
         self.cache: Optional[List[Any]] = None
         self.token_ids: Optional[List[int]] = None
+        self.last_used: float = time.time()
+        self.created_at: float = time.time()
+
+    @property
+    def token_count(self) -> int:
+        """Number of tokens stored in the cache."""
+        return len(self.token_ids) if self.token_ids else 0
 
     def find_prefix_length(self, new_ids: list) -> int:
         """Return the number of leading tokens that match the cached ids."""
@@ -366,10 +373,15 @@ class PromptCacheState:
                 return i
         return max_len
 
+    def touch(self):
+        """Update last_used timestamp."""
+        self.last_used = time.time()
+
     def update(self, token_ids: list, kv_cache: list):
         """Store the full token sequence and corresponding KV cache."""
         self.token_ids = list(token_ids)
         self.cache = kv_cache
+        self.last_used = time.time()
 
     def invalidate(self):
         """Discard cached state, forcing a full prefill on next turn."""
