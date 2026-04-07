@@ -12,7 +12,7 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_map
 from tqdm import tqdm
 
-from .utils import Colors, grad_checkpoint, save_adapter
+from .utils import Colors, get_learning_rate, grad_checkpoint, save_adapter
 
 
 def _squeeze_leading_batch_dim(value):
@@ -341,6 +341,7 @@ def train(
 
     state = [model.state, optimizer.state, mx.random.state]
 
+    @partial(mx.compile, inputs=state, outputs=state)
     def step(batch, prev_grad, do_update):
         # Calculate number of tokens for metrics
         if "attention_mask" in batch:
@@ -420,6 +421,14 @@ def train(
                 )
 
             tic = time.perf_counter()
+
+        # Update learning rate schedule
+        optimizer.learning_rate = get_learning_rate(
+            iters=args.iters, step=it,
+            warmup_steps=args.warmup_steps,
+            learning_rate=args.learning_rate,
+            min_learning_rate=args.min_learning_rate,
+        )
 
         # Training step
         lvalue, toks, grad_accum = step(
