@@ -685,9 +685,18 @@ def stream_generate(
                 kwargs.pop("cached_image_features", None)
             # Reuse the saved KV cache (trimmed to prefix length)
             kv_cache = prompt_cache_state.cache
-            # Trim cache to prefix_len in case it includes generated tokens
+            # Trim cache to prefix_len in case it includes generated tokens.
+            # Use the cache's own trim() method when available (handles KVCache,
+            # QuantizedKVCache, RotatingKVCache). Fall back to direct array
+            # slicing for plain array caches. Skip non-trimmable caches
+            # (ArraysCache for SSM/recurrent layers in hybrid models).
             for c in kv_cache:
-                if hasattr(c, "keys") and c.keys is not None:
+                if hasattr(c, "trim") and hasattr(c, "offset"):
+                    # KVCache, QuantizedKVCache, RotatingKVCache
+                    if c.offset > prefix_len:
+                        c.trim(c.offset - prefix_len)
+                elif hasattr(c, "keys") and c.keys is not None and hasattr(c.keys, "shape"):
+                    # Plain array cache (legacy fallback)
                     cached_len = c.keys.shape[2]
                     if cached_len > prefix_len:
                         c.keys = c.keys[:, :, :prefix_len, :]
