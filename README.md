@@ -620,7 +620,7 @@ TriAttention ([arXiv:2604.04921](https://arxiv.org/abs/2604.04921)) compresses t
 
 ```sh
 python -m mlx_vlm.triattention_calibrate \
-  --model google/gemma-4-12b-it \
+  --model google/gemma-4-31b-it \
   --output gemma4_calib.safetensors
 ```
 
@@ -628,7 +628,7 @@ python -m mlx_vlm.triattention_calibrate \
 
 ```sh
 mlx_vlm generate \
-  --model google/gemma-4-12b-it \
+  --model google/gemma-4-31b-it \
   --triattention-calib gemma4_calib.safetensors \
   --triattention-budget 512 \
   --prompt "Your prompt here..." \
