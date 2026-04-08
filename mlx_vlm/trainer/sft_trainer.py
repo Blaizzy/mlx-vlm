@@ -78,6 +78,21 @@ class TrainingArgs:
         default=1,
         metadata={"help": "Number of steps to accumulate gradients before updating."},
     )
+    cache_vision: bool = field(
+        default=False,
+        metadata={
+            "help": "Cache vision encoder features during training. "
+            "Skips repeated vision encoding for frozen vision towers (default for LoRA). "
+            "Features are cached lazily on first encounter and reused across epochs."
+        },
+    )
+    cache_vision_size: int = field(
+        default=1000,
+        metadata={
+            "help": "Maximum number of vision features to cache. "
+            "Each cached feature is ~2MB. Set to 0 for unlimited."
+        },
+    )
 
 
 def vision_language_loss_fn(
@@ -122,6 +137,7 @@ def vision_language_loss_fn(
         k: v
         for k, v in batch.items()
         if k not in ["input_ids", "pixel_values", "attention_mask"]
+        and not k.startswith("_")  # Skip internal keys like _sample_indices
     }
 
     outputs = model(input_ids, pixel_values, attention_mask, **kwargs)
@@ -209,6 +225,7 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                 "input_ids": mx.array(input_ids_batch),
                 "attention_mask": mx.array(attention_mask_batch),
                 "pixel_values": pixel_values_batch,
+                "_sample_indices": batch_indices[b],
             }
 
             extra_keys = [
@@ -334,6 +351,27 @@ def train(
     if grad_accum_steps < 1 and args:
         raise ValueError("gradient_accumulation_steps must be at least 1")
 
+    # Vision feature caching: skip repeated vision encoding for frozen towers
+    from collections import OrderedDict
+    vision_cache = None
+    if args.cache_vision:
+        if not hasattr(model, "encode_image"):
+            print(
+                f"{Colors.WARNING}--cache-vision: model does not implement encode_image(). "
+                f"Vision caching disabled. Supported models: gemma4, molmo.{Colors.ENDC}"
+            )
+        else:
+            max_size = args.cache_vision_size if args.cache_vision_size > 0 else float("inf")
+            vision_cache = OrderedDict()
+            vision_cache_max = max_size
+            # Force vision tower to eval mode to ensure deterministic output
+            if hasattr(model, "vision_tower"):
+                model.vision_tower.eval()
+            print(
+                f"{Colors.OKBLUE}Vision feature caching enabled "
+                f"(max {int(max_size) if max_size != float('inf') else 'unlimited'} entries){Colors.ENDC}"
+            )
+
     # Create loss function with partial application
     loss_fn_partial = partial(
         loss_fn, train_on_completions=train_on_completions, assistant_id=assistant_id
@@ -374,6 +412,9 @@ def train(
 
     # Training metrics
     model.train()
+    # Keep vision tower in eval mode when caching (deterministic output)
+    if vision_cache is not None and hasattr(model, "vision_tower"):
+        model.vision_tower.eval()
     losses = 0
     n_tokens = 0
     steps = 0
@@ -409,6 +450,9 @@ def train(
                 assistant_id=assistant_id,
             )
             model.train()
+            # Keep vision tower in eval mode when caching (deterministic output)
+            if vision_cache is not None and hasattr(model, "vision_tower"):
+                model.vision_tower.eval()
             val_time = time.perf_counter() - tic_val
 
             if rank == 0:
@@ -420,6 +464,29 @@ def train(
                 )
 
             tic = time.perf_counter()
+
+        # Vision feature caching: encode once, reuse across epochs
+        if vision_cache is not None and batch.get("pixel_values") is not None:
+            sample_indices = batch.get("_sample_indices", [])
+            # Use first sample index as cache key (batch_size=1 is typical)
+            cache_key = tuple(sample_indices) if len(sample_indices) > 1 else (
+                sample_indices[0] if sample_indices else None
+            )
+            if cache_key is not None:
+                if cache_key in vision_cache:
+                    # Cache hit: pass cached features, keep pixel_values as gate
+                    batch["cached_image_features"] = vision_cache[cache_key]
+                    # Touch for LRU
+                    vision_cache.move_to_end(cache_key)
+                else:
+                    # Cache miss: encode and store
+                    features = model.encode_image(batch["pixel_values"])
+                    mx.eval(features)
+                    vision_cache[cache_key] = features
+                    batch["cached_image_features"] = features
+                    # LRU eviction
+                    while len(vision_cache) > vision_cache_max:
+                        vision_cache.popitem(last=False)
 
         # Training step
         lvalue, toks, grad_accum = step(

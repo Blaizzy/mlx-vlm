@@ -268,6 +268,13 @@ def main(args):
             assistant_id=args.assistant_id,
         )
     else:
+        # Disable vision caching if vision tower is being trained
+        cache_vision = args.cache_vision and not args.train_vision
+        if args.cache_vision and args.train_vision:
+            logger.warning(
+                "Vision caching disabled: --train-vision makes features non-deterministic"
+            )
+
         training_args = TrainingArgs(
             batch_size=args.batch_size,
             iters=iters,
@@ -282,6 +289,8 @@ def main(args):
             grad_clip=args.grad_clip,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             full_finetune=args.full_finetune,
+            cache_vision=cache_vision,
+            cache_vision_size=args.cache_vision_size,
         )
         train(
             model=model,
@@ -335,6 +344,15 @@ if __name__ == "__main__":
     parser.add_argument("--train-on-completions", action="store_true")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--assistant-id", type=int, default=77091)
+    parser.add_argument(
+        "--cache-vision", action="store_true",
+        help="Cache vision encoder features during training. "
+             "Skips repeated vision encoding for frozen vision towers.",
+    )
+    parser.add_argument(
+        "--cache-vision-size", type=int, default=1000,
+        help="Max cached vision features. Each is ~2MB. 0 = unlimited.",
+    )
 
     # LoRA arguments
     parser.add_argument("--lora-alpha", type=float, default=16)
