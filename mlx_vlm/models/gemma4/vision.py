@@ -225,6 +225,11 @@ class VisionAttention(nn.Module):
 
         attn_output = ensure_fused_sdpa(q, k, v, scale=1.0, mask=mask)
 
+        # Replace NaN with 0 — all-masked padding rows produce NaN via softmax
+        # (0/0) at sequence lengths where the fused SDPA kernel is not used.
+        # These rows are zeroed out by the pooler, so 0 is the correct value.
+        attn_output = mx.where(mx.isnan(attn_output), 0.0, attn_output)
+
         # [B, H, L, D] -> [B, L, H*D]
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
