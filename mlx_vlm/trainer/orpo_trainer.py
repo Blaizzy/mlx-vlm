@@ -139,7 +139,8 @@ def _pad_and_collate(items, prefix, max_seq_length):
     mask_key = f"{prefix}_attention_mask"
     pv_key = f"{prefix}_pixel_values"
 
-    lengths = [min(len(x[id_key]), max_seq_length) for x in items]
+    input_arrays = [np.asarray(x[id_key]).reshape(-1) for x in items]
+    lengths = [min(arr.shape[0], max_seq_length) for arr in input_arrays]
     max_len = min(max(lengths), max_seq_length)
     pad_to = 32
     padded_len = 1 + pad_to * ((max_len + pad_to - 1) // pad_to)
@@ -149,7 +150,7 @@ def _pad_and_collate(items, prefix, max_seq_length):
     attention_mask_batch = np.zeros((len(items), padded_len), dtype=np.int32)
 
     for i, item in enumerate(items):
-        arr = np.array(item[id_key]).reshape(-1)
+        arr = input_arrays[i]
         L = min(len(arr), padded_len)
         input_ids_batch[i, :L] = arr[:L]
 
