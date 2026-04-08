@@ -13,6 +13,11 @@ from mlx_lm.models.cache import (
     _BaseCache,
 )
 
+try:
+    from ..triattention import TriAttentionKVCache
+except ImportError:
+    TriAttentionKVCache = None
+
 
 def make_prompt_cache(
     model: nn.Module,

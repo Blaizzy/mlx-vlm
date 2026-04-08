@@ -217,6 +217,19 @@ def parse_arguments():
         default=DEFAULT_THINKING_END_TOKEN,
         help="Token that marks the end of a thinking block (default: %(default)s).",
     )
+    parser.add_argument(
+        "--triattention-calib",
+        type=str,
+        default=None,
+        help="Path to TriAttention calibration file (.safetensors). Enables "
+        "TriAttention KV cache compression when provided.",
+    )
+    parser.add_argument(
+        "--triattention-budget",
+        type=int,
+        default=2048,
+        help="Maximum KV tokens to retain after TriAttention compression.",
+    )
 
     return parser.parse_args()
 
@@ -394,6 +407,8 @@ def generate_step(
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
+    triattention_calib: Optional[str] = None,
+    triattention_budget: int = 2048,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -468,6 +483,17 @@ def generate_step(
         prompt_cache = cache.make_prompt_cache(
             model.language_model,
             max_kv_size=max_kv_size,
+        )
+
+    # Apply TriAttention KV cache compression if calibration is provided
+    if triattention_calib is not None:
+        from .triattention import maybe_apply_triattention
+
+        maybe_apply_triattention(
+            prompt_cache,
+            model,
+            triattention_calib,
+            budget=triattention_budget,
         )
 
     def _step(y, inputs_embeds=None):
@@ -1594,6 +1620,9 @@ def main():
                 "vision_cache": vision_cache,
                 **kwargs,
             }
+            if args.triattention_calib is not None:
+                stream_kwargs["triattention_calib"] = args.triattention_calib
+                stream_kwargs["triattention_budget"] = args.triattention_budget
             if args.resize_shape is not None:
                 stream_kwargs["resize_shape"] = args.resize_shape
             if args.prefill_step_size is not None:
@@ -1629,6 +1658,9 @@ def main():
             "quantized_kv_start": args.quantized_kv_start,
             **kwargs,
         }
+        if args.triattention_calib is not None:
+            gen_kwargs["triattention_calib"] = args.triattention_calib
+            gen_kwargs["triattention_budget"] = args.triattention_budget
         if args.resize_shape is not None:
             gen_kwargs["resize_shape"] = args.resize_shape
         if args.prefill_step_size is not None:
