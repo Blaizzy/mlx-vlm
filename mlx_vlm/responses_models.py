@@ -244,8 +244,8 @@ class ResponsesRequest(GenerationParams, TemplateParams):
         ..., description="Input text or list of input items (messages, tool outputs)."
     )
     model: str = Field(..., description="The model to use for generation.")
-    max_output_tokens: int = Field(
-        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
+    max_output_tokens: Optional[int] = Field(
+        None, description="Maximum number of tokens to generate. Uses server default if not specified."
     )
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
@@ -283,7 +283,8 @@ class ResponsesRequest(GenerationParams, TemplateParams):
 
     def generation_kwargs(self) -> dict[str, Any]:
         kwargs = self.dump_kwargs("max_output_tokens")
-        kwargs["max_tokens"] = kwargs.pop("max_output_tokens")
+        if "max_output_tokens" in kwargs:
+            kwargs["max_tokens"] = kwargs.pop("max_output_tokens")
         return {**kwargs, **self.shared_generation_kwargs()}
 
 

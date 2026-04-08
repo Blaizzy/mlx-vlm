@@ -78,6 +78,13 @@ from .vision_cache import VisionFeatureCache
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 
+
+def get_default_max_tokens() -> int:
+    """Server-side default max tokens for API responses.
+    The upstream generate.py default (256) is too low for agentic use.
+    Configurable via --default-max-tokens CLI flag or DEFAULT_MAX_TOKENS env var."""
+    return int(os.environ.get("DEFAULT_MAX_TOKENS", DEFAULT_MAX_TOKENS))
+
 _responses_store = ResponseStore()
 
 
@@ -543,7 +550,7 @@ class OpenAIRequest(GenerationParams, TemplateParams):
     )
     model: str = Field(..., description="The model to use for generation.")
     max_output_tokens: int = Field(
-        DEFAULT_MAX_TOKENS,
+        None,
         description="Maximum number of tokens to generate.",
     )
     stream: bool = Field(
@@ -725,9 +732,9 @@ class VLMRequest(GenerationParams, TemplateParams):
     adapter_path: Optional[str] = Field(
         None, description="The path to the adapter weights."
     )
-    max_tokens: int = Field(
-        DEFAULT_MAX_TOKENS,
-        description="Maximum number of tokens to generate.",
+    max_tokens: Optional[int] = Field(
+        None,
+        description="Maximum number of tokens to generate. Uses server default if not specified.",
     )
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     stop: Optional[Union[str, List[str]]] = Field(
@@ -895,6 +902,10 @@ def build_generation_kwargs(
     template_kwargs: dict[str, Any],
 ) -> dict[str, Any]:
     gen_kwargs = request.generation_kwargs()
+    # Apply server-side default max_tokens if not specified in request.
+    default_max = get_default_max_tokens()
+    if "max_tokens" not in gen_kwargs or gen_kwargs["max_tokens"] is None:
+        gen_kwargs["max_tokens"] = default_max
     # Apply server-side default repetition penalty if not specified in request.
     # Prevents MoE models from degenerating into repetition loops.
     if "repetition_penalty" not in gen_kwargs or gen_kwargs["repetition_penalty"] is None:
@@ -1222,6 +1233,9 @@ async def responses_endpoint(request: ResponsesRequest):
     Supports tool calling, multi-turn via previous_response_id, and streaming
     with proper SSE event sequences including function_call argument events.
     """
+    # Resolve default max tokens if not specified in request
+    if request.max_output_tokens is None:
+        request.max_output_tokens = get_default_max_tokens()
 
     try:
         # Get model, processor, config - loading if necessary
@@ -1467,16 +1481,11 @@ async def responses_endpoint(request: ResponsesRequest):
                     all_output_items: list = [final_msg]
 
                     # Parse tool calls from accumulated text
-                    _has_tc_start = tool_module.tool_call_start in full_text if tool_module else False
-                    print(f"[responses-stream] full_text_len={len(full_text)} visible_text_len={len(visible_text)} has_tool_call_start={_has_tc_start} tool_parser={tool_parser_type}")
-                    if _has_tc_start:
-                        print(f"[responses-stream] tool_call_region=...{full_text[full_text.index(tool_module.tool_call_start):][:200]}")
                     if tool_parser_type and tool_module and tools:
                         try:
                             tc_result = process_tool_calls(
                                 full_text, tool_module, tools
                             )
-                            print(f"[responses-stream] tool_calls_found={len(tc_result.get('calls', []))} remaining_text_len={len(tc_result.get('remaining_text', ''))}")
                             if tc_result["calls"]:
                                 for idx, call in enumerate(tc_result["calls"]):
                                     func_info = call.get("function", {})
@@ -1712,6 +1721,9 @@ async def chat_completions_endpoint(request: ChatRequest):
     System message will be ignored if not already in the prompt.
     Can operate in streaming or non-streaming mode.
     """
+    # Resolve default max tokens if not specified in request
+    if request.max_tokens is None:
+        request.max_tokens = get_default_max_tokens()
 
     try:
         # Get model, processor, config - loading if necessary
@@ -2140,6 +2152,14 @@ def main():
         help="Maximum seconds per generation request. (default: %(default)s)",
     )
     parser.add_argument(
+        "--default-max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help="Default max tokens for API responses when not specified in the request. "
+        "The upstream default (256) is too low for agentic use. "
+        "(default: %(default)s)",
+    )
+    parser.add_argument(
         "--prompt-cache-ttl",
         type=int,
         default=DEFAULT_PROMPT_CACHE_TTL,
@@ -2172,6 +2192,7 @@ def main():
     os.environ["MAX_CONTEXT_TOKENS"] = str(args.max_context_tokens)
     os.environ["REQUEST_TIMEOUT"] = str(args.request_timeout)
     os.environ["PROMPT_CACHE_TTL"] = str(args.prompt_cache_ttl)
+    os.environ["DEFAULT_MAX_TOKENS"] = str(args.default_max_tokens)
 
     uvicorn.run(
         "mlx_vlm.server:app",
