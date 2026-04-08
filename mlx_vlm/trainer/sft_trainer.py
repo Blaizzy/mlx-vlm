@@ -178,7 +178,8 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
         )
         for b in order:
             items = [dataset[idx] for idx in batch_indices[b]]
-            lengths = [min(len(x["input_ids"]), max_seq_length) for x in items]
+            input_arrays = [np.asarray(x["input_ids"]).reshape(-1) for x in items]
+            lengths = [min(arr.shape[0], max_seq_length) for arr in input_arrays]
 
             max_len = min(max(lengths), max_seq_length)
             pad_to = 32
@@ -189,7 +190,7 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
             attention_mask_batch = np.zeros((len(items), padded_len), dtype=np.int32)
 
             for i, item in enumerate(items):
-                arr = np.array(item["input_ids"]).reshape(-1)
+                arr = input_arrays[i]
                 L = min(len(arr), padded_len)
                 input_ids_batch[i, :L] = arr[:L]
 
