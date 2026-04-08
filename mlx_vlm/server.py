@@ -87,13 +87,14 @@ def get_quantized_kv_start():
 
 @asynccontextmanager
 async def lifespan(app):
+    global server_adapter_path
     # Startup
     model_path = os.environ.get("PRELOAD_MODEL")
-    adapter_path = os.environ.get("PRELOAD_ADAPTER") or None
+    server_adapter_path = os.environ.get("PRELOAD_ADAPTER") or None
     if model_path:
         try:
             print(f"Preloading model: {model_path}")
-            get_cached_model(model_path, adapter_path)
+            get_cached_model(model_path, server_adapter_path)
         except Exception as e:
             print(f"Failed to preload model: {e}")
             print("Server will continue without a preloaded model.")
@@ -121,6 +122,7 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 # Loading/unloading utilities
 
 model_cache = {}
+server_adapter_path = None
 
 
 class FlexibleBaseModel(BaseModel):
@@ -766,7 +768,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
 
     try:
         # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(openai_request.model)
+        model, processor, config = get_cached_model(openai_request.model, server_adapter_path)
 
         chat_messages = []
         images = []
