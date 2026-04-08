@@ -1398,8 +1398,8 @@ def main():
         type=int,
         default=DEFAULT_PREFILL_STEP_SIZE,
         help="Number of tokens to process per prefill step. "
-        "Lower values reduce peak memory usage but may be slower. "
-        "Try 512 or 256 if you hit GPU memory errors during prefill.",
+        "Defaults to 32768 so most prompts prefill in a single pass. "
+        "Lower to 2048 or 512 if you hit GPU memory errors during prefill.",
     )
     parser.add_argument(
         "--kv-bits",
