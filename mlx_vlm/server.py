@@ -78,6 +78,11 @@ from .vision_cache import VisionFeatureCache
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 
+def _is_verbose() -> bool:
+    return os.environ.get("VERBOSE", "").lower() in ("1", "true", "yes")
+
+_verbose = _is_verbose()
+
 
 def get_default_max_tokens() -> int:
     """Server-side default max tokens for API responses.
@@ -180,7 +185,8 @@ async def lifespan(app):
     cleanup_task = None
     if ttl > 0:
         cleanup_task = asyncio.create_task(_prompt_cache_cleanup_loop())
-        print(f"[prompt_cache] Cleanup task started (TTL={ttl}s, check every 60s)")
+        if _verbose:
+            print(f"[prompt_cache] Cleanup task started (TTL={ttl}s, check every 60s)")
 
     yield
 
@@ -224,6 +230,7 @@ def get_prompt_cache_ttl() -> int:
     return int(os.environ.get("PROMPT_CACHE_TTL", DEFAULT_PROMPT_CACHE_TTL))
 
 
+_PROMPT_CACHE_MAX_ENTRIES = 64
 _prompt_cache_states: dict[str, PromptCacheState] = {}
 
 # Concurrency guard: MLX generation is single-threaded on Metal.
@@ -242,6 +249,23 @@ def get_generation_semaphore() -> asyncio.Semaphore:
     if _generation_semaphore is None:
         _generation_semaphore = asyncio.Semaphore(get_max_concurrent_requests())
     return _generation_semaphore
+
+
+async def acquire_semaphore() -> asyncio.Semaphore:
+    """Acquire the generation semaphore with timeout. Returns the semaphore for release."""
+    sem = get_generation_semaphore()
+    timeout = get_request_timeout()
+    try:
+        if timeout > 0:
+            await asyncio.wait_for(sem.acquire(), timeout=timeout)
+        else:
+            await sem.acquire()
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail="Server busy: generation request timed out waiting for GPU.",
+        )
+    return sem
 
 
 def get_prompt_cache_state(
@@ -267,9 +291,12 @@ def get_prompt_cache_state(
             request).  When provided, each key gets its own cache state.
     """
     key = f"{model_name}::{cache_key}" if cache_key else model_name
-    if key not in _prompt_cache_states:
-        _prompt_cache_states[key] = PromptCacheState()
-    state = _prompt_cache_states[key]
+    # Evict LRU entry if at capacity and key is new
+    if key not in _prompt_cache_states and len(_prompt_cache_states) >= _PROMPT_CACHE_MAX_ENTRIES:
+        lru_key = min(_prompt_cache_states, key=lambda k: _prompt_cache_states[k].last_used)
+        evicted = _prompt_cache_states.pop(lru_key)
+        evicted.invalidate()
+    state = _prompt_cache_states.setdefault(key, PromptCacheState())
     state.touch()
     return state
 
@@ -287,8 +314,10 @@ def evict_stale_prompt_caches() -> int:
     for k in stale_keys:
         entry = _prompt_cache_states.pop(k)
         tokens = entry.token_count
+        idle = now - entry.last_used
         entry.invalidate()
-        print(f"[prompt_cache] Evicted '{k}' ({tokens} tokens, idle {now - entry.last_used:.0f}s)")
+        if _verbose:
+            print(f"[prompt_cache] Evicted '{k}' ({tokens} tokens, idle {idle:.0f}s)")
     if stale_keys:
         gc.collect()
         mx.clear_cache()
@@ -784,11 +813,31 @@ class UsageStats(OpenAIUsage):
 
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
+    logprobs: Optional[bool] = Field(
+        None, description="Whether to return log probabilities."
+    )
+    top_logprobs: Optional[int] = Field(
+        None,
+        ge=0,
+        le=20,
+        description="Number of most likely tokens to return at each position.",
+    )
+
+
+class TokenLogprob(BaseModel):
+    token: str
+    logprob: float
+    bytes: Optional[List[int]] = None
+
+
+class ChoiceLogprobs(BaseModel):
+    content: Optional[List[TokenLogprob]] = None
 
 
 class ChatChoice(BaseModel):
     finish_reason: str
     message: ChatMessage
+    logprobs: Optional[ChoiceLogprobs] = None
 
 
 class ChatResponse(BaseModel):
@@ -801,6 +850,7 @@ class ChatStreamChoice(BaseModel):
     index: int = 0
     finish_reason: Optional[str] = None
     delta: ChatMessage
+    logprobs: Optional[ChoiceLogprobs] = None
 
 
 class ChatStreamChunk(BaseModel):
@@ -1246,7 +1296,8 @@ async def responses_endpoint(request: ResponsesRequest):
         _tool_names = [t.get("name", t.get("function", {}).get("name", "?")) if isinstance(t, dict) else "?" for t in (request.tools or [])]
         _input_len = len(str(request.input))
         _instructions_len = len(request.instructions) if request.instructions else 0
-        print(f"[responses] tools={_tools_count} names={_tool_names} stream={request.stream} input_chars={_input_len} instructions_chars={_instructions_len}")
+        if _verbose:
+            print(f"[responses] tools={_tools_count} names={_tool_names} stream={request.stream} input_chars={_input_len} instructions_chars={_instructions_len}")
 
         # Convert input to chat messages
         chat_messages, images = responses_input_to_messages(
@@ -1254,6 +1305,10 @@ async def responses_endpoint(request: ResponsesRequest):
             instructions=request.instructions,
             previous_response_id=request.previous_response_id,
         )
+
+        # Apply JSON mode if requested
+        response_format = getattr(request, "response_format", None)
+        chat_messages = resolve_response_format(chat_messages, response_format)
 
         # Set up tool parser (apply tool_choice policy)
         tools = request.tools
@@ -1271,7 +1326,8 @@ async def responses_endpoint(request: ResponsesRequest):
             tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
             if tool_parser_type is not None:
                 tool_module = load_tool_module(tool_parser_type)
-        print(f"[responses] tool_parser={tool_parser_type} tool_module={'yes' if tool_module else 'no'} tools_after_choice={len(tools) if tools else 0}")
+        if _verbose:
+            print(f"[responses] tool_parser={tool_parser_type} tool_module={'yes' if tool_module else 'no'} tools_after_choice={len(tools) if tools else 0}")
 
         # Build template kwargs
         template_kwargs = request.template_kwargs()
@@ -1287,9 +1343,9 @@ async def responses_endpoint(request: ResponsesRequest):
         )
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
 
-        # Debug: log formatted prompt tail
-        _prompt_str = formatted_prompt if isinstance(formatted_prompt, str) else str(formatted_prompt)
-        print(f"[responses] prompt_chars={len(_prompt_str)} last_300=...{_prompt_str[-300:]!r}")
+        if _verbose:
+            _prompt_str = formatted_prompt if isinstance(formatted_prompt, str) else str(formatted_prompt)
+            print(f"[responses] prompt_chars={len(_prompt_str)} last_300=...{_prompt_str[-300:]!r}")
 
         check_context_length(formatted_prompt, processor, get_max_context_tokens())
 
@@ -1317,6 +1373,7 @@ async def responses_endpoint(request: ResponsesRequest):
                         f"event: {event_type}\ndata: {event_obj.model_dump_json()}\n\n"
                     )
 
+                sem = await acquire_semaphore()
                 try:
                     # Build base ResponseObject (in_progress, empty output)
                     base_response = ResponseObject(
@@ -1370,10 +1427,6 @@ async def responses_endpoint(request: ResponsesRequest):
                             part=empty_part,
                         ),
                     )
-
-                    # Stream text deltas (with prompt cache + concurrency guard)
-                    sem = get_generation_semaphore()
-                    await sem.acquire()
                     cache_state = get_prompt_cache_state(
                         request.model, getattr(request, "prompt_cache_key", None)
                     )
@@ -1594,7 +1647,8 @@ async def responses_endpoint(request: ResponsesRequest):
                     mx.clear_cache()
                     gc.collect()
                     sem.release()
-                    print("Stream finished, cleared cache.")
+                    if _verbose:
+                        print("Stream finished, cleared cache.")
 
             return StreamingResponse(
                 stream_responses_generator(),
@@ -1610,8 +1664,7 @@ async def responses_endpoint(request: ResponsesRequest):
             # ----------------------------------------------------------
             # Non-streaming response
             # ----------------------------------------------------------
-            sem = get_generation_semaphore()
-            await sem.acquire()
+            sem = await acquire_semaphore()
             try:
                 cache_state = get_prompt_cache_state(
                     request.model, getattr(request, "prompt_cache_key", None)
@@ -1799,8 +1852,7 @@ async def chat_completions_endpoint(request: ChatRequest):
         if request.stream:
             # Streaming response
             async def stream_generator():
-                sem = get_generation_semaphore()
-                await sem.acquire()
+                sem = await acquire_semaphore()
                 token_iterator = None
                 try:
                     # Use stream_generate with prompt cache reuse
@@ -1820,9 +1872,11 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                     output_text = ""
                     request_id = f"chatcmpl-{uuid.uuid4()}"
+                    want_logprobs = getattr(request, "logprobs", None)
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
-                            print("Warning: Received unexpected chunk format:", chunk)
+                            if _verbose:
+                                print("Warning: Received unexpected chunk format:", chunk)
                             continue
 
                         output_text += chunk.text
@@ -1838,9 +1892,24 @@ async def chat_completions_endpoint(request: ChatRequest):
                             "peak_memory": chunk.peak_memory,
                         }
 
+                        chunk_logprobs = None
+                        if want_logprobs and chunk.token is not None and chunk.logprobs is not None:
+                            token_text = tokenizer.decode([chunk.token])
+                            chosen_logprob = float(chunk.logprobs[chunk.token])
+                            chunk_logprobs = ChoiceLogprobs(
+                                content=[
+                                    TokenLogprob(
+                                        token=token_text,
+                                        logprob=chosen_logprob,
+                                        bytes=list(token_text.encode("utf-8")),
+                                    )
+                                ]
+                            )
+
                         choices = [
                             ChatStreamChoice(
-                                delta=ChatMessage(role="assistant", content=chunk.text)
+                                delta=ChatMessage(role="assistant", content=chunk.text),
+                                logprobs=chunk_logprobs,
                             )
                         ]
                         chunk_data = ChatStreamChunk(
@@ -1897,7 +1966,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                     mx.clear_cache()
                     gc.collect()
                     sem.release()
-                    print("Stream finished, cleared cache.")
+                    if _verbose:
+                        print("Stream finished, cleared cache.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -1911,28 +1981,59 @@ async def chat_completions_endpoint(request: ChatRequest):
 
         else:
             # Non-streaming response
-            sem = get_generation_semaphore()
-            await sem.acquire()
+            sem = await acquire_semaphore()
             try:
-                # Use generate from generate.py
+                want_logprobs = getattr(request, "logprobs", None)
                 cache_state = get_prompt_cache_state(
                     request.model, getattr(request, "prompt_cache_key", None)
                 )
-                gen_result = generate(
-                    model=model,
-                    processor=processor,
-                    prompt=formatted_prompt,
-                    image=images,
-                    audio=audio,
-                    verbose=False,  # Keep API output clean
-                    vision_cache=model_cache.get("vision_cache"),
-                    prompt_cache_state=cache_state,
-                    **generation_kwargs,
-                )
+                token_logprobs = []
+
+                if want_logprobs:
+                    # Use stream_generate to collect per-token logprobs
+                    full_text = ""
+                    gen_result = None
+                    for chunk in stream_generate(
+                        model=model,
+                        processor=processor,
+                        prompt=formatted_prompt,
+                        image=images,
+                        audio=audio,
+                        vision_cache=model_cache.get("vision_cache"),
+                        prompt_cache_state=cache_state,
+                        **generation_kwargs,
+                    ):
+                        if chunk is None or not hasattr(chunk, "text"):
+                            continue
+                        full_text += chunk.text
+                        if chunk.token is not None and chunk.logprobs is not None:
+                            token_text = tokenizer.decode([chunk.token])
+                            chosen_logprob = float(chunk.logprobs[chunk.token])
+                            token_logprobs.append(
+                                TokenLogprob(
+                                    token=token_text,
+                                    logprob=chosen_logprob,
+                                    bytes=list(token_text.encode("utf-8")),
+                                )
+                            )
+                        gen_result = chunk
+                    gen_result.text = full_text
+                else:
+                    gen_result = generate(
+                        model=model,
+                        processor=processor,
+                        prompt=formatted_prompt,
+                        image=images,
+                        audio=audio,
+                        verbose=False,
+                        vision_cache=model_cache.get("vision_cache"),
+                        prompt_cache_state=cache_state,
+                        **generation_kwargs,
+                    )
+
                 # Clean up resources
                 mx.clear_cache()
                 gc.collect()
-                print("Generation finished, cleared cache.")
 
                 usage_stats = UsageStats(
                     input_tokens=gen_result.prompt_tokens,
@@ -1954,6 +2055,10 @@ async def chat_completions_endpoint(request: ChatRequest):
                     tool_calls["calls"] = []
                     tool_calls["remaining_text"] = gen_result.text
 
+                choice_logprobs = None
+                if want_logprobs and token_logprobs:
+                    choice_logprobs = ChoiceLogprobs(content=token_logprobs)
+
                 finish = "tool_calls" if tool_calls.get("calls") else "stop"
                 choices = [
                     ChatChoice(
@@ -1963,6 +2068,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             content=tool_calls["remaining_text"],
                             tool_calls=tool_calls["calls"],
                         ),
+                        logprobs=choice_logprobs,
                     )
                 ]
 
@@ -2168,6 +2274,12 @@ def main():
         "(default: %(default)s)",
     )
     parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Enable verbose debug logging (prompt content, cache state, tool detection).",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -2193,6 +2305,8 @@ def main():
     os.environ["REQUEST_TIMEOUT"] = str(args.request_timeout)
     os.environ["PROMPT_CACHE_TTL"] = str(args.prompt_cache_ttl)
     os.environ["DEFAULT_MAX_TOKENS"] = str(args.default_max_tokens)
+    if args.verbose:
+        os.environ["VERBOSE"] = "1"
 
     uvicorn.run(
         "mlx_vlm.server:app",
