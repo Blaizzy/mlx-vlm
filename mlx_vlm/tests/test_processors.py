@@ -1013,6 +1013,87 @@ class TestErnie4_5VLProcessor(_ProcessorTestBase, unittest.TestCase):
         )
 
 
+class TestPaddleOCRVLProcessor(unittest.TestCase):
+    """Regression tests for PaddleOCR-VL processor loading."""
+
+    def test_from_pretrained_loads_preprocessor_geometry(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.paddleocr_vl.processing_paddleocr_vl import (
+            PaddleOCRVLProcessor,
+        )
+
+        def _fake_init(
+            self,
+            image_processor=None,
+            tokenizer=None,
+            chat_template=None,
+            **kwargs,
+        ):
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+            self.chat_template = chat_template
+            self.image_token = (
+                "<|IMAGE_PLACEHOLDER|>"
+                if not hasattr(tokenizer, "image_token")
+                else tokenizer.image_token
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            (path / "config.json").write_text(
+                json.dumps({"model_type": "paddleocr_vl"})
+            )
+            (path / "preprocessor_config.json").write_text(
+                json.dumps(
+                    {
+                        "min_pixels": 64,
+                        "max_pixels": 4096,
+                        "patch_size": 16,
+                        "temporal_patch_size": 2,
+                        "merge_size": 4,
+                        "image_mean": [0.1, 0.2, 0.3],
+                        "image_std": [0.9, 0.8, 0.7],
+                        "do_convert_rgb": False,
+                    }
+                )
+            )
+
+            with patch(
+                "transformers.AutoTokenizer.from_pretrained",
+                return_value=_mock_tokenizer(image_token="<paddle-image>"),
+            ), patch.object(PaddleOCRVLProcessor, "__init__", _fake_init):
+                processor = PaddleOCRVLProcessor.from_pretrained(tmpdir)
+
+        self.assertEqual(processor.image_token, "<paddle-image>")
+        self.assertEqual(processor.image_processor.min_pixels, 64)
+        self.assertEqual(processor.image_processor.max_pixels, 4096)
+        self.assertEqual(processor.image_processor.patch_size, 16)
+        self.assertEqual(processor.image_processor.temporal_patch_size, 2)
+        self.assertEqual(processor.image_processor.merge_size, 4)
+        self.assertEqual(processor.image_processor.image_mean, [0.1, 0.2, 0.3])
+        self.assertEqual(processor.image_processor.image_std, [0.9, 0.8, 0.7])
+        self.assertFalse(processor.image_processor.do_convert_rgb)
+
+    def test_load_image_processor_returns_none(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.utils import load_image_processor
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            (path / "config.json").write_text(
+                json.dumps({"model_type": "paddleocr_vl"})
+            )
+            image_processor = load_image_processor(path)
+
+        self.assertIsNone(image_processor)
+
+
 class TestToMlxHelper(unittest.TestCase):
     def test_converts_lists_and_numpy(self):
         import mlx.core as mx
@@ -1261,6 +1342,16 @@ class TestErnie4_5VLPatch(unittest.TestCase):
             "ernie4_5_moe_vl",
             "mlx_vlm.models.ernie4_5_moe_vl",
             "Ernie4_5_VLProcessor",
+        )
+
+
+class TestPaddleOCRVLPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "paddleocr_vl",
+            "mlx_vlm.models.paddleocr_vl",
+            "PaddleOCRVLProcessor",
         )
 
 
