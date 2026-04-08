@@ -126,7 +126,7 @@ class Gemma4AudioFeatureExtractor:
         max_frequency: float = 8000.0,
         preemphasis: float = 0.0,
         preemphasis_htk_flavor: bool = True,
-        fft_overdrive: bool = True,
+        fft_overdrive: bool = False,
         dither: float = 0.0,
         input_scale_factor: float = 1.0,
         mel_floor: float = 1e-3,
@@ -153,12 +153,14 @@ class Gemma4AudioFeatureExtractor:
             fft_length *= 2
         self.fft_length = fft_length
 
-        # Hanning window (non-zero at endpoints)
-        arg = math.pi * 2.0 / self.frame_length
-        window = 0.5 - (
-            0.5 * np.cos(arg * (np.arange(self.frame_length, dtype=np.float32) + 0.5))
+        # Periodic Hann window: w[n] = 0.5 - 0.5 * cos(2*pi*n / frame_length)
+        # Matches HuggingFace Transformers (signal.hann_window with periodic=True)
+        self.window = 0.5 - 0.5 * np.cos(
+            2.0
+            * np.pi
+            * np.arange(self.frame_length, dtype=np.float32)
+            / self.frame_length
         )
-        self.window = window.astype(np.float32)
 
         # Mel filter bank
         try:
@@ -209,6 +211,14 @@ class Gemma4AudioFeatureExtractor:
         if self.input_scale_factor != 1.0:
             waveform = waveform * self.input_scale_factor
 
+        # Semicausal left-padding: prepend frame_length // 2 zeros so that
+        # the first frame is centered at t=0, matching HuggingFace Transformers
+        pad_left = self.frame_length // 2
+        waveform = np.pad(waveform, ((0, 0), (pad_left, 0)), mode="constant")
+        attention_mask = np.pad(
+            attention_mask, (pad_left, 0), mode="constant", constant_values=0
+        )
+
         frame_size_for_unfold = self.frame_length + 1
 
         frames_to_process = _unfold(
@@ -239,7 +249,7 @@ class Gemma4AudioFeatureExtractor:
 
         magnitude_spec = np.abs(stft)
         mel_spec = np.matmul(magnitude_spec, self.mel_filters)
-        log_mel_spec = np.log(np.maximum(mel_spec, self.mel_floor))
+        log_mel_spec = np.log(mel_spec + self.mel_floor)
 
         if self.per_bin_mean is not None:
             log_mel_spec = log_mel_spec - self.per_bin_mean
@@ -248,8 +258,13 @@ class Gemma4AudioFeatureExtractor:
             log_mel_spec = log_mel_spec / self.per_bin_stddev
 
         mel_spectrogram = log_mel_spec.squeeze(0)
-        mask = attention_mask[:: self.hop_length].astype(bool)
-        return mel_spectrogram, mask[: mel_spectrogram.shape[0]]
+        num_mel_frames = mel_spectrogram.shape[0]
+
+        frame_end_indices = (
+            np.arange(num_mel_frames) * self.hop_length + frame_size_for_unfold - 1
+        )
+        mask = attention_mask[frame_end_indices].astype(bool)
+        return mel_spectrogram, mask
 
     def _pad_waveforms(self, waveforms, max_length=None, pad_to_multiple_of=None):
         """Pad a list of waveforms to equal length."""
@@ -340,6 +355,12 @@ class Gemma4AudioFeatureExtractor:
             spec, spec_mask = self._extract_spectrogram(speech_2d, mask)
             prepared_speech.append(spec.astype(np.float32))
             prepared_speech_mask.append(spec_mask)
+
+        # Zero out padded spectrogram positions, matching HuggingFace Transformers
+        prepared_speech = [
+            spec * m[..., None]
+            for spec, m in zip(prepared_speech, prepared_speech_mask)
+        ]
 
         return {
             "input_features": prepared_speech,

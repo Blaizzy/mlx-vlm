@@ -195,7 +195,9 @@ class Model(nn.Module):
             else:
                 new_key = k
 
-            if new_key.startswith("language_model."):
+            if new_key.startswith("language_model.") and not new_key.startswith(
+                "language_model.model."
+            ):
                 rest = new_key[len("language_model.") :]
                 new_key = "language_model.model." + rest
 
