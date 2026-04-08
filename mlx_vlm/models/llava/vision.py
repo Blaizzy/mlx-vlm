@@ -90,6 +90,7 @@ class MLP(nn.Module):
         return 0.5 * x * (
             1.0
             + mx.tanh(
+                # This calculation comes from https://github.com/huggingface/transformers/blob/3606a1f1e86cfe1aac10f49b63026ede57f12cc1/src/transformers/activations.py#L48
                 math.sqrt(2.0 / math.pi) * (x + 0.044715 * mx.power(x, 3))
             )
         )
