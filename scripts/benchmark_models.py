@@ -197,7 +197,15 @@ def run_benchmarks(models):
 
 
 if __name__ == "__main__":
-    models = MODELS
-    if len(sys.argv) > 1 and sys.argv[1] == "--models":
-        models = sys.argv[2].split(",")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Benchmark MLX-VLM models")
+    parser.add_argument(
+        "--models",
+        type=str,
+        default=None,
+        help="Comma-separated list of model names to benchmark.",
+    )
+    args = parser.parse_args()
+    models = args.models.split(",") if args.models else MODELS
     run_benchmarks(models)

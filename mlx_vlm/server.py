@@ -193,6 +193,10 @@ async def lifespan(app):
     # Shutdown
     if cleanup_task is not None:
         cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
     unload_model_sync()
 
 
@@ -1373,8 +1377,9 @@ async def responses_endpoint(request: ResponsesRequest):
                         f"event: {event_type}\ndata: {event_obj.model_dump_json()}\n\n"
                     )
 
-                sem = await acquire_semaphore()
+                sem = None
                 try:
+                    sem = await acquire_semaphore()
                     # Build base ResponseObject (in_progress, empty output)
                     base_response = ResponseObject(
                         id=response_id,
@@ -1646,7 +1651,8 @@ async def responses_endpoint(request: ResponsesRequest):
                 finally:
                     mx.clear_cache()
                     gc.collect()
-                    sem.release()
+                    if sem is not None:
+                        sem.release()
                     if _verbose:
                         print("Stream finished, cleared cache.")
 
@@ -1664,8 +1670,9 @@ async def responses_endpoint(request: ResponsesRequest):
             # ----------------------------------------------------------
             # Non-streaming response
             # ----------------------------------------------------------
-            sem = await acquire_semaphore()
+            sem = None
             try:
+                sem = await acquire_semaphore()
                 cache_state = get_prompt_cache_state(
                     request.model, getattr(request, "prompt_cache_key", None)
                 )
@@ -1749,7 +1756,8 @@ async def responses_endpoint(request: ResponsesRequest):
                 gc.collect()
                 raise HTTPException(status_code=500, detail="Generation failed. Check server logs for details.")
             finally:
-                sem.release()
+                if sem is not None:
+                    sem.release()
 
     except HTTPException:
         raise
@@ -1852,9 +1860,10 @@ async def chat_completions_endpoint(request: ChatRequest):
         if request.stream:
             # Streaming response
             async def stream_generator():
-                sem = await acquire_semaphore()
+                sem = None
                 token_iterator = None
                 try:
+                    sem = await acquire_semaphore()
                     # Use stream_generate with prompt cache reuse
                     cache_state = get_prompt_cache_state(
                         request.model, getattr(request, "prompt_cache_key", None)
@@ -1965,7 +1974,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                 finally:
                     mx.clear_cache()
                     gc.collect()
-                    sem.release()
+                    if sem is not None:
+                        sem.release()
                     if _verbose:
                         print("Stream finished, cleared cache.")
 
@@ -1981,8 +1991,9 @@ async def chat_completions_endpoint(request: ChatRequest):
 
         else:
             # Non-streaming response
-            sem = await acquire_semaphore()
+            sem = None
             try:
+                sem = await acquire_semaphore()
                 want_logprobs = getattr(request, "logprobs", None)
                 cache_state = get_prompt_cache_state(
                     request.model, getattr(request, "prompt_cache_key", None)
@@ -2085,7 +2096,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                 gc.collect()
                 raise HTTPException(status_code=500, detail="Generation failed. Check server logs for details.")
             finally:
-                sem.release()
+                if sem is not None:
+                    sem.release()
 
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions (like model loading failure)

@@ -30,14 +30,14 @@ run_test() {
     printf "  %-55s " "$name"
 
     local output
-    if ! output=$(eval "$cmd" 2>&1); then
+    if ! output=$(bash -c "$cmd" 2>&1); then
         printf "${RED}FAIL${NC} (command error)\n"
         FAIL=$((FAIL + 1))
         RESULTS+=("FAIL: $name — command error")
         return
     fi
 
-    if echo "$output" | eval "$check" > /dev/null 2>&1; then
+    if printf '%s\n' "$output" | bash -c "$check" > /dev/null 2>&1; then
         printf "${GREEN}PASS${NC}\n"
         PASS=$((PASS + 1))
         RESULTS+=("PASS: $name")

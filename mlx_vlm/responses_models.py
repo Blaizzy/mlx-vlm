@@ -180,7 +180,7 @@ class ChatMessage(FlexibleBaseModel):
             ResponseOutputMessageContentList,
         ]
     ] = Field(None, description="Content of the message.")
-    tool_calls: List = []
+    tool_calls: List = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +298,7 @@ class ContentPartOutputText(BaseModel):
 
     type: Literal["output_text"] = "output_text"
     text: str = ""
-    annotations: List[str] = []
+    annotations: List[str] = Field(default_factory=list)
 
 
 class ResponseMessageItem(BaseModel):
@@ -308,7 +308,7 @@ class ResponseMessageItem(BaseModel):
     type: Literal["message"] = "message"
     role: Literal["assistant"] = "assistant"
     status: Literal["in_progress", "completed"] = "completed"
-    content: List[ContentPartOutputText] = []
+    content: List[ContentPartOutputText] = Field(default_factory=list)
 
 
 class ResponseFunctionCallItem(BaseModel):
