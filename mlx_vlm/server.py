@@ -81,7 +81,14 @@ DEFAULT_SERVER_PORT = 8080
 def _is_verbose() -> bool:
     return os.environ.get("VERBOSE", "").lower() in ("1", "true", "yes")
 
-_verbose = _is_verbose()
+
+class _VerboseFlag:
+    """Lazy flag that checks env var on each access, so --verbose works after import."""
+    def __bool__(self) -> bool:
+        return _is_verbose()
+
+
+_verbose = _VerboseFlag()
 
 
 def get_default_max_tokens() -> int:
@@ -827,6 +834,15 @@ class ChatRequest(GenerationRequest):
         description="Number of most likely tokens to return at each position.",
     )
 
+    @field_validator("top_logprobs")
+    @classmethod
+    def validate_top_logprobs_supported(cls, value):
+        if value is not None:
+            raise ValueError(
+                "`top_logprobs` is not supported by this server and must be omitted."
+            )
+        return value
+
 
 class TokenLogprob(BaseModel):
     token: str
@@ -1499,7 +1515,7 @@ async def responses_endpoint(request: ResponsesRequest):
                     status = "incomplete" if is_length else "completed"
 
                     # Use visible_text (sans tool call markup) for text events
-                    display_text = visible_text.strip()
+                    display_text = visible_text
 
                     # output_text.done
                     yield _evt(
@@ -1688,7 +1704,8 @@ async def responses_endpoint(request: ResponsesRequest):
                 )
                 mx.clear_cache()
                 gc.collect()
-                print("Generation finished, cleared cache.")
+                if _verbose:
+                    print("Generation finished, cleared cache.")
 
                 # Build output items (with tool call parsing)
                 output_items = build_responses_output(

@@ -3,6 +3,7 @@ import codecs
 import contextlib
 import functools
 import json
+import os
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -736,7 +737,8 @@ def stream_generate(
         except Exception as e:
             # Cache reuse failed (e.g., shape mismatch, stale KV state).
             # Invalidate and fall back to fresh generation.
-            print(f"[prompt_cache] Cache reuse failed, invalidating: {e}")
+            if os.environ.get("VERBOSE", "").lower() in ("1", "true", "yes"):
+                print(f"[prompt_cache] Cache reuse failed, invalidating: {e}")
             prompt_cache_state.invalidate()
             reused_prefix_len = 0
             input_ids = _original_input_ids
@@ -784,7 +786,8 @@ def stream_generate(
                             f"Cache offset mismatch: expected {reused_prefix_len}, got {c.offset}"
                         )
         except (ValueError, IndexError, AttributeError) as e:
-            print(f"[prompt_cache] Cache validation failed, rebuilding: {e}")
+            if os.environ.get("VERBOSE", "").lower() in ("1", "true", "yes"):
+                print(f"[prompt_cache] Cache validation failed, rebuilding: {e}")
             if prompt_cache_state is not None:
                 prompt_cache_state.invalidate()
             reused_prefix_len = 0
