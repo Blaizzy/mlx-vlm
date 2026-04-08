@@ -2748,27 +2748,31 @@ def _fused_kv_quantize_kernel(key_bits: int, val_bits: int):
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Step 5: Pack indices
-        threadgroup uint packed_shared[Dim];  // oversized but safe
-        if (d < pw) packed_shared[d] = 0;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (d < Dim) {{
-            uint idx_val = shared_idx[d] & idx_mask;
-            int bo = d * bits;
-            int w = bo >> 5;
-            int shift = bo & 31;
-            packed_shared[w] |= idx_val << shift;
-            if (shift + bits > 32)
-                packed_shared[w + 1] |= idx_val >> (32 - shift);
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
+        // Step 5: Pack indices — thread-per-word, race-free, no atomics.
+        // Each thread d (d < pw) walks the dims whose
+        // [i*bits, (i+1)*bits) range intersects [32d, 32(d+1)) and
+        // accumulates them into a private register, then writes the
+        // word once. `bits` and `pw` are runtime-uniform here so the
+        // loop bound is well-defined per dispatch.
         if (d < pw) {{
+            uint w_val = 0u;
+            int word_start = (int)d * 32;
+            int i_min = word_start / bits;
+            int i_max = (word_start + 31) / bits;
+            if (i_max >= (int)Dim) i_max = (int)Dim - 1;
+            for (int i = i_min; i <= i_max; i++) {{
+                uint idx_val = shared_idx[i] & idx_mask;
+                int bit_off = i * bits - word_start;
+                if (bit_off >= 0) {{
+                    w_val |= idx_val << bit_off;
+                }} else {{
+                    w_val |= idx_val >> (-bit_off);
+                }}
+            }}
             if (is_val)
-                out_val_packed[bh * pw + d] = packed_shared[d];
+                out_val_packed[bh * pw + d] = w_val;
             else
-                out_key_packed[bh * pw + d] = packed_shared[d];
+                out_key_packed[bh * pw + d] = w_val;
         }}
     """
 
@@ -2802,6 +2806,24 @@ def _fused_norot_quantize_kernel(bits: int):
     num_midpoints = (1 << bits) - 1
     mask = (1 << bits) - 1
 
+    # Pack step has to combine `Dim` low-bit indices into `PackedWidth`
+    # 32-bit words. The original kernel had every dim-thread write
+    # `packed_shared[w] |= idx_val << shift`, but `|=` on threadgroup
+    # memory is *not* atomic on Metal, so dim-threads writing to the same
+    # word raced and only one contribution per word survived (every other
+    # slot was silently zeroed). The result was decode-time KV cache
+    # corruption that grew worse at higher bit-widths.
+    #
+    # An earlier attempt swapped the buffer to `threadgroup atomic_uint`
+    # + `atomic_fetch_or_explicit`, which is correct but ran into Metal
+    # GPU watchdog hangs on the high-contention cases (e.g. bits=2,
+    # Dim=128 → 16 dim-threads contending for the same word).
+    #
+    # The race-free *and* atomic-free fix is `thread-per-word packing`:
+    # only threads with `d < PackedWidth` participate, and each one
+    # walks exactly the dims that touch its word, OR-ing them into a
+    # private register. No threadgroup memory is shared during the pack,
+    # so there is neither a race nor any atomic contention.
     source = f"""
         auto d = thread_position_in_threadgroup.x;
         auto bh = threadgroup_position_in_grid.x;
@@ -2819,24 +2841,28 @@ def _fused_norot_quantize_kernel(bits: int):
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Pack indices (word-spanning)
-        threadgroup uint packed_shared[PackedWidth];
-        if (d < PackedWidth) packed_shared[d] = 0;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (d < Dim) {{
-            uint idx_val = shared_idx[d] & {mask}u;
-            int bo = d * {bits};
-            int w = bo >> 5;
-            int shift = bo & 31;
-            packed_shared[w] |= idx_val << shift;
-            if (shift + {bits} > 32)
-                packed_shared[w + 1] |= idx_val >> (32 - shift);
+        // Pack indices: thread d builds word d in a private register
+        // and writes it once (no shared-memory race, no atomics).
+        // Walks every dim whose [i*bits, (i+1)*bits) range intersects
+        // [32d, 32(d+1)), including a single spill from the previous
+        // word for non-32-aligned bit-widths (3-bit, 5-bit, etc.).
+        if (d < PackedWidth) {{
+            uint w_val = 0u;
+            int word_start = (int)d * 32;
+            int i_min = word_start / {bits};
+            int i_max = (word_start + 31) / {bits};
+            if (i_max >= (int)Dim) i_max = (int)Dim - 1;
+            for (int i = i_min; i <= i_max; i++) {{
+                uint idx_val = shared_idx[i] & {mask}u;
+                int bit_off = i * {bits} - word_start;
+                if (bit_off >= 0) {{
+                    w_val |= idx_val << bit_off;
+                }} else {{
+                    w_val |= idx_val >> (-bit_off);
+                }}
+            }}
+            out[bh * PackedWidth + d] = w_val;
         }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (d < PackedWidth)
-            out[bh * PackedWidth + d] = packed_shared[d];
     """
 
     return mx.fast.metal_kernel(
@@ -2904,25 +2930,30 @@ def _fused_mse_quantize_kernel(bits: int, use_rht: bool = False):
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Step 5: Pack indices — per-dim write handles word-spanning
-        threadgroup uint packed_shared[PackedWidth];
-        // Zero packed buffer (use all threads, stride by Dim)
-        if (d < PackedWidth) packed_shared[d] = 0;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (d < Dim) {{
-            uint idx_val = shared_idx[d] & {mask}u;
-            int bo = d * {bits};
-            int w = bo >> 5;
-            int shift = bo & 31;
-            packed_shared[w] |= idx_val << shift;
-            if (shift + {bits} > 32)
-                packed_shared[w + 1] |= idx_val >> (32 - shift);
+        // Step 5: Pack indices — thread-per-word, race-free, no atomics.
+        // Each thread d (d < PackedWidth) walks the dims whose
+        // [i*bits, (i+1)*bits) range intersects [32d, 32(d+1)) and
+        // accumulates them into a private register, then writes the
+        // word once. This avoids both the original `|=` race and the
+        // GPU watchdog hangs that high-contention atomic_or sees on
+        // some Metal devices.
+        if (d < PackedWidth) {{
+            uint w_val = 0u;
+            int word_start = (int)d * 32;
+            int i_min = word_start / {bits};
+            int i_max = (word_start + 31) / {bits};
+            if (i_max >= (int)Dim) i_max = (int)Dim - 1;
+            for (int i = i_min; i <= i_max; i++) {{
+                uint idx_val = shared_idx[i] & {mask}u;
+                int bit_off = i * {bits} - word_start;
+                if (bit_off >= 0) {{
+                    w_val |= idx_val << bit_off;
+                }} else {{
+                    w_val |= idx_val >> (-bit_off);
+                }}
+            }}
+            out_packed[bh * PackedWidth + d] = w_val;
         }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (d < PackedWidth)
-            out_packed[bh * PackedWidth + d] = packed_shared[d];
     """
 
     return mx.fast.metal_kernel(
