@@ -634,8 +634,8 @@ def stream_generate(
     else:
         inputs = prepare_inputs(
             processor,
-            images=image,
-            audio=audio,
+            images=image or None,  # NOTE: avoid image=[]
+            audio=audio or None,   # NOTE: avoid image=[]
             prompts=prompt,
             image_token_index=image_token_index,
             resize_shape=resize_shape,
