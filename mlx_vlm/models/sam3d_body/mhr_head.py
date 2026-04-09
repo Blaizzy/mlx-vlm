@@ -127,7 +127,7 @@ class MHRHead(nn.Module):
 
         Returns:
             dict with pred_vertices, pred_keypoints_3d, pred_joint_coords,
-            pred_model_params
+            pred_model_params, pred_shape
         """
         # Project to parameter space
         pred = self.proj(x)  # (B, 519)
@@ -211,6 +211,7 @@ class MHRHead(nn.Module):
             "pred_keypoints_3d": keypoints,
             "pred_joint_coords": joint_coords,
             "pred_model_params": model_params,
+            "pred_shape": pred_shape,
         }
 
 
