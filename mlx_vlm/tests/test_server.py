@@ -130,3 +130,127 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["repetition_penalty"] == 1.15
     assert mock_generate.call_args.kwargs["logit_bias"] == {12: -1.5}
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
+
+
+# ---------------------------------------------------------------------------
+# Stop sequences tests
+# ---------------------------------------------------------------------------
+
+
+def test_chat_completions_stop_passed_as_eos_tokens(client):
+    """stop parameter should be passed as eos_tokens strings to generate."""
+    model = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=""))
+    config = SimpleNamespace(model_type="test")
+    result = SimpleNamespace(
+        text="Hello",
+        prompt_tokens=5,
+        generation_tokens=1,
+        total_tokens=6,
+        prompt_tps=100.0,
+        generation_tps=50.0,
+        peak_memory=1.0,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result) as mock_gen,
+    ):
+        resp = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stop": ["\n\n", "</s>"],
+            },
+        )
+    assert resp.status_code == 200
+    assert "eos_tokens" in mock_gen.call_args.kwargs
+    assert mock_gen.call_args.kwargs["eos_tokens"] == ["\n\n", "</s>"]
+
+
+def test_chat_completions_no_stop_no_eos_tokens(client):
+    """Without stop parameter, eos_tokens should not be in kwargs."""
+    model = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=""))
+    config = SimpleNamespace(model_type="test")
+    result = SimpleNamespace(
+        text="Hi",
+        prompt_tokens=5,
+        generation_tokens=1,
+        total_tokens=6,
+        prompt_tps=100.0,
+        generation_tps=50.0,
+        peak_memory=1.0,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result) as mock_gen,
+    ):
+        resp = client.post(
+            "/chat/completions",
+            json={"model": "demo", "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert resp.status_code == 200
+    assert "eos_tokens" not in mock_gen.call_args.kwargs
+
+
+def test_responses_stop_passed_as_eos_tokens(client):
+    """stop parameter on /responses should pass strings as eos_tokens."""
+    model = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=""))
+    config = SimpleNamespace(model_type="test")
+    result = SimpleNamespace(
+        text="Hello",
+        prompt_tokens=5,
+        generation_tokens=1,
+        total_tokens=6,
+        prompt_tps=100.0,
+        generation_tps=50.0,
+        peak_memory=1.0,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result) as mock_gen,
+    ):
+        resp = client.post(
+            "/responses",
+            json={"model": "demo", "input": "hi", "stop": "STOP"},
+        )
+    assert resp.status_code == 200
+    assert "eos_tokens" in mock_gen.call_args.kwargs
+    assert mock_gen.call_args.kwargs["eos_tokens"] == ["STOP"]
+
+
+def test_resolve_stop_sequences_single_string():
+    """resolve_stop_sequences should normalize a single string to a list."""
+    result = server.resolve_stop_sequences("hello")
+    assert result == ["hello"]
+
+
+def test_resolve_stop_sequences_list():
+    """resolve_stop_sequences should pass through a list."""
+    result = server.resolve_stop_sequences(["a", "b"])
+    assert result == ["a", "b"]
+
+
+def test_resolve_stop_sequences_none():
+    """resolve_stop_sequences should return None for None input."""
+    assert server.resolve_stop_sequences(None) is None
+
+
+def test_resolve_stop_sequences_limits_to_four():
+    """resolve_stop_sequences should process at most 4 sequences."""
+    result = server.resolve_stop_sequences(["a", "b", "c", "d", "e", "f"])
+    assert len(result) == 4

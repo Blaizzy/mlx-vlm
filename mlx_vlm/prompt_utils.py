@@ -460,6 +460,39 @@ def get_message_json(
     )
 
 
+def _normalize_tool(tool):
+    """Ensure a tool dict uses the Chat Completions nested format.
+
+    The OpenAI Responses API uses a flat format::
+
+        {"type": "function", "name": "...", "description": "...", "parameters": {...}}
+
+    While Chat Completions (and most Jinja chat templates) expect::
+
+        {"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}
+
+    This helper converts the flat format to nested so that Jinja templates
+    referencing ``tool['function']`` (e.g. Gemma 4) work correctly.
+    """
+    if not isinstance(tool, dict):
+        return tool
+    # Already in nested format
+    if "function" in tool and isinstance(tool["function"], dict):
+        return tool
+    # Flat Responses-API format → wrap in 'function' key
+    if tool.get("type") == "function" and "name" in tool:
+        fn = {k: v for k, v in tool.items() if k != "type"}
+        return {"type": "function", "function": fn}
+    return tool
+
+
+def _normalize_tools(tools):
+    """Normalize a list of tool dicts to the Chat Completions nested format."""
+    if not isinstance(tools, list):
+        return tools
+    return [_normalize_tool(t) for t in tools]
+
+
 def get_chat_template(
     processor,
     messages: List[Dict[str, Any]],
@@ -614,6 +647,11 @@ def get_chat_template(
 
         if template_processor is None:
             return _messages_to_plain_prompt()
+
+        # Normalize tool dicts from flat Responses-API format to the nested
+        # Chat Completions format expected by Jinja chat templates.
+        if "tools" in kwargs and kwargs["tools"] is not None:
+            kwargs["tools"] = _normalize_tools(kwargs["tools"])
 
         try:
             return template_processor.apply_chat_template(

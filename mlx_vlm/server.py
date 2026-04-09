@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import gc
 import json
 import os
@@ -7,7 +8,6 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
 from typing import Any, List, Literal, Optional, Union
 
 import mlx.core as mx
@@ -31,11 +31,45 @@ from .generate import (
     DEFAULT_THINKING_END_TOKEN,
     DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
+    PromptCacheState,
     generate,
     normalize_resize_shape,
     stream_generate,
 )
 from .prompt_utils import apply_chat_template
+from .responses_models import ContentPartOutputText as ResponseContentPartOutputText
+from .responses_models import InputTokensDetails
+from .responses_models import ResponseCompletedEvent as ResponsesCompletedEvent
+from .responses_models import (
+    ResponseContentPartAddedEvent as ResponsesContentPartAddedEvent,
+)
+from .responses_models import (
+    ResponseContentPartDoneEvent as ResponsesContentPartDoneEvent,
+)
+from .responses_models import ResponseCreatedEvent as ResponsesCreatedEvent
+from .responses_models import (
+    ResponseFunctionCallArgumentsDeltaEvent as ResponsesFunctionCallArgumentsDeltaEvent,
+)
+from .responses_models import (
+    ResponseFunctionCallArgumentsDoneEvent as ResponsesFunctionCallArgumentsDoneEvent,
+)
+from .responses_models import ResponseFunctionCallItem, ResponseIncompleteDetails
+from .responses_models import ResponseInProgressEvent as ResponsesInProgressEvent
+from .responses_models import ResponseMessageItem, ResponseObject
+from .responses_models import (
+    ResponseOutputItemAddedEvent as ResponsesOutputItemAddedEvent,
+)
+from .responses_models import (
+    ResponseOutputItemDoneEvent as ResponsesOutputItemDoneEvent,
+)
+from .responses_models import (
+    ResponseOutputTextDeltaEvent as ResponsesOutputTextDeltaEvent,
+)
+from .responses_models import (
+    ResponseOutputTextDoneEvent as ResponsesOutputTextDoneEvent,
+)
+from .responses_models import ResponsesRequest, ResponseUsage
+from .responses_store import ResponseStore
 from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load
 from .version import __version__
@@ -44,9 +78,54 @@ from .vision_cache import VisionFeatureCache
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 
+def _is_verbose() -> bool:
+    return os.environ.get("VERBOSE", "").lower() in ("1", "true", "yes")
+
+
+class _VerboseFlag:
+    """Lazy flag that checks env var on each access, so --verbose works after import."""
+    def __bool__(self) -> bool:
+        return _is_verbose()
+
+
+_verbose = _VerboseFlag()
+
+
+def get_default_max_tokens() -> int:
+    """Server-side default max tokens for API responses.
+    The upstream generate.py default (256) is too low for agentic use.
+    Configurable via --default-max-tokens CLI flag or DEFAULT_MAX_TOKENS env var."""
+    return int(os.environ.get("DEFAULT_MAX_TOKENS", DEFAULT_MAX_TOKENS))
+
+_responses_store = ResponseStore()
+
 
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
+
+
+def get_max_context_tokens() -> int:
+    """Maximum prompt tokens before rejecting a request. 0 = no limit."""
+    return int(os.environ.get("MAX_CONTEXT_TOKENS", 0))
+
+
+def get_request_timeout() -> int:
+    """Maximum seconds for a generation request. 0 = no timeout."""
+    return int(os.environ.get("REQUEST_TIMEOUT", 300))
+
+
+def check_context_length(prompt: str, processor, max_context: int) -> None:
+    """Raise HTTP 400 if the tokenized prompt exceeds *max_context* tokens."""
+    if max_context <= 0:
+        return
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    token_count = len(tokenizer.encode(prompt, add_special_tokens=False))
+    if token_count > max_context:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Prompt length ({token_count} tokens) exceeds maximum context "
+            f"window ({max_context} tokens).",
+        )
 
 
 def get_quantized_kv_bits(model: str):
@@ -85,6 +164,16 @@ def get_quantized_kv_start():
     return int(os.environ.get("QUANTIZED_KV_START", DEFAULT_QUANTIZED_KV_START))
 
 
+async def _prompt_cache_cleanup_loop():
+    """Background task that periodically evicts stale prompt caches."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            evict_stale_prompt_caches()
+        except Exception as e:
+            print(f"[prompt_cache] Cleanup error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app):
     # Startup
@@ -97,7 +186,24 @@ async def lifespan(app):
         except Exception as e:
             print(f"Failed to preload model: {e}")
             print("Server will continue without a preloaded model.")
+
+    # Start prompt cache cleanup task
+    ttl = get_prompt_cache_ttl()
+    cleanup_task = None
+    if ttl > 0:
+        cleanup_task = asyncio.create_task(_prompt_cache_cleanup_loop())
+        if _verbose:
+            print(f"[prompt_cache] Cleanup task started (TTL={ttl}s, check every 60s)")
+
     yield
+
+    # Shutdown
+    if cleanup_task is not None:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
     unload_model_sync()
 
 
@@ -121,6 +227,112 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 # Loading/unloading utilities
 
 model_cache = {}
+
+# Prompt cache: reuse KV state across requests with the same prompt prefix.
+# Keyed by (model_name, cache_key) — supports both:
+#   - OpenClaw: sends `prompt_cache_key` for per-session routing
+#   - Hermes: relies on stable system prompt prefix for automatic matching
+# When no cache_key is provided, falls back to model name only.
+DEFAULT_PROMPT_CACHE_TTL = 300  # seconds
+
+
+def get_prompt_cache_ttl() -> int:
+    """Prompt cache TTL in seconds. 0 = no expiry."""
+    return int(os.environ.get("PROMPT_CACHE_TTL", DEFAULT_PROMPT_CACHE_TTL))
+
+
+_PROMPT_CACHE_MAX_ENTRIES = 64
+_prompt_cache_states: dict[str, PromptCacheState] = {}
+
+# Concurrency guard: MLX generation is single-threaded on Metal.
+# Concurrent requests would corrupt shared GPU state. The semaphore
+# serializes access to the generation pipeline.
+_generation_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def get_max_concurrent_requests() -> int:
+    return int(os.environ.get("MAX_CONCURRENT_REQUESTS", 1))
+
+
+def get_generation_semaphore() -> asyncio.Semaphore:
+    """Get or create the generation semaphore."""
+    global _generation_semaphore
+    if _generation_semaphore is None:
+        _generation_semaphore = asyncio.Semaphore(get_max_concurrent_requests())
+    return _generation_semaphore
+
+
+async def acquire_semaphore() -> asyncio.Semaphore:
+    """Acquire the generation semaphore with timeout. Returns the semaphore for release."""
+    sem = get_generation_semaphore()
+    timeout = get_request_timeout()
+    try:
+        if timeout > 0:
+            await asyncio.wait_for(sem.acquire(), timeout=timeout)
+        else:
+            await sem.acquire()
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail="Server busy: generation request timed out waiting for GPU.",
+        )
+    return sem
+
+
+def get_prompt_cache_state(
+    model_name: str,
+    cache_key: Optional[str] = None,
+) -> PromptCacheState:
+    """Get or create a PromptCacheState for the given model and cache key.
+
+    Supports two caching patterns:
+
+    **OpenClaw**: Sends ``prompt_cache_key`` per session so that requests
+    from the same conversation share a KV cache.  The system prompt prefix
+    is stable across turns, so prefix matching works.
+
+    **Hermes**: Relies on a stable system prompt and ``cache_control``
+    breakpoints.  No ``prompt_cache_key`` is sent, so we fall back to
+    a single cache per model.  The ``PromptCacheState.find_prefix_length``
+    in generate.py will still match the common system-prompt prefix.
+
+    Args:
+        model_name: The model identifier.
+        cache_key: Optional routing key (e.g., ``prompt_cache_key`` from the
+            request).  When provided, each key gets its own cache state.
+    """
+    key = f"{model_name}::{cache_key}" if cache_key else model_name
+    # Evict LRU entry if at capacity and key is new
+    if key not in _prompt_cache_states and len(_prompt_cache_states) >= _PROMPT_CACHE_MAX_ENTRIES:
+        lru_key = min(_prompt_cache_states, key=lambda k: _prompt_cache_states[k].last_used)
+        evicted = _prompt_cache_states.pop(lru_key)
+        evicted.invalidate()
+    state = _prompt_cache_states.setdefault(key, PromptCacheState())
+    state.touch()
+    return state
+
+
+def evict_stale_prompt_caches() -> int:
+    """Remove prompt cache entries that exceed the TTL. Returns count evicted."""
+    ttl = get_prompt_cache_ttl()
+    if ttl <= 0:
+        return 0
+    now = time.time()
+    stale_keys = [
+        k for k, v in _prompt_cache_states.items()
+        if (now - v.last_used) > ttl
+    ]
+    for k in stale_keys:
+        entry = _prompt_cache_states.pop(k)
+        tokens = entry.token_count
+        idle = now - entry.last_used
+        entry.invalidate()
+        if _verbose:
+            print(f"[prompt_cache] Evicted '{k}' ({tokens} tokens, idle {idle:.0f}s)")
+    if stale_keys:
+        gc.collect()
+        mx.clear_cache()
+    return len(stale_keys)
 
 
 class FlexibleBaseModel(BaseModel):
@@ -204,6 +416,8 @@ def unload_model_sync():
     if "vision_cache" in model_cache:
         model_cache["vision_cache"].clear()
     model_cache = {}
+    # Clear prompt cache states
+    _prompt_cache_states.clear()
     # Force garbage collection
     gc.collect()
     mx.clear_cache()
@@ -376,11 +590,15 @@ class OpenAIRequest(GenerationParams, TemplateParams):
     )
     model: str = Field(..., description="The model to use for generation.")
     max_output_tokens: int = Field(
-        DEFAULT_MAX_TOKENS,
+        None,
         description="Maximum number of tokens to generate.",
     )
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
+    )
+    stop: Optional[Union[str, List[str]]] = Field(
+        None,
+        description="Up to 4 sequences where the API will stop generating further tokens.",
     )
 
     def generation_kwargs(self) -> dict[str, Any]:
@@ -554,11 +772,15 @@ class VLMRequest(GenerationParams, TemplateParams):
     adapter_path: Optional[str] = Field(
         None, description="The path to the adapter weights."
     )
-    max_tokens: int = Field(
-        DEFAULT_MAX_TOKENS,
-        description="Maximum number of tokens to generate.",
+    max_tokens: Optional[int] = Field(
+        None,
+        description="Maximum number of tokens to generate. Uses server default if not specified.",
     )
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
+    stop: Optional[Union[str, List[str]]] = Field(
+        None,
+        description="Up to 4 sequences where the API will stop generating further tokens.",
+    )
     resize_shape: Optional[ResizeShapeInput] = Field(
         None,
         description="Resize shape for the image. Provide one integer for a square resize or two integers for (height, width).",
@@ -602,11 +824,40 @@ class UsageStats(OpenAIUsage):
 
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
+    logprobs: Optional[bool] = Field(
+        None, description="Whether to return log probabilities."
+    )
+    top_logprobs: Optional[int] = Field(
+        None,
+        ge=0,
+        le=20,
+        description="Number of most likely tokens to return at each position.",
+    )
+
+    @field_validator("top_logprobs")
+    @classmethod
+    def validate_top_logprobs_supported(cls, value):
+        if value is not None:
+            raise ValueError(
+                "`top_logprobs` is not supported by this server and must be omitted."
+            )
+        return value
+
+
+class TokenLogprob(BaseModel):
+    token: str
+    logprob: float
+    bytes: Optional[List[int]] = None
+
+
+class ChoiceLogprobs(BaseModel):
+    content: Optional[List[TokenLogprob]] = None
 
 
 class ChatChoice(BaseModel):
     finish_reason: str
     message: ChatMessage
+    logprobs: Optional[ChoiceLogprobs] = None
 
 
 class ChatResponse(BaseModel):
@@ -619,6 +870,7 @@ class ChatStreamChoice(BaseModel):
     index: int = 0
     finish_reason: Optional[str] = None
     delta: ChatMessage
+    logprobs: Optional[ChoiceLogprobs] = None
 
 
 class ChatStreamChunk(BaseModel):
@@ -630,10 +882,106 @@ class ChatStreamChunk(BaseModel):
     usage: Optional[UsageStats]
 
 
+def resolve_stop_sequences(
+    stop: Optional[Union[str, list]],
+) -> Optional[list]:
+    """Normalize stop sequences for the generation stopping criteria.
+
+    The generation pipeline's ``add_eos_token_ids`` accepts strings
+    and handles tokenization internally.
+
+    Args:
+        stop: A single stop string or list of stop strings, or None.
+
+    Returns:
+        A list of stop strings (max 4), or None.
+    """
+    if not stop:
+        return None
+    if isinstance(stop, str):
+        stop = [stop]
+    sequences = [s for s in stop[:4] if isinstance(s, str) and s]
+    return sequences if sequences else None
+
+
+def resolve_tool_choice(
+    tools: Optional[list],
+    tool_choice: Optional[Any],
+) -> tuple[Optional[list], Optional[str]]:
+    """Apply tool_choice policy to the tools list.
+
+    Args:
+        tools: The original tools list from the request.
+        tool_choice: ``"none"``, ``"auto"``, ``"required"``, or a dict
+            specifying a particular tool.
+
+    Returns:
+        Tuple of ``(filtered_tools, system_instruction)``.
+    """
+    if not tools or tool_choice is None or tool_choice == "auto":
+        return tools, None
+
+    if tool_choice == "none":
+        return None, None
+
+    if tool_choice == "required":
+        return tools, "You must call one of the available tools to answer this request."
+
+    if isinstance(tool_choice, dict):
+        func = tool_choice.get("function", {})
+        name = func.get("name") if isinstance(func, dict) else None
+        if name:
+            filtered = [
+                t
+                for t in tools
+                if (t.get("function", {}) or {}).get("name") == name
+                or t.get("name") == name
+            ]
+            return (
+                filtered or tools,
+                f'You must call the "{name}" tool to answer this request.',
+            )
+
+    return tools, None
+
+
+def resolve_response_format(
+    messages: list,
+    response_format: Optional[dict],
+) -> list:
+    """Inject JSON instruction if json_object format is requested."""
+    if not response_format:
+        return messages
+    fmt_type = response_format.get("type", "text")
+    if fmt_type == "json_object":
+        messages.insert(
+            0,
+            {
+                "role": "system",
+                "content": "You must respond with valid JSON only. Do not include any text outside the JSON object.",
+            },
+        )
+    return messages
+
+
+DEFAULT_REPETITION_PENALTY = 1.1
+
+
 def build_generation_kwargs(
     request: Any,
     template_kwargs: dict[str, Any],
 ) -> dict[str, Any]:
+    gen_kwargs = request.generation_kwargs()
+    # Apply server-side default max_tokens if not specified in request.
+    default_max = get_default_max_tokens()
+    if "max_tokens" not in gen_kwargs or gen_kwargs["max_tokens"] is None:
+        gen_kwargs["max_tokens"] = default_max
+    # Apply server-side default repetition penalty if not specified in request.
+    # Prevents MoE models from degenerating into repetition loops.
+    if "repetition_penalty" not in gen_kwargs or gen_kwargs["repetition_penalty"] is None:
+        default_rp = float(os.environ.get("DEFAULT_REPETITION_PENALTY", DEFAULT_REPETITION_PENALTY))
+        if default_rp > 0:
+            gen_kwargs["repetition_penalty"] = default_rp
     return {
         "prefill_step_size": get_prefill_step_size(),
         "kv_bits": get_quantized_kv_bits(request.model),
@@ -641,7 +989,7 @@ def build_generation_kwargs(
         "kv_quant_scheme": get_kv_quant_scheme(),
         "max_kv_size": get_max_kv_size(request.model),
         "quantized_kv_start": get_quantized_kv_start(),
-        **request.generation_kwargs(),
+        **gen_kwargs,
         **template_kwargs,
     }
 
@@ -704,273 +1052,628 @@ class ModelsResponse(BaseModel):
     data: List[ModelInfo]
 
 
-# OpenAI compatile endpoints
+# ---------------------------------------------------------------------------
+# Responses API helpers
+# ---------------------------------------------------------------------------
+
+
+def responses_input_to_messages(
+    input_items: Union[str, list],
+    instructions: Optional[str] = None,
+    previous_response_id: Optional[str] = None,
+) -> tuple[list[dict], list[str]]:
+    """Convert Responses API input items to chat messages and images.
+
+    Args:
+        input_items: String input or list of input items.
+        instructions: Optional system instructions to prepend.
+        previous_response_id: Optional previous response ID for context replay.
+
+    Returns:
+        Tuple of (chat_messages, image_urls).
+    """
+    chat_messages: list[dict] = []
+    images: list[str] = []
+
+    # Replay previous response context
+    if previous_response_id:
+        replayed = _responses_store.replay_input(previous_response_id)
+        if replayed is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Previous response not found: {previous_response_id}",
+            )
+        # Recursively process replayed items
+        prev_messages, prev_images = responses_input_to_messages(replayed)
+        chat_messages.extend(prev_messages)
+        images.extend(prev_images)
+
+    # Prepend instructions as system message
+    if instructions:
+        chat_messages.insert(0, {"role": "system", "content": instructions})
+
+    # Handle string input
+    if isinstance(input_items, str):
+        chat_messages.append({"role": "user", "content": input_items})
+        return chat_messages, images
+
+    # Handle list of input items
+    for item in input_items:
+        if isinstance(item, dict):
+            item_type = item.get("type", "")
+            role = item.get("role", "")
+
+            # Function call output item
+            if item_type == "function_call_output":
+                call_id = item.get("call_id", "unknown")
+                output = item.get("output", "")
+                chat_messages.append(
+                    {
+                        "role": "tool",
+                        "content": output,
+                        "tool_call_id": call_id,
+                    }
+                )
+                continue
+
+            # Function call item (from previous assistant turn)
+            if item_type == "function_call":
+                chat_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": item.get("call_id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": item.get("arguments", ""),
+                                },
+                            }
+                        ],
+                    }
+                )
+                continue
+
+            # Regular message with role and content
+            if role:
+                content = item.get("content", "")
+
+                # Normalize developer role to system
+                msg_role = "system" if role == "developer" else role
+
+                if isinstance(content, str):
+                    chat_messages.append({"role": msg_role, "content": content})
+                elif isinstance(content, list):
+                    # Process content items
+                    text_parts = []
+                    for ci in content:
+                        if isinstance(ci, dict):
+                            ci_type = ci.get("type", "")
+                            if ci_type in ("input_text", "text"):
+                                text_parts.append(ci.get("text", ""))
+                            elif ci_type == "input_image":
+                                images.append(ci.get("image_url", ""))
+                            elif ci_type == "image_url":
+                                img = ci.get("image_url", {})
+                                if isinstance(img, dict):
+                                    images.append(img.get("url", ""))
+                                elif isinstance(img, str):
+                                    images.append(img)
+                            elif ci_type == "output_text":
+                                # Multi-turn: previous assistant output
+                                chat_messages.append(
+                                    {
+                                        "role": "assistant",
+                                        "content": ci.get("text", ""),
+                                    }
+                                )
+                            elif ci_type == "input_audio":
+                                pass  # Audio not yet supported in responses
+                            else:
+                                pass  # Skip unsupported content types gracefully
+
+                    if text_parts:
+                        chat_messages.append(
+                            {
+                                "role": msg_role,
+                                "content": "\n".join(text_parts),
+                            }
+                        )
+                else:
+                    chat_messages.append(
+                        {
+                            "role": msg_role,
+                            "content": str(content) if content else "",
+                        }
+                    )
+                continue
+
+        # Handle Pydantic ChatMessage objects
+        elif hasattr(item, "role"):
+            role = item.role
+            msg_role = "system" if role == "developer" else role
+            content = item.content
+
+            if content is None:
+                chat_messages.append({"role": msg_role, "content": ""})
+            elif isinstance(content, str):
+                chat_messages.append({"role": msg_role, "content": content})
+            elif isinstance(content, list):
+                text_parts = []
+                for ci in content:
+                    if isinstance(ci, dict):
+                        ci_type = ci.get("type", "")
+                        if ci_type in ("input_text", "text"):
+                            text_parts.append(ci.get("text", ""))
+                        elif ci_type == "input_image":
+                            images.append(ci.get("image_url", ""))
+                        elif ci_type == "image_url":
+                            img = ci.get("image_url", {})
+                            if isinstance(img, dict):
+                                images.append(img.get("url", ""))
+                            elif isinstance(img, str):
+                                images.append(img)
+                        elif ci_type == "output_text":
+                            chat_messages.append(
+                                {
+                                    "role": "assistant",
+                                    "content": ci.get("text", ""),
+                                }
+                            )
+
+                if text_parts:
+                    chat_messages.append(
+                        {
+                            "role": msg_role,
+                            "content": "\n".join(text_parts),
+                        }
+                    )
+
+    return chat_messages, images
+
+
+def build_responses_output(
+    raw_text: str,
+    tool_parser_type: Optional[str],
+    tool_module: Optional[Any],
+    tools: Optional[list],
+) -> list[Union[ResponseMessageItem, ResponseFunctionCallItem]]:
+    """Build structured Responses API output items from raw model text.
+
+    Parses tool calls from the raw text if a tool parser is available,
+    creating ResponseFunctionCallItem for each detected call and a
+    ResponseMessageItem for any remaining text.
+
+    Args:
+        raw_text: The raw text output from the model.
+        tool_parser_type: The detected tool parser type (e.g., "gemma4"), or None.
+        tool_module: The loaded tool parser module, or None.
+        tools: The tool definitions from the request, or None.
+
+    Returns:
+        List of output items (message items and/or function call items).
+    """
+    output_items: list[Union[ResponseMessageItem, ResponseFunctionCallItem]] = []
+    remaining_text = raw_text
+
+    # Try to parse tool calls
+    if tool_parser_type and tool_module and tools:
+        try:
+            result = process_tool_calls(raw_text, tool_module, tools)
+            if result["calls"]:
+                for call in result["calls"]:
+                    func_info = call.get("function", {})
+                    output_items.append(
+                        ResponseFunctionCallItem(
+                            name=func_info.get("name", ""),
+                            arguments=func_info.get("arguments", "{}"),
+                            call_id=call.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+                        )
+                    )
+                remaining_text = result.get("remaining_text", "").strip()
+        except Exception:
+            # If tool parsing fails, fall through to plain text
+            remaining_text = raw_text
+
+    # Create message item for any remaining text
+    if remaining_text or not output_items:
+        msg_item = ResponseMessageItem(
+            content=(
+                [ResponseContentPartOutputText(text=remaining_text)]
+                if remaining_text
+                else []
+            ),
+        )
+        # Insert message before function calls (matching OpenAI ordering)
+        output_items.insert(0, msg_item)
+
+    return output_items
+
+
+# OpenAI compatible endpoints
 
 
 @app.post("/responses")
 @app.post("/v1/responses", include_in_schema=False)
-async def responses_endpoint(openai_request: OpenAIRequest):
+async def responses_endpoint(request: ResponsesRequest):
+    """OpenAI-compatible Responses API endpoint.
+
+    Supports tool calling, multi-turn via previous_response_id, and streaming
+    with proper SSE event sequences including function_call argument events.
     """
-    OpenAI-compatible endpoint for generating text based on a prompt and optional images.
-
-    using client.responses.create method.
-
-    example:
-
-    from openai import OpenAI
-
-    API_URL = "http://0.0.0.0:8000"
-    API_KEY = 'any'
-
-    def run_openai(prompt, img_url,system, stream=False, max_output_tokens=512, model="mlx-community/Qwen2.5-VL-3B-Instruct-8bit"):
-        ''' Calls the OpenAI API
-        '''
-
-        client = OpenAI(base_url=f"{API_URL}", api_key=API_KEY)
-
-        try :
-            response = client.responses.create(
-                model=model,
-                input=[
-                    {"role":"system",
-                    "content": f"{system}"
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": prompt},
-                            {"type": "input_image", "image_url": f"{img_url}"},
-                        ],
-                    }
-                ],
-                max_output_tokens=max_output_tokens,
-                stream=stream
-            )
-            if not stream:
-                print(response.output[0].content[0].text)
-                print(response.usage)
-            else:
-                for event in response:
-                    # Process different event types if needed
-                    if hasattr(event, 'delta') and event.delta:
-                        print(event.delta, end="", flush=True)
-                    elif event.type == 'response.completed':
-                        print("\n--- Usage ---")
-                        print(event.response.usage)
-
-        except Exception as e:
-            # building a response object to match the one returned when request is successful so that it can be processed in the same way
-            return {"model - error":str(e),"content":{}, "model":model}
-
-    """
+    # Resolve default max tokens if not specified in request
+    if request.max_output_tokens is None:
+        request.max_output_tokens = get_default_max_tokens()
 
     try:
         # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(openai_request.model)
+        model, processor, config = get_cached_model(request.model)
 
-        chat_messages = []
-        images = []
-        instructions = None
-        if openai_request.input:
-            if isinstance(openai_request.input, str):
-                # If input is a string, treat it as a single text message
-                chat_messages.append({"role": "user", "content": openai_request.input})
-            elif isinstance(openai_request.input, list):
-                # If input is a list, treat it as a series of chat messages
-                for message in openai_request.input:
-                    if isinstance(message, ChatMessage):
-                        if message.content is None:
-                            chat_messages.append({"role": message.role, "content": ""})
-                        elif isinstance(message.content, str):
-                            chat_messages.append(
-                                {"role": message.role, "content": message.content}
-                            )
-                            if message.role == "system":
-                                instructions = message.content
-                        elif isinstance(message.content, list):
-                            # Handle list of content items
-                            for item in message.content:
-                                if isinstance(item, dict):
-                                    if item["type"] == "input_text":
-                                        chat_messages.append(
-                                            {
-                                                "role": message.role,
-                                                "content": item["text"],
-                                            }
-                                        )
-                                        if message.role == "system":
-                                            instructions = item["text"]
-                                    # examples for multiple images (https://platform.openai.com/docs/guides/images?api-mode=responses)
-                                    elif item["type"] == "input_image":
-                                        images.append(item["image_url"])
-                                    else:
-                                        print(
-                                            f"invalid input item type: {item['type']}"
-                                        )
-                                        raise HTTPException(
-                                            status_code=400,
-                                            detail="Invalid input item type.",
-                                        )
-                                else:
-                                    print(
-                                        f"Invalid message content item format: {item}"
-                                    )
-                                    raise HTTPException(
-                                        status_code=400,
-                                        detail="Missing type in input item.",
-                                    )
-                        else:
-                            print("Invalid message content format.")
-                            raise HTTPException(
-                                status_code=400, detail="Invalid input format."
-                            )
-                    else:
-                        print("not a ChatMessage")
-                        raise HTTPException(
-                            status_code=400, detail="Invalid input format."
-                        )
-            else:
-                print("neither string not list")
-                raise HTTPException(status_code=400, detail="Invalid input format.")
+        # Debug: log incoming request details
+        _tools_count = len(request.tools) if request.tools else 0
+        _tool_names = [t.get("name", t.get("function", {}).get("name", "?")) if isinstance(t, dict) else "?" for t in (request.tools or [])]
+        _input_len = len(str(request.input))
+        _instructions_len = len(request.instructions) if request.instructions else 0
+        if _verbose:
+            print(f"[responses] tools={_tools_count} names={_tool_names} stream={request.stream} input_chars={_input_len} instructions_chars={_instructions_len}")
 
-        else:
-            print("no input")
-            raise HTTPException(status_code=400, detail="Missing input.")
+        # Convert input to chat messages
+        chat_messages, images = responses_input_to_messages(
+            request.input,
+            instructions=request.instructions,
+            previous_response_id=request.previous_response_id,
+        )
 
-        template_kwargs = openai_request.template_kwargs()
+        # Apply JSON mode if requested
+        response_format = getattr(request, "response_format", None)
+        chat_messages = resolve_response_format(chat_messages, response_format)
+
+        # Set up tool parser (apply tool_choice policy)
+        tools = request.tools
+        tool_choice_val = getattr(request, "tool_choice", "auto")
+        tools, tool_instruction = resolve_tool_choice(tools, tool_choice_val)
+        if tool_instruction:
+            chat_messages.insert(0, {"role": "system", "content": tool_instruction})
+
+        tool_parser_type = None
+        tool_module = None
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        if hasattr(tokenizer, "chat_template") and tools:
+            tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
+            if tool_parser_type is not None:
+                tool_module = load_tool_module(tool_parser_type)
+        if _verbose:
+            print(f"[responses] tool_parser={tool_parser_type} tool_module={'yes' if tool_module else 'no'} tools_after_choice={len(tools) if tools else 0}")
+
+        # Build template kwargs
+        template_kwargs = request.template_kwargs()
+
+        # Apply chat template (pass tools so the template can include tool defs)
         formatted_prompt = apply_chat_template(
             processor,
             config,
             chat_messages,
             num_images=len(images),
+            tools=tools,
             **template_kwargs,
         )
-        generation_kwargs = build_generation_kwargs(openai_request, template_kwargs)
+        generation_kwargs = build_generation_kwargs(request, template_kwargs)
 
-        generated_at = datetime.now().timestamp()
-        response_id = f"resp_{uuid.uuid4().hex}"
-        message_id = f"msg_{uuid.uuid4().hex}"
+        if _verbose:
+            _prompt_str = formatted_prompt if isinstance(formatted_prompt, str) else str(formatted_prompt)
+            print(f"[responses] prompt_chars={len(_prompt_str)} last_300=...{_prompt_str[-300:]!r}")
 
-        if openai_request.stream:
+        check_context_length(formatted_prompt, processor, get_max_context_tokens())
+
+        # Resolve stop sequences to token IDs
+        stop_seqs = resolve_stop_sequences(getattr(request, "stop", None))
+        if stop_seqs:
+            generation_kwargs["eos_tokens"] = stop_seqs
+
+        generated_at = int(time.time())
+        response_id = f"resp_{uuid.uuid4().hex[:24]}"
+        message_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+        if request.stream:
+            # ----------------------------------------------------------
             # Streaming response
-            async def stream_generator():
-                token_iterator = None
+            # ----------------------------------------------------------
+            async def stream_responses_generator():
+                seq = 0  # sequence_number counter
+
+                def _evt(event_type: str, event_obj) -> str:
+                    nonlocal seq
+                    event_obj.sequence_number = seq
+                    seq += 1
+                    return (
+                        f"event: {event_type}\ndata: {event_obj.model_dump_json()}\n\n"
+                    )
+
+                sem = None
                 try:
-                    # Create base response object (to match the openai pipeline)
-                    base_response = OpenAIResponse(
+                    sem = await acquire_semaphore()
+                    # Build base ResponseObject (in_progress, empty output)
+                    base_response = ResponseObject(
                         id=response_id,
-                        object="response",
-                        created_at=int(generated_at),
+                        created_at=generated_at,
                         status="in_progress",
-                        instructions=instructions,
-                        max_output_tokens=openai_request.max_output_tokens,
-                        model=openai_request.model,
+                        model=request.model,
                         output=[],
-                        output_text="",
-                        temperature=openai_request.temperature,
-                        top_p=openai_request.top_p,
-                        usage={
-                            "input_tokens": 0,  # get prompt tokens
-                            "output_tokens": 0,
-                            "total_tokens": 0,
-                        },
+                        instructions=request.instructions,
+                        max_output_tokens=request.max_output_tokens,
+                        temperature=request.temperature,
+                        top_p=request.top_p,
+                        tools=tools or [],
+                        tool_choice=request.tool_choice,
+                        parallel_tool_calls=request.parallel_tool_calls,
+                        previous_response_id=request.previous_response_id,
+                        metadata=request.metadata,
+                        usage=ResponseUsage(
+                            input_tokens=0, output_tokens=0, total_tokens=0
+                        ),
                     )
 
-                    # Send response.created event  (to match the openai pipeline)
-                    yield f"event: response.created\ndata: {ResponseCreatedEvent(type='response.created', response=base_response).model_dump_json()}\n\n"
-
-                    # Send response.in_progress event  (to match the openai pipeline)
-                    yield f"event: response.in_progress\ndata: {ResponseInProgressEvent(type='response.in_progress', response=base_response).model_dump_json()}\n\n"
-
-                    # Send response.output_item.added event  (to match the openai pipeline)
-                    message_item = MessageItem(
-                        id=message_id,
-                        type="message",
-                        status="in_progress",
-                        role="assistant",
-                        content=[],
+                    # response.created
+                    yield _evt(
+                        "response.created",
+                        ResponsesCreatedEvent(response=base_response),
                     )
-                    yield f"event: response.output_item.added\ndata: {ResponseOutputItemAddedEvent(type='response.output_item.added', output_index=0, item=message_item).model_dump_json()}\n\n"
-
-                    # Send response.content_part.added event
-                    content_part = ContentPartOutputText(
-                        type="output_text", text="", annotations=[]
+                    # response.in_progress
+                    yield _evt(
+                        "response.in_progress",
+                        ResponsesInProgressEvent(response=base_response),
                     )
-                    yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=0, content_index=0, part=content_part).model_dump_json()}\n\n"
 
-                    # Stream text deltas
+                    # output_item.added (message)
+                    msg_item = ResponseMessageItem(
+                        id=message_id, status="in_progress", content=[]
+                    )
+                    yield _evt(
+                        "response.output_item.added",
+                        ResponsesOutputItemAddedEvent(output_index=0, item=msg_item),
+                    )
+
+                    # content_part.added
+                    empty_part = ResponseContentPartOutputText(text="")
+                    yield _evt(
+                        "response.content_part.added",
+                        ResponsesContentPartAddedEvent(
+                            item_id=message_id,
+                            output_index=0,
+                            content_index=0,
+                            part=empty_part,
+                        ),
+                    )
+                    cache_state = get_prompt_cache_state(
+                        request.model, getattr(request, "prompt_cache_key", None)
+                    )
                     token_iterator = stream_generate(
                         model=model,
                         processor=processor,
                         prompt=formatted_prompt,
                         image=images,
                         vision_cache=model_cache.get("vision_cache"),
+                        prompt_cache_state=cache_state,
                         **generation_kwargs,
                     )
 
                     full_text = ""
+                    visible_text = ""
+                    usage_stats = {"input_tokens": 0, "output_tokens": 0}
+                    in_tool_call = False
+                    tool_call_start_tag = (
+                        tool_module.tool_call_start if tool_module else "<tool_call>"
+                    )
+
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
                             continue
 
                         delta = chunk.text
                         full_text += delta
-
                         usage_stats = {
                             "input_tokens": chunk.prompt_tokens,
                             "output_tokens": chunk.generation_tokens,
                         }
 
-                        # Send response.output_text.delta event
-                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                        # Suppress tool call tokens from being streamed as text
+                        if not in_tool_call and tool_call_start_tag in full_text:
+                            in_tool_call = True
+                        if in_tool_call:
+                            continue
 
-                    # Send response.output_text.done event (to match the openai pipeline)
-                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=full_text).model_dump_json()}\n\n"
+                        # Check if this delta starts a tool call tag
+                        # (partial match: buffer might end with "<tool" before "_call>")
+                        if tools and tool_call_start_tag[:1] in delta:
+                            pending = full_text[
+                                -(len(delta) + len(tool_call_start_tag)) :
+                            ]
+                            if any(
+                                tool_call_start_tag[:i] == pending[-i:]
+                                for i in range(2, len(tool_call_start_tag) + 1)
+                            ):
+                                continue
 
-                    # Send response.content_part.done event (to match the openai pipeline)
-                    final_content_part = ContentPartOutputText(
-                        type="output_text", text=full_text, annotations=[]
+                        visible_text += delta
+                        yield _evt(
+                            "response.output_text.delta",
+                            ResponsesOutputTextDeltaEvent(
+                                item_id=message_id,
+                                output_index=0,
+                                content_index=0,
+                                delta=delta,
+                            ),
+                        )
+
+                    # Determine finish reason
+                    max_tok = request.max_output_tokens
+                    is_length = usage_stats["output_tokens"] >= max_tok
+                    status = "incomplete" if is_length else "completed"
+
+                    # Use visible_text (sans tool call markup) for text events
+                    display_text = visible_text
+
+                    # output_text.done
+                    yield _evt(
+                        "response.output_text.done",
+                        ResponsesOutputTextDoneEvent(
+                            item_id=message_id,
+                            output_index=0,
+                            content_index=0,
+                            text=display_text,
+                        ),
                     )
-                    yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=0, content_index=0, part=final_content_part).model_dump_json()}\n\n"
 
-                    # Send response.output_item.done event (to match the openai pipeline)
-                    final_message_item = MessageItem(
+                    # content_part.done
+                    final_part = ResponseContentPartOutputText(text=display_text)
+                    yield _evt(
+                        "response.content_part.done",
+                        ResponsesContentPartDoneEvent(
+                            item_id=message_id,
+                            output_index=0,
+                            content_index=0,
+                            part=final_part,
+                        ),
+                    )
+
+                    # output_item.done (message)
+                    final_msg = ResponseMessageItem(
                         id=message_id,
-                        type="message",
                         status="completed",
-                        role="assistant",
-                        content=[final_content_part],
+                        content=[final_part],
                     )
-                    yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_item).model_dump_json()}\n\n"
+                    yield _evt(
+                        "response.output_item.done",
+                        ResponsesOutputItemDoneEvent(output_index=0, item=final_msg),
+                    )
 
-                    # Send response.completed event (to match the openai pipeline)
+                    # Collect all output items for final response
+                    all_output_items: list = [final_msg]
+
+                    # Parse tool calls from accumulated text
+                    if tool_parser_type and tool_module and tools:
+                        try:
+                            tc_result = process_tool_calls(
+                                full_text, tool_module, tools
+                            )
+                            if tc_result["calls"]:
+                                for idx, call in enumerate(tc_result["calls"]):
+                                    func_info = call.get("function", {})
+                                    fc_item = ResponseFunctionCallItem(
+                                        name=func_info.get("name", ""),
+                                        arguments=func_info.get("arguments", "{}"),
+                                        call_id=call.get(
+                                            "id", f"call_{uuid.uuid4().hex[:24]}"
+                                        ),
+                                    )
+                                    out_idx = len(all_output_items)
+
+                                    # output_item.added (function_call)
+                                    yield _evt(
+                                        "response.output_item.added",
+                                        ResponsesOutputItemAddedEvent(
+                                            output_index=out_idx, item=fc_item
+                                        ),
+                                    )
+
+                                    # function_call_arguments.delta (full arguments in one shot)
+                                    yield _evt(
+                                        "response.function_call_arguments.delta",
+                                        ResponsesFunctionCallArgumentsDeltaEvent(
+                                            item_id=fc_item.id,
+                                            output_index=out_idx,
+                                            delta=fc_item.arguments,
+                                        ),
+                                    )
+
+                                    # function_call_arguments.done
+                                    yield _evt(
+                                        "response.function_call_arguments.done",
+                                        ResponsesFunctionCallArgumentsDoneEvent(
+                                            item_id=fc_item.id,
+                                            output_index=out_idx,
+                                            arguments=fc_item.arguments,
+                                        ),
+                                    )
+
+                                    # output_item.done (function_call)
+                                    yield _evt(
+                                        "response.output_item.done",
+                                        ResponsesOutputItemDoneEvent(
+                                            output_index=out_idx, item=fc_item
+                                        ),
+                                    )
+
+                                    all_output_items.append(fc_item)
+                        except Exception:
+                            pass  # Tool parsing failure is non-fatal in streaming
+
+                    # response.completed
+                    total_tokens = (
+                        usage_stats["input_tokens"] + usage_stats["output_tokens"]
+                    )
                     completed_response = base_response.model_copy(
                         update={
-                            "status": "completed",
-                            "output": [final_message_item],
-                            "usage": {
-                                "input_tokens": usage_stats["input_tokens"],
-                                "output_tokens": usage_stats["output_tokens"],
-                                "total_tokens": usage_stats["input_tokens"]
-                                + usage_stats["output_tokens"],
-                            },
+                            "status": status,
+                            "output": all_output_items,
+                            "incomplete_details": (
+                                ResponseIncompleteDetails(reason="max_output_tokens")
+                                if status == "incomplete"
+                                else None
+                            ),
+                            "usage": ResponseUsage(
+                                input_tokens=usage_stats["input_tokens"],
+                                output_tokens=usage_stats["output_tokens"],
+                                total_tokens=total_tokens,
+                            ),
                         }
                     )
-                    yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
+                    yield _evt(
+                        "response.completed",
+                        ResponsesCompletedEvent(response=completed_response),
+                    )
+
+                    # Save to store for previous_response_id
+                    _responses_store.save(
+                        response_id,
+                        (
+                            request.input
+                            if isinstance(request.input, str)
+                            else [
+                                (
+                                    item.model_dump()
+                                    if hasattr(item, "model_dump")
+                                    else item
+                                )
+                                for item in request.input
+                            ]
+                        ),
+                        [item.model_dump() for item in all_output_items],
+                    )
+
+                    # Final sentinel
+                    yield "data: [DONE]\n\n"
 
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
-                    error_data = json.dumps({"error": str(e)})
+                    error_data = json.dumps({"error": "Internal generation error"})
                     yield f"data: {error_data}\n\n"
 
                 finally:
                     mx.clear_cache()
                     gc.collect()
-                    print("Stream finished, cleared cache.")
+                    if sem is not None:
+                        sem.release()
+                    if _verbose:
+                        print("Stream finished, cleared cache.")
 
             return StreamingResponse(
-                stream_generator(),
+                stream_responses_generator(),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -980,64 +1683,102 @@ async def responses_endpoint(openai_request: OpenAIRequest):
             )
 
         else:
+            # ----------------------------------------------------------
             # Non-streaming response
+            # ----------------------------------------------------------
+            sem = None
             try:
-                # Use generate from generate.py
+                sem = await acquire_semaphore()
+                cache_state = get_prompt_cache_state(
+                    request.model, getattr(request, "prompt_cache_key", None)
+                )
                 result = generate(
                     model=model,
                     processor=processor,
                     prompt=formatted_prompt,
                     image=images,
-                    verbose=False,  # stats are passed in the response
+                    verbose=False,
+                    vision_cache=model_cache.get("vision_cache"),
+                    prompt_cache_state=cache_state,
                     **generation_kwargs,
                 )
-                # Clean up resources
                 mx.clear_cache()
                 gc.collect()
-                print("Generation finished, cleared cache.")
+                if _verbose:
+                    print("Generation finished, cleared cache.")
 
-                response = OpenAIResponse(
-                    id=response_id,
-                    object="response",
-                    created_at=int(generated_at),
-                    status="completed",
-                    instructions=instructions,
-                    max_output_tokens=openai_request.max_output_tokens,
-                    model=openai_request.model,
-                    output=[
-                        {
-                            "role": "assistant",
-                            "content": [
-                                {
-                                    "type": "output_text",
-                                    "text": result.text,
-                                }
-                            ],
-                        }
-                    ],
-                    output_text=result.text,
-                    temperature=openai_request.temperature,
-                    top_p=openai_request.top_p,
-                    usage={
-                        "input_tokens": result.prompt_tokens,
-                        "output_tokens": result.generation_tokens,
-                        "total_tokens": result.total_tokens,
-                    },
+                # Build output items (with tool call parsing)
+                output_items = build_responses_output(
+                    result.text,
+                    tool_parser_type,
+                    tool_module,
+                    tools,
                 )
-                return response
+
+                # Determine status
+                is_length = result.generation_tokens >= request.max_output_tokens
+                status = "incomplete" if is_length else "completed"
+                incomplete_details = (
+                    ResponseIncompleteDetails(reason="max_output_tokens")
+                    if status == "incomplete"
+                    else None
+                )
+
+                response_obj = ResponseObject(
+                    id=response_id,
+                    created_at=generated_at,
+                    model=request.model,
+                    output=output_items,
+                    status=status,
+                    incomplete_details=incomplete_details,
+                    instructions=request.instructions,
+                    max_output_tokens=request.max_output_tokens,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    tools=tools or [],
+                    tool_choice=request.tool_choice,
+                    parallel_tool_calls=request.parallel_tool_calls,
+                    previous_response_id=request.previous_response_id,
+                    metadata=request.metadata,
+                    usage=ResponseUsage(
+                        input_tokens=result.prompt_tokens,
+                        output_tokens=result.generation_tokens,
+                        total_tokens=result.total_tokens,
+                        input_tokens_details=InputTokensDetails(
+                            cached_tokens=getattr(result, "cached_tokens", 0),
+                        ),
+                    ),
+                )
+
+                # Save to store for previous_response_id support
+                _responses_store.save(
+                    response_obj.id,
+                    (
+                        request.input
+                        if isinstance(request.input, str)
+                        else [
+                            item.model_dump() if hasattr(item, "model_dump") else item
+                            for item in request.input
+                        ]
+                    ),
+                    [item.model_dump() for item in output_items],
+                )
+
+                return response_obj.model_dump()
 
             except Exception as e:
                 print(f"Error during generation: {e}")
                 traceback.print_exc()
                 mx.clear_cache()
                 gc.collect()
-                raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+                raise HTTPException(status_code=500, detail="Generation failed. Check server logs for details.")
+            finally:
+                if sem is not None:
+                    sem.release()
 
-    except HTTPException as http_exc:
-        # Re-raise HTTP exceptions (like model loading failure)
-        raise http_exc
+    except HTTPException:
+        raise
     except Exception as e:
-        # Catch unexpected errors
         print(f"Unexpected error in /responses endpoint: {e}")
         traceback.print_exc()
         mx.clear_cache()
@@ -1058,6 +1799,9 @@ async def chat_completions_endpoint(request: ChatRequest):
     System message will be ignored if not already in the prompt.
     Can operate in streaming or non-streaming mode.
     """
+    # Resolve default max tokens if not specified in request
+    if request.max_tokens is None:
+        request.max_tokens = get_default_max_tokens()
 
     try:
         # Get model, processor, config - loading if necessary
@@ -1095,6 +1839,14 @@ async def chat_completions_endpoint(request: ChatRequest):
         if hasattr(request, "tools"):
             tools = request.tools
 
+        # Apply tool_choice policy
+        tool_choice = getattr(request, "tool_choice", None)
+        tools, tool_instruction = resolve_tool_choice(tools, tool_choice)
+        if tool_instruction:
+            processed_messages.insert(
+                0, {"role": "system", "content": tool_instruction}
+            )
+
         tool_parser_type = None
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
@@ -1115,12 +1867,24 @@ async def chat_completions_endpoint(request: ChatRequest):
         )
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
 
+        check_context_length(formatted_prompt, processor, get_max_context_tokens())
+
+        # Resolve stop sequences to token IDs
+        stop_seqs = resolve_stop_sequences(getattr(request, "stop", None))
+        if stop_seqs:
+            generation_kwargs["eos_tokens"] = stop_seqs
+
         if request.stream:
             # Streaming response
             async def stream_generator():
+                sem = None
                 token_iterator = None
                 try:
-                    # Use stream_generate from utils
+                    sem = await acquire_semaphore()
+                    # Use stream_generate with prompt cache reuse
+                    cache_state = get_prompt_cache_state(
+                        request.model, getattr(request, "prompt_cache_key", None)
+                    )
                     token_iterator = stream_generate(
                         model=model,
                         processor=processor,
@@ -1128,14 +1892,17 @@ async def chat_completions_endpoint(request: ChatRequest):
                         image=images,
                         audio=audio,
                         vision_cache=model_cache.get("vision_cache"),
+                        prompt_cache_state=cache_state,
                         **generation_kwargs,
                     )
 
                     output_text = ""
                     request_id = f"chatcmpl-{uuid.uuid4()}"
+                    want_logprobs = getattr(request, "logprobs", None)
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
-                            print("Warning: Received unexpected chunk format:", chunk)
+                            if _verbose:
+                                print("Warning: Received unexpected chunk format:", chunk)
                             continue
 
                         output_text += chunk.text
@@ -1151,9 +1918,24 @@ async def chat_completions_endpoint(request: ChatRequest):
                             "peak_memory": chunk.peak_memory,
                         }
 
+                        chunk_logprobs = None
+                        if want_logprobs and chunk.token is not None and chunk.logprobs is not None:
+                            token_text = tokenizer.decode([chunk.token])
+                            chosen_logprob = float(chunk.logprobs[chunk.token])
+                            chunk_logprobs = ChoiceLogprobs(
+                                content=[
+                                    TokenLogprob(
+                                        token=token_text,
+                                        logprob=chosen_logprob,
+                                        bytes=list(token_text.encode("utf-8")),
+                                    )
+                                ]
+                            )
+
                         choices = [
                             ChatStreamChoice(
-                                delta=ChatMessage(role="assistant", content=chunk.text)
+                                delta=ChatMessage(role="assistant", content=chunk.text),
+                                logprobs=chunk_logprobs,
                             )
                         ]
                         chunk_data = ChatStreamChunk(
@@ -1176,10 +1958,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                         tool_calls = {}
                         tool_calls["calls"] = []
 
-                    # Signal stream end
+                    # Signal stream end with correct finish_reason
+                    stream_finish = "tool_calls" if tool_calls.get("calls") else "stop"
                     choices = [
                         ChatStreamChoice(
-                            finish_reason="stop",
+                            finish_reason=stream_finish,
                             delta=ChatMessage(
                                 role="assistant",
                                 content="",
@@ -1202,13 +1985,16 @@ async def chat_completions_endpoint(request: ChatRequest):
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
-                    error_data = json.dumps({"error": str(e)})
+                    error_data = json.dumps({"error": "Internal generation error"})
                     yield f"data: {error_data}\n\n"
 
                 finally:
                     mx.clear_cache()
                     gc.collect()
-                    print("Stream finished, cleared cache.")
+                    if sem is not None:
+                        sem.release()
+                    if _verbose:
+                        print("Stream finished, cleared cache.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -1222,22 +2008,60 @@ async def chat_completions_endpoint(request: ChatRequest):
 
         else:
             # Non-streaming response
+            sem = None
             try:
-                # Use generate from generate.py
-                gen_result = generate(
-                    model=model,
-                    processor=processor,
-                    prompt=formatted_prompt,
-                    image=images,
-                    audio=audio,
-                    verbose=False,  # Keep API output clean
-                    vision_cache=model_cache.get("vision_cache"),
-                    **generation_kwargs,
+                sem = await acquire_semaphore()
+                want_logprobs = getattr(request, "logprobs", None)
+                cache_state = get_prompt_cache_state(
+                    request.model, getattr(request, "prompt_cache_key", None)
                 )
+                token_logprobs = []
+
+                if want_logprobs:
+                    # Use stream_generate to collect per-token logprobs
+                    full_text = ""
+                    gen_result = None
+                    for chunk in stream_generate(
+                        model=model,
+                        processor=processor,
+                        prompt=formatted_prompt,
+                        image=images,
+                        audio=audio,
+                        vision_cache=model_cache.get("vision_cache"),
+                        prompt_cache_state=cache_state,
+                        **generation_kwargs,
+                    ):
+                        if chunk is None or not hasattr(chunk, "text"):
+                            continue
+                        full_text += chunk.text
+                        if chunk.token is not None and chunk.logprobs is not None:
+                            token_text = tokenizer.decode([chunk.token])
+                            chosen_logprob = float(chunk.logprobs[chunk.token])
+                            token_logprobs.append(
+                                TokenLogprob(
+                                    token=token_text,
+                                    logprob=chosen_logprob,
+                                    bytes=list(token_text.encode("utf-8")),
+                                )
+                            )
+                        gen_result = chunk
+                    gen_result.text = full_text
+                else:
+                    gen_result = generate(
+                        model=model,
+                        processor=processor,
+                        prompt=formatted_prompt,
+                        image=images,
+                        audio=audio,
+                        verbose=False,
+                        vision_cache=model_cache.get("vision_cache"),
+                        prompt_cache_state=cache_state,
+                        **generation_kwargs,
+                    )
+
                 # Clean up resources
                 mx.clear_cache()
                 gc.collect()
-                print("Generation finished, cleared cache.")
 
                 usage_stats = UsageStats(
                     input_tokens=gen_result.prompt_tokens,
@@ -1259,14 +2083,20 @@ async def chat_completions_endpoint(request: ChatRequest):
                     tool_calls["calls"] = []
                     tool_calls["remaining_text"] = gen_result.text
 
+                choice_logprobs = None
+                if want_logprobs and token_logprobs:
+                    choice_logprobs = ChoiceLogprobs(content=token_logprobs)
+
+                finish = "tool_calls" if tool_calls.get("calls") else "stop"
                 choices = [
                     ChatChoice(
-                        finish_reason="stop",
+                        finish_reason=finish,
                         message=ChatMessage(
                             role="assistant",
                             content=tool_calls["remaining_text"],
                             tool_calls=tool_calls["calls"],
                         ),
+                        logprobs=choice_logprobs,
                     )
                 ]
 
@@ -1281,7 +2111,10 @@ async def chat_completions_endpoint(request: ChatRequest):
                 traceback.print_exc()
                 mx.clear_cache()
                 gc.collect()
-                raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+                raise HTTPException(status_code=500, detail="Generation failed. Check server logs for details.")
+            finally:
+                if sem is not None:
+                    sem.release()
 
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions (like model loading failure)
@@ -1434,6 +2267,48 @@ def main():
         help="Start index (of token) for the quantized KV cache.",
     )
     parser.add_argument(
+        "--max-concurrent-requests",
+        type=int,
+        default=1,
+        help="Maximum number of concurrent generation requests. "
+        "MLX runs single-threaded on Metal; values > 1 may cause GPU errors. "
+        "(default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=0,
+        help="Maximum context window in tokens. 0 = no limit. (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=int,
+        default=300,
+        help="Maximum seconds per generation request. (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--default-max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help="Default max tokens for API responses when not specified in the request. "
+        "The upstream default (256) is too low for agentic use. "
+        "(default: %(default)s)",
+    )
+    parser.add_argument(
+        "--prompt-cache-ttl",
+        type=int,
+        default=DEFAULT_PROMPT_CACHE_TTL,
+        help="Seconds of idle time before a prompt cache entry is evicted. "
+        "Frees GPU memory from stale KV caches. 0 = no expiry. "
+        "(default: %(default)s)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Enable verbose debug logging (prompt content, cache state, tool detection).",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -1454,6 +2329,13 @@ def main():
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    os.environ["MAX_CONCURRENT_REQUESTS"] = str(args.max_concurrent_requests)
+    os.environ["MAX_CONTEXT_TOKENS"] = str(args.max_context_tokens)
+    os.environ["REQUEST_TIMEOUT"] = str(args.request_timeout)
+    os.environ["PROMPT_CACHE_TTL"] = str(args.prompt_cache_ttl)
+    os.environ["DEFAULT_MAX_TOKENS"] = str(args.default_max_tokens)
+    if args.verbose:
+        os.environ["VERBOSE"] = "1"
 
     uvicorn.run(
         "mlx_vlm.server:app",
