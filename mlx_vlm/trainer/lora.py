@@ -31,19 +31,29 @@ class LoRaLayer(nn.Module):
             shape=(input_dims, rank),
         )
         self.B = mx.zeros((rank, output_dims))
+        self.rank = rank
         self.alpha = alpha
+        # Standard LoRA scaling factor (Hu et al. 2021): alpha / rank.
+        # Computed once at construction so __call__ and
+        # replace_lora_with_linear apply consistent scaling. Previously
+        # this layer multiplied the update by raw `alpha`, which made
+        # the effective scaling rank-times too large for the documented
+        # defaults (e.g. r=8 alpha=16 gave an effective scaling of 16
+        # instead of 2). See issue #845.
+        self.scaling = alpha / rank
 
     def __call__(self, x):
         y = self.original_layer(x)
         lora_update = (self.dropout(x) @ self.A) @ self.B
-        return y + (self.alpha * lora_update).astype(x.dtype)
+        return y + (self.scaling * lora_update).astype(x.dtype)
 
 
 def replace_lora_with_linear(model):
     for i, layer in enumerate(model.layers):
         if isinstance(layer, LoRaLayer):
-            # Compute the final merged weight
-            lora_update = layer.alpha * (layer.A @ layer.B)
+            # Compute the final merged weight using the same alpha/rank
+            # scaling that LoRaLayer.__call__ applies during training.
+            lora_update = layer.scaling * (layer.A @ layer.B)
             updated_weight = layer.original_layer.weight + lora_update
             use_bias = layer.original_layer.bias is not None
 
