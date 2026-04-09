@@ -304,6 +304,21 @@ def train(
     """
     Main training function for vision-language models.
     """
+    # Defensive default — checkpoint and final saves crash with a
+    # `TypeError: argument should be a str ... not 'NoneType'` if
+    # `args.adapter_file` is None. This can happen when callers
+    # construct TrainingArgs (or a SimpleNamespace) without setting
+    # `adapter_file` explicitly. Falling back to the dataclass default
+    # keeps training useful while making the situation visible.
+    # See issue #908.
+    if getattr(args, "adapter_file", None) is None:
+        args.adapter_file = "adapters.safetensors"
+        if mx.distributed.init().rank() == 0:
+            print(
+                f"{Colors.WARNING}[warning] args.adapter_file was None — "
+                f"defaulting to '{args.adapter_file}'.{Colors.ENDC}"
+            )
+
     # Set memory limit if using Metal
     if mx.metal.is_available():
         device_info = mx.device_info()
