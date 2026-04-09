@@ -5,6 +5,17 @@ import regex as re
 tool_call_start = "<|tool_call>"
 tool_call_end = "<tool_call|>"
 
+# Gemma 4's "thinking channel" markers (token IDs 100 / 101 in the
+# tokenizer). Content between these markers is internal reasoning and
+# must not reach the client — Google's chat template strips it via the
+# ``strip_thinking`` Jinja macro, and mlx-lm's server handles them as
+# a reasoning state (see ml-explore/mlx-lm#1114). mlx-vlm's streaming
+# path consumes these attributes from ``_streamable_prefix`` in
+# ``server.py`` to drop the blocks from ``delta.content`` during
+# streaming.
+think_start = "<|channel>"
+think_end = "<channel|>"
+
 _ESCAPE = '<|"|>'
 
 

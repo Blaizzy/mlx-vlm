@@ -694,30 +694,70 @@ def _streamable_prefix(text, tool_module, tools):
     """Return the portion of ``text`` safe to include in a streamed
     ``delta.content``.
 
-    Complete ``tool_call_start`` / ``tool_call_end`` blocks are dropped
-    (the structured ``tool_calls`` array is still built from the full
-    accumulated output in the final delta). An unclosed tool call at
-    the tail — either a start marker without its matching end, or a
-    partial prefix of the start marker — is held back so a later chunk
-    can complete it. Called per chunk from the streaming loop.
+    Two kinds of markup can appear in a raw stream and must not reach
+    ``delta.content``:
+
+    - Tool-call blocks delimited by ``tool_module.tool_call_start`` /
+      ``tool_module.tool_call_end``. The authoritative ``tool_calls``
+      array is built from the full accumulated output in the final
+      delta, so the raw markup is pure noise for streaming clients.
+    - Thinking / reasoning blocks delimited by optional
+      ``tool_module.think_start`` / ``tool_module.think_end``
+      attributes. Gemma 4 emits these as internal reasoning and
+      Google's chat template removes them via a ``strip_thinking``
+      Jinja macro; mlx-lm's server routes them through a reasoning
+      state machine (ml-explore/mlx-lm#1114).
+
+    For each marker pair, three things can happen inside a chunk:
+
+    1. A complete block: drop it.
+    2. A start marker without its matching end (yet): suppress from
+       the start marker onwards.
+    3. A partial prefix of the start marker at the tail: hold it back
+       so a later chunk can complete it without leaking half of the
+       marker first.
+
+    Called per chunk from the streaming loop.
     """
     parsed = process_tool_calls(model_output=text, tool_module=tool_module, tools=tools)
     cleaned = parsed["remaining_text"] if parsed["calls"] else text
 
-    tc_start = tool_module.tool_call_start
+    # Strip complete thinking blocks if the parser declares them.
+    think_start = getattr(tool_module, "think_start", None)
+    think_end = getattr(tool_module, "think_end", None)
+    if think_start and think_end and think_start in cleaned and think_end in cleaned:
+        think_pattern = re.compile(
+            f"{re.escape(think_start)}.*?{re.escape(think_end)}", re.DOTALL
+        )
+        cleaned = re.sub(think_pattern, "", cleaned).strip()
 
-    # Unclosed tool call: suppress from the start marker onwards.
-    if tc_start in cleaned:
-        cleaned = cleaned[: cleaned.index(tc_start)]
+    # Collect the start markers we care about for the "unclosed" and
+    # "partial tail" cases. Tool-call start is always present; the
+    # thinking start marker is optional and only added when declared.
+    start_markers = [tool_module.tool_call_start]
+    if think_start and think_end:
+        start_markers.append(think_start)
 
-    # Partial prefix of the start marker at the tail (the marker is
-    # being generated across chunks): hold it back so the next chunk
-    # can complete it without leaking half of the marker first.
-    max_partial = min(len(cleaned), len(tc_start) - 1)
-    for n in range(max_partial, 0, -1):
-        if cleaned.endswith(tc_start[:n]):
-            cleaned = cleaned[:-n]
-            break
+    # Unclosed block: suppress from the EARLIEST start marker present.
+    earliest = min(
+        (cleaned.index(m) for m in start_markers if m in cleaned),
+        default=-1,
+    )
+    if earliest >= 0:
+        cleaned = cleaned[:earliest]
+
+    # Partial prefix of any start marker at the tail: hold back the
+    # LONGEST such prefix so the next chunk can complete it.
+    longest_holdback = 0
+    for marker in start_markers:
+        max_partial = min(len(cleaned), len(marker) - 1)
+        for n in range(max_partial, 0, -1):
+            if cleaned.endswith(marker[:n]):
+                if n > longest_holdback:
+                    longest_holdback = n
+                break
+    if longest_holdback:
+        cleaned = cleaned[:-longest_holdback]
 
     return cleaned
 

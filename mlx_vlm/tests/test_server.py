@@ -405,3 +405,84 @@ def test_chat_completions_stream_holds_back_partial_start_marker(client):
     tool_calls = final_delta.get("tool_calls") or []
     assert len(tool_calls) == 1
     assert tool_calls[0]["function"]["name"] == "read"
+
+
+def test_chat_completions_stream_strips_thinking_markup(client):
+    """Gemma 4's ``<|channel>…<channel|>`` reasoning blocks (token IDs
+    100 / 101) must not reach ``delta.content``. Google's chat template
+    strips them via a ``strip_thinking`` Jinja macro; this exercises
+    the same semantics in the streaming path."""
+    events = _run_stream_with_chunks(
+        client,
+        chunks=[
+            _fake_chunk(
+                "Sure, let me think. <|channel>thought\nwhich tool?<channel|> "
+                "Here is the answer.",
+                output_tokens=1,
+            ),
+        ],
+    )
+
+    for event in events[:-1]:
+        content = event["choices"][0]["delta"].get("content") or ""
+        assert "<|channel>" not in content
+        assert "<channel|>" not in content
+        assert "which tool?" not in content
+
+    streamed = "".join(
+        (event["choices"][0]["delta"].get("content") or "") for event in events[:-1]
+    )
+    assert "Sure, let me think." in streamed
+    assert "Here is the answer." in streamed
+
+
+def test_chat_completions_stream_handles_thinking_split_across_chunks(client):
+    """The ``<|channel>`` marker arrives in one chunk, the matching
+    ``<channel|>`` in the next. No intermediate delta may expose any
+    part of the reasoning block."""
+    events = _run_stream_with_chunks(
+        client,
+        chunks=[
+            _fake_chunk("hello <|channel>thought\ninternal", output_tokens=1),
+            _fake_chunk(" reasoning<channel|> world", output_tokens=2),
+        ],
+    )
+
+    for event in events[:-1]:
+        content = event["choices"][0]["delta"].get("content") or ""
+        assert "<|channel>" not in content
+        assert "<channel|>" not in content
+        assert "internal" not in content
+        assert "reasoning" not in content
+
+    streamed = "".join(
+        (event["choices"][0]["delta"].get("content") or "") for event in events[:-1]
+    )
+    assert streamed.startswith("hello")
+    assert "world" in streamed
+
+
+def test_chat_completions_stream_holds_back_partial_thinking_start(client):
+    """The tail of a chunk is a partial prefix of the thinking start
+    marker (``<|c``). The next chunk completes it into a real
+    reasoning block. The partial tokens must never be emitted as
+    content."""
+    events = _run_stream_with_chunks(
+        client,
+        chunks=[
+            _fake_chunk("ready <|c", output_tokens=1),
+            _fake_chunk("hannel>thought\nhidden<channel|> done", output_tokens=2),
+        ],
+    )
+
+    for event in events[:-1]:
+        content = event["choices"][0]["delta"].get("content") or ""
+        assert "<|c" not in content
+        assert "<|channel>" not in content
+        assert "hidden" not in content
+
+    streamed = "".join(
+        (event["choices"][0]["delta"].get("content") or "") for event in events[:-1]
+    )
+    assert streamed.startswith("ready")
+    assert "done" in streamed
