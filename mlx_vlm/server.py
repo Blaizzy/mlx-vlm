@@ -586,11 +586,14 @@ class GenerationRequest(VLMRequest):
     )
 
 
-class UsageStats(OpenAIUsage):
+class UsageStats(BaseModel):
     """
-    Inherits from OpenAIUsage and adds additional fields for usage statistics.
+    OpenAI chat-completion usage with extra MLX stats.
     """
 
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
     prompt_tps: float = Field(..., description="Tokens per second for the prompt.")
     generation_tps: float = Field(
         ..., description="Tokens per second for the generation."
@@ -1142,8 +1145,8 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                         # Yield chunks in Server-Sent Events (SSE) format
                         usage_stats = {
-                            "input_tokens": chunk.prompt_tokens,
-                            "output_tokens": chunk.generation_tokens,
+                            "prompt_tokens": chunk.prompt_tokens,
+                            "completion_tokens": chunk.generation_tokens,
                             "total_tokens": chunk.prompt_tokens
                             + chunk.generation_tokens,
                             "prompt_tps": chunk.prompt_tps,
@@ -1240,8 +1243,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                 print("Generation finished, cleared cache.")
 
                 usage_stats = UsageStats(
-                    input_tokens=gen_result.prompt_tokens,
-                    output_tokens=gen_result.generation_tokens,
+                    prompt_tokens=gen_result.prompt_tokens,
+                    completion_tokens=gen_result.generation_tokens,
                     total_tokens=gen_result.total_tokens,
                     prompt_tps=gen_result.prompt_tps,
                     generation_tps=gen_result.generation_tps,
