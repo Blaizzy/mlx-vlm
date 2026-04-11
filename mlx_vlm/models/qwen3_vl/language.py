@@ -503,7 +503,7 @@ class LanguageModel(nn.Module):
     ):
         # Slicing visual_pos_masks when prefilling
         n_to_process = kwargs.get("n_to_process", None)
-        if n_to_process is not None:
+        if n_to_process is not None and visual_pos_masks is not None:
             visual_pos_masks = visual_pos_masks[:, n_to_process:]
 
         position_ids = kwargs.pop("position_ids", None)
