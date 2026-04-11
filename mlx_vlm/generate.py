@@ -497,7 +497,7 @@ def generate_step(
 
             quantize_cache_fn(prompt_cache)
 
-            logprobs = logits - mx.logsumexp(logits)
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
             y = sampler(logprobs)
 
             if outputs.cross_attention_states is not None:
@@ -550,13 +550,13 @@ def generate_step(
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
-    mx.async_eval(y)
+    mx.async_eval(y, logprobs)
 
     n = 0
     while True:
         if n != max_tokens:
             next_y, next_logprobs = _step(y[None])
-            mx.async_eval(next_y)
+            mx.async_eval(next_y, next_logprobs)
         if n == 0:
             mx.eval(y)
         if n == max_tokens:
@@ -732,6 +732,10 @@ def stream_generate(
         tic = time.perf_counter()
 
         generated_tokens = []
+        # mx.get_peak_memory() is a Metal query that forces a host sync; don't
+        # call it on every yielded token. Stale-but-cheap during stream, then
+        # refresh for the final chunk so clients still see an accurate value.
+        cached_peak_memory = 0.0
         for n, (token, logprobs) in enumerate(gen):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
@@ -760,10 +764,11 @@ def stream_generate(
                 total_tokens=total_prompt_tokens + n + 1,
                 prompt_tps=prompt_tps,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
-                peak_memory=mx.get_peak_memory() / 1e9,
+                peak_memory=cached_peak_memory,
             )
 
         detokenizer.finalize()
+        cached_peak_memory = mx.get_peak_memory() / 1e9
         yield GenerationResult(
             text=detokenizer.last_segment,
             token=token,
@@ -773,7 +778,7 @@ def stream_generate(
             total_tokens=total_prompt_tokens + n + 1,
             prompt_tps=prompt_tps,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
-            peak_memory=mx.get_peak_memory() / 1e9,
+            peak_memory=cached_peak_memory,
         )
 
         # Save cache state for potential reuse on next turn
