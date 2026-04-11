@@ -1117,8 +1117,20 @@ async def chat_completions_endpoint(request: ChatRequest):
 
         if request.stream:
             # Streaming response
-            async def stream_generator():
+            #
+            # Hot-path note: this is a SYNC generator (not `async def`) so that
+            # Starlette runs it in anyio's threadpool via iterate_in_threadpool.
+            # The MLX decode loop is GPU-bound and already releases the GIL on
+            # heavy ops — running it under the asyncio event loop only adds
+            # scheduling ping-pong per yielded SSE chunk. Per-token payloads
+            # are hand-rolled dicts + json.dumps, skipping pydantic (three
+            # model instantiations + model_dump_json per decode step was ~25-30%
+            # of end-to-end latency).
+            def stream_generator():
                 token_iterator = None
+                request_id = f"chatcmpl-{uuid.uuid4()}"
+                created_ts = int(time.time())
+                model_name = request.model
                 try:
                     # Use stream_generate from utils
                     token_iterator = stream_generate(
@@ -1132,7 +1144,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     )
 
                     output_text = ""
-                    request_id = f"chatcmpl-{uuid.uuid4()}"
+                    usage_stats = None
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
                             print("Warning: Received unexpected chunk format:", chunk)
@@ -1140,7 +1152,9 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                         output_text += chunk.text
 
-                        # Yield chunks in Server-Sent Events (SSE) format
+                        # Always refresh usage_stats so the end-of-stream chunk
+                        # carries the latest numbers, even when we skip an SSE
+                        # frame for an empty-text segment below.
                         usage_stats = {
                             "input_tokens": chunk.prompt_tokens,
                             "output_tokens": chunk.generation_tokens,
@@ -1151,20 +1165,43 @@ async def chat_completions_endpoint(request: ChatRequest):
                             "peak_memory": chunk.peak_memory,
                         }
 
-                        choices = [
-                            ChatStreamChoice(
-                                delta=ChatMessage(role="assistant", content=chunk.text)
-                            )
-                        ]
-                        chunk_data = ChatStreamChunk(
-                            id=request_id,
-                            created=int(time.time()),
-                            model=request.model,
-                            usage=usage_stats,
-                            choices=choices,
-                        )
+                        # Skip frames with no decoded text. Streaming
+                        # detokenizers (SPM/BPE) buffer multi-byte pieces and
+                        # emit empty `chunk.text` for ~30% of decoded tokens.
+                        # mlx_lm.server gates writes the same way (see
+                        # mlx_lm/server.py:1468 `if text or tool_calls or ...`).
+                        # Benchmark tools like llama-benchy 0.3.5 count only
+                        # frames whose `delta.content` is truthy, so emitting
+                        # empty frames cuts the reported t/s by the buffered
+                        # fraction without changing real throughput.
+                        if not chunk.text:
+                            continue
 
-                        yield f"data: {chunk_data.model_dump_json()}\n\n"
+                        # Yield chunks in Server-Sent Events (SSE) format.
+                        # Build usage + payload dict inline — shape matches
+                        # ChatStreamChunk/ChatStreamChoice/ChatMessage/UsageStats
+                        # so clients see the same wire format as the pydantic path.
+                        payload = json.dumps(
+                            {
+                                "id": request_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": model_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "finish_reason": None,
+                                        "delta": {
+                                            "role": "assistant",
+                                            "content": chunk.text,
+                                            "tool_calls": [],
+                                        },
+                                    }
+                                ],
+                                "usage": usage_stats,
+                            }
+                        )
+                        yield f"data: {payload}\n\n"
 
                     if tool_parser_type is not None:
                         tool_calls = process_tool_calls(
@@ -1190,8 +1227,8 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                     chunk_data = ChatStreamChunk(
                         id=request_id,
-                        created=int(time.time()),
-                        model=request.model,
+                        created=created_ts,
+                        model=model_name,
                         usage=usage_stats,
                         choices=choices,
                     )
