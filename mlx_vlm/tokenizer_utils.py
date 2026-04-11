@@ -116,80 +116,66 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
 class SPMStreamingDetokenizer(StreamingDetokenizer):
     """A streaming detokenizer for SPM models.
 
-    It adds tokens to the text if the next token starts with the special SPM
-    underscore which results in linear complexity.
+    Flushes after every token by converting accumulated bytes to UTF-8,
+    replacing the SPM underscore `\u2581` with a space. Partial UTF-8
+    sequences (detected via the replacement char) are held back until the
+    next token completes them. This matches mlx_lm's SPMStreamingDetokenizer
+    (see mlx_lm/tokenizer_utils.py:107) and emits one text segment per token.
 
-    Handles UTF-8 byte tokens (like <0xE5><0xA4><0xA2>) by accumulating them
-    and decoding as UTF-8 bytes, which is necessary for multi-byte characters
-    like Chinese that may not be in the vocabulary.
+    The previous mlx-vlm implementation only flushed on word boundaries
+    (when the next token started with `\u2581`), which batched several
+    tokens into a single `last_segment`. That produced wire-format drift
+    from mlx_lm and caused per-frame token counters (e.g. llama-benchy 0.3.5)
+    to under-report tokens/sec. Byte tokens `<0xXX>` are stored directly as
+    their raw byte in `tokenmap`, so multi-byte UTF-8 (e.g. Chinese) is
+    handled by the same partial-UTF-8 holdback path as regular tokens.
     """
 
     def __init__(self, tokenizer, trim_space=True):
         self.trim_space = trim_space
+        self._sep = "\u2581".encode()
 
-        # Extract the tokens in a list from id to text
-        self.tokenmap = [None] * len(tokenizer.vocab)
-        self.is_byte_token = [False] * len(tokenizer.vocab)
-        self.byte_value = [0] * len(tokenizer.vocab)
-
-        for value, tokenid in tokenizer.vocab.items():
-            self.tokenmap[tokenid] = value
-            # Mark byte tokens and store their byte value
-            if value.startswith("<0x") and len(value) >= 6 and value[5] == ">":
-                self.is_byte_token[tokenid] = True
-                self.byte_value[tokenid] = int(value[3:5], 16)
+        # Extract the tokens in a list from id to bytes
+        vocab = tokenizer.vocab
+        self.tokenmap = [b""] * (max(vocab.values()) + 1)
+        for value, tokenid in vocab.items():
+            if (
+                value.startswith("<0x")
+                and len(value) >= 6
+                and value[5] == ">"
+            ):
+                # Byte tokens — store the raw byte value
+                self.tokenmap[tokenid] = bytes([int(value[3:5], 16)])
+            else:
+                self.tokenmap[tokenid] = value.encode()
 
         self.reset()
 
     def reset(self):
         self.offset = 0
-        self._unflushed = ""
-        self._byte_buffer = bytearray()
+        self._unflushed = b""
         self.text = ""
         self.tokens = []
 
-    def _flush_bytes(self):
-        """Decode accumulated bytes as UTF-8 and append to unflushed text."""
-        if self._byte_buffer:
-            try:
-                decoded = self._byte_buffer.decode("utf-8")
-                self._unflushed += decoded
-            except UnicodeDecodeError:
-                # If decoding fails, use replacement character
-                self._unflushed += self._byte_buffer.decode("utf-8", errors="replace")
-            self._byte_buffer = bytearray()
+    def _try_flush(self, force=False):
+        text = self._unflushed.replace(self._sep, b" ").decode("utf-8", "replace")
+        if not force and text.endswith("\ufffd"):
+            return
+        if not self.text and self.trim_space and text and text[0] == " ":
+            text = text[1:]
+        self.text += text
+        self._unflushed = b""
 
     def add_token(self, token, skip_special_token_ids: List[int] = []):
         if token in skip_special_token_ids:
             return
-
-        if self.is_byte_token[token]:
-            # Accumulate byte tokens
-            self._byte_buffer.append(self.byte_value[token])
-            return
-
-        # Flush any accumulated bytes before processing regular token
-        self._flush_bytes()
-
-        v = self.tokenmap[token]
-        if v and v[0] == "\u2581":
-            if self.text or not self.trim_space:
-                self.text += self._unflushed.replace("\u2581", " ")
-            else:
-                self.text = _remove_space(self._unflushed.replace("\u2581", " "))
-            self._unflushed = v
-        else:
-            self._unflushed += v
+        self.tokens.append(token)
+        self._unflushed += self.tokenmap[token]
+        self._try_flush()
 
     def finalize(self):
-        # Flush any remaining bytes
-        self._flush_bytes()
-
-        if self.text or not self.trim_space:
-            self.text += self._unflushed.replace("\u2581", " ")
-        else:
-            self.text = _remove_space(self._unflushed.replace("\u2581", " "))
-        self._unflushed = ""
+        self._try_flush(force=True)
+        self._unflushed = b""
 
 
 class BPEStreamingDetokenizer(StreamingDetokenizer):
