@@ -48,19 +48,6 @@ _DEFAULT_VIDEO_PROCESSOR_CONFIG = {
 }
 
 
-def _normalize_gemma4_chat_template(chat_template: Optional[str]) -> Optional[str]:
-    """Align older MLX Gemma 4 chat templates with the compact HF formatting."""
-    if not chat_template:
-        return chat_template
-
-    return (
-        chat_template.replace("\n\n<|image|>\n\n", "<|image|>")
-        .replace("\\n\\n<|image|>\\n\\n", "<|image|>")
-        .replace("\n\n<|video|>\n\n", "<|video|>")
-        .replace("\\n\\n<|video|>\\n\\n", "<|video|>")
-    )
-
-
 def _convert_to_rgb(image):
     from PIL import Image
 
@@ -278,11 +265,10 @@ class Gemma4Processor(ProcessorMixin):
         # repeated <|video|> placeholders for each sampled frame.
         if tokenizer is not None:
             video_token_id = tokenizer.convert_tokens_to_ids("<|video|>")
-            if video_token_id == tokenizer.unk_token_id:
-                tokenizer.add_special_tokens(
-                    {"additional_special_tokens": ["<|video|>"]}
+            if video_token_id is None or video_token_id == tokenizer.unk_token_id:
+                raise ValueError(
+                    "Gemma 4 tokenizer is missing the <|video|> special token."
                 )
-                video_token_id = tokenizer.convert_tokens_to_ids("<|video|>")
             self.video_token = "<|video|>"
             self.video_token_id = video_token_id
         else:
@@ -594,9 +580,6 @@ class Gemma4Processor(ProcessorMixin):
             local_files_only=is_local,
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
-        tokenizer.chat_template = _normalize_gemma4_chat_template(
-            getattr(tokenizer, "chat_template", None)
-        )
 
         # Load processor config (contains image_processor and feature_extractor settings)
         proc_config = {}

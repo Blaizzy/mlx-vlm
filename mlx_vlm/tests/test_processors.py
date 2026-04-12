@@ -341,6 +341,7 @@ class TestGemma4Processor(_ProcessorTestBase, unittest.TestCase):
             eos_token = "<eos>"
             pad_token = "<pad>"
             pad_token_id = 0
+            unk_token_id = 0
             image_token = "<image>"
             image_token_id = 100
             boi_token = "<boi>"
@@ -466,6 +467,36 @@ class TestGemma4Processor(_ProcessorTestBase, unittest.TestCase):
         self.assertIn("00:00 <boi><|video|><|video|><eoi>", rendered)
         self.assertIn("00:01 <boi><|video|><|video|><eoi>", rendered)
         self.assertIn("<boa><audio><eoa>", rendered)
+
+    def test_missing_video_special_token_raises(self):
+        from mlx_vlm.models.gemma4.processing_gemma4 import (
+            Gemma4ImageProcessor,
+            Gemma4Processor,
+        )
+
+        class Tokenizer:
+            model_input_names = ["input_ids", "attention_mask"]
+            image_token = "<image>"
+            image_token_id = 100
+            audio_token = "<audio>"
+            audio_token_id = 101
+            boi_token = "<boi>"
+            eoi_token = "<eoi>"
+            boa_token = "<boa>"
+            eoa_token = "<eoa>"
+            unk_token_id = 0
+
+            def convert_tokens_to_ids(self, token):
+                if token == "<|video|>":
+                    return self.unk_token_id
+                return 1
+
+        with self.assertRaisesRegex(ValueError, "missing the <\\|video\\|> special token"):
+            Gemma4Processor(
+                image_processor=Gemma4ImageProcessor(),
+                tokenizer=Tokenizer(),
+                video_processor=None,
+            )
 
 
 class TestDotsVLProcessor(unittest.TestCase):

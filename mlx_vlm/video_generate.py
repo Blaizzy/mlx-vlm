@@ -452,6 +452,15 @@ def maybe_load_audio_from_videos(processor, video_paths: List[str], enabled: boo
     return audio_inputs
 
 
+def supports_native_gemma4_audio(model, processor) -> bool:
+    return (
+        getattr(model.config, "model_type", None) == "gemma4"
+        and getattr(model, "audio_tower", None) is not None
+        and getattr(processor, "feature_extractor", None) is not None
+        and bool(getattr(processor, "audio_token", None))
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Video Description CLI")
     parser.add_argument(
@@ -550,12 +559,21 @@ def main():
             getattr(model.config, "model_type", None) == "gemma4"
             and hasattr(processor, "video_processor")
         )
+        native_audio_enabled = supports_native_gemma4_audio(model, processor)
+
+        if is_gemma4_native_video and is_video_file(args.video) and len(args.video) != 1:
+            raise ValueError("Gemma 4 native video processing currently supports exactly one video input.")
+        if is_gemma4_native_video and isinstance(args.max_pixels, (tuple, list)):
+            raise ValueError(
+                "--max-pixels is not supported for native Gemma 4 video processing. "
+                "Use --video-max-soft-tokens to control the per-frame visual budget."
+            )
 
         # Check if video is image or video
         if is_video_file(args.video):
             content = [{"type": "video", "video": args.video[0]}]
             content.append({"type": "text", "text": args.prompt})
-            if is_gemma4_native_video and not args.no_audio_from_video:
+            if native_audio_enabled and not args.no_audio_from_video:
                 content.append({"type": "audio"})
             messages = [{"role": "user", "content": content}]
         else:
@@ -585,13 +603,15 @@ def main():
             processor_kwargs = {"padding": True, "return_tensors": "pt"}
             if args.max_frames is not None:
                 processor_kwargs["num_frames"] = args.max_frames
+            if args.fps != 1.0:
+                processor_kwargs["fps"] = args.fps
             if args.video_max_soft_tokens is not None:
                 processor_kwargs["max_soft_tokens"] = args.video_max_soft_tokens
 
             audio_inputs = maybe_load_audio_from_videos(
                 processor,
                 args.video,
-                enabled=not args.no_audio_from_video,
+                enabled=native_audio_enabled and not args.no_audio_from_video,
             )
             inputs = processor(
                 text=[text],
