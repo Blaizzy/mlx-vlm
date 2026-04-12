@@ -651,6 +651,7 @@ def process_tool_calls(model_output: str, tool_module, tools):
     remaining = model_output
 
     if tool_module.tool_call_start in model_output:
+        tool_call_index = 0
         if tool_module.tool_call_end == "":
             pattern = re.compile(
                 f"{re.escape(tool_module.tool_call_start)}.*?(?:\n|$)", re.DOTALL
@@ -665,7 +666,6 @@ def process_tool_calls(model_output: str, tool_module, tools):
         matches = re.findall(pattern, model_output)
         if matches:
             remaining = re.sub(pattern, " ", model_output).strip()
-            tool_call_index = 0
             for match in matches:
                 call = (
                     match.strip()
@@ -687,7 +687,11 @@ def process_tool_calls(model_output: str, tool_module, tools):
                     tool_call_index += 1
                 except Exception:
                     print(f"Invalid tool call: {call}")
-    return dict(calls=called_tools, remaining_text=remaining)
+        if tool_call_index == 0:
+            reason = "stop"
+        else:
+            reason = "tool_calls"
+    return dict(calls=called_tools, remaining_text=remaining, finish_reason=reason)
 
 
 # Models for /models endpoint
@@ -1175,11 +1179,12 @@ async def chat_completions_endpoint(request: ChatRequest):
                     else:
                         tool_calls = {}
                         tool_calls["calls"] = []
+                        tool_calls["finish_reason"] = "stop"
 
                     # Signal stream end
                     choices = [
                         ChatStreamChoice(
-                            finish_reason="stop",
+                            finish_reason=tool_calls["finish_reason"],
                             delta=ChatMessage(
                                 role="assistant",
                                 content="",
@@ -1258,10 +1263,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                     tool_calls = {}
                     tool_calls["calls"] = []
                     tool_calls["remaining_text"] = gen_result.text
+                    tool_calls["finish_reason"] = "stop"
 
                 choices = [
                     ChatChoice(
-                        finish_reason="stop",
+                        finish_reason=tool_calls["finish_reason"],
                         message=ChatMessage(
                             role="assistant",
                             content=tool_calls["remaining_text"],
