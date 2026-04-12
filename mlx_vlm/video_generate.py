@@ -569,11 +569,19 @@ def main():
                 "Use --video-max-soft-tokens to control the per-frame visual budget."
             )
 
+        audio_inputs = None
+        if is_gemma4_native_video and is_video_file(args.video):
+            audio_inputs = maybe_load_audio_from_videos(
+                processor,
+                args.video,
+                enabled=native_audio_enabled and not args.no_audio_from_video,
+            )
+
         # Check if video is image or video
         if is_video_file(args.video):
             content = [{"type": "video", "video": args.video[0]}]
             content.append({"type": "text", "text": args.prompt})
-            if native_audio_enabled and not args.no_audio_from_video:
+            if audio_inputs is not None:
                 content.append({"type": "audio"})
             messages = [{"role": "user", "content": content}]
         else:
@@ -608,11 +616,6 @@ def main():
             if args.video_max_soft_tokens is not None:
                 processor_kwargs["max_soft_tokens"] = args.video_max_soft_tokens
 
-            audio_inputs = maybe_load_audio_from_videos(
-                processor,
-                args.video,
-                enabled=native_audio_enabled and not args.no_audio_from_video,
-            )
             inputs = processor(
                 text=[text],
                 videos=args.video,
