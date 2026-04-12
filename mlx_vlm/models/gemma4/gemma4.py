@@ -71,6 +71,8 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        pixel_values_videos: Optional[mx.array] = None,
+        video_features: Optional[mx.array] = None,
         audio_features: Optional[mx.array] = None,
         audio_mask: Optional[mx.array] = None,
         input_features: Optional[mx.array] = None,
@@ -87,8 +89,9 @@ class Model(nn.Module):
         per_layer_inputs = None
         if self.language_model.model.hidden_size_per_layer_input:
             image_mask_ids = input_ids == self.config.image_token_id
+            video_mask_ids = input_ids == self.config.video_token_id
             audio_mask_ids = input_ids == self.config.audio_token_id
-            text_mask = ~(image_mask_ids | audio_mask_ids)
+            text_mask = ~(image_mask_ids | video_mask_ids | audio_mask_ids)
             per_layer_inputs_tokens = mx.where(
                 text_mask, input_ids, mx.zeros_like(input_ids)
             )
@@ -113,6 +116,34 @@ class Model(nn.Module):
 
             inputs_embeds = masked_scatter(
                 inputs_embeds, image_mask_expanded, image_features
+            )
+
+        if video_features is None:
+            cached_video = kwargs.get("cached_video_features", None)
+            if cached_video is not None:
+                video_features = cached_video
+            elif pixel_values_videos is not None:
+                video_encode_inputs = pixel_values_videos
+                video_position_ids = kwargs.get("video_position_ids")
+                output_length = kwargs.get("output_length")
+                if video_position_ids is not None or output_length is not None:
+                    video_encode_inputs = {
+                        "pixel_values_videos": pixel_values_videos,
+                        "video_position_ids": video_position_ids,
+                        "output_length": output_length,
+                    }
+                video_features = self.encode_video(video_encode_inputs)
+
+        if video_features is not None:
+            video_features = video_features.astype(inputs_embeds.dtype)
+            video_mask = input_ids == self.config.video_token_id
+            video_mask_expanded = mx.expand_dims(video_mask, -1)
+            video_mask_expanded = mx.broadcast_to(
+                video_mask_expanded, inputs_embeds.shape
+            )
+
+            inputs_embeds = masked_scatter(
+                inputs_embeds, video_mask_expanded, video_features
             )
 
         # Scatter audio features
@@ -150,6 +181,54 @@ class Model(nn.Module):
         image_features = self.vision_tower(pixel_values)
         image_features = self.embed_vision(image_features)
         return image_features
+
+    def encode_video(self, pixel_values_videos: mx.array) -> mx.array:
+        """Encode externally prepared video frames through the vision tower.
+
+        This expects video frames to already be sampled outside the library and
+        preprocessed in the same format as image inputs. Frames are encoded
+        frame-by-frame and concatenated so they can be scattered into
+        ``video_token_id`` placeholders.
+        """
+        video_position_ids = None
+        output_length = None
+        if isinstance(pixel_values_videos, tuple):
+            pixel_values_videos, video_position_ids = pixel_values_videos
+        elif isinstance(pixel_values_videos, dict):
+            video_position_ids = pixel_values_videos.get("video_position_ids")
+            output_length = pixel_values_videos.get("output_length")
+            pixel_values_videos = pixel_values_videos["pixel_values_videos"]
+
+        if not isinstance(pixel_values_videos, mx.array):
+            pixel_values_videos = mx.array(pixel_values_videos)
+        if video_position_ids is not None and not isinstance(video_position_ids, mx.array):
+            video_position_ids = mx.array(video_position_ids)
+
+        if pixel_values_videos.ndim == 4:
+            batch_size, num_frames, max_patches, patch_dim = pixel_values_videos.shape
+            pixel_values_videos = pixel_values_videos.reshape(
+                batch_size * num_frames, max_patches, patch_dim
+            )
+            if video_position_ids is not None:
+                video_position_ids = video_position_ids.reshape(
+                    batch_size * num_frames, max_patches, video_position_ids.shape[-1]
+                )
+            if output_length is None:
+                output_length = (
+                    max_patches // self.vision_tower.pooling_kernel_size**2
+                )
+        elif pixel_values_videos.ndim == 3 and output_length is None:
+            output_length = (
+                pixel_values_videos.shape[1] // self.vision_tower.pooling_kernel_size**2
+            )
+
+        video_features = self.vision_tower(
+            pixel_values_videos,
+            pixel_position_ids=video_position_ids,
+            output_length=output_length,
+        )
+        video_features = self.embed_vision(video_features)
+        return video_features
 
     def __call__(
         self,

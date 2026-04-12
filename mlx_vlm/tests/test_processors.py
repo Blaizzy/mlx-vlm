@@ -199,7 +199,20 @@ class TestPaliGemmaProcessor(_ProcessorTestBase, unittest.TestCase):
         p.image_token = "<image>"
         p.image_seq_length = 4
         p.bos_token = "<bos>"
-        p.image_processor = _mock_ip()
+        p.image_processor = type(
+            "Gemma4IP",
+            (),
+            {
+                "model_input_names": ["pixel_values"],
+                "__call__": lambda self, images=None, **kw: (
+                    {"pixel_values": np.random.randn(1, 3, 224, 224).astype(np.float32)},
+                    [4],
+                ),
+                "fetch_images": lambda self, images: (
+                    [images] if not isinstance(images, list) else images
+                ),
+            },
+        )()
         p.tokenizer = _mock_tokenizer()
         return p
 
@@ -316,6 +329,143 @@ class TestGemma3nProcessor(_ProcessorTestBase, unittest.TestCase):
 
     def _image_call_args(self):
         return {"text": ["<image> Cats"], "images": [_make_image()]}
+
+
+class TestGemma4Processor(_ProcessorTestBase, unittest.TestCase):
+    def _make_processor(self):
+        from mlx_vlm.models.gemma4.processing_gemma4 import Gemma4Processor
+
+        class Tokenizer:
+            model_input_names = ["input_ids", "attention_mask"]
+            bos_token = "<bos>"
+            eos_token = "<eos>"
+            pad_token = "<pad>"
+            pad_token_id = 0
+            image_token = "<image>"
+            image_token_id = 100
+            boi_token = "<boi>"
+            eoi_token = "<eoi>"
+            audio_token = "<audio>"
+            audio_token_id = 101
+            boa_token = "<boa>"
+            eoa_token = "<eoa>"
+            video_token = "<|video|>"
+            video_token_id = 102
+
+            def __init__(self):
+                self.seen_text = None
+
+            def __call__(self, text=None, return_token_type_ids=False, **kwargs):
+                batch = [text] if isinstance(text, str) else text
+                self.seen_text = batch
+                payload = {
+                    "input_ids": [list(range(12)) for _ in batch],
+                    "attention_mask": [[1] * 12 for _ in batch],
+                }
+                if return_token_type_ids:
+                    payload["token_type_ids"] = [[0] * 12 for _ in batch]
+                return payload
+
+            def convert_tokens_to_ids(self, token):
+                mapping = {
+                    self.image_token: self.image_token_id,
+                    self.audio_token: self.audio_token_id,
+                    self.video_token: self.video_token_id,
+                }
+                return mapping.get(token, 0)
+
+            def add_special_tokens(self, tokens):
+                return None
+
+            @property
+            def init_kwargs(self):
+                return {}
+
+            def batch_decode(self, ids, **kwargs):
+                return ["decoded"] * len(ids)
+
+            def decode(self, ids, **kwargs):
+                return "decoded"
+
+        class VideoProcessor:
+            model_input_names = ["pixel_values_videos", "video_position_ids"]
+
+            def __call__(self, videos=None, **kwargs):
+                return {
+                    "pixel_values_videos": np.random.randn(2, 18, 768).astype(np.float32),
+                    "video_position_ids": np.zeros((2, 18, 2), dtype=np.int64),
+                    "num_soft_tokens_per_video": [2],
+                    "video_metadata": [
+                        SimpleNamespace(fps=30.0, timestamps=[0.0, 1.0])
+                    ],
+                }
+
+        class FeatureExtractor:
+            model_input_names = ["input_features", "input_features_mask"]
+            sampling_rate = 16000
+
+            def __call__(self, audio_arrays, sampling_rate=None, return_attention_mask=True):
+                return {
+                    "input_features": np.zeros((1, 4, 8), dtype=np.float32),
+                    "input_features_mask": np.ones((1, 4), dtype=np.int64),
+                }
+
+        p = Gemma4Processor.__new__(Gemma4Processor)
+        p.image_seq_length = 4
+        p.audio_seq_length = 4
+        p.audio_ms_per_token = 40
+        p.image_token_id = 100
+        p.audio_token_id = 101
+        p.video_token_id = 102
+        p.boi_token = "<boi>"
+        p.eoi_token = "<eoi>"
+        p.image_token = "<image>"
+        p.video_token = "<|video|>"
+        p.boa_token = "<boa>"
+        p.eoa_token = "<eoa>"
+        p.audio_token = "<audio>"
+        p.full_image_sequence = "<boi>" + "<image>" * 4 + "<eoi>"
+        p.full_audio_sequence = "<boa>" + "<audio>" * 4 + "<eoa>"
+        p.image_processor = type(
+            "Gemma4IP",
+            (),
+            {
+                "model_input_names": ["pixel_values"],
+                "__call__": lambda self, images=None, **kw: (
+                    {"pixel_values": np.random.randn(1, 3, 224, 224).astype(np.float32)},
+                    [4],
+                ),
+                "fetch_images": lambda self, images: (
+                    [images] if not isinstance(images, list) else images
+                ),
+            },
+        )()
+        p.video_processor = VideoProcessor()
+        p.feature_extractor = FeatureExtractor()
+        p.tokenizer = Tokenizer()
+        return p
+
+    def _image_call_args(self):
+        return {"text": ["<image> Describe"], "images": [_make_image()]}
+
+    def test_video_and_audio_inputs_expand_native_prompt(self):
+        processor = self._make_processor()
+
+        result = processor(
+            text=["<|video|>\nList the domains.<audio>"],
+            videos=[np.zeros((2, 3, 224, 224), dtype=np.uint8)],
+            audio=[(np.zeros((1,), dtype=np.float32), 16000)],
+        )
+
+        self._assert_all_mx(result)
+        self.assertIn("pixel_values_videos", result)
+        self.assertIn("video_position_ids", result)
+        self.assertIn("input_features", result)
+
+        rendered = processor.tokenizer.seen_text[0]
+        self.assertIn("00:00 <boi><|video|><|video|><eoi>", rendered)
+        self.assertIn("00:01 <boi><|video|><|video|><eoi>", rendered)
+        self.assertIn("<boa><audio><eoa>", rendered)
 
 
 class TestDotsVLProcessor(unittest.TestCase):

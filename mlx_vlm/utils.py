@@ -850,7 +850,7 @@ def read_audio(file) -> tuple:
     use_ffmpeg = False
     if isinstance(file, (str, Path)):
         ext = Path(file).suffix.lstrip(".").lower()
-        if ext in ("m4a", "aac", "ogg", "opus"):
+        if ext in ("m4a", "aac", "ogg", "opus", "mp4", "m4v", "mov", "avi", "mkv", "webm"):
             use_ffmpeg = True
     elif isinstance(file, _io.BytesIO):
         pos = file.tell()

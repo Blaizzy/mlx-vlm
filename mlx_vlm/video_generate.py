@@ -17,7 +17,7 @@ import requests
 from PIL import Image
 
 from .generate import generate
-from .utils import load, load_image, process_inputs_with_fallback
+from .utils import load, load_audio, load_image, process_inputs_with_fallback
 
 # This is a beta version of the video generation script.
 # It is not fully tested and may not work as expected.
@@ -425,6 +425,29 @@ def is_video_file(video_path: List[str]) -> bool:
     return True
 
 
+def maybe_load_audio_from_videos(processor, video_paths: List[str], enabled: bool):
+    if not enabled:
+        return None
+    if not hasattr(processor, "feature_extractor") or processor.feature_extractor is None:
+        return None
+    if not getattr(processor, "audio_token", None):
+        return None
+
+    sample_rate = getattr(processor.feature_extractor, "sampling_rate", None)
+    if sample_rate is None:
+        return None
+
+    audio_inputs = []
+    for video_path in video_paths:
+        try:
+            waveform = load_audio(video_path, sr=sample_rate)
+        except Exception as exc:
+            logger.warning(f"Failed to extract audio from video {video_path}: {exc}")
+            return None
+        audio_inputs.append((waveform, sample_rate))
+    return audio_inputs
+
+
 def main():
     parser = argparse.ArgumentParser(description="Video Description CLI")
     parser.add_argument(
@@ -441,6 +464,17 @@ def main():
         "--max-frames", type=int, default=None, help="Maximum number of frames"
     )
     parser.add_argument("--fps", type=float, default=1.0, help="Frames per second")
+    parser.add_argument(
+        "--no-audio-from-video",
+        action="store_true",
+        help="Disable extracting audio from the input video for audio-capable models",
+    )
+    parser.add_argument(
+        "--video-max-soft-tokens",
+        type=int,
+        default=None,
+        help="Override Gemma 4 per-frame visual token budget when using native video processing",
+    )
     parser.add_argument(
         "--prompt", default="Describe this video.", help="Text prompt for the model"
     )
@@ -485,23 +519,18 @@ def main():
 
     kwargs = {}
     if is_video_model(model):
+        is_gemma4_native_video = (
+            getattr(model.config, "model_type", None) == "gemma4"
+            and hasattr(processor, "video_processor")
+        )
 
         # Check if video is image or video
         if is_video_file(args.video):
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "video",
-                            "video": args.video[0],
-                            "max_pixels": max_pixels,
-                            "fps": args.fps,
-                        },
-                        {"type": "text", "text": args.prompt},
-                    ],
-                }
-            ]
+            content = [{"type": "video", "video": args.video[0]}]
+            content.append({"type": "text", "text": args.prompt})
+            if is_gemma4_native_video and not args.no_audio_from_video:
+                content.append({"type": "audio"})
+            messages = [{"role": "user", "content": content}]
         else:
             messages = [
                 {
@@ -522,31 +551,50 @@ def main():
         text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        image_inputs, video_inputs, fps = process_vision_info(messages, True)
+        if is_gemma4_native_video and is_video_file(args.video):
+            processor_kwargs = {"padding": True, "return_tensors": "pt"}
+            if args.max_frames is not None:
+                processor_kwargs["num_frames"] = args.max_frames
+            if args.video_max_soft_tokens is not None:
+                processor_kwargs["max_soft_tokens"] = args.video_max_soft_tokens
 
-        if args.max_frames is not None:
-            video_inputs = video_inputs[: args.max_frames]
-        inputs = processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
+            audio_inputs = maybe_load_audio_from_videos(
+                processor,
+                args.video,
+                enabled=not args.no_audio_from_video,
+            )
+            inputs = processor(
+                text=[text],
+                videos=args.video,
+                audio=audio_inputs,
+                **processor_kwargs,
+            )
+        else:
+            image_inputs, video_inputs, fps = process_vision_info(messages, True)
+
+            if args.max_frames is not None and video_inputs is not None:
+                video_inputs = video_inputs[: args.max_frames]
+            inputs = processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
 
         input_ids = mx.array(inputs["input_ids"])
-        pixel_values = inputs.get(
-            "pixel_values_videos", inputs.get("pixel_values", None)
-        )
-        if pixel_values is None:
-            raise ValueError("Please provide a valid video or image input.")
-        pixel_values = mx.array(pixel_values)
-
         mask = mx.array(inputs["attention_mask"])
-        if inputs.get("video_grid_thw", None) is not None:
-            kwargs["video_grid_thw"] = mx.array(inputs["video_grid_thw"])
-        if inputs.get("image_grid_thw", None) is not None:
-            kwargs["image_grid_thw"] = mx.array(inputs["image_grid_thw"])
+        pixel_values = None
+        for key, value in inputs.items():
+            if key in ["input_ids", "attention_mask", "video_metadata"]:
+                continue
+            if value is None:
+                continue
+            array_value = value if isinstance(value, mx.array) else mx.array(value)
+            if key == "pixel_values":
+                pixel_values = array_value
+            else:
+                kwargs[key] = array_value
 
     else:
         if is_video_file(args.video):
@@ -619,7 +667,8 @@ def main():
 
     kwargs["video"] = args.video
     kwargs["input_ids"] = input_ids
-    kwargs["pixel_values"] = pixel_values
+    if pixel_values is not None:
+        kwargs["pixel_values"] = pixel_values
     kwargs["mask"] = mask
     kwargs["temperature"] = args.temperature
     kwargs["max_tokens"] = args.max_tokens

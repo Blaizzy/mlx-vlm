@@ -316,6 +316,9 @@ class VisionPatchEmbedder(nn.Module):
         patches = pixel_values.reshape(B, C, pH, p, pW, p)
         patches = patches.transpose(0, 2, 4, 3, 5, 1)  # [B, pH, pW, p, p, C]
         patches = patches.reshape(B, pH * pW, C * p * p)
+        return patches
+
+    def _project_patches(self, patches: mx.array) -> mx.array:
         patches = 2 * (patches - 0.5)
         return self.input_proj(patches.astype(self.input_proj.weight.dtype))
 
@@ -325,7 +328,15 @@ class VisionPatchEmbedder(nn.Module):
         patch_positions: mx.array,
         padding_positions: mx.array,
     ) -> mx.array:
-        hidden_states = self._patchify(pixel_values)
+        if pixel_values.ndim == 4:
+            patches = self._patchify(pixel_values)
+        elif pixel_values.ndim == 3:
+            patches = pixel_values
+        else:
+            raise ValueError(
+                f"Expected pixel_values with ndim 3 or 4, got shape {pixel_values.shape}"
+            )
+        hidden_states = self._project_patches(patches)
         position_embeddings = self._position_embeddings(
             patch_positions, padding_positions
         )
@@ -363,7 +374,7 @@ class VisionPooler(nn.Module):
 
         length = output_length or self.default_output_length
         if hidden_states.shape[1] == length:
-            mask = padding_positions
+            mask = ~padding_positions
         else:
             hidden_states, mask = self._avg_pool_by_positions(
                 hidden_states, patch_positions, length
@@ -438,7 +449,12 @@ class VisionModel(nn.Module):
 
         return patch_positions.astype(np.int32), padding_mask, num_patches
 
-    def __call__(self, pixel_values) -> mx.array:
+    def __call__(
+        self,
+        pixel_values,
+        pixel_position_ids: Optional[mx.array] = None,
+        output_length: Optional[int] = None,
+    ) -> mx.array:
         # Handle list of different-sized images: process each individually
         if isinstance(pixel_values, list):
             all_real = []
@@ -454,54 +470,70 @@ class VisionModel(nn.Module):
         if not isinstance(pixel_values, mx.array):
             pixel_values = mx.array(pixel_values)
 
-        B, C, H, W = pixel_values.shape
-        all_same_size = True
+        if pixel_values.ndim == 3:
+            if pixel_position_ids is None:
+                raise ValueError("pixel_position_ids are required for patchified inputs.")
+            if not isinstance(pixel_position_ids, mx.array):
+                pixel_position_ids = mx.array(pixel_position_ids)
 
-        if all_same_size:
-            num_real = (H // self.patch_size) * (W // self.patch_size)
-            num_real = min(num_real, self.max_patches)
-            positions, padding_mask, _ = self._patch_positions_single(H, W)
-            # Tile for batch
-            patch_positions = mx.array(np.tile(positions[None], (B, 1, 1)))
-            padding_positions = mx.array(np.tile(padding_mask[None], (B, 1)))
-
+            B, max_patches, _ = pixel_values.shape
+            patch_positions = pixel_position_ids
+            padding_positions = mx.all(patch_positions == -1, axis=-1)
             inputs_embeds = self.patch_embedder(
-                pixel_values,
-                patch_positions[:, :num_real],
-                padding_positions[:, :num_real],
+                pixel_values, patch_positions, padding_positions
             )
-
-            num_padding = self.max_patches - num_real
-            if num_padding > 0:
-                pad_embeds = mx.zeros(
-                    (B, num_padding, inputs_embeds.shape[-1]), dtype=inputs_embeds.dtype
-                )
-                inputs_embeds = mx.concatenate([inputs_embeds, pad_embeds], axis=1)
+            pooled_length = output_length or (max_patches // self.pooling_kernel_size**2)
         else:
-            # Per-image processing for different sizes (shouldn't happen with padding)
-            all_embeds = []
-            all_positions = []
-            all_padding = []
-            for i in range(B):
-                img = pixel_values[i : i + 1]
-                _, _, h, w = img.shape
-                pos, pad_mask, n_real = self._patch_positions_single(h, w)
-                pos_mx = mx.array(pos[None])
-                pad_mx = mx.array(pad_mask[None])
-                n_real = min(n_real, self.max_patches)
+            B, C, H, W = pixel_values.shape
+            all_same_size = True
 
-                emb = self.patch_embedder(img, pos_mx[:, :n_real], pad_mx[:, :n_real])
-                n_pad = self.max_patches - n_real
-                if n_pad > 0:
-                    pad_emb = mx.zeros((1, n_pad, emb.shape[-1]), dtype=emb.dtype)
-                    emb = mx.concatenate([emb, pad_emb], axis=1)
-                all_embeds.append(emb)
-                all_positions.append(pos_mx)
-                all_padding.append(pad_mx)
+            if all_same_size:
+                num_real = (H // self.patch_size) * (W // self.patch_size)
+                num_real = min(num_real, self.max_patches)
+                positions, padding_mask, _ = self._patch_positions_single(H, W)
+                # Tile for batch
+                patch_positions = mx.array(np.tile(positions[None], (B, 1, 1)))
+                padding_positions = mx.array(np.tile(padding_mask[None], (B, 1)))
 
-            inputs_embeds = mx.concatenate(all_embeds, axis=0)
-            patch_positions = mx.concatenate(all_positions, axis=0)
-            padding_positions = mx.concatenate(all_padding, axis=0)
+                inputs_embeds = self.patch_embedder(
+                    pixel_values,
+                    patch_positions[:, :num_real],
+                    padding_positions[:, :num_real],
+                )
+
+                num_padding = self.max_patches - num_real
+                if num_padding > 0:
+                    pad_embeds = mx.zeros(
+                        (B, num_padding, inputs_embeds.shape[-1]), dtype=inputs_embeds.dtype
+                    )
+                    inputs_embeds = mx.concatenate([inputs_embeds, pad_embeds], axis=1)
+            else:
+                # Per-image processing for different sizes (shouldn't happen with padding)
+                all_embeds = []
+                all_positions = []
+                all_padding = []
+                for i in range(B):
+                    img = pixel_values[i : i + 1]
+                    _, _, h, w = img.shape
+                    pos, pad_mask, n_real = self._patch_positions_single(h, w)
+                    pos_mx = mx.array(pos[None])
+                    pad_mx = mx.array(pad_mask[None])
+                    n_real = min(n_real, self.max_patches)
+
+                    emb = self.patch_embedder(img, pos_mx[:, :n_real], pad_mx[:, :n_real])
+                    n_pad = self.max_patches - n_real
+                    if n_pad > 0:
+                        pad_emb = mx.zeros((1, n_pad, emb.shape[-1]), dtype=emb.dtype)
+                        emb = mx.concatenate([emb, pad_emb], axis=1)
+                    all_embeds.append(emb)
+                    all_positions.append(pos_mx)
+                    all_padding.append(pad_mx)
+
+                inputs_embeds = mx.concatenate(all_embeds, axis=0)
+                patch_positions = mx.concatenate(all_positions, axis=0)
+                padding_positions = mx.concatenate(all_padding, axis=0)
+
+            pooled_length = output_length or self.default_output_length
 
         # Build bidirectional attention mask [B, 1, L, L] for SDPA
         valid_mask = ~padding_positions
@@ -515,13 +547,13 @@ class VisionModel(nn.Module):
         hidden_states = self.encoder(inputs_embeds, patch_positions, attn_mask)
 
         pooled, pool_mask = self.pooler(
-            hidden_states, patch_positions, padding_positions
+            hidden_states,
+            patch_positions,
+            padding_positions,
+            output_length=pooled_length,
         )
 
-        if pool_mask.shape[1] == self.default_output_length:
-            valid_mask = pool_mask
-        else:
-            valid_mask = ~pool_mask
+        valid_mask = pool_mask
 
         all_real = []
         for i in range(B):

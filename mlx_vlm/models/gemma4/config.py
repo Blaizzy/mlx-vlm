@@ -129,6 +129,7 @@ class ModelConfig(BaseModelConfig):
     ignore_index: int = -100
     image_token_id: int = 258880
     audio_token_id: int = 258881
+    video_token_id: int = 258884
     boi_token_id: int = 255999
     eoi_token_id: int = 258882
     boa_token_id: int = 256000
