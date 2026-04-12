@@ -16,7 +16,11 @@ import numpy as np
 import requests
 from PIL import Image
 
-from .generate import generate
+from .generate import (
+    DEFAULT_THINKING_END_TOKEN,
+    DEFAULT_THINKING_START_TOKEN,
+    generate,
+)
 from .utils import load, load_audio, load_image, process_inputs_with_fallback
 
 # This is a beta version of the video generation script.
@@ -493,6 +497,29 @@ def main():
         default="mlx-community/Qwen2.5-VL-7B-Instruct-4bit",
         help="Select the model to use",
     )
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="Enable thinking mode in the chat template and generation.",
+    )
+    parser.add_argument(
+        "--thinking-budget",
+        type=int,
+        default=None,
+        help="Maximum number of thinking tokens before forcing the end-of-thinking token.",
+    )
+    parser.add_argument(
+        "--thinking-start-token",
+        type=str,
+        default=DEFAULT_THINKING_START_TOKEN,
+        help="Token that marks the start of a thinking block (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--thinking-end-token",
+        type=str,
+        default=DEFAULT_THINKING_END_TOKEN,
+        help="Token that marks the end of a thinking block (default: %(default)s).",
+    )
     parser.add_argument("--verbose", action="store_false", help="Print verbose output")
 
     args = parser.parse_args()
@@ -549,7 +576,10 @@ def main():
             )
 
         text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=args.enable_thinking,
         )
         if is_gemma4_native_video and is_video_file(args.video):
             processor_kwargs = {"padding": True, "return_tensors": "pt"}
@@ -626,7 +656,10 @@ def main():
             )
 
         text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=args.enable_thinking,
         )
 
         # Configure processor for video frames
@@ -672,6 +705,12 @@ def main():
     kwargs["mask"] = mask
     kwargs["temperature"] = args.temperature
     kwargs["max_tokens"] = args.max_tokens
+    kwargs["enable_thinking"] = args.enable_thinking
+    if args.thinking_budget is not None:
+        kwargs["thinking_budget"] = args.thinking_budget
+        kwargs["thinking_end_token"] = args.thinking_end_token
+        if args.thinking_start_token is not None:
+            kwargs["thinking_start_token"] = args.thinking_start_token
 
     response = generate(
         model,
