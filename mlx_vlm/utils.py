@@ -12,6 +12,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import requests
+import safetensors
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
@@ -171,9 +172,6 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
-        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
-            to QQLinear layers for activation quantization. Only supported for models
-            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -216,8 +214,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     weights = {}
     for wf in weight_files:
         weights.update(mx.load(wf))
-
-    import safetensors
 
     with safetensors.safe_open(weight_files[0], framework="np") as f:
         is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
@@ -385,10 +381,6 @@ def load(
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
 
-        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
-            to QQLinear layers for activation quantization. Only supported for models
-            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
-
     Returns:
         Tuple[nn.Module, TokenizerWrapper]: A tuple containing the loaded model and tokenizer.
 
@@ -432,7 +424,11 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
         FileNotFoundError: If config.json is not found at the path
     """
     if isinstance(model_path, str):
-        model_path = get_model_path(model_path)
+        model_path = get_model_path(
+            model_path,
+            revision=kwargs.get("revision"),
+            force_download=kwargs.get("force_download", False),
+        )
 
     try:
         with open(model_path / "config.json", encoding="utf-8") as f:
@@ -458,7 +454,11 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
 
 def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImageProcessor:
     if isinstance(model_path, str):
-        model_path = get_model_path(model_path)
+        model_path = get_model_path(
+            model_path,
+            revision=kwargs.get("revision"),
+            force_download=kwargs.get("force_download", False),
+        )
 
     if not kwargs:
         config = load_config(model_path, trust_remote_code=True)
@@ -743,6 +743,7 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     """
     import base64
 
+    original_source = image_source
     try:
         if not isinstance(image_source, (str, Path, BytesIO)):
             raise ValueError(
@@ -756,15 +757,15 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
         if isinstance(image_source, str) and image_source.startswith(
             ("http://", "https://")
         ):
-            response = requests.get(image_source, stream=True, timeout=timeout)
-            response.raise_for_status()
-            image_source = response.raw
+            with requests.get(image_source, stream=True, timeout=timeout) as response:
+                response.raise_for_status()
+                image_source = BytesIO(response.content)
 
         image = Image.open(image_source)
     except ValueError:
         raise
     except Exception as e:
-        raise ValueError(f"Failed to load image from {image_source}: {e}") from e
+        raise ValueError(f"Failed to load image from {original_source}: {e}") from e
 
     image = ImageOps.exif_transpose(image)
     return image.convert("RGB")
