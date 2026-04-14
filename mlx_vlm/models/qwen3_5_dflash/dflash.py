@@ -2,222 +2,174 @@
 
 Reference: huggingface.co/z-lab/Qwen3.5-4B-DFlash (dflash.py).
 
-The drafter is a stateless head that runs on top of a target Qwen3.5 model:
-    * `noise_embedding` — [B, L, H] embeddings of L mask tokens (from the
-       target's embed_tokens) at the positions to be drafted
-    * `target_hidden` — [B, T, num_target_layers * H] concatenated hidden
-       states collected from the target model at layers `target_layer_ids`,
-       spanning the full committed context (T tokens)
-    * `position_ids` — [B, T + L] 1D absolute positions for context + noise
+The drafter is a stateful head that runs on top of a target Qwen3.5 model:
+    * ``inputs`` — ``[B, S, V]`` token ids for the noise block of length
+       ``block_size`` (first slot = previous bonus token ``b``, remaining
+       ``block_size - 1`` slots = mask tokens). The drafter embeds them via
+       the target model's tied ``embed_tokens``.
+    * ``target_hidden`` — ``[B, T_new, num_target_layers * H]`` concatenated
+       hidden states from the target's selected ``target_layer_ids`` for the
+       newly committed positions since the previous drafter call.
+    * ``cache`` — list of ``mlx_lm.models.cache.KVCache`` (one per drafter
+       layer) that absorbs both the new target features and the noise K/V.
 
-The drafter returns [B, L, H] noise-position hidden states. Logits are obtained
-externally by projecting through the target model's tied embed_tokens
-(``target.embed_tokens.as_linear(...)``).
+The drafter returns logits ``[B, block_size, V]`` via the target's tied
+``lm_head``/``embed_tokens.as_linear``. Call ``trim_prompt_cache`` on the
+drafter cache after each round to drop the transient noise slots, leaving
+only committed target features behind.
 """
 
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.cache import KVCache
+from mlx_lm.models.qwen3 import MLP as Qwen3MLP
 
 from .config import DFlashConfig
 
 
-def _rotate_half(x: mx.array) -> mx.array:
-    half = x.shape[-1] // 2
-    x1 = x[..., :half]
-    x2 = x[..., half:]
-    return mx.concatenate([-x2, x1], axis=-1)
-
-
-class _Qwen3RotaryEmbedding:
-    """Standard Qwen3 (rotate_half) RoPE with full rotary factor."""
-
-    def __init__(self, head_dim: int, base: float):
-        self.head_dim = head_dim
-        self.base = base
-        self.inv_freq = 1.0 / (
-            base ** (mx.arange(0, head_dim, 2, dtype=mx.float32) / head_dim)
-        )
-
-    def __call__(self, position_ids: mx.array, dtype):
-        # position_ids: [B, S]  ->  cos/sin: [B, S, head_dim]
-        pos = position_ids.astype(mx.float32)
-        freqs = pos[..., None] * self.inv_freq[None, None, :]  # [B, S, head_dim/2]
-        emb = mx.concatenate([freqs, freqs], axis=-1)  # [B, S, head_dim]
-        return mx.cos(emb).astype(dtype), mx.sin(emb).astype(dtype)
-
-
-def _apply_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
-    # x: [B, num_heads, S, head_dim], cos/sin: [B, 1, S, head_dim]
-    return (x * cos) + (_rotate_half(x) * sin)
-
-
 class DFlashAttention(nn.Module):
-    """Non-causal attention where Q comes from noise positions and K/V come
-    from the concatenation of target context + noise positions.
-
-    K/V projections are shared between context and noise — the same k_proj /
-    v_proj is applied to ``target_hidden`` (already fused via `fc`) and the
-    current layer's noise hidden states, then the two are concatenated along
-    the sequence dimension. This matches the reference implementation.
+    """Cross-attention where Q comes from the noise block and K/V come from
+    the concatenation of new target context + noise. Non-causal. Uses the
+    offset-aware ``nn.RoPE`` so RoPE positions are automatically consistent
+    with the drafter's stateful ``KVCache``.
     """
 
     def __init__(self, config: DFlashConfig):
         super().__init__()
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
+        dim = config.hidden_size
+        self.n_heads = config.num_attention_heads
+        self.n_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.scale = self.head_dim ** -0.5
-
-        self.q_proj = nn.Linear(
-            config.hidden_size,
-            self.num_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size,
-            self.num_kv_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size,
-            self.num_kv_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim,
-            config.hidden_size,
-            bias=config.attention_bias,
-        )
+        self.q_proj = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.n_heads * self.head_dim, dim, bias=False)
         self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def __call__(
         self,
-        noise: mx.array,          # [B, L, H]
-        target_hidden: mx.array,  # [B, T, H] (already fused + normed)
-        cos: mx.array,            # [B, T+L, head_dim]
-        sin: mx.array,            # [B, T+L, head_dim]
-        mask: Optional[mx.array] = None,
+        x: mx.array,          # [B, L, H]   noise block hidden states
+        x_ctx: mx.array,      # [B, S, H]   new fused target context features
+        rope: nn.RoPE,
+        cache: KVCache,
     ) -> mx.array:
-        B, L, _ = noise.shape
-        T = target_hidden.shape[1]
-
-        q = self.q_proj(noise).reshape(B, L, self.num_heads, self.head_dim)
-        q = self.q_norm(q).transpose(0, 2, 1, 3)  # [B, nH, L, D]
-
-        k_ctx = self.k_proj(target_hidden)
-        k_noise = self.k_proj(noise)
-        k = mx.concatenate([k_ctx, k_noise], axis=1).reshape(
-            B, T + L, self.num_kv_heads, self.head_dim
+        B, L, _ = x.shape
+        S = x_ctx.shape[1]
+        c = mx.concatenate([x_ctx, x], axis=1)  # [B, S+L, H]
+        q = self.q_proj(x)
+        k = self.k_proj(c)
+        v = self.v_proj(c)
+        q = self.q_norm(q.reshape(B, L, self.n_heads, self.head_dim)).transpose(
+            0, 2, 1, 3
         )
-        k = self.k_norm(k).transpose(0, 2, 1, 3)  # [B, nKV, T+L, D]
-
-        v_ctx = self.v_proj(target_hidden)
-        v_noise = self.v_proj(noise)
-        v = mx.concatenate([v_ctx, v_noise], axis=1).reshape(
-            B, T + L, self.num_kv_heads, self.head_dim
+        k = self.k_norm(k.reshape(B, S + L, self.n_kv_heads, self.head_dim)).transpose(
+            0, 2, 1, 3
         )
-        v = v.transpose(0, 2, 1, 3)  # [B, nKV, T+L, D]
-
-        # RoPE: Q takes the last L positions (noise), K takes all T+L positions.
-        cos_kv = cos[:, None, :, :]
-        sin_kv = sin[:, None, :, :]
-        cos_q = cos[:, None, -L:, :]
-        sin_q = sin[:, None, -L:, :]
-
-        q = _apply_rope(q, cos_q, sin_q)
-        k = _apply_rope(k, cos_kv, sin_kv)
-
-        out = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.scale, mask=mask
-        )
-        out = out.transpose(0, 2, 1, 3).reshape(B, L, self.num_heads * self.head_dim)
-        return self.o_proj(out)
-
-
-class DFlashMLP(nn.Module):
-    def __init__(self, config: DFlashConfig):
-        super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        v = v.reshape(B, S + L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        # Q sits right after the existing cache + new target context.
+        q = rope(q, offset=cache.offset + S)
+        # K starts at cache.offset (new target features, then noise).
+        k = rope(k, offset=cache.offset)
+        k, v = cache.update_and_fetch(k, v)
+        o = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        return self.o_proj(o.transpose(0, 2, 1, 3).reshape(B, L, -1))
 
 
 class DFlashDecoderLayer(nn.Module):
     def __init__(self, config: DFlashConfig):
         super().__init__()
         self.self_attn = DFlashAttention(config)
-        self.mlp = DFlashMLP(config)
+        self.mlp = Qwen3MLP(config.hidden_size, config.intermediate_size)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    def __call__(
-        self,
-        noise: mx.array,
-        target_hidden: mx.array,
-        cos: mx.array,
-        sin: mx.array,
-        mask: Optional[mx.array] = None,
-    ) -> mx.array:
-        h = noise + self.self_attn(
-            self.input_layernorm(noise), target_hidden, cos, sin, mask
-        )
-        h = h + self.mlp(self.post_attention_layernorm(h))
-        return h
+    def __call__(self, x, x_ctx, rope, cache):
+        h = x + self.self_attn(self.input_layernorm(x), x_ctx, rope, cache)
+        return h + self.mlp(self.post_attention_layernorm(h))
 
 
 class DFlashDraftModel(nn.Module):
-    """Stateless block-diffusion drafter. See module docstring."""
+    """Stateful block-diffusion drafter. See module docstring."""
 
     def __init__(self, config: DFlashConfig):
         super().__init__()
         self.config = config
-        self.layers = [DFlashDecoderLayer(config) for _ in range(config.num_hidden_layers)]
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.fc = nn.Linear(
-            len(config.target_layer_ids) * config.hidden_size,
-            config.hidden_size,
-            bias=False,
-        )
+        concat_dim = len(config.target_layer_ids) * config.hidden_size
+        self.fc = nn.Linear(concat_dim, config.hidden_size, bias=False)
         self.hidden_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = _Qwen3RotaryEmbedding(config.head_dim, config.rope_theta)
+        self.layers = [
+            DFlashDecoderLayer(config) for _ in range(config.num_hidden_layers)
+        ]
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rope = nn.RoPE(config.head_dim, traditional=False, base=config.rope_theta)
+        # Filled in by ``bind`` — the drafter uses the target's tied
+        # embed_tokens for both input embedding and output projection.
+        self.embed_tokens = None
+        self.lm_head = None
+
+    def bind(self, target_model) -> "DFlashDraftModel":
+        """Attach the target model's ``embed_tokens`` and ``lm_head``.
+
+        Handles three common layouts:
+            * plain mlx_lm Qwen3 (``target_model.model.embed_tokens``)
+            * mlx_lm hybrid (``target_model.model.embed_tokens``)
+            * mlx_vlm VLM (``target_model.language_model.model.embed_tokens``)
+        """
+        if hasattr(target_model, "embed_tokens"):
+            inner = target_model
+        elif hasattr(target_model, "model") and hasattr(
+            target_model.model, "embed_tokens"
+        ):
+            inner = target_model.model
+        elif (
+            hasattr(target_model, "language_model")
+            and hasattr(target_model.language_model, "model")
+            and hasattr(target_model.language_model.model, "embed_tokens")
+        ):
+            inner = target_model.language_model.model
+        else:
+            raise AttributeError(
+                f"Cannot find embed_tokens in {type(target_model).__name__}"
+            )
+        self.embed_tokens = inner.embed_tokens
+        lm = getattr(target_model, "language_model", target_model)
+        self.lm_head = (
+            getattr(target_model, "lm_head", None)
+            or getattr(lm, "lm_head", None)
+            or self.embed_tokens.as_linear
+        )
+        return self
+
+    def make_cache(self) -> List[KVCache]:
+        return [KVCache() for _ in self.layers]
 
     def __call__(
         self,
-        noise_embedding: mx.array,        # [B, L, H]
-        target_hidden: mx.array,          # [B, T, num_target_layers * H]
-        position_ids: Optional[mx.array] = None,
+        inputs: mx.array,           # [B, block_size] token ids
+        target_hidden: mx.array,    # [B, T_new, num_target_layers * H]
+        cache: List[KVCache],
     ) -> mx.array:
-        B, L, _ = noise_embedding.shape
-        T = target_hidden.shape[1]
-
-        fused = self.hidden_norm(self.fc(target_hidden))  # [B, T, H]
-
-        if position_ids is None:
-            position_ids = mx.arange(T + L, dtype=mx.int32)[None, :]
-            position_ids = mx.broadcast_to(position_ids, (B, T + L))
-
-        cos, sin = self.rotary_emb(position_ids, noise_embedding.dtype)
-
-        h = noise_embedding
-        for layer in self.layers:
-            h = layer(h, fused, cos, sin)
-        return self.norm(h)
+        h = self.embed_tokens(inputs)
+        h_ctx = self.hidden_norm(self.fc(target_hidden))
+        for layer, c in zip(self.layers, cache):
+            h = layer(h, h_ctx, self.rope, c)
+        return self.lm_head(self.norm(h))
 
     def sanitize(self, weights: dict) -> dict:
-        # Reference repo uses the key prefixes `layers.*`, `fc`, `hidden_norm`,
-        # `norm` directly (no outer "model." wrapper) — but some checkpoints
-        # do wrap them. Strip an optional leading "model." for robustness.
         out = {}
         for k, v in weights.items():
             if k.startswith("model."):
                 k = k[len("model."):]
             out[k] = v
         return out
+
+
+# Backwards-compat alias (earlier module versions exposed a ``DFlashKVCache``
+# shim; we now use mlx_lm.KVCache directly).
+DFlashKVCache = KVCache

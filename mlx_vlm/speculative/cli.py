@@ -18,7 +18,6 @@ import mlx.core as mx
 from ..models.qwen3_5_dflash import load_dflash_drafter
 from ..utils import load
 from .dflash_loop import dflash_generate
-from .tree_verify import ddtree_generate
 
 
 def _apply_chat(tokenizer, prompt: str) -> str:
@@ -40,15 +39,6 @@ def main():
     p.add_argument("--drafter", required=True, help="DFlash drafter path or HF id")
     p.add_argument("--prompt", required=True)
     p.add_argument("--max-new-tokens", type=int, default=200)
-    p.add_argument(
-        "--mode",
-        choices=["dflash", "ddtree", "both"],
-        default="dflash",
-        help="'dflash' is the single-trajectory loop (safe on hybrid targets). "
-             "'ddtree' enables tree verification (FA-only targets). 'both' runs "
-             "both and compares against plain AR.",
-    )
-    p.add_argument("--node-budget", type=int, default=64)
     p.add_argument("--compare-ar", action="store_true", help="Also run plain AR for wall-time comparison")
     args = p.parse_args()
 
@@ -93,37 +83,16 @@ def main():
         )
         return elapsed, len(produced)
 
-    runs = []
-    if args.mode in ("dflash", "both"):
-        runs.append(
-            (
-                "DFlash (vanilla, single trajectory)",
-                dflash_generate(
-                    target,
-                    drafter,
-                    input_ids,
-                    max_new_tokens=args.max_new_tokens,
-                    eos_token_id=eos,
-                ),
-            )
-        )
-    if args.mode in ("ddtree", "both"):
-        runs.append(
-            (
-                "DDTree (tree verification, FA-only targets)",
-                ddtree_generate(
-                    target,
-                    drafter,
-                    input_ids,
-                    max_new_tokens=args.max_new_tokens,
-                    node_budget=args.node_budget,
-                    eos_token_id=eos,
-                ),
-            )
-        )
-
-    for label, gen in runs:
-        _run(gen, label)
+    _run(
+        dflash_generate(
+            target,
+            drafter,
+            input_ids,
+            max_new_tokens=args.max_new_tokens,
+            eos_token_id=eos,
+        ),
+        "DFlash",
+    )
 
     if args.compare_ar:
         from ..generate import generate_step

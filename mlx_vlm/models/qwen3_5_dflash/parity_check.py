@@ -1,82 +1,67 @@
-"""Optional parity check: compares MLX DFlash against the HF reference on a
-single synthetic forward pass. Requires torch + transformers + an HF checkpoint.
+"""Lightweight smoke test: loads the MLX drafter and runs a single forward
+pass with a dummy target / cache to confirm weights are readable and the
+stack executes without errors.
 
-Usage:
     python -m mlx_vlm.models.qwen3_5_dflash.parity_check \
         --drafter z-lab/Qwen3.5-4B-DFlash
+
+The full HF-vs-MLX parity check is no longer meaningful now that the
+drafter wires through the target model's tied embed_tokens (which requires
+the target model to be loaded). End-to-end correctness is instead verified
+by the speculative decoding loop's accept rate against plain AR.
 """
 
 import argparse
 
 import mlx.core as mx
-import numpy as np
+import mlx.nn as nn
+from mlx_lm.models.cache import KVCache
 
 from .load import load_dflash_drafter
 
 
-def _mlx_forward(model, noise_np, target_np):
-    noise = mx.array(noise_np)
-    target = mx.array(target_np)
-    out = model(noise, target)
-    mx.eval(out)
-    return np.array(out.astype(mx.float32))
+class _DummyEmbed(nn.Module):
+    def __init__(self, vocab_size: int, hidden_size: int):
+        super().__init__()
+        self.weight = mx.random.normal((vocab_size, hidden_size)) * 0.02
 
+    def __call__(self, ids: mx.array) -> mx.array:
+        return self.weight[ids]
 
-def _hf_forward(drafter_path, noise_np, target_np):
-    import torch
-    from transformers import AutoConfig, AutoModel
-
-    torch.set_grad_enabled(False)
-    config = AutoConfig.from_pretrained(drafter_path, trust_remote_code=True)
-    model = AutoModel.from_pretrained(
-        drafter_path, trust_remote_code=True, torch_dtype=torch.float32
-    ).eval()
-
-    B, L, H = noise_np.shape
-    T = target_np.shape[1]
-    position_ids = torch.arange(T + L, dtype=torch.long).unsqueeze(0).expand(B, -1)
-
-    out = model(
-        position_ids=position_ids,
-        noise_embedding=torch.from_numpy(noise_np).float(),
-        target_hidden=torch.from_numpy(target_np).float(),
-    )
-    return out.float().cpu().numpy()
+    def as_linear(self, x: mx.array) -> mx.array:
+        return x @ self.weight.T
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--drafter", default="z-lab/Qwen3.5-4B-DFlash")
-    p.add_argument("--ctx", type=int, default=16)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--skip-hf", action="store_true")
     args = p.parse_args()
-
-    np.random.seed(args.seed)
 
     model = load_dflash_drafter(args.drafter, dtype=mx.float32)
     cfg = model.config
-    B, L, H = 1, cfg.block_size, cfg.hidden_size
-    T = args.ctx
 
-    noise_np = np.random.randn(B, L, H).astype(np.float32) * 0.02
-    target_np = (
-        np.random.randn(B, T, len(cfg.target_layer_ids) * H).astype(np.float32) * 0.02
+    # Bind to a dummy embed for the smoke test. In real use this is the
+    # target model's tied embed_tokens (see DFlashDraftModel.bind).
+    dummy = _DummyEmbed(cfg.vocab_size, cfg.hidden_size)
+    model.embed_tokens = dummy
+    model.lm_head = dummy.as_linear
+
+    B = 1
+    block = cfg.block_size
+    T = 16  # pretend-committed target context length
+
+    ids = mx.zeros((B, block), dtype=mx.int32)
+    target_hidden = mx.random.normal(
+        (B, T, len(cfg.target_layer_ids) * cfg.hidden_size)
+    ) * 0.02
+    cache = model.make_cache()
+
+    logits = model(ids, target_hidden, cache)
+    mx.eval(logits)
+    print(
+        f"forward OK: logits shape={tuple(logits.shape)} "
+        f"mean={float(logits.mean()):.5f} std={float(logits.std()):.5f}"
     )
-
-    mlx_out = _mlx_forward(model, noise_np, target_np)
-    print(f"MLX   out: shape={mlx_out.shape} mean={mlx_out.mean():.5f} std={mlx_out.std():.5f}")
-
-    if args.skip_hf:
-        return
-    try:
-        hf_out = _hf_forward(args.drafter, noise_np, target_np)
-    except Exception as e:  # noqa: BLE001
-        print(f"[skip HF] {type(e).__name__}: {e}")
-        return
-    print(f"HF    out: shape={hf_out.shape} mean={hf_out.mean():.5f} std={hf_out.std():.5f}")
-    diff = np.abs(mlx_out - hf_out)
-    print(f"|mlx - hf| max={diff.max():.4e} mean={diff.mean():.4e}")
 
 
 if __name__ == "__main__":
