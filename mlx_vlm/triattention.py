@@ -648,6 +648,228 @@ def maybe_apply_triattention(
         )
 
 
+# ──────────────────────────── online calibration ──────────────────
+
+
+class _OnlineCaptureWrapper:
+    """Lightweight wrapper that captures pre-RoPE Q during prefill.
+
+    Same approach as the calibration script's _CaptureWrapper, but designed
+    for transient use during a single generation call.
+    """
+
+    def __init__(self, wrapped: nn.Module, capture_list: list):
+        object.__setattr__(self, "_wrapped", wrapped)
+        object.__setattr__(self, "_capture_list", capture_list)
+
+    def __getattr__(self, name: str):
+        return getattr(object.__getattribute__(self, "_wrapped"), name)
+
+    def __call__(self, x, mask=None, cache=None, **kwargs):
+        wrapped = object.__getattribute__(self, "_wrapped")
+        capture_list = object.__getattribute__(self, "_capture_list")
+
+        B, L, _ = x.shape
+        n_heads = getattr(wrapped, "n_heads", None) or getattr(
+            wrapped, "num_heads", None
+        )
+        if n_heads is not None:
+            q = wrapped.q_proj(x).reshape(B, L, n_heads, -1)
+            if hasattr(wrapped, "q_norm"):
+                q = wrapped.q_norm(q)
+            capture_list.append(mx.stop_gradient(q))
+
+        return wrapped(x, mask=mask, cache=cache, **kwargs)
+
+
+class OnlineCalibrationState:
+    """Holds hooks and captures for online TriAttention calibration.
+
+    Usage in generate_step::
+
+        # Before prefill
+        online_state = setup_online_triattention(model, budget=512)
+
+        # ... prefill runs, hooks capture Q vectors ...
+
+        # After prefill, before decode loop
+        activate_online_triattention(online_state, prompt_cache)
+    """
+
+    def __init__(self):
+        self.hooks: list = []  # (layer, attr_name, original_attn)
+        self.captures: Dict[int, list] = {}
+        self.budget: int = DEFAULT_BUDGET
+        self.divide_length: int = DEFAULT_DIVIDE_LENGTH
+        self.protect_recent: int = DEFAULT_PROTECT_RECENT
+        self.protect_initial: int = DEFAULT_PROTECT_INITIAL
+        self.rope_config: Optional[RoPEConfig] = None
+        self.model_info: Optional[tuple] = None
+
+
+def setup_online_triattention(
+    model: nn.Module,
+    budget: int = DEFAULT_BUDGET,
+    divide_length: int = DEFAULT_DIVIDE_LENGTH,
+    protect_recent: int = DEFAULT_PROTECT_RECENT,
+    protect_initial: int = DEFAULT_PROTECT_INITIAL,
+) -> OnlineCalibrationState:
+    """Install capture hooks for online calibration. Call before prefill.
+
+    Hooks capture pre-RoPE Q vectors from all full-attention layers during
+    the prefill phase. After prefill, call :func:`activate_online_triattention`
+    to compute calibration and convert caches.
+    """
+    state = OnlineCalibrationState()
+    state.budget = budget
+    state.divide_length = divide_length
+    state.protect_recent = protect_recent
+    state.protect_initial = protect_initial
+
+    info = extract_model_info(model)
+    if info is None:
+        raise ValueError(
+            "TriAttention: could not extract model info. "
+            "Unsupported architecture."
+        )
+    state.model_info = info
+    state.rope_config = info[4]
+
+    # Find the language model for hooking
+    lm = model
+    if hasattr(model, "language_model"):
+        lm_prop = model.language_model
+        if lm_prop is not model:
+            lm = lm_prop
+
+    layers = _find_layers(lm)
+    if layers is None:
+        raise ValueError("Cannot find transformer layers")
+
+    for layer_idx, layer in enumerate(layers):
+        attr_name = None
+        attn = None
+        for name in ("self_attn", "attention"):
+            if hasattr(layer, name):
+                attr_name = name
+                attn = getattr(layer, name)
+                break
+        if attn is None:
+            continue
+
+        # Skip sliding-window layers
+        if getattr(attn, "is_sliding", False):
+            continue
+
+        state.captures[layer_idx] = []
+        wrapper = _OnlineCaptureWrapper(attn, state.captures[layer_idx])
+        setattr(layer, attr_name, wrapper)
+        state.hooks.append((layer, attr_name, attn))
+
+    return state
+
+
+def activate_online_triattention(
+    state: OnlineCalibrationState,
+    prompt_cache: List[Any],
+) -> None:
+    """Compute calibration from captured Q vectors and activate compression.
+
+    Call after prefill completes. Removes capture hooks, computes Q-center
+    statistics from the prefill tokens, and converts KVCache entries to
+    TriAttentionKVCache.
+    """
+    from .models.cache import KVCache, RotatingKVCache, CacheList
+
+    # 1. Remove hooks
+    for layer, attr_name, original_attn in state.hooks:
+        setattr(layer, attr_name, original_attn)
+
+    n_layers, n_q_heads, n_kv_heads, head_dim, rope_config = state.model_info
+    n_freqs = rope_config.rotated_dims // 2
+
+    # 2. Compute calibration from captures
+    q_center_real = {}
+    q_center_imag = {}
+    q_mean_norm = {}
+
+    for layer_idx in range(n_layers):
+        if layer_idx not in state.captures or not state.captures.get(
+            layer_idx
+        ):
+            q_center_real[layer_idx] = mx.zeros((n_q_heads, n_freqs))
+            q_center_imag[layer_idx] = mx.zeros((n_q_heads, n_freqs))
+            q_mean_norm[layer_idx] = mx.zeros((n_q_heads, n_freqs))
+            continue
+
+        all_q = mx.concatenate(state.captures[layer_idx], axis=1)
+        mx.eval(all_q)
+
+        cr_list, ci_list, mn_list = [], [], []
+        for h in range(n_q_heads):
+            q_head = all_q[0, :, h, :]
+            real, imag = _decompose_complex(q_head, rope_config)
+            cr_list.append(mx.mean(real, axis=0))
+            ci_list.append(mx.mean(imag, axis=0))
+            mag = mx.sqrt(real * real + imag * imag + 1e-12)
+            mn_list.append(mx.mean(mag, axis=0))
+
+        q_center_real[layer_idx] = mx.stack(cr_list)
+        q_center_imag[layer_idx] = mx.stack(ci_list)
+        q_mean_norm[layer_idx] = mx.stack(mn_list)
+        mx.eval(
+            q_center_real[layer_idx],
+            q_center_imag[layer_idx],
+            q_mean_norm[layer_idx],
+        )
+
+    calib = TriAttentionCalibData(
+        q_center_real=q_center_real,
+        q_center_imag=q_center_imag,
+        q_mean_norm=q_mean_norm,
+        n_layers=n_layers,
+        n_q_heads=n_q_heads,
+        n_kv_heads=n_kv_heads,
+    )
+
+    # 3. Free capture memory
+    state.captures.clear()
+    state.hooks.clear()
+
+    # 4. Convert caches to TriAttentionKVCache
+    def convert_entry(entry, layer_idx):
+        if isinstance(entry, TriAttentionKVCache):
+            return entry
+        if isinstance(entry, RotatingKVCache):
+            return entry
+        if isinstance(entry, KVCache):
+            return TriAttentionKVCache.from_cache(
+                entry,
+                budget=state.budget,
+                calib=calib,
+                layer_idx=layer_idx,
+                rope_config=rope_config,
+                divide_length=state.divide_length,
+                protect_recent=state.protect_recent,
+                protect_initial=state.protect_initial,
+            )
+        if isinstance(entry, CacheList):
+            entry.caches = [
+                convert_entry(sub, layer_idx) for sub in entry.caches
+            ]
+            return entry
+        if isinstance(entry, list):
+            for i, sub in enumerate(entry):
+                entry[i] = convert_entry(sub, layer_idx)
+            return entry
+        return entry
+
+    for layer_idx in range(len(prompt_cache)):
+        prompt_cache[layer_idx] = convert_entry(
+            prompt_cache[layer_idx], layer_idx
+        )
+
+
 # ──────────────────────────── private helpers ─────────────────────
 
 

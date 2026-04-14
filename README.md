@@ -616,20 +616,11 @@ TriAttention ([arXiv:2604.04921](https://arxiv.org/abs/2604.04921)) compresses t
 
 ### Quick Start
 
-**Step 1: Calibrate** (one-time per model, takes ~30s)
-
-```sh
-python -m mlx_vlm.triattention_calibrate \
-  --model google/gemma-4-31b-it \
-  --output gemma4_calib.safetensors
-```
-
-**Step 2: Generate with compression**
+**Zero-config (online calibration)** — Q/K centers are computed from prefill tokens automatically:
 
 ```sh
 mlx_vlm generate \
   --model google/gemma-4-31b-it \
-  --triattention-calib gemma4_calib.safetensors \
   --triattention-budget 512 \
   --prompt "Your prompt here..." \
   --max-tokens 2048
@@ -640,11 +631,29 @@ from mlx_vlm import generate
 
 result = generate(
     model, processor, prompt,
-    triattention_calib="gemma4_calib.safetensors",
     triattention_budget=512,
     max_tokens=2048,
 )
 ```
+
+**With offline calibration** (optional, for repeated use with the same model):
+
+```sh
+# Calibrate once (~30s)
+python -m mlx_vlm.triattention_calibrate \
+  --model google/gemma-4-31b-it \
+  --output gemma4_calib.safetensors
+
+# Generate with pre-computed calibration
+mlx_vlm generate \
+  --model google/gemma-4-31b-it \
+  --triattention-calib gemma4_calib.safetensors \
+  --triattention-budget 512 \
+  --prompt "Your prompt here..." \
+  --max-tokens 2048
+```
+
+> **Why online works:** The paper (Appendix H) shows Q/K centers are model-intrinsic properties that converge from as few as 50K tokens and are stable across domains (math, code, chat all yield MRL ~0.98). Even a short prompt provides enough signal.
 
 ### Performance
 

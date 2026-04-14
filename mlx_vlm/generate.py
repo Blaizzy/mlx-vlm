@@ -485,8 +485,10 @@ def generate_step(
             max_kv_size=max_kv_size,
         )
 
-    # Apply TriAttention KV cache compression if calibration is provided
+    # Apply TriAttention KV cache compression
+    _triattention_online_state = None
     if triattention_calib is not None:
+        # Offline mode: use pre-computed calibration file
         from .triattention import maybe_apply_triattention
 
         maybe_apply_triattention(
@@ -494,6 +496,13 @@ def generate_step(
             model,
             triattention_calib,
             budget=triattention_budget,
+        )
+    elif triattention_budget is not None:
+        # Online mode: calibrate from prefill tokens (no calib file needed)
+        from .triattention import setup_online_triattention
+
+        _triattention_online_state = setup_online_triattention(
+            model, budget=triattention_budget
         )
 
     def _step(y, inputs_embeds=None):
@@ -575,6 +584,13 @@ def generate_step(
             input_ids = input_ids[:, -1:]
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
+
+    # Activate online TriAttention after prefill (hooks captured Q during prefill)
+    if _triattention_online_state is not None:
+        from .triattention import activate_online_triattention
+
+        activate_online_triattention(_triattention_online_state, prompt_cache)
+        _triattention_online_state = None
 
     mx.async_eval(y)
 
