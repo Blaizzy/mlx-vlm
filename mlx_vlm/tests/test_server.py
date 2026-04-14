@@ -67,6 +67,7 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
                 "top_k": 40,
                 "min_p": 0.08,
                 "repetition_penalty": 1.15,
+                "repetition_context_size": 4096,
                 "logit_bias": {"12": -1.5},
                 "enable_thinking": False,
                 "thinking_budget": 24,
@@ -82,6 +83,7 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     assert mock_generate.call_args.kwargs["top_k"] == 40
     assert mock_generate.call_args.kwargs["min_p"] == 0.08
     assert mock_generate.call_args.kwargs["repetition_penalty"] == 1.15
+    assert mock_generate.call_args.kwargs["repetition_context_size"] == 4096
     assert mock_generate.call_args.kwargs["logit_bias"] == {12: -1.5}
     assert mock_generate.call_args.kwargs["enable_thinking"] is False
     assert mock_generate.call_args.kwargs["thinking_budget"] == 24
@@ -118,6 +120,11 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
                 "top_k": 40,
                 "min_p": 0.08,
                 "repetition_penalty": 1.15,
+                "repetition_context_size": 4096,
+                "presence_penalty": 0.3,
+                "presence_context_size": 256,
+                "frequency_penalty": 0.05,
+                "frequency_context_size": 512,
                 "logit_bias": {"12": -1.5},
                 "resize_shape": [512],
             },
@@ -128,5 +135,10 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["top_k"] == 40
     assert mock_generate.call_args.kwargs["min_p"] == 0.08
     assert mock_generate.call_args.kwargs["repetition_penalty"] == 1.15
+    assert mock_generate.call_args.kwargs["repetition_context_size"] == 4096
+    assert mock_generate.call_args.kwargs["presence_penalty"] == 0.3
+    assert mock_generate.call_args.kwargs["presence_context_size"] == 256
+    assert mock_generate.call_args.kwargs["frequency_penalty"] == 0.05
+    assert mock_generate.call_args.kwargs["frequency_context_size"] == 512
     assert mock_generate.call_args.kwargs["logit_bias"] == {12: -1.5}
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)

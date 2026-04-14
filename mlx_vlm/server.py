@@ -319,7 +319,47 @@ class GenerationParams(FlexibleBaseModel):
         description="Min-p sampling threshold.",
     )
     repetition_penalty: Optional[float] = Field(
-        None, description="Penalty applied to repeated tokens."
+        None,
+        description=(
+            "Multiplicative penalty applied to tokens that have appeared in the "
+            "recent generation window (Keskar et al. 2019). Each unique repeated "
+            "token is penalised once regardless of frequency; values below ~1.7 "
+            "may be insufficient to prevent loops on VLMs whose logits are "
+            "sharply peaked (e.g. OCR), where 2.0 is a more reliable starting "
+            "point. Combine with frequency_penalty for finer control."
+        ),
+    )
+    repetition_context_size: Optional[int] = Field(
+        None,
+        description=(
+            "Number of previous tokens considered when applying the repetition "
+            "penalty. mlx_lm's default of 20 is small; raise this for long-form "
+            "generation (e.g. full-page OCR) where loop cycles exceed 20 tokens."
+        ),
+    )
+    presence_penalty: Optional[float] = Field(
+        None,
+        description=(
+            "Additive penalty subtracted from a logit if the token has occurred "
+            "at least once in the recent window. Mirrors the OpenAI parameter."
+        ),
+    )
+    presence_context_size: Optional[int] = Field(
+        None,
+        description="Token window for presence_penalty (mlx_lm default: 20).",
+    )
+    frequency_penalty: Optional[float] = Field(
+        None,
+        description=(
+            "Additive penalty proportional to a token's count in the recent "
+            "window. Effective at breaking high-frequency repetition loops "
+            "(e.g. OCR pages where one heading is repeated dozens of times). "
+            "Mirrors the OpenAI parameter."
+        ),
+    )
+    frequency_context_size: Optional[int] = Field(
+        None,
+        description="Token window for frequency_penalty (mlx_lm default: 20).",
     )
     logit_bias: Optional[dict[int, float]] = Field(
         None, description="Additive logit bias keyed by token id."
@@ -332,6 +372,11 @@ class GenerationParams(FlexibleBaseModel):
             "top_k",
             "min_p",
             "repetition_penalty",
+            "repetition_context_size",
+            "presence_penalty",
+            "presence_context_size",
+            "frequency_penalty",
+            "frequency_context_size",
             "logit_bias",
         )
 
