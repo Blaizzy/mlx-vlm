@@ -710,6 +710,12 @@ def apply_chat_template(
                         **kwargs,
                     )
                 )
+            elif isinstance(p, dict) and (
+                p.get("tool_calls") or p.get("role") == "tool"
+            ):
+                # Tool-calling messages: pass through as-is so the tokenizer's
+                # Jinja chat template sees tool_calls and tool_call_id intact.
+                messages.append(p)
             elif (role_content := _get_role_content(p)) is not None:
                 role, content = role_content
                 # Handle multimodal content: extract only text, skip image/audio URLs

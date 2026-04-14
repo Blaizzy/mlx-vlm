@@ -1068,11 +1068,9 @@ async def chat_completions_endpoint(request: ChatRequest):
         processed_messages = []
         for message in request.messages:
             if message.content is None:
-                processed_messages.append({"role": message.role, "content": ""})
+                msg = {"role": message.role, "content": ""}
             elif isinstance(message.content, str):
-                processed_messages.append(
-                    {"role": message.role, "content": message.content}
-                )
+                msg = {"role": message.role, "content": message.content}
             elif isinstance(message.content, list):
                 text_content = ""
                 for item in message.content:
@@ -1087,9 +1085,22 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 audio.append(item["input_audio"]["data"])
                         if item["type"] in ("text", "input_text"):
                             text_content = item.get("text", "")
-                processed_messages.append(
-                    {"role": message.role, "content": text_content}
-                )
+                msg = {"role": message.role, "content": text_content}
+            else:
+                msg = {"role": message.role, "content": ""}
+
+            # Preserve tool-calling metadata so the tokenizer's Jinja chat
+            # template can correctly format multi-turn tool call / result turns.
+            if getattr(message, "tool_calls", None):
+                msg["tool_calls"] = [
+                    tc if isinstance(tc, dict) else tc.model_dump()
+                    for tc in message.tool_calls
+                ]
+            tool_call_id = getattr(message, "tool_call_id", None)
+            if tool_call_id:
+                msg["tool_call_id"] = tool_call_id
+
+            processed_messages.append(msg)
 
         tools = None
         if hasattr(request, "tools"):
