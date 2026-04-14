@@ -1092,10 +1092,28 @@ async def chat_completions_endpoint(request: ChatRequest):
             # Preserve tool-calling metadata so the tokenizer's Jinja chat
             # template can correctly format multi-turn tool call / result turns.
             if getattr(message, "tool_calls", None):
-                msg["tool_calls"] = [
-                    tc if isinstance(tc, dict) else tc.model_dump()
-                    for tc in message.tool_calls
-                ]
+                tool_calls_out = []
+                for tc in message.tool_calls:
+                    tc_dict = tc if isinstance(tc, dict) else tc.model_dump()
+                    # arguments is stored as a JSON string in the OpenAI wire
+                    # format, but Gemma 4's Jinja template expects a native
+                    # object. Passing a string causes the model to re-emit it
+                    # verbatim with <|"|> escapes around JSON fragments,
+                    # producing double-encoded arguments on the next turn.
+                    func = tc_dict.get("function", {})
+                    if isinstance(func.get("arguments"), str):
+                        try:
+                            tc_dict = {
+                                **tc_dict,
+                                "function": {
+                                    **func,
+                                    "arguments": json.loads(func["arguments"]),
+                                },
+                            }
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    tool_calls_out.append(tc_dict)
+                msg["tool_calls"] = tool_calls_out
             tool_call_id = getattr(message, "tool_call_id", None)
             if tool_call_id:
                 msg["tool_call_id"] = tool_call_id
