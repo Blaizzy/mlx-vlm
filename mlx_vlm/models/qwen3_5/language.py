@@ -377,6 +377,7 @@ class Qwen3_5Model(nn.Module):
         mask: Optional[mx.array] = None,
         cache=None,
         position_ids: Optional[mx.array] = None,
+        capture_layer_ids: Optional[list] = None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -389,11 +390,19 @@ class Qwen3_5Model(nn.Module):
         fa_mask = create_attention_mask(h, cache[self.fa_idx])
         ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        capture = set(capture_layer_ids) if capture_layer_ids else None
+        captured = {} if capture else None
+
+        for idx, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             h = layer(h, mask, c, position_ids)
+            if capture and idx in capture:
+                captured[idx] = h
 
-        return self.norm(h)
+        out = self.norm(h)
+        if capture:
+            return out, captured
+        return out
 
 
 class LanguageModel(nn.Module):
@@ -587,6 +596,7 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
         if pixel_values is not None:
             self._rope_deltas = None
             self._position_ids = None
@@ -650,17 +660,24 @@ class LanguageModel(nn.Module):
                     position_ids, (3, batch_size, seq_length)
                 )
 
-        out = self.model(
+        result = self.model(
             inputs,
             cache=cache,
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
+            capture_layer_ids=capture_layer_ids,
         )
+        captured = None
+        if capture_layer_ids:
+            out, captured_map = result
+            captured = [captured_map[i] for i in capture_layer_ids]
+        else:
+            out = result
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(logits=out, hidden_states=captured)
 
     @property
     def layers(self):
