@@ -19,7 +19,7 @@ drafter cache after each round to drop the transient noise slots, leaving
 only committed target features behind.
 """
 
-from typing import List, Optional, Tuple
+from typing import List
 
 import mlx.core as mx
 import mlx.nn as nn

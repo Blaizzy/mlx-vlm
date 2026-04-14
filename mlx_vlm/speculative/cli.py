@@ -39,18 +39,22 @@ def main():
     p.add_argument("--drafter", required=True, help="DFlash drafter path or HF id")
     p.add_argument("--prompt", required=True)
     p.add_argument("--max-new-tokens", type=int, default=200)
-    p.add_argument("--compare-ar", action="store_true", help="Also run plain AR for wall-time comparison")
+    p.add_argument(
+        "--compare-ar",
+        action="store_true",
+        help="Also run plain AR for wall-time comparison",
+    )
     args = p.parse_args()
 
     print(f"Loading target model: {args.target}")
     target, processor = load(args.target)
+    tokenizer = (
+        processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    )
 
     print(f"Loading DFlash drafter: {args.drafter}")
     drafter = load_dflash_drafter(args.drafter)
 
-    tokenizer = (
-        processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    )
     text = _apply_chat(tokenizer, args.prompt)
     input_ids = mx.array([tokenizer.encode(text)], dtype=mx.int32)
     print(f"Prompt tokens: {input_ids.shape[1]}")
@@ -62,8 +66,8 @@ def main():
         accept_lens: list = []
         round_accepts = 0
         t0 = time.perf_counter()
-        for tok, accept_idx in gen_fn:
-            produced.append(tok)
+        for tok_id, accept_idx in gen_fn:
+            produced.append(tok_id)
             if accept_idx == 0:
                 if round_accepts or produced:
                     accept_lens.append(round_accepts)
@@ -71,8 +75,7 @@ def main():
             else:
                 round_accepts = max(round_accepts, accept_idx)
         elapsed = time.perf_counter() - t0
-        text_out = tokenizer.decode(produced)
-        print(text_out)
+        print(tokenizer.decode(produced))
         tok_per_s = len(produced) / elapsed if elapsed > 0 else 0.0
         mean_accept = (
             sum(accept_lens) / len(accept_lens) if accept_lens else 0.0
@@ -98,9 +101,9 @@ def main():
         from ..generate import generate_step
 
         print("\n=== plain AR (baseline) ===")
-        t0 = time.perf_counter()
         tokens = []
-        for tok, _ in generate_step(
+        t0 = time.perf_counter()
+        for tok_id, _ in generate_step(
             input_ids,
             target,
             pixel_values=None,
@@ -108,12 +111,12 @@ def main():
             max_tokens=args.max_new_tokens,
             temperature=0.0,
         ):
-            if isinstance(tok, mx.array):
-                tok = int(tok.item())
-            tokens.append(tok)
+            if isinstance(tok_id, mx.array):
+                tok_id = int(tok_id.item())
+            tokens.append(tok_id)
             if len(tokens) >= args.max_new_tokens:
                 break
-            if eos is not None and tok == eos:
+            if eos is not None and tok_id == eos:
                 break
         elapsed = time.perf_counter() - t0
         print(tokenizer.decode(tokens))
