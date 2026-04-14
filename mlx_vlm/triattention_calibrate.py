@@ -14,9 +14,7 @@ statistics used by TriAttention for key importance scoring.
 from __future__ import annotations
 
 import argparse
-import sys
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -25,7 +23,6 @@ from .triattention import (
     RoPEConfig,
     TriAttentionCalibData,
     _decompose_complex,
-    _find_attention,
     _find_layers,
     extract_model_info,
     save_calibration,
@@ -263,9 +260,7 @@ def calibrate(
 
     # Tokenize calibration text
     text = calibration_text or DEFAULT_CALIBRATION_TEXT
-    tokenizer = (
-        processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    )
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     tokens = tokenizer.encode(text, return_tensors=None)
     if isinstance(tokens, list):
         tokens = tokens[:max_tokens]
@@ -322,9 +317,7 @@ def calibrate(
 
     # Compute statistics
     print("Computing frequency-domain statistics...")
-    calib = compute_statistics(
-        captures, rope_config, n_q_heads, n_kv_heads, n_layers
-    )
+    calib = compute_statistics(captures, rope_config, n_q_heads, n_kv_heads, n_layers)
 
     # Verify statistics: pick first captured layer for MRL diagnostic
     if captured_layers:
@@ -334,9 +327,7 @@ def calibrate(
             + calib.q_center_imag[diag_layer] ** 2
             + 1e-12
         )
-        mean_mrl = mx.mean(
-            diag_mag / (calib.q_mean_norm[diag_layer] + 1e-6)
-        ).item()
+        mean_mrl = mx.mean(diag_mag / (calib.q_mean_norm[diag_layer] + 1e-6)).item()
         print(f"Layer {diag_layer} mean MRL (Q concentration): {mean_mrl:.4f}")
 
     # Save

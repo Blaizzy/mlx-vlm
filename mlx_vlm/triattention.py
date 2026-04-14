@@ -12,9 +12,7 @@ Q-center phases with post-RoPE K phases.
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -143,9 +141,7 @@ def extract_model_info(
     attn = None
     for layer in layers:
         candidate = _find_attention(layer)
-        if candidate is not None and not getattr(
-            candidate, "is_sliding", False
-        ):
+        if candidate is not None and not getattr(candidate, "is_sliding", False):
             attn = candidate
             break
     if attn is None:
@@ -153,9 +149,7 @@ def extract_model_info(
     if attn is None:
         return None
 
-    n_q_heads = getattr(attn, "n_heads", None) or getattr(
-        attn, "num_heads", None
-    )
+    n_q_heads = getattr(attn, "n_heads", None) or getattr(attn, "num_heads", None)
     n_kv_heads = (
         getattr(attn, "n_kv_heads", None)
         or getattr(attn, "num_key_value_heads", None)
@@ -462,9 +456,7 @@ class TriAttentionKVCache(_BaseCache):
 
         # Select top-budget tokens
         keep_count = min(self.budget, S)
-        keep_idx = mx.argpartition(-avg_scores[0], kth=keep_count - 1)[
-            :keep_count
-        ]
+        keep_idx = mx.argpartition(-avg_scores[0], kth=keep_count - 1)[:keep_count]
         keep_idx = mx.sort(keep_idx)  # preserve temporal order
 
         # Gather retained keys/values
@@ -507,9 +499,7 @@ class TriAttentionKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(
-            map(str, (self.budget, self.offset, self._tokens_since_compress))
-        )
+        return tuple(map(str, (self.budget, self.offset, self._tokens_since_compress)))
 
     @meta_state.setter
     def meta_state(self, v):
@@ -595,7 +585,7 @@ def maybe_apply_triattention(
 
     Follows the same pattern as maybe_quantize_kv_cache for TurboQuant.
     """
-    from .models.cache import KVCache, RotatingKVCache, CacheList
+    from .models.cache import CacheList, KVCache, RotatingKVCache
 
     calib = load_calibration(calib_path)
     rope_config = extract_rope_config(model)
@@ -632,9 +622,7 @@ def maybe_apply_triattention(
                 protect_initial=protect_initial,
             )
         if isinstance(entry, CacheList):
-            entry.caches = [
-                convert_entry(sub, layer_idx) for sub in entry.caches
-            ]
+            entry.caches = [convert_entry(sub, layer_idx) for sub in entry.caches]
             return entry
         if isinstance(entry, list):
             for i, sub in enumerate(entry):
@@ -643,9 +631,7 @@ def maybe_apply_triattention(
         return entry
 
     for layer_idx in range(len(prompt_cache)):
-        prompt_cache[layer_idx] = convert_entry(
-            prompt_cache[layer_idx], layer_idx
-        )
+        prompt_cache[layer_idx] = convert_entry(prompt_cache[layer_idx], layer_idx)
 
 
 # ──────────────────────────── online calibration ──────────────────
@@ -729,8 +715,7 @@ def setup_online_triattention(
     info = extract_model_info(model)
     if info is None:
         raise ValueError(
-            "TriAttention: could not extract model info. "
-            "Unsupported architecture."
+            "TriAttention: could not extract model info. " "Unsupported architecture."
         )
     state.model_info = info
     state.rope_config = info[4]
@@ -779,7 +764,7 @@ def activate_online_triattention(
     statistics from the prefill tokens, and converts KVCache entries to
     TriAttentionKVCache.
     """
-    from .models.cache import KVCache, RotatingKVCache, CacheList
+    from .models.cache import CacheList, KVCache, RotatingKVCache
 
     # 1. Remove hooks
     for layer, attr_name, original_attn in state.hooks:
@@ -794,9 +779,7 @@ def activate_online_triattention(
     q_mean_norm = {}
 
     for layer_idx in range(n_layers):
-        if layer_idx not in state.captures or not state.captures.get(
-            layer_idx
-        ):
+        if layer_idx not in state.captures or not state.captures.get(layer_idx):
             q_center_real[layer_idx] = mx.zeros((n_q_heads, n_freqs))
             q_center_imag[layer_idx] = mx.zeros((n_q_heads, n_freqs))
             q_mean_norm[layer_idx] = mx.zeros((n_q_heads, n_freqs))
@@ -854,9 +837,7 @@ def activate_online_triattention(
                 protect_initial=state.protect_initial,
             )
         if isinstance(entry, CacheList):
-            entry.caches = [
-                convert_entry(sub, layer_idx) for sub in entry.caches
-            ]
+            entry.caches = [convert_entry(sub, layer_idx) for sub in entry.caches]
             return entry
         if isinstance(entry, list):
             for i, sub in enumerate(entry):
@@ -865,9 +846,7 @@ def activate_online_triattention(
         return entry
 
     for layer_idx in range(len(prompt_cache)):
-        prompt_cache[layer_idx] = convert_entry(
-            prompt_cache[layer_idx], layer_idx
-        )
+        prompt_cache[layer_idx] = convert_entry(prompt_cache[layer_idx], layer_idx)
 
 
 # ──────────────────────────── private helpers ─────────────────────
@@ -890,9 +869,7 @@ def _find_layers(model: nn.Module) -> Optional[list]:
 
 def _find_attention(layer: nn.Module) -> Optional[nn.Module]:
     """Find the attention sub-module in a transformer layer."""
-    return getattr(layer, "self_attn", None) or getattr(
-        layer, "attention", None
-    )
+    return getattr(layer, "self_attn", None) or getattr(layer, "attention", None)
 
 
 def _get_head_dim(attn: nn.Module) -> Optional[int]:
@@ -900,9 +877,7 @@ def _get_head_dim(attn: nn.Module) -> Optional[int]:
     hd = getattr(attn, "head_dim", None)
     if hd is not None:
         return hd
-    n_heads = getattr(attn, "n_heads", None) or getattr(
-        attn, "num_heads", None
-    )
+    n_heads = getattr(attn, "n_heads", None) or getattr(attn, "num_heads", None)
     if n_heads and hasattr(attn, "q_proj") and hasattr(attn.q_proj, "weight"):
         return attn.q_proj.weight.shape[0] // n_heads
     return None
