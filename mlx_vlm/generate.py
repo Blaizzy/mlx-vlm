@@ -381,6 +381,10 @@ def generate_step(
     temperature: float = DEFAULT_TEMPERATURE,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
+    presence_penalty: Optional[float] = None,
+    presence_context_size: Optional[int] = None,
+    frequency_penalty: Optional[float] = None,
+    frequency_context_size: Optional[int] = None,
     top_p: float = DEFAULT_TOP_P,
     min_p: float = DEFAULT_MIN_P,
     top_k: int = DEFAULT_TOP_K,
@@ -406,10 +410,21 @@ def generate_step(
         mask: The attention mask (optional).
         max_tokens (int): Maximum number of tokens to generate.
         temperature (float): The temperature for sampling, if 0 the argmax is used.
-        repetition_penalty (float, optional): The penalty factor for repeating
-          tokens.
+        repetition_penalty (float, optional): The multiplicative penalty factor
+          for tokens that have appeared in the recent window. Each unique
+          repeated token is penalised once regardless of frequency.
         repetition_context_size (int, optional): The number of tokens to
-          consider for repetition penalty.
+          consider for repetition penalty (mlx_lm default: 20).
+        presence_penalty (float, optional): Additive penalty subtracted from a
+          logit if the token has occurred at least once in the recent window
+          (OpenAI semantics).
+        presence_context_size (int, optional): Token window for
+          ``presence_penalty`` (mlx_lm default: 20).
+        frequency_penalty (float, optional): Additive penalty proportional to a
+          token's count in the recent window (OpenAI semantics). Effective at
+          breaking high-frequency repetition loops where a few tokens dominate.
+        frequency_context_size (int, optional): Token window for
+          ``frequency_penalty`` (mlx_lm default: 20).
         top_p (float, optional): Nucleus sampling, higher means model considers
           more less likely words.
         min_p (float, optional): Minimum probability threshold relative to the
@@ -452,9 +467,23 @@ def generate_step(
             top_k=top_k,
         )
 
-    processors = make_logits_processors(
-        logit_bias, repetition_penalty, repetition_context_size
-    )
+    # Build the kwargs explicitly so unset fields fall back to mlx_lm defaults
+    # rather than being overridden by ``None``.
+    _processor_kwargs: Dict[str, Any] = {
+        "logit_bias": logit_bias,
+        "repetition_penalty": repetition_penalty,
+        "repetition_context_size": repetition_context_size,
+    }
+    if presence_penalty is not None:
+        _processor_kwargs["presence_penalty"] = presence_penalty
+    if presence_context_size is not None:
+        _processor_kwargs["presence_context_size"] = presence_context_size
+    if frequency_penalty is not None:
+        _processor_kwargs["frequency_penalty"] = frequency_penalty
+    if frequency_context_size is not None:
+        _processor_kwargs["frequency_context_size"] = frequency_context_size
+
+    processors = make_logits_processors(**_processor_kwargs)
     if logits_processors is not None:
         processors.extend(logits_processors)
 
@@ -809,8 +838,15 @@ def generate(
            (default ``False``).
        formatter (Optional[Callable]): A function which takes a token and a
            probability and displays it.
-       repetition_penalty (float, optional): The penalty factor for repeating tokens.
-       repetition_context_size (int, optional): The number of tokens to consider for repetition penalty.
+       repetition_penalty (float, optional): Multiplicative penalty for repeated tokens.
+       repetition_context_size (int, optional): Token window for repetition_penalty.
+       presence_penalty (float, optional): Additive penalty for any token already seen
+         in the recent window (OpenAI semantics).
+       presence_context_size (int, optional): Token window for presence_penalty.
+       frequency_penalty (float, optional): Additive penalty proportional to a token's
+         occurrence count in the recent window (OpenAI semantics). Helpful for
+         breaking high-frequency loops.
+       frequency_context_size (int, optional): Token window for frequency_penalty.
     """
 
     if verbose:
