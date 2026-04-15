@@ -2,7 +2,7 @@
 pass with a dummy target / cache to confirm weights are readable and the
 stack executes without errors.
 
-    python -m mlx_vlm.models.qwen3_5_dflash.parity_check \
+    python -m mlx_vlm.speculative.drafters.qwen3_5_dflash.parity_check \
         --drafter z-lab/Qwen3.5-4B-DFlash
 
 The full HF-vs-MLX parity check is no longer meaningful now that the

@@ -2,7 +2,7 @@ import inspect
 from dataclasses import dataclass, field
 from typing import List
 
-from ..base import BaseModelConfig
+from ....models.base import BaseModelConfig
 
 
 @dataclass

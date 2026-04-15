@@ -1,8 +1,8 @@
 from .ddtree import DDTreeNode, build_ddtree
-from .dflash_loop import dflash_generate
+from .drafters import load_drafter
 
 __all__ = [
     "DDTreeNode",
     "build_ddtree",
-    "dflash_generate",
+    "load_drafter",
 ]
