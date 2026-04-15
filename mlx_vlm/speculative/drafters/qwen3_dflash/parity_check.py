@@ -2,7 +2,7 @@
 pass with a dummy target / cache to confirm weights are readable and the
 stack executes without errors.
 
-    python -m mlx_vlm.speculative.drafters.qwen3_5_dflash.parity_check \
+    python -m mlx_vlm.speculative.drafters.qwen3_dflash.parity_check \
         --drafter z-lab/Qwen3.5-4B-DFlash
 
 The full HF-vs-MLX parity check is no longer meaningful now that the
@@ -15,9 +15,8 @@ import argparse
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import KVCache
 
-from .load import load_dflash_drafter
+from ...drafters import load_drafter
 
 
 class _DummyEmbed(nn.Module):
@@ -37,7 +36,7 @@ def main():
     p.add_argument("--drafter", default="z-lab/Qwen3.5-4B-DFlash")
     args = p.parse_args()
 
-    model = load_dflash_drafter(args.drafter, dtype=mx.float32)
+    model = load_drafter(args.drafter)
     cfg = model.config
 
     # Bind to a dummy embed for the smoke test. In real use this is the

@@ -1,40 +1,30 @@
 """Drafter registry for speculative decoding.
 
-Each drafter kind maps to a loader that returns a ready-to-use drafter
-module. Today only ``dflash`` (block-diffusion drafter for Qwen3.5) is
-registered; EAGLE/Medusa/etc. can be added by appending to ``_LOADERS``.
+Today only ``dflash`` (block-diffusion drafter for Qwen3.5) is registered;
+EAGLE/Medusa/etc. can be added later. Loading goes through the shared
+:func:`mlx_vlm.utils.load_model`, which picks up drafters via the extra
+import path in ``utils._EXTRA_MODEL_PACKAGES`` and the ``dflash_config``
+key detection in ``get_model_and_args``.
 """
 
-from typing import Any, Callable, Dict
-
-import mlx.core as mx
-
-from .qwen3_5_dflash import DFlashDraftModel, load_dflash_drafter
-
-_LOADERS: Dict[str, Callable[..., Any]] = {
-    "dflash": load_dflash_drafter,
-}
+from .qwen3_dflash import DFlashDraftModel
 
 
-def load_drafter(
-    path_or_repo: str,
-    kind: str = "dflash",
-    dtype: mx.Dtype = mx.bfloat16,
-    **kwargs,
-):
-    """Load a speculative-decoding drafter.
+def load_drafter(path_or_repo: str, kind: str = "dflash", **kwargs):
+    """Load a speculative-decoding drafter via :func:`mlx_vlm.utils.load_model`.
 
     Args:
         path_or_repo: Local path or HuggingFace repo id for the drafter.
         kind: Drafter family. Currently only ``"dflash"`` is supported.
-        dtype: Weight dtype to cast to at load time.
-        **kwargs: Forwarded to the underlying loader.
+            Dispatch is actually driven by ``get_model_and_args`` inside
+            ``load_model``, so this argument is retained for validation.
+        **kwargs: Forwarded to ``load_model`` (e.g. ``lazy=True``).
     """
-    if kind not in _LOADERS:
-        raise ValueError(
-            f"Unknown drafter kind {kind!r}. Known: {sorted(_LOADERS)}"
-        )
-    return _LOADERS[kind](path_or_repo, dtype=dtype, **kwargs)
+    if kind != "dflash":
+        raise ValueError(f"Unknown drafter kind {kind!r}. Known: ['dflash']")
+    from ...utils import get_model_path, load_model
+
+    return load_model(get_model_path(path_or_repo), **kwargs)
 
 
-__all__ = ["DFlashDraftModel", "load_dflash_drafter", "load_drafter"]
+__all__ = ["DFlashDraftModel", "load_drafter"]
