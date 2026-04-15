@@ -302,11 +302,13 @@ def dflash_generate(
 ) -> Iterator[Tuple[int, int]]:
     """Yield ``(token_id, accepted_in_round)`` pairs.
 
-    ``accepted_in_round`` is 0 for the prefill bonus and each round's bonus
-    token; it is 1-indexed within the accepted drafted prefix otherwise.
+    ``accepted_in_round`` is 0 for the prefill bonus and each round's
+    bonus token; it is 1-indexed within the accepted drafted prefix
+    otherwise. Output is bit-identical to plain autoregressive greedy.
     """
     cfg = drafter.config
     block_total = block_size if block_size is not None else int(cfg.block_size)
+    L = block_total - 1  # drafted slots per round
     target_layer_ids = cfg.target_layer_ids
 
     if sampler is None:
@@ -371,14 +373,10 @@ def dflash_generate(
                     dtype=input_ids.dtype,
                 )
                 draft_logits = drafter(block, hidden, draft_cache)
-                # Draft cache may be over-extended by the noise tail — trim
-                # back to the committed length (prompt_len + emitted - 1 =
-                # the position of the current bonus token).
                 trim_n = draft_cache[0].offset - (prompt_len + emitted - 1)
                 if trim_n > 0:
                     trim_prompt_cache(draft_cache, trim_n)
                 draft_tokens = sampler(draft_logits[:, 1 - bs:])
-            mx.async_eval(draft_tokens)
 
             # --- Verify forward ---------------------------------------
             if capture is not None:
@@ -395,7 +393,8 @@ def dflash_generate(
                 target_tokens = sampler(verify_logits)
             mx.async_eval(target_tokens, hidden)
 
-            # --- Walk (Python; triggers sync on draft/target tokens) ---
+            # --- Walk (exact greedy, matches the reference torch and
+            # MLX implementations — first mismatch stops acceptance).
             d_list = draft_tokens[0].tolist()
             t_list = target_tokens[0].tolist()
             accepted = next(
@@ -403,7 +402,6 @@ def dflash_generate(
                 len(d_list),
             )
             new_tokens = d_list[:accepted] + [t_list[accepted]]
-            # Clamp to budget
             new_tokens = new_tokens[: max_new_tokens - emitted]
 
             # --- Emit -------------------------------------------------
