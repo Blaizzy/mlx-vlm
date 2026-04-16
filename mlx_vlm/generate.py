@@ -1053,27 +1053,33 @@ class BatchGenerator:
         inputs_embeds = kwargs.pop("inputs_embeds", None)
 
         if inputs_embeds is not None:
-            # Multimodal prefill with progress tracking
-            while inputs_embeds.shape[1] > 1:
-                n_to_process = min(self.prefill_step_size, inputs_embeds.shape[1] - 1)
-                self.model(
-                    padded_inputs[:, :n_to_process],
-                    cache=prompt_cache,
-                    inputs_embeds=inputs_embeds[:, :n_to_process],
-                    n_to_process=n_to_process,
-                    **kwargs,
-                )
-                mx.eval([c.state for c in prompt_cache])
-                inputs_embeds = inputs_embeds[:, n_to_process:]
-                padded_inputs = padded_inputs[:, n_to_process:]
-                processed_tokens += n_to_process
-                self.prompt_progress_callback(
-                    [
-                        (uid, processed_tokens, length)
-                        for uid, length in zip(uids, lengths)
-                    ]
-                )
-                mx.clear_cache()
+            # Multimodal prefill — only chunk if prompt exceeds step size
+            if (
+                self.prefill_step_size is not None
+                and inputs_embeds.shape[1] > self.prefill_step_size
+            ):
+                while inputs_embeds.shape[1] > 1:
+                    n_to_process = min(
+                        self.prefill_step_size, inputs_embeds.shape[1] - 1
+                    )
+                    self.model(
+                        padded_inputs[:, :n_to_process],
+                        cache=prompt_cache,
+                        inputs_embeds=inputs_embeds[:, :n_to_process],
+                        n_to_process=n_to_process,
+                        **kwargs,
+                    )
+                    mx.eval([c.state for c in prompt_cache])
+                    inputs_embeds = inputs_embeds[:, n_to_process:]
+                    padded_inputs = padded_inputs[:, n_to_process:]
+                    processed_tokens += n_to_process
+                    self.prompt_progress_callback(
+                        [
+                            (uid, processed_tokens, length)
+                            for uid, length in zip(uids, lengths)
+                        ]
+                    )
+                    mx.clear_cache()
 
             step_kwargs = {"inputs_embeds": inputs_embeds}
 
@@ -1543,6 +1549,7 @@ class ResponseGenerator:
 
         input_ids = inputs.get("input_ids", None)
         pixel_values = inputs.get("pixel_values", None)
+        mask = inputs.get("attention_mask", None)
 
         data_kwargs = {
             k: v
@@ -1553,22 +1560,12 @@ class ResponseGenerator:
         gen_kwargs = {}
         if pixel_values is not None:
             embedding_output = self.model.get_input_embeddings(
-                input_ids, pixel_values, **data_kwargs
+                input_ids, pixel_values, mask=mask, **data_kwargs
             )
 
-            if isinstance(embedding_output, dict):
-                embed_kwargs = embedding_output
-            elif hasattr(embedding_output, "to_dict"):
-                embed_kwargs = {
-                    k: v for k, v in embedding_output.to_dict().items() if v is not None
-                }
-            else:
-                embed_kwargs = {"inputs_embeds": embedding_output}
-
             gen_kwargs = {
-                "pixel_values": pixel_values,
                 **data_kwargs,
-                **embed_kwargs,
+                **embedding_output.to_dict(),
             }
 
         return input_ids, gen_kwargs
@@ -1735,6 +1732,19 @@ class ResponseGenerator:
                     sampler = self._make_sampler(args)
                     has_embeddings = bool(gen_kwargs.get("inputs_embeds") is not None)
 
+                    # Drain pending text-only prompts BEFORE inserting an
+                    # image request, so they don't get prefilled without
+                    # the correct embeddings.
+                    if has_embeddings and batch_generator.unprocessed_prompts:
+                        while batch_generator.unprocessed_prompts:
+                            drain_responses = batch_generator.next()
+                            if drain_responses:
+                                self._handle_responses(
+                                    drain_responses, batch_results
+                                )
+                            else:
+                                break
+
                     # Insert and get UID
                     (uid,) = batch_generator.insert(
                         [input_ids.squeeze(0).tolist()],
@@ -1754,19 +1764,8 @@ class ResponseGenerator:
                         "needs_prefill": has_embeddings,
                     }
 
-                    # If this request has embeddings, do its prefill immediately.
-                    # First, drain any pending text-only prompts to prevent
-                    # shape mismatch when mixing text-only and multimodal prefills.
+                    # Prefill this image request immediately with its embeddings
                     if has_embeddings:
-                        while batch_generator.unprocessed_prompts:
-                            drain_responses = batch_generator.next()
-                            if drain_responses:
-                                self._handle_responses(
-                                    drain_responses, batch_results
-                                )
-                            else:
-                                break
-
                         responses = batch_generator.next(**gen_kwargs)
                         if responses:
                             self._handle_responses(responses, batch_results)
@@ -2104,7 +2103,6 @@ def _generate_batch(
                 embed_kwargs = {"inputs_embeds": embedding_output}
 
             gen_kwargs = {
-                "pixel_values": pixel_values,
                 **data_kwargs,
                 **embed_kwargs,
             }
