@@ -1416,13 +1416,17 @@ class StoppingCriteria:
             raise ValueError("Processor is not provided")
 
         if new_eos_token_ids is not None:
-            if isinstance(new_eos_token_ids, str):
+            if isinstance(new_eos_token_ids, (str, int)):
                 new_eos_token_ids = [new_eos_token_ids]
-            new_eos_token_ids = [
-                self.tokenizer.encode(" " + token, add_special_tokens=False)[-1]
-                for token in new_eos_token_ids
-            ]
-            self.eos_token_ids.extend(new_eos_token_ids)
+            resolved = []
+            for token in new_eos_token_ids:
+                if isinstance(token, int):
+                    resolved.append(token)
+                elif isinstance(token, str):
+                    resolved.append(
+                        self.tokenizer.encode(" " + token, add_special_tokens=False)[-1]
+                    )
+            self.eos_token_ids.extend(resolved)
 
     def reset(self, eos_token_ids: List[int] = None):
         eos_token_ids = (
