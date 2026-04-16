@@ -11,9 +11,10 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
   - [Python Script](#python-script)
   - [Server (FastAPI)](#server-fastapi)
     - [Continuous Batching](#continuous-batching)
-- [Multi-Image Chat Support](#multi-image-chat-support)
-  - [Supported Models](#supported-models)
-  - [Usage Examples](#usage-examples)
+  - [Multi-Image Chat Support](#multi-image-chat-support)
+    - [Supported Models](#supported-models)
+    - [Usage Examples](#usage-examples)
+  - [Video Understanding](#video-understanding)
 - [Model-Specific Documentation](#model-specific-documentation)
 - [Fine-tuning](#fine-tuning)
 
@@ -401,14 +402,14 @@ with ThreadPoolExecutor(max_workers=4) as pool:
         print(f"[{name}]: {text}")
 ```
 
-## Multi-Image Chat Support
+### Multi-Image Chat Support
 
 MLX-VLM supports analyzing multiple images simultaneously with select models. This feature enables more complex visual reasoning tasks and comprehensive analysis across multiple images in a single conversation.
 
 
-### Usage Examples
+#### Usage Examples
 
-#### Python Script
+##### Python Script
 
 ```python
 from mlx_vlm import load, generate
@@ -430,13 +431,13 @@ output = generate(model, processor, formatted_prompt, images, verbose=False)
 print(output)
 ```
 
-#### Command Line
+##### Command Line
 
 ```sh
 mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Compare these images" --image path/to/image1.jpg path/to/image2.jpg
 ```
 
-## Video Understanding
+### Video Understanding
 
 MLX-VLM also supports video analysis such as captioning, summarization, and more, with select models.
 
@@ -451,9 +452,9 @@ The following models support video chat:
 
 With more coming soon.
 
-### Usage Examples
+#### Usage Examples
 
-#### Command Line
+##### Command Line
 ```sh
 mlx_vlm.video_generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --max-pixels 224 224 --fps 1.0
 ```
