@@ -1026,6 +1026,7 @@ class ModelsResponse(BaseModel):
 
 
 @app.post("/responses")
+@app.post("/v1/responses", include_in_schema=False)
 async def responses_endpoint(request: Request):
     """
     OpenAI-compatible endpoint for generating text based on a prompt and optional images.
@@ -1421,9 +1422,8 @@ async def responses_endpoint(request: Request):
         )
 
 
-@app.post(
-    "/chat/completions", response_model=None
-)  # Response model handled dynamically based on stream flag
+@app.post("/chat/completions", response_model=None)
+@app.post("/v1/chat/completions", response_model=None, include_in_schema=False)
 async def chat_completions_endpoint(request: ChatRequest):
     """
     Generate text based on a prompt and optional images.
@@ -1814,6 +1814,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
 
 @app.get("/models", response_model=ModelsResponse)
+@app.get("/v1/models", response_model=ModelsResponse, include_in_schema=False)
 def models_endpoint():
     """
     Return list of locally downloaded MLX models.
