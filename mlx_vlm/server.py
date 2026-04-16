@@ -405,7 +405,8 @@ def _split_thinking(text: str) -> Tuple[Optional[str], str]:
         reasoning = parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
         return reasoning or None, ""
     # Handle <think>...</think> format (qwen3.5 etc)
-    if "<think>" in text:
+    # Also handle partial: output starts with thinking text + </think> (no opening tag)
+    if "<think>" in text or "</think>" in text:
         parts = text.split("</think>", 1)
         if len(parts) == 2:
             reasoning = parts[0].replace("<think>", "").strip()
@@ -1385,9 +1386,24 @@ async def chat_completions_endpoint(request: ChatRequest):
             else:
                 msg["content"] = message.content
 
-            # Preserve tool-calling metadata
+            # Preserve tool-calling metadata.
+            # Ensure arguments are dicts (not JSON strings) for Jinja templates
+            # that iterate them with |items (e.g. Qwen3.5).
             if message.tool_calls is not None:
-                msg["tool_calls"] = message.tool_calls
+                normalized_calls = []
+                for tc in message.tool_calls:
+                    tc = dict(tc) if isinstance(tc, dict) else tc
+                    if isinstance(tc, dict) and "function" in tc:
+                        fn = dict(tc["function"])
+                        args = fn.get("arguments", {})
+                        if isinstance(args, str):
+                            try:
+                                fn["arguments"] = json.loads(args)
+                            except (json.JSONDecodeError, TypeError):
+                                fn["arguments"] = {}
+                        tc["function"] = fn
+                    normalized_calls.append(tc)
+                msg["tool_calls"] = normalized_calls
             if message.tool_call_id is not None:
                 msg["tool_call_id"] = message.tool_call_id
             if message.name is not None:
@@ -1667,8 +1683,13 @@ async def chat_completions_endpoint(request: ChatRequest):
                     )
                     if tc["calls"]:
                         parsed_tool_calls = tc["calls"]
-                        # Clean thinking tags from remaining text
+                        # Clean thinking tags and control tokens from remaining text
                         _, clean_remaining = _split_thinking(tc["remaining_text"] or "")
+                        if clean_remaining:
+                            # Strip model control tokens
+                            clean_remaining = re.sub(
+                                r"<\|[^>]+\|>|<[^>]+>", "", clean_remaining
+                            ).strip()
                         content = clean_remaining or None
 
                 choices = [

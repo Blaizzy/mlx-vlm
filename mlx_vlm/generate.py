@@ -1267,7 +1267,7 @@ class BatchGenerator:
             num_tok += 1
             batch.num_tokens[e] = num_tok
 
-            if t in self.stop_tokens:
+            if t in self.stop_tokens or self.tokenizer.stopping_criteria(t):
                 finish_reason = "stop"
                 end_idx.append(e)
             elif num_tok >= max_tok:
