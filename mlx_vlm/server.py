@@ -1654,11 +1654,12 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                             choices = [
                                 ChatStreamChoice(
+                                    finish_reason=token.finish_reason,
                                     delta=ChatMessage(
                                         role="assistant",
                                         content=delta_content,
                                         reasoning=delta_reasoning,
-                                    )
+                                    ),
                                 )
                             ]
                             chunk_data = ChatStreamChunk(
