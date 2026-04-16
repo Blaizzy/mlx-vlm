@@ -231,6 +231,34 @@ class GenerationResult:
     peak_memory: float = 0.0
 
 
+class PromptCacheState:
+    """Holds KV cache and token history across conversation turns.
+
+    Pass this to stream_generate via the ``prompt_cache_state`` kwarg to
+    reuse the KV cache from previous turns.  Only the new tokens (after
+    the common prefix) are processed, avoiding redundant prefill.
+    """
+
+    def __init__(self):
+        self.cache: Optional[List[Any]] = None
+        self.token_ids: Optional[List[int]] = None
+
+    def find_prefix_length(self, new_ids: list) -> int:
+        """Return the number of leading tokens that match the cached ids."""
+        if self.token_ids is None:
+            return 0
+        max_len = min(len(self.token_ids), len(new_ids))
+        for i in range(max_len):
+            if self.token_ids[i] != new_ids[i]:
+                return i
+        return max_len
+
+    def update(self, token_ids: list, kv_cache: list):
+        """Store the full token sequence and corresponding KV cache."""
+        self.token_ids = list(token_ids)
+        self.cache = kv_cache
+
+
 def generate_step(
     input_ids: mx.array,
     model: nn.Module,
