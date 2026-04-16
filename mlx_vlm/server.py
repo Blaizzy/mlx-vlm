@@ -83,10 +83,13 @@ class ResponseGenerator:
     higher throughput — same pattern as mlx-lm's server.
     """
 
-    def __init__(self, model, processor, stop_tokens: Optional[set] = None):
+    def __init__(
+        self, model, processor, stop_tokens=None, vision_cache=None
+    ):
         self.model = model
         self.processor = processor
         self.stop_tokens = stop_tokens or set()
+        self.vision_cache = vision_cache
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -119,7 +122,7 @@ class ResponseGenerator:
             else len(raw_inputs["input_ids"])
         )
 
-        self.requests.put((rqueue, raw_inputs, prompt_tokens, args))
+        self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images))
 
         # Block until the GPU thread sends back the context
         ctx = rqueue.get()
@@ -171,7 +174,7 @@ class ResponseGenerator:
 
         return sampler
 
-    def _gpu_embed(self, raw_inputs: dict) -> Tuple[mx.array, dict]:
+    def _gpu_embed(self, raw_inputs: dict, images=None) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
         input_ids = raw_inputs.get("input_ids")
         pixel_values = raw_inputs.get("pixel_values")
@@ -183,6 +186,17 @@ class ResponseGenerator:
         }
         gen_kwargs = {}
         if pixel_values is not None:
+            # Vision feature caching: skip vision encoder on repeated images
+            if self.vision_cache is not None and images is not None:
+                cached = self.vision_cache.get(images)
+                if cached is not None:
+                    data_kwargs["cached_image_features"] = cached
+                elif hasattr(self.model, "encode_image"):
+                    features = self.model.encode_image(pixel_values)
+                    mx.eval(features)
+                    self.vision_cache.put(images, features)
+                    data_kwargs["cached_image_features"] = features
+
             embed = self.model.get_input_embeddings(
                 input_ids, pixel_values, mask=mask, **data_kwargs
             )
@@ -220,7 +234,7 @@ class ResponseGenerator:
                         break
 
                 # Insert new requests into batch
-                for rqueue, raw_inputs, prompt_tokens, args in new_items:
+                for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
                             self.model.language_model,
@@ -230,7 +244,7 @@ class ResponseGenerator:
                         )
 
                     # GPU work: vision encoder only (if images present)
-                    input_ids, gen_kwargs = self._gpu_embed(raw_inputs)
+                    input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
 
                     # Image request: flush pending text-only first
@@ -495,10 +509,12 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
             stop_tokens.add(config.eos_token_id)
 
     # Create ResponseGenerator for continuous batching
+    vision_cache = VisionFeatureCache()
     response_generator = ResponseGenerator(
         model=model,
         processor=processor,
         stop_tokens=stop_tokens,
+        vision_cache=vision_cache,
     )
 
     model_cache = {
@@ -508,7 +524,7 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
         "model": model,
         "processor": processor,
         "config": config,
-        "vision_cache": VisionFeatureCache(),
+        "vision_cache": vision_cache,
     }
 
     return model, processor, config
