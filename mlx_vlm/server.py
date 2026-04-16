@@ -1224,15 +1224,10 @@ async def responses_endpoint(request: Request):
                     usage_stats = {"input_tokens": 0, "output_tokens": 0}
 
                     if response_generator is not None:
-                        args = GenerationArguments(
-                            max_tokens=openai_request.max_output_tokens,
-                            temperature=openai_request.temperature,
-                            top_p=openai_request.top_p,
-                        )
                         ctx, token_iter = response_generator.generate(
                             prompt=formatted_prompt,
                             images=images if images else None,
-                            args=args,
+                            args=gen_args,
                         )
 
                         output_tokens = 0
@@ -1341,15 +1336,10 @@ async def responses_endpoint(request: Request):
                 output_tokens = 0
 
                 if response_generator is not None:
-                    args = GenerationArguments(
-                        max_tokens=openai_request.max_output_tokens,
-                        temperature=openai_request.temperature,
-                        top_p=openai_request.top_p,
-                    )
                     ctx, token_iter = response_generator.generate(
                         prompt=formatted_prompt,
                         images=images if images else None,
-                        args=args,
+                        args=gen_args,
                     )
                     prompt_tokens = ctx.prompt_tokens
                     for token in token_iter:
@@ -1545,11 +1535,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                 try:
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
                     if response_generator is not None:
-                        gen_args = GenerationArguments(
-                            max_tokens=request.max_tokens,
-                            temperature=request.temperature,
-                            top_p=request.top_p,
-                        )
                         # generate() does blocking Queue.get — run off event loop
                         ctx, token_iter = await asyncio.to_thread(
                             response_generator.generate,
@@ -1706,11 +1691,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                 peak_memory = 0.0
 
                 if response_generator is not None:
-                    gen_args = GenerationArguments(
-                        max_tokens=request.max_tokens,
-                        temperature=request.temperature,
-                        top_p=request.top_p,
-                    )
 
                     def _blocking_generate():
                         text = ""
