@@ -19,7 +19,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
 from .generate import (
@@ -30,6 +30,7 @@ from .generate import (
     DEFAULT_TOP_P,
     BatchGenerator,
     generate,
+    normalize_resize_shape,
     stream_generate,
 )
 from .prompt_utils import apply_chat_template
@@ -51,7 +52,43 @@ class GenerationArguments:
     max_tokens: int = DEFAULT_MAX_TOKENS
     temperature: float = DEFAULT_TEMPERATURE
     top_p: float = DEFAULT_TOP_P
+    top_k: int = 0
+    min_p: float = 0.0
     seed: Optional[int] = None
+    repetition_penalty: Optional[float] = None
+    logit_bias: Optional[dict] = None
+    enable_thinking: bool = True
+    thinking_budget: Optional[int] = None
+    thinking_start_token: Optional[str] = None
+
+    def to_generate_kwargs(self) -> dict:
+        """Convert to kwargs dict for generate()/stream_generate()."""
+        kw = {
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "min_p": self.min_p,
+            "enable_thinking": self.enable_thinking,
+        }
+        if self.repetition_penalty is not None:
+            kw["repetition_penalty"] = self.repetition_penalty
+        if self.logit_bias is not None:
+            kw["logit_bias"] = self.logit_bias
+        if self.thinking_budget is not None:
+            kw["thinking_budget"] = self.thinking_budget
+        if self.thinking_start_token is not None:
+            kw["thinking_start_token"] = self.thinking_start_token
+        return kw
+
+    def to_template_kwargs(self) -> dict:
+        """Convert to kwargs for apply_chat_template()."""
+        kw = {"enable_thinking": self.enable_thinking}
+        if self.thinking_budget is not None:
+            kw["thinking_budget"] = self.thinking_budget
+        if self.thinking_start_token is not None:
+            kw["thinking_start_token"] = self.thinking_start_token
+        return kw
 
 
 @dataclass
@@ -390,6 +427,28 @@ def process_tool_calls(model_output: str, tool_module, tools):
     return dict(calls=called_tools, remaining_text=remaining)
 
 
+def _build_gen_args(request) -> GenerationArguments:
+    """Build GenerationArguments from an OpenAIRequest or ChatRequest."""
+    max_tokens = getattr(request, "max_tokens", None) or getattr(
+        request, "max_output_tokens", DEFAULT_MAX_TOKENS
+    )
+    logit_bias = getattr(request, "logit_bias", None)
+    if logit_bias is not None and isinstance(logit_bias, dict):
+        logit_bias = {int(k): v for k, v in logit_bias.items()}
+    return GenerationArguments(
+        max_tokens=max_tokens,
+        temperature=getattr(request, "temperature", DEFAULT_TEMPERATURE),
+        top_p=getattr(request, "top_p", DEFAULT_TOP_P),
+        top_k=getattr(request, "top_k", 0),
+        min_p=getattr(request, "min_p", 0.0),
+        repetition_penalty=getattr(request, "repetition_penalty", None),
+        logit_bias=logit_bias,
+        enable_thinking=getattr(request, "enable_thinking", True),
+        thinking_budget=getattr(request, "thinking_budget", None),
+        thinking_start_token=getattr(request, "thinking_start_token", None),
+    )
+
+
 def _count_thinking_tag_tokens(text: str) -> int:
     """Count tokens consumed by thinking tags (excluded from completion_tokens)."""
     count = 0
@@ -620,6 +679,8 @@ class ResponseImageUrlParam(TypedDict, total=False):
     image_url: Required[ImageUrl]
 
 
+ResizeShapeInput: TypeAlias = Union[Tuple[int], Tuple[int, int]]
+
 ResponseInputContentParam: TypeAlias = Union[
     ResponseInputTextParam,
     ResponseInputImageParam,
@@ -680,6 +741,15 @@ class OpenAIRequest(FlexibleBaseModel):
         DEFAULT_TEMPERATURE, description="Temperature for sampling."
     )
     top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    top_k: int = Field(0, description="Top-k sampling.")
+    min_p: float = Field(0.0, description="Min-p sampling.")
+    repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
+    logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
+    enable_thinking: bool = Field(True, description="Enable thinking mode.")
+    thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
+    thinking_start_token: Optional[str] = Field(
+        None, description="Thinking start token."
+    )
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
@@ -857,11 +927,25 @@ class VLMRequest(FlexibleBaseModel):
         DEFAULT_TEMPERATURE, description="Temperature for sampling."
     )
     top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    top_k: int = Field(0, description="Top-k sampling.")
+    min_p: float = Field(0.0, description="Min-p sampling.")
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
-    resize_shape: Optional[Tuple[int, int]] = Field(
-        None,
-        description="Resize shape for the image (height, width). Provide two integers.",
+    repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
+    logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
+    enable_thinking: bool = Field(True, description="Enable thinking mode.")
+    thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
+    thinking_start_token: Optional[str] = Field(
+        None, description="Thinking start token."
     )
+    resize_shape: Optional[ResizeShapeInput] = Field(
+        None,
+        description="Resize shape for the image. Provide one integer for square or two for (height, width).",
+    )
+
+    @field_validator("resize_shape", mode="before")
+    @classmethod
+    def normalize_resize_shape_field(cls, value):
+        return normalize_resize_shape(value)
 
 
 class GenerationRequest(VLMRequest):
@@ -1073,16 +1157,14 @@ async def responses_endpoint(request: Request):
             print("no input")
             raise HTTPException(status_code=400, detail="Missing input.")
 
-        template_kwargs = {}
-        if getattr(openai_request, "enable_thinking", True):
-            template_kwargs["enable_thinking"] = True
+        gen_args = _build_gen_args(openai_request)
 
         formatted_prompt = apply_chat_template(
             processor,
             config,
             chat_messages,
             num_images=len(images),
-            **template_kwargs,
+            **gen_args.to_template_kwargs(),
         )
 
         generated_at = datetime.now().timestamp()
@@ -1285,11 +1367,9 @@ async def responses_endpoint(request: Request):
                         processor=processor,
                         prompt=formatted_prompt,
                         image=images,
-                        temperature=openai_request.temperature,
-                        max_tokens=openai_request.max_output_tokens,
-                        top_p=openai_request.top_p,
                         verbose=False,
                         vision_cache=model_cache.get("vision_cache"),
+                        **gen_args.to_generate_kwargs(),
                         **kwargs,
                     )
                     full_text = result.text
@@ -1444,9 +1524,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             if tool_parser_type is not None:
                 tool_module = load_tool_module(tool_parser_type)
 
-        template_kwargs = {}
-        if getattr(request, "enable_thinking", True):
-            template_kwargs["enable_thinking"] = True
+        gen_args = _build_gen_args(request)
 
         formatted_prompt = apply_chat_template(
             processor,
@@ -1455,7 +1533,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             num_images=len(images),
             num_audios=len(audio),
             tools=tools,
-            **template_kwargs,
+            **gen_args.to_template_kwargs(),
         )
 
         if request.stream:
@@ -1667,11 +1745,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                         prompt=formatted_prompt,
                         image=images,
                         audio=audio,
-                        temperature=request.temperature,
-                        max_tokens=request.max_tokens,
-                        top_p=request.top_p,
                         verbose=False,
                         vision_cache=model_cache.get("vision_cache"),
+                        **gen_args.to_generate_kwargs(),
                         **kwargs,
                     )
                     full_text = gen_result.text
