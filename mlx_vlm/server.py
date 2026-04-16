@@ -83,9 +83,7 @@ class ResponseGenerator:
     higher throughput — same pattern as mlx-lm's server.
     """
 
-    def __init__(
-        self, model, processor, stop_tokens=None, vision_cache=None
-    ):
+    def __init__(self, model, processor, stop_tokens=None, vision_cache=None):
         self.model = model
         self.processor = processor
         self.stop_tokens = stop_tokens or set()
@@ -509,7 +507,8 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
             stop_tokens.add(config.eos_token_id)
 
     # Create ResponseGenerator for continuous batching
-    vision_cache = VisionFeatureCache()
+    vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
+    vision_cache = VisionFeatureCache(max_size=vision_cache_size)
     response_generator = ResponseGenerator(
         model=model,
         processor=processor,
@@ -1856,6 +1855,12 @@ def main():
         default=None,
         help="Adapter weights to load with the model.",
     )
+    parser.add_argument(
+        "--vision-cache-size",
+        type=int,
+        default=20,
+        help="Max number of cached vision features (default: 20).",
+    )
     args = parser.parse_args()
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
@@ -1863,6 +1868,7 @@ def main():
         os.environ["MLX_VLM_PRELOAD_MODEL"] = args.model
         if args.adapter_path:
             os.environ["MLX_VLM_PRELOAD_ADAPTER"] = args.adapter_path
+    os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     uvicorn.run(
         "mlx_vlm.server:app", host=args.host, port=args.port, workers=1, reload=True
     )
