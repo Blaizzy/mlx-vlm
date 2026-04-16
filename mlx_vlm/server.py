@@ -790,12 +790,17 @@ class GenerationRequest(VLMRequest):
     )
 
 
+class PromptTokensDetails(BaseModel):
+    cached_tokens: int = 0
+
+
 class UsageStats(BaseModel):
     """OpenAI-compatible usage statistics for chat completions."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    prompt_tokens_details: PromptTokensDetails = PromptTokensDetails()
     prompt_tps: float = 0.0
     generation_tps: float = 0.0
     peak_memory: float = 0.0
@@ -806,7 +811,8 @@ class ChatRequest(GenerationRequest):
 
 
 class ChatChoice(BaseModel):
-    finish_reason: str
+    index: int = 0
+    finish_reason: str = "stop"
     message: ChatMessage
 
 
@@ -820,6 +826,7 @@ class ChatResponse(BaseModel):
 
 
 class ChatStreamChoice(BaseModel):
+    index: int = 0
     finish_reason: Optional[str] = None
     delta: ChatMessage
 
