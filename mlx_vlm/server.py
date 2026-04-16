@@ -337,6 +337,17 @@ class ResponseGenerator:
                 break
 
 
+def _count_thinking_tag_tokens(text: str) -> int:
+    """Count tokens consumed by thinking tags (excluded from completion_tokens)."""
+    count = 0
+    # <|channel>thought (2 tokens) + <channel|> (1 token) + EOS (1 token)
+    if "<|channel>thought" in text and "<channel|>" in text:
+        count = 4
+    elif "<think>" in text and "</think>" in text:
+        count = 2  # <think> and </think> are 1 token each typically
+    return count
+
+
 def _split_thinking(text: str) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content)."""
     # Handle <|channel>thought...<channel|> format (gemma4)
@@ -1559,10 +1570,15 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                 reasoning, content = _split_thinking(full_text)
 
+                # Count raw generated tokens minus thinking tag tokens
+                completion_tokens = output_tokens - _count_thinking_tag_tokens(
+                    full_text
+                )
+
                 usage_stats = UsageStats(
                     prompt_tokens=prompt_tokens,
-                    completion_tokens=output_tokens,
-                    total_tokens=prompt_tokens + output_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
                     peak_memory=peak_memory,
                 )
 
