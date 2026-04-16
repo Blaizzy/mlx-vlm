@@ -1298,20 +1298,33 @@ async def chat_completions_endpoint(request: ChatRequest):
                 try:
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
                     if response_generator is not None:
-                        args = GenerationArguments(
+                        gen_args = GenerationArguments(
                             max_tokens=request.max_tokens,
                             temperature=request.temperature,
                             top_p=request.top_p,
                         )
-                        ctx, token_iter = response_generator.generate(
-                            prompt=formatted_prompt,
-                            images=images if images else None,
-                            audio=audio if audio else None,
-                            args=args,
+                        # generate() does blocking Queue.get — run off event loop
+                        ctx, token_iter = await asyncio.to_thread(
+                            response_generator.generate,
+                            formatted_prompt,
+                            images if images else None,
+                            audio if audio else None,
+                            gen_args,
                         )
 
                         output_tokens = 0
-                        for token in token_iter:
+
+                        def _next_token():
+                            try:
+                                return next(token_iter)
+                            except StopIteration:
+                                return None
+
+                        while True:
+                            # Each next() does blocking Queue.get
+                            token = await asyncio.to_thread(_next_token)
+                            if token is None:
+                                break
                             output_tokens += 1
                             usage_stats = {
                                 "input_tokens": ctx.prompt_tokens,
@@ -1334,7 +1347,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                             )
 
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
-                            await asyncio.sleep(0.01)
 
                             if token.finish_reason:
                                 break
@@ -1423,28 +1435,38 @@ async def chat_completions_endpoint(request: ChatRequest):
                 peak_memory = 0.0
 
                 if response_generator is not None:
-                    args = GenerationArguments(
+                    gen_args = GenerationArguments(
                         max_tokens=request.max_tokens,
                         temperature=request.temperature,
                         top_p=request.top_p,
                     )
-                    ctx, token_iter = response_generator.generate(
-                        prompt=formatted_prompt,
-                        images=images if images else None,
-                        audio=audio if audio else None,
-                        args=args,
+
+                    def _blocking_generate():
+                        text = ""
+                        pt = gt = 0
+                        pm = 0.0
+                        ctx, token_iter = response_generator.generate(
+                            prompt=formatted_prompt,
+                            images=images if images else None,
+                            audio=audio if audio else None,
+                            args=gen_args,
+                        )
+                        pt = ctx.prompt_tokens
+                        for token in token_iter:
+                            text += token.text
+                            gt += 1
+                            pm = token.peak_memory
+                            if token.finish_reason:
+                                break
+                        try:
+                            token_iter.close()
+                        except Exception:
+                            pass
+                        return text, pt, gt, pm
+
+                    full_text, prompt_tokens, output_tokens, peak_memory = (
+                        await asyncio.to_thread(_blocking_generate)
                     )
-                    prompt_tokens = ctx.prompt_tokens
-                    for token in token_iter:
-                        full_text += token.text
-                        output_tokens += 1
-                        peak_memory = token.peak_memory
-                        if token.finish_reason:
-                            break
-                    try:
-                        token_iter.close()
-                    except Exception:
-                        pass
                 else:
                     gen_result = generate(
                         model=model,
