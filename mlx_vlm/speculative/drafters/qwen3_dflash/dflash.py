@@ -112,6 +112,10 @@ class DFlashDraftModel(nn.Module):
         # embed_tokens for both input embedding and output projection.
         self.embed_tokens = None
         self.lm_head = None
+        #: Per-round accepted drafted-token counts for the current
+        #: generation. Reset by :meth:`reset`; read by callers after
+        #: generation to report mean acceptance.
+        self.accept_lens: List[int] = []
 
     def bind(self, target_model) -> "DFlashDraftModel":
         """Attach the target model's ``embed_tokens`` and ``lm_head``.
@@ -148,6 +152,46 @@ class DFlashDraftModel(nn.Module):
 
     def make_cache(self) -> List[KVCache]:
         return [KVCache() for _ in self.layers]
+
+    def reset(self, target_model) -> List[KVCache]:
+        """Prepare for a fresh generation.
+
+        Binds the drafter to the target's tied ``embed_tokens`` /
+        ``lm_head``, clears per-round acceptance stats, and returns a
+        fresh drafter cache list.
+        """
+        self.bind(target_model)
+        self.accept_lens = []
+        return self.make_cache()
+
+    def draft_block(
+        self,
+        last_bonus: int,
+        hidden: mx.array,
+        cache: List[KVCache],
+        block_size: int,
+        sampler,
+        token_dtype: mx.Dtype = mx.int32,
+    ) -> mx.array:
+        """Run one drafter round.
+
+        Builds the noise block ``[last_bonus, mask, mask, …]`` of length
+        ``block_size``, runs the drafter forward with the newly-committed
+        target features in ``hidden`` as context, trims the transient
+        noise K/V tail off ``cache`` (exactly ``block_size`` entries —
+        this is an invariant of the drafter forward), and samples the
+        ``block_size - 1`` drafted tokens.
+
+        Returns an ``mx.array`` of shape ``(1, block_size - 1)``.
+        """
+        block = mx.array(
+            [[last_bonus] + [int(self.config.mask_token_id)] * (block_size - 1)],
+            dtype=token_dtype,
+        )
+        draft_logits = self(block, hidden, cache)
+        for c in cache:
+            c.trim(block_size)
+        return sampler(draft_logits[:, 1 - block_size :])
 
     def __call__(
         self,

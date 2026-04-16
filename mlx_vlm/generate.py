@@ -389,6 +389,25 @@ class PromptCacheState:
         self.cache = kv_cache
 
 
+def _speculative_walk(
+    draft_tokens: mx.array,
+    target_tokens: mx.array,
+    budget: int,
+) -> Tuple[int, List[int]]:
+    """Exact-greedy speculative-decoding walk.
+
+    Accept drafted tokens up to the first mismatch with the target's
+    greedy choice, then take the target's bonus at that position.
+    Returns ``(accepted_count, new_tokens)`` with ``new_tokens``
+    truncated to ``budget``.
+    """
+    d = draft_tokens[0].tolist()
+    t = target_tokens[0].tolist()
+    accepted = next((i for i in range(len(d)) if d[i] != t[i]), len(d))
+    new_tokens = (d[:accepted] + [t[accepted]])[:budget]
+    return accepted, new_tokens
+
+
 def _dflash_rounds(
     model: nn.Module,
     draft_model: nn.Module,
@@ -396,7 +415,6 @@ def _dflash_rounds(
     hidden: mx.array,
     *,
     first_bonus: int,
-    prompt_len: int,
     max_tokens: int,
     sampler: Callable[[mx.array], mx.array],
     draft_block_size: Optional[int] = None,
@@ -404,7 +422,9 @@ def _dflash_rounds(
 ) -> Generator[Tuple[int, None], None, None]:
     """DFlash speculative-decoding **round loop**.
 
-    draft → verify → walk → rollback.
+    draft → verify → walk → rollback. ``generate_step`` is responsible
+    for prefill, sampling the first bonus token, and packaging the
+    captured hidden states into ``hidden``.
     """
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
@@ -414,15 +434,13 @@ def _dflash_rounds(
             "supports mlx_vlm.models.qwen3_5."
         )
 
-    cfg = draft_model.config
-    target_layer_ids = list(cfg.target_layer_ids)
+    target_layer_ids = list(draft_model.config.target_layer_ids)
     block_total = (
-        draft_block_size if draft_block_size is not None else int(cfg.block_size)
+        draft_block_size
+        if draft_block_size is not None
+        else int(draft_model.config.block_size)
     )
-
-    draft_model.bind(model)
-    draft_model._last_accept_lens = []
-    draft_cache = draft_model.make_cache()
+    draft_cache = draft_model.reset(model)
 
     b = first_bonus
     emitted = 1  # the first bonus has already been yielded by the caller
@@ -434,16 +452,9 @@ def _dflash_rounds(
 
         # Draft
         with mx.stream(generation_stream):
-            block = mx.array(
-                [[b] + [int(cfg.mask_token_id)] * (bs - 1)],
-                dtype=token_dtype,
+            draft_tokens = draft_model.draft_block(
+                b, hidden, draft_cache, bs, sampler, token_dtype
             )
-            draft_logits = draft_model(block, hidden, draft_cache)
-            trim_n = draft_cache[0].offset - (prompt_len + emitted - 1)
-            if trim_n > 0:
-                for c in draft_cache:
-                    c.trim(trim_n)
-            draft_tokens = sampler(draft_logits[:, 1 - bs :])
         mx.async_eval(draft_tokens)
 
         # Verify
@@ -461,17 +472,13 @@ def _dflash_rounds(
             target_tokens = sampler(verify_out.logits)
         mx.async_eval(target_tokens, hidden)
 
-        # Walk — first drafted-vs-target mismatch stops acceptance.
-        d_list = draft_tokens[0].tolist()
-        t_list = target_tokens[0].tolist()
-        accepted = next(
-            (i for i in range(len(d_list)) if d_list[i] != t_list[i]),
-            len(d_list),
+        # Walk
+        accepted, new_tokens = _speculative_walk(
+            draft_tokens, target_tokens, max_tokens - emitted
         )
-        new_tokens = d_list[:accepted] + [t_list[accepted]]
-        new_tokens = new_tokens[: max_tokens - emitted]
-        draft_model._last_accept_lens.append(accepted)
+        draft_model.accept_lens.append(accepted)
 
+        # Emit
         for tok in new_tokens:
             yield tok, None
             emitted += 1
@@ -601,7 +608,6 @@ def generate_step(
         )
 
     # Speculative decoding setup
-    original_prompt_len = int(input_ids.shape[1])
     last_outputs = None
     if draft_model is not None:
         kwargs["capture_layer_ids"] = list(draft_model.config.target_layer_ids)
@@ -707,7 +713,6 @@ def generate_step(
                 prompt_cache,
                 hidden,
                 first_bonus=y.item(),
-                prompt_len=original_prompt_len,
                 max_tokens=max_tokens,
                 sampler=sampler,
                 draft_block_size=draft_block_size,
@@ -1823,14 +1828,10 @@ def main():
             print(result.text)
 
         if draft_model is not None:
-            lens = getattr(draft_model, "_last_accept_lens", None) or []
+            lens = getattr(draft_model, "accept_lens", None) or []
             if lens:
-                mean_accept = sum(lens) / len(lens)
-                print(
-                    f"\nDFlash: mean accepted drafted tokens/round = "
-                    f"{mean_accept:.2f} over {len(lens)} rounds "
-                    f"(block_size={draft_model.config.block_size})"
-                )
+                mean_accept = round(sum(lens) / len(lens), 2)
+                print(f"Speculative decoding: {mean_accept} accepted tokens over {len(lens)} rounds")
 
 
 if __name__ == "__main__":
