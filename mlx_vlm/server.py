@@ -521,6 +521,17 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
     return model, processor, config
 
 
+@app.on_event("startup")
+def preload_model():
+    """Pre-load a model at startup if --model was specified."""
+    model_path = os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
+    if model_path:
+        adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
+        print(f"Pre-loading model: {model_path}")
+        get_cached_model(model_path, adapter_path)
+        print("Model ready, continuous batching enabled.")
+
+
 # Synchronous unload function for internal use
 def unload_model_sync():
     global model_cache, response_generator
@@ -1661,12 +1672,28 @@ def main():
         action="store_true",
         help="Trust remote code when loading models from Hugging Face Hub.",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Pre-load a model at startup (e.g. mlx-community/Qwen2.5-VL-3B-Instruct-4bit).",
+    )
+    parser.add_argument(
+        "--adapter-path",
+        type=str,
+        default=None,
+        help="Adapter weights to load with the model.",
+    )
     args = parser.parse_args()
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
+    if args.model:
+        os.environ["MLX_VLM_PRELOAD_MODEL"] = args.model
+        if args.adapter_path:
+            os.environ["MLX_VLM_PRELOAD_ADAPTER"] = args.adapter_path
     uvicorn.run(
         "mlx_vlm.server:app", host=args.host, port=args.port, workers=1, reload=True
-    )  # reload=True for development to automatically restart on code changes.
+    )
 
 
 if __name__ == "__main__":

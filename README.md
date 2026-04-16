@@ -307,14 +307,20 @@ curl -X POST "http://localhost:8080/responses" \
 
 The server supports continuous batching for higher throughput when handling multiple concurrent requests. New requests join the active batch immediately without waiting for existing requests to finish, and mixed batches of image and text-only requests are supported.
 
-Continuous batching is enabled automatically when the server loads a model. Start the server and verify via the health endpoint:
+Continuous batching is enabled automatically when the server loads a model. You can pre-load a model at startup so it's ready to serve immediately:
 
 ```sh
-mlx_vlm.server --port 8080
+mlx_vlm.server --port 8080 --model mlx-community/Qwen2.5-VL-3B-Instruct-4bit
+```
 
+Verify via the health endpoint:
+
+```sh
 curl http://localhost:8080/health
 # {"status":"healthy","loaded_model":"...","continuous_batching_enabled":true}
 ```
+
+If `--model` is omitted, the model is loaded on the first request.
 
 ### How It Works
 
