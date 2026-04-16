@@ -1040,6 +1040,13 @@ class BatchGenerator:
         tokens = [mx.array(inp) for inp in inputs]
         processed_tokens = 0
 
+        # Reset any cached position state from previous prefills
+        # (e.g. Qwen3.5 caches _position_ids / _rope_deltas on the model)
+        if hasattr(self.model, "_position_ids"):
+            self.model._position_ids = None
+        if hasattr(self.model, "_rope_deltas"):
+            self.model._rope_deltas = None
+
         # Slice batch data in kwargs to match current batch size
         batch_size = len(uids)
         for key, value in kwargs.items():

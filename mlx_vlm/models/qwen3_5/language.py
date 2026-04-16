@@ -600,6 +600,9 @@ class LanguageModel(nn.Module):
                 cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
             else:
                 raise ValueError(f"Unexpected cache offset type: {type(offset)}")
+            # BatchKVCache uses negative offsets for left padding;
+            # clamp to 0 so position_ids stay non-negative.
+            cache_offset = max(cache_offset, 0)
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask
