@@ -182,23 +182,23 @@ class ResponseGenerator:
             for k, v in raw_inputs.items()
             if k not in ["input_ids", "pixel_values", "attention_mask"]
         }
-        gen_kwargs = {}
-        if pixel_values is not None:
-            # Vision feature caching: skip vision encoder on repeated images
-            if self.vision_cache is not None and images is not None:
-                cached = self.vision_cache.get(images)
-                if cached is not None:
-                    data_kwargs["cached_image_features"] = cached
-                elif hasattr(self.model, "encode_image"):
-                    features = self.model.encode_image(pixel_values)
-                    mx.eval(features)
-                    self.vision_cache.put(images, features)
-                    data_kwargs["cached_image_features"] = features
+        # Pass vision cache for image feature caching
+        if (
+            pixel_values is not None
+            and self.vision_cache is not None
+            and images is not None
+        ):
+            data_kwargs["vision_cache"] = self.vision_cache
+            data_kwargs["_image_key"] = images
 
-            embed = self.model.get_input_embeddings(
-                input_ids, pixel_values, mask=mask, **data_kwargs
-            )
-            gen_kwargs = {**data_kwargs, **embed.to_dict()}
+        # Always call get_input_embeddings — BatchGenerator requires inputs_embeds
+        embed = self.model.get_input_embeddings(
+            input_ids, pixel_values, mask=mask, **data_kwargs
+        )
+        # Remove cache kwargs before passing to BatchGenerator
+        data_kwargs.pop("vision_cache", None)
+        data_kwargs.pop("_image_key", None)
+        gen_kwargs = {**data_kwargs, **embed.to_dict()}
         return input_ids, gen_kwargs
 
     def _run(self):
