@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Any, List, Optional
 
 import mlx.core as mx
@@ -58,7 +59,7 @@ class Qwen3_5RotaryEmbedding:
         cos = mx.cos(emb)
         sin = mx.sin(emb)
 
-        return cos.astype(x.dtype), sin.astype(x.dtype)
+        return cos, sin
 
 
 def rotate_half(x):
@@ -78,8 +79,9 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
     k_rot = k[..., :rotary_dim]
     k_pass = k[..., rotary_dim:]
 
-    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    dtype = q.dtype
+    q_embed = ((q_rot * cos) + (rotate_half(q_rot) * sin)).astype(dtype)
+    k_embed = ((k_rot * cos) + (rotate_half(k_rot) * sin)).astype(dtype)
 
     q_embed = mx.concatenate([q_embed, q_pass], axis=-1)
     k_embed = mx.concatenate([k_embed, k_pass], axis=-1)
@@ -98,8 +100,15 @@ class Qwen3_5RMSNormGated(nn.Module):
     ) -> mx.array:
         x = mx.fast.rms_norm(hidden_states, self.weight, self.eps)
         if gate is not None:
-            x = swiglu(gate, x)
+            return _precise_swiglu(hidden_states, gate, x)
         return x.astype(hidden_states.dtype)
+
+
+@partial(mx.compile, shapeless=True)
+def _precise_swiglu(h, gate, x):
+    gate = nn.silu(gate.astype(mx.float32))
+    x = x.astype(mx.float32)
+    return (gate * x).astype(h.dtype)
 
 
 class Qwen3_5Attention(nn.Module):
