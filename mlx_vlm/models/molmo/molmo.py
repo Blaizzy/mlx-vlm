@@ -55,13 +55,19 @@ class Model(nn.Module):
                 else None
             )
 
+        vision_cache = kwargs.get("vision_cache", None)
         cached = kwargs.get("cached_image_features", None)
+        if cached is None and vision_cache is not None:
+            cached = vision_cache.get(kwargs.get("_image_key"))
         if cached is not None:
             image_features = cached
             cls_embed = None
         else:
             image_features, cls_embed = self.vision_tower(pixel_values, image_masks)
 
+            if vision_cache is not None and kwargs.get("_image_key") is not None:
+                mx.eval(image_features)
+                vision_cache.put(kwargs["_image_key"], image_features)
         # Insert image features into the input embeddings
         num_image, num_patch = image_features.shape[1:3]
 

@@ -305,12 +305,18 @@ class Model(nn.Module):
 
         # Process image if provided
         if pixel_values is not None:
+            vision_cache = kwargs.get("vision_cache", None)
             cached = kwargs.get("cached_image_features", None)
+            if cached is None and vision_cache is not None:
+                cached = vision_cache.get(kwargs.get("_image_key"))
             if cached is not None:
                 image_features = cached
             else:
                 image_features = self._encode_image(pixel_values)
 
+                if vision_cache is not None and kwargs.get("_image_key") is not None:
+                    mx.eval(image_features)
+                    vision_cache.put(kwargs["_image_key"], image_features)
             # Merge image features with text embeddings (task prompt only)
             inputs_embeds, attention_mask = self._merge_input_ids_with_image_features(
                 image_features, inputs_embeds

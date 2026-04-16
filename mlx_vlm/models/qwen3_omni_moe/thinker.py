@@ -176,7 +176,10 @@ class Thinker(nn.Module):
             inputs_embeds = masked_scatter(inputs_embeds, audio_mask, audio_features)
 
         if pixel_values is not None:
+            vision_cache = kwargs.get("vision_cache", None)
             cached = kwargs.get("cached_image_features", None)
+            if cached is None and vision_cache is not None:
+                cached = vision_cache.get(kwargs.get("_image_key"))
             if cached is not None:
                 image_embeds = cached.astype(inputs_embeds.dtype)
                 image_embeds_multiscale = None
@@ -190,6 +193,9 @@ class Thinker(nn.Module):
                     image_embeds = vision_output
                     image_embeds_multiscale = None
                 image_embeds = image_embeds.astype(inputs_embeds.dtype)
+                if vision_cache is not None and kwargs.get("_image_key") is not None:
+                    mx.eval(image_embeds)
+                    vision_cache.put(kwargs["_image_key"], image_embeds)
             image_mask, _, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )

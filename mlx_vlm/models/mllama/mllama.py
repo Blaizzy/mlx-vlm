@@ -45,7 +45,10 @@ class Model(nn.Module):
 
         # Process vision input if provided
         if pixel_values is not None:
+            vision_cache = kwargs.get("vision_cache", None)
             cached = kwargs.get("cached_image_features", None)
+            if cached is None and vision_cache is not None:
+                cached = vision_cache.get(kwargs.get("_image_key"))
             if cached is not None:
                 cross_attention_states = cached
             else:
@@ -69,6 +72,9 @@ class Model(nn.Module):
                     self.config.text_config.hidden_size,
                 )
 
+                if vision_cache is not None and kwargs.get("_image_key") is not None:
+                    mx.eval(cross_attention_states)
+                    vision_cache.put(kwargs["_image_key"], cross_attention_states)
         # Prepare cross attention mask
         if cross_attention_mask is not None:
             cross_attention_mask, full_text_row_masked_out_mask = (

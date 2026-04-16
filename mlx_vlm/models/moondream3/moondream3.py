@@ -54,7 +54,10 @@ class Model(nn.Module):
         dtype = inputs_embeds.dtype
         pixel_values = pixel_values.astype(dtype)
 
+        vision_cache = kwargs.get("vision_cache", None)
         cached = kwargs.get("cached_image_features", None)
+        if cached is None and vision_cache is not None:
+            cached = vision_cache.get(kwargs.get("_image_key"))
         if cached is not None:
             image_features = cached
         else:
@@ -64,6 +67,9 @@ class Model(nn.Module):
                 crop_layouts=crop_layouts,
             )
 
+            if vision_cache is not None and kwargs.get("_image_key") is not None:
+                mx.eval(image_features)
+                vision_cache.put(kwargs["_image_key"], image_features)
         B = inputs.shape[0]
         bos_embed = inputs_embeds[:, :1, :]
 

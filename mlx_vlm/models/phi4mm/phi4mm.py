@@ -90,7 +90,10 @@ class Model(nn.Module):
         # --- Process images ---
         image_features = None
         if has_images:
+            vision_cache = kwargs.get("vision_cache", None)
             cached = kwargs.get("cached_image_features", None)
+            if cached is None and vision_cache is not None:
+                cached = vision_cache.get(kwargs.get("_image_key"))
             if cached is not None:
                 image_features = cached
             else:
@@ -102,6 +105,9 @@ class Model(nn.Module):
                 )
                 image_features = self.apply_mm_projector(image_features)
 
+                if vision_cache is not None and kwargs.get("_image_key") is not None:
+                    mx.eval(image_features)
+                    vision_cache.put(kwargs["_image_key"], image_features)
         # --- Process audio ---
         audio_features = None
         if has_audio:

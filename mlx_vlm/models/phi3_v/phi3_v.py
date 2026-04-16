@@ -212,7 +212,10 @@ class Model(nn.Module):
         p = np.argwhere(np.array(inputs_list) < 0).tolist()
 
         if pixel_values is not None:
+            vision_cache = kwargs.get("vision_cache", None)
             cached = kwargs.get("cached_image_features", None) if kwargs else None
+            if cached is None and vision_cache is not None:
+                cached = vision_cache.get(kwargs.get("_image_key"))
             if cached is not None:
                 # Replace image token positions with cached features
                 for positions in p:
@@ -227,6 +230,9 @@ class Model(nn.Module):
                     pixel_values, inputs_embeds, image_sizes, p
                 )
 
+                if vision_cache is not None and kwargs.get("_image_key") is not None:
+                    mx.eval(inputs_embeds)
+                    vision_cache.put(kwargs["_image_key"], inputs_embeds)
         return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
     @property
