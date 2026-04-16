@@ -444,8 +444,7 @@ class LanguageModel(nn.Module):
         Full-attention (trimmable) caches are sliced directly. Linear
         (gated-delta) caches are restored by replaying
         ``gated_delta_update`` on the captured pre-verify inputs in
-        ``gdn_states`` (produced by :class:`Qwen3_5GatedDeltaNet` during
-        the verify forward via the ``gdn_sink`` call argument).
+        ``gdn_states``.
         """
         n = accepted + 1
         j = 0
