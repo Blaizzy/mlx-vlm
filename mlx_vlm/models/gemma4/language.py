@@ -524,9 +524,7 @@ class Gemma4TextModel(nn.Module):
             else [None] * len(self.layers)
         )
 
-        for i, (layer, m, pli) in enumerate(
-            zip(self.layers, masks, per_layer_list)
-        ):
+        for i, (layer, m, pli) in enumerate(zip(self.layers, masks, per_layer_list)):
             c = cache[self.layer_idx_to_cache_idx[i]]
             h = layer(h, m, c, per_layer_input=pli)
 

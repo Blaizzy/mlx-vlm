@@ -11,16 +11,7 @@ from datetime import datetime
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Thread
-from typing import (
-    Any,
-    Callable,
-    Iterator,
-    List,
-    Literal,
-    Optional,
-    Tuple,
-    Union,
-)
+from typing import Any, Callable, Iterator, List, Literal, Optional, Tuple, Union
 
 import mlx.core as mx
 import uvicorn
@@ -44,7 +35,6 @@ from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
 from .utils import load, prepare_inputs
 from .version import __version__
-
 
 # =============================================================================
 # ResponseGenerator - Concurrent Request Handling with Threaded Batching
@@ -299,7 +289,7 @@ class ResponseGenerator:
                 if len(tokens) >= 2:
                     prev = self.tokenizer.decode(tokens[:-1])
                     curr = self.tokenizer.decode(tokens)
-                    text = curr[len(prev):]
+                    text = curr[len(prev) :]
                 else:
                     text = self.tokenizer.decode(tokens)
 
@@ -1005,7 +995,10 @@ async def responses_endpoint(request: Request):
             template_kwargs["enable_thinking"] = True
 
         formatted_prompt = apply_chat_template(
-            processor, config, chat_messages, num_images=len(images),
+            processor,
+            config,
+            chat_messages,
+            num_images=len(images),
             **template_kwargs,
         )
 
@@ -1397,8 +1390,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 accumulated = ""
                                 # Don't emit opening tag tokens
                             elif in_thinking and (
-                                "<channel|>" in accumulated
-                                or "</think>" in accumulated
+                                "<channel|>" in accumulated or "</think>" in accumulated
                             ):
                                 in_thinking = False
                                 accumulated = ""
@@ -1406,8 +1398,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             elif in_thinking:
                                 delta_reasoning = token.text
                             elif not in_thinking and (
-                                "<|channel>" in accumulated
-                                or "<think" in accumulated
+                                "<|channel>" in accumulated or "<think" in accumulated
                             ):
                                 pass  # Partial tag, don't emit yet
                             else:
@@ -1429,8 +1420,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 usage={
                                     "prompt_tokens": ctx.prompt_tokens,
                                     "completion_tokens": output_tokens,
-                                    "total_tokens": ctx.prompt_tokens
-                                    + output_tokens,
+                                    "total_tokens": ctx.prompt_tokens + output_tokens,
                                 },
                                 choices=choices,
                             )
