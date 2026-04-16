@@ -304,70 +304,116 @@ class ResponseGenerator:
                         self._process_batch_step(batch_generator, batch_results)
                     continue
 
-                # Handle cleanup request
-                if isinstance(item, tuple) and len(item) == 2 and item[0] == "_cleanup":
-                    cleanup_uid = item[1]
-                    if cleanup_uid in batch_results:
-                        del batch_results[cleanup_uid]
-                    if batch_generator is not None:
-                        batch_generator.remove([cleanup_uid])
-                    continue
+                # Collect this item + drain all other pending items from
+                # the queue so text-only requests get batched together.
+                pending = [item]
+                while True:
+                    try:
+                        pending.append(self.requests.get_nowait())
+                    except QueueEmpty:
+                        break
 
-                response_queue, request = item
-                args = request["args"]
+                for item in pending:
+                    if item is None:
+                        if self._stop:
+                            return
+                        continue
+                    # Handle cleanup request
+                    if (
+                        isinstance(item, tuple)
+                        and len(item) == 2
+                        and item[0] == "_cleanup"
+                    ):
+                        cleanup_uid = item[1]
+                        if cleanup_uid in batch_results:
+                            del batch_results[cleanup_uid]
+                        if batch_generator is not None:
+                            batch_generator.remove([cleanup_uid])
+                        continue
 
-                # Non-batchable: has seed
-                if args.seed is not None:
-                    if batch_generator is not None and batch_results:
-                        while batch_results:
-                            self._process_batch_step(batch_generator, batch_results)
-                        batch_generator = None
-                    self._serve_single(response_queue, request)
-                    continue
+                    response_queue, request = item
+                    args = request["args"]
 
-                if batch_generator is None:
-                    batch_generator = BatchGenerator(
-                        self.model.language_model,
-                        self.processor,
-                        stop_tokens=self.stop_tokens,
-                        sampler=self._make_sampler(args),
-                    )
+                    # Non-batchable: has seed
+                    if args.seed is not None:
+                        if batch_generator is not None and batch_results:
+                            while batch_results:
+                                self._process_batch_step(
+                                    batch_generator, batch_results
+                                )
+                            batch_generator = None
+                        self._serve_single(response_queue, request)
+                        continue
 
-                try:
-                    input_ids, gen_kwargs = self._preprocess_request(request)
-                    prompt_tokens = (
-                        input_ids.size if hasattr(input_ids, "size") else len(input_ids)
-                    )
-                    has_embeddings = bool(gen_kwargs.get("inputs_embeds") is not None)
+                    if batch_generator is None:
+                        batch_generator = BatchGenerator(
+                            self.model.language_model,
+                            self.processor,
+                            stop_tokens=self.stop_tokens,
+                            sampler=self._make_sampler(args),
+                        )
 
-                    # Drain pending text-only prompts BEFORE inserting an
-                    # image request so they aren't prefilled without embeddings.
-                    if has_embeddings and batch_generator.unprocessed_prompts:
-                        while batch_generator.unprocessed_prompts:
-                            drain_responses = batch_generator.next()
-                            if drain_responses:
-                                self._handle_responses(drain_responses, batch_results)
-                            else:
-                                break
+                    try:
+                        input_ids, gen_kwargs = self._preprocess_request(request)
+                        prompt_tokens = (
+                            input_ids.size
+                            if hasattr(input_ids, "size")
+                            else len(input_ids)
+                        )
+                        has_embeddings = bool(
+                            gen_kwargs.get("inputs_embeds") is not None
+                        )
 
-                    (uid,) = batch_generator.insert(
-                        [input_ids.squeeze(0).tolist()],
-                        max_tokens=args.max_tokens,
-                    )
+                        # Image request: drain pending text-only prompts first,
+                        # then insert and prefill immediately with embeddings.
+                        if has_embeddings:
+                            if batch_generator.unprocessed_prompts:
+                                while batch_generator.unprocessed_prompts:
+                                    drain = batch_generator.next()
+                                    if drain:
+                                        self._handle_responses(drain, batch_results)
+                                    else:
+                                        break
 
-                    ctx = GenerationContext(uid=uid, prompt_tokens=prompt_tokens)
-                    response_queue.put(ctx)
+                            (uid,) = batch_generator.insert(
+                                [input_ids.squeeze(0).tolist()],
+                                max_tokens=args.max_tokens,
+                            )
+                            ctx = GenerationContext(
+                                uid=uid, prompt_tokens=prompt_tokens
+                            )
+                            response_queue.put(ctx)
+                            batch_results[uid] = {
+                                "rqueue": response_queue,
+                                "tokens": [],
+                            }
 
-                    batch_results[uid] = {"rqueue": response_queue, "tokens": []}
+                            responses = batch_generator.next(**gen_kwargs)
+                            if responses:
+                                self._handle_responses(responses, batch_results)
+                        else:
+                            # Text-only: just insert, will be batched with
+                            # other text-only requests on the next next() call.
+                            (uid,) = batch_generator.insert(
+                                [input_ids.squeeze(0).tolist()],
+                                max_tokens=args.max_tokens,
+                            )
+                            ctx = GenerationContext(
+                                uid=uid, prompt_tokens=prompt_tokens
+                            )
+                            response_queue.put(ctx)
+                            batch_results[uid] = {
+                                "rqueue": response_queue,
+                                "tokens": [],
+                            }
 
-                    # Prefill image request immediately with its embeddings
-                    if has_embeddings:
-                        responses = batch_generator.next(**gen_kwargs)
-                        if responses:
-                            self._handle_responses(responses, batch_results)
+                    except Exception as e:
+                        response_queue.put(e)
 
-                except Exception as e:
-                    response_queue.put(e)
+                # After processing all pending items, run one batch step
+                # to prefill any queued text-only prompts together + decode.
+                if batch_generator is not None and batch_results:
+                    self._process_batch_step(batch_generator, batch_results)
 
             except Exception as e:
                 print(f"Error in generation thread: {e}")
