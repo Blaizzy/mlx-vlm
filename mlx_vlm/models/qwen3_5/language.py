@@ -483,20 +483,25 @@ class LanguageModel(nn.Module):
         accepted: mx.array,
         block_size: int,
     ) -> int:
-        """Batch rollback: trim to ``min(accepted)`` for correctness.
+        """Batch rollback: trim to ``max(accepted)`` with stale-entry zeroing.
 
-        ``BatchKVCache`` uses a single ``_idx`` for the KV extent, so
-        we must trim to the minimum acceptance across the batch to
-        avoid stale entries leaking into the attention mask. Sequences
-        with higher acceptance lose a few tokens that will be
-        re-drafted next round — a small throughput cost for correctness.
+        Trims trimmable caches to ``max(accepted) + 1`` positions past
+        the pre-verify offset. For sequences with ``accepted[i] < max_a``
+        the KV entries at stale positions are zeroed so subsequent
+        attention assigns near-zero weight to them.
 
-        Returns the effective ``min_accepted`` so the caller can
-        truncate hidden states and emitted tokens accordingly.
+        For GDN layers, the replay uses a per-sequence mask that zeros
+        out positions beyond each sequence's accepted count. Conv state
+        is gathered per-sequence.
+
+        Returns ``max_a`` so the caller uses it for hidden slicing and
+        full per-sequence token emission.
         """
-        min_a = int(accepted.min().item())
-        n = min_a + 1
+        max_a = int(accepted.max().item())
+        n = max_a + 1
         trim = block_size - n
+        valid_ends = accepted + 1  # [B] per-sequence valid length in verify block
+
         j = 0
         for c in caches:
             if c is None:
@@ -504,20 +509,39 @@ class LanguageModel(nn.Module):
             if c.is_trimmable():
                 if trim > 0:
                     c.trim(trim)
+                # Zero stale KV entries for shorter-accepted sequences
+                if hasattr(c, "_idx") and c.keys is not None and max_a > 0:
+                    kv_len = c._idx
+                    B_cache = accepted.shape[0]
+                    ve = valid_ends.tolist()
+                    verify_start = kv_len - n
+                    for bi in range(B_cache):
+                        start = verify_start + int(ve[bi])
+                        if start < kv_len:
+                            c.keys[bi, :, start:kv_len, :] = 0
+                            c.values[bi, :, start:kv_len, :] = 0
                 continue
+            # GDN layer: masked replay to max_a+1 positions
             q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = (
                 gdn_states[j]
             )
+            batch_mask = mx.arange(n)[None, :] <= accepted[:, None]
             _, state = gated_delta_update(
                 q[:, :n], k[:, :n], v[:, :n], a[:, :n], b[:, :n],
                 A_log, dt_bias, init_state,
-                None if mask is None else mask[:, :n],
+                batch_mask,
                 use_kernel=True,
             )
             c[1] = state
-            c[0] = conv_input[:, min_a + 1 : min_a + K]
+            B = accepted.shape[0]
+            acc_list = accepted.tolist()
+            slices = [
+                conv_input[bi : bi + 1, int(acc_list[bi]) + 1 : int(acc_list[bi]) + K]
+                for bi in range(B)
+            ]
+            c[0] = mx.concatenate(slices, axis=0)
             j += 1
-        return min_a
+        return max_a
 
     def get_rope_index(
         self,

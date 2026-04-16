@@ -614,17 +614,15 @@ def _dflash_rounds_batch(
             draft_tokens, target_tokens, budgets
         )
 
-        # Rollback
+        # Rollback — trim to max(accepted), zero stale KV entries
         accepted_arr = mx.array(accepted_list)
-        min_a = lm.rollback_speculative_cache_batch(
+        max_a = lm.rollback_speculative_cache_batch(
             prompt_cache, verify_out.gdn_states, accepted_arr, bs
         )
-        hidden = hidden_full[:, : min_a + 1, :]
+        hidden = hidden_full[:, : max_a + 1, :]
 
-        for j in range(n_active):
-            new_tokens_list[j] = new_tokens_list[j][: min_a + 1]
         for a in accepted_list:
-            draft_model.accept_lens.append(min(a, min_a))
+            draft_model.accept_lens.append(a)
 
         # Emit (map active slots back to original indices)
         max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
