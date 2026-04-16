@@ -749,7 +749,7 @@ def _make_cache(model, left_padding):
                 raise ValueError("RotatingKVCache with keep tokens is not supported.")
             return cache.BatchRotatingKVCache(c.max_size, left_padding)
         elif isinstance(c, cache.CacheList):
-            return cache.BatchCacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
+            return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
         else:
             raise ValueError(f"{type(c)} does not yet support batching")
 
@@ -1726,9 +1726,19 @@ class ResponseGenerator:
                         "needs_prefill": has_embeddings,
                     }
 
-                    # If this request has embeddings, do its prefill immediately
-                    # This ensures each image request gets its own embeddings during prefill
+                    # If this request has embeddings, do its prefill immediately.
+                    # First, drain any pending text-only prompts to prevent
+                    # shape mismatch when mixing text-only and multimodal prefills.
                     if has_embeddings:
+                        while batch_generator.unprocessed_prompts:
+                            drain_responses = batch_generator.next()
+                            if drain_responses:
+                                self._handle_responses(
+                                    drain_responses, batch_results
+                                )
+                            else:
+                                break
+
                         responses = batch_generator.next(**gen_kwargs)
                         if responses:
                             self._handle_responses(responses, batch_results)

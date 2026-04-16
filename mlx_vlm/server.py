@@ -647,6 +647,7 @@ async def responses_endpoint(request: Request):
             # Streaming response
             async def stream_generator():
                 token_iterator = None
+                token_iter = None  # For ResponseGenerator cleanup
                 try:
                     # Create base response object (to match the openai pipeline)
                     base_response = OpenAIResponse(
@@ -690,34 +691,63 @@ async def responses_endpoint(request: Request):
                     )
                     yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=0, content_index=0, part=content_part).model_dump_json()}\n\n"
 
-                    # Stream text deltas
-                    token_iterator = stream_generate(
-                        model=model,
-                        processor=processor,
-                        prompt=formatted_prompt,
-                        image=images,
-                        temperature=openai_request.temperature,
-                        max_tokens=openai_request.max_output_tokens,
-                        top_p=openai_request.top_p,
-                        **kwargs,
-                    )
-
+                    # Stream text deltas using ResponseGenerator (continuous batching)
                     full_text = ""
-                    for chunk in token_iterator:
-                        if chunk is None or not hasattr(chunk, "text"):
-                            continue
+                    usage_stats = {"input_tokens": 0, "output_tokens": 0}
 
-                        delta = chunk.text
-                        full_text += delta
+                    if response_generator is not None:
+                        args = GenerationArguments(
+                            max_tokens=openai_request.max_output_tokens,
+                            temperature=openai_request.temperature,
+                            top_p=openai_request.top_p,
+                        )
+                        ctx, token_iter = response_generator.generate(
+                            prompt=formatted_prompt,
+                            images=images if images else None,
+                            args=args,
+                        )
 
-                        usage_stats = {
-                            "input_tokens": chunk.prompt_tokens,
-                            "output_tokens": chunk.generation_tokens,
-                        }
+                        output_tokens = 0
+                        for token in token_iter:
+                            output_tokens += 1
+                            delta = token.text
+                            full_text += delta
+                            usage_stats = {
+                                "input_tokens": ctx.prompt_tokens,
+                                "output_tokens": output_tokens,
+                            }
 
-                        # Send response.output_text.delta event
-                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
-                        await asyncio.sleep(0.01)
+                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                            await asyncio.sleep(0.01)
+
+                            if token.finish_reason:
+                                break
+                    else:
+                        # Fallback to stream_generate
+                        token_iterator = stream_generate(
+                            model=model,
+                            processor=processor,
+                            prompt=formatted_prompt,
+                            image=images,
+                            temperature=openai_request.temperature,
+                            max_tokens=openai_request.max_output_tokens,
+                            top_p=openai_request.top_p,
+                            **kwargs,
+                        )
+
+                        for chunk in token_iterator:
+                            if chunk is None or not hasattr(chunk, "text"):
+                                continue
+
+                            delta = chunk.text
+                            full_text += delta
+                            usage_stats = {
+                                "input_tokens": chunk.prompt_tokens,
+                                "output_tokens": chunk.generation_tokens,
+                            }
+
+                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                            await asyncio.sleep(0.01)
 
                     # Send response.output_text.done event (to match the openai pipeline)
                     yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=full_text).model_dump_json()}\n\n"
@@ -760,6 +790,11 @@ async def responses_endpoint(request: Request):
                     yield f"data: {error_data}\n\n"
 
                 finally:
+                    if token_iter is not None:
+                        try:
+                            token_iter.close()
+                        except Exception:
+                            pass
                     mx.clear_cache()
                     gc.collect()
                     print("Stream finished, cleared cache.")
@@ -769,22 +804,49 @@ async def responses_endpoint(request: Request):
         else:
             # Non-streaming response
             try:
-                # Use generate from generate.py
-                result = generate(
-                    model=model,
-                    processor=processor,
-                    prompt=formatted_prompt,
-                    image=images,
-                    temperature=openai_request.temperature,
-                    max_tokens=openai_request.max_output_tokens,
-                    top_p=openai_request.top_p,
-                    verbose=False,  # stats are passed in the response
-                    **kwargs,
-                )
-                # Clean up resources
+                full_text = ""
+                prompt_tokens = 0
+                output_tokens = 0
+
+                if response_generator is not None:
+                    args = GenerationArguments(
+                        max_tokens=openai_request.max_output_tokens,
+                        temperature=openai_request.temperature,
+                        top_p=openai_request.top_p,
+                    )
+                    ctx, token_iter = response_generator.generate(
+                        prompt=formatted_prompt,
+                        images=images if images else None,
+                        args=args,
+                    )
+                    prompt_tokens = ctx.prompt_tokens
+                    for token in token_iter:
+                        full_text += token.text
+                        output_tokens += 1
+                        if token.finish_reason:
+                            break
+                    try:
+                        token_iter.close()
+                    except Exception:
+                        pass
+                else:
+                    result = generate(
+                        model=model,
+                        processor=processor,
+                        prompt=formatted_prompt,
+                        image=images,
+                        temperature=openai_request.temperature,
+                        max_tokens=openai_request.max_output_tokens,
+                        top_p=openai_request.top_p,
+                        verbose=False,
+                        **kwargs,
+                    )
+                    full_text = result.text
+                    prompt_tokens = result.prompt_tokens
+                    output_tokens = result.generation_tokens
+
                 mx.clear_cache()
                 gc.collect()
-                print("Generation finished, cleared cache.")
 
                 response = OpenAIResponse(
                     id=response_id,
@@ -800,18 +862,18 @@ async def responses_endpoint(request: Request):
                             "content": [
                                 {
                                     "type": "output_text",
-                                    "text": result.text,
+                                    "text": full_text,
                                 }
                             ],
                         }
                     ],
-                    output_text=result.text,
+                    output_text=full_text,
                     temperature=openai_request.temperature,
                     top_p=openai_request.top_p,
                     usage={
-                        "input_tokens": result.prompt_tokens,
-                        "output_tokens": result.generation_tokens,
-                        "total_tokens": result.total_tokens,
+                        "input_tokens": prompt_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": prompt_tokens + output_tokens,
                     },
                 )
                 return response
@@ -824,10 +886,8 @@ async def responses_endpoint(request: Request):
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
     except HTTPException as http_exc:
-        # Re-raise HTTP exceptions (like model loading failure)
         raise http_exc
     except Exception as e:
-        # Catch unexpected errors
         print(f"Unexpected error in /responses endpoint: {e}")
         traceback.print_exc()
         mx.clear_cache()
@@ -1030,37 +1090,68 @@ async def chat_completions_endpoint(request: ChatRequest):
         else:
             # Non-streaming response
             try:
-                # Use generate from generate.py
-                gen_result = generate(
-                    model=model,
-                    processor=processor,
-                    prompt=formatted_prompt,
-                    image=images,
-                    audio=audio,
-                    temperature=request.temperature,
-                    max_tokens=request.max_tokens,
-                    top_p=request.top_p,
-                    verbose=False,  # Keep API output clean
-                    **kwargs,
-                )
-                # Clean up resources
+                full_text = ""
+                prompt_tokens = 0
+                output_tokens = 0
+                peak_memory = 0.0
+
+                if response_generator is not None:
+                    args = GenerationArguments(
+                        max_tokens=request.max_tokens,
+                        temperature=request.temperature,
+                        top_p=request.top_p,
+                    )
+                    ctx, token_iter = response_generator.generate(
+                        prompt=formatted_prompt,
+                        images=images if images else None,
+                        audio=audio if audio else None,
+                        args=args,
+                    )
+                    prompt_tokens = ctx.prompt_tokens
+                    for token in token_iter:
+                        full_text += token.text
+                        output_tokens += 1
+                        peak_memory = token.peak_memory
+                        if token.finish_reason:
+                            break
+                    try:
+                        token_iter.close()
+                    except Exception:
+                        pass
+                else:
+                    gen_result = generate(
+                        model=model,
+                        processor=processor,
+                        prompt=formatted_prompt,
+                        image=images,
+                        audio=audio,
+                        temperature=request.temperature,
+                        max_tokens=request.max_tokens,
+                        top_p=request.top_p,
+                        verbose=False,
+                        **kwargs,
+                    )
+                    full_text = gen_result.text
+                    prompt_tokens = gen_result.prompt_tokens
+                    output_tokens = gen_result.generation_tokens
+                    peak_memory = gen_result.peak_memory
+
                 mx.clear_cache()
                 gc.collect()
-                print("Generation finished, cleared cache.")
 
                 usage_stats = UsageStats(
-                    input_tokens=gen_result.prompt_tokens,
-                    output_tokens=gen_result.generation_tokens,
-                    total_tokens=gen_result.total_tokens,
-                    prompt_tps=gen_result.prompt_tps,
-                    generation_tps=gen_result.generation_tps,
-                    peak_memory=gen_result.peak_memory,
+                    input_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                    total_tokens=prompt_tokens + output_tokens,
+                    prompt_tps=0.0,
+                    generation_tps=0.0,
+                    peak_memory=peak_memory,
                 )
 
                 choices = [
                     ChatChoice(
                         finish_reason="stop",
-                        message=ChatMessage(role="assistant", content=gen_result.text),
+                        message=ChatMessage(role="assistant", content=full_text),
                     )
                 ]
                 result = ChatResponse(
