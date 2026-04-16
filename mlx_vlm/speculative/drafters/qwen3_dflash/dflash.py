@@ -166,7 +166,7 @@ class DFlashDraftModel(nn.Module):
 
     def draft_block(
         self,
-        last_bonus: int,
+        last_bonus,
         hidden: mx.array,
         cache: List[KVCache],
         block_size: int,
@@ -175,19 +175,26 @@ class DFlashDraftModel(nn.Module):
     ) -> mx.array:
         """Run one drafter round.
 
-        Builds the noise block ``[last_bonus, mask, mask, …]`` of length
-        ``block_size``, runs the drafter forward with the newly-committed
-        target features in ``hidden`` as context, trims the transient
-        noise K/V tail off ``cache`` (exactly ``block_size`` entries —
-        this is an invariant of the drafter forward), and samples the
-        ``block_size - 1`` drafted tokens.
+        Builds the noise block ``[bonus, mask, mask, …]`` of length
+        ``block_size``, runs the drafter forward, trims the transient
+        noise K/V tail off ``cache``, and samples the drafted tokens.
 
-        Returns an ``mx.array`` of shape ``(1, block_size - 1)``.
+        ``last_bonus`` may be a scalar ``int`` (B=1) or an
+        ``mx.array`` of shape ``[B]`` for batch speculative decoding.
+        Returns shape ``(B, block_size - 1)``.
         """
-        block = mx.array(
-            [[last_bonus] + [int(self.config.mask_token_id)] * (block_size - 1)],
-            dtype=token_dtype,
-        )
+        mask_id = int(self.config.mask_token_id)
+        if isinstance(last_bonus, int):
+            block = mx.array(
+                [[last_bonus] + [mask_id] * (block_size - 1)],
+                dtype=token_dtype,
+            )
+        else:
+            B = last_bonus.shape[0]
+            masks = mx.full((B, block_size - 1), mask_id, dtype=token_dtype)
+            block = mx.concatenate(
+                [last_bonus[:, None].astype(token_dtype), masks], axis=1
+            )
         draft_logits = self(block, hidden, cache)
         for c in cache:
             c.trim(block_size)

@@ -476,6 +476,49 @@ class LanguageModel(nn.Module):
             c[0] = conv_input[:, accepted + 1 : accepted + K]
             j += 1
 
+    def rollback_speculative_cache_batch(
+        self,
+        caches: List[Any],
+        gdn_states: List,
+        accepted: mx.array,
+        block_size: int,
+    ) -> int:
+        """Batch rollback: trim to ``min(accepted)`` for correctness.
+
+        ``BatchKVCache`` uses a single ``_idx`` for the KV extent, so
+        we must trim to the minimum acceptance across the batch to
+        avoid stale entries leaking into the attention mask. Sequences
+        with higher acceptance lose a few tokens that will be
+        re-drafted next round — a small throughput cost for correctness.
+
+        Returns the effective ``min_accepted`` so the caller can
+        truncate hidden states and emitted tokens accordingly.
+        """
+        min_a = int(accepted.min().item())
+        n = min_a + 1
+        trim = block_size - n
+        j = 0
+        for c in caches:
+            if c is None:
+                continue
+            if c.is_trimmable():
+                if trim > 0:
+                    c.trim(trim)
+                continue
+            q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = (
+                gdn_states[j]
+            )
+            _, state = gated_delta_update(
+                q[:, :n], k[:, :n], v[:, :n], a[:, :n], b[:, :n],
+                A_log, dt_bias, init_state,
+                None if mask is None else mask[:, :n],
+                use_kernel=True,
+            )
+            c[1] = state
+            c[0] = conv_input[:, min_a + 1 : min_a + K]
+            j += 1
+        return min_a
+
     def get_rope_index(
         self,
         input_ids: mx.array,
@@ -660,12 +703,20 @@ class LanguageModel(nn.Module):
             self._position_ids = None
 
         cache_offset = 0
+        is_batch_offset = False
         if cache and cache[self.model.fa_idx] is not None:
             offset = cache[self.model.fa_idx].offset
             if isinstance(offset, int):
                 cache_offset = offset
             elif isinstance(offset, mx.array):
-                cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
+                if offset.ndim == 0 or offset.shape[0] <= 1:
+                    cache_offset = (
+                        offset.item() if offset.ndim == 0 else offset[0].item()
+                    )
+                else:
+                    # Batch mode: per-sequence offsets from BatchKVCache
+                    cache_offset = offset
+                    is_batch_offset = True
             else:
                 raise ValueError(f"Unexpected cache offset type: {type(offset)}")
 
@@ -673,6 +724,35 @@ class LanguageModel(nn.Module):
         rope_mask = mask
         if mask is not None and mask.shape[-1] != inputs.shape[-1]:
             rope_mask = None
+
+        # Batch with per-sequence offsets: compute position_ids directly
+        # from the offset array. Each sequence gets arange(S) + offset[i],
+        # broadcast to the 3 mRoPE dims (text-only: all 3 equal).
+        # Batch with per-sequence offsets: only use the per-sequence
+        # path when all offsets are non-negative (= decode phase after
+        # prefill). During prefill, offsets can be negative due to
+        # BatchKVCache's left_padding initialization — fall through to
+        # the standard first-call branch which uses arange positions
+        # and lets the attention mask handle padding.
+        if (
+            position_ids is None
+            and is_batch_offset
+            and bool((cache_offset >= 0).all())
+        ):
+            batch_size, seq_length = inputs.shape
+            arange = mx.arange(seq_length).reshape(1, -1)
+            offsets = cache_offset[:batch_size, None]
+            if self._rope_deltas is not None:
+                offsets = offsets + self._rope_deltas[:batch_size]
+            position_ids = (arange + offsets)[None, ...]
+            position_ids = mx.broadcast_to(
+                position_ids, (3, batch_size, seq_length)
+            )
+
+        if is_batch_offset and position_ids is None:
+            # Falling through to non-batch branch — extract scalar
+            # offset from the first sequence for position computation.
+            cache_offset = int(cache_offset[0].item())
 
         if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
             if (

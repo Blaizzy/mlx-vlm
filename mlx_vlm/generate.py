@@ -408,6 +408,30 @@ def _speculative_walk(
     return accepted, new_tokens
 
 
+def _speculative_walk_batch(
+    draft_tokens: mx.array,
+    target_tokens: mx.array,
+    budgets: List[int],
+) -> Tuple[List[int], List[List[int]]]:
+    """Per-sequence speculative walk for B > 1.
+
+    Returns ``(accepted_list, new_tokens_list)`` where each entry
+    corresponds to one sequence in the batch.
+    """
+    B = draft_tokens.shape[0]
+    d_batch = draft_tokens.tolist()
+    t_batch = target_tokens.tolist()
+    accepted_list: List[int] = []
+    new_tokens_list: List[List[int]] = []
+    for i in range(B):
+        d, t = d_batch[i], t_batch[i]
+        acc = next((j for j in range(len(d)) if d[j] != t[j]), len(d))
+        new = (d[:acc] + [t[acc]])[: budgets[i]]
+        accepted_list.append(acc)
+        new_tokens_list.append(new)
+    return accepted_list, new_tokens_list
+
+
 def _dflash_rounds(
     model: nn.Module,
     draft_model: nn.Module,
@@ -494,6 +518,118 @@ def _dflash_rounds(
 
         hidden = hidden[:, : accepted + 1, :]
         b = new_tokens[-1] if new_tokens else b
+
+
+def _dflash_rounds_batch(
+    model: nn.Module,
+    draft_model: nn.Module,
+    prompt_cache: List[Any],
+    hidden: mx.array,
+    *,
+    first_bonus: mx.array,
+    max_tokens: int,
+    sampler: Callable[[mx.array], mx.array],
+    draft_block_size: Optional[int] = None,
+    token_dtype: mx.Dtype = mx.int32,
+) -> Generator[Tuple[List[Optional[int]], None], None, None]:
+    """Batch DFlash speculative-decoding round loop (B > 1).
+
+    Same algorithm as ``_dflash_rounds`` but processes ``B`` sequences
+    in parallel. Yields ``(tokens_list, None)`` where ``tokens_list[i]``
+    is the token for sequence ``i`` (or ``None`` if that sequence has
+    nothing to emit this step).
+    """
+    lm = model.language_model if hasattr(model, "language_model") else model
+    if not hasattr(lm, "rollback_speculative_cache_batch"):
+        raise RuntimeError(
+            f"{type(lm).__name__} does not implement "
+            "rollback_speculative_cache_batch."
+        )
+
+    B = first_bonus.shape[0]
+    target_layer_ids = list(draft_model.config.target_layer_ids)
+    block_total = (
+        draft_block_size
+        if draft_block_size is not None
+        else int(draft_model.config.block_size)
+    )
+    draft_cache = draft_model.reset(model)
+
+    b = first_bonus.tolist()
+    emitted = [1] * B
+    finished = [False] * B
+
+    while not all(finished):
+        remaining = [
+            max(1, max_tokens - emitted[i] + 1) if not finished[i] else 1
+            for i in range(B)
+        ]
+        bs = min(block_total, min(remaining))
+        if bs <= 1:
+            break
+
+        # Draft
+        b_arr = mx.array(b, dtype=token_dtype)
+        with mx.stream(generation_stream):
+            draft_tokens = draft_model.draft_block(
+                b_arr, hidden, draft_cache, bs, sampler, token_dtype
+            )
+        mx.async_eval(draft_tokens)
+
+        # Verify
+        with mx.stream(generation_stream):
+            verify_input = mx.concatenate(
+                [b_arr[:, None], draft_tokens], axis=1
+            )
+            verify_out = lm(
+                verify_input,
+                cache=prompt_cache,
+                capture_layer_ids=target_layer_ids,
+            )
+            hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
+            target_tokens = sampler(verify_out.logits)
+        mx.async_eval(target_tokens, hidden_full)
+
+        # Walk (per-sequence)
+        budgets = [max_tokens - emitted[i] for i in range(B)]
+        accepted_list, new_tokens_list = _speculative_walk_batch(
+            draft_tokens, target_tokens, budgets
+        )
+
+        # Rollback — trim to min(accepted) for BatchKVCache correctness.
+        # Sequences with higher acceptance lose a few tokens (re-drafted
+        # next round). The returned min_a caps what we can emit.
+        accepted_arr = mx.array(accepted_list)
+        min_a = lm.rollback_speculative_cache_batch(
+            prompt_cache, verify_out.gdn_states, accepted_arr, bs
+        )
+        hidden = hidden_full[:, : min_a + 1, :]
+
+        # Truncate new_tokens to min_a + 1 (min_a drafted + 1 bonus)
+        for i in range(B):
+            new_tokens_list[i] = new_tokens_list[i][: min_a + 1]
+        for a in accepted_list:
+            draft_model.accept_lens.append(min(a, min_a))
+
+        # Emit round-robin (one yield per token position)
+        max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
+        for pos in range(max_new):
+            tokens_out: List[Optional[int]] = []
+            for i in range(B):
+                if pos < len(new_tokens_list[i]) and not finished[i]:
+                    tok = new_tokens_list[i][pos]
+                    tokens_out.append(tok)
+                    emitted[i] += 1
+                    if emitted[i] >= max_tokens:
+                        finished[i] = True
+                else:
+                    tokens_out.append(None)
+            yield tokens_out, None
+
+        # Update per-sequence bonus tokens
+        for i in range(B):
+            if new_tokens_list[i]:
+                b[i] = new_tokens_list[i][-1]
 
 
 def generate_step(
@@ -704,9 +840,15 @@ def generate_step(
 
     # Speculative decoding
     if draft_model is not None:
-        yield y.item(), logprobs
         hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
-        if draft_kind == "dflash":
+        B = input_ids.shape[0]
+        if draft_kind != "dflash":
+            raise ValueError(
+                f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash']"
+            )
+        if B == 1:
+            mx.eval(y)
+            yield y.item(), logprobs
             yield from _dflash_rounds(
                 model,
                 draft_model,
@@ -719,8 +861,19 @@ def generate_step(
                 token_dtype=input_ids.dtype,
             )
         else:
-            raise ValueError(
-                f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash']"
+            mx.eval(y)
+            first_bonus = y.squeeze(-1)
+            yield first_bonus.tolist(), logprobs
+            yield from _dflash_rounds_batch(
+                model,
+                draft_model,
+                prompt_cache,
+                hidden,
+                first_bonus=first_bonus,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                draft_block_size=draft_block_size,
+                token_dtype=input_ids.dtype,
             )
         return
 
