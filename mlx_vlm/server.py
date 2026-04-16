@@ -337,6 +337,27 @@ class ResponseGenerator:
                 break
 
 
+def _split_thinking(text: str) -> Tuple[Optional[str], str]:
+    """Split thinking tags from content. Returns (reasoning, content)."""
+    # Handle <|channel>thought...<channel|> format (gemma4)
+    if "<|channel>thought" in text:
+        parts = text.split("<channel|>", 1)
+        if len(parts) == 2:
+            reasoning = parts[0].replace("<|channel>thought", "").strip()
+            content = parts[1].strip()
+            return reasoning or None, content
+        return parts[0].replace("<|channel>thought", "").strip(), ""
+    # Handle <think>...</think> format (qwen3.5 etc)
+    if "<think>" in text:
+        parts = text.split("</think>", 1)
+        if len(parts) == 2:
+            reasoning = parts[0].replace("<think>", "").strip()
+            content = parts[1].strip()
+            return reasoning or None, content
+        return parts[0].replace("<think>", "").strip(), ""
+    return None, text
+
+
 # Global response generator for continuous batching
 response_generator: Optional[ResponseGenerator] = None
 
@@ -548,8 +569,14 @@ class ChatMessage(FlexibleBaseModel):
         description="Role of the message sender (e.g., 'system', 'user', 'assistant').",
     )
     content: Union[
-        str, ResponseInputMessageContentListParam, ResponseOutputMessageContentList
-    ] = Field(..., description="Content of the message.")
+        str,
+        None,
+        ResponseInputMessageContentListParam,
+        ResponseOutputMessageContentList,
+    ] = Field(None, description="Content of the message.")
+    reasoning: Optional[str] = Field(
+        None, description="Thinking/reasoning content (when thinking is enabled)."
+    )
 
 
 class OpenAIRequest(FlexibleBaseModel):
@@ -763,18 +790,15 @@ class GenerationRequest(VLMRequest):
     )
 
 
-class UsageStats(OpenAIUsage):
-    """
-    Inherits from OpenAIUsage and adds additional fields for usage statistics.
-    """
+class UsageStats(BaseModel):
+    """OpenAI-compatible usage statistics for chat completions."""
 
-    prompt_tps: float = Field(..., description="Tokens per second for the prompt.")
-    generation_tps: float = Field(
-        ..., description="Tokens per second for the generation."
-    )
-    peak_memory: float = Field(
-        ..., description="Peak memory usage during the generation."
-    )
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    prompt_tps: float = 0.0
+    generation_tps: float = 0.0
+    peak_memory: float = 0.0
 
 
 class ChatRequest(GenerationRequest):
@@ -787,9 +811,12 @@ class ChatChoice(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    model: str
-    choices: List[ChatChoice]
-    usage: Optional[UsageStats]
+    id: str = ""
+    object: str = "chat.completion"
+    created: int = 0
+    model: str = ""
+    choices: List[ChatChoice] = []
+    usage: Optional[UsageStats] = None
 
 
 class ChatStreamChoice(BaseModel):
@@ -798,9 +825,12 @@ class ChatStreamChoice(BaseModel):
 
 
 class ChatStreamChunk(BaseModel):
-    model: str
-    choices: List[ChatStreamChoice]
-    usage: Optional[UsageStats]
+    id: str = ""
+    object: str = "chat.completion.chunk"
+    created: int = 0
+    model: str = ""
+    choices: List[ChatStreamChoice] = []
+    usage: Optional[UsageStats] = None
 
 
 # Models for /models endpoint
@@ -1313,6 +1343,10 @@ async def chat_completions_endpoint(request: ChatRequest):
                         )
 
                         output_tokens = 0
+                        request_id = f"chatcmpl-{uuid.uuid4()}"
+                        # Track thinking state for reasoning/content split
+                        in_thinking = False
+                        accumulated = ""
 
                         def _next_token():
                             try:
@@ -1321,29 +1355,60 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 return None
 
                         while True:
-                            # Each next() does blocking Queue.get
                             token = await asyncio.to_thread(_next_token)
                             if token is None:
                                 break
                             output_tokens += 1
-                            usage_stats = {
-                                "input_tokens": ctx.prompt_tokens,
-                                "output_tokens": output_tokens,
-                                "total_tokens": ctx.prompt_tokens + output_tokens,
-                                "prompt_tps": 0.0,
-                                "generation_tps": 0.0,
-                                "peak_memory": token.peak_memory,
-                            }
+                            accumulated += token.text
+
+                            # Detect thinking boundaries
+                            delta_reasoning = None
+                            delta_content = None
+
+                            if not in_thinking and (
+                                "<|channel>thought" in accumulated
+                                or "<think>" in accumulated
+                            ):
+                                in_thinking = True
+                                accumulated = ""
+                                # Don't emit opening tag tokens
+                            elif in_thinking and (
+                                "<channel|>" in accumulated
+                                or "</think>" in accumulated
+                            ):
+                                in_thinking = False
+                                accumulated = ""
+                                # Don't emit closing tag tokens
+                            elif in_thinking:
+                                delta_reasoning = token.text
+                            elif not in_thinking and (
+                                "<|channel>" in accumulated
+                                or "<think" in accumulated
+                            ):
+                                pass  # Partial tag, don't emit yet
+                            else:
+                                delta_content = token.text
 
                             choices = [
                                 ChatStreamChoice(
                                     delta=ChatMessage(
-                                        role="assistant", content=token.text
+                                        role="assistant",
+                                        content=delta_content,
+                                        reasoning=delta_reasoning,
                                     )
                                 )
                             ]
                             chunk_data = ChatStreamChunk(
-                                model=request.model, usage=usage_stats, choices=choices
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                usage={
+                                    "prompt_tokens": ctx.prompt_tokens,
+                                    "completion_tokens": output_tokens,
+                                    "total_tokens": ctx.prompt_tokens
+                                    + output_tokens,
+                                },
+                                choices=choices,
                             )
 
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
@@ -1364,22 +1429,13 @@ async def chat_completions_endpoint(request: ChatRequest):
                             **kwargs,
                         )
 
+                        request_id = f"chatcmpl-{uuid.uuid4()}"
+                        output_text = ""
                         for chunk in token_iterator:
                             if chunk is None or not hasattr(chunk, "text"):
-                                print(
-                                    "Warning: Received unexpected chunk format:", chunk
-                                )
                                 continue
 
-                            usage_stats = {
-                                "input_tokens": chunk.prompt_tokens,
-                                "output_tokens": chunk.generation_tokens,
-                                "total_tokens": chunk.prompt_tokens
-                                + chunk.generation_tokens,
-                                "prompt_tps": chunk.prompt_tps,
-                                "generation_tps": chunk.generation_tps,
-                                "peak_memory": chunk.peak_memory,
-                            }
+                            output_text += chunk.text
 
                             choices = [
                                 ChatStreamChoice(
@@ -1389,23 +1445,23 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 )
                             ]
                             chunk_data = ChatStreamChunk(
-                                model=request.model, usage=usage_stats, choices=choices
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                usage={
+                                    "prompt_tokens": chunk.prompt_tokens,
+                                    "completion_tokens": chunk.generation_tokens,
+                                    "total_tokens": chunk.prompt_tokens
+                                    + chunk.generation_tokens,
+                                },
+                                choices=choices,
                             )
 
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
                             await asyncio.sleep(0.01)
 
                     # Signal stream end
-                    choices = [
-                        ChatStreamChoice(
-                            finish_reason="stop",
-                            delta=ChatMessage(role="assistant", content=""),
-                        )
-                    ]
-                    chunk_data = ChatStreamChunk(
-                        model=request.model, usage=usage_stats, choices=choices
-                    )
-                    yield f"data: {chunk_data.model_dump_json()}\n\n"
+                    yield "data: [DONE]\n\n"
 
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
@@ -1488,23 +1544,31 @@ async def chat_completions_endpoint(request: ChatRequest):
                 mx.clear_cache()
                 gc.collect()
 
+                reasoning, content = _split_thinking(full_text)
+
                 usage_stats = UsageStats(
-                    input_tokens=prompt_tokens,
-                    output_tokens=output_tokens,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=output_tokens,
                     total_tokens=prompt_tokens + output_tokens,
-                    prompt_tps=0.0,
-                    generation_tps=0.0,
                     peak_memory=peak_memory,
                 )
 
                 choices = [
                     ChatChoice(
                         finish_reason="stop",
-                        message=ChatMessage(role="assistant", content=full_text),
+                        message=ChatMessage(
+                            role="assistant",
+                            content=content,
+                            reasoning=reasoning,
+                        ),
                     )
                 ]
                 result = ChatResponse(
-                    model=request.model, usage=usage_stats, choices=choices
+                    id=f"chatcmpl-{uuid.uuid4()}",
+                    created=int(time.time()),
+                    model=request.model,
+                    usage=usage_stats,
+                    choices=choices,
                 )
 
                 return result
