@@ -117,13 +117,9 @@ class ResponseGenerator:
         args = args or GenerationArguments()
         rqueue: Queue = Queue()
 
-        # Preprocess images/audio on the caller thread (not the GPU thread)
-        input_ids, gen_kwargs = self._preprocess(prompt, images, audio)
-        prompt_tokens = (
-            input_ids.size if hasattr(input_ids, "size") else len(input_ids)
-        )
-
-        self.requests.put((rqueue, input_ids, gen_kwargs, args))
+        # All preprocessing deferred to the GPU thread to avoid
+        # concurrent Metal access from multiple caller threads.
+        self.requests.put((rqueue, prompt, images, audio, args))
 
         # Block until the GPU thread sends back the context
         ctx = rqueue.get()
@@ -142,7 +138,7 @@ class ResponseGenerator:
             finally:
                 pass  # batch cleanup happens in _run
 
-        return GenerationContext(uid=ctx, prompt_tokens=prompt_tokens), token_iterator()
+        return ctx, token_iterator()
 
     # -- internals --
 
@@ -158,9 +154,9 @@ class ResponseGenerator:
 
         return sampler
 
-    def _preprocess(
-        self, prompt, images=None, audio=None
-    ) -> Tuple[mx.array, dict]:
+    def _preprocess(self, prompt, images=None, audio=None) -> Tuple[mx.array, dict]:
+        """Full preprocessing: tokenize, load images, run vision encoder.
+        Must run on the GPU thread."""
         add_special_tokens = (
             getattr(self.processor, "chat_template", None) is None
             if self.model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
@@ -222,7 +218,7 @@ class ResponseGenerator:
                         break
 
                 # Insert new requests into batch
-                for rqueue, input_ids, gen_kwargs, args in new_items:
+                for rqueue, prompt, images, audio, args in new_items:
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
                             self.model.language_model,
@@ -231,6 +227,15 @@ class ResponseGenerator:
                             sampler=self._make_sampler(args),
                         )
 
+                    # All preprocessing on the GPU thread
+                    input_ids, gen_kwargs = self._preprocess(
+                        prompt, images, audio
+                    )
+                    prompt_tokens = (
+                        input_ids.size
+                        if hasattr(input_ids, "size")
+                        else len(input_ids)
+                    )
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
 
                     # Image request: flush pending text-only first
@@ -246,7 +251,7 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    rqueue.put(uid)  # send uid as context
+                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     active[uid] = {
                         "rqueue": rqueue,
                         "tokens": [],
