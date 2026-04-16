@@ -1549,6 +1549,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         # Track thinking state for reasoning/content split
                         in_thinking = False
                         accumulated = ""
+                        full_output = ""  # raw output for tool call parsing
 
                         def _next_token():
                             try:
@@ -1562,6 +1563,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 break
                             output_tokens += 1
                             accumulated += token.text
+                            full_output += token.text
 
                             # Detect thinking boundaries
                             delta_reasoning = None
@@ -1614,6 +1616,27 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                             if token.finish_reason:
                                 break
+
+                        # Parse tool calls from full output and emit final chunk
+                        if tool_module is not None:
+                            tc = process_tool_calls(full_output, tool_module, tools)
+                            if tc["calls"]:
+                                choices = [
+                                    ChatStreamChoice(
+                                        finish_reason="tool_calls",
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            tool_calls=tc["calls"],
+                                        ),
+                                    )
+                                ]
+                                chunk_data = ChatStreamChunk(
+                                    id=request_id,
+                                    created=int(time.time()),
+                                    model=request.model,
+                                    choices=choices,
+                                )
+                                yield f"data: {chunk_data.model_dump_json()}\n\n"
                     else:
                         # Fallback to stream_generate
                         token_iterator = stream_generate(
