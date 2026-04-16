@@ -520,6 +520,7 @@ def generate_step(
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
     draft_model: Optional[nn.Module] = None,
+    draft_kind: str = "dflash",
     draft_block_size: Optional[int] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -707,25 +708,31 @@ def generate_step(
     mx.async_eval(y)
 
     # Speculative decoding: skip the AR decode loop, yield the prefill
-    # bonus, then hand off to the dflash round loop which shares the
-    # prompt cache and the captured hidden states from ``last_outputs``.
+    # bonus, then dispatch to the correct speculative round loop by
+    # ``draft_kind``. Each family (dflash today; EAGLE, Medusa, … later)
+    # plugs in as an additional branch here.
     if draft_model is not None:
         mx.eval(y)
         first_bonus = y.item()
         yield first_bonus, logprobs
         hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
-        yield from _dflash_rounds(
-            model,
-            draft_model,
-            prompt_cache,
-            hidden,
-            first_bonus=first_bonus,
-            prompt_len=original_prompt_len,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            draft_block_size=draft_block_size,
-            token_dtype=input_ids.dtype,
-        )
+        if draft_kind == "dflash":
+            yield from _dflash_rounds(
+                model,
+                draft_model,
+                prompt_cache,
+                hidden,
+                first_bonus=first_bonus,
+                prompt_len=original_prompt_len,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                draft_block_size=draft_block_size,
+                token_dtype=input_ids.dtype,
+            )
+        else:
+            raise ValueError(
+                f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash']"
+            )
         return
 
     n = 0
@@ -1818,6 +1825,7 @@ def main():
             gen_kwargs["prefill_step_size"] = args.prefill_step_size
         if draft_model is not None:
             gen_kwargs["draft_model"] = draft_model
+            gen_kwargs["draft_kind"] = args.draft_kind
             if args.draft_block_size is not None:
                 gen_kwargs["draft_block_size"] = args.draft_block_size
 
