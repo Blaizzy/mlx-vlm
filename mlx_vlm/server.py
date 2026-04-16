@@ -7,6 +7,7 @@ import re
 import time
 import traceback
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from queue import Empty as QueueEmpty
@@ -17,14 +18,19 @@ from typing import Any, Callable, Iterator, List, Literal, Optional, Tuple, Unio
 import mlx.core as mx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
 from .generate import (
+    DEFAULT_KV_GROUP_SIZE,
+    DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL_PATH,
+    DEFAULT_PREFILL_STEP_SIZE,
+    DEFAULT_QUANTIZED_KV_START,
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
@@ -39,6 +45,46 @@ from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load, prepare_inputs
 from .version import __version__
 from .vision_cache import VisionFeatureCache
+
+DEFAULT_SERVER_HOST = "0.0.0.0"
+DEFAULT_SERVER_PORT = 8080
+
+
+def get_prefill_step_size():
+    return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
+
+
+def get_quantized_kv_bits(model: str):
+    kv_bits = float(os.environ.get("KV_BITS", 0))
+    if kv_bits == 0:
+        return None
+    if "qat" in model:
+        print(f"Model {model} is quantization aware, KV cache will not be quantized.")
+        return None
+    return kv_bits
+
+
+def get_kv_group_size():
+    return int(os.environ.get("KV_GROUP_SIZE", DEFAULT_KV_GROUP_SIZE))
+
+
+def get_kv_quant_scheme():
+    return os.environ.get("KV_QUANT_SCHEME", DEFAULT_KV_QUANT_SCHEME)
+
+
+def get_max_kv_size(model: str):
+    max_kv_tokens = int(os.environ.get("MAX_KV_SIZE", 0))
+    if max_kv_tokens == 0:
+        return None
+    if get_quantized_kv_bits(model) is not None:
+        print(f"Model {model} uses QuantizedKVCache, can't set max KV size.")
+        return None
+    return max_kv_tokens
+
+
+def get_quantized_kv_start():
+    return int(os.environ.get("QUANTIZED_KV_START", DEFAULT_QUANTIZED_KV_START))
+
 
 # =============================================================================
 # ResponseGenerator - Concurrent Request Handling with Threaded Batching
@@ -491,17 +537,37 @@ def _split_thinking(text: str) -> Tuple[Optional[str], str]:
 # Global response generator for continuous batching
 response_generator: Optional[ResponseGenerator] = None
 
+# Loading/unloading utilities
+model_cache = {}
+
+
+@asynccontextmanager
+async def lifespan(app):
+    model_path = os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
+    if model_path:
+        adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
+        print(f"Pre-loading model: {model_path}")
+        get_cached_model(model_path, adapter_path)
+        print("Model ready, continuous batching enabled.")
+    yield
+
+
 app = FastAPI(
     title="MLX-VLM Inference API",
     description="API for using Vision Language Models (VLMs) and Omni Models (Vision, Audio and Video support) with MLX.",
     version=__version__,
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 MAX_IMAGES = 10  # Maximum number of images to process at once
-
-# Loading/unloading utilities
-
-model_cache = {}
 
 
 class FlexibleBaseModel(BaseModel):
@@ -586,17 +652,6 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
     }
 
     return model, processor, config
-
-
-@app.on_event("startup")
-def preload_model():
-    """Pre-load a model at startup if --model was specified."""
-    model_path = os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
-    if model_path:
-        adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
-        print(f"Pre-loading model: {model_path}")
-        get_cached_model(model_path, adapter_path)
-        print("Model ready, continuous batching enabled.")
 
 
 # Synchronous unload function for internal use
@@ -1327,7 +1382,15 @@ async def responses_endpoint(request: Request):
                     gc.collect()
                     print("Stream finished, cleared cache.")
 
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
         else:
             # Non-streaming response
@@ -1449,8 +1512,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                 if len(request.resize_shape) == 1
                 else tuple(request.resize_shape)
             )
-
-        chat_messages = request.messages
 
         images = []
         audio = []
@@ -1703,7 +1764,15 @@ async def chat_completions_endpoint(request: ChatRequest):
                     gc.collect()
                     print("Stream finished, cleared cache.")
 
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
         else:
             # Non-streaming response
@@ -1941,6 +2010,49 @@ def main():
         default=20,
         help="Max number of cached vision features (default: 20).",
     )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=DEFAULT_PREFILL_STEP_SIZE,
+        help="Tokens per prefill step (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=float,
+        default=None,
+        help="Number of bits for KV cache quantization (e.g. 3.5 for TurboQuant).",
+    )
+    parser.add_argument(
+        "--kv-quant-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=DEFAULT_KV_QUANT_SCHEME,
+        help="KV cache quantization backend.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=DEFAULT_KV_GROUP_SIZE,
+        help="Group size for uniform KV cache quantization.",
+    )
+    parser.add_argument(
+        "--max-kv-size",
+        type=int,
+        default=None,
+        help="Maximum KV cache size in tokens.",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=DEFAULT_QUANTIZED_KV_START,
+        help="Start index for quantized KV cache.",
+    )
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        default=False,
+        help="Enable auto-reload for development.",
+    )
     args = parser.parse_args()
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
@@ -1949,8 +2061,21 @@ def main():
         if args.adapter_path:
             os.environ["MLX_VLM_PRELOAD_ADAPTER"] = args.adapter_path
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
+    if args.prefill_step_size:
+        os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
+    if args.kv_bits is not None:
+        os.environ["KV_BITS"] = str(args.kv_bits)
+    os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
+    os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
+    if args.max_kv_size is not None:
+        os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
+    os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
     uvicorn.run(
-        "mlx_vlm.server:app", host=args.host, port=args.port, workers=1, reload=True
+        "mlx_vlm.server:app",
+        host=args.host,
+        port=args.port,
+        workers=1,
+        reload=args.reload,
     )
 
 
