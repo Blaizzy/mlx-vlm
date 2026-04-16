@@ -3,6 +3,7 @@ import asyncio
 import gc
 import json
 import os
+import re
 import time
 import traceback
 import uuid
@@ -33,6 +34,7 @@ from .generate import (
 )
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
+from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load, prepare_inputs
 from .version import __version__
 
@@ -327,6 +329,54 @@ class ResponseGenerator:
                 break
 
 
+def process_tool_calls(model_output: str, tool_module, tools):
+    """Parse tool calls from model output using the appropriate tool parser."""
+    called_tools = []
+    remaining = model_output
+
+    if tool_module.tool_call_start in model_output:
+        if tool_module.tool_call_end == "":
+            pattern = re.compile(
+                f"{re.escape(tool_module.tool_call_start)}.*?(?:\n|$)", re.DOTALL
+            )
+        else:
+            pattern = re.compile(
+                f"{re.escape(tool_module.tool_call_start)}.*?{re.escape(tool_module.tool_call_end)}",
+                re.DOTALL,
+            )
+
+        matches = re.findall(pattern, model_output)
+        if matches:
+            remaining = re.sub(pattern, " ", model_output).strip()
+            for i, match in enumerate(matches):
+                call = (
+                    match.strip()
+                    .removeprefix(tool_module.tool_call_start)
+                    .removesuffix(tool_module.tool_call_end)
+                )
+                try:
+                    tool_call = tool_module.parse_tool_call(call, tools)
+                    args = tool_call["arguments"]
+                    called_tools.append(
+                        {
+                            "type": "function",
+                            "index": i,
+                            "id": str(uuid.uuid4()),
+                            "function": {
+                                "name": tool_call["name"].strip(),
+                                "arguments": (
+                                    args
+                                    if isinstance(args, str)
+                                    else json.dumps(args, ensure_ascii=False)
+                                ),
+                            },
+                        }
+                    )
+                except Exception:
+                    print(f"Invalid tool call: {call}")
+    return dict(calls=called_tools, remaining_text=remaining)
+
+
 def _count_thinking_tag_tokens(text: str) -> int:
     """Count tokens consumed by thinking tags (excluded from completion_tokens)."""
     count = 0
@@ -341,13 +391,19 @@ def _count_thinking_tag_tokens(text: str) -> int:
 def _split_thinking(text: str) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content)."""
     # Handle <|channel>thought...<channel|> format (gemma4)
-    if "<|channel>thought" in text:
+    # Also handle partial tag: text starting with "thought\n" (continuation)
+    if "<|channel>thought" in text or (
+        "<channel|>" in text and text.lstrip().startswith("thought")
+    ):
         parts = text.split("<channel|>", 1)
         if len(parts) == 2:
-            reasoning = parts[0].replace("<|channel>thought", "").strip()
+            reasoning = (
+                parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
+            )
             content = parts[1].strip()
             return reasoning or None, content
-        return parts[0].replace("<|channel>thought", "").strip(), ""
+        reasoning = parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
+        return reasoning or None, ""
     # Handle <think>...</think> format (qwen3.5 etc)
     if "<think>" in text:
         parts = text.split("</think>", 1)
@@ -565,9 +621,9 @@ ResponseOutputMessageContentList: TypeAlias = List[ResponseOutputText]
 
 
 class ChatMessage(FlexibleBaseModel):
-    role: Literal["user", "assistant", "system", "developer"] = Field(
+    role: Literal["user", "assistant", "system", "developer", "tool"] = Field(
         ...,
-        description="Role of the message sender (e.g., 'system', 'user', 'assistant').",
+        description="Role of the message sender.",
     )
     content: Union[
         str,
@@ -578,6 +634,13 @@ class ChatMessage(FlexibleBaseModel):
     reasoning: Optional[str] = Field(
         None, description="Thinking/reasoning content (when thinking is enabled)."
     )
+    tool_calls: Optional[List[Any]] = Field(
+        None, description="Tool calls made by the assistant."
+    )
+    tool_call_id: Optional[str] = Field(
+        None, description="ID of the tool call this message is a response to."
+    )
+    name: Optional[str] = Field(None, description="Name of the tool/function.")
 
 
 class OpenAIRequest(FlexibleBaseModel):
@@ -1301,15 +1364,14 @@ async def chat_completions_endpoint(request: ChatRequest):
         audio = []
         processed_messages = []
         for message in request.messages:
+            msg = {"role": message.role}
+
             if isinstance(message.content, str):
-                processed_messages.append(
-                    {"role": message.role, "content": message.content}
-                )
+                msg["content"] = message.content
             elif isinstance(message.content, list):
                 text_content = ""
                 for item in message.content:
                     if isinstance(item, dict):
-                        # Only extract images/audio from user messages
                         if message.role == "user":
                             if item["type"] == "input_image":
                                 images.append(item["image_url"])
@@ -1319,9 +1381,31 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 audio.append(item["input_audio"]["data"])
                         if item["type"] in ("text", "input_text"):
                             text_content = item.get("text", "")
-                processed_messages.append(
-                    {"role": message.role, "content": text_content}
-                )
+                msg["content"] = text_content
+            else:
+                msg["content"] = message.content
+
+            # Preserve tool-calling metadata
+            if message.tool_calls is not None:
+                msg["tool_calls"] = message.tool_calls
+            if message.tool_call_id is not None:
+                msg["tool_call_id"] = message.tool_call_id
+            if message.name is not None:
+                msg["name"] = message.name
+
+            processed_messages.append(msg)
+
+        # Detect tool parser from chat template
+        tools = getattr(request, "tools", None)
+        tool_parser_type = None
+        tool_module = None
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+            tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
+            if tool_parser_type is not None:
+                tool_module = load_tool_module(tool_parser_type)
 
         template_kwargs = {}
         if getattr(request, "enable_thinking", True):
@@ -1333,6 +1417,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             processed_messages,
             num_images=len(images),
             num_audios=len(audio),
+            tools=tools,
             **template_kwargs,
         )
 
@@ -1572,13 +1657,28 @@ async def chat_completions_endpoint(request: ChatRequest):
                     peak_memory=peak_memory,
                 )
 
+                # Parse tool calls from generated output
+                parsed_tool_calls = None
+                if tool_module is not None:
+                    tc = process_tool_calls(
+                        model_output=full_text,
+                        tool_module=tool_module,
+                        tools=tools,
+                    )
+                    if tc["calls"]:
+                        parsed_tool_calls = tc["calls"]
+                        # Clean thinking tags from remaining text
+                        _, clean_remaining = _split_thinking(tc["remaining_text"] or "")
+                        content = clean_remaining or None
+
                 choices = [
                     ChatChoice(
-                        finish_reason="stop",
+                        finish_reason="tool_calls" if parsed_tool_calls else "stop",
                         message=ChatMessage(
                             role="assistant",
-                            content=content,
+                            content=content if content else None,
                             reasoning=reasoning,
+                            tool_calls=parsed_tool_calls,
                         ),
                     )
                 ]
