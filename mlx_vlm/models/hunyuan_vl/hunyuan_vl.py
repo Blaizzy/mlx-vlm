@@ -38,13 +38,19 @@ class Model(nn.Module):
             self.language_model._position_ids = None
             return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
+        vision_cache = kwargs.get("vision_cache", None)
         cached = kwargs.get("cached_image_features", None)
+        if cached is None and vision_cache is not None:
+            cached = vision_cache.get(kwargs.get("_image_key"))
         if cached is not None:
             vision_features = cached
         else:
             # Get vision features
             vision_features = self.vision_tower(pixel_values, image_grid_thw)
 
+            if vision_cache is not None and kwargs.get("_image_key") is not None:
+                mx.eval(vision_features)
+                vision_cache.put(kwargs["_image_key"], vision_features)
         # Find image token positions and replace with vision features
         image_token_id = self.config.image_token_id
         image_mask = input_ids == image_token_id

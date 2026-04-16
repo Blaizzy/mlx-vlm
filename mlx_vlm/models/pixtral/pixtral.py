@@ -53,7 +53,10 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
+        vision_cache = kwargs.get("vision_cache", None)
         cached = kwargs.get("cached_image_features", None)
+        if cached is None and vision_cache is not None:
+            cached = vision_cache.get(kwargs.get("_image_key"))
         if cached is not None:
             image_features = cached
         else:
@@ -76,6 +79,9 @@ class Model(nn.Module):
             # Pass image features through the multi-modal projector
             image_features = self.multi_modal_projector(selected_image_feature)
 
+            if vision_cache is not None and kwargs.get("_image_key") is not None:
+                mx.eval(image_features)
+                vision_cache.put(kwargs["_image_key"], image_features)
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self.merge_input_ids_with_image_features(
             self.config.image_token_index, image_features, inputs_embeds, input_ids

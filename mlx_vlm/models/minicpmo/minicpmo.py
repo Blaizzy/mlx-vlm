@@ -376,7 +376,10 @@ class Model(nn.Module):
 
         tgt_sizes = kwargs.get("tgt_sizes", None)
         image_bound = kwargs.get("image_bound", None)
+        vision_cache = kwargs.get("vision_cache", None)
         cached = kwargs.get("cached_image_features", None)
+        if cached is None and vision_cache is not None:
+            cached = vision_cache.get(kwargs.get("_image_key"))
         if cached is not None:
             vision_hidden_states = cached
         elif pixel_values is not None:
@@ -384,6 +387,9 @@ class Model(nn.Module):
         else:
             vision_hidden_states = None
 
+            if vision_cache is not None and kwargs.get("_image_key") is not None:
+                mx.eval(vision_hidden_states)
+                vision_cache.put(kwargs["_image_key"], vision_hidden_states)
         audio_features = kwargs.get("audio_features", None)
         audio_feature_lens = kwargs.get("audio_feature_lens", None)
         audio_bounds = kwargs.get("audio_bounds", None)

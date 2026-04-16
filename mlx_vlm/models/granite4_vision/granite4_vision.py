@@ -155,7 +155,10 @@ class Model(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         image_sizes = kwargs.get("image_sizes", None)
 
+        vision_cache = kwargs.get("vision_cache", None)
         cached = kwargs.get("cached_image_features", None)
+        if cached is None and vision_cache is not None:
+            cached = vision_cache.get(kwargs.get("_image_key"))
         if cached is not None:
             hidden_states = cached
         else:
@@ -164,6 +167,9 @@ class Model(nn.Module):
                 pixel_values[0].transpose(0, 2, 3, 1), output_hidden_states=True
             )
 
+            if vision_cache is not None and kwargs.get("_image_key") is not None:
+                mx.eval(hidden_states)
+                vision_cache.put(kwargs["_image_key"], hidden_states)
         num_patches = pixel_values[0].shape[0]
         image_num_patches = [num_patches]
 

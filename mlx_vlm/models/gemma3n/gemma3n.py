@@ -167,7 +167,10 @@ class Model(nn.Module):
 
         # Vision features
         if pixel_values is not None:
+            vision_cache = kwargs.get("vision_cache", None)
             cached = kwargs.get("cached_image_features", None)
+            if cached is None and vision_cache is not None:
+                cached = vision_cache.get(kwargs.get("_image_key"))
             if cached is not None:
                 image_features = cached
             else:
@@ -175,6 +178,9 @@ class Model(nn.Module):
                     pixel_values, self.vision_tower, self.config, self.embed_vision
                 )
 
+                if vision_cache is not None and kwargs.get("_image_key") is not None:
+                    mx.eval(image_features)
+                    vision_cache.put(kwargs["_image_key"], image_features)
             modality = "image"
             inputs_embeds = self.merge_multimodal_and_text(
                 inputs_embeds,

@@ -108,7 +108,10 @@ class Model(nn.Module):
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
+        vision_cache = kwargs.get("vision_cache", None)
         cached = kwargs.get("cached_image_features", None)
+        if cached is None and vision_cache is not None:
+            cached = vision_cache.get(kwargs.get("_image_key"))
         if cached is not None:
             image_features = cached
         else:
@@ -121,6 +124,9 @@ class Model(nn.Module):
 
             image_features = self.mm_projector(image_features)
 
+            if vision_cache is not None and kwargs.get("_image_key") is not None:
+                mx.eval(image_features)
+                vision_cache.put(kwargs["_image_key"], image_features)
         final_inputs_embeds = self._prepare_inputs_for_multimodal(
             image_features, inputs_embeds, input_ids
         )

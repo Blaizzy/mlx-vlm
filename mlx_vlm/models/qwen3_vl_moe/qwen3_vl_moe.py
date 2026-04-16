@@ -66,7 +66,10 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
+        vision_cache = kwargs.get("vision_cache", None)
         cached = kwargs.get("cached_image_features", None)
+        if cached is None and vision_cache is not None:
+            cached = vision_cache.get(kwargs.get("_image_key"))
         if cached is not None:
             hidden_states = cached
             deepstack_image_embeds = None
@@ -76,6 +79,9 @@ class Model(nn.Module):
                 pixel_values, grid_thw
             )
 
+            if vision_cache is not None and kwargs.get("_image_key") is not None:
+                mx.eval(hidden_states)
+                vision_cache.put(kwargs["_image_key"], hidden_states)
         visual_pos_masks = None
         deepstack_visual_embeds = None
 
