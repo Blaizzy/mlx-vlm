@@ -4,6 +4,7 @@ import contextlib
 import functools
 import json
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
@@ -161,6 +162,21 @@ def parse_arguments():
     )
 
     return parser.parse_args()
+
+
+def normalize_resize_shape(
+    values: Optional[Sequence[int]],
+) -> Optional[Tuple[int, int]]:
+    if values is None:
+        return None
+    if not (
+        isinstance(values, Sequence)
+        and not isinstance(values, (str, bytes))
+        and len(values) in (1, 2)
+        and all(type(value) is int for value in values)
+    ):
+        raise ValueError("resize_shape must contain 1 or 2 integers")
+    return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
 # A stream on the default device just for generation
