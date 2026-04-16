@@ -9,6 +9,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
   - [Command Line Interface (CLI)](#command-line-interface-cli)
   - [Chat UI with Gradio](#chat-ui-with-gradio)
   - [Python Script](#python-script)
+- [Continuous Batching](#continuous-batching)
 - [Multi-Image Chat Support](#multi-image-chat-support)
   - [Supported Models](#supported-models)
   - [Usage Examples](#usage-examples)
@@ -301,6 +302,85 @@ curl -X POST "http://localhost:8080/responses" \
 - `top_p`: Top-p sampling parameter
 - `stream`: Enable streaming responses
 
+
+## Continuous Batching
+
+The server supports continuous batching for higher throughput when handling multiple concurrent requests. New requests join the active batch immediately without waiting for existing requests to finish, and mixed batches of image and text-only requests are supported.
+
+Continuous batching is enabled automatically when the server loads a model. You can verify it via the health endpoint:
+
+```sh
+curl http://localhost:8080/health
+# {"status":"healthy","loaded_model":"...","continuous_batching_enabled":true}
+```
+
+### How It Works
+
+- A dedicated generation thread runs a `BatchGenerator` that processes multiple requests in parallel
+- Image requests are prefilled individually with their own vision embeddings, then join the shared decoding batch
+- Text-only requests are batched together for efficient prefill
+- After prefill, all requests decode together in a single batch, sharing GPU compute
+
+### Python Example
+
+You can also use continuous batching directly via the `ResponseGenerator`:
+
+```python
+from mlx_vlm.server import ResponseGenerator, GenerationArguments
+from mlx_vlm import load
+from mlx_vlm.prompt_utils import apply_chat_template
+
+model, processor = load("mlx-community/Qwen2.5-VL-3B-Instruct-4bit")
+config = model.config
+
+# Get stop tokens
+stop_tokens = set()
+if isinstance(config.eos_token_id, list):
+    stop_tokens.update(config.eos_token_id)
+elif config.eos_token_id is not None:
+    stop_tokens.add(config.eos_token_id)
+
+rg = ResponseGenerator(model=model, processor=processor, stop_tokens=stop_tokens)
+args = GenerationArguments(max_tokens=100, temperature=0.0)
+
+# Submit a request (text-only or with images)
+prompt = apply_chat_template(processor, config, "What is in this image?", num_images=1)
+ctx, token_iter = rg.generate(
+    prompt=prompt, images=["path/to/image.jpg"], args=args
+)
+
+# Stream tokens
+for token in token_iter:
+    print(token.text, end="", flush=True)
+    if token.finish_reason:
+        break
+
+rg.stop_and_join()
+```
+
+### Concurrent Requests
+
+Multiple requests can be submitted from different threads. They will be batched together automatically:
+
+```python
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def submit(name, prompt, images=None):
+    formatted = apply_chat_template(processor, config, prompt, num_images=len(images) if images else 0)
+    ctx, it = rg.generate(prompt=formatted, images=images, args=args)
+    text = "".join(t.text for t in it)
+    return name, text
+
+with ThreadPoolExecutor(max_workers=4) as pool:
+    futures = [
+        pool.submit(submit, "text", "What is 2+2?"),
+        pool.submit(submit, "image", "Describe this image.", ["photo.jpg"]),
+        pool.submit(submit, "text2", "Capital of France?"),
+    ]
+    for f in as_completed(futures):
+        name, text = f.result()
+        print(f"[{name}]: {text}")
+```
 
 ## Multi-Image Chat Support
 
