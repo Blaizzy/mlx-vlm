@@ -160,7 +160,17 @@ mlx_vlm.server --trust-remote-code
 
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
+- `--model`: Pre-load a model at startup for faster first request
+- `--adapter-path`: Adapter weights to load with the model
 - `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
+- `--vision-cache-size`: Max number of cached vision features (default: `20`)
+
+```sh
+# Pre-load model with custom vision cache
+mlx_vlm.server --model mlx-community/Qwen2.5-VL-3B-Instruct-4bit --vision-cache-size 50
+```
+
+**Vision Feature Caching**: The server caches vision encoder outputs so repeated images skip the vision tower entirely. On gemma4, this saves ~230ms and ~1GB peak memory per cached image hit. The cache uses LRU eviction and is cleared automatically on model unload. Set `--vision-cache-size 0` to disable.
 
 You can also set trust remote code via environment variable:
 ```sh
