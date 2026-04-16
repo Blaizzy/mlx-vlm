@@ -953,7 +953,7 @@ async def responses_endpoint(request: Request):
             raise HTTPException(status_code=400, detail="Missing input.")
 
         template_kwargs = {}
-        if getattr(openai_request, "enable_thinking", False):
+        if getattr(openai_request, "enable_thinking", True):
             template_kwargs["enable_thinking"] = True
 
         formatted_prompt = apply_chat_template(
@@ -1277,7 +1277,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 )
 
         template_kwargs = {}
-        if getattr(request, "enable_thinking", False):
+        if getattr(request, "enable_thinking", True):
             template_kwargs["enable_thinking"] = True
 
         formatted_prompt = apply_chat_template(
