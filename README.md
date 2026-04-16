@@ -9,7 +9,8 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
   - [Command Line Interface (CLI)](#command-line-interface-cli)
   - [Chat UI with Gradio](#chat-ui-with-gradio)
   - [Python Script](#python-script)
-- [Continuous Batching](#continuous-batching)
+  - [Server (FastAPI)](#server-fastapi)
+    - [Continuous Batching](#continuous-batching)
 - [Multi-Image Chat Support](#multi-image-chat-support)
   - [Supported Models](#supported-models)
   - [Usage Examples](#usage-examples)
@@ -313,7 +314,7 @@ curl -X POST "http://localhost:8080/responses" \
 - `stream`: Enable streaming responses
 
 
-## Continuous Batching
+### Continuous Batching
 
 The server supports continuous batching for higher throughput when handling multiple concurrent requests. New requests join the active batch immediately without waiting for existing requests to finish, and mixed batches of image and text-only requests are supported.
 
@@ -332,14 +333,14 @@ curl http://localhost:8080/health
 
 If `--model` is omitted, the model is loaded on the first request.
 
-### How It Works
+#### How It Works
 
 - A dedicated generation thread runs a `BatchGenerator` that processes multiple requests in parallel
 - Image requests are prefilled individually with their own vision embeddings, then join the shared decoding batch
 - Text-only requests are batched together for efficient prefill
 - After prefill, all requests decode together in a single batch, sharing GPU compute
 
-### Python Example
+#### Python Example
 
 You can also use continuous batching directly via the `ResponseGenerator`:
 
@@ -376,7 +377,7 @@ for token in token_iter:
 rg.stop_and_join()
 ```
 
-### Concurrent Requests
+#### Concurrent Requests
 
 Multiple requests can be submitted from different threads. They will be batched together automatically:
 
