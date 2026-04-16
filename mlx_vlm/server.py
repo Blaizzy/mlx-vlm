@@ -37,6 +37,7 @@ from .sample_utils import top_p_sampling
 from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load, prepare_inputs
 from .version import __version__
+from .vision_cache import VisionFeatureCache
 
 # =============================================================================
 # ResponseGenerator - Concurrent Request Handling with Threaded Batching
@@ -507,6 +508,7 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
         "model": model,
         "processor": processor,
         "config": config,
+        "vision_cache": VisionFeatureCache(),
     }
 
     return model, processor, config
@@ -539,7 +541,9 @@ def unload_model_sync():
         response_generator.stop_and_join()
         response_generator = None
 
-    # Clear references
+    # Clear vision cache before dropping references
+    if "vision_cache" in model_cache:
+        model_cache["vision_cache"].clear()
     model_cache = {}
     # Force garbage collection
     gc.collect()
@@ -1159,6 +1163,7 @@ async def responses_endpoint(request: Request):
                             temperature=openai_request.temperature,
                             max_tokens=openai_request.max_output_tokens,
                             top_p=openai_request.top_p,
+                            vision_cache=model_cache.get("vision_cache"),
                             **kwargs,
                         )
 
@@ -1269,6 +1274,7 @@ async def responses_endpoint(request: Request):
                         max_tokens=openai_request.max_output_tokens,
                         top_p=openai_request.top_p,
                         verbose=False,
+                        vision_cache=model_cache.get("vision_cache"),
                         **kwargs,
                     )
                     full_text = result.text
@@ -1541,6 +1547,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             temperature=request.temperature,
                             max_tokens=request.max_tokens,
                             top_p=request.top_p,
+                            vision_cache=model_cache.get("vision_cache"),
                             **kwargs,
                         )
 
@@ -1649,6 +1656,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         max_tokens=request.max_tokens,
                         top_p=request.top_p,
                         verbose=False,
+                        vision_cache=model_cache.get("vision_cache"),
                         **kwargs,
                     )
                     full_text = gen_result.text
