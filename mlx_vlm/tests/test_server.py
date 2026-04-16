@@ -27,7 +27,6 @@ def test_chat_completions_endpoint_rejects_invalid_resize_shape(client, value):
     assert response.status_code == 422
 
 
-@pytest.mark.skip(reason="Server uses legacy resize_shape schema")
 def test_chat_request_schema_allows_one_or_two_resize_shape_values():
     resize_shape = server.ChatRequest.model_json_schema()["properties"]["resize_shape"]
     lengths = {
@@ -39,7 +38,6 @@ def test_chat_request_schema_allows_one_or_two_resize_shape_values():
     assert lengths == {(1, 1), (2, 2)}
 
 
-@pytest.mark.skip(reason="Server uses legacy request schema without enable_thinking")
 def test_responses_endpoint_forwards_new_sampling_args(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
@@ -90,7 +88,6 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     assert mock_generate.call_args.kwargs["thinking_start_token"] == "<think>"
 
 
-@pytest.mark.skip(reason="Server uses legacy request schema")
 def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()

@@ -64,9 +64,6 @@ def test_fractional_turboquant_improves_reconstruction():
     assert mse_35bit < mse_3bit
 
 
-@pytest.mark.skip(
-    reason="maybe_quantize_kv_cache uses legacy signature without kv_quant_scheme"
-)
 def test_turboquant_cache_replaces_kv_cache_for_fractional_bits():
     layer_cache = KVCache()
     layer_cache.update_and_fetch(
@@ -86,9 +83,6 @@ def test_turboquant_cache_replaces_kv_cache_for_fractional_bits():
     assert isinstance(prompt_cache[0], TurboQuantKVCache)
 
 
-@pytest.mark.skip(
-    reason="maybe_quantize_kv_cache uses legacy signature without kv_quant_scheme"
-)
 def test_explicit_turboquant_scheme_supports_integer_bits():
     layer_cache = KVCache()
     layer_cache.update_and_fetch(
@@ -109,9 +103,6 @@ def test_explicit_turboquant_scheme_supports_integer_bits():
     assert prompt_cache[0].bits == pytest.approx(3.0)
 
 
-@pytest.mark.skip(
-    reason="maybe_quantize_kv_cache uses legacy signature without kv_quant_scheme"
-)
 def test_turboquant_skips_non_kv_cache_entries():
     linear_cache = ArraysCache(size=2)
     linear_cache[0] = mx.zeros((1, 8))
