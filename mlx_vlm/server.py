@@ -3,6 +3,7 @@ import asyncio
 import gc
 import json
 import os
+import time
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -13,7 +14,6 @@ from threading import Thread
 from typing import (
     Any,
     Callable,
-    Dict,
     Iterator,
     List,
     Literal,
@@ -82,11 +82,12 @@ class StreamingToken:
 
 class ResponseGenerator:
     """
-    Manages concurrent request handling with threaded batching.
+    Continuous batching for concurrent requests via a single GPU thread.
 
-    Runs a dedicated generation thread that processes requests from a queue
-    using BatchGenerator. Supports mixed batches of image and text-only
-    requests via continuous batching.
+    A dedicated thread owns all GPU work (BatchGenerator). FastAPI async
+    handlers submit requests to a queue and read tokens back from
+    per-request queues. Multiple requests are batched together for
+    higher throughput — same pattern as mlx-lm's server.
     """
 
     def __init__(self, model, processor, stop_tokens: Optional[set] = None):
@@ -98,14 +99,13 @@ class ResponseGenerator:
         )
         self.requests: Queue = Queue()
         self._stop = False
-
-        self._generation_thread = Thread(target=self._generate, daemon=True)
-        self._generation_thread.start()
+        self._thread = Thread(target=self._run, daemon=True)
+        self._thread.start()
 
     def stop_and_join(self):
         self._stop = True
         self.requests.put(None)
-        self._generation_thread.join(timeout=5.0)
+        self._thread.join(timeout=5.0)
 
     def generate(
         self,
@@ -115,56 +115,36 @@ class ResponseGenerator:
         args: Optional[GenerationArguments] = None,
     ) -> Tuple[GenerationContext, Iterator[StreamingToken]]:
         args = args or GenerationArguments()
-        response_queue: Queue = Queue()
+        rqueue: Queue = Queue()
 
-        # Preprocess images/audio BEFORE queueing
-        preprocessed_inputs = None
-        if images or audio:
-            add_special_tokens = (
-                getattr(self.processor, "chat_template", None) is None
-                if self.model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
-                else True
-            )
-            image_token_index = getattr(self.model.config, "image_token_index", None)
-            preprocessed_inputs = prepare_inputs(
-                self.processor,
-                images=images,
-                audio=audio,
-                prompts=prompt,
-                image_token_index=image_token_index,
-                add_special_tokens=add_special_tokens,
-            )
+        # Preprocess images/audio on the caller thread (not the GPU thread)
+        input_ids, gen_kwargs = self._preprocess(prompt, images, audio)
+        prompt_tokens = (
+            input_ids.size if hasattr(input_ids, "size") else len(input_ids)
+        )
 
-        request = {
-            "prompt": prompt,
-            "images": images,
-            "audio": audio,
-            "args": args,
-            "preprocessed_inputs": preprocessed_inputs,
-        }
+        self.requests.put((rqueue, input_ids, gen_kwargs, args))
 
-        self.requests.put((response_queue, request))
-
-        ctx = response_queue.get()
+        # Block until the GPU thread sends back the context
+        ctx = rqueue.get()
         if isinstance(ctx, Exception):
             raise ctx
 
         def token_iterator():
             try:
                 while True:
-                    response = response_queue.get(timeout=30.0)
-                    if response is None:
+                    item = rqueue.get(timeout=60.0)
+                    if item is None:
                         break
-                    if isinstance(response, Exception):
-                        raise response
-                    yield response
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item
             finally:
-                self._request_cleanup(ctx.uid)
+                pass  # batch cleanup happens in _run
 
-        return ctx, token_iterator()
+        return GenerationContext(uid=ctx, prompt_tokens=prompt_tokens), token_iterator()
 
-    def _request_cleanup(self, uid: int):
-        self.requests.put(("_cleanup", uid))
+    # -- internals --
 
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
         if args.temperature == 0:
@@ -178,264 +158,141 @@ class ResponseGenerator:
 
         return sampler
 
-    def _preprocess_request(self, request: dict) -> Tuple[mx.array, dict]:
-        prompt = request["prompt"]
-        images = request["images"]
-        audio = request["audio"]
-
-        if request.get("preprocessed_inputs") is not None:
-            inputs = request["preprocessed_inputs"]
-        else:
-            add_special_tokens = (
-                getattr(self.processor, "chat_template", None) is None
-                if self.model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
-                else True
-            )
-            image_token_index = getattr(self.model.config, "image_token_index", None)
-            inputs = prepare_inputs(
-                self.processor,
-                images=images,
-                audio=audio,
-                prompts=prompt,
-                image_token_index=image_token_index,
-                add_special_tokens=add_special_tokens,
-            )
-
-        input_ids = inputs.get("input_ids", None)
-        pixel_values = inputs.get("pixel_values", None)
-        mask = inputs.get("attention_mask", None)
-
+    def _preprocess(
+        self, prompt, images=None, audio=None
+    ) -> Tuple[mx.array, dict]:
+        add_special_tokens = (
+            getattr(self.processor, "chat_template", None) is None
+            if self.model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
+            else True
+        )
+        image_token_index = getattr(self.model.config, "image_token_index", None)
+        inputs = prepare_inputs(
+            self.processor,
+            images=images,
+            audio=audio,
+            prompts=prompt,
+            image_token_index=image_token_index,
+            add_special_tokens=add_special_tokens,
+        )
+        input_ids = inputs.get("input_ids")
+        pixel_values = inputs.get("pixel_values")
+        mask = inputs.get("attention_mask")
         data_kwargs = {
             k: v
             for k, v in inputs.items()
             if k not in ["input_ids", "pixel_values", "attention_mask"]
         }
-
         gen_kwargs = {}
         if pixel_values is not None:
-            embedding_output = self.model.get_input_embeddings(
+            embed = self.model.get_input_embeddings(
                 input_ids, pixel_values, mask=mask, **data_kwargs
             )
-            gen_kwargs = {**data_kwargs, **embedding_output.to_dict()}
-
+            gen_kwargs = {**data_kwargs, **embed.to_dict()}
         return input_ids, gen_kwargs
 
-    def _serve_single(self, response_queue: Queue, request: dict):
-        prompt = request["prompt"]
-        images = request["images"]
-        audio = request["audio"]
-        args = request["args"]
-        preprocessed_inputs = request.get("preprocessed_inputs")
-
-        try:
-            if args.seed is not None:
-                mx.random.seed(args.seed)
-
-            gen_kwargs = {
-                "max_tokens": args.max_tokens,
-                "temperature": args.temperature,
-                "top_p": args.top_p,
-            }
-
-            if preprocessed_inputs is not None:
-                gen_kwargs.update(preprocessed_inputs)
-                prompt_tokens = preprocessed_inputs.get("input_ids").size
-            else:
-                input_ids, _ = self._preprocess_request(request)
-                prompt_tokens = (
-                    input_ids.size if hasattr(input_ids, "size") else len(input_ids)
-                )
-
-            ctx = GenerationContext(uid=-1, prompt_tokens=prompt_tokens)
-            response_queue.put(ctx)
-
-            for result in stream_generate(
-                self.model,
-                self.processor,
-                prompt,
-                image=images if preprocessed_inputs is None else None,
-                audio=audio if preprocessed_inputs is None else None,
-                **gen_kwargs,
-            ):
-                tok = result.token
-                if hasattr(tok, "item"):
-                    tok = tok.item()
-
-                lp = 0.0
-                if result.logprobs is not None:
-                    try:
-                        lp_val = result.logprobs[tok]
-                        lp = lp_val.item() if hasattr(lp_val, "item") else float(lp_val)
-                    except (IndexError, TypeError, ValueError):
-                        lp = 0.0
-
-                response_queue.put(
-                    StreamingToken(
-                        text=result.text,
-                        token=tok,
-                        logprobs=lp,
-                        finish_reason=None,
-                        peak_memory=result.peak_memory,
-                    )
-                )
-
-            response_queue.put(None)
-        except Exception as e:
-            response_queue.put(e)
-        finally:
-            mx.clear_cache()
-
-    def _generate(self):
-        batch_generator = None
-        batch_results: Dict[int, dict] = {}
+    def _run(self):
+        """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
+        batch_gen = None
+        # uid -> {rqueue, tokens, gen_kwargs}
+        active: dict = {}
 
         while not self._stop:
             try:
-                timeout = 0.01 if batch_results else 0.1
+                # Collect all pending requests from the queue
+                new_items = []
+                timeout = 0.001 if active else 0.1
                 try:
                     item = self.requests.get(timeout=timeout)
+                    if item is None:
+                        if self._stop:
+                            break
+                    else:
+                        new_items.append(item)
                 except QueueEmpty:
-                    item = None
+                    pass
 
-                if item is None:
-                    if self._stop:
-                        break
-                    if batch_generator is not None and batch_results:
-                        self._process_batch_step(batch_generator, batch_results)
-                    continue
-
-                # Collect this item + drain all other pending items from
-                # the queue so text-only requests get batched together.
-                pending = [item]
+                # Drain any more that arrived
                 while True:
                     try:
-                        pending.append(self.requests.get_nowait())
+                        item = self.requests.get_nowait()
+                        if item is not None:
+                            new_items.append(item)
                     except QueueEmpty:
                         break
 
-                for item in pending:
-                    if item is None:
-                        if self._stop:
-                            return
-                        continue
-                    # Handle cleanup request
-                    if (
-                        isinstance(item, tuple)
-                        and len(item) == 2
-                        and item[0] == "_cleanup"
-                    ):
-                        cleanup_uid = item[1]
-                        if cleanup_uid in batch_results:
-                            del batch_results[cleanup_uid]
-                        if batch_generator is not None:
-                            batch_generator.remove([cleanup_uid])
-                        continue
-
-                    response_queue, request = item
-                    args = request["args"]
-
-                    # Non-batchable: has seed
-                    if args.seed is not None:
-                        if batch_generator is not None and batch_results:
-                            while batch_results:
-                                self._process_batch_step(
-                                    batch_generator, batch_results
-                                )
-                            batch_generator = None
-                        self._serve_single(response_queue, request)
-                        continue
-
-                    if batch_generator is None:
-                        batch_generator = BatchGenerator(
+                # Insert new requests into batch
+                for rqueue, input_ids, gen_kwargs, args in new_items:
+                    if batch_gen is None:
+                        batch_gen = BatchGenerator(
                             self.model.language_model,
                             self.processor,
                             stop_tokens=self.stop_tokens,
                             sampler=self._make_sampler(args),
                         )
 
+                    has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
+
+                    # Image request: flush pending text-only first
+                    if has_embeds and batch_gen.unprocessed_prompts:
+                        self._flush(batch_gen, active)
+
                     try:
-                        input_ids, gen_kwargs = self._preprocess_request(request)
-                        prompt_tokens = (
-                            input_ids.size
-                            if hasattr(input_ids, "size")
-                            else len(input_ids)
+                        (uid,) = batch_gen.insert(
+                            [input_ids.squeeze(0).tolist()],
+                            max_tokens=args.max_tokens,
                         )
-                        has_embeddings = bool(
-                            gen_kwargs.get("inputs_embeds") is not None
-                        )
-
-                        # Image request: drain pending text-only prompts first,
-                        # then insert and prefill immediately with embeddings.
-                        if has_embeddings:
-                            if batch_generator.unprocessed_prompts:
-                                while batch_generator.unprocessed_prompts:
-                                    drain = batch_generator.next()
-                                    if drain:
-                                        self._handle_responses(drain, batch_results)
-                                    else:
-                                        break
-
-                            (uid,) = batch_generator.insert(
-                                [input_ids.squeeze(0).tolist()],
-                                max_tokens=args.max_tokens,
-                            )
-                            ctx = GenerationContext(
-                                uid=uid, prompt_tokens=prompt_tokens
-                            )
-                            response_queue.put(ctx)
-                            batch_results[uid] = {
-                                "rqueue": response_queue,
-                                "tokens": [],
-                            }
-
-                            responses = batch_generator.next(**gen_kwargs)
-                            if responses:
-                                self._handle_responses(responses, batch_results)
-                        else:
-                            # Text-only: just insert, will be batched with
-                            # other text-only requests on the next next() call.
-                            (uid,) = batch_generator.insert(
-                                [input_ids.squeeze(0).tolist()],
-                                max_tokens=args.max_tokens,
-                            )
-                            ctx = GenerationContext(
-                                uid=uid, prompt_tokens=prompt_tokens
-                            )
-                            response_queue.put(ctx)
-                            batch_results[uid] = {
-                                "rqueue": response_queue,
-                                "tokens": [],
-                            }
-
                     except Exception as e:
-                        response_queue.put(e)
+                        rqueue.put(e)
+                        continue
 
-                # After processing all pending items, run one batch step
-                # to prefill any queued text-only prompts together + decode.
-                if batch_generator is not None and batch_results:
-                    self._process_batch_step(batch_generator, batch_results)
+                    rqueue.put(uid)  # send uid as context
+                    active[uid] = {
+                        "rqueue": rqueue,
+                        "tokens": [],
+                        "gen_kwargs": gen_kwargs if has_embeds else None,
+                    }
+
+                    # Prefill image request immediately with its embeddings
+                    if has_embeds:
+                        self._step(batch_gen, active, gen_kwargs)
+
+                if not active or batch_gen is None:
+                    continue
+
+                # Tight generation loop — run as many steps as we can
+                # in a time budget, then check for new requests.
+                deadline = time.time() + 0.5
+                while active and time.time() < deadline:
+                    self._step(batch_gen, active)
 
             except Exception as e:
                 print(f"Error in generation thread: {e}")
                 traceback.print_exc()
 
-    def _handle_responses(self, responses, batch_results: dict):
+    def _step(self, batch_gen, active, gen_kwargs=None):
+        """One batch generation step: prefill + decode."""
+        kwargs = gen_kwargs or {}
+        responses = batch_gen.next(**kwargs)
+        if not responses:
+            return
+
         for r in responses:
-            if r.uid not in batch_results:
+            if r.uid not in active:
                 continue
 
-            result = batch_results[r.uid]
-            rqueue = result["rqueue"]
-            tokens = result["tokens"]
+            info = active[r.uid]
+            rqueue = info["rqueue"]
+            tokens = info["tokens"]
 
             if r.finish_reason == "stop":
                 text = ""
             else:
                 tokens.append(r.token)
                 if len(tokens) >= 2:
-                    prev_text = self.tokenizer.decode(tokens[:-1])
-                    curr_text = self.tokenizer.decode(tokens)
-                    text = curr_text[len(prev_text) :]
+                    prev = self.tokenizer.decode(tokens[:-1])
+                    curr = self.tokenizer.decode(tokens)
+                    text = curr[len(prev):]
                 else:
                     text = self.tokenizer.decode(tokens)
 
@@ -446,10 +303,10 @@ class ResponseGenerator:
             lp = 0.0
             if r.logprobs is not None:
                 try:
-                    lp_val = r.logprobs[tok]
-                    lp = lp_val.item() if hasattr(lp_val, "item") else float(lp_val)
+                    v = r.logprobs[tok]
+                    lp = v.item() if hasattr(v, "item") else float(v)
                 except (IndexError, TypeError, ValueError):
-                    lp = 0.0
+                    pass
 
             rqueue.put(
                 StreamingToken(
@@ -463,12 +320,14 @@ class ResponseGenerator:
 
             if r.finish_reason is not None:
                 rqueue.put(None)
-                del batch_results[r.uid]
+                del active[r.uid]
 
-    def _process_batch_step(self, batch_generator: BatchGenerator, batch_results: dict):
-        responses = batch_generator.next()
-        if responses:
-            self._handle_responses(responses, batch_results)
+    def _flush(self, batch_gen, active):
+        """Drain all pending text-only prompts before inserting an image request."""
+        while batch_gen.unprocessed_prompts:
+            self._step(batch_gen, active)
+            if not batch_gen.unprocessed_prompts:
+                break
 
 
 # Global response generator for continuous batching
