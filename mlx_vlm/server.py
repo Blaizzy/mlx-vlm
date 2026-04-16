@@ -117,9 +117,16 @@ class ResponseGenerator:
         args = args or GenerationArguments()
         rqueue: Queue = Queue()
 
-        # All preprocessing deferred to the GPU thread to avoid
-        # concurrent Metal access from multiple caller threads.
-        self.requests.put((rqueue, prompt, images, audio, args))
+        # CPU preprocessing (tokenize, load images) on caller thread.
+        # GPU work (vision encoder) deferred to GPU thread.
+        raw_inputs = self._cpu_preprocess(prompt, images, audio)
+        prompt_tokens = (
+            raw_inputs["input_ids"].size
+            if hasattr(raw_inputs["input_ids"], "size")
+            else len(raw_inputs["input_ids"])
+        )
+
+        self.requests.put((rqueue, raw_inputs, prompt_tokens, args))
 
         # Block until the GPU thread sends back the context
         ctx = rqueue.get()
@@ -140,6 +147,23 @@ class ResponseGenerator:
 
         return ctx, token_iterator()
 
+    def _cpu_preprocess(self, prompt, images=None, audio=None) -> dict:
+        """CPU-only: tokenize text, load/resize images. Thread-safe."""
+        add_special_tokens = (
+            getattr(self.processor, "chat_template", None) is None
+            if self.model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
+            else True
+        )
+        image_token_index = getattr(self.model.config, "image_token_index", None)
+        return prepare_inputs(
+            self.processor,
+            images=images,
+            audio=audio,
+            prompts=prompt,
+            image_token_index=image_token_index,
+            add_special_tokens=add_special_tokens,
+        )
+
     # -- internals --
 
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
@@ -154,29 +178,14 @@ class ResponseGenerator:
 
         return sampler
 
-    def _preprocess(self, prompt, images=None, audio=None) -> Tuple[mx.array, dict]:
-        """Full preprocessing: tokenize, load images, run vision encoder.
-        Must run on the GPU thread."""
-        add_special_tokens = (
-            getattr(self.processor, "chat_template", None) is None
-            if self.model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
-            else True
-        )
-        image_token_index = getattr(self.model.config, "image_token_index", None)
-        inputs = prepare_inputs(
-            self.processor,
-            images=images,
-            audio=audio,
-            prompts=prompt,
-            image_token_index=image_token_index,
-            add_special_tokens=add_special_tokens,
-        )
-        input_ids = inputs.get("input_ids")
-        pixel_values = inputs.get("pixel_values")
-        mask = inputs.get("attention_mask")
+    def _gpu_embed(self, raw_inputs: dict) -> Tuple[mx.array, dict]:
+        """GPU-only: run vision encoder if needed. Must run on GPU thread."""
+        input_ids = raw_inputs.get("input_ids")
+        pixel_values = raw_inputs.get("pixel_values")
+        mask = raw_inputs.get("attention_mask")
         data_kwargs = {
             k: v
-            for k, v in inputs.items()
+            for k, v in raw_inputs.items()
             if k not in ["input_ids", "pixel_values", "attention_mask"]
         }
         gen_kwargs = {}
@@ -218,7 +227,7 @@ class ResponseGenerator:
                         break
 
                 # Insert new requests into batch
-                for rqueue, prompt, images, audio, args in new_items:
+                for rqueue, raw_inputs, prompt_tokens, args in new_items:
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
                             self.model.language_model,
@@ -227,15 +236,8 @@ class ResponseGenerator:
                             sampler=self._make_sampler(args),
                         )
 
-                    # All preprocessing on the GPU thread
-                    input_ids, gen_kwargs = self._preprocess(
-                        prompt, images, audio
-                    )
-                    prompt_tokens = (
-                        input_ids.size
-                        if hasattr(input_ids, "size")
-                        else len(input_ids)
-                    )
+                    # GPU work: vision encoder only (if images present)
+                    input_ids, gen_kwargs = self._gpu_embed(raw_inputs)
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
 
                     # Image request: flush pending text-only first
@@ -950,8 +952,13 @@ async def responses_endpoint(request: Request):
             print("no input")
             raise HTTPException(status_code=400, detail="Missing input.")
 
+        template_kwargs = {}
+        if getattr(openai_request, "enable_thinking", False):
+            template_kwargs["enable_thinking"] = True
+
         formatted_prompt = apply_chat_template(
-            processor, config, chat_messages, num_images=len(images)
+            processor, config, chat_messages, num_images=len(images),
+            **template_kwargs,
         )
 
         generated_at = datetime.now().timestamp()
@@ -1269,12 +1276,17 @@ async def chat_completions_endpoint(request: ChatRequest):
                     {"role": message.role, "content": text_content}
                 )
 
+        template_kwargs = {}
+        if getattr(request, "enable_thinking", False):
+            template_kwargs["enable_thinking"] = True
+
         formatted_prompt = apply_chat_template(
             processor,
             config,
             processed_messages,
             num_images=len(images),
             num_audios=len(audio),
+            **template_kwargs,
         )
 
         if request.stream:
