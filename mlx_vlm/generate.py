@@ -227,7 +227,7 @@ def parse_arguments():
     parser.add_argument(
         "--triattention-budget",
         type=int,
-        default=2048,
+        default=None,
         help="Maximum KV tokens to retain after TriAttention compression.",
     )
 
@@ -408,7 +408,7 @@ def generate_step(
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
     triattention_calib: Optional[str] = None,
-    triattention_budget: int = 2048,
+    triattention_budget: Optional[int] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
