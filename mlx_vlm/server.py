@@ -1101,12 +1101,15 @@ async def responses_endpoint(request: Request):
                             yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
                             await asyncio.sleep(0.01)
 
+                    # Split thinking from content for final events
+                    _, clean_text = _split_thinking(full_text)
+
                     # Send response.output_text.done event (to match the openai pipeline)
-                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=full_text).model_dump_json()}\n\n"
+                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text).model_dump_json()}\n\n"
 
                     # Send response.content_part.done event (to match the openai pipeline)
                     final_content_part = ContentPartOutputText(
-                        type="output_text", text=full_text, annotations=[]
+                        type="output_text", text=clean_text, annotations=[]
                     )
                     yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=0, content_index=0, part=final_content_part).model_dump_json()}\n\n"
 
@@ -1200,6 +1203,8 @@ async def responses_endpoint(request: Request):
                 mx.clear_cache()
                 gc.collect()
 
+                reasoning, content = _split_thinking(full_text)
+
                 response = OpenAIResponse(
                     id=response_id,
                     object="response",
@@ -1214,12 +1219,13 @@ async def responses_endpoint(request: Request):
                             "content": [
                                 {
                                     "type": "output_text",
-                                    "text": full_text,
+                                    "text": content,
                                 }
                             ],
+                            "reasoning": reasoning,
                         }
                     ],
-                    output_text=full_text,
+                    output_text=content,
                     temperature=openai_request.temperature,
                     top_p=openai_request.top_p,
                     usage={
