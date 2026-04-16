@@ -404,14 +404,7 @@ def _dflash_rounds(
 ) -> Generator[Tuple[int, None], None, None]:
     """DFlash speculative-decoding **round loop**.
 
-    The caller (``generate_step``) is responsible for prefill: running
-    the target on the prompt with ``capture_layer_ids`` set, sampling
-    the first bonus token, and packaging the captured hidden states into
-    ``hidden``. This function picks up from there and only runs the
-    speculative rounds: draft → verify → walk → rollback.
-
-    Yields ``(token_id, None)`` tuples starting from round 1 (the
-    caller has already yielded ``first_bonus``).
+    draft → verify → walk → rollback.
     """
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
@@ -607,11 +600,7 @@ def generate_step(
             max_kv_size=max_kv_size,
         )
 
-    # Speculative decoding setup. The drafter needs hidden states at
-    # ``target_layer_ids`` captured during prefill, so we tell the
-    # language model to surface them via ``LanguageModelOutput`` and
-    # disable chunked prefill (the drafter requires the full prompt's
-    # hidden states in one shot for its first round).
+    # Speculative decoding setup
     original_prompt_len = int(input_ids.shape[1])
     last_outputs = None
     if draft_model is not None:
@@ -707,14 +696,9 @@ def generate_step(
 
     mx.async_eval(y)
 
-    # Speculative decoding: skip the AR decode loop, yield the prefill
-    # bonus, then dispatch to the correct speculative round loop by
-    # ``draft_kind``. Each family (dflash today; EAGLE, Medusa, … later)
-    # plugs in as an additional branch here.
+    # Speculative decoding
     if draft_model is not None:
-        mx.eval(y)
-        first_bonus = y.item()
-        yield first_bonus, logprobs
+        yield y.item(), logprobs
         hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
         if draft_kind == "dflash":
             yield from _dflash_rounds(
@@ -722,7 +706,7 @@ def generate_step(
                 draft_model,
                 prompt_cache,
                 hidden,
-                first_bonus=first_bonus,
+                first_bonus=y.item(),
                 prompt_len=original_prompt_len,
                 max_tokens=max_tokens,
                 sampler=sampler,
