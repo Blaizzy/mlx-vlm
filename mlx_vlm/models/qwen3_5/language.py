@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -256,6 +256,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         inputs: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        gdn_sink: Optional[list] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
 
@@ -306,6 +307,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
+        if gdn_sink is not None:
+            # Tuple layout consumed by ``rollback_speculative_cache`` below.
+            gdn_sink.append(
+                (
+                    q, k, v, a, b,
+                    self.A_log, self.dt_bias,
+                    state, mask,
+                    conv_input, self.conv_kernel_size,
+                )
+            )
+
         out, state = gated_delta_update(
             q,
             k,
@@ -321,6 +333,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         if cache is not None:
             cache[1] = state
+            if hasattr(cache, "advance"):
+                cache.advance(S)
 
         out = self.norm(out, z)
         return self.out_proj(out.reshape(B, S, -1))
@@ -347,14 +361,16 @@ class Qwen3_5DecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
+        gdn_sink: Optional[list] = None,
     ) -> mx.array:
         if self.is_linear:
-            r = self.linear_attn(self.input_layernorm(x), mask, cache)
+            r = self.linear_attn(
+                self.input_layernorm(x), mask, cache, gdn_sink=gdn_sink
+            )
         else:
             r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
         h = x + r
-        out = h + self.mlp(self.post_attention_layernorm(h))
-        return out
+        return h + self.mlp(self.post_attention_layernorm(h))
 
 
 class Qwen3_5Model(nn.Module):
@@ -377,6 +393,9 @@ class Qwen3_5Model(nn.Module):
         mask: Optional[mx.array] = None,
         cache=None,
         position_ids: Optional[mx.array] = None,
+        capture_layer_ids: Optional[List[int]] = None,
+        hidden_sink: Optional[list] = None,
+        gdn_sink: Optional[list] = None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -389,9 +408,12 @@ class Qwen3_5Model(nn.Module):
         fa_mask = create_attention_mask(h, cache[self.fa_idx])
         ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        capture_set = set(capture_layer_ids) if capture_layer_ids else set()
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
-            h = layer(h, mask, c, position_ids)
+            h = layer(h, mask, c, position_ids, gdn_sink=gdn_sink)
+            if hidden_sink is not None and i in capture_set:
+                hidden_sink.append(h)
 
         return self.norm(h)
 
@@ -408,6 +430,43 @@ class LanguageModel(nn.Module):
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def rollback_speculative_cache(
+        self,
+        caches: List[Any],
+        gdn_states: List,
+        accepted: int,
+        trim: int,
+    ) -> None:
+        """Roll caches back to the first ``accepted + 1`` positions of
+        the last verify block.
+
+        Full-attention (trimmable) caches are sliced directly. Linear
+        (gated-delta) caches are restored by replaying
+        ``gated_delta_update`` on the captured pre-verify inputs in
+        ``gdn_states`` (produced by :class:`Qwen3_5GatedDeltaNet` during
+        the verify forward via the ``gdn_sink`` call argument).
+        """
+        n = accepted + 1
+        j = 0
+        for c in caches:
+            if c is None:
+                continue
+            if c.is_trimmable():
+                c.trim(trim)
+                continue
+            q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = (
+                gdn_states[j]
+            )
+            _, state = gated_delta_update(
+                q[:, :n], k[:, :n], v[:, :n], a[:, :n], b[:, :n],
+                A_log, dt_bias, init_state,
+                None if mask is None else mask[:, :n],
+                use_kernel=True,
+            )
+            c[1] = state
+            c[0] = conv_input[:, accepted + 1 : accepted + K]
+            j += 1
 
     def get_rope_index(
         self,
@@ -587,6 +646,7 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
         if pixel_values is not None:
             self._rope_deltas = None
             self._position_ids = None
@@ -650,17 +710,31 @@ class LanguageModel(nn.Module):
                     position_ids, (3, batch_size, seq_length)
                 )
 
+        hidden_sink: Optional[List[mx.array]] = (
+            [] if capture_layer_ids is not None else None
+        )
+        gdn_sink: Optional[list] = (
+            [] if capture_layer_ids is not None else None
+        )
+
         out = self.model(
             inputs,
             cache=cache,
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
+            capture_layer_ids=capture_layer_ids,
+            hidden_sink=hidden_sink,
+            gdn_sink=gdn_sink,
         )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(
+            logits=out,
+            hidden_states=hidden_sink,
+            gdn_states=gdn_sink,
+        )
 
     @property
     def layers(self):

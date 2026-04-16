@@ -195,6 +195,24 @@ def parse_arguments():
         "Try 512 or 256 if you hit GPU memory errors during prefill.",
     )
     parser.add_argument(
+        "--draft-model",
+        type=str,
+        default=None,
+        help="Speculative drafter path or HF id (e.g. z-lab/Qwen3.5-4B-DFlash).",
+    )
+    parser.add_argument(
+        "--draft-kind",
+        type=str,
+        default="dflash",
+        help="Drafter family. Currently only 'dflash' is supported.",
+    )
+    parser.add_argument(
+        "--draft-block-size",
+        type=int,
+        default=None,
+        help="Override the drafter's configured block size.",
+    )
+    parser.add_argument(
         "--enable-thinking",
         action="store_true",
         help="Enable thinking mode in the chat template (e.g. for Qwen3.5).",
@@ -371,6 +389,113 @@ class PromptCacheState:
         self.cache = kv_cache
 
 
+def _dflash_rounds(
+    model: nn.Module,
+    draft_model: nn.Module,
+    prompt_cache: List[Any],
+    hidden: mx.array,
+    *,
+    first_bonus: int,
+    prompt_len: int,
+    max_tokens: int,
+    sampler: Callable[[mx.array], mx.array],
+    draft_block_size: Optional[int] = None,
+    token_dtype: mx.Dtype = mx.int32,
+) -> Generator[Tuple[int, None], None, None]:
+    """DFlash speculative-decoding **round loop**.
+
+    The caller (``generate_step``) is responsible for prefill: running
+    the target on the prompt with ``capture_layer_ids`` set, sampling
+    the first bonus token, and packaging the captured hidden states into
+    ``hidden``. This function picks up from there and only runs the
+    speculative rounds: draft → verify → walk → rollback.
+
+    Yields ``(token_id, None)`` tuples starting from round 1 (the
+    caller has already yielded ``first_bonus``).
+    """
+    lm = model.language_model if hasattr(model, "language_model") else model
+    if not hasattr(lm, "rollback_speculative_cache"):
+        raise RuntimeError(
+            f"{type(lm).__name__} does not implement rollback_speculative_cache. "
+            "Speculative decoding with a DFlash drafter currently only "
+            "supports mlx_vlm.models.qwen3_5."
+        )
+
+    cfg = draft_model.config
+    target_layer_ids = list(cfg.target_layer_ids)
+    block_total = (
+        draft_block_size if draft_block_size is not None else int(cfg.block_size)
+    )
+
+    draft_model.bind(model)
+    draft_model._last_accept_lens = []
+    draft_cache = draft_model.make_cache()
+
+    b = first_bonus
+    emitted = 1  # the first bonus has already been yielded by the caller
+
+    while emitted < max_tokens:
+        bs = min(block_total, max_tokens - emitted + 1)
+        if bs <= 1:
+            break
+
+        # Draft
+        with mx.stream(generation_stream):
+            block = mx.array(
+                [[b] + [int(cfg.mask_token_id)] * (bs - 1)],
+                dtype=token_dtype,
+            )
+            draft_logits = draft_model(block, hidden, draft_cache)
+            trim_n = draft_cache[0].offset - (prompt_len + emitted - 1)
+            if trim_n > 0:
+                for c in draft_cache:
+                    c.trim(trim_n)
+            draft_tokens = sampler(draft_logits[:, 1 - bs :])
+        mx.async_eval(draft_tokens)
+
+        # Verify
+        with mx.stream(generation_stream):
+            verify_input = mx.concatenate(
+                [mx.array([[b]], dtype=token_dtype), draft_tokens],
+                axis=1,
+            )
+            verify_out = lm(
+                verify_input,
+                cache=prompt_cache,
+                capture_layer_ids=target_layer_ids,
+            )
+            hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
+            target_tokens = sampler(verify_out.logits)
+        mx.async_eval(target_tokens, hidden)
+
+        # Walk — first drafted-vs-target mismatch stops acceptance.
+        d_list = draft_tokens[0].tolist()
+        t_list = target_tokens[0].tolist()
+        accepted = next(
+            (i for i in range(len(d_list)) if d_list[i] != t_list[i]),
+            len(d_list),
+        )
+        new_tokens = d_list[:accepted] + [t_list[accepted]]
+        new_tokens = new_tokens[: max_tokens - emitted]
+        draft_model._last_accept_lens.append(accepted)
+
+        for tok in new_tokens:
+            yield tok, None
+            emitted += 1
+            if emitted >= max_tokens:
+                return
+
+        # Rollback the target cache to the accepted prefix.
+        trim = bs - accepted - 1
+        if trim > 0:
+            lm.rollback_speculative_cache(
+                prompt_cache, verify_out.gdn_states, accepted, trim
+            )
+
+        hidden = hidden[:, : accepted + 1, :]
+        b = new_tokens[-1] if new_tokens else b
+
+
 def generate_step(
     input_ids: mx.array,
     model: nn.Module,
@@ -394,6 +519,8 @@ def generate_step(
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
+    draft_model: Optional[nn.Module] = None,
+    draft_block_size: Optional[int] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -430,6 +557,15 @@ def generate_step(
         prefill_step_size (int): Number of tokens to process per prefill step.
           Chunked prefill processes prompts in smaller chunks to reduce peak
           memory usage.
+        draft_model (nn.Module, optional): A drafter for speculative decoding.
+          When set, the decode loop is replaced by the drafter's speculative
+          loop (e.g. DFlash block-diffusion). VLM prefill with image/audio
+          is supported via the same ``get_input_embeddings`` path the normal
+          decoder uses; decode itself is text-only. ``temperature`` and
+          ``sampler`` are respected; ``logprobs`` is always ``None`` on the
+          speculative path.
+        draft_block_size (int, optional): Override the drafter's configured
+          block size.
 
     Yields:
         Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
@@ -470,8 +606,25 @@ def generate_step(
             max_kv_size=max_kv_size,
         )
 
+    # Speculative decoding setup. The drafter needs hidden states at
+    # ``target_layer_ids`` captured during prefill, so we tell the
+    # language model to surface them via ``LanguageModelOutput`` and
+    # disable chunked prefill (the drafter requires the full prompt's
+    # hidden states in one shot for its first round).
+    original_prompt_len = int(input_ids.shape[1])
+    last_outputs = None
+    if draft_model is not None:
+        kwargs["capture_layer_ids"] = list(draft_model.config.target_layer_ids)
+        prefill_step_size = None
+        # Reset stale mRoPE state from any previous generation.
+        lm = model.language_model if hasattr(model, "language_model") else model
+        if hasattr(lm, "_position_ids"):
+            lm._position_ids = None
+        if hasattr(lm, "_rope_deltas"):
+            lm._rope_deltas = None
+
     def _step(y, inputs_embeds=None):
-        nonlocal tokens, kwargs
+        nonlocal tokens, kwargs, last_outputs
 
         with mx.stream(generation_stream):
             if "decoder_input_ids" in kwargs:
@@ -487,6 +640,7 @@ def generate_step(
                     **kwargs,
                 )
 
+            last_outputs = outputs
             logits = outputs.logits[:, -1, :]
 
             if len(processors) > 0 and len(y) > 0:
@@ -551,6 +705,28 @@ def generate_step(
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
     mx.async_eval(y)
+
+    # Speculative decoding: skip the AR decode loop, yield the prefill
+    # bonus, then hand off to the dflash round loop which shares the
+    # prompt cache and the captured hidden states from ``last_outputs``.
+    if draft_model is not None:
+        mx.eval(y)
+        first_bonus = y.item()
+        yield first_bonus, logprobs
+        hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
+        yield from _dflash_rounds(
+            model,
+            draft_model,
+            prompt_cache,
+            hidden,
+            first_bonus=first_bonus,
+            prompt_len=original_prompt_len,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            draft_block_size=draft_block_size,
+            token_dtype=input_ids.dtype,
+        )
+        return
 
     n = 0
     while True:
@@ -714,7 +890,7 @@ def stream_generate(
     else:
         tokenizer.thinking_budget_criteria = None
 
-    # Ensure we have a prompt_cache we can track for reuse
+    # Ensure we have a prompt_cache we can track for reuse.
     if "prompt_cache" not in kwargs:
         kwargs["prompt_cache"] = cache.make_prompt_cache(
             model.language_model,
@@ -1529,6 +1705,13 @@ def main():
     )
     config = model.config
 
+    draft_model = None
+    if args.draft_model is not None:
+        from .speculative.drafters import load_drafter
+
+        print(f"Loading drafter ({args.draft_kind}): {args.draft_model}")
+        draft_model = load_drafter(args.draft_model, kind=args.draft_kind)
+
     prompt = args.prompt
 
     num_images = len(args.image) if args.image is not None else 0
@@ -1633,6 +1816,10 @@ def main():
             gen_kwargs["resize_shape"] = args.resize_shape
         if args.prefill_step_size is not None:
             gen_kwargs["prefill_step_size"] = args.prefill_step_size
+        if draft_model is not None:
+            gen_kwargs["draft_model"] = draft_model
+            if args.draft_block_size is not None:
+                gen_kwargs["draft_block_size"] = args.draft_block_size
 
         result = generate(
             model,
@@ -1642,6 +1829,16 @@ def main():
         )
         if not args.verbose:
             print(result.text)
+
+        if draft_model is not None:
+            lens = getattr(draft_model, "_last_accept_lens", None) or []
+            if lens:
+                mean_accept = sum(lens) / len(lens)
+                print(
+                    f"\nDFlash: mean accepted drafted tokens/round = "
+                    f"{mean_accept:.2f} over {len(lens)} rounds "
+                    f"(block_size={draft_model.config.block_size})"
+                )
 
 
 if __name__ == "__main__":
