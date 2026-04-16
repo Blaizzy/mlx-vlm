@@ -531,13 +531,20 @@ def _dflash_rounds_batch(
     sampler: Callable[[mx.array], mx.array],
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
+    stop_check: Optional[Callable[[int, int], bool]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batch DFlash speculative-decoding round loop (B > 1).
 
-    Same algorithm as ``_dflash_rounds`` but processes ``B`` sequences
-    in parallel. Yields ``(tokens_list, None)`` where ``tokens_list[i]``
-    is the token for sequence ``i`` (or ``None`` if that sequence has
-    nothing to emit this step).
+    Supports continuous batching: when a sequence finishes (EOS or
+    max_tokens), it is filtered out of the target caches and the
+    drafter cache is reinitialized for the new batch size.
+
+    ``stop_check(seq_idx, token_id) -> bool`` is an optional callback
+    that returns True to stop a sequence (e.g. EOS detection).
+
+    Yields ``(tokens_list, None)`` where ``tokens_list[i]`` is the
+    token for sequence ``i`` (or ``None`` if that sequence has nothing
+    to emit this step).
     """
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache_batch"):
@@ -555,21 +562,32 @@ def _dflash_rounds_batch(
     )
     draft_cache = draft_model.reset(model)
 
-    b = first_bonus.tolist()
+    # Per-sequence state tracked by ORIGINAL index so the caller sees
+    # stable indices in the yielded token lists.
+    b = first_bonus.tolist()  # active bonus tokens
     emitted = [1] * B
     finished = [False] * B
+    active_idx = list(range(B))  # maps active-slot → original-index
 
-    while not all(finished):
+    def _reinit_drafter():
+        """Cold-restart the drafter cache after a batch change."""
+        nonlocal draft_cache
+        draft_cache = draft_model.make_cache()
+
+    while len(active_idx) > 0:
         remaining = [
-            max(1, max_tokens - emitted[i] + 1) if not finished[i] else 1
-            for i in range(B)
+            max(1, max_tokens - emitted[active_idx[j]] + 1)
+            for j in range(len(active_idx))
         ]
         bs = min(block_total, min(remaining))
         if bs <= 1:
             break
 
+        n_active = len(active_idx)
+        b_active = [b[active_idx[j]] for j in range(n_active)]
+        b_arr = mx.array(b_active, dtype=token_dtype)
+
         # Draft
-        b_arr = mx.array(b, dtype=token_dtype)
         with mx.stream(generation_stream):
             draft_tokens = draft_model.draft_block(
                 b_arr, hidden, draft_cache, bs, sampler, token_dtype
@@ -591,45 +609,63 @@ def _dflash_rounds_batch(
         mx.async_eval(target_tokens, hidden_full)
 
         # Walk (per-sequence)
-        budgets = [max_tokens - emitted[i] for i in range(B)]
+        budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
         accepted_list, new_tokens_list = _speculative_walk_batch(
             draft_tokens, target_tokens, budgets
         )
 
-        # Rollback — trim to min(accepted) for BatchKVCache correctness.
-        # Sequences with higher acceptance lose a few tokens (re-drafted
-        # next round). The returned min_a caps what we can emit.
+        # Rollback
         accepted_arr = mx.array(accepted_list)
         min_a = lm.rollback_speculative_cache_batch(
             prompt_cache, verify_out.gdn_states, accepted_arr, bs
         )
         hidden = hidden_full[:, : min_a + 1, :]
 
-        # Truncate new_tokens to min_a + 1 (min_a drafted + 1 bonus)
-        for i in range(B):
-            new_tokens_list[i] = new_tokens_list[i][: min_a + 1]
+        for j in range(n_active):
+            new_tokens_list[j] = new_tokens_list[j][: min_a + 1]
         for a in accepted_list:
             draft_model.accept_lens.append(min(a, min_a))
 
-        # Emit round-robin (one yield per token position)
+        # Emit (map active slots back to original indices)
         max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
         for pos in range(max_new):
-            tokens_out: List[Optional[int]] = []
-            for i in range(B):
-                if pos < len(new_tokens_list[i]) and not finished[i]:
-                    tok = new_tokens_list[i][pos]
-                    tokens_out.append(tok)
-                    emitted[i] += 1
-                    if emitted[i] >= max_tokens:
-                        finished[i] = True
-                else:
-                    tokens_out.append(None)
+            tokens_out: List[Optional[int]] = [None] * B
+            for j in range(n_active):
+                orig = active_idx[j]
+                if pos < len(new_tokens_list[j]) and not finished[orig]:
+                    tok = new_tokens_list[j][pos]
+                    tokens_out[orig] = tok
+                    emitted[orig] += 1
+                    if emitted[orig] >= max_tokens:
+                        finished[orig] = True
+                    if stop_check is not None and stop_check(orig, tok):
+                        finished[orig] = True
             yield tokens_out, None
 
-        # Update per-sequence bonus tokens
-        for i in range(B):
-            if new_tokens_list[i]:
-                b[i] = new_tokens_list[i][-1]
+        # Update bonus tokens
+        for j in range(n_active):
+            orig = active_idx[j]
+            if new_tokens_list[j]:
+                b[orig] = new_tokens_list[j][-1]
+
+        # --- Continuous batching: filter out finished sequences ---
+        keep_slots = [
+            j for j in range(n_active) if not finished[active_idx[j]]
+        ]
+        if len(keep_slots) < n_active:
+            if len(keep_slots) == 0:
+                break
+            # Filter target caches (BatchKVCache supports this)
+            keep_mx = mx.array(keep_slots, dtype=mx.int32)
+            for c in prompt_cache:
+                if hasattr(c, "filter"):
+                    c.filter(keep_mx)
+            # Filter hidden
+            hidden = hidden[keep_mx]
+            # Update active index mapping
+            active_idx = [active_idx[j] for j in keep_slots]
+            # Cold-restart drafter for the new batch size
+            _reinit_drafter()
 
 
 def generate_step(
