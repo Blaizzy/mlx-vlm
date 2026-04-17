@@ -309,18 +309,30 @@ class ResponseGenerator:
 
         while not self._stop:
             try:
-                # Collect all pending requests from the queue
+                # Collect pending requests (non-blocking when generating)
                 new_items = []
-                timeout = 0.001 if active else 0.1
-                try:
-                    item = self.requests.get(timeout=timeout)
-                    if item is None:
-                        if self._stop:
-                            break
-                    else:
-                        new_items.append(item)
-                except QueueEmpty:
-                    pass
+                if active:
+                    # Non-blocking poll when actively generating
+                    try:
+                        item = self.requests.get_nowait()
+                        if item is None:
+                            if self._stop:
+                                break
+                        else:
+                            new_items.append(item)
+                    except QueueEmpty:
+                        pass
+                else:
+                    # Block briefly when idle
+                    try:
+                        item = self.requests.get(timeout=0.1)
+                        if item is None:
+                            if self._stop:
+                                break
+                        else:
+                            new_items.append(item)
+                    except QueueEmpty:
+                        pass
 
                 # Drain any more that arrived
                 while True:
@@ -367,6 +379,7 @@ class ResponseGenerator:
                     active[uid] = {
                         "rqueue": rqueue,
                         "tokens": [],
+                        "prev_text": "",
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                     }
 
@@ -377,8 +390,11 @@ class ResponseGenerator:
                 if not active or batch_gen is None:
                     continue
 
-                # One decode step, then loop back to check for new requests
-                self._step(batch_gen, active)
+                # Time-budget loop: run generation steps continuously
+                # for up to 0.5s before checking for new requests
+                budget = time.perf_counter() + 0.5
+                while active and time.perf_counter() < budget:
+                    self._step(batch_gen, active)
 
             except Exception as e:
                 print(f"Error in generation thread: {e}")
@@ -387,7 +403,7 @@ class ResponseGenerator:
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""
         kwargs = gen_kwargs or {}
-        responses = batch_gen.next(**kwargs)
+        _, responses = batch_gen.next(**kwargs)
         if not responses:
             return
 
@@ -397,30 +413,20 @@ class ResponseGenerator:
 
             info = active[r.uid]
             rqueue = info["rqueue"]
-            tokens = info["tokens"]
-
-            if r.finish_reason == "stop":
-                text = ""
-            else:
-                tokens.append(r.token)
-                if len(tokens) >= 2:
-                    prev = self.tokenizer.decode(tokens[:-1])
-                    curr = self.tokenizer.decode(tokens)
-                    text = curr[len(prev) :]
-                else:
-                    text = self.tokenizer.decode(tokens)
 
             tok = r.token
             if hasattr(tok, "item"):
                 tok = tok.item()
 
-            lp = 0.0
-            if r.logprobs is not None:
-                try:
-                    v = r.logprobs[tok]
-                    lp = v.item() if hasattr(v, "item") else float(v)
-                except (IndexError, TypeError, ValueError):
-                    pass
+            if r.finish_reason == "stop":
+                text = ""
+            else:
+                info["tokens"].append(tok)
+                curr = self.tokenizer.decode(info["tokens"])
+                text = curr[len(info["prev_text"]) :]
+                info["prev_text"] = curr
+
+            lp = r.token_logprob
 
             rqueue.put(
                 StreamingToken(
@@ -428,7 +434,7 @@ class ResponseGenerator:
                     token=tok,
                     logprobs=lp,
                     finish_reason=r.finish_reason,
-                    peak_memory=mx.get_peak_memory() / 1e9,
+                    peak_memory=mx.get_peak_memory() / 1e9 if r.finish_reason else 0,
                 )
             )
 
@@ -438,10 +444,8 @@ class ResponseGenerator:
 
     def _flush(self, batch_gen, active):
         """Drain all pending text-only prompts before inserting an image request."""
-        while batch_gen.unprocessed_prompts:
+        while batch_gen.has_pending_prompts:
             self._step(batch_gen, active)
-            if not batch_gen.unprocessed_prompts:
-                break
 
 
 def process_tool_calls(model_output: str, tool_module, tools):
