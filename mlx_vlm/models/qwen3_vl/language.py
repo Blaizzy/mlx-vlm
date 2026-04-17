@@ -510,6 +510,7 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        rope_deltas_kw = kwargs.pop("rope_deltas", None)
         # reset rope_deltas and position_ids when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None
@@ -566,9 +567,14 @@ class LanguageModel(nn.Module):
                 else:
                     base_offset = mx.array(cache_offset)
 
-                # Add rope_deltas if available
-                if self._rope_deltas is not None:
-                    rope_delta = self._rope_deltas
+                # Add rope_deltas if available — kwarg wins over self state
+                rope_delta_src = (
+                    rope_deltas_kw
+                    if rope_deltas_kw is not None
+                    else self._rope_deltas
+                )
+                if rope_delta_src is not None:
+                    rope_delta = rope_delta_src
                     if rope_delta.ndim == 0:
                         rope_delta = mx.expand_dims(rope_delta, axis=0)
                     if rope_delta.shape[0] < batch_size:

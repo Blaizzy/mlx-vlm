@@ -456,6 +456,10 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        # Per-sequence MRoPE delta supplied by GenerationBatch — overrides
+        # self._rope_deltas for this call so sequences with different deltas
+        # can share a decode batch.
+        rope_deltas_kw = kwargs.pop("rope_deltas", None)
         # reset rope_deltas and position_ids when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None
@@ -509,7 +513,11 @@ class LanguageModel(nn.Module):
                 if cache_offsets is not None and cache_offsets.size >= batch_size:
                     # Batched: per-element offsets
                     offsets = cache_offsets[:batch_size]
-                    rope_deltas = self._rope_deltas
+                    rope_deltas = (
+                        rope_deltas_kw
+                        if rope_deltas_kw is not None
+                        else self._rope_deltas
+                    )
                     if rope_deltas.shape[0] > batch_size:
                         rope_deltas = rope_deltas[:batch_size]
                     delta = (offsets + rope_deltas.squeeze(-1))[:, None]

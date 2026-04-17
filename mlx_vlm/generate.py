@@ -1111,6 +1111,15 @@ class GenerationBatch:
         self._next_tokens = inputs
         self._next_lps = None
 
+        # Per-sequence MRoPE delta for models that compute it at prefill
+        # (Qwen2-VL / Qwen2.5-VL / Qwen3-VL / Qwen3.5). Captured by
+        # PromptProcessingBatch.generate on transition, concatenated by
+        # extend, sliced by filter, and passed into the language model as
+        # an explicit kwarg on every decode step. Avoids aliasing the
+        # single-slot _rope_deltas attribute when sequences with different
+        # deltas share a batch.
+        self._rope_deltas = None
+
     def __len__(self):
         return len(self.uids)
 
@@ -1126,7 +1135,13 @@ class GenerationBatch:
         self._current_lps = self._next_lps
         inputs = self._current_tokens
 
-        output = self._language_model(inputs[:, None], cache=self.prompt_cache)
+        fwd_kwargs = {}
+        if self._rope_deltas is not None:
+            fwd_kwargs["rope_deltas"] = self._rope_deltas
+
+        output = self._language_model(
+            inputs[:, None], cache=self.prompt_cache, **fwd_kwargs
+        )
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits[:, -1, :]
 
@@ -1181,6 +1196,13 @@ class GenerationBatch:
                     [self._next_lps, other._next_lps]
                 )
 
+        if self._rope_deltas is None:
+            self._rope_deltas = other._rope_deltas
+        elif other._rope_deltas is not None:
+            self._rope_deltas = mx.concatenate(
+                [self._rope_deltas, other._rope_deltas]
+            )
+
     def filter(self, keep: List[int]):
         """Filter the batch to keep only the specified indices."""
         self.uids = [self.uids[idx] for idx in keep]
@@ -1193,6 +1215,7 @@ class GenerationBatch:
             self._current_lps = None
             self._next_tokens = None
             self._next_lps = None
+            self._rope_deltas = None
         else:
             keep_arr = mx.array(keep, mx.int32)
             for c in self.prompt_cache:
@@ -1201,6 +1224,8 @@ class GenerationBatch:
                 self._next_tokens = self._next_tokens[keep_arr]
             if self._next_lps is not None:
                 self._next_lps = self._next_lps[keep_arr]
+            if self._rope_deltas is not None:
+                self._rope_deltas = self._rope_deltas[keep_arr]
 
     def next(self) -> List[Response]:
         """Generate the next batch of tokens."""
@@ -1255,6 +1280,7 @@ class GenerationBatch:
         batch._current_lps = None
         batch._next_tokens = None
         batch._next_lps = None
+        batch._rope_deltas = None
         return batch
 
 
@@ -1361,6 +1387,19 @@ class PromptProcessingBatch:
             gen_batch._next_lps = logprobs[
                 mx.arange(first_tokens.shape[0]), first_tokens
             ]
+
+        # Snapshot the MRoPE delta the model produced for this prefill so
+        # the decode path can pass it back in per-sequence via kwargs,
+        # without aliasing self._rope_deltas when another sequence joins.
+        language_model = getattr(self.model, "language_model", self.model)
+        rope_deltas = getattr(language_model, "_rope_deltas", None)
+        if rope_deltas is not None:
+            # Normalize to shape (B, 1) so extend/filter stay consistent.
+            if rope_deltas.ndim == 0:
+                rope_deltas = rope_deltas.reshape(1, 1)
+            elif rope_deltas.ndim == 1:
+                rope_deltas = rope_deltas[:, None]
+            gen_batch._rope_deltas = rope_deltas
 
         self.uids = []
         self.prompt_cache = []
