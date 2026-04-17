@@ -1106,13 +1106,6 @@ class BatchGenerator:
         left_padding = [max_length - l for l in lengths]
         inputs = _left_pad_prompts(inputs, max_length=max_length)
 
-        # Reset cached position state from previous prefills
-        # (e.g. Qwen3.5 caches _position_ids / _rope_deltas on the model)
-        if hasattr(self.model, "_position_ids"):
-            self.model._position_ids = None
-        if hasattr(self.model, "_rope_deltas"):
-            self.model._rope_deltas = None
-
         if self.prompt_cache is not None:
             prompt_cache = self.prompt_cache
         else:
