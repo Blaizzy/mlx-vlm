@@ -29,9 +29,10 @@ class Model(nn.Module):
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
-            # Reset position state for text-only generation
-            self.language_model._position_ids = None
-            self.language_model._rope_deltas = None
+            # Text-only: don't reset _position_ids / _rope_deltas — other
+            # sequences in the current batch may still be decoding and
+            # rely on these. Prefill of this new sequence will recompute
+            # them via the cache_offset==0 path in LanguageModel.__call__.
             return InputEmbeddingsFeatures(
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids)
             )

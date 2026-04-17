@@ -244,7 +244,7 @@ class Qwen2Model(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            mask = create_attention_mask(h, cache[0])
+            mask = create_attention_mask(h, cache)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c, position_ids)
@@ -460,14 +460,21 @@ class LanguageModel(nn.Module):
             self._position_ids = None
 
         cache_offset = 0
+        cache_offsets = None  # per-element offsets for batched caches
         if cache and cache[0] is not None:
             offset = cache[0].offset
             if isinstance(offset, int):
                 cache_offset = offset
             elif isinstance(offset, mx.array):
-                cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
+                if offset.ndim > 0 and offset.size > 1:
+                    # BatchKVCache: per-element offsets
+                    cache_offsets = mx.maximum(offset, 0)
+                    cache_offset = cache_offsets[0].item()
+                else:
+                    cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
             else:
                 raise ValueError(f"Unexpected cache offset type: {type(offset)}")
+            cache_offset = max(cache_offset, 0)
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask
@@ -495,24 +502,30 @@ class LanguageModel(nn.Module):
                     self._rope_deltas = rope_deltas
                     self._position_ids = position_ids
             else:
-                # Use the prev pre-calculated rope-deltas to get the correct position ids
+                # Generation step — build position_ids from per-sequence
+                # cache offsets so each batch item gets the correct RoPE
+                # position even when sequences have different left_padding.
                 batch_size, seq_length = inputs.shape
-                delta = mx.array(
-                    cache_offset + self._rope_deltas if cache is not None else 0
-                )
-                position_ids = mx.arange(seq_length).reshape(1, -1)
-                position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
-
-                if cache_offset is not None:
+                if cache_offsets is not None and cache_offsets.size >= batch_size:
+                    # Batched: per-element offsets
+                    offsets = cache_offsets[:batch_size]
+                    rope_deltas = self._rope_deltas
+                    if rope_deltas.shape[0] > batch_size:
+                        rope_deltas = rope_deltas[:batch_size]
+                    delta = (offsets + rope_deltas.squeeze(-1))[:, None]
+                else:
+                    delta = mx.array(
+                        cache_offset + self._rope_deltas if cache is not None else 0
+                    )
                     if delta.ndim == 0:
                         delta = mx.expand_dims(delta, axis=0)
-
                     if delta.shape[0] < batch_size:
                         delta = mx.tile(delta, (batch_size, 1))
                     else:
-                        # Slice delta to match batch
                         delta = delta[:batch_size]
 
+                position_ids = mx.arange(seq_length).reshape(1, -1)
+                position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
                 position_ids = mx.add(position_ids, delta)[None, ...]
                 position_ids = mx.broadcast_to(
                     position_ids, (3, batch_size, seq_length)
