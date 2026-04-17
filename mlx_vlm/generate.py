@@ -1131,15 +1131,24 @@ class BatchGenerator:
         self.tokenizer.stopping_criteria.add_eos_token_ids(stop_tokens)
 
         self.active_batch = None
+        self._pending_prefill = None  # Partial prefill state for interleaving
 
-    def insert(self, prompts, max_tokens: Union[List[int], int, None] = None):
+    def insert(
+        self,
+        prompts,
+        max_tokens: Union[List[int], int, None] = None,
+        prompt_kwargs: Optional[List[dict]] = None,
+    ):
         uids = []
 
         if max_tokens is None or isinstance(max_tokens, int):
             max_tokens = [max_tokens or self.max_tokens] * len(prompts)
 
-        for p, m in zip(prompts, max_tokens):
-            self.unprocessed_prompts.append((self.uid_count, p, m))
+        if prompt_kwargs is None:
+            prompt_kwargs = [{}] * len(prompts)
+
+        for p, m, kw in zip(prompts, max_tokens, prompt_kwargs):
+            self.unprocessed_prompts.append((self.uid_count, p, m, kw))
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
@@ -1148,8 +1157,16 @@ class BatchGenerator:
         )
         return uids
 
-    def _process_prompts(self, prompts, **kwargs) -> Batch:
-        uids, inputs, max_tokens = zip(*prompts)
+    def _process_prompts(self, prompts, **kwargs) -> Optional[Batch]:
+        uids, inputs, max_tokens, stored_kw_list = zip(*prompts)
+        # Merge: passed kwargs as defaults, stored per-prompt kwargs override.
+        # This lets _generate_batch pass kwargs via next() while the server
+        # stores them per-prompt via insert(prompt_kwargs=...).
+        for sk in stored_kw_list:
+            if sk:
+                kwargs = {**kwargs, **sk}
+                break
+
         lengths = [len(p) for p in inputs]
         max_length = max(lengths)
 
@@ -1191,9 +1208,12 @@ class BatchGenerator:
             self.prefill_step_size is not None
             and inputs_embeds.shape[1] > self.prefill_step_size
         ):
-            # Chunked prefill with embeddings
-            while inputs_embeds.shape[1] > 1:
-                n_to_process = min(self.prefill_step_size, inputs_embeds.shape[1] - 1)
+            if self.active_batch is not None:
+                # Incremental prefill: process one chunk now, store remainder.
+                # This lets existing requests get decode steps between chunks.
+                n_to_process = min(
+                    self.prefill_step_size, inputs_embeds.shape[1] - 1
+                )
                 self.model(
                     inputs[:, :n_to_process],
                     cache=prompt_cache,
@@ -1205,6 +1225,36 @@ class BatchGenerator:
                 inputs_embeds = inputs_embeds[:, n_to_process:]
                 inputs = inputs[:, n_to_process:]
                 mx.clear_cache()
+
+                if inputs_embeds.shape[1] > 1:
+                    # More chunks needed — save state for _next() to resume
+                    self._pending_prefill = {
+                        "uids": list(uids),
+                        "max_tokens": list(max_tokens),
+                        "inputs": inputs,
+                        "inputs_embeds": inputs_embeds,
+                        "prompt_cache": prompt_cache,
+                        "kwargs": kwargs,
+                    }
+                    return None
+                # Only one extra chunk was needed — fall through to final step
+            else:
+                # No active batch — full blocking prefill is fine
+                while inputs_embeds.shape[1] > 1:
+                    n_to_process = min(
+                        self.prefill_step_size, inputs_embeds.shape[1] - 1
+                    )
+                    self.model(
+                        inputs[:, :n_to_process],
+                        cache=prompt_cache,
+                        inputs_embeds=inputs_embeds[:, :n_to_process],
+                        n_to_process=n_to_process,
+                        **kwargs,
+                    )
+                    mx.eval([c.state for c in prompt_cache])
+                    inputs_embeds = inputs_embeds[:, n_to_process:]
+                    inputs = inputs[:, n_to_process:]
+                    mx.clear_cache()
 
         y, logprobs = self._step(
             inputs, prompt_cache, inputs_embeds=inputs_embeds, **kwargs
@@ -1235,44 +1285,99 @@ class BatchGenerator:
         tic = time.perf_counter()
 
         prompt_processing = False
-        batch = self.active_batch
-        num_active = len(batch) if batch else 0
-        num_to_add = self.completion_batch_size - num_active
-        while num_to_add >= self.prefill_batch_size:
-            prompts = self.unprocessed_prompts[: self.prefill_batch_size]
-            # Finish processing the last examples of the last batch
-            if len(prompts) == 0 and num_active > 0:
-                break
-            # No more prompts and no more completions, all done
-            elif len(prompts) == 0:
-                self.active_batch = None
-                return []
-            # Process prompts
-            if batch is not None and not prompt_processing:
-                # Finish any active completion tokens
-                mx.eval(batch.y, batch.logprobs)
-                self._stats.generation_time += time.perf_counter() - tic
-                tic = time.perf_counter()
 
-            batch = self._process_prompts(prompts, **kwargs)
-            self.unprocessed_prompts = self.unprocessed_prompts[
-                self.prefill_batch_size :
-            ]
+        # --- Resume incremental prefill (one chunk per call) ---
+        if self._pending_prefill is not None:
             prompt_processing = True
-            # If there was no active batch, set it
-            if self.active_batch is None:
-                self.active_batch = batch
-            else:
-                self.active_batch.extend(batch)
-                # Interleave: when existing requests are decoding,
-                # prefill only one batch then do a decode step.
-                # Next _next() call handles remaining prompts.
-                break
+            pp = self._pending_prefill
+            n_to_process = min(
+                self.prefill_step_size, pp["inputs_embeds"].shape[1] - 1
+            )
+            self.model(
+                pp["inputs"][:, :n_to_process],
+                cache=pp["prompt_cache"],
+                inputs_embeds=pp["inputs_embeds"][:, :n_to_process],
+                n_to_process=n_to_process,
+                **pp["kwargs"],
+            )
+            mx.eval([c.state for c in pp["prompt_cache"]])
+            pp["inputs_embeds"] = pp["inputs_embeds"][:, n_to_process:]
+            pp["inputs"] = pp["inputs"][:, n_to_process:]
+            mx.clear_cache()
 
-            num_active = len(self.active_batch)
-            num_to_add -= len(batch)
+            if pp["inputs_embeds"].shape[1] <= 1:
+                # Prefill complete — finalize into a Batch
+                y, logprobs = self._step(
+                    pp["inputs"],
+                    pp["prompt_cache"],
+                    inputs_embeds=pp["inputs_embeds"],
+                    **pp["kwargs"],
+                )
+                mx.async_eval(y, logprobs)
+                mx.clear_cache()
+                new_batch = Batch(
+                    pp["uids"],
+                    y,
+                    logprobs,
+                    pp["max_tokens"],
+                    [0] * len(pp["uids"]),
+                    pp["prompt_cache"],
+                )
+                self._pending_prefill = None
+                if self.active_batch is None:
+                    self.active_batch = new_batch
+                else:
+                    self.active_batch.extend(new_batch)
 
+        # --- Start new prefills (only if no pending prefill) ---
+        if self._pending_prefill is None:
+            batch = self.active_batch
+            num_active = len(batch) if batch else 0
+            num_to_add = self.completion_batch_size - num_active
+            while num_to_add >= self.prefill_batch_size:
+                prompts = self.unprocessed_prompts[: self.prefill_batch_size]
+                # Finish processing the last examples of the last batch
+                if len(prompts) == 0 and num_active > 0:
+                    break
+                # No more prompts and no more completions, all done
+                elif len(prompts) == 0:
+                    self.active_batch = None
+                    return []
+                # Process prompts
+                if batch is not None and not prompt_processing:
+                    # Finish any active completion tokens
+                    mx.eval(batch.y, batch.logprobs)
+                    self._stats.generation_time += time.perf_counter() - tic
+                    tic = time.perf_counter()
+
+                new_batch = self._process_prompts(prompts, **kwargs)
+                self.unprocessed_prompts = self.unprocessed_prompts[
+                    self.prefill_batch_size :
+                ]
+                prompt_processing = True
+
+                if new_batch is None:
+                    # Incremental prefill started — will resume next call
+                    break
+
+                if self.active_batch is None:
+                    self.active_batch = new_batch
+                else:
+                    self.active_batch.extend(new_batch)
+                    # Interleave: prefill one batch then decode.
+                    break
+
+                num_active = len(self.active_batch)
+                num_to_add -= len(new_batch)
+
+        # --- Decode step for active batch ---
         batch = self.active_batch
+        if batch is None:
+            # Only pending prefill, no active batch to decode yet
+            toc = time.perf_counter()
+            self._stats.prompt_time += toc - tic
+            return []
+
         y, logprobs = batch.y, batch.logprobs
         batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
         mx.async_eval(batch.y, batch.logprobs)

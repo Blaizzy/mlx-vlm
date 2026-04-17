@@ -357,6 +357,7 @@ class ResponseGenerator:
                         (uid,) = batch_gen.insert(
                             [input_ids.squeeze(0).tolist()],
                             max_tokens=args.max_tokens,
+                            prompt_kwargs=[gen_kwargs],
                         )
                     except Exception as e:
                         rqueue.put(e)
@@ -369,9 +370,9 @@ class ResponseGenerator:
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                     }
 
-                    # Prefill image request immediately with its embeddings
+                    # Trigger prefill (kwargs stored in prompt via insert)
                     if has_embeds:
-                        self._step(batch_gen, active, gen_kwargs)
+                        self._step(batch_gen, active)
 
                 if not active or batch_gen is None:
                     continue
