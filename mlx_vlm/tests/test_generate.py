@@ -1077,6 +1077,9 @@ def test_generate_cli_smoke(capsys):
         thinking_budget=None,
         thinking_start_token="<think>",
         thinking_end_token="</think>",
+        draft_model=None,
+        draft_kind="dflash",
+        draft_block_size=None,
     )
     model = SimpleNamespace(config=SimpleNamespace(model_type="demo"))
     processor = SimpleNamespace()
