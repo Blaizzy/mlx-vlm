@@ -29,10 +29,6 @@ class Model(nn.Module):
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
-            # Reset _position_ids so a stale image-prefill slice doesn't
-            # leak into this text prefill. Leave _rope_deltas alone so
-            # other sequences still decoding in the batch keep their
-            # per-sequence positional state.
             self.language_model._position_ids = None
             return InputEmbeddingsFeatures(
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids)
