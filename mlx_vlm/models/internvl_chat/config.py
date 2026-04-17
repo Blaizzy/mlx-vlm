@@ -56,16 +56,17 @@ class TextConfig(BaseModelConfig):
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
-    max_window_layers: int
-    hidden_act: str
+    hidden_act: str = "silu"
     num_key_value_heads: Optional[int] = 8
     head_dim: Optional[int] = None
+    max_window_layers: Optional[int] = None
     max_position_embeddings: Optional[int] = 40960
     rope_theta: float = 1000000.0
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = False
-    sliding_window: int = 32768
+    attention_bias: bool = True
+    sliding_window: Optional[int] = None
     use_sliding_window: bool = False
     use_cache: bool = True
 

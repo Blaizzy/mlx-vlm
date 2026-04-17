@@ -141,6 +141,7 @@ class Thinker(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         visual_pos_masks = None
         deepstack_visual_embeds = None
+        visual_embeds_multiscale = None
 
         if input_features is not None:
             audio_features = self.get_audio_features(
@@ -175,15 +176,20 @@ class Thinker(nn.Module):
             inputs_embeds = masked_scatter(inputs_embeds, audio_mask, audio_features)
 
         if pixel_values is not None:
-            dtype = self.vision_tower.patch_embed.proj.weight.dtype
-            pixel_values = pixel_values.astype(dtype)
-            vision_output = self.vision_tower(pixel_values, image_grid_thw)
-            if isinstance(vision_output, tuple):
-                image_embeds, image_embeds_multiscale = vision_output
-            else:
-                image_embeds = vision_output
+            cached = kwargs.get("cached_image_features", None)
+            if cached is not None:
+                image_embeds = cached.astype(inputs_embeds.dtype)
                 image_embeds_multiscale = None
-            image_embeds = image_embeds.astype(inputs_embeds.dtype)
+            else:
+                dtype = self.vision_tower.patch_embed.proj.weight.dtype
+                pixel_values = pixel_values.astype(dtype)
+                vision_output = self.vision_tower(pixel_values, image_grid_thw)
+                if isinstance(vision_output, tuple):
+                    image_embeds, image_embeds_multiscale = vision_output
+                else:
+                    image_embeds = vision_output
+                    image_embeds_multiscale = None
+                image_embeds = image_embeds.astype(inputs_embeds.dtype)
             image_mask, _, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )

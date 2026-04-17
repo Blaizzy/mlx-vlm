@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
+from . import processing_pixtral  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -52,27 +53,28 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the output hidden states from the vision model
-        if isinstance(pixel_values, list):
-            pixel_values = mx.concatenate(
-                [mx.array(pv)[None, ...] for pv in pixel_values], axis=0
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
+        else:
+            # Get the output hidden states from the vision model
+            if isinstance(pixel_values, list):
+                pixel_values = mx.concatenate(
+                    [mx.array(pv)[None, ...] for pv in pixel_values], axis=0
+                )
+            if pixel_values.ndim == 3:
+                pixel_values = pixel_values[None, ...]
+
+            *_, hidden_states = self.vision_tower(
+                pixel_values.transpose(0, 2, 3, 1),
+                output_hidden_states=True,
+                image_sizes=image_sizes,
             )
-        if pixel_values.ndim == 3:
-            pixel_values = pixel_values[None, ...]
+            # Select the hidden states from the desired layer
+            selected_image_feature = hidden_states[self.vision_feature_layer]
 
-        # Pass pixel_values as list of images, as each image is individually run through conv2d and position encoding
-        # Reference code from transformers: https://github.com/huggingface/transformers/blob/main/src/transformers/models/pixtral/modeling_pixtral.py#L479C9-L479C21
-        # and mistral_inference: https://github.com/mistralai/mistral-inference/blob/main/src/mistral_inference/vision_encoder.py#L85
-        *_, hidden_states = self.vision_tower(
-            pixel_values.transpose(0, 2, 3, 1),
-            output_hidden_states=True,
-            image_sizes=image_sizes,
-        )
-        # Select the hidden states from the desired layer
-        selected_image_feature = hidden_states[self.vision_feature_layer]
-
-        # Pass image features through the multi-modal projector
-        image_features = self.multi_modal_projector(selected_image_feature)
+            # Pass image features through the multi-modal projector
+            image_features = self.multi_modal_projector(selected_image_feature)
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self.merge_input_ids_with_image_features(

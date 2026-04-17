@@ -341,7 +341,7 @@ class Model(nn.Module):
                     (1 + num_width_tiles * num_height_tiles).item()
                 )
 
-            total_tiles.append(pixel_values[idx, : batch_num_tiles[idx]])
+            total_tiles.append(pixel_values[idx, : int(batch_num_tiles[idx])])
 
         total_tiles = mx.concatenate(total_tiles, axis=0)
 
@@ -353,13 +353,17 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         input_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the ouptut hidden states from the vision model
-        hidden_states, *_ = self.vision(
-            total_tiles.transpose(0, 2, 3, 1), output_hidden_states=True
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
+        else:
+            # Get the ouptut hidden states from the vision model
+            hidden_states, *_ = self.vision(
+                total_tiles.transpose(0, 2, 3, 1), output_hidden_states=True
+            )
 
-        # Pass image features through the multi-modal projector
-        image_features = self.projector(hidden_states)
+            # Pass image features through the multi-modal projector
+            image_features = self.projector(hidden_states)
 
         _, hw, n_dim = image_features.shape
         h = w = int(hw**0.5)

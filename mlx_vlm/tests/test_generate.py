@@ -1,6 +1,8 @@
 """Tests for batch generation functionality in mlx_vlm.generate module."""
 
 import sys
+from argparse import Namespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
@@ -14,7 +16,9 @@ from mlx_vlm.generate import (
     BatchStats,
     GenerationResult,
     _left_pad_prompts,
+    normalize_resize_shape,
 )
+from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
 
@@ -896,6 +900,216 @@ class TestEdgeCases:
 
         assert response.texts == []
         assert response.image_sizes is None
+
+
+# ============================================================================
+# Tests for ThinkingBudgetCriteria
+# ============================================================================
+
+
+class FakeTokenizer:
+    """Mock tokenizer that maps token strings to fixed IDs."""
+
+    TOKEN_MAP = {"<think>": 99, "</think>": 100, "\n": 10}
+
+    def encode(self, text, add_special_tokens=False):
+        if text in self.TOKEN_MAP:
+            return [self.TOKEN_MAP[text]]
+        return [0]
+
+
+class TestThinkingBudgetCriteria:
+    """Tests for ThinkingBudgetCriteria class."""
+
+    def test_thinking_model(self):
+        """Test thinking budget for thinking models (enable_thinking=True)."""
+        criteria = ThinkingBudgetCriteria(
+            tokenizer=FakeTokenizer(),
+            thinking_budget=5,
+            thinking_end_token="</think>",
+            thinking_start_token="<think>",
+            enable_thinking=True,
+        )
+
+        # enable_thinking=True — already in thinking mode
+        assert criteria.in_thinking is True
+
+        # Tokens within budget return None
+        for i in range(5):
+            assert criteria(50 + i) is None
+        assert criteria.thinking_token_count == 5
+        assert criteria.budget_exceeded is False
+
+        # Exceeding budget forces \n then </think>
+        assert criteria(60) == 10  # \n
+        assert criteria(60) == 100  # </think>
+        assert criteria.budget_exceeded is True
+
+        # End token resets state
+        assert criteria(100) is None
+        assert criteria.in_thinking is False
+        assert criteria.budget_exceeded is False
+
+    def test_non_thinking_model(self):
+        """Test thinking budget for non-thinking models (enable_thinking=False)."""
+        criteria = ThinkingBudgetCriteria(
+            tokenizer=FakeTokenizer(),
+            thinking_budget=3,
+            thinking_end_token="</think>",
+            thinking_start_token="<think>",
+            enable_thinking=False,
+        )
+
+        # Not in thinking initially
+        assert criteria.in_thinking is False
+
+        # Tokens are not counted — model is not in thinking mode
+        criteria(50)
+        criteria(51)
+        assert criteria.thinking_token_count == 0
+
+        # Start token does NOT enter thinking mode when enable_thinking=False
+        assert criteria(99) is None
+        assert criteria.in_thinking is False
+
+        # Tokens still not counted
+        for i in range(3):
+            assert criteria(50 + i) is None
+        assert criteria.thinking_token_count == 0
+        assert criteria.budget_exceeded is False
+
+
+class TestSamplerArgs:
+    """Tests for sampler argument forwarding."""
+
+    @patch.object(generate_module.cache, "make_prompt_cache", return_value=[])
+    @patch.object(generate_module, "make_logits_processors", return_value=[])
+    @patch.object(generate_module, "make_sampler")
+    def test_generate_step_passes_sampling_and_logits_processor_args(
+        self,
+        mock_make_sampler,
+        mock_make_logits_processors,
+        _mock_prompt_cache,
+    ):
+        mock_make_sampler.return_value = lambda logprobs: mx.array([0])
+
+        model = MagicMock()
+        model.language_model.return_value = MagicMock(
+            logits=mx.zeros((1, 1, 4)),
+            cross_attention_states=None,
+            encoder_outputs=None,
+        )
+
+        embedding_output = MagicMock()
+        embedding_output.inputs_embeds = mx.zeros((1, 1, 4))
+        embedding_output.to_dict.return_value = {}
+        model.get_input_embeddings.return_value = embedding_output
+
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            max_tokens=1,
+            temperature=0.7,
+            top_p=0.9,
+            min_p=0.05,
+            top_k=32,
+            repetition_penalty=1.15,
+            logit_bias={3: -0.75},
+        )
+
+        next(gen)
+
+        mock_make_sampler.assert_called_once_with(
+            temp=0.7,
+            top_p=0.9,
+            min_p=0.05,
+            top_k=32,
+        )
+        mock_make_logits_processors.assert_called_once_with({3: -0.75}, 1.15, 20)
+
+
+def test_normalize_resize_shape_expands_single_value():
+    assert normalize_resize_shape([224]) == (224, 224)
+
+
+def test_normalize_resize_shape_accepts_two_values():
+    assert normalize_resize_shape((224, 448)) == (224, 448)
+
+
+@pytest.mark.parametrize("value", [224, "22", [1.5], [True], [1, 2, 3]])
+def test_normalize_resize_shape_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="resize_shape must contain 1 or 2 integers"):
+        normalize_resize_shape(value)
+
+
+def test_generate_cli_smoke(capsys):
+    import importlib
+
+    generate_module = importlib.import_module("mlx_vlm.generate")
+
+    args = Namespace(
+        model="demo",
+        adapter_path=None,
+        image=["image.png"],
+        audio=None,
+        resize_shape=[224],
+        prompt=["Describe this image."],
+        system=None,
+        max_tokens=12,
+        temperature=0.7,
+        chat=False,
+        verbose=False,
+        eos_tokens=None,
+        max_kv_size=None,
+        kv_bits=None,
+        kv_group_size=64,
+        quantized_kv_start=512,
+        skip_special_tokens=False,
+        force_download=False,
+        revision="main",
+        trust_remote_code=False,
+        quantize_activations=False,
+        processor_kwargs={},
+        prefill_step_size=128,
+        enable_thinking=False,
+        thinking_budget=None,
+        thinking_start_token="<think>",
+        thinking_end_token="</think>",
+    )
+    model = SimpleNamespace(config=SimpleNamespace(model_type="demo"))
+    processor = SimpleNamespace()
+
+    with (
+        patch.object(generate_module, "parse_arguments", return_value=args),
+        patch.object(generate_module, "load", return_value=(model, processor)),
+        patch.object(
+            generate_module, "apply_chat_template", return_value="prompt"
+        ) as mock_apply_chat_template,
+        patch.object(
+            generate_module,
+            "generate",
+            return_value=SimpleNamespace(text="done"),
+        ) as mock_generate,
+    ):
+        generate_module.main()
+
+    assert mock_apply_chat_template.call_args.kwargs["enable_thinking"] is False
+    assert mock_generate.call_args.kwargs["enable_thinking"] is False
+    assert mock_generate.call_args.kwargs["max_tokens"] == 12
+    assert mock_generate.call_args.kwargs["temperature"] == pytest.approx(0.7)
+    assert mock_generate.call_args.kwargs["prefill_step_size"] == 128
+    assert capsys.readouterr().out.strip() == "done"
+
+
+def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["mlx_vlm.generate"])
+
+    args = generate_module.parse_arguments()
+
+    assert args.thinking_start_token == "<think>"
+    assert args.thinking_end_token == "</think>"
 
 
 if __name__ == "__main__":

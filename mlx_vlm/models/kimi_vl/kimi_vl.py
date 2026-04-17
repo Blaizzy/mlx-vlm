@@ -3,23 +3,11 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from transformers import AutoImageProcessor, AutoProcessor
 
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
-from .processing_kimi_vl import KimiVLImageProcessor, KimiVLProcessor
 from .vision import VisionModel
-
-# Register custom processor classes for kimi_vl model type
-try:
-    MODEL_TYPE = "kimi_vl"
-    AutoImageProcessor.register(
-        MODEL_TYPE, slow_image_processor_class=KimiVLImageProcessor
-    )
-    AutoProcessor.register(MODEL_TYPE, KimiVLProcessor)
-except Exception:
-    raise Exception("Failed to register kimi_vl processor")
 
 
 class KimiVLMultiModalProjector(nn.Module):
@@ -76,13 +64,17 @@ class Model(nn.Module):
 
         inputs_embeds = self.language_model.embed_tokens(input_ids)
 
-        hidden_state = self.vision_tower(
-            pixel_values.transpose(0, 2, 3, 1),
-            output_hidden_states=True,
-            grid_thw=grid_thw,
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
+        else:
+            hidden_state = self.vision_tower(
+                pixel_values.transpose(0, 2, 3, 1),
+                output_hidden_states=True,
+                grid_thw=grid_thw,
+            )
 
-        image_features = self.multi_modal_projector(hidden_state)
+            image_features = self.multi_modal_projector(hidden_state)
 
         final_inputs_embeds = self._prepare_inputs_for_multimodal(
             image_features,

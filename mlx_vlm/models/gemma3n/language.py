@@ -129,7 +129,9 @@ class Gemma3nAttention(nn.Module):
         offset = 0
         if self.is_kv_shared_layer and cache is not None:
             # For shared layers, retrieve KV from the designated cache layer
-            keys, values = cache.state
+            # cache.state returns (k, v) for KVCache or (k, v, offset, left_padding) for BatchKVCache
+            state = cache.state
+            keys, values = state[0], state[1]
             offset = cache.offset
 
         else:

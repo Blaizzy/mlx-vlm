@@ -5,6 +5,7 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import InputEmbeddingsFeatures
+from . import processing_llava  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -52,29 +53,33 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the ouptut hidden states from the vision model
-        *_, hidden_states = self.vision_tower(
-            pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
-        )
-
-        # Select the hidden states from the desired layer
-        selected_image_feature = hidden_states[self.vision_feature_layer]
-
-        if isinstance(self.vision_feature_layer, int):
-            if self.vision_feature_select_strategy == "default":
-                selected_image_feature = selected_image_feature[:, 1:]
-
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
         else:
-            hs_pool = [
-                hidden_states[layer_idx] for layer_idx in self.vision_feature_layer
-            ]
-            # For default; crop CLS from each hidden state in the hidden state pool
-            if self.vision_feature_select_strategy == "default":
-                hs_pool = [hs[:, 1:] for hs in hs_pool]
-            selected_image_feature = mx.concatenate(hs_pool, axis=-1)
+            # Get the ouptut hidden states from the vision model
+            *_, hidden_states = self.vision_tower(
+                pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
+            )
 
-        # Pass image features through the multi-modal projector
-        image_features = self.multi_modal_projector(selected_image_feature)
+            # Select the hidden states from the desired layer
+            selected_image_feature = hidden_states[self.vision_feature_layer]
+
+            if isinstance(self.vision_feature_layer, int):
+                if self.vision_feature_select_strategy == "default":
+                    selected_image_feature = selected_image_feature[:, 1:]
+
+            else:
+                hs_pool = [
+                    hidden_states[layer_idx] for layer_idx in self.vision_feature_layer
+                ]
+                # For default; crop CLS from each hidden state in the hidden state pool
+                if self.vision_feature_select_strategy == "default":
+                    hs_pool = [hs[:, 1:] for hs in hs_pool]
+                selected_image_feature = mx.concatenate(hs_pool, axis=-1)
+
+            # Pass image features through the multi-modal projector
+            image_features = self.multi_modal_projector(selected_image_feature)
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self._merge_input_ids_with_image_features(

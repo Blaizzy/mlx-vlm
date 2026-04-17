@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
+from . import processing_paligemma  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -47,13 +48,17 @@ class Model(nn.Module):
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        hidden_state, _, _ = self.vision_tower(
-            pixel_values.transpose(0, 2, 3, 1).astype(inputs_embeds.dtype),
-            output_hidden_states=True,
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
+        else:
+            hidden_state, _, _ = self.vision_tower(
+                pixel_values.transpose(0, 2, 3, 1).astype(inputs_embeds.dtype),
+                output_hidden_states=True,
+            )
 
-        image_features = hidden_state[None, :].astype(pixel_values.dtype)
-        image_features = self.multi_modal_projector(image_features)
+            image_features = hidden_state[None, :].astype(pixel_values.dtype)
+            image_features = self.multi_modal_projector(image_features)
 
         final_inputs_embeds, final_attention_mask_4d = (
             self._prepare_inputs_for_multimodal(

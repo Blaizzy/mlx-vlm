@@ -5,7 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_vlm.trainer.datasets import VisionDataset
-from mlx_vlm.trainer.trainer import TrainingArgs, train
+from mlx_vlm.trainer.sft_trainer import TrainingArgs, train
 
 
 class TestDataset(unittest.TestCase):
@@ -22,7 +22,6 @@ class TestDataset(unittest.TestCase):
             self.mock_hf_dataset,
             self.mock_config,
             self.mock_processor,
-            self.mock_image_processor,
         )
 
         mock_get_prompt.return_value = ""
@@ -68,13 +67,11 @@ class TestDataset(unittest.TestCase):
             self.mock_hf_dataset,
             self.mock_config,
             self.mock_processor,
-            self.mock_image_processor,
         )
 
         self.assertEqual(len(dataset), len(self.mock_hf_dataset))
         self.assertEqual(dataset.config, self.mock_config)
         self.assertEqual(dataset.processor, self.mock_processor)
-        self.assertEqual(dataset.image_processor, self.mock_image_processor)
 
 
 class TestTrainer(unittest.TestCase):
@@ -95,8 +92,8 @@ class TestTrainer(unittest.TestCase):
         self.mock_optimizer = MagicMock()
         self.mock_optimizer.learning_rate = 1e-4
 
-    @patch("mlx_vlm.trainer.trainer.iterate_batches")
-    @patch("mlx_vlm.trainer.trainer.mx.save_safetensors")
+    @patch("mlx_vlm.trainer.sft_trainer.iterate_batches")
+    @patch("mlx_vlm.trainer.sft_trainer.mx.save_safetensors")
     def test_trainer_initialization(self, mock_save_safetensors, mock_iterate_batches):
         mock_batch = {
             "input_ids": mx.array([[1, 2, 3], [1, 2, 3], [1, 2, 3], [1, 2, 3]]),
@@ -120,8 +117,8 @@ class TestTrainer(unittest.TestCase):
         self.mock_optimizer.update.assert_called()
         mock_save_safetensors.assert_called()
 
-    @patch("mlx_vlm.trainer.trainer.iterate_batches")
-    @patch("mlx_vlm.trainer.trainer.mx.save_safetensors")
+    @patch("mlx_vlm.trainer.sft_trainer.iterate_batches")
+    @patch("mlx_vlm.trainer.sft_trainer.mx.save_safetensors")
     def test_train_smoke(self, mock_save_safetensors, mock_iterate_batches):
         mock_batch = {
             "input_ids": mx.array([[1, 2, 3], [1, 2, 3], [1, 2, 3], [1, 2, 3]]),
@@ -148,7 +145,7 @@ class TestTrainer(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
-    @patch("mlx_vlm.trainer.trainer.get_prompt")
+    @patch("mlx_vlm.trainer.sft_trainer.get_prompt")
     @patch("mlx_vlm.utils.prepare_inputs")
     def test_dataset_getitem_falls_back_to_image_token_id(
         self, mock_prepare_inputs, mock_get_prompt
@@ -156,11 +153,10 @@ if __name__ == "__main__":
         """Test that image_token_id is used when image_token_index is missing."""
         config_with_token_id = {"model_type": "test_model", "image_token_id": 151655}
 
-        dataset = Dataset(
+        dataset = VisionDataset(
             self.mock_hf_dataset,
             config_with_token_id,
             self.mock_processor,
-            self.mock_image_processor,
         )
 
         mock_item = {
@@ -183,11 +179,10 @@ if __name__ == "__main__":
         """Test that a clear KeyError is raised when neither key exists."""
         config_missing_token = {"model_type": "test_model"}
 
-        dataset = Dataset(
+        dataset = VisionDataset(
             self.mock_hf_dataset,
             config_missing_token,
             self.mock_processor,
-            self.mock_image_processor,
         )
 
         mock_item = {

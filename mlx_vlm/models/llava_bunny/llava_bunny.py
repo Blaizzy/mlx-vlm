@@ -15,6 +15,7 @@ from transformers.image_transforms import (
 from transformers.image_utils import to_numpy_array
 
 from ..base import BaseImageProcessor, InputEmbeddingsFeatures
+from ..llava import processing_llava  # noqa: F401
 from .config import ModelConfig, VisionConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -107,14 +108,18 @@ class Model(nn.Module):
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        *_, hidden_state = self.vision_tower(
-            pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
+        else:
+            *_, hidden_state = self.vision_tower(
+                pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
+            )
 
-        image_features = hidden_state[-1].astype(pixel_values.dtype)
-        assert image_features.shape[-2] == 729
+            image_features = hidden_state[-1].astype(pixel_values.dtype)
+            assert image_features.shape[-2] == 729
 
-        image_features = self.mm_projector(image_features)
+            image_features = self.mm_projector(image_features)
 
         final_inputs_embeds = self._prepare_inputs_for_multimodal(
             image_features, inputs_embeds, input_ids

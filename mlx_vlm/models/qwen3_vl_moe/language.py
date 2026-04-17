@@ -171,7 +171,9 @@ class Attention(nn.Module):
         cos, sin = self.rotary_emb(values, position_ids)
 
         if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., :kv_seq_len]
+            if isinstance(kv_seq_len, mx.array):
+                kv_seq_len = kv_seq_len.max().item()
+            mask = mask[..., : int(kv_seq_len)]
 
         queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
@@ -561,6 +563,7 @@ class LanguageModel(nn.Module):
         # reset rope_deltas when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None
+            self._position_ids = None
 
         cache_offset = 0
         if cache and cache[0] is not None:
@@ -584,7 +587,9 @@ class LanguageModel(nn.Module):
                 or self._rope_deltas is None
                 or cache is None
             ):
-                if self._position_ids is not None:
+                # Only reuse _position_ids for chunked prefill (cache_offset > 0)
+                # For new prompts (cache_offset == 0), always recalculate
+                if self._position_ids is not None and cache_offset > 0:
                     seq_length = inputs.shape[1]
                     position_ids = self._position_ids[
                         :, :, cache_offset : cache_offset + seq_length

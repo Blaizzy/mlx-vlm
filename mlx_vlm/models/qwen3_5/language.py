@@ -99,7 +99,7 @@ class Qwen3_5RMSNormGated(nn.Module):
         x = mx.fast.rms_norm(hidden_states, self.weight, self.eps)
         if gate is not None:
             x = swiglu(gate, x)
-        return x
+        return x.astype(hidden_states.dtype)
 
 
 class Qwen3_5Attention(nn.Module):
@@ -179,7 +179,9 @@ class Qwen3_5Attention(nn.Module):
         cos, sin = self.rotary_emb(values, position_ids)
 
         if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., :kv_seq_len]
+            if isinstance(kv_seq_len, mx.array):
+                kv_seq_len = kv_seq_len.max().item()
+            mask = mask[..., : int(kv_seq_len)]
 
         queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
@@ -267,6 +269,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         if cache is not None and cache[0] is not None:
             conv_state = cache[0]
+            if conv_state.shape[0] != B:
+                conv_state = mx.zeros(
+                    (B, self.conv_kernel_size - 1, self.conv_dim),
+                    dtype=inputs.dtype,
+                )
         else:
             conv_state = mx.zeros(
                 (B, self.conv_kernel_size - 1, self.conv_dim),
@@ -274,7 +281,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
 
         if mask is not None:
-            mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
+            if mask.shape[0] != B:
+                mask = None
+            else:
+                mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
         if cache is not None:
             cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
@@ -290,6 +300,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         ]
 
         state = cache[1] if cache else None
+        if state is not None and state.shape[0] != B:
+            state = None
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
@@ -580,14 +592,21 @@ class LanguageModel(nn.Module):
             self._position_ids = None
 
         cache_offset = 0
+        cache_offsets = None  # per-element offsets for batched caches
         if cache and cache[self.model.fa_idx] is not None:
             offset = cache[self.model.fa_idx].offset
             if isinstance(offset, int):
                 cache_offset = offset
             elif isinstance(offset, mx.array):
-                cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
+                if offset.ndim > 0 and offset.size > 1:
+                    # BatchKVCache: per-element offsets
+                    cache_offsets = mx.maximum(offset, 0)
+                    cache_offset = cache_offsets[0].item()
+                else:
+                    cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
             else:
                 raise ValueError(f"Unexpected cache offset type: {type(offset)}")
+            cache_offset = max(cache_offset, 0)
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask
@@ -595,6 +614,8 @@ class LanguageModel(nn.Module):
             rope_mask = None
 
         if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
+            batch_size, seq_length = inputs.shape
+
             if (
                 (
                     cache is not None
@@ -604,9 +625,11 @@ class LanguageModel(nn.Module):
                 or self._rope_deltas is None
                 or cache is None
             ):
-                # Use cached position_ids when available (pre-computed in get_input_embeddings)
-                if self._position_ids is not None:
-                    seq_length = inputs.shape[1]
+                # First prefill or fresh cache — compute position_ids
+                if (
+                    self._position_ids is not None
+                    and self._position_ids.shape[1] == batch_size
+                ):
                     position_ids = self._position_ids[
                         :, :, cache_offset : cache_offset + seq_length
                     ]
@@ -617,22 +640,27 @@ class LanguageModel(nn.Module):
                     self._rope_deltas = rope_deltas
                     self._position_ids = position_ids
             else:
-                batch_size, seq_length = inputs.shape
-                delta = mx.array(
-                    cache_offset + self._rope_deltas if cache is not None else 0
-                )
-                position_ids = mx.arange(seq_length).reshape(1, -1)
-                position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
-
-                if cache_offset is not None:
+                # Generation step — build position_ids from cache offsets
+                if cache_offsets is not None and cache_offsets.size >= batch_size:
+                    # Batched: per-element offsets
+                    offsets = cache_offsets[:batch_size]
+                    rope_deltas = self._rope_deltas
+                    if rope_deltas.shape[0] > batch_size:
+                        rope_deltas = rope_deltas[:batch_size]
+                    delta = (offsets + rope_deltas.squeeze(-1))[:, None]
+                else:
+                    delta = mx.array(
+                        cache_offset + self._rope_deltas if cache is not None else 0
+                    )
                     if delta.ndim == 0:
                         delta = mx.expand_dims(delta, axis=0)
-
                     if delta.shape[0] < batch_size:
                         delta = mx.tile(delta, (batch_size, 1))
                     else:
                         delta = delta[:batch_size]
 
+                position_ids = mx.arange(seq_length).reshape(1, -1)
+                position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
                 position_ids = mx.add(position_ids, delta)[None, ...]
                 position_ids = mx.broadcast_to(
                     position_ids, (3, batch_size, seq_length)
@@ -667,7 +695,8 @@ class LanguageModel(nn.Module):
 
     @property
     def quant_predicate(self):
-        if self.config.num_experts <= 0:
+
+        if getattr(self.args, "num_experts", 0) <= 0:
             return None
 
         def predicate(path, _):

@@ -8,6 +8,7 @@ from mlx_vlm.models.qwen3_omni_moe.code2wav import Code2WavModel
 from mlx_vlm.models.qwen3_omni_moe.talker import Talker
 from mlx_vlm.models.qwen3_omni_moe.thinker import Thinker
 
+from . import processing_qwen3_omni_moe  # noqa: F401
 from .config import ModelConfig
 
 
@@ -101,6 +102,11 @@ class Model(nn.Module):
         if isinstance(vision_output, tuple):
             return vision_output[0]
         return vision_output
+
+    @property
+    def language_model(self):
+        """Expose thinker's language model for the generic generate path."""
+        return self.thinker.language_model
 
     @property
     def layers(self):
