@@ -1484,6 +1484,49 @@ class BatchGenerator:
         )
         return uids
 
+    def remove(self, uid) -> bool:
+        """Remove a sequence from the batch by uid.
+
+        Removes from unprocessed_sequences, prompt_batch, or generation_batch
+        depending on where the sequence currently lives. Returns True if the
+        uid was found and removed.
+
+        Note: when multiple sequences share a PromptProcessingBatch (true for
+        direct multi-insert), we can only remove the whole prompt_batch if
+        the target uid is the only one left; otherwise the remaining siblings
+        would be cancelled too. Callers that need finer-grained removal during
+        prompt processing should prefer the server's flush pattern, which keeps
+        each prompt_batch to a single sequence.
+        """
+        # 1) Still waiting in the queue — easy
+        for i, (seq_uid, _, _, _) in enumerate(self._unprocessed_sequences):
+            if seq_uid == uid:
+                self._unprocessed_sequences.pop(i)
+                return True
+
+        # 2) Currently being prefilled
+        if self._prompt_batch is not None and uid in self._prompt_batch.uids:
+            if len(self._prompt_batch.uids) == 1:
+                # Sole occupant — discard the whole in-flight prefill.
+                self._prompt_batch.uids = []
+                self._prompt_batch.prompt_cache = []
+                self._prompt_batch = None
+                mx.clear_cache()
+                return True
+            # Multiple sequences share this prefill batch; let prefill finish
+            # and then remove from the generation batch below.
+            # Fall through — check generation batch too, in case this uid was
+            # already transitioned by a concurrent call.
+
+        # 3) Already decoding
+        if uid in self._generation_batch.uids:
+            idx = self._generation_batch.uids.index(uid)
+            keep = [i for i in range(len(self._generation_batch.uids)) if i != idx]
+            self._generation_batch.filter(keep)
+            return True
+
+        return False
+
     @property
     def unprocessed_prompts(self):
         """Backward-compatible alias for server flush logic."""

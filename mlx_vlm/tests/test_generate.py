@@ -454,6 +454,31 @@ class TestBatchGenerator:
         assert response.token == 42
         assert response.finish_reason == "stop"
 
+    def test_remove_from_unprocessed(self, mock_model, mock_processor):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+        )
+        uids = gen.insert([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+        assert len(gen.unprocessed_prompts) == 3
+
+        assert gen.remove(uids[1]) is True
+        assert len(gen.unprocessed_prompts) == 2
+        remaining_uids = [seq[0] for seq in gen.unprocessed_prompts]
+        assert uids[1] not in remaining_uids
+        assert uids[0] in remaining_uids
+        assert uids[2] in remaining_uids
+
+    def test_remove_missing_uid_returns_false(self, mock_model, mock_processor):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+        )
+        gen.insert([[1, 2, 3]])
+        assert gen.remove(9999) is False
+
 
 # ============================================================================
 # Tests for batch_generate function

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Callable, Iterator, List, Literal, Optional, Tuple, Union
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -193,6 +193,10 @@ class ResponseGenerator:
         )
         self.requests: Queue = Queue()
         self._stop = False
+        # Cancellation: uids that clients have abandoned. Read and cleared by
+        # the GPU thread between generation steps.
+        self._cancelled: set = set()
+        self._cancel_lock = Lock()
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -200,6 +204,16 @@ class ResponseGenerator:
         self._stop = True
         self.requests.put(None)
         self._thread.join(timeout=5.0)
+
+    def _cancel(self, uid):
+        """Mark a uid for cancellation. Picked up by the GPU thread."""
+        with self._cancel_lock:
+            self._cancelled.add(uid)
+
+    def _drain_cancellations(self) -> set:
+        with self._cancel_lock:
+            pending, self._cancelled = self._cancelled, set()
+            return pending
 
     def generate(
         self,
@@ -227,17 +241,27 @@ class ResponseGenerator:
         if isinstance(ctx, Exception):
             raise ctx
 
+        uid = ctx.uid
+
         def token_iterator():
+            ended = False
             try:
                 while True:
                     item = rqueue.get(timeout=60.0)
                     if item is None:
+                        ended = True
                         break
                     if isinstance(item, Exception):
+                        ended = True
                         raise item
                     yield item
             finally:
-                pass  # batch cleanup happens in _run
+                # If the consumer stopped before natural end (exception or
+                # GeneratorExit from the caller closing the iterator), signal
+                # the GPU thread to drop this uid so we don't waste compute
+                # on an abandoned request.
+                if not ended:
+                    self._cancel(uid)
 
         return ctx, token_iterator()
 
@@ -342,6 +366,19 @@ class ResponseGenerator:
                             new_items.append(item)
                     except QueueEmpty:
                         break
+
+                # Drop any abandoned requests before doing more work.
+                cancelled = self._drain_cancellations()
+                if cancelled and batch_gen is not None:
+                    for uid in cancelled:
+                        if uid in active:
+                            batch_gen.remove(uid)
+                            info = active.pop(uid)
+                            # Let any pending consumer unblock cleanly.
+                            try:
+                                info["rqueue"].put(None)
+                            except Exception:
+                                pass
 
                 # Insert new requests into batch
                 for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
