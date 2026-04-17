@@ -1091,8 +1091,8 @@ class GenerationBatch:
         max_tokens: List[int],
     ):
         self.model = model
-        # Use language_model directly during generation to skip VLM overhead
-        # (image/audio mask computation, per_layer_inputs in get_input_embeddings)
+        # Skip VLM wrapper overhead (image/audio masking, per_layer_inputs)
+        # by calling language_model directly during generation.
         self._language_model = getattr(model, "language_model", model)
         self.uids = uids
         self.prompt_cache = prompt_cache
@@ -1100,15 +1100,14 @@ class GenerationBatch:
         self.stop_criteria = stop_criteria
         self.max_tokens = max_tokens
         self._num_tokens = [0] * len(uids)
-        self.compute_logprobs = True  # Set False to skip logprob eval
+        self.compute_logprobs = True
 
-        # Double-buffer state: _next holds the pending (async) computation,
-        # _current holds the previous step's results being consumed.
-        # On construction, _next holds the first token already sampled by
-        # prefill; the first next() call will emit it and kick off the
-        # pipeline for the second token.
+        # Double-buffered pipeline: _next is the pending async computation,
+        # _current is the previous step's result being consumed. On
+        # construction _next holds the first token already sampled by
+        # prefill, so the first next() call emits it.
         self._current_tokens = None
-        self._current_lps = None  # pre-gathered per-token logprobs (scalar per seq)
+        self._current_lps = None
         self._next_tokens = inputs
         self._next_lps = None
 
@@ -1127,7 +1126,6 @@ class GenerationBatch:
         self._current_lps = self._next_lps
         inputs = self._current_tokens
 
-        # Forward pass — use language_model directly (skips VLM overhead)
         output = self._language_model(inputs[:, None], cache=self.prompt_cache)
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits[:, -1, :]
@@ -1135,8 +1133,8 @@ class GenerationBatch:
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         sampled = self.sampler(logprobs)
 
-        # Pre-gather logprobs for sampled tokens in the same graph,
-        # so the full vocab logprobs tensor is never materialized.
+        # Gather per-token logprobs in the same graph so the full vocab
+        # tensor stays a GPU intermediate instead of being materialized.
         self._next_tokens = sampled
         if self.compute_logprobs:
             self._next_lps = logprobs[mx.arange(sampled.shape[0]), sampled]
@@ -1145,7 +1143,6 @@ class GenerationBatch:
             self._next_lps = None
             mx.async_eval(self._next_tokens)
 
-        # Block on current step
         if self._current_lps is not None:
             mx.eval(inputs, self._current_lps)
             return inputs.tolist(), self._current_lps.tolist()
@@ -1288,7 +1285,6 @@ class PromptProcessingBatch:
         self.max_tokens = max_tokens
         self.prefill_step_size = prefill_step_size
 
-        # Left-pad input IDs for batching
         lengths = [len(ids) for ids in input_ids]
         max_length = max(lengths)
         left_padding = [max_length - l for l in lengths]
@@ -1298,14 +1294,13 @@ class PromptProcessingBatch:
         self._inputs_embeds = inputs_embeds
         self._prompt_kwargs = prompt_kwargs
 
-        # Reset cached position state from previous prefills
-        # (e.g. Qwen3.5 caches _position_ids / _rope_deltas on the model)
+        # Reset any per-model position state left over from a previous
+        # prefill (e.g. Qwen3.5 caches _position_ids / _rope_deltas).
         if hasattr(model, "_position_ids"):
             model._position_ids = None
         if hasattr(model, "_rope_deltas"):
             model._rope_deltas = None
 
-        # Create batch cache
         self.prompt_cache = _make_cache(
             model,
             left_padding,
@@ -1366,17 +1361,14 @@ class PromptProcessingBatch:
         )
         gen_batch.compute_logprobs = compute_logprobs
 
-        # Pre-populate _next_lps so that extend() can concatenate logprobs
-        # correctly when merging this batch into an existing generation batch.
-        # Without this, _next_lps is None for the new batch and extend skips
-        # the lps concat, leaving a size mismatch that trips IndexError in
-        # GenerationBatch.next().
+        # Populate _next_lps for the first tokens so extend() can concatenate
+        # logprobs correctly; without this, merging into an existing gen
+        # batch leaves a size mismatch that later trips IndexError in next().
         if compute_logprobs:
             gen_batch._next_lps = logprobs[
                 mx.arange(first_tokens.shape[0]), first_tokens
             ]
 
-        # Clear our state
         self.uids = []
         self.prompt_cache = []
         return gen_batch
@@ -1435,22 +1427,20 @@ class BatchGenerator:
 
         self.tokenizer.stopping_criteria.add_eos_token_ids(stop_tokens)
 
-        # Batch state
         self._generation_batch = GenerationBatch.empty(
             self.model, self.sampler, self.tokenizer.stopping_criteria,
             compute_logprobs=self.compute_logprobs,
         )
-        self._prompt_batch = None  # PromptProcessingBatch or None
+        self._prompt_batch: Optional[PromptProcessingBatch] = None
         self._unprocessed_sequences = []
 
-        # Stats counters
         self._prompt_tokens_counter = 0
         self._prompt_time_counter = 0
         self._gen_tokens_counter = 0
         self._steps_counter = 0
 
-        # Wire memory for maximum GPU residency (reuses the wired_limit
-        # context manager — same mechanism used by stream_generate).
+        # Hold wired_limit open for the lifetime of this generator so GPU
+        # residency matches what stream_generate gets via its own context.
         self._wire_stack = contextlib.ExitStack()
         self._wire_stack.enter_context(wired_limit(model, [generation_stream]))
 
@@ -1491,41 +1481,34 @@ class BatchGenerator:
 
         Removes from unprocessed_sequences, prompt_batch, or generation_batch
         depending on where the sequence currently lives. Returns True if the
-        uid was found and removed.
+        uid was found and removed. Runs inside the generation stream so cache
+        filter ops are ordered correctly against pending async evals.
 
-        Runs inside the generation stream so that cache filter ops are
-        ordered correctly against any in-flight async evals scheduled by
-        the previous next() call on that stream.
-
-        Note: when multiple sequences share a PromptProcessingBatch (true for
-        direct multi-insert), we can only remove the whole prompt_batch if
-        the target uid is the only one left; otherwise the remaining siblings
-        would be cancelled too. Callers that need finer-grained removal during
-        prompt processing should prefer the server's flush pattern, which keeps
-        each prompt_batch to a single sequence.
+        When a PromptProcessingBatch holds multiple sequences, only the whole
+        batch can be discarded — so this only tears the prompt_batch down when
+        uid is its sole occupant, otherwise it falls through and catches the
+        uid in the generation batch after prefill transitions.
         """
         with mx.stream(generation_stream):
-            # 1) Still waiting in the queue — easy
+            # Waiting in the queue.
             for i, (seq_uid, _, _, _) in enumerate(self._unprocessed_sequences):
                 if seq_uid == uid:
                     self._unprocessed_sequences.pop(i)
                     return True
 
-            # 2) Currently being prefilled
+            # Being prefilled — only safe to tear down when this uid is the
+            # sole occupant; otherwise we'd cancel its batch siblings too.
+            # Fall through so a multi-sequence prefill still has its transition
+            # caught in the generation batch below.
             if self._prompt_batch is not None and uid in self._prompt_batch.uids:
                 if len(self._prompt_batch.uids) == 1:
-                    # Sole occupant — discard the whole in-flight prefill.
                     self._prompt_batch.uids = []
                     self._prompt_batch.prompt_cache = []
                     self._prompt_batch = None
                     mx.clear_cache()
                     return True
-                # Multiple sequences share this prefill batch; let prefill
-                # finish and then remove from the generation batch below.
-                # Fall through — check generation batch too, in case this uid
-                # was already transitioned by a concurrent call.
 
-            # 3) Already decoding
+            # Already decoding.
             if uid in self._generation_batch.uids:
                 idx = self._generation_batch.uids.index(uid)
                 keep = [i for i in range(len(self._generation_batch.uids)) if i != idx]
@@ -1571,7 +1554,7 @@ class BatchGenerator:
         generation_responses = []
         prompt_responses = []
 
-        # 1. Generate tokens first (decode-first ordering)
+        # Decode-first: always emit a generation step before touching prefill.
         if len(self._generation_batch) > 0:
             generation_responses = self._generation_batch.next()
             self._gen_tokens_counter += len(generation_responses)
@@ -1579,11 +1562,9 @@ class BatchGenerator:
             if self._steps_counter % 512 == 0:
                 mx.clear_cache()
 
-        # 2. If generation batch is at capacity, just return
         if len(self._generation_batch) >= self.completion_batch_size:
             return prompt_responses, generation_responses
 
-        # 3. Continue processing existing prompt batch
         if self._prompt_batch is not None:
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
@@ -1592,7 +1573,6 @@ class BatchGenerator:
                 self._prompt_tokens_counter += n
                 return prompt_responses, generation_responses
 
-            # Prompt fully processed -> transition to generation
             tic = time.perf_counter()
             gen_batch = self._prompt_batch.generate(
                 self.sampler, self.tokenizer.stopping_criteria,
@@ -1604,7 +1584,6 @@ class BatchGenerator:
             mx.clear_cache()
             return prompt_responses, generation_responses
 
-        # 4. Start new prompt batch from queue
         num_active = len(self._generation_batch)
         num_to_add = self.completion_batch_size - num_active
         if self._unprocessed_sequences and num_to_add >= self.prefill_batch_size:
@@ -1617,7 +1596,6 @@ class BatchGenerator:
             max_tokens_list = [s[2] for s in sequences]
             prompt_kwargs_list = [s[3] for s in sequences]
 
-            # Extract and merge prompt kwargs
             inputs_embeds = None
             merged_kwargs = {}
             for kw in prompt_kwargs_list:
@@ -1631,7 +1609,6 @@ class BatchGenerator:
             if inputs_embeds is None:
                 raise ValueError("inputs_embeds is required")
 
-            # Slice batch data to match current batch size
             batch_size = len(uids)
             for key, value in merged_kwargs.items():
                 if isinstance(value, mx.array) and value.ndim > 0:
@@ -1651,13 +1628,13 @@ class BatchGenerator:
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 
-            # Process first chunk or go straight to generation if short
+            # Chunk if the prompt is too long, otherwise transition straight
+            # to the generation batch.
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
                 n = self._prompt_batch.prompt_step()
                 self._prompt_time_counter += time.perf_counter() - tic
             else:
-                # Short prompt — go straight to generation
                 tic = time.perf_counter()
                 gen_batch = self._prompt_batch.generate(
                     self.sampler, self.tokenizer.stopping_criteria

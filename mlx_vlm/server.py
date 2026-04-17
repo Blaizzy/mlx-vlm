@@ -193,8 +193,6 @@ class ResponseGenerator:
         )
         self.requests: Queue = Queue()
         self._stop = False
-        # Cancellation: uids that clients have abandoned. Read and cleared by
-        # the GPU thread between generation steps.
         self._cancelled: set = set()
         self._cancel_lock = Lock()
         self._thread = Thread(target=self._run, daemon=True)
@@ -206,7 +204,6 @@ class ResponseGenerator:
         self._thread.join(timeout=5.0)
 
     def _cancel(self, uid):
-        """Mark a uid for cancellation. Picked up by the GPU thread."""
         with self._cancel_lock:
             self._cancelled.add(uid)
 
@@ -244,6 +241,9 @@ class ResponseGenerator:
         uid = ctx.uid
 
         def token_iterator():
+            # Mark ended before yielding the final token so a consumer that
+            # closes immediately after seeing finish_reason isn't treated
+            # as a client abort.
             ended = False
             try:
                 while True:
@@ -254,20 +254,12 @@ class ResponseGenerator:
                     if isinstance(item, Exception):
                         ended = True
                         raise item
-                    # Mark ended BEFORE yielding the final token so that if
-                    # the consumer closes the iterator right after consuming
-                    # it (as stream_generator does on finish_reason), we
-                    # don't mis-interpret that as a client abort.
                     if getattr(item, "finish_reason", None):
                         ended = True
                     yield item
                     if ended:
                         break
             finally:
-                # If the consumer stopped before natural end (exception or
-                # GeneratorExit from the caller closing the iterator), signal
-                # the GPU thread to drop this uid so we don't waste compute
-                # on an abandoned request.
                 if not ended:
                     self._cancel(uid)
 
@@ -341,10 +333,10 @@ class ResponseGenerator:
 
         while not self._stop:
             try:
-                # Collect pending requests (non-blocking when generating)
+                # Poll the request queue — non-blocking when generating, short
+                # blocking wait when idle so we don't spin.
                 new_items = []
                 if active:
-                    # Non-blocking poll when actively generating
                     try:
                         item = self.requests.get_nowait()
                         if item is None:
@@ -355,7 +347,6 @@ class ResponseGenerator:
                     except QueueEmpty:
                         pass
                 else:
-                    # Block briefly when idle
                     try:
                         item = self.requests.get(timeout=0.1)
                         if item is None:
@@ -366,7 +357,6 @@ class ResponseGenerator:
                     except QueueEmpty:
                         pass
 
-                # Drain any more that arrived
                 while True:
                     try:
                         item = self.requests.get_nowait()
@@ -375,20 +365,18 @@ class ResponseGenerator:
                     except QueueEmpty:
                         break
 
-                # Drop any abandoned requests before doing more work.
+                # Drop abandoned requests before doing more work.
                 cancelled = self._drain_cancellations()
                 if cancelled and batch_gen is not None:
                     for uid in cancelled:
                         if uid in active:
                             batch_gen.remove(uid)
                             info = active.pop(uid)
-                            # Let any pending consumer unblock cleanly.
                             try:
                                 info["rqueue"].put(None)
                             except Exception:
                                 pass
 
-                # Insert new requests into batch
                 for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
@@ -402,11 +390,13 @@ class ResponseGenerator:
                             quantized_kv_start=self.quantized_kv_start,
                         )
 
-                    # GPU work: vision encoder only (if images present)
+                    # Vision encoder runs on the GPU thread; text tokenization
+                    # already happened on the caller thread.
                     input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
 
-                    # Image request: flush pending text-only first
+                    # Image/embed requests can't share a prefill batch with
+                    # pending text-only prompts — drain them first.
                     if has_embeds and batch_gen.unprocessed_prompts:
                         self._flush(batch_gen, active)
 
@@ -428,14 +418,12 @@ class ResponseGenerator:
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                     }
 
-                    # Trigger prefill (kwargs stored in prompt via insert)
                     if has_embeds:
                         self._step(batch_gen, active)
 
                 if not active or batch_gen is None:
                     continue
 
-                # One decode step, then loop back to check for new requests
                 self._step(batch_gen, active)
 
             except Exception as e:
