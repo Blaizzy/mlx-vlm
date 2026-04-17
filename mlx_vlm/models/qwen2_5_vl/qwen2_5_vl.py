@@ -28,10 +28,11 @@ class Model(nn.Module):
         mask = kwargs.get("mask", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
         if pixel_values is None:
-            # Text-only: don't reset _position_ids / _rope_deltas — other
-            # sequences in the current batch may still be decoding and
-            # rely on these. Prefill of this new sequence will recompute
-            # them via the cache_offset==0 path in LanguageModel.__call__.
+            # Reset _position_ids so a stale image-prefill slice doesn't
+            # leak into this text prefill. Leave _rope_deltas alone so
+            # other sequences still decoding in the batch keep their
+            # per-sequence positional state.
+            self.language_model._position_ids = None
             return InputEmbeddingsFeatures(
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids)
             )

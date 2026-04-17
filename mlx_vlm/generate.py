@@ -1294,13 +1294,6 @@ class PromptProcessingBatch:
         self._inputs_embeds = inputs_embeds
         self._prompt_kwargs = prompt_kwargs
 
-        # Reset any per-model position state left over from a previous
-        # prefill (e.g. Qwen3.5 caches _position_ids / _rope_deltas).
-        if hasattr(model, "_position_ids"):
-            model._position_ids = None
-        if hasattr(model, "_rope_deltas"):
-            model._rope_deltas = None
-
         self.prompt_cache = _make_cache(
             model,
             left_padding,
