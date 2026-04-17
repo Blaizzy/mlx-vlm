@@ -376,11 +376,8 @@ class ResponseGenerator:
                 if not active or batch_gen is None:
                     continue
 
-                # Tight generation loop — run as many steps as we can
-                # in a time budget, then check for new requests.
-                deadline = time.time() + 0.5
-                while active and time.time() < deadline:
-                    self._step(batch_gen, active)
+                # One decode step, then loop back to check for new requests
+                self._step(batch_gen, active)
 
             except Exception as e:
                 print(f"Error in generation thread: {e}")
