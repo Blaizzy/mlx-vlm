@@ -4007,6 +4007,104 @@ def _write_state(dst, src, start: int):
     raise TypeError(f"Unsupported TurboQuant state type: {type(dst)!r}")
 
 
+def _map_state(state, fn):
+    """Apply *fn* to every ``mx.array`` leaf in a TurboQuant state NamedTuple.
+
+    *fn* receives ``(array, ndim)`` where *ndim* is the number of dimensions
+    the array has (3 for norm-like ``(B,H,T)``, 4 for index-like
+    ``(B,H,T,P)``).  The function must return an ``mx.array`` with the same
+    number of dimensions.
+    """
+    if state is None:
+        return None
+    if isinstance(state, TurboQuantMSEState):
+        return TurboQuantMSEState(fn(state.norms, 3), fn(state.indices, 4))
+    if isinstance(state, TurboQuantProdState):
+        return TurboQuantProdState(
+            fn(state.norms, 3),
+            fn(state.mse_indices, 4),
+            fn(state.residual_norms, 3),
+            fn(state.qjl_signs, 4),
+        )
+    if isinstance(state, TurboQuantPolarState):
+        return TurboQuantPolarState(
+            fn(state.radii, 4),
+            tuple(fn(level, 4) for level in state.level_indices),
+        )
+    if isinstance(state, TurboQuantPolarProdState):
+        return TurboQuantPolarProdState(
+            fn(state.norms, 3),
+            _map_state(state.polar_state, fn),
+            fn(state.residual_norms, 3),
+            fn(state.qjl_signs, 4),
+        )
+    if isinstance(state, TurboQuantSplitState):
+        return TurboQuantSplitState(
+            _map_state(state.low, fn),
+            _map_state(state.high, fn),
+        )
+    raise TypeError(f"Unsupported TurboQuant state type: {type(state)!r}")
+
+
+def _map_state_pair(s1, s2, fn):
+    """Apply *fn(a1, a2, ndim)* element-wise across two matching states."""
+    if s1 is None and s2 is None:
+        return None
+    if isinstance(s1, TurboQuantMSEState):
+        return TurboQuantMSEState(
+            fn(s1.norms, s2.norms, 3), fn(s1.indices, s2.indices, 4)
+        )
+    if isinstance(s1, TurboQuantProdState):
+        return TurboQuantProdState(
+            fn(s1.norms, s2.norms, 3),
+            fn(s1.mse_indices, s2.mse_indices, 4),
+            fn(s1.residual_norms, s2.residual_norms, 3),
+            fn(s1.qjl_signs, s2.qjl_signs, 4),
+        )
+    if isinstance(s1, TurboQuantPolarState):
+        return TurboQuantPolarState(
+            fn(s1.radii, s2.radii, 4),
+            tuple(fn(l1, l2, 4) for l1, l2 in zip(s1.level_indices, s2.level_indices)),
+        )
+    if isinstance(s1, TurboQuantPolarProdState):
+        return TurboQuantPolarProdState(
+            fn(s1.norms, s2.norms, 3),
+            _map_state_pair(s1.polar_state, s2.polar_state, fn),
+            fn(s1.residual_norms, s2.residual_norms, 3),
+            fn(s1.qjl_signs, s2.qjl_signs, 4),
+        )
+    if isinstance(s1, TurboQuantSplitState):
+        return TurboQuantSplitState(
+            _map_state_pair(s1.low, s2.low, fn),
+            _map_state_pair(s1.high, s2.high, fn),
+        )
+    raise TypeError(f"Unsupported TurboQuant state type: {type(s1)!r}")
+
+
+def _filter_state(state, batch_indices: mx.array):
+    """Select batch elements from a TurboQuant state."""
+    return _map_state(state, lambda a, ndim: a[batch_indices])
+
+
+def _pad_state_tokens(state, left: int, right: int):
+    """Pad along the token dimension (index 2)."""
+    if left == 0 and right == 0:
+        return state
+
+    def _pad(a, ndim):
+        if ndim == 3:  # (B, H, T)
+            return mx.pad(a, [(0, 0), (0, 0), (left, right)])
+        else:  # (B, H, T, P)
+            return mx.pad(a, [(0, 0), (0, 0), (left, right), (0, 0)])
+
+    return _map_state(state, _pad)
+
+
+def _concat_state_batch(s1, s2):
+    """Concatenate two states along the batch dimension (index 0)."""
+    return _map_state_pair(s1, s2, lambda a1, a2, ndim: mx.concatenate([a1, a2]))
+
+
 def _reserve_state_capacity(state, used: int, needed: int, step: int):
     if state is None:
         return None
@@ -5944,3 +6042,244 @@ class TurboQuantKVCache(_BaseCache):
     @property
     def nbytes(self):
         return _state_nbytes(self.state)
+
+
+# ── Batch-aware TurboQuant cache for continuous batching ────────────────
+
+
+class BatchTurboQuantKVCache(_BaseCache):
+    """Batch-aware TurboQuant KV cache for continuous batching.
+
+    Wraps TurboQuant's quantization codecs with per-sequence offsets and
+    left-padding so that ``Batch.extend`` / ``Batch.filter`` work during
+    continuous batching.
+
+    Unlike ``BatchQuantizedKVCache`` (uniform ``mx.quantize``), this uses
+    TurboQuant's MSE/Prod codecs for higher quality at the same bit-rate.
+    """
+
+    cache_step = 256
+
+    def __init__(
+        self,
+        left_padding: list,
+        bits: float,
+        seed: int = DEFAULT_TURBOQUANT_SEED,
+    ):
+        self.bits = _validate_bits(bits)
+        self.seed = seed
+        self.keys = None
+        self.values = None
+        self.key_codec = None
+        self.value_codec = None
+        self.left_padding = mx.array(left_padding)
+        self.offset = mx.array([-lp for lp in left_padding])
+        self._idx = 0
+
+    # ------------------------------------------------------------------
+    # Codec initialisation (deferred until first update)
+    # ------------------------------------------------------------------
+
+    def _ensure_codecs(self, keys: mx.array):
+        if self.key_codec is not None:
+            return
+        D = keys.shape[-1]
+        # Delegate to a temporary TurboQuantKVCache to get codec setup right
+        tmp = TurboQuantKVCache(bits=self.bits, seed=self.seed)
+        tmp._ensure_codecs(keys, keys)  # values have same D
+        self.key_codec = tmp.key_codec
+        self.value_codec = tmp.value_codec
+
+    # ------------------------------------------------------------------
+    # Core cache operation
+    # ------------------------------------------------------------------
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        self._ensure_codecs(keys)
+        prev = self._idx
+
+        new_keys = self.key_codec.quantize(keys)
+        new_values = self.value_codec.quantize(values)
+
+        new_end = prev + keys.shape[2]
+        if self.keys is None:
+            self.keys = _allocate_state_like(new_keys, new_end)
+            self.values = _allocate_state_like(new_values, new_end)
+        else:
+            self.keys = _reserve_state_capacity(
+                self.keys, prev, new_end, self.cache_step
+            )
+            self.values = _reserve_state_capacity(
+                self.values, prev, new_end, self.cache_step
+            )
+
+        _write_state(self.keys, new_keys, prev)
+        _write_state(self.values, new_values, prev)
+
+        self.offset += keys.shape[2]
+        self._idx = new_end
+
+        if keys.shape[2] > 1 or (self._idx % 50 == 0):
+            mx.eval(self.keys, self.values)
+
+        ks = _slice_state(self.keys, self._idx)
+        vs = _slice_state(self.values, self._idx)
+        n_heads = keys.shape[1]
+        return (
+            _QuantizedStateProxy(ks, self._idx, n_heads),
+            _QuantizedStateProxy(vs, self._idx, n_heads),
+        )
+
+    # ------------------------------------------------------------------
+    # Batch operations for Batch.filter / Batch.extend
+    # ------------------------------------------------------------------
+
+    def filter(self, batch_indices: mx.array):
+        if self.keys is not None:
+            self.keys = _filter_state(self.keys, batch_indices)
+            self.values = _filter_state(self.values, batch_indices)
+        self.offset = self.offset[batch_indices]
+        self.left_padding = self.left_padding[batch_indices]
+
+        min_lp = self.left_padding.min().item()
+        if min_lp > 0:
+            if self.keys is not None:
+                # Trim leading padding tokens
+                def _trim(a, ndim):
+                    if ndim == 3:
+                        return a[..., min_lp:]
+                    return a[..., min_lp:, :]
+
+                self.keys = _map_state(self.keys, _trim)
+                self.values = _map_state(self.values, _trim)
+            self._idx -= min_lp
+            self.left_padding -= min_lp
+
+    def extend(self, other: "BatchTurboQuantKVCache"):
+        if self.keys is None and other.keys is None:
+            self.left_padding = mx.concatenate(
+                [self.left_padding, other.left_padding]
+            )
+            self.offset = mx.concatenate([self.offset, other.offset])
+            return
+
+        max_idx = max(self._idx, other._idx)
+
+        def _pad_side(cache_obj):
+            if cache_obj.keys is None:
+                return None
+            left = max_idx - cache_obj._idx
+            right = 0
+            k = _pad_state_tokens(
+                _slice_state(cache_obj.keys, cache_obj._idx), left, right
+            )
+            v = _pad_state_tokens(
+                _slice_state(cache_obj.values, cache_obj._idx), left, right
+            )
+            lp = cache_obj.left_padding + left
+            return k, v, cache_obj.offset, lp
+
+        r_self = _pad_side(self)
+        r_other = _pad_side(other)
+
+        if r_self is None and r_other is None:
+            self.left_padding = mx.concatenate(
+                [self.left_padding, other.left_padding]
+            )
+            self.offset = mx.concatenate([self.offset, other.offset])
+            return
+        if r_self is None:
+            self.keys, self.values, so, slp = r_other
+            self.offset = mx.concatenate([self.offset, so])
+            self.left_padding = mx.concatenate(
+                [self.left_padding + max_idx, slp]
+            )
+            self._idx = max_idx
+            return
+        if r_other is None:
+            self.keys, self.values, so, slp = r_self
+            self.offset = mx.concatenate([so, other.offset])
+            self.left_padding = mx.concatenate(
+                [slp, other.left_padding + max_idx]
+            )
+            self._idx = max_idx
+            return
+
+        sk, sv, so, slp = r_self
+        ok, ov, oo, olp = r_other
+
+        self.keys = _concat_state_batch(sk, ok)
+        self.values = _concat_state_batch(sv, ov)
+        self.offset = mx.concatenate([so, oo])
+        self.left_padding = mx.concatenate([slp, olp])
+        self._idx = max_idx
+
+    # ------------------------------------------------------------------
+    # Dequantize (for attention fallback)
+    # ------------------------------------------------------------------
+
+    def dequantize(self, keys_state=None, values_state=None):
+        if keys_state is None or values_state is None:
+            keys_state = _slice_state(self.keys, self._idx)
+            values_state = _slice_state(self.values, self._idx)
+        if isinstance(keys_state, _QuantizedStateProxy):
+            keys_state = keys_state._state
+        if isinstance(values_state, _QuantizedStateProxy):
+            values_state = values_state._state
+        k = self.key_codec.dequantize(keys_state).astype(mx.float32)
+        v = self.value_codec.dequantize(values_state).astype(mx.float32)
+        return k, v
+
+    # ------------------------------------------------------------------
+    # State / introspection
+    # ------------------------------------------------------------------
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None, self.offset, self.left_padding
+        k = _slice_state(self.keys, self._idx)
+        v = _slice_state(self.values, self._idx)
+        return k, v, self.offset, self.left_padding
+
+    @state.setter
+    def state(self, val):
+        self.keys, self.values, self.offset, self.left_padding = val
+        if self.keys is not None:
+            self._idx = _state_length(self.keys)
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (self._idx, self.bits, self.seed)))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self._idx = int(v[0])
+        self.bits = float(v[1])
+        self.seed = int(v[2])
+
+    def is_trimmable(self):
+        return False
+
+    def trim(self, n):
+        return 0
+
+    def empty(self):
+        return self.keys is None
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    @property
+    def group_size(self):
+        # Required by mlx_lm's scaled_dot_product_attention dispatch
+        # but not used for TurboQuant (it has its own attention path)
+        return 64
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        s = _slice_state(self.keys, self._idx)
+        v = _slice_state(self.values, self._idx)
+        return _state_nbytes(s) + _state_nbytes(v)

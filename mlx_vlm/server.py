@@ -39,6 +39,7 @@ from .generate import (
     normalize_resize_shape,
     stream_generate,
 )
+from .turboquant import turboquant_enabled
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
 from .tool_parsers import _infer_tool_parser, load_tool_module
@@ -166,11 +167,25 @@ class ResponseGenerator:
     higher throughput — same pattern as mlx-lm's server.
     """
 
-    def __init__(self, model, processor, stop_tokens=None, vision_cache=None):
+    def __init__(
+        self,
+        model,
+        processor,
+        stop_tokens=None,
+        vision_cache=None,
+        kv_bits=None,
+        kv_group_size=DEFAULT_KV_GROUP_SIZE,
+        kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
+        quantized_kv_start=DEFAULT_QUANTIZED_KV_START,
+    ):
         self.model = model
         self.processor = processor
         self.stop_tokens = stop_tokens or set()
         self.vision_cache = vision_cache
+        self.kv_bits = kv_bits
+        self.kv_group_size = kv_group_size
+        self.kv_quant_scheme = kv_quant_scheme
+        self.quantized_kv_start = quantized_kv_start
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -322,6 +337,10 @@ class ResponseGenerator:
                             self.processor,
                             stop_tokens=self.stop_tokens,
                             sampler=self._make_sampler(args),
+                            kv_bits=self.kv_bits,
+                            kv_group_size=self.kv_group_size,
+                            kv_quant_scheme=self.kv_quant_scheme,
+                            quantized_kv_start=self.quantized_kv_start,
                         )
 
                     # GPU work: vision encoder only (if images present)
@@ -634,11 +653,22 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
     # Create ResponseGenerator for continuous batching
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
+
+    # KV cache quantization (uniform or TurboQuant)
+    kv_bits = get_quantized_kv_bits(model_path)
+    kv_group_size = get_kv_group_size()
+    quantized_kv_start = get_quantized_kv_start()
+    kv_quant_scheme = get_kv_quant_scheme()
+
     response_generator = ResponseGenerator(
         model=model,
         processor=processor,
         stop_tokens=stop_tokens,
         vision_cache=vision_cache,
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        kv_quant_scheme=kv_quant_scheme,
+        quantized_kv_start=quantized_kv_start,
     )
 
     model_cache = {

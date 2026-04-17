@@ -13,7 +13,7 @@ from mlx_lm.models.base import (
 )
 from PIL import Image
 
-from ..turboquant import TurboQuantKVCache
+from ..turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
 
 
 def load_chat_template(tokenizer, model_path):
@@ -211,6 +211,20 @@ def scaled_dot_product_attention(
         )
         if result is not None:
             return result
+        dequantized_keys, dequantized_values = cache.dequantize(keys, values)
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            dequantized_keys.astype(queries.dtype),
+            dequantized_values.astype(queries.dtype),
+            scale=scale,
+            mask=mask,
+        )
+
+    if isinstance(cache, BatchTurboQuantKVCache):
+        # Batch TurboQuant: dequantize and use standard sdpa.
+        # TurboQuant's custom Metal kernels don't support batched
+        # per-sequence offsets, so we dequantize at attention time.
+        # Memory savings are preserved (KV stored quantized).
         dequantized_keys, dequantized_values = cache.dequantize(keys, values)
         return mx.fast.scaled_dot_product_attention(
             queries,
