@@ -12,6 +12,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
   - [Python Script](#python-script)
   - [Server (FastAPI)](#server-fastapi)
     - [Continuous Batching](#continuous-batching)
+    - [KV Cache Quantization](#kv-cache-quantization)
 - [Activation Quantization (CUDA)](#activation-quantization-cuda)
 - [Multi-Image Chat Support](#multi-image-chat-support)
   - [Supported Models](#supported-models)
@@ -208,9 +209,12 @@ mlx_vlm.server --trust-remote-code
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
 - `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
-- `--kv-bits`: Number of bits for KV cache quantization (e.g. `3.5` for TurboQuant)
+- `--kv-bits`: Number of bits for KV cache quantization (e.g. `8` for uniform, `3.5` for TurboQuant)
 - `--kv-quant-scheme`: KV cache quantization backend (`uniform` or `turboquant`)
+- `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
+- `--max-kv-size`: Maximum KV cache size in tokens
 - `--vision-cache-size`: Max number of cached vision features (default: `20`)
+- `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
 
 You can also set trust remote code via environment variable:
 ```sh
@@ -237,6 +241,30 @@ curl http://localhost:8080/health
 ```
 
 If `--model` is omitted, the model is loaded on the first request.
+
+#### KV Cache Quantization
+
+Reduce KV cache memory during continuous batching with `--kv-bits`. Both uniform quantization and TurboQuant are supported:
+
+```sh
+# Uniform 8-bit KV cache quantization
+mlx_vlm.server --model google/gemma-4-26b-a4b-it --kv-bits 8
+
+# TurboQuant 3.5-bit (3-bit keys + 4-bit values)
+mlx_vlm.server --model google/gemma-4-26b-a4b-it --kv-bits 3.5 --kv-quant-scheme turboquant
+```
+
+Full-attention layers use quantized batch caches while sliding-window layers keep their fixed-size rotating caches. The last full-attention layer stays unquantized (sensitive in deep models).
+
+Tested with gemma-4-26b-a4b-it at 20K context:
+
+| Config | Gen tok/s | KV Cache | KV Reduction |
+|--------|-----------|----------|--------------|
+| No quant | 50.3 | 0.624 GB | 1x |
+| Uniform 8-bit | 52.6 | 0.469 GB | **1.33x** |
+| TurboQuant 3.5-bit | 25.6 | 0.365 GB | **1.71x** |
+
+> Models with all full-attention layers (e.g. Qwen, LLaMA) see larger reductions — up to 3.6x at 8-bit and 6.4x at 4-bit.
 
 #### How It Works
 
@@ -629,6 +657,8 @@ Tested on gemma-4-31b-it at 128k context:
 ### Compatibility
 
 TurboQuant automatically quantizes `KVCache` layers (global attention). Models with `RotatingKVCache` (sliding window) or `ArraysCache` (MLA/absorbed keys) keep their native cache format for those layers since they are already memory-efficient.
+
+TurboQuant is supported in both single-request generation and continuous batching on the server. In continuous batching mode, KV states are stored in TurboQuant's compressed format and dequantized at attention time (custom Metal kernels are not yet batch-aware).
 
 # Fine-tuning
 
