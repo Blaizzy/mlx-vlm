@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import gc
 import json
+import logging
 import os
 import re
 import time
@@ -14,6 +15,8 @@ from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Thread
 from typing import Any, Callable, Iterator, List, Literal, Optional, Tuple, Union
+
+logger = logging.getLogger("mlx_vlm.server")
 
 import mlx.core as mx
 import uvicorn
@@ -564,9 +567,13 @@ async def lifespan(app):
     model_path = os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
     if model_path:
         adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
-        print(f"Pre-loading model: {model_path}")
+        logger.info("Pre-loading model: %s", model_path)
         get_cached_model(model_path, adapter_path)
-        print("Model ready, continuous batching enabled.")
+        kv_bits = os.environ.get("KV_BITS")
+        kv_scheme = os.environ.get("KV_QUANT_SCHEME", "uniform")
+        if kv_bits:
+            logger.info("KV cache quantization: bits=%s scheme=%s", kv_bits, kv_scheme)
+        logger.info("Model ready, continuous batching enabled.")
     yield
 
 
@@ -1166,6 +1173,7 @@ async def responses_endpoint(request: Request):
 
     """
 
+    request_start = time.perf_counter()
     body = await request.json()
     openai_request = OpenAIRequest(**body)
 
@@ -1250,6 +1258,15 @@ async def responses_endpoint(request: Request):
             chat_messages,
             num_images=len(images),
             **gen_args.to_template_kwargs(),
+        )
+
+        logger.debug(
+            "responses request: model=%s images=%d max_tokens=%s temp=%s stream=%s",
+            openai_request.model,
+            len(images),
+            gen_args.max_tokens,
+            gen_args.temperature,
+            openai_request.stream,
         )
 
         generated_at = datetime.now().timestamp()
@@ -1493,6 +1510,22 @@ async def responses_endpoint(request: Request):
                         "total_tokens": prompt_tokens + output_tokens,
                     },
                 )
+
+                elapsed = time.perf_counter() - request_start
+                logger.debug(
+                    "responses done: prompt_tokens=%d output_tokens=%d "
+                    "total_time=%.2fs",
+                    prompt_tokens,
+                    output_tokens,
+                    elapsed,
+                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    resp_text = content or ""
+                    logger.debug(
+                        "  response: %s",
+                        resp_text[:200] + ("..." if len(resp_text) > 200 else ""),
+                    )
+
                 return response
 
             except Exception as e:
@@ -1524,6 +1557,7 @@ async def chat_completions_endpoint(request: ChatRequest):
     Can operate in streaming or non-streaming mode.
     """
 
+    request_start = time.perf_counter()
     try:
         # Get model, processor, config - loading if necessary
         model, processor, config = get_cached_model(request.model, request.adapter_path)
@@ -1614,6 +1648,17 @@ async def chat_completions_endpoint(request: ChatRequest):
             num_audios=len(audio),
             tools=tools,
             **gen_args.to_template_kwargs(),
+        )
+
+        logger.debug(
+            "chat/completions request: model=%s images=%d audio=%d "
+            "max_tokens=%s temp=%s stream=%s",
+            request.model,
+            len(images),
+            len(audio),
+            gen_args.max_tokens,
+            gen_args.temperature,
+            request.stream,
         )
 
         if request.stream:
@@ -1777,6 +1822,13 @@ async def chat_completions_endpoint(request: ChatRequest):
                     # Signal stream end
                     yield "data: [DONE]\n\n"
 
+                    elapsed = time.perf_counter() - request_start
+                    logger.debug(
+                        "chat/completions stream done: tokens=%d " "total_time=%.2fs",
+                        output_tokens,
+                        elapsed,
+                    )
+
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
@@ -1911,6 +1963,22 @@ async def chat_completions_endpoint(request: ChatRequest):
                     usage=usage_stats,
                     choices=choices,
                 )
+
+                elapsed = time.perf_counter() - request_start
+                logger.debug(
+                    "chat/completions done: prompt_tokens=%d completion_tokens=%d "
+                    "total_time=%.2fs peak_memory=%.2fGB",
+                    prompt_tokens,
+                    completion_tokens,
+                    elapsed,
+                    peak_memory,
+                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    resp_text = content or ""
+                    logger.debug(
+                        "  response: %s",
+                        resp_text[:200] + ("..." if len(resp_text) > 200 else ""),
+                    )
 
                 return result
 
@@ -2083,6 +2151,13 @@ def main():
         default=False,
         help="Enable auto-reload for development.",
     )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the logging level (default: INFO).",
+    )
     args = parser.parse_args()
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
@@ -2100,6 +2175,15 @@ def main():
     if args.max_kv_size is not None:
         os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+
+    # Configure logging
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+    logger.setLevel(log_level)
+
     uvicorn.run(
         "mlx_vlm.server:app",
         host=args.host,
