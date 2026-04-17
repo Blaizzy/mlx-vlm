@@ -737,7 +737,7 @@ class LanguageModel(nn.Module):
                 if offset.ndim > 0 and offset.size > 1:
                     # BatchKVCache: per-element offsets (clamped for generation path)
                     cache_offsets = mx.maximum(offset, 0)
-                    # Raw offsets for batch path (may be negative during prefill)
+                    # Raw offsets for batch speculative path (may be negative during prefill)
                     cache_offset = offset
                     is_batch_offset = True
                 else:
