@@ -1192,6 +1192,8 @@ class GenerationBatch:
 
         if not keep:
             self.prompt_cache.clear()
+            self._current_tokens = None
+            self._current_lps = None
             self._next_tokens = None
             self._next_lps = None
         else:

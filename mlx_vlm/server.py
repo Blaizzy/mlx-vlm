@@ -254,7 +254,15 @@ class ResponseGenerator:
                     if isinstance(item, Exception):
                         ended = True
                         raise item
+                    # Mark ended BEFORE yielding the final token so that if
+                    # the consumer closes the iterator right after consuming
+                    # it (as stream_generator does on finish_reason), we
+                    # don't mis-interpret that as a client abort.
+                    if getattr(item, "finish_reason", None):
+                        ended = True
                     yield item
+                    if ended:
+                        break
             finally:
                 # If the consumer stopped before natural end (exception or
                 # GeneratorExit from the caller closing the iterator), signal
