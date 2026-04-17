@@ -1264,6 +1264,10 @@ class BatchGenerator:
                 self.active_batch = batch
             else:
                 self.active_batch.extend(batch)
+                # Interleave: when existing requests are decoding,
+                # prefill only one batch then do a decode step.
+                # Next _next() call handles remaining prompts.
+                break
 
             num_active = len(self.active_batch)
             num_to_add -= len(batch)
