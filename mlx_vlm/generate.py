@@ -1105,9 +1105,9 @@ class GenerationBatch:
         # Double-buffer state: _next holds the pending (async) computation,
         # _current holds the previous step's results being consumed.
         self._current_tokens = None
-        self._current_logprobs = None
+        self._current_lps = None  # pre-gathered per-token logprobs (scalar per seq)
         self._next_tokens = inputs
-        self._next_logprobs = None
+        self._next_lps = None
 
         if self.uids:
             self._step()
@@ -1118,11 +1118,13 @@ class GenerationBatch:
     def _step(self):
         """Perform one generation step with double buffering.
 
-        Evaluates the current (previous step's) tokens while asynchronously
-        starting the next step's computation.
+        Pre-gathers per-token logprobs right after sampling so the full
+        vocab-size logprobs tensor stays as a GPU intermediate (never
+        materialized to CPU). Only the sampled token + its logprob are
+        async_eval'd, keeping memory pressure minimal.
         """
         self._current_tokens = self._next_tokens
-        self._current_logprobs = self._next_logprobs
+        self._current_lps = self._next_lps
         inputs = self._current_tokens
 
         # Forward pass — use language_model directly (skips VLM overhead)
@@ -1133,15 +1135,23 @@ class GenerationBatch:
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         sampled = self.sampler(logprobs)
 
-        # Start computing next step asynchronously
+        # Pre-gather logprobs for sampled tokens in the same graph,
+        # so the full vocab logprobs tensor is never materialized.
         self._next_tokens = sampled
-        self._next_logprobs = logprobs
-        mx.async_eval(self._next_tokens, self._next_logprobs)
+        if self.compute_logprobs:
+            self._next_lps = logprobs[mx.arange(sampled.shape[0]), sampled]
+            mx.async_eval(self._next_tokens, self._next_lps)
+        else:
+            self._next_lps = None
+            mx.async_eval(self._next_tokens)
 
-        # Block on current step's tokens
-        mx.eval(inputs)
-
-        return inputs.tolist(), self._current_logprobs
+        # Block on current step
+        if self._current_lps is not None:
+            mx.eval(inputs, self._current_lps)
+            return inputs.tolist(), self._current_lps.tolist()
+        else:
+            mx.eval(inputs)
+            return inputs.tolist(), None
 
     def extend(self, other: "GenerationBatch"):
         """Extend this batch with another generation batch."""
@@ -1152,29 +1162,26 @@ class GenerationBatch:
 
         if self._current_tokens is None:
             self._current_tokens = other._current_tokens
-            self._current_logprobs = other._current_logprobs
+            self._current_lps = other._current_lps
         elif other._current_tokens is not None:
             self._current_tokens = mx.concatenate(
                 [self._current_tokens, other._current_tokens]
             )
-            if (
-                self._current_logprobs is not None
-                and other._current_logprobs is not None
-            ):
-                self._current_logprobs = mx.concatenate(
-                    [self._current_logprobs, other._current_logprobs]
+            if self._current_lps is not None and other._current_lps is not None:
+                self._current_lps = mx.concatenate(
+                    [self._current_lps, other._current_lps]
                 )
 
         if self._next_tokens is None:
             self._next_tokens = other._next_tokens
-            self._next_logprobs = other._next_logprobs
+            self._next_lps = other._next_lps
         elif other._next_tokens is not None:
             self._next_tokens = mx.concatenate(
                 [self._next_tokens, other._next_tokens]
             )
-            if self._next_logprobs is not None and other._next_logprobs is not None:
-                self._next_logprobs = mx.concatenate(
-                    [self._next_logprobs, other._next_logprobs]
+            if self._next_lps is not None and other._next_lps is not None:
+                self._next_lps = mx.concatenate(
+                    [self._next_lps, other._next_lps]
                 )
 
     def filter(self, keep: List[int]):
@@ -1186,31 +1193,22 @@ class GenerationBatch:
         if not keep:
             self.prompt_cache.clear()
             self._next_tokens = None
-            self._next_logprobs = None
+            self._next_lps = None
         else:
             keep_arr = mx.array(keep, mx.int32)
             for c in self.prompt_cache:
                 c.filter(keep_arr)
             if self._next_tokens is not None:
                 self._next_tokens = self._next_tokens[keep_arr]
-            if self._next_logprobs is not None:
-                self._next_logprobs = self._next_logprobs[keep_arr]
+            if self._next_lps is not None:
+                self._next_lps = self._next_lps[keep_arr]
 
     def next(self) -> List[Response]:
         """Generate the next batch of tokens."""
         if not self.uids:
             return []
 
-        tokens, logprobs = self._step()
-
-        # Batch-gather per-token logprobs if needed (one GPU sync vs N syncs)
-        if self.compute_logprobs and logprobs is not None:
-            token_indices = mx.array(tokens)
-            lps = logprobs[mx.arange(len(tokens)), token_indices]
-            mx.eval(lps)
-            lp_list = lps.tolist()
-        else:
-            lp_list = None
+        tokens, lp_list = self._step()
 
         keep = []
         responses = []
@@ -1255,9 +1253,9 @@ class GenerationBatch:
         batch._num_tokens = []
         batch.compute_logprobs = compute_logprobs
         batch._current_tokens = None
-        batch._current_logprobs = None
+        batch._current_lps = None
         batch._next_tokens = None
-        batch._next_logprobs = None
+        batch._next_lps = None
         return batch
 
 
