@@ -613,6 +613,7 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        rope_deltas_kw = kwargs.pop("rope_deltas", None)
 
         if pixel_values is not None:
             self._rope_deltas = None
@@ -632,7 +633,12 @@ class LanguageModel(nn.Module):
                 self._rope_deltas = rope_deltas
             else:
                 batch_size, seq_length = inputs.shape
-                delta = cache_offset + self._rope_deltas if cache is not None else 0
+                rope_deltas_src = (
+                    rope_deltas_kw
+                    if rope_deltas_kw is not None
+                    else self._rope_deltas
+                )
+                delta = cache_offset + rope_deltas_src if cache is not None else 0
                 position_ids = mx.arange(seq_length) + delta
                 position_ids = mx.broadcast_to(
                     position_ids[None, :], (batch_size, seq_length)
