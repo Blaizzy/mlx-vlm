@@ -16,9 +16,9 @@ log-probability order with a max-heap, popping one prefix per iteration and
 pushing its first child and next sibling.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from heapq import heappop, heappush
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import mlx.core as mx
 
@@ -41,9 +41,7 @@ class DDTreeNode:
     parent: int = -1
 
 
-def _top_k_tokens_per_depth(
-    log_probs: mx.array, K: int
-) -> Tuple[mx.array, mx.array]:
+def _top_k_tokens_per_depth(log_probs: mx.array, K: int) -> Tuple[mx.array, mx.array]:
     """Return (top_log_probs[L, K], top_ids[L, K]) along the vocabulary
     axis. ``log_probs`` has shape ``[L, V]``.
     """

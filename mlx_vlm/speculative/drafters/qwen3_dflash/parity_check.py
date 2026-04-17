@@ -50,9 +50,9 @@ def main():
     T = 16  # pretend-committed target context length
 
     ids = mx.zeros((B, block), dtype=mx.int32)
-    target_hidden = mx.random.normal(
-        (B, T, len(cfg.target_layer_ids) * cfg.hidden_size)
-    ) * 0.02
+    target_hidden = (
+        mx.random.normal((B, T, len(cfg.target_layer_ids) * cfg.hidden_size)) * 0.02
+    )
     cache = model.make_cache()
 
     logits = model(ids, target_hidden, cache)

@@ -21,9 +21,7 @@ class DFlashConfig(BaseModelConfig):
     tie_word_embeddings: bool = True
     block_size: int = 16
     mask_token_id: int = 248070
-    target_layer_ids: List[int] = field(
-        default_factory=lambda: [1, 8, 15, 22, 29]
-    )
+    target_layer_ids: List[int] = field(default_factory=lambda: [1, 8, 15, 22, 29])
     num_target_layers: int = 32
 
     @classmethod

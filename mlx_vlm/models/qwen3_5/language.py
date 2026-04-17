@@ -320,10 +320,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # Tuple layout consumed by ``rollback_speculative_cache`` below.
             gdn_sink.append(
                 (
-                    q, k, v, a, b,
-                    self.A_log, self.dt_bias,
-                    state, mask,
-                    conv_input, self.conv_kernel_size,
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    self.A_log,
+                    self.dt_bias,
+                    state,
+                    mask,
+                    conv_input,
+                    self.conv_kernel_size,
                 )
             )
 
@@ -463,12 +470,18 @@ class LanguageModel(nn.Module):
             if c.is_trimmable():
                 c.trim(trim)
                 continue
-            q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = (
-                gdn_states[j]
-            )
+            q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = gdn_states[
+                j
+            ]
             _, state = gated_delta_update(
-                q[:, :n], k[:, :n], v[:, :n], a[:, :n], b[:, :n],
-                A_log, dt_bias, init_state,
+                q[:, :n],
+                k[:, :n],
+                v[:, :n],
+                a[:, :n],
+                b[:, :n],
+                A_log,
+                dt_bias,
+                init_state,
                 None if mask is None else mask[:, :n],
                 use_kernel=True,
             )
@@ -522,13 +535,19 @@ class LanguageModel(nn.Module):
                             c.values[bi, :, start:kv_len, :] = 0
                 continue
             # GDN layer: masked replay to max_a+1 positions
-            q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = (
-                gdn_states[j]
-            )
+            q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = gdn_states[
+                j
+            ]
             batch_mask = mx.arange(n)[None, :] <= accepted[:, None]
             _, state = gated_delta_update(
-                q[:, :n], k[:, :n], v[:, :n], a[:, :n], b[:, :n],
-                A_log, dt_bias, init_state,
+                q[:, :n],
+                k[:, :n],
+                v[:, :n],
+                a[:, :n],
+                b[:, :n],
+                A_log,
+                dt_bias,
+                init_state,
                 batch_mask,
                 use_kernel=True,
             )
@@ -761,20 +780,14 @@ class LanguageModel(nn.Module):
         # BatchKVCache's left_padding initialization — fall through to
         # the standard first-call branch which uses arange positions
         # and lets the attention mask handle padding.
-        if (
-            position_ids is None
-            and is_batch_offset
-            and bool((cache_offset >= 0).all())
-        ):
+        if position_ids is None and is_batch_offset and bool((cache_offset >= 0).all()):
             batch_size, seq_length = inputs.shape
             arange = mx.arange(seq_length).reshape(1, -1)
             offsets = cache_offset[:batch_size, None]
             if self._rope_deltas is not None:
                 offsets = offsets + self._rope_deltas[:batch_size]
             position_ids = (arange + offsets)[None, ...]
-            position_ids = mx.broadcast_to(
-                position_ids, (3, batch_size, seq_length)
-            )
+            position_ids = mx.broadcast_to(position_ids, (3, batch_size, seq_length))
 
         if is_batch_offset and position_ids is None:
             # Falling through to non-batch branch — extract scalar
@@ -837,9 +850,7 @@ class LanguageModel(nn.Module):
         hidden_sink: Optional[List[mx.array]] = (
             [] if capture_layer_ids is not None else None
         )
-        gdn_sink: Optional[list] = (
-            [] if capture_layer_ids is not None else None
-        )
+        gdn_sink: Optional[list] = [] if capture_layer_ids is not None else None
 
         out = self.model(
             inputs,

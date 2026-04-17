@@ -434,16 +434,12 @@ class ResponseGenerator:
                     token_lists[uid] = []
                     max_tokens_map[uid] = args.max_tokens
                     all_input_ids.append(input_ids.squeeze(0).tolist())
-                    rqueue.put(
-                        GenerationContext(uid=uid, prompt_tokens=prompt_tokens)
-                    )
+                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     sampler = self._make_sampler(args) or _make_sampler(temp=0)
 
                 B = len(uids)
                 max_len = max(len(ids) for ids in all_input_ids)
-                padded = [
-                    [0] * (max_len - len(ids)) + ids for ids in all_input_ids
-                ]
+                padded = [[0] * (max_len - len(ids)) + ids for ids in all_input_ids]
                 input_mx = mx.array(padded, dtype=mx.int32)
 
                 prompt_cache = _make_cache(lm, [0] * B)
@@ -515,19 +511,13 @@ class ResponseGenerator:
                         if len(tokens) >= 2:
                             prev = self.tokenizer.decode(tokens[:-1])
                             curr = self.tokenizer.decode(tokens)
-                            text = curr[len(prev):]
+                            text = curr[len(prev) :]
                         else:
                             text = self.tokenizer.decode(tokens)
 
                         is_stop = tok in self.stop_tokens
                         is_max = len(tokens) >= max_tokens_map[uid]
-                        finish = (
-                            "stop"
-                            if is_stop
-                            else "length"
-                            if is_max
-                            else None
-                        )
+                        finish = "stop" if is_stop else "length" if is_max else None
 
                         rqueues[uid].put(
                             StreamingToken(

@@ -596,9 +596,7 @@ def _dflash_rounds_batch(
 
         # Verify
         with mx.stream(generation_stream):
-            verify_input = mx.concatenate(
-                [b_arr[:, None], draft_tokens], axis=1
-            )
+            verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
             verify_out = lm(
                 verify_input,
                 cache=prompt_cache,
@@ -647,9 +645,7 @@ def _dflash_rounds_batch(
                 b[orig] = new_tokens_list[j][-1]
 
         # --- Continuous batching: filter out finished sequences ---
-        keep_slots = [
-            j for j in range(n_active) if not finished[active_idx[j]]
-        ]
+        keep_slots = [j for j in range(n_active) if not finished[active_idx[j]]]
         if len(keep_slots) < n_active:
             if len(keep_slots) == 0:
                 break
@@ -2023,7 +2019,9 @@ def main():
             lens = getattr(draft_model, "accept_lens", None) or []
             if lens:
                 mean_accept = round(sum(lens) / len(lens), 2)
-                print(f"Speculative decoding: {mean_accept} accepted tokens over {len(lens)} rounds")
+                print(
+                    f"Speculative decoding: {mean_accept} accepted tokens over {len(lens)} rounds"
+                )
 
 
 if __name__ == "__main__":

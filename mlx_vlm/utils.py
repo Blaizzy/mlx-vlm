@@ -98,7 +98,6 @@ def skip_multimodal_module(path: str) -> bool:
     )
 
 
-
 def get_model_and_args(config: dict):
     """
     Retrieve the model object based on the configuration.

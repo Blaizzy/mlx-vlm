@@ -42,7 +42,7 @@ class DFlashAttention(nn.Module):
         self.n_heads = config.num_attention_heads
         self.n_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
         self.q_proj = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
@@ -52,8 +52,8 @@ class DFlashAttention(nn.Module):
 
     def __call__(
         self,
-        x: mx.array,          # [B, L, H]   noise block hidden states
-        x_ctx: mx.array,      # [B, S, H]   new fused target context features
+        x: mx.array,  # [B, L, H]   noise block hidden states
+        x_ctx: mx.array,  # [B, S, H]   new fused target context features
         rope: nn.RoPE,
         cache: KVCache,
     ) -> mx.array:
@@ -202,8 +202,8 @@ class DFlashDraftModel(nn.Module):
 
     def __call__(
         self,
-        inputs: mx.array,           # [B, block_size] token ids
-        target_hidden: mx.array,    # [B, T_new, num_target_layers * H]
+        inputs: mx.array,  # [B, block_size] token ids
+        target_hidden: mx.array,  # [B, T_new, num_target_layers * H]
         cache: List[KVCache],
     ) -> mx.array:
         h = self.embed_tokens(inputs)
@@ -216,7 +216,7 @@ class DFlashDraftModel(nn.Module):
         out = {}
         for k, v in weights.items():
             if k.startswith("model."):
-                k = k[len("model."):]
+                k = k[len("model.") :]
             out[k] = v
         return out
 
