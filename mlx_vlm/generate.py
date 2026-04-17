@@ -1104,13 +1104,13 @@ class GenerationBatch:
 
         # Double-buffer state: _next holds the pending (async) computation,
         # _current holds the previous step's results being consumed.
+        # On construction, _next holds the first token already sampled by
+        # prefill; the first next() call will emit it and kick off the
+        # pipeline for the second token.
         self._current_tokens = None
         self._current_lps = None  # pre-gathered per-token logprobs (scalar per seq)
         self._next_tokens = inputs
         self._next_lps = None
-
-        if self.uids:
-            self._step()
 
     def __len__(self):
         return len(self.uids)
@@ -1363,6 +1363,16 @@ class PromptProcessingBatch:
             max_tokens=list(self.max_tokens),
         )
         gen_batch.compute_logprobs = compute_logprobs
+
+        # Pre-populate _next_lps so that extend() can concatenate logprobs
+        # correctly when merging this batch into an existing generation batch.
+        # Without this, _next_lps is None for the new batch and extend skips
+        # the lps concat, leaving a size mismatch that trips IndexError in
+        # GenerationBatch.next().
+        if compute_logprobs:
+            gen_batch._next_lps = logprobs[
+                mx.arange(first_tokens.shape[0]), first_tokens
+            ]
 
         # Clear our state
         self.uids = []
