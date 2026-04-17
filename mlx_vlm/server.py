@@ -39,7 +39,6 @@ from .generate import (
     normalize_resize_shape,
     stream_generate,
 )
-from .turboquant import turboquant_enabled
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
 from .tool_parsers import _infer_tool_parser, load_tool_module

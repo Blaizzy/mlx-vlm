@@ -1001,9 +1001,11 @@ def _make_cache(
         if kv_bits is not None:
             n = len(model.layers)
             return [
-                _make_quant_cache(left_padding)
-                if i < n - 1 or n <= 2
-                else cache.BatchKVCache(left_padding)
+                (
+                    _make_quant_cache(left_padding)
+                    if i < n - 1 or n <= 2
+                    else cache.BatchKVCache(left_padding)
+                )
                 for i in range(n)
             ]
         return [cache.BatchKVCache(left_padding) for _ in model.layers]

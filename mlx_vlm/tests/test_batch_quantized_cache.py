@@ -5,7 +5,6 @@ import pytest
 
 from mlx_vlm.models.cache import BatchKVCache, BatchQuantizedKVCache
 
-
 B, H, D = 2, 4, 64  # batch, heads, head_dim
 GROUP_SIZE = 32
 BITS = 8

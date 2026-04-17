@@ -121,9 +121,7 @@ class BatchQuantizedKVCache(_BaseCache):
     def extend(self, other: "BatchQuantizedKVCache"):
         """Concatenate *other* batch into this cache along the batch dim."""
         if self.keys is None and other.keys is None:
-            self.left_padding = mx.concatenate(
-                [self.left_padding, other.left_padding]
-            )
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])
             return
 
@@ -153,9 +151,7 @@ class BatchQuantizedKVCache(_BaseCache):
             if left != 0 or right != 0:
                 pad_spec = [(0, 0), (0, 0), (left, right), (0, 0)]
                 padded_keys = tuple(mx.pad(k, pad_spec) for k in trimmed_keys)
-                padded_values = tuple(
-                    mx.pad(v, pad_spec) for v in trimmed_values
-                )
+                padded_values = tuple(mx.pad(v, pad_spec) for v in trimmed_values)
             else:
                 padded_keys = trimmed_keys
                 padded_values = trimmed_values
@@ -168,9 +164,7 @@ class BatchQuantizedKVCache(_BaseCache):
 
         # Handle case where one side has no keys yet
         if r_self is None and r_other is None:
-            self.left_padding = mx.concatenate(
-                [self.left_padding, other.left_padding]
-            )
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])
             return
         if r_self is None:
@@ -222,9 +216,7 @@ class BatchQuantizedKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(
-            map(str, (self._idx, self.group_size, self.bits))
-        )
+        return tuple(map(str, (self._idx, self.group_size, self.bits)))
 
     @meta_state.setter
     def meta_state(self, v):

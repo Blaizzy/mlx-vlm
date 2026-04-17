@@ -6157,9 +6157,7 @@ class BatchTurboQuantKVCache(_BaseCache):
 
     def extend(self, other: "BatchTurboQuantKVCache"):
         if self.keys is None and other.keys is None:
-            self.left_padding = mx.concatenate(
-                [self.left_padding, other.left_padding]
-            )
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])
             return
 
@@ -6183,25 +6181,19 @@ class BatchTurboQuantKVCache(_BaseCache):
         r_other = _pad_side(other)
 
         if r_self is None and r_other is None:
-            self.left_padding = mx.concatenate(
-                [self.left_padding, other.left_padding]
-            )
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])
             return
         if r_self is None:
             self.keys, self.values, so, slp = r_other
             self.offset = mx.concatenate([self.offset, so])
-            self.left_padding = mx.concatenate(
-                [self.left_padding + max_idx, slp]
-            )
+            self.left_padding = mx.concatenate([self.left_padding + max_idx, slp])
             self._idx = max_idx
             return
         if r_other is None:
             self.keys, self.values, so, slp = r_self
             self.offset = mx.concatenate([so, other.offset])
-            self.left_padding = mx.concatenate(
-                [slp, other.left_padding + max_idx]
-            )
+            self.left_padding = mx.concatenate([slp, other.left_padding + max_idx])
             self._idx = max_idx
             return
 
