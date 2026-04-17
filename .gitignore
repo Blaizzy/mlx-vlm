@@ -1,6 +1,7 @@
 test.ipynb
 **.pyc
 .claude
+.spec-workflow/
 Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -27,3 +28,9 @@ var/
 .venv
 .codex_tmp/
 .vscode
+
+# Local model weights (large files)
+model/
+
+# Local scripts
+start.sh

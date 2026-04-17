@@ -31,7 +31,7 @@ DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
 DEFAULT_AUDIO = None
 DEFAULT_PROMPT = "What are these?"
-DEFAULT_MAX_TOKENS = 256
+DEFAULT_MAX_TOKENS = 32768
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_SEED = 0
@@ -284,6 +284,18 @@ def maybe_quantize_kv_cache(
             prompt_cache[index] = quantize_entry(layer_cache)
         return
 
+    # RotatingKVCache does not support mlx_lm's to_quantized(), skip entirely
+    def _has_rotating(entry):
+        if isinstance(entry, cache.RotatingKVCache):
+            return True
+        if isinstance(entry, (list, tuple)):
+            return any(_has_rotating(e) for e in entry)
+        if isinstance(entry, cache.CacheList):
+            return any(_has_rotating(e) for e in entry.caches)
+        return False
+
+    if any(_has_rotating(c) for c in prompt_cache):
+        return
     mlx_maybe_quantize_kv_cache(
         prompt_cache,
         quantized_kv_start=quantized_kv_start,

@@ -601,6 +601,43 @@ Tested on gemma-4-31b-it at 128k context:
 
 TurboQuant automatically quantizes `KVCache` layers (global attention). Models with `RotatingKVCache` (sliding window) or `ArraysCache` (MLA/absorbed keys) keep their native cache format for those layers since they are already memory-efficient.
 
+## Server Improvements
+
+### Async Streaming (Non-blocking Event Loop)
+
+The server now runs synchronous MLX generation in a thread pool via `asyncio.run_in_executor`, keeping the event loop responsive during long prefill and token generation. This prevents client timeouts and `socket.send()` errors when streaming from large models (e.g. 30B+ models with multi-second prefill).
+
+**Before:** Synchronous `for chunk in token_iterator` blocked the entire event loop, causing clients/proxies to disconnect during prefill.
+
+**After:** Each token iteration yields control back to the event loop, keeping SSE connections alive.
+
+### RotatingKVCache Quantization Fix
+
+Models using `RotatingKVCache` (e.g. Gemma 4) no longer crash with `NotImplementedError: RotatingKVCache Quantization NYI` when KV cache quantization is enabled. The quantizer now detects `RotatingKVCache` entries (including nested `CacheList`/tuple structures) and skips them gracefully.
+
+### Default Image Resolution Limit
+
+The server now applies a default `resize_shape` of 1280x1280 pixels to incoming images, preventing OOM crashes from high-resolution inputs that would otherwise expand into millions of visual tokens. Override via:
+
+```sh
+# Environment variable
+DEFAULT_RESIZE_SHAPE=2048,2048 mlx_vlm.server --model <model>
+
+# Or per-request in the API body
+{"resize_shape": [2048, 2048], ...}
+```
+
+### Model Cache Reuse
+
+The server reuses the preloaded model regardless of the model name in the client request, avoiding unnecessary HuggingFace download attempts when the client sends a short name instead of the full path.
+
+### Tested Models
+
+| Model | Size | Status | Notes |
+|-------|------|--------|-------|
+| gemma-4-31b-it-mxfp4 | 31B | Streaming works | RotatingKVCache quantization fix verified |
+| Qwen3.6-35B-A3B-4bit | 35B MoE | Streaming works | Requires `torch` + `torchvision` in venv |
+
 # Fine-tuning
 
 MLX-VLM supports fine-tuning models with LoRA and QLoRA.

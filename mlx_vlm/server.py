@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import gc
 import json
 import os
@@ -170,10 +171,13 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
         print(f"Using cached model: {model_path}, Adapter: {adapter_path}")
         return model_cache["model"], model_cache["processor"], model_cache["config"]
 
-    # If cache exists but doesn't match, clear it
+    # If a model is already loaded, reuse it regardless of the requested name
     if model_cache:
-        print("New model request, clearing existing cache...")
-        unload_model_sync()  # Use a synchronous version for internal call
+        print(
+            f"Using preloaded model: {model_cache['model_path']} "
+            f"(requested: {model_path})"
+        )
+        return model_cache["model"], model_cache["processor"], model_cache["config"]
 
     # Load the model resources
     model, processor, config = load_model_resources(model_path, adapter_path)
@@ -630,11 +634,17 @@ class ChatStreamChunk(BaseModel):
     usage: Optional[UsageStats]
 
 
+def get_default_resize_shape():
+    shape = os.environ.get("DEFAULT_RESIZE_SHAPE", "1280,1280")
+    parts = shape.split(",")
+    return (int(parts[0]), int(parts[1])) if len(parts) == 2 else (int(parts[0]), int(parts[0]))
+
+
 def build_generation_kwargs(
     request: Any,
     template_kwargs: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
+    kwargs = {
         "prefill_step_size": get_prefill_step_size(),
         "kv_bits": get_quantized_kv_bits(request.model),
         "kv_group_size": get_kv_group_size(),
@@ -644,6 +654,10 @@ def build_generation_kwargs(
         **request.generation_kwargs(),
         **template_kwargs,
     }
+    # Apply default image resolution limit if not specified by client
+    if kwargs.get("resize_shape") is None:
+        kwargs["resize_shape"] = get_default_resize_shape()
+    return kwargs
 
 
 def process_tool_calls(model_output: str, tool_module, tools):
@@ -855,6 +869,15 @@ async def responses_endpoint(openai_request: OpenAIRequest):
             # Streaming response
             async def stream_generator():
                 token_iterator = None
+                loop = asyncio.get_event_loop()
+
+                def _next_item(it):
+                    """Pull next item from sync generator in a worker thread."""
+                    try:
+                        return next(it), False
+                    except StopIteration:
+                        return None, True
+
                 try:
                     # Create base response object (to match the openai pipeline)
                     base_response = OpenAIResponse(
@@ -909,7 +932,12 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     )
 
                     full_text = ""
-                    for chunk in token_iterator:
+                    while True:
+                        chunk, done = await loop.run_in_executor(
+                            None, _next_item, token_iterator
+                        )
+                        if done:
+                            break
                         if chunk is None or not hasattr(chunk, "text"):
                             continue
 
@@ -1119,6 +1147,15 @@ async def chat_completions_endpoint(request: ChatRequest):
             # Streaming response
             async def stream_generator():
                 token_iterator = None
+                loop = asyncio.get_event_loop()
+
+                def _next_item(it):
+                    """Pull next item from sync generator in a worker thread."""
+                    try:
+                        return next(it), False
+                    except StopIteration:
+                        return None, True
+
                 try:
                     # Use stream_generate from utils
                     token_iterator = stream_generate(
@@ -1133,7 +1170,12 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                     output_text = ""
                     request_id = f"chatcmpl-{uuid.uuid4()}"
-                    for chunk in token_iterator:
+                    while True:
+                        chunk, done = await loop.run_in_executor(
+                            None, _next_item, token_iterator
+                        )
+                        if done:
+                            break
                         if chunk is None or not hasattr(chunk, "text"):
                             print("Warning: Received unexpected chunk format:", chunk)
                             continue
