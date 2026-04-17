@@ -1437,19 +1437,15 @@ class BatchGenerator:
         self._gen_tokens_counter = 0
         self._steps_counter = 0
 
-        # Wire memory for maximum GPU residency
-        if mx.metal.is_available():
-            self._old_wired_limit = mx.set_wired_limit(
-                mx.device_info()["max_recommended_working_set_size"]
-            )
-        else:
-            self._old_wired_limit = None
+        # Wire memory for maximum GPU residency (reuses the wired_limit
+        # context manager — same mechanism used by stream_generate).
+        self._wire_stack = contextlib.ExitStack()
+        self._wire_stack.enter_context(wired_limit(model, [generation_stream]))
 
     def close(self):
-        if self._old_wired_limit is not None:
-            mx.synchronize(generation_stream)
-            mx.set_wired_limit(self._old_wired_limit)
-            self._old_wired_limit = None
+        if self._wire_stack is not None:
+            self._wire_stack.close()
+            self._wire_stack = None
 
     def __del__(self):
         self.close()
