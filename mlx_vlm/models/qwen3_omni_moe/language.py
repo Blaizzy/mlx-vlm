@@ -518,21 +518,26 @@ class LanguageModel(nn.Module):
             self._rope_deltas = None
 
         cache_offset = 0
+        cache_offsets = None
         if cache and cache[0] is not None:
             offset = cache[0].offset
             if isinstance(offset, int):
                 cache_offset = offset
             elif isinstance(offset, mx.array):
-                cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
+                if offset.ndim == 0 or offset.size == 1:
+                    cache_offset = offset.item()
+                else:
+                    cache_offsets = offset
             else:
                 raise ValueError(f"Unexpected cache offset type: {type(offset)}")
 
         if position_ids is None and (mask is None or mask.ndim == 2):
-            if (
-                (cache is not None and cache[0] is not None and (cache_offset == 0))
-                or self._rope_deltas is None
-                or cache is None
-            ):
+            is_prefill = (
+                cache is None
+                or cache[0] is None
+                or (cache_offsets is None and cache_offset == 0)
+            )
+            if is_prefill or self._rope_deltas is None:
                 position_ids, rope_deltas = self.get_rope_index(
                     inputs, image_grid_thw, video_grid_thw, mask
                 )
@@ -542,21 +547,25 @@ class LanguageModel(nn.Module):
                 rope_deltas_src = (
                     rope_deltas_kw if rope_deltas_kw is not None else self._rope_deltas
                 )
-                delta = mx.array(
-                    cache_offset + rope_deltas_src if cache is not None else 0
-                )
-                position_ids = mx.arange(seq_length).reshape(1, -1)
-                position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
-
-                if cache_offset is not None:
+                if cache_offsets is not None:
+                    offsets = cache_offsets[:batch_size]
+                    rope_deltas = rope_deltas_src
+                    if rope_deltas.shape[0] > batch_size:
+                        rope_deltas = rope_deltas[:batch_size]
+                    delta = (offsets + rope_deltas.squeeze(-1))[:, None]
+                else:
+                    delta = mx.array(
+                        cache_offset + rope_deltas_src if cache is not None else 0
+                    )
                     if delta.ndim == 0:
                         delta = mx.expand_dims(delta, axis=0)
-
                     if delta.shape[0] < batch_size:
                         delta = mx.tile(delta, (batch_size, 1))
                     else:
                         delta = delta[:batch_size]
 
+                position_ids = mx.arange(seq_length).reshape(1, -1)
+                position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
                 position_ids = mx.add(position_ids, delta)[None, ...]
                 position_ids = mx.broadcast_to(
                     position_ids, (3, batch_size, seq_length)
