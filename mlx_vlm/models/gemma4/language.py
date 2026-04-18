@@ -364,7 +364,6 @@ class Gemma4TextModel(nn.Module):
         ]
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # KV sharing: map each layer to its previous KV source
         num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
         self.first_kv_shared_layer_idx = config.num_hidden_layers - num_kv_shared
         self.previous_kvs = list(range(len(self.layers)))

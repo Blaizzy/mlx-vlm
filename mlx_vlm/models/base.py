@@ -227,10 +227,6 @@ def scaled_dot_product_attention(
         )
 
     if isinstance(cache, BatchTurboQuantKVCache):
-        # Batch TurboQuant: dequantize and use standard sdpa.
-        # TurboQuant's custom Metal kernels don't support batched
-        # per-sequence offsets, so we dequantize at attention time.
-        # Memory savings are preserved (KV stored quantized).
         dequantized_keys, dequantized_values = cache.dequantize(keys, values)
         return mx.fast.scaled_dot_product_attention(
             queries,

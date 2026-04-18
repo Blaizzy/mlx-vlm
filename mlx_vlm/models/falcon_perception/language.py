@@ -27,8 +27,6 @@ def apply_rotary_emb_1d(
     xk_r = xk.astype(mx.float32).reshape(*shape_k, d // 2, 2)
     xq_0, xq_1 = xq_r[..., 0], xq_r[..., 1]
     xk_0, xk_1 = xk_r[..., 0], xk_r[..., 1]
-    # cos/sin can be (L, D) for a single sequence or (B, L, D) when positions
-    # differ per batch item (continuous batching with per-sequence offsets).
     if cos.ndim == 2:
         c = cos.reshape(1, 1, -1, cos.shape[-1])
         s = sin.reshape(1, 1, -1, sin.shape[-1])

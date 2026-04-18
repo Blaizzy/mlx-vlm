@@ -178,9 +178,7 @@ class Model(nn.Module):
     ):
         features = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
         kwargs.update({"pixel_values": pixel_values, **features.to_dict()})
-        return self.language_model(
-            input_ids, mask=mask, cache=cache, **kwargs
-        )
+        return self.language_model(input_ids, mask=mask, cache=cache, **kwargs)
 
     def sanitize(self, weights):
         new_weights = {}

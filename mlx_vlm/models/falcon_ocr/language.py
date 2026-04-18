@@ -2,6 +2,7 @@ from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
@@ -30,8 +31,6 @@ def apply_rotary_emb_1d(
     xk_r = xk.astype(mx.float32).reshape(*shape_k, d // 2, 2)
     xq_0, xq_1 = xq_r[..., 0], xq_r[..., 1]
     xk_0, xk_1 = xk_r[..., 0], xk_r[..., 1]
-    # cos/sin can be (L, D) for a single sequence or (B, L, D) when positions
-    # differ per batch item (continuous batching with per-sequence offsets).
     if cos.ndim == 2:
         c = cos.reshape(1, 1, -1, cos.shape[-1])
         s = sin.reshape(1, 1, -1, sin.shape[-1])
@@ -296,8 +295,6 @@ class FalconOCRTransformerModel(nn.Module):
                 offset = cache[0].offset
                 if isinstance(offset, mx.array):
                     if offset.ndim > 0 and offset.size > 1:
-                        # Continuous batching: per-sequence offsets → build
-                        # per-sequence position_ids of shape (B, L).
                         base = mx.maximum(offset, 0).reshape(-1, 1)
                         position_ids = base + mx.arange(L).reshape(1, -1)
                     else:
@@ -308,7 +305,6 @@ class FalconOCRTransformerModel(nn.Module):
             else:
                 position_ids = mx.arange(L)
 
-        # Index cos/sin with the (possibly batched) position ids.
         if position_ids.ndim == 2:
             pos_t = position_ids  # (B, L)
         elif position_ids.ndim > 1:
@@ -401,7 +397,9 @@ class LanguageModel(nn.Module):
                     position_ids = position_ids[cache_offset : cache_offset + L]
             if pos_hw is not None:
                 pos_hw = pos_hw[:, cache_offset : cache_offset + L, :]
-        elif (cache_offset > 0 or cache_offset_array is not None) and rope_deltas is not None:
+        elif (
+            cache_offset > 0 or cache_offset_array is not None
+        ) and rope_deltas is not None:
             if cache_offset_array is not None:
                 base_offset = cache_offset_array.reshape(-1, 1)
             else:

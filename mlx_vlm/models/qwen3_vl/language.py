@@ -567,7 +567,6 @@ class LanguageModel(nn.Module):
                 else:
                     base_offset = mx.array(cache_offset)
 
-                # Add rope_deltas if available — kwarg wins over self state
                 rope_delta_src = (
                     rope_deltas_kw if rope_deltas_kw is not None else self._rope_deltas
                 )

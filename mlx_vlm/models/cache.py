@@ -40,10 +40,6 @@ class BatchQuantizedKVCache(_BaseCache):
         self.group_size = group_size
         self.bits = bits
 
-    # ------------------------------------------------------------------
-    # Core cache operation
-    # ------------------------------------------------------------------
-
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         """Quantize incoming keys/values and append to the cache.
 
@@ -97,10 +93,6 @@ class BatchQuantizedKVCache(_BaseCache):
             tuple(k[..., : self._idx, :] for k in self.keys),
             tuple(v[..., : self._idx, :] for v in self.values),
         )
-
-    # ------------------------------------------------------------------
-    # Batch operations required by Batch.filter / Batch.extend
-    # ------------------------------------------------------------------
 
     def filter(self, batch_indices: mx.array):
         """Keep only the sequences at *batch_indices*."""
@@ -162,14 +154,12 @@ class BatchQuantizedKVCache(_BaseCache):
         r_self = _pad_quant(self)
         r_other = _pad_quant(other)
 
-        # Handle case where one side has no keys yet
         if r_self is None and r_other is None:
             self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])
             return
         if r_self is None:
             ok, ov, oo, olp = r_other
-            # Pad self's metadata with max_idx left_padding
             slp = self.left_padding + max_idx
             self.keys = ok
             self.values = ov
@@ -195,10 +185,6 @@ class BatchQuantizedKVCache(_BaseCache):
         self.offset = mx.concatenate([so, oo])
         self.left_padding = mx.concatenate([slp, olp])
         self._idx = max_idx
-
-    # ------------------------------------------------------------------
-    # State / introspection
-    # ------------------------------------------------------------------
 
     @property
     def state(self):

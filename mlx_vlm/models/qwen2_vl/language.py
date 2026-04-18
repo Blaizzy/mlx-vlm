@@ -468,7 +468,6 @@ class LanguageModel(nn.Module):
                 cache_offset = offset
             elif isinstance(offset, mx.array):
                 if offset.ndim > 0 and offset.size > 1:
-                    # BatchKVCache: per-element offsets
                     cache_offsets = mx.maximum(offset, 0)
                     cache_offset = cache_offsets[0].item()
                 else:
@@ -501,12 +500,8 @@ class LanguageModel(nn.Module):
                     self._rope_deltas = rope_deltas
                     self._position_ids = position_ids
             else:
-                # Generation step — build position_ids from per-sequence
-                # cache offsets so each batch item gets the correct RoPE
-                # position even when sequences have different left_padding.
                 batch_size, seq_length = inputs.shape
                 if cache_offsets is not None and cache_offsets.size >= batch_size:
-                    # Batched: per-element offsets
                     offsets = cache_offsets[:batch_size]
                     rope_deltas = (
                         rope_deltas_kw
