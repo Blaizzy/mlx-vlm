@@ -323,8 +323,6 @@ class FalconOCRTransformerModel(nn.Module):
         if pos_hw is not None:
             cos_2d, sin_2d = compute_golden_freqs(self.freqs_cis_golden, pos_hw)
 
-        # Pass cache[0] (not the list) so BatchKVCache.make_mask fires and
-        # zeros out each sequence's left_padding slots.
         if mask is None and cache[0] is not None:
             mask = create_attention_mask(h, cache[0], return_array=True)
 
@@ -363,15 +361,10 @@ class LanguageModel(nn.Module):
     ):
         kwargs.pop("image_grid_hw", None)
         kwargs.pop("pixel_values", None)
-        # Per-request prefill state rides in kwargs via InputEmbeddingsFeatures
-        # so each request's forward gets its own positions even under
-        # continuous batching (mirrors qwen2_5_vl).
         position_ids = kwargs.pop("position_ids", None)
         pos_hw = kwargs.pop("pos_hw", None)
         rope_deltas = kwargs.pop("rope_deltas", None)
         full_attn_mask = kwargs.pop("attention_mask_4d", None)
-        # Mirror onto self so PromptProcessingBatch.generate()'s snapshot
-        # picks up this request's deltas for gen_batch._rope_deltas.
         if rope_deltas is not None:
             self._rope_deltas = rope_deltas
         else:
@@ -401,8 +394,6 @@ class LanguageModel(nn.Module):
             L = 1
 
         if inputs_embeds is not None and cache_offset_array is None:
-            # Prefill (or chunked-prefill continuation): slice the full
-            # position tables to this chunk's window.
             if position_ids is not None:
                 if position_ids.ndim == 2:
                     position_ids = position_ids[:, cache_offset : cache_offset + L]
@@ -411,7 +402,6 @@ class LanguageModel(nn.Module):
             if pos_hw is not None:
                 pos_hw = pos_hw[:, cache_offset : cache_offset + L, :]
         elif (cache_offset > 0 or cache_offset_array is not None) and rope_deltas is not None:
-            # Decode: per-sequence positions from cache offsets + rope_delta.
             if cache_offset_array is not None:
                 base_offset = cache_offset_array.reshape(-1, 1)
             else:

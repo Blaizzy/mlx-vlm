@@ -663,14 +663,8 @@ _INHERIT_ADAPTER = object()
 
 def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     """
-    Factory function to get or load the appropriate model resources from cache
-    or by loading. Also creates/updates the ResponseGenerator for continuous
-    batching.
-
-    If ``adapter_path`` is ``_INHERIT_ADAPTER`` (the default), inherit the
-    adapter currently cached for ``model_path`` — lets a CLI-preloaded
-    adapter survive OpenAI-compatible requests that don't know about the
-    ``adapter_path`` field. Pass ``None`` explicitly to force base weights.
+    Factory function to get or load the appropriate model resources from cache or by loading.
+    Also creates/updates the ResponseGenerator for continuous batching.
     """
     global model_cache, response_generator
 
@@ -1604,10 +1598,6 @@ async def chat_completions_endpoint(request: ChatRequest):
 
     request_start = time.perf_counter()
     try:
-        # Get model, processor, config - loading if necessary. Only pass
-        # adapter_path through when the client actually included it; if
-        # the field is absent, inherit the currently-cached adapter so a
-        # CLI-preloaded LoRA isn't torn down by every no-adapter request.
         adapter_path = (
             request.adapter_path
             if "adapter_path" in request.model_fields_set

@@ -61,8 +61,6 @@ class Model(nn.Module):
 
         return InputEmbeddingsFeatures(
             inputs_embeds=final_embeds,
-            # (1, L) so BatchGenerator's value[:batch_size] leading-axis
-            # slice is a no-op for single-request prefill.
             position_ids=position_ids[None, :],
             pos_hw=pos_hw,
             rope_deltas=mx.array([[delta]], dtype=mx.int32),
