@@ -72,6 +72,9 @@ class InputEmbeddingsFeatures:
     full_text_row_masked_out_mask: Optional[mx.array] = None
     decoder_inputs_embeds: Optional[mx.array] = None
     attention_mask: Optional[mx.array] = None  # For encoder-decoder models
+    position_ids: Optional[mx.array] = None
+    pos_hw: Optional[mx.array] = None
+    rope_deltas: Optional[mx.array] = None
 
     def to_dict(self):
         return {
@@ -85,6 +88,9 @@ class InputEmbeddingsFeatures:
             "full_text_row_masked_out_mask": self.full_text_row_masked_out_mask,
             "decoder_inputs_embeds": self.decoder_inputs_embeds,
             "attention_mask": self.attention_mask,
+            "position_ids": self.position_ids,
+            "pos_hw": self.pos_hw,
+            "rope_deltas": self.rope_deltas,
         }
 
 

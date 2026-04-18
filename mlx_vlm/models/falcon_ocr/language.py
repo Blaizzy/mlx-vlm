@@ -2,8 +2,11 @@ from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-
-from ..base import LanguageModelOutput, scaled_dot_product_attention
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from ..cache import KVCache
 from .config import ModelConfig, TextConfig
 
@@ -298,9 +301,7 @@ class FalconOCRTransformerModel(nn.Module):
                         base = mx.maximum(offset, 0).reshape(-1, 1)
                         position_ids = base + mx.arange(L).reshape(1, -1)
                     else:
-                        off = (
-                            offset if offset.ndim == 0 else offset[0]
-                        ).item()
+                        off = (offset if offset.ndim == 0 else offset[0]).item()
                         position_ids = mx.arange(off, off + L)
                 else:
                     position_ids = mx.arange(offset, offset + L)
@@ -321,6 +322,11 @@ class FalconOCRTransformerModel(nn.Module):
         cos_2d, sin_2d = None, None
         if pos_hw is not None:
             cos_2d, sin_2d = compute_golden_freqs(self.freqs_cis_golden, pos_hw)
+
+        # Pass cache[0] (not the list) so BatchKVCache.make_mask fires and
+        # zeros out each sequence's left_padding slots.
+        if mask is None and cache[0] is not None:
+            mask = create_attention_mask(h, cache[0], return_array=True)
 
         for layer, c in zip(self.layers, cache):
             h = layer(
@@ -345,10 +351,7 @@ class LanguageModel(nn.Module):
         self.model = FalconOCRTransformerModel(args, config)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-        self._rope_delta = None
-        self._position_ids = None
-        self._pos_hw = None
-        self._full_attn_mask = None
+        self._rope_deltas = None
 
     def __call__(
         self,
@@ -360,14 +363,35 @@ class LanguageModel(nn.Module):
     ):
         kwargs.pop("image_grid_hw", None)
         kwargs.pop("pixel_values", None)
+        # Per-request prefill state rides in kwargs via InputEmbeddingsFeatures
+        # so each request's forward gets its own positions even under
+        # continuous batching (mirrors qwen2_5_vl).
+        position_ids = kwargs.pop("position_ids", None)
+        pos_hw = kwargs.pop("pos_hw", None)
+        rope_deltas = kwargs.pop("rope_deltas", None)
+        full_attn_mask = kwargs.pop("attention_mask_4d", None)
+        # Mirror onto self so PromptProcessingBatch.generate()'s snapshot
+        # picks up this request's deltas for gen_batch._rope_deltas.
+        if rope_deltas is not None:
+            self._rope_deltas = rope_deltas
+        else:
+            rope_deltas = self._rope_deltas
 
         cache_offset = 0
+        cache_offset_array = None
         if cache and cache[0] is not None:
             offset = cache[0].offset
             if isinstance(offset, int):
                 cache_offset = offset
             elif isinstance(offset, mx.array):
-                cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
+                if offset.ndim == 0:
+                    cache_offset = int(offset.item())
+                elif offset.size == 1:
+                    cache_offset = int(offset[0].item())
+                else:
+                    cache_offset_array = offset
+                    cache_offset = int(offset[0].item())
+            cache_offset = max(cache_offset, 0)
 
         if inputs_embeds is not None:
             L = inputs_embeds.shape[1]
@@ -376,20 +400,39 @@ class LanguageModel(nn.Module):
         else:
             L = 1
 
-        position_ids = None
-        pos_hw = None
+        if inputs_embeds is not None and cache_offset_array is None:
+            # Prefill (or chunked-prefill continuation): slice the full
+            # position tables to this chunk's window.
+            if position_ids is not None:
+                if position_ids.ndim == 2:
+                    position_ids = position_ids[:, cache_offset : cache_offset + L]
+                else:
+                    position_ids = position_ids[cache_offset : cache_offset + L]
+            if pos_hw is not None:
+                pos_hw = pos_hw[:, cache_offset : cache_offset + L, :]
+        elif (cache_offset > 0 or cache_offset_array is not None) and rope_deltas is not None:
+            # Decode: per-sequence positions from cache offsets + rope_delta.
+            if cache_offset_array is not None:
+                base_offset = cache_offset_array.reshape(-1, 1)
+            else:
+                base_offset = mx.array([[cache_offset]], dtype=mx.int32)
+            rd = rope_deltas
+            if rd.ndim == 0:
+                rd = rd.reshape(1, 1)
+            elif rd.ndim == 1:
+                rd = rd.reshape(-1, 1)
+            if rd.shape[0] == 1 and base_offset.shape[0] > 1:
+                rd = mx.broadcast_to(rd, base_offset.shape)
+            elif rd.shape[0] > base_offset.shape[0]:
+                rd = rd[: base_offset.shape[0]]
+            start = base_offset + rd.astype(base_offset.dtype)
+            position_ids = start + mx.arange(L, dtype=start.dtype).reshape(1, -1)
+        else:
+            position_ids = None
 
-        if self._position_ids is not None and inputs_embeds is not None:
-            position_ids = self._position_ids[cache_offset : cache_offset + L]
-            if self._pos_hw is not None:
-                pos_hw = self._pos_hw[:, cache_offset : cache_offset + L, :]
-        elif self._rope_delta is not None and cache_offset > 0:
-            start = cache_offset + self._rope_delta
-            position_ids = mx.arange(start, start + L, dtype=mx.int32)
-
-        if mask is None and self._full_attn_mask is not None and L > 1:
+        if mask is None and full_attn_mask is not None and L > 1:
             end = cache_offset + L
-            mask = self._full_attn_mask[:, :, cache_offset:end, :end]
+            mask = full_attn_mask[:, :, cache_offset:end, :end]
 
         out = self.model(
             inputs,

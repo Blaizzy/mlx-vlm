@@ -290,9 +290,7 @@ class FalconPerceptionTransformerModel(nn.Module):
                         base = mx.maximum(offset, 0).reshape(-1, 1)
                         position_ids = base + mx.arange(L).reshape(1, -1)
                     else:
-                        off = (
-                            offset if offset.ndim == 0 else offset[0]
-                        ).item()
+                        off = (offset if offset.ndim == 0 else offset[0]).item()
                         position_ids = mx.arange(off, off + L)
                 else:
                     position_ids = mx.arange(offset, offset + L)

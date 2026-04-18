@@ -15,7 +15,6 @@ from mlx_vlm.generate import (
     BatchStats,
     GenerationBatch,
     GenerationResult,
-    PromptProcessingBatch,
     _left_pad_prompts,
     normalize_resize_shape,
 )

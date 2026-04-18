@@ -30,10 +30,6 @@ class Model(nn.Module):
         image_grid_hw = kwargs.get("image_grid_hw", None)
 
         if pixel_values is None:
-            self.language_model._rope_delta = None
-            self.language_model._position_ids = None
-            self.language_model._pos_hw = None
-            self.language_model._full_attn_mask = None
             return InputEmbeddingsFeatures(
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids)
             )
@@ -56,17 +52,22 @@ class Model(nn.Module):
         position_ids, pos_hw, delta = self._precompute_positions(
             input_ids, image_grid_hw
         )
-        self.language_model._position_ids = position_ids
-        self.language_model._pos_hw = pos_hw
-        self.language_model._rope_delta = delta
         single_ids = input_ids[0:1] if input_ids.ndim == 2 else input_ids
-        self.language_model._full_attn_mask = create_falcon_ocr_mask(
+        full_attn_mask = create_falcon_ocr_mask(
             single_ids,
             self.config.image_cls_token_id,
             self.config.img_end_id,
         )
 
-        return InputEmbeddingsFeatures(inputs_embeds=final_embeds)
+        return InputEmbeddingsFeatures(
+            inputs_embeds=final_embeds,
+            # (1, L) so BatchGenerator's value[:batch_size] leading-axis
+            # slice is a no-op for single-request prefill.
+            position_ids=position_ids[None, :],
+            pos_hw=pos_hw,
+            rope_deltas=mx.array([[delta]], dtype=mx.int32),
+            attention_mask_4d=full_attn_mask,
+        )
 
     def _precompute_positions(self, input_ids, image_grid_hw):
         single_ids = input_ids[0] if input_ids.ndim == 2 else input_ids
@@ -178,13 +179,9 @@ class Model(nn.Module):
         **kwargs,
     ):
         features = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
-        kwargs["pixel_values"] = pixel_values
+        kwargs.update({"pixel_values": pixel_values, **features.to_dict()})
         return self.language_model(
-            input_ids,
-            inputs_embeds=features.inputs_embeds,
-            mask=mask,
-            cache=cache,
-            **kwargs,
+            input_ids, mask=mask, cache=cache, **kwargs
         )
 
     def sanitize(self, weights):
