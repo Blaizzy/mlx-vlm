@@ -217,6 +217,19 @@ def parse_arguments():
         default=DEFAULT_THINKING_END_TOKEN,
         help="Token that marks the end of a thinking block (default: %(default)s).",
     )
+    parser.add_argument(
+        "--triattention-calib",
+        type=str,
+        default=None,
+        help="Path to TriAttention calibration file (.safetensors). Enables "
+        "TriAttention KV cache compression when provided.",
+    )
+    parser.add_argument(
+        "--triattention-budget",
+        type=int,
+        default=None,
+        help="Maximum KV tokens to retain after TriAttention compression.",
+    )
 
     return parser.parse_args()
 
@@ -394,6 +407,8 @@ def generate_step(
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
+    triattention_calib: Optional[str] = None,
+    triattention_budget: Optional[int] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -468,6 +483,26 @@ def generate_step(
         prompt_cache = cache.make_prompt_cache(
             model.language_model,
             max_kv_size=max_kv_size,
+        )
+
+    # Apply TriAttention KV cache compression
+    _triattention_online_state = None
+    if triattention_calib is not None:
+        # Offline mode: use pre-computed calibration file
+        from .triattention import maybe_apply_triattention
+
+        maybe_apply_triattention(
+            prompt_cache,
+            model,
+            triattention_calib,
+            budget=triattention_budget,
+        )
+    elif triattention_budget is not None:
+        # Online mode: calibrate from prefill tokens (no calib file needed)
+        from .triattention import setup_online_triattention
+
+        _triattention_online_state = setup_online_triattention(
+            model, budget=triattention_budget
         )
 
     def _step(y, inputs_embeds=None):
@@ -549,6 +584,13 @@ def generate_step(
             input_ids = input_ids[:, -1:]
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
+
+    # Activate online TriAttention after prefill (hooks captured Q during prefill)
+    if _triattention_online_state is not None:
+        from .triattention import activate_online_triattention
+
+        activate_online_triattention(_triattention_online_state, prompt_cache)
+        _triattention_online_state = None
 
     mx.async_eval(y)
 
@@ -1599,6 +1641,9 @@ def main():
                 "vision_cache": vision_cache,
                 **kwargs,
             }
+            if args.triattention_calib is not None:
+                stream_kwargs["triattention_calib"] = args.triattention_calib
+                stream_kwargs["triattention_budget"] = args.triattention_budget
             if args.resize_shape is not None:
                 stream_kwargs["resize_shape"] = args.resize_shape
             if args.prefill_step_size is not None:
@@ -1634,6 +1679,9 @@ def main():
             "quantized_kv_start": args.quantized_kv_start,
             **kwargs,
         }
+        if args.triattention_calib is not None:
+            gen_kwargs["triattention_calib"] = args.triattention_calib
+            gen_kwargs["triattention_budget"] = args.triattention_budget
         if args.resize_shape is not None:
             gen_kwargs["resize_shape"] = args.resize_shape
         if args.prefill_step_size is not None:
