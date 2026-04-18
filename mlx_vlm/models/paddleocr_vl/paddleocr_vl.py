@@ -59,7 +59,8 @@ class Model(nn.Module):
             input_ids,
         )
 
-        # Pre-calculate position_ids for chunked prefill
+        position_ids = None
+        rope_deltas = None
         if image_grid_thw is not None or video_grid_thw is not None:
             position_ids, rope_deltas = self.language_model.get_rope_index(
                 input_ids, image_grid_thw, video_grid_thw, mask
@@ -67,7 +68,14 @@ class Model(nn.Module):
             self.language_model._position_ids = position_ids
             self.language_model._rope_deltas = rope_deltas
 
-        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
+        shipped_positions = (
+            position_ids.transpose(1, 0, 2) if position_ids is not None else None
+        )
+        return InputEmbeddingsFeatures(
+            inputs_embeds=final_inputs_embeds,
+            position_ids=shipped_positions,
+            rope_deltas=rope_deltas,
+        )
 
     @staticmethod
     def merge_input_ids_with_image_features(
