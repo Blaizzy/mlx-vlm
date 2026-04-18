@@ -284,9 +284,11 @@ curl -X POST "http://localhost:8080/v1/chat/completions" \
 
 Each choice gets a `logprobs.content[]` list with one entry per generated token: `{token, logprob, bytes, top_logprobs: [{token, logprob, bytes}, ...]}`. Works for both streaming and non-streaming.
 
-`top_logprobs` requires the server to be started with the `TOP_LOGPROBS_K` env var set, which caps how many alternatives the server will compute per token (default `0` = disabled, max `20`):
+`top_logprobs` requires the server to be started with a non-zero cap on how many alternatives it will compute per token (default `0` = disabled, max `20`). Set it via the `--top-logprobs-k` flag or the `TOP_LOGPROBS_K` env var:
 
 ```sh
+mlx_vlm.server --model mlx-community/Qwen2-VL-2B-Instruct-4bit --top-logprobs-k 5
+# or
 TOP_LOGPROBS_K=5 mlx_vlm.server --model mlx-community/Qwen2-VL-2B-Instruct-4bit
 ```
 

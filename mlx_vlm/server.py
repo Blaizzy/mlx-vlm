@@ -2317,6 +2317,15 @@ def main():
         help="Start index for quantized KV cache.",
     )
     parser.add_argument(
+        "--top-logprobs-k",
+        type=int,
+        default=None,
+        help=(
+            "Server-side cap for per-token top_logprobs (0-20, default 0 = "
+            "disabled). Maps to the TOP_LOGPROBS_K env var."
+        ),
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -2346,6 +2355,8 @@ def main():
     if args.max_kv_size is not None:
         os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    if args.top_logprobs_k is not None:
+        os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
 
     # Configure logging
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
