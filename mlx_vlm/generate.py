@@ -132,6 +132,12 @@ def parse_arguments():
         help="Number of bits to quantize the KV cache to.",
     )
     parser.add_argument(
+        "--turbo-kv-bits-swa",
+        type=float,
+        default=None,
+        help="TurboQuant bit-width for SWA/RotatingKVCache layers.",
+    )
+    parser.add_argument(
         "--kv-quant-scheme",
         type=str,
         choices=("uniform", "turboquant"),
@@ -245,6 +251,7 @@ def maybe_quantize_kv_cache(
     quantized_kv_start,
     kv_group_size,
     kv_bits,
+    turbo_kv_bits_swa: Optional[float] = None,
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
 ):
     if kv_bits is None:
@@ -255,8 +262,20 @@ def maybe_quantize_kv_cache(
         def quantize_entry(entry):
             if isinstance(entry, TurboQuantKVCache):
                 return entry
-            if isinstance(entry, cache.RotatingKVCache):
+            if isinstance(entry, cache.TurboQuantRotatingKVCache):
                 return entry
+            if isinstance(entry, cache.RotatingKVCache):
+                if turbo_kv_bits_swa is None:
+                    return entry
+                if entry.offset == 0:
+                    return cache.TurboQuantRotatingKVCache(
+                        max_size=entry.max_size, keep=entry.keep, bits=turbo_kv_bits_swa
+                    )
+                if entry.offset < quantized_kv_start:
+                    return entry
+                return cache.TurboQuantRotatingKVCache.from_rotating_cache(
+                    entry, bits=turbo_kv_bits_swa
+                )
             if isinstance(entry, cache.KVCache):
                 if entry.offset == 0:
                     # Empty: replace so update_and_fetch quantizes on the fly
@@ -388,6 +407,7 @@ def generate_step(
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
     kv_bits: Optional[float] = None,
+    turbo_kv_bits_swa: Optional[float] = None,
     kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
@@ -441,6 +461,7 @@ def generate_step(
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
+        turbo_kv_bits_swa=turbo_kv_bits_swa,
         kv_quant_scheme=kv_quant_scheme,
     )
 
@@ -1597,6 +1618,7 @@ def main():
                 "max_tokens": args.max_tokens,
                 "temperature": args.temperature,
                 "vision_cache": vision_cache,
+                "turbo_kv_bits_swa": args.turbo_kv_bits_swa,
                 **kwargs,
             }
             if args.resize_shape is not None:
@@ -1627,6 +1649,7 @@ def main():
             "verbose": args.verbose,
             "max_kv_size": args.max_kv_size,
             "kv_bits": args.kv_bits,
+            "turbo_kv_bits_swa": args.turbo_kv_bits_swa,
             "kv_group_size": args.kv_group_size,
             "kv_quant_scheme": getattr(
                 args, "kv_quant_scheme", DEFAULT_KV_QUANT_SCHEME
