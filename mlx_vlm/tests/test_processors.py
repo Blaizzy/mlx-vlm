@@ -1,6 +1,8 @@
 """Tests for custom processor implementations."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -207,6 +209,73 @@ class TestPaliGemmaProcessor(_ProcessorTestBase, unittest.TestCase):
     def _text_call_args(self):
         return None  # PaliGemma requires images
 
+    def test_tokenizer_kwargs_do_not_leak_into_image_processor(self):
+        from mlx_vlm.models.paligemma.processing_paligemma import PaliGemmaProcessor
+
+        calls = {}
+
+        class ImageProcessor:
+            model_input_names = ["pixel_values"]
+            valid_kwargs = type(
+                "ImageValidKwargs",
+                (),
+                {"__annotations__": {"do_resize": bool}},
+            )
+
+            def __call__(self, images=None, **kwargs):
+                if "padding" in kwargs or "add_special_tokens" in kwargs:
+                    raise AssertionError("Tokenizer kwargs reached the image processor")
+                calls["image_kwargs"] = kwargs
+                return {
+                    "pixel_values": np.random.randn(1, 3, 224, 224).astype(np.float32)
+                }
+
+        class Tokenizer:
+            bos_token = "<bos>"
+            eos_token = "<eos>"
+            model_input_names = ["input_ids", "attention_mask"]
+
+            def __call__(
+                self,
+                text,
+                text_pair=None,
+                return_token_type_ids=False,
+                **kwargs,
+            ):
+                calls["tokenizer_kwargs"] = kwargs
+                batch = [text] if isinstance(text, str) else text
+                return {
+                    "input_ids": [list(range(10)) for _ in batch],
+                    "attention_mask": [[1] * 10 for _ in batch],
+                    "token_type_ids": [[0] * 10 for _ in batch],
+                }
+
+        p = PaliGemmaProcessor.__new__(PaliGemmaProcessor)
+        p.image_token = "<image>"
+        p.image_seq_length = 4
+        p.image_processor = ImageProcessor()
+        p.tokenizer = Tokenizer()
+
+        result = p(
+            text="describe",
+            images=[_make_image()],
+            padding=True,
+            padding_side="left",
+            add_special_tokens=False,
+            do_resize=False,
+        )
+
+        self._assert_all_mx(result)
+        self.assertEqual(calls["image_kwargs"], {"do_resize": False})
+        self.assertEqual(
+            calls["tokenizer_kwargs"],
+            {
+                "padding": True,
+                "padding_side": "left",
+                "add_special_tokens": False,
+            },
+        )
+
 
 class TestGemma3Processor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
@@ -247,6 +316,97 @@ class TestGemma3nProcessor(_ProcessorTestBase, unittest.TestCase):
 
     def _image_call_args(self):
         return {"text": ["<image> Cats"], "images": [_make_image()]}
+
+
+class TestDotsVLProcessor(unittest.TestCase):
+    def test_sets_upstream_special_token_ids(self):
+        from mlx_vlm.models.dots_ocr.processing_dots_ocr import (
+            DotsDummyVideoProcessor,
+            DotsVLProcessor,
+        )
+
+        def _fake_init(
+            self,
+            image_processor=None,
+            tokenizer=None,
+            chat_template=None,
+        ):
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+            self.chat_template = chat_template
+
+        tokenizer = _mock_tokenizer(
+            image_token="<|imgpad|>",
+            image_token_id=7,
+            video_token="<|video_pad|>",
+            video_token_id=13,
+        )
+
+        with patch(
+            "mlx_vlm.models.dots_ocr.processing_dots_ocr.ProcessorMixin.__init__",
+            _fake_init,
+        ):
+            processor = DotsVLProcessor(
+                image_processor=_mock_ip(),
+                tokenizer=tokenizer,
+            )
+
+        self.assertEqual(processor.image_token, "<|imgpad|>")
+        self.assertEqual(processor.image_token_id, 151665)
+        self.assertEqual(processor.video_token, "<|video_pad|>")
+        self.assertEqual(processor.video_token_id, 151656)
+        self.assertIsInstance(processor.video_processor, DotsDummyVideoProcessor)
+        self.assertEqual(processor.video_processor.temporal_patch_size, 1)
+
+    def test_from_pretrained_uses_slow_image_processor(self):
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.dots_ocr.processing_dots_ocr import (
+            DotsDummyVideoProcessor,
+            DotsVLProcessor,
+        )
+
+        def _fake_init(
+            self,
+            image_processor=None,
+            tokenizer=None,
+            chat_template=None,
+        ):
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+            self.chat_template = chat_template
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "chat_template.json").write_text(
+                '{"chat_template": "{{ messages[0].content }}"}'
+            )
+
+            tokenizer_from_pretrained = lambda *args, **kwargs: _mock_tokenizer()
+            image_from_pretrained = unittest.mock.Mock(return_value=_mock_ip())
+
+            with (
+                patch.dict(
+                    "transformers.__dict__",
+                    {
+                        "AutoTokenizer": SimpleNamespace(
+                            from_pretrained=tokenizer_from_pretrained
+                        ),
+                        "AutoImageProcessor": SimpleNamespace(
+                            from_pretrained=image_from_pretrained
+                        ),
+                    },
+                ),
+                patch(
+                    "mlx_vlm.models.dots_ocr.processing_dots_ocr.ProcessorMixin.__init__",
+                    _fake_init,
+                ),
+            ):
+                processor = DotsVLProcessor.from_pretrained(tmpdir, use_fast=True)
+
+        image_from_pretrained.assert_called_once()
+        self.assertEqual(image_from_pretrained.call_args.kwargs["use_fast"], False)
+        self.assertIsInstance(processor.video_processor, DotsDummyVideoProcessor)
 
 
 class TestSmolVLMProcessor(_ProcessorTestBase, unittest.TestCase):
@@ -633,6 +793,88 @@ class TestMistral3Processor(_ProcessorTestBase, unittest.TestCase):
     def _image_call_args(self):
         return {"text": ["[IMG]Describe"], "images": [[_make_image()]]}
 
+    def test_from_pretrained_prefers_model_geometry_over_processor_config(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from mlx_vlm.models.mistral3.processing_mistral3 import Mistral3Processor
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            (path / "processor_config.json").write_text(
+                json.dumps(
+                    {
+                        "patch_size": 16,
+                        "spatial_merge_size": 1,
+                        "image_token": "[IMG]",
+                        "image_break_token": "[IMG_BREAK]",
+                        "image_end_token": "[IMG_END]",
+                    }
+                )
+            )
+            (path / "preprocessor_config.json").write_text(
+                json.dumps(
+                    {
+                        "patch_size": {"height": 14, "width": 14},
+                        "image_processor_type": "PixtralImageProcessor",
+                    }
+                )
+            )
+            (path / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "mistral3",
+                        "spatial_merge_size": 2,
+                        "vision_config": {"patch_size": 14},
+                    }
+                )
+            )
+
+            class DummyImageProcessor:
+                model_input_names = ["pixel_values"]
+
+            def _fake_init(
+                self,
+                image_processor=None,
+                tokenizer=None,
+                patch_size=16,
+                spatial_merge_size=1,
+                image_token="[IMG]",
+                image_break_token="[IMG_BREAK]",
+                image_end_token="[IMG_END]",
+                chat_template=None,
+                **kwargs,
+            ):
+                self.image_processor = image_processor
+                self.tokenizer = tokenizer
+                self.patch_size = patch_size
+                self.spatial_merge_size = spatial_merge_size
+                self.image_token = image_token
+                self.image_break_token = image_break_token
+                self.image_end_token = image_end_token
+                self.chat_template = chat_template
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=_mock_tokenizer(),
+                ),
+                patch(
+                    "mlx_vlm.models.mistral3.processing_mistral3._load_mistral3_image_processor",
+                    return_value=DummyImageProcessor(),
+                ),
+                patch.object(Mistral3Processor, "__init__", _fake_init),
+            ):
+                processor = Mistral3Processor.from_pretrained(tmpdir)
+
+        self.assertEqual(processor.patch_size, 14)
+        self.assertEqual(processor.spatial_merge_size, 2)
+        self.assertEqual(processor.image_token, "[IMG]")
+        self.assertEqual(processor.image_break_token, "[IMG_BREAK]")
+        self.assertEqual(processor.image_end_token, "[IMG_END]")
+
 
 class TestMultiModalityProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
@@ -802,6 +1044,118 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertEqual(_num_image_tokens_from_patch_grid(1, 1, 2), 1)
         self.assertEqual(_num_image_tokens_from_patch_grid(7, 9, 4), 6)
 
+    def test_scalar_image_rows_and_cols_are_supported(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import _patched_call
+
+        class DummyImageProcessor:
+            def __init__(self):
+                self.patch_size = 16
+                self.downsample_factor = 2
+                self.tile_size = 512
+                self.max_image_tokens = 256
+                self.min_image_tokens = 64
+                self.encoder_patch_size = 16
+                self.do_image_splitting = False
+                self.use_thumbnail = False
+
+            def fetch_images(self, images):
+                return [images]
+
+            def __call__(self, images, **kwargs):
+                return {
+                    "pixel_values": np.zeros((1, 16, 768), dtype=np.float32),
+                    "image_rows": np.array([np.int64(1)]),
+                    "image_cols": np.array([np.int64(1)]),
+                    "image_sizes": [[416, 576]],
+                }
+
+        processor = type("DummyProcessor", (), {})()
+        processor.image_processor = DummyImageProcessor()
+        processor.tokenizer = _mock_tokenizer(image_token="<image>")
+        processor.image_token = "<image>"
+        processor.image_start_token = "<|image_start|>"
+        processor.image_end_token = "<|image_end|>"
+        processor._merge_kwargs = lambda *args, **kwargs: {
+            "text_kwargs": {},
+            "images_kwargs": {},
+        }
+
+        result = _patched_call(
+            processor,
+            images=_make_image(),
+            text="<image>Describe this image",
+        )
+
+        self.assertIn("input_ids", result)
+        self.assertIn("attention_mask", result)
+
+    def test_from_pretrained_uses_slow_image_processor(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlProcessor
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "preprocessor_config.json").write_text(
+                json.dumps(
+                    {
+                        "image_processor_type": "Lfm2VlImageProcessorFast",
+                        "do_resize": False,
+                        "do_image_splitting": True,
+                        "do_normalize": True,
+                        "do_rescale": True,
+                        "image_mean": [0.5, 0.5, 0.5],
+                        "image_std": [0.5, 0.5, 0.5],
+                        "max_num_patches": 1024,
+                        "patch_size": 16,
+                        "return_row_col_info": True,
+                    }
+                )
+            )
+
+            class DummySiglip2ImageProcessor:
+                def __init__(self, **kwargs):
+                    self.do_resize = kwargs.get("do_resize", True)
+                    self.do_image_splitting = kwargs.get("do_image_splitting", False)
+                    self.image_mean = kwargs.get("image_mean")
+                    self.image_std = kwargs.get("image_std")
+                    self.max_num_patches = kwargs.get("max_num_patches")
+                    self.patch_size = kwargs.get("patch_size")
+
+            def _fake_init(
+                self, image_processor, tokenizer, chat_template=None, **kwargs
+            ):
+                self.image_processor = image_processor
+                self.tokenizer = tokenizer
+                self.chat_template = chat_template
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=_mock_tokenizer(),
+                ),
+                patch(
+                    "mlx_vlm.models.lfm2_vl.processing_lfm2_vl.Siglip2ImageProcessor",
+                    DummySiglip2ImageProcessor,
+                    create=True,
+                ),
+                patch(
+                    "mlx_vlm.models.lfm2_vl.processing_lfm2_vl._SLOW_PROCESSOR_AVAILABLE",
+                    True,
+                ),
+                patch(
+                    "mlx_vlm.models.lfm2_vl.processing_lfm2_vl._original_init",
+                    _fake_init,
+                ),
+            ):
+                processor = Lfm2VlProcessor.from_pretrained(tmpdir)
+
+        self.assertIsInstance(processor.image_processor, DummySiglip2ImageProcessor)
+        self.assertTrue(processor.image_processor.do_resize)
+        self.assertFalse(processor.image_processor.do_image_splitting)
+
 
 # ── AutoProcessor patch tests ─────────────────────────────────────────────────
 
@@ -879,6 +1233,27 @@ class TestHunYuanVLPatch(unittest.TestCase):
         )
 
 
+class TestLfm2VlPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        import importlib
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        importlib.import_module("mlx_vlm.models.lfm2_vl")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps({"model_type": "lfm2_vl"})
+            )
+            with self.assertRaises(Exception) as cm:
+                AutoProcessor.from_pretrained(tmpdir)
+
+            self.assertNotIn("requires `torchvision`", str(cm.exception).lower())
+
+
 class TestErnie4_5VLPatch(unittest.TestCase):
     def test_patch_intercepts(self):
         _assert_patch_intercepts(
@@ -906,6 +1281,16 @@ class TestQwen3_5MoePatch(unittest.TestCase):
             "qwen3_5_moe",
             "mlx_vlm.models.qwen3_vl.processing_qwen3_vl",
             "Qwen3VLProcessor",
+        )
+
+
+class TestDotsVLPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "dots_ocr",
+            "mlx_vlm.models.dots_ocr.processing_dots_ocr",
+            "DotsVLProcessor",
         )
 
 

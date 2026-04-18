@@ -276,18 +276,22 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the ouptut hidden states from the vision model
-        if self.config.vision_config.cls == "HybridVisionTower":
-            hidden_states = self.vision_model(
-                pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
-            )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
         else:
-            hidden_states, _, _ = self.vision_model(
-                pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
-            )
+            # Get the ouptut hidden states from the vision model
+            if self.config.vision_config.cls == "HybridVisionTower":
+                hidden_states = self.vision_model(
+                    pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
+                )
+            else:
+                hidden_states, _, _ = self.vision_model(
+                    pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
+                )
 
-        # Pass image features through the multi-modal projector
-        image_features = self.aligner(hidden_states)
+            # Pass image features through the multi-modal projector
+            image_features = self.aligner(hidden_states)
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self._merge_input_ids_with_image_features(

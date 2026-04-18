@@ -444,6 +444,7 @@ def main():
     parser.add_argument(
         "--prompt", default="Describe this video.", help="Text prompt for the model"
     )
+    parser.add_argument("--system", type=str, required=False, help="System prompt")
     parser.add_argument(
         "--temperature", type=float, default=0.7, help="Temperature for generation"
     )
@@ -464,6 +465,12 @@ def main():
 
     print(f"\033[32mLoading model:\033[0m {args.model}")
     model, processor = load(args.model)
+
+    # Ensure processor has chat_template (may only be on tokenizer)
+    if getattr(processor, "chat_template", None) is None and hasattr(
+        processor, "tokenizer"
+    ):
+        processor.chat_template = getattr(processor.tokenizer, "chat_template", None)
 
     # Validate the model
     if not is_video_model(model):
@@ -506,6 +513,12 @@ def main():
                 }
             ]
 
+        if args.system:
+            messages.insert(
+                0,
+                {"role": "system", "content": [{"type": "text", "text": args.system}]},
+            )
+
         text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
@@ -540,7 +553,7 @@ def main():
             if len(args.video) > 1:
                 raise ValueError("Only one video is supported for video models.")
             else:
-                frame_extractor = VideoFrameExtractor(args.max_frames)
+                frame_extractor = VideoFrameExtractor(args.max_frames or 50)
                 frames = frame_extractor.extract_frames(args.video[0])
         else:
             frames = [load_image(image) for image in args.video]
@@ -558,36 +571,47 @@ def main():
             }
         ]
 
+        if args.system:
+            messages.insert(
+                0,
+                {"role": "system", "content": [{"type": "text", "text": args.system}]},
+            )
+
         text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
 
         # Configure processor for video frames
-        processor.image_processor.size = (
-            args.max_pixels
-            if isinstance(args.max_pixels, tuple)
-            else (args.max_pixels, args.max_pixels)
-        )
-        if hasattr(processor.image_processor, "do_resize"):
-            processor.image_processor.do_resize = False
-        if hasattr(processor.image_processor, "do_image_splitting"):
-            processor.image_processor.do_image_splitting = False
+        if hasattr(processor, "image_processor"):
+            processor.image_processor.size = (
+                args.max_pixels
+                if isinstance(args.max_pixels, tuple)
+                else (args.max_pixels, args.max_pixels)
+            )
+            if hasattr(processor.image_processor, "do_resize"):
+                processor.image_processor.do_resize = False
+            if hasattr(processor.image_processor, "do_image_splitting"):
+                processor.image_processor.do_image_splitting = False
 
         # Process inputs
         inputs = process_inputs_with_fallback(
             processor,
             images=[img for img in frames],
             prompts=text,
+            audio=None,
         )
 
         input_ids = mx.array(inputs["input_ids"])
         pixel_values = mx.array(inputs["pixel_values"])
         mask = mx.array(inputs["attention_mask"])
+        if "pixel_attention_mask" in inputs:
+            kwargs["pixel_mask"] = mx.array(inputs["pixel_attention_mask"])
         for key, value in inputs.items():
             if key not in [
                 "input_ids",
                 "pixel_values",
                 "attention_mask",
+                "pixel_attention_mask",
             ] and not isinstance(value, (str, list)):
                 kwargs[key] = mx.array(value)
 

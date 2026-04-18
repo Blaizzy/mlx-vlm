@@ -53,22 +53,26 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the output hidden states from the vision model
-        hidden_states, _, _ = self.vision_model(
-            pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            hidden_states = cached
+        else:
+            # Get the output hidden states from the vision model
+            hidden_states, _, _ = self.vision_model(
+                pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
+            )
 
-        # Extract vision embeddings, removing the class token (first token)
-        hidden_states = hidden_states[:, 1:, :]
+            # Extract vision embeddings, removing the class token (first token)
+            hidden_states = hidden_states[:, 1:, :]
 
-        # Apply pixel shuffle with downsampling
-        hidden_states = pixel_shuffle(
-            hidden_states, shuffle_ratio=self.downsample_ratio
-        )
+            # Apply pixel shuffle with downsampling
+            hidden_states = pixel_shuffle(
+                hidden_states, shuffle_ratio=self.downsample_ratio
+            )
 
-        # Apply MLP transformation
-        for layer in self.mlp1:
-            hidden_states = layer(hidden_states)
+            # Apply MLP transformation
+            for layer in self.mlp1:
+                hidden_states = layer(hidden_states)
 
         # Use dynamic image_token_index from processor if available
         image_token_index = kwargs.get(

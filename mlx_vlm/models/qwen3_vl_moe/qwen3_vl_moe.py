@@ -66,10 +66,15 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the ouptut hidden states from the vision model
-        hidden_states, deepstack_image_embeds = self.vision_tower(
-            pixel_values, grid_thw
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            hidden_states = cached
+            deepstack_image_embeds = None
+        else:
+            # Get the ouptut hidden states from the vision model
+            hidden_states, deepstack_image_embeds = self.vision_tower(
+                pixel_values, grid_thw
+            )
 
         visual_pos_masks = None
         deepstack_visual_embeds = None
