@@ -2105,7 +2105,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                     response_logprobs = ChatLogprobs(
                         content=[
                             _make_logprob_content(
-                                tokenizer, tid, lp, top_logprobs=top_lps, top_k=req_top_k
+                                tokenizer,
+                                tid,
+                                lp,
+                                top_logprobs=top_lps,
+                                top_k=req_top_k,
                             )
                             for tid, lp, top_lps in collected_logprobs
                         ]
