@@ -25,11 +25,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
 from .generate import (
-    BatchGenerator,
     DEFAULT_MAX_TOKENS,
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
+    BatchGenerator,
     filter_generation_config,
     generate,
     normalize_resize_shape,
@@ -59,6 +59,7 @@ _SERVER_GENERATION_ENV = {
     "max_kv_size": ("MAX_KV_SIZE", int),
     "quantized_kv_start": ("QUANTIZED_KV_START", int),
 }
+
 
 def load_server_generation_defaults() -> dict[str, Any]:
     generation = {}
@@ -1900,9 +1901,12 @@ async def chat_completions_endpoint(request: ChatRequest):
                             pass
                         return text, pt, gt, pm
 
-                    full_text, prompt_tokens, output_tokens, peak_memory = (
-                        await asyncio.to_thread(_blocking_generate)
-                    )
+                    (
+                        full_text,
+                        prompt_tokens,
+                        output_tokens,
+                        peak_memory,
+                    ) = await asyncio.to_thread(_blocking_generate)
                 else:
                     gen_result = generate(
                         model=model,
