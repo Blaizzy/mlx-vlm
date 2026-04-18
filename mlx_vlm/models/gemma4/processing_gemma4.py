@@ -197,12 +197,12 @@ class Gemma4ImageProcessor(HFBaseImageProcessor):
             num_patches = (h // patch_size) * (w // patch_size)
             num_soft_tokens_per_image.append(num_patches // (pooling_kernel_size**2))
 
-        # Different-shaped images can't be stacked; return as a list
+        # Stack if all same shape, otherwise return as list for per-image processing
         shapes = {img.shape for img in processed}
-        if len(shapes) > 1:
-            data = {"pixel_values": processed}
-        else:
+        if len(shapes) == 1:
             data = {"pixel_values": np.stack(processed)}
+        else:
+            data = {"pixel_values": processed}
 
         return data, num_soft_tokens_per_image
 
@@ -548,20 +548,22 @@ class Gemma4Processor(ProcessorMixin):
 
         image_processor = Gemma4ImageProcessor(**ip_config)
 
-        # Load audio feature extractor if config available
+        # Load audio feature extractor.
+        # The standard HF checkpoint does not include a "feature_extractor" key
+        # in processor_config.json, so we instantiate with defaults when the
+        # config is missing — the USM parameters are fixed for all Gemma 4 models.
         feature_extractor = None
-        if fe_config:
+        try:
+            from .audio_feature_extractor import Gemma4AudioFeatureExtractor
+
+            feature_extractor = Gemma4AudioFeatureExtractor(**(fe_config or {}))
+        except ImportError:
             try:
-                from .audio_feature_extractor import Gemma4AudioFeatureExtractor
+                from transformers import Gemma4AudioFeatureExtractor
 
-                feature_extractor = Gemma4AudioFeatureExtractor(**fe_config)
-            except ImportError:
-                try:
-                    from transformers import Gemma4AudioFeatureExtractor
-
-                    feature_extractor = Gemma4AudioFeatureExtractor(**fe_config)
-                except (ImportError, Exception):
-                    pass
+                feature_extractor = Gemma4AudioFeatureExtractor(**(fe_config or {}))
+            except (ImportError, Exception):
+                pass
 
         image_seq_length = ip_config.get("max_soft_tokens", 280)
         audio_seq_length = proc_config.get("audio_seq_length", 750)

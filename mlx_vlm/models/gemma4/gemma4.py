@@ -97,13 +97,19 @@ class Model(nn.Module):
             )
 
         if pixel_values is not None:
+            vision_cache = kwargs.get("vision_cache", None)
             cached = kwargs.get("cached_image_features", None)
+            if cached is None and vision_cache is not None:
+                cached = vision_cache.get(kwargs.get("_image_key"))
             if cached is not None:
                 image_features = cached.astype(inputs_embeds.dtype)
             else:
                 image_features = self.vision_tower(pixel_values)
                 image_features = self.embed_vision(image_features)
                 image_features = image_features.astype(inputs_embeds.dtype)
+                if vision_cache is not None and kwargs.get("_image_key") is not None:
+                    mx.eval(image_features)
+                    vision_cache.put(kwargs["_image_key"], image_features)
 
             image_mask = input_ids == self.config.image_token_id
             image_mask_expanded = mx.expand_dims(image_mask, -1)
@@ -195,7 +201,9 @@ class Model(nn.Module):
             else:
                 new_key = k
 
-            if new_key.startswith("language_model."):
+            if new_key.startswith("language_model.") and not new_key.startswith(
+                "language_model.model."
+            ):
                 rest = new_key[len("language_model.") :]
                 new_key = "language_model.model." + rest
 
