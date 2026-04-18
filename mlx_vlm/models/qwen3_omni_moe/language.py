@@ -540,9 +540,7 @@ class LanguageModel(nn.Module):
             else:
                 batch_size, seq_length = inputs.shape
                 rope_deltas_src = (
-                    rope_deltas_kw
-                    if rope_deltas_kw is not None
-                    else self._rope_deltas
+                    rope_deltas_kw if rope_deltas_kw is not None else self._rope_deltas
                 )
                 delta = mx.array(
                     cache_offset + rope_deltas_src if cache is not None else 0

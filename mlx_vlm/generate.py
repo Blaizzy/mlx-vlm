@@ -1188,20 +1188,14 @@ class GenerationBatch:
             self._next_tokens = other._next_tokens
             self._next_lps = other._next_lps
         elif other._next_tokens is not None:
-            self._next_tokens = mx.concatenate(
-                [self._next_tokens, other._next_tokens]
-            )
+            self._next_tokens = mx.concatenate([self._next_tokens, other._next_tokens])
             if self._next_lps is not None and other._next_lps is not None:
-                self._next_lps = mx.concatenate(
-                    [self._next_lps, other._next_lps]
-                )
+                self._next_lps = mx.concatenate([self._next_lps, other._next_lps])
 
         if self._rope_deltas is None:
             self._rope_deltas = other._rope_deltas
         elif other._rope_deltas is not None:
-            self._rope_deltas = mx.concatenate(
-                [self._rope_deltas, other._rope_deltas]
-            )
+            self._rope_deltas = mx.concatenate([self._rope_deltas, other._rope_deltas])
 
     def filter(self, keep: List[int]):
         """Filter the batch to keep only the specified indices."""
@@ -1356,7 +1350,9 @@ class PromptProcessingBatch:
         mx.clear_cache()
         return n
 
-    def generate(self, sampler, stop_criteria, compute_logprobs=True) -> GenerationBatch:
+    def generate(
+        self, sampler, stop_criteria, compute_logprobs=True
+    ) -> GenerationBatch:
         """Process final tokens and transition to GenerationBatch."""
         output = self.model(
             self._input_ids,
@@ -1460,7 +1456,9 @@ class BatchGenerator:
         self.tokenizer.stopping_criteria.add_eos_token_ids(stop_tokens)
 
         self._generation_batch = GenerationBatch.empty(
-            self.model, self.sampler, self.tokenizer.stopping_criteria,
+            self.model,
+            self.sampler,
+            self.tokenizer.stopping_criteria,
             compute_logprobs=self.compute_logprobs,
         )
         self._prompt_batch: Optional[PromptProcessingBatch] = None
@@ -1607,7 +1605,8 @@ class BatchGenerator:
 
             tic = time.perf_counter()
             gen_batch = self._prompt_batch.generate(
-                self.sampler, self.tokenizer.stopping_criteria,
+                self.sampler,
+                self.tokenizer.stopping_criteria,
                 compute_logprobs=self.compute_logprobs,
             )
             self._prompt_time_counter += time.perf_counter() - tic
