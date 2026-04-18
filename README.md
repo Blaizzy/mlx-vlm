@@ -266,6 +266,32 @@ Tested with gemma-4-26b-a4b-it at 20K context:
 
 > Models with all full-attention layers (e.g. Qwen, LLaMA) see larger reductions — up to 3.6x at 8-bit and 6.4x at 4-bit.
 
+#### Log Probabilities
+
+The `/chat/completions` endpoint supports OpenAI-compatible per-token log probabilities. Pass `logprobs: true` (and optionally `top_logprobs: N`, up to 20) in the request:
+
+```sh
+curl -X POST "http://localhost:8080/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen2-VL-2B-Instruct-4bit",
+    "messages": [{"role":"user","content":"Say hi in 3 words."}],
+    "max_tokens": 8,
+    "logprobs": true,
+    "top_logprobs": 3
+  }'
+```
+
+Each choice gets a `logprobs.content[]` list with one entry per generated token: `{token, logprob, bytes, top_logprobs: [{token, logprob, bytes}, ...]}`. Works for both streaming and non-streaming.
+
+`top_logprobs` requires the server to be started with the `TOP_LOGPROBS_K` env var set, which caps how many alternatives the server will compute per token (default `0` = disabled, max `20`):
+
+```sh
+TOP_LOGPROBS_K=5 mlx_vlm.server --model mlx-community/Qwen2-VL-2B-Instruct-4bit
+```
+
+Per-request `top_logprobs` is clamped to `TOP_LOGPROBS_K`. When `TOP_LOGPROBS_K=0`, requests with `logprobs: true` still return chosen-token logprobs; only the `top_logprobs` list stays empty. Leaving the cap at `0` keeps the vocab-wide sort out of the decode graph, so deployments that don't need logprobs pay zero overhead.
+
 #### How It Works
 
 - A dedicated generation thread runs a `BatchGenerator` that processes multiple requests in parallel

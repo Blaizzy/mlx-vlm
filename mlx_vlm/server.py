@@ -89,6 +89,16 @@ def get_quantized_kv_start():
     return int(os.environ.get("QUANTIZED_KV_START", DEFAULT_QUANTIZED_KV_START))
 
 
+def get_top_logprobs_k():
+    """Max per-token top_logprobs honored by the server (0 = disabled).
+
+    Set via TOP_LOGPROBS_K env var. OpenAI caps this at 20. When 0, requests
+    with top_logprobs>0 still succeed but the top_logprobs list stays empty.
+    """
+    k = int(os.environ.get("TOP_LOGPROBS_K", 0))
+    return max(0, min(k, 20))
+
+
 # =============================================================================
 # ResponseGenerator - Concurrent Request Handling with Threaded Batching
 # =============================================================================
@@ -157,6 +167,7 @@ class StreamingToken:
     logprobs: float
     finish_reason: Optional[str]
     peak_memory: float = 0.0
+    top_logprobs: Optional[List[Tuple[int, float]]] = None
 
 
 class ResponseGenerator:
@@ -179,6 +190,7 @@ class ResponseGenerator:
         kv_group_size=DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
         quantized_kv_start=DEFAULT_QUANTIZED_KV_START,
+        top_logprobs_k=0,
     ):
         self.model = model
         self.processor = processor
@@ -188,6 +200,7 @@ class ResponseGenerator:
         self.kv_group_size = kv_group_size
         self.kv_quant_scheme = kv_quant_scheme
         self.quantized_kv_start = quantized_kv_start
+        self.top_logprobs_k = top_logprobs_k
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -388,6 +401,7 @@ class ResponseGenerator:
                             kv_group_size=self.kv_group_size,
                             kv_quant_scheme=self.kv_quant_scheme,
                             quantized_kv_start=self.quantized_kv_start,
+                            top_logprobs_k=self.top_logprobs_k,
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
@@ -465,6 +479,7 @@ class ResponseGenerator:
                     logprobs=lp,
                     finish_reason=r.finish_reason,
                     peak_memory=mx.get_peak_memory() / 1e9 if r.finish_reason else 0,
+                    top_logprobs=getattr(r, "top_logprobs", None),
                 )
             )
 
@@ -585,6 +600,41 @@ def _split_thinking(text: str) -> Tuple[Optional[str], str]:
             return reasoning or None, content
         return parts[0].replace("<think>", "").strip(), ""
     return None, text
+
+
+def _decode_token(tokenizer, token_id: int) -> Tuple[str, Optional[List[int]]]:
+    """Decode a single token id to its string + UTF-8 bytes."""
+    try:
+        text = tokenizer.decode([int(token_id)])
+    except Exception:
+        text = ""
+    try:
+        token_bytes = list(text.encode("utf-8"))
+    except Exception:
+        token_bytes = None
+    return text, token_bytes
+
+
+def _make_logprob_content(
+    tokenizer,
+    token_id: int,
+    logprob: float,
+    top_logprobs: Optional[List[Tuple[int, float]]] = None,
+    top_k: int = 0,
+) -> "ChatLogprobContent":
+    """Build an OpenAI-style logprob entry for a single token."""
+    token_text, token_bytes = _decode_token(tokenizer, token_id)
+    top_list: List[TopLogprob] = []
+    if top_k > 0 and top_logprobs:
+        for tid, lp in top_logprobs[:top_k]:
+            t_text, t_bytes = _decode_token(tokenizer, tid)
+            top_list.append(TopLogprob(token=t_text, logprob=float(lp), bytes=t_bytes))
+    return ChatLogprobContent(
+        token=token_text,
+        logprob=float(logprob),
+        bytes=token_bytes,
+        top_logprobs=top_list,
+    )
 
 
 # Global response generator for continuous batching
@@ -714,6 +764,7 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
         kv_group_size=kv_group_size,
         kv_quant_scheme=kv_quant_scheme,
         quantized_kv_start=quantized_kv_start,
+        top_logprobs_k=get_top_logprobs_k(),
     )
 
     model_cache = {
@@ -1067,6 +1118,18 @@ class VLMRequest(FlexibleBaseModel):
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
     )
+    logprobs: Optional[bool] = Field(
+        None,
+        description="Return log-probabilities for each output token.",
+    )
+    top_logprobs: Optional[int] = Field(
+        None,
+        description=(
+            "Number of most-likely tokens to return at each position "
+            "(0-20). Requires logprobs=true. The server-side cap is set by "
+            "the TOP_LOGPROBS_K env var; values above the cap are clamped."
+        ),
+    )
     resize_shape: Optional[ResizeShapeInput] = Field(
         None,
         description="Resize shape for the image. Provide one integer for square or two for (height, width).",
@@ -1108,10 +1171,28 @@ class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
 
 
+class TopLogprob(BaseModel):
+    token: str
+    logprob: float
+    bytes: Optional[List[int]] = None
+
+
+class ChatLogprobContent(BaseModel):
+    token: str
+    logprob: float
+    bytes: Optional[List[int]] = None
+    top_logprobs: List[TopLogprob] = []
+
+
+class ChatLogprobs(BaseModel):
+    content: List[ChatLogprobContent] = []
+
+
 class ChatChoice(BaseModel):
     index: int = 0
     finish_reason: str = "stop"
     message: ChatMessage
+    logprobs: Optional[ChatLogprobs] = None
 
 
 class ChatResponse(BaseModel):
@@ -1127,6 +1208,7 @@ class ChatStreamChoice(BaseModel):
     index: int = 0
     finish_reason: Optional[str] = None
     delta: ChatMessage
+    logprobs: Optional[ChatLogprobs] = None
 
 
 class ChatStreamChunk(BaseModel):
@@ -1769,6 +1851,21 @@ async def chat_completions_endpoint(request: ChatRequest):
                             else:
                                 delta_content = token.text
 
+                            chunk_logprobs = None
+                            if request.logprobs and token.finish_reason != "stop":
+                                req_top_k = int(request.top_logprobs or 0)
+                                chunk_logprobs = ChatLogprobs(
+                                    content=[
+                                        _make_logprob_content(
+                                            response_generator.tokenizer,
+                                            token.token,
+                                            token.logprobs,
+                                            top_logprobs=token.top_logprobs,
+                                            top_k=req_top_k,
+                                        )
+                                    ]
+                                )
+
                             choices = [
                                 ChatStreamChoice(
                                     finish_reason=token.finish_reason,
@@ -1777,6 +1874,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                                         content=delta_content,
                                         reasoning=delta_reasoning,
                                     ),
+                                    logprobs=chunk_logprobs,
                                 )
                             ]
                             chunk_data = ChatStreamChunk(
@@ -1907,6 +2005,10 @@ async def chat_completions_endpoint(request: ChatRequest):
                 output_tokens = 0
                 peak_memory = 0.0
 
+                collected_logprobs: List[
+                    Tuple[int, float, Optional[List[Tuple[int, float]]]]
+                ] = []
+
                 if response_generator is not None:
 
                     def _blocking_generate():
@@ -1924,6 +2026,10 @@ async def chat_completions_endpoint(request: ChatRequest):
                             text += token.text
                             gt += 1
                             pm = token.peak_memory
+                            if request.logprobs and token.finish_reason != "stop":
+                                collected_logprobs.append(
+                                    (token.token, token.logprobs, token.top_logprobs)
+                                )
                             if token.finish_reason:
                                 break
                         try:
@@ -1988,6 +2094,23 @@ async def chat_completions_endpoint(request: ChatRequest):
                             ).strip()
                         content = clean_remaining or None
 
+                response_logprobs = None
+                if request.logprobs and collected_logprobs:
+                    tokenizer = (
+                        processor.tokenizer
+                        if hasattr(processor, "tokenizer")
+                        else processor
+                    )
+                    req_top_k = int(request.top_logprobs or 0)
+                    response_logprobs = ChatLogprobs(
+                        content=[
+                            _make_logprob_content(
+                                tokenizer, tid, lp, top_logprobs=top_lps, top_k=req_top_k
+                            )
+                            for tid, lp, top_lps in collected_logprobs
+                        ]
+                    )
+
                 choices = [
                     ChatChoice(
                         finish_reason="tool_calls" if parsed_tool_calls else "stop",
@@ -1997,6 +2120,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             reasoning=reasoning,
                             tool_calls=parsed_tool_calls,
                         ),
+                        logprobs=response_logprobs,
                     )
                 ]
                 result = ChatResponse(

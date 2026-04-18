@@ -1079,6 +1079,7 @@ class GenerationBatch:
         token: int
         token_logprob: float
         finish_reason: Optional[str]
+        top_logprobs: Optional[List[Tuple[int, float]]] = None
 
     def __init__(
         self,
@@ -1089,6 +1090,7 @@ class GenerationBatch:
         sampler: Callable[[mx.array], mx.array],
         stop_criteria,
         max_tokens: List[int],
+        top_logprobs_k: int = 0,
     ):
         self.model = model
         self._language_model = getattr(model, "language_model", model)
@@ -1099,11 +1101,14 @@ class GenerationBatch:
         self.max_tokens = max_tokens
         self._num_tokens = [0] * len(uids)
         self.compute_logprobs = True
+        self.top_logprobs_k = top_logprobs_k
 
         self._current_tokens = None
         self._current_lps = None
         self._next_tokens = inputs
         self._next_lps = None
+        self._next_top_idx = None
+        self._next_top_lp = None
 
         # Per-sequence MRoPE delta
         self._rope_deltas = None
@@ -1139,19 +1144,49 @@ class GenerationBatch:
         # Gather per-token logprobs in the same graph so the full vocab
         # tensor stays a GPU intermediate instead of being materialized.
         self._next_tokens = sampled
+        # Snapshot the top buffers before we overwrite them — we emit the
+        # previous step's top-K, not the one we're about to compute.
+        prev_top_idx = self._next_top_idx
+        prev_top_lp = self._next_top_lp
+
+        eval_targets = [self._next_tokens]
         if self.compute_logprobs:
             self._next_lps = logprobs[mx.arange(sampled.shape[0]), sampled]
-            mx.async_eval(self._next_tokens, self._next_lps)
+            eval_targets.append(self._next_lps)
         else:
             self._next_lps = None
-            mx.async_eval(self._next_tokens)
+
+        k = self.top_logprobs_k
+        if k > 0:
+            # argsort ascending; take last K columns and reverse for descending.
+            sort_idx = mx.argsort(logprobs, axis=-1)
+            top_idx = sort_idx[..., -k:][..., ::-1].astype(mx.int32)
+            top_lp = mx.take_along_axis(logprobs, top_idx, axis=-1)
+            self._next_top_idx = top_idx
+            self._next_top_lp = top_lp
+            eval_targets.extend([top_idx, top_lp])
+        else:
+            self._next_top_idx = None
+            self._next_top_lp = None
+
+        mx.async_eval(*eval_targets)
 
         if self._current_lps is not None:
-            mx.eval(inputs, self._current_lps)
-            return inputs.tolist(), self._current_lps.tolist()
+            to_eval = [inputs, self._current_lps]
+            if prev_top_idx is not None:
+                to_eval.extend([prev_top_idx, prev_top_lp])
+            mx.eval(*to_eval)
+            top_idx_list = prev_top_idx.tolist() if prev_top_idx is not None else None
+            top_lp_list = prev_top_lp.tolist() if prev_top_lp is not None else None
+            return (
+                inputs.tolist(),
+                self._current_lps.tolist(),
+                top_idx_list,
+                top_lp_list,
+            )
         else:
             mx.eval(inputs)
-            return inputs.tolist(), None
+            return inputs.tolist(), None, None, None
 
     def extend(self, other: "GenerationBatch"):
         """Extend this batch with another generation batch."""
@@ -1175,10 +1210,29 @@ class GenerationBatch:
         if self._next_tokens is None:
             self._next_tokens = other._next_tokens
             self._next_lps = other._next_lps
+            self._next_top_idx = other._next_top_idx
+            self._next_top_lp = other._next_top_lp
         elif other._next_tokens is not None:
             self._next_tokens = mx.concatenate([self._next_tokens, other._next_tokens])
             if self._next_lps is not None and other._next_lps is not None:
                 self._next_lps = mx.concatenate([self._next_lps, other._next_lps])
+            # Top-K buffers: concat when both sides have matching K; otherwise
+            # drop to None (the affected step will emit no top_logprobs for
+            # anyone and recompute cleanly on the next step).
+            if (
+                self._next_top_idx is not None
+                and other._next_top_idx is not None
+                and self._next_top_idx.shape[-1] == other._next_top_idx.shape[-1]
+            ):
+                self._next_top_idx = mx.concatenate(
+                    [self._next_top_idx, other._next_top_idx]
+                )
+                self._next_top_lp = mx.concatenate(
+                    [self._next_top_lp, other._next_top_lp]
+                )
+            else:
+                self._next_top_idx = None
+                self._next_top_lp = None
 
         if self._rope_deltas is None:
             self._rope_deltas = other._rope_deltas
@@ -1197,6 +1251,8 @@ class GenerationBatch:
             self._current_lps = None
             self._next_tokens = None
             self._next_lps = None
+            self._next_top_idx = None
+            self._next_top_lp = None
             self._rope_deltas = None
         else:
             keep_arr = mx.array(keep, mx.int32)
@@ -1206,6 +1262,9 @@ class GenerationBatch:
                 self._next_tokens = self._next_tokens[keep_arr]
             if self._next_lps is not None:
                 self._next_lps = self._next_lps[keep_arr]
+            if self._next_top_idx is not None:
+                self._next_top_idx = self._next_top_idx[keep_arr]
+                self._next_top_lp = self._next_top_lp[keep_arr]
             if self._rope_deltas is not None:
                 self._rope_deltas = self._rope_deltas[keep_arr]
 
@@ -1214,7 +1273,7 @@ class GenerationBatch:
         if not self.uids:
             return []
 
-        tokens, lp_list = self._step()
+        tokens, lp_list, top_idx_list, top_lp_list = self._step()
 
         keep = []
         responses = []
@@ -1231,12 +1290,17 @@ class GenerationBatch:
             if finish_reason is None:
                 keep.append(i)
 
+            top_lp = None
+            if top_idx_list is not None:
+                top_lp = list(zip(top_idx_list[i], top_lp_list[i]))
+
             responses.append(
                 self.Response(
                     uid=self.uids[i],
                     token=tok,
                     token_logprob=lp_list[i] if lp_list is not None else 0.0,
                     finish_reason=finish_reason,
+                    top_logprobs=top_lp,
                 )
             )
 
@@ -1246,7 +1310,9 @@ class GenerationBatch:
         return responses
 
     @classmethod
-    def empty(cls, model, sampler, stop_criteria, compute_logprobs=True):
+    def empty(
+        cls, model, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
+    ):
         """Create an empty generation batch."""
         batch = cls.__new__(cls)
         batch.model = model
@@ -1258,10 +1324,13 @@ class GenerationBatch:
         batch.max_tokens = []
         batch._num_tokens = []
         batch.compute_logprobs = compute_logprobs
+        batch.top_logprobs_k = top_logprobs_k
         batch._current_tokens = None
         batch._current_lps = None
         batch._next_tokens = None
         batch._next_lps = None
+        batch._next_top_idx = None
+        batch._next_top_lp = None
         batch._rope_deltas = None
         return batch
 
@@ -1339,7 +1408,7 @@ class PromptProcessingBatch:
         return n
 
     def generate(
-        self, sampler, stop_criteria, compute_logprobs=True
+        self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
     ) -> GenerationBatch:
         """Process final tokens and transition to GenerationBatch."""
         output = self.model(
@@ -1361,6 +1430,7 @@ class PromptProcessingBatch:
             sampler=sampler,
             stop_criteria=stop_criteria,
             max_tokens=list(self.max_tokens),
+            top_logprobs_k=top_logprobs_k,
         )
         gen_batch.compute_logprobs = compute_logprobs
 
@@ -1371,6 +1441,15 @@ class PromptProcessingBatch:
             gen_batch._next_lps = logprobs[
                 mx.arange(first_tokens.shape[0]), first_tokens
             ]
+
+        # Prime top-K buffers so the first token can emit top_logprobs too.
+        if top_logprobs_k > 0:
+            k = top_logprobs_k
+            sort_idx = mx.argsort(logprobs, axis=-1)
+            top_idx = sort_idx[..., -k:][..., ::-1].astype(mx.int32)
+            top_lp = mx.take_along_axis(logprobs, top_idx, axis=-1)
+            gen_batch._next_top_idx = top_idx
+            gen_batch._next_top_lp = top_lp
 
         # Snapshot the MRoPE delta the model produced for this prefill so
         # the decode path can pass it back in per-sequence via kwargs,
@@ -1423,6 +1502,7 @@ class BatchGenerator:
         kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
         quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
         compute_logprobs: bool = True,
+        top_logprobs_k: int = 0,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1432,6 +1512,7 @@ class BatchGenerator:
         self.kv_quant_scheme = kv_quant_scheme
         self.quantized_kv_start = quantized_kv_start
         self.compute_logprobs = compute_logprobs
+        self.top_logprobs_k = top_logprobs_k
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1448,6 +1529,7 @@ class BatchGenerator:
             self.sampler,
             self.tokenizer.stopping_criteria,
             compute_logprobs=self.compute_logprobs,
+            top_logprobs_k=self.top_logprobs_k,
         )
         self._prompt_batch: Optional[PromptProcessingBatch] = None
         self._unprocessed_sequences = []
@@ -1596,6 +1678,7 @@ class BatchGenerator:
                 self.sampler,
                 self.tokenizer.stopping_criteria,
                 compute_logprobs=self.compute_logprobs,
+                top_logprobs_k=self.top_logprobs_k,
             )
             self._prompt_time_counter += time.perf_counter() - tic
             self._generation_batch.extend(gen_batch)
@@ -1656,7 +1739,10 @@ class BatchGenerator:
             else:
                 tic = time.perf_counter()
                 gen_batch = self._prompt_batch.generate(
-                    self.sampler, self.tokenizer.stopping_criteria
+                    self.sampler,
+                    self.tokenizer.stopping_criteria,
+                    compute_logprobs=self.compute_logprobs,
+                    top_logprobs_k=self.top_logprobs_k,
                 )
                 self._prompt_time_counter += time.perf_counter() - tic
                 self._generation_batch.extend(gen_batch)
