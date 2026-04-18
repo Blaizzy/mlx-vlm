@@ -745,4 +745,13 @@ def apply_chat_template(
     if model_type in ["paligemma", "molmo", "florence2", "falcon_ocr"]:
         return messages[-1]
 
+    # Qwen3-Omni-Instruct's chat template appends an empty <think>\n\n</think>\n\n
+    # block when enable_thinking=False; the Instruct model is not trained to
+    # continue from that exact suffix and drifts into control tokens
+    # (<|endoftext|>, <|im_start|>, ...). Mirror Qwen3-VL-Instruct's behavior
+    # by dropping enable_thinking=False so the template emits the plain
+    # assistant prompt instead.
+    if model_type == "qwen3_omni_moe" and kwargs.get("enable_thinking") is False:
+        kwargs = {k: v for k, v in kwargs.items() if k != "enable_thinking"}
+
     return get_chat_template(processor, messages, add_generation_prompt, **kwargs)
