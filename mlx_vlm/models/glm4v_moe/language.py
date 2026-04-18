@@ -369,7 +369,9 @@ class GLM4VModel(nn.Module):
         position_embeddings = self.rotary_emb(h, position_ids)
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            mask = create_attention_mask(
+                h, cache[0] if cache and cache[0] is not None else cache
+            )
 
         if cache is None:
             cache = [None] * self.num_layers
