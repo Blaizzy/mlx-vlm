@@ -67,6 +67,11 @@ class Attention(nn.Module):
         qkv_out = self.qkv(x)
 
         offset = cache.offset if cache is not None else 0
+        if isinstance(offset, mx.array):
+            # BatchKVCache stores offset as a per-sequence array. Collapse to
+            # the max so arange/RoPE get a Python int; per-row positions for
+            # heterogeneous-length batches would need a larger refactor.
+            offset = int(offset.max().item()) if offset.size > 1 else int(offset.item())
         positions = mx.arange(offset, offset + L)
         tau_q, tau_v = self.tau(qkv_out, positions)
 
@@ -86,8 +91,8 @@ class Attention(nn.Module):
         values = values * tau_v
 
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
+            queries = self.rope(queries, offset=offset)
+            keys = self.rope(keys, offset=offset)
             keys, values = cache.update_and_fetch(keys, values)
         else:
             queries = self.rope(queries)
