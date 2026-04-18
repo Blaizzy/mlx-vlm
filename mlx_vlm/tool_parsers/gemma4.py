@@ -166,4 +166,7 @@ def parse_tool_call(text, tools=None):
         args_str = balanced[1:-1]
 
     arguments = _parse_object(args_str)
+    # OpenAI spec requires arguments as a JSON string, not a dict
+    if isinstance(arguments, dict):
+        arguments = json.dumps(arguments)
     return dict(name=func_name, arguments=arguments)

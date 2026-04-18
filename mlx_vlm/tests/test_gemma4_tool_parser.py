@@ -1,5 +1,6 @@
 """Tests for the Gemma 4 tool-call parser."""
 
+import json
 import unittest
 
 from mlx_vlm.tool_parsers.gemma4 import parse_tool_call
@@ -27,13 +28,15 @@ class TestGemma4ToolParser(unittest.TestCase):
         text = _wrap(f"call:get_weather{{city:{_str('Nuremberg')}}}")
         result = parse_tool_call(text)
         self.assertEqual(result["name"], "get_weather")
-        self.assertEqual(result["arguments"], {"city": "Nuremberg"})
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"city": "Nuremberg"})
 
     def test_snake_case_with_numeric_arg(self):
         text = _wrap("call:set_volume{level:42}")
         result = parse_tool_call(text)
         self.assertEqual(result["name"], "set_volume")
-        self.assertEqual(result["arguments"], {"level": 42})
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"level": 42})
 
     # ── hyphenated names (the bug this PR fixes) ──────────────────────────
 
@@ -43,13 +46,15 @@ class TestGemma4ToolParser(unittest.TestCase):
         )
         result = parse_tool_call(text)
         self.assertEqual(result["name"], "lobe-web-browsing____search")
-        self.assertEqual(result["arguments"], {"search_query": "Lustgarten Berlin"})
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"search_query": "Lustgarten Berlin"})
 
     def test_single_hyphen_name(self):
         text = _wrap(f"call:get-weather{{city:{_str('Tokyo')}}}")
         result = parse_tool_call(text)
         self.assertEqual(result["name"], "get-weather")
-        self.assertEqual(result["arguments"], {"city": "Tokyo"})
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"city": "Tokyo"})
 
     def test_hyphenated_name_with_nested_args(self):
         text = _wrap(
@@ -57,11 +62,22 @@ class TestGemma4ToolParser(unittest.TestCase):
         )
         result = parse_tool_call(text)
         self.assertEqual(result["name"], "edit-file")
-        self.assertEqual(result["arguments"]["path"], "test.txt")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args["path"], "test.txt")
         self.assertEqual(
-            result["arguments"]["edits"],
+            args["edits"],
             [{"newText": "orange", "oldText": "apple"}],
         )
+
+    # ── arguments type ────────────────────────────────────────────────────
+
+    def test_arguments_is_json_string(self):
+        """Arguments should be a JSON string per OpenAI spec."""
+        text = _wrap(f"call:get_weather{{city:{_str('Berlin')}}}")
+        result = parse_tool_call(text)
+        self.assertIsInstance(result["arguments"], str)
+        parsed = json.loads(result["arguments"])
+        self.assertEqual(parsed, {"city": "Berlin"})
 
     # ── error path ────────────────────────────────────────────────────────
 

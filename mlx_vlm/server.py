@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import gc
 import json
 import os
@@ -7,12 +8,16 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, List, Literal, Optional, Union
+from queue import Empty as QueueEmpty
+from queue import Queue
+from threading import Thread
+from typing import Any, Callable, Iterator, List, Literal, Optional, Tuple, Union
 
 import mlx.core as mx
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
@@ -20,11 +25,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
 from .generate import (
+    BatchGenerator,
     DEFAULT_MAX_TOKENS,
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
-    DEFAULT_THINKING_END_TOKEN,
-    DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
     filter_generation_config,
     generate,
@@ -33,8 +37,9 @@ from .generate import (
     stream_generate,
 )
 from .prompt_utils import apply_chat_template
+from .sample_utils import top_p_sampling
 from .tool_parsers import _infer_tool_parser, load_tool_module
-from .utils import load
+from .utils import load, prepare_inputs
 from .version import __version__
 from .vision_cache import VisionFeatureCache
 
@@ -55,7 +60,6 @@ _SERVER_GENERATION_ENV = {
     "quantized_kv_start": ("QUANTIZED_KV_START", int),
 }
 
-
 def load_server_generation_defaults() -> dict[str, Any]:
     generation = {}
     for key, (env_name, cast) in _SERVER_GENERATION_ENV.items():
@@ -66,14 +70,521 @@ def load_server_generation_defaults() -> dict[str, Any]:
     return filter_generation_config(generation)
 
 
+# =============================================================================
+# ResponseGenerator - Concurrent Request Handling with Threaded Batching
+# =============================================================================
+
+
+@dataclass
+class GenerationArguments:
+    """Arguments for a generation request."""
+
+    max_tokens: int = DEFAULT_MAX_TOKENS
+    temperature: float = DEFAULT_TEMPERATURE
+    top_p: float = DEFAULT_TOP_P
+    top_k: int = 0
+    min_p: float = 0.0
+    seed: Optional[int] = None
+    repetition_penalty: Optional[float] = None
+    logit_bias: Optional[dict] = None
+    enable_thinking: bool = True
+    thinking_budget: Optional[int] = None
+    thinking_end_token: Optional[str] = None
+    thinking_start_token: Optional[str] = None
+
+    def to_generate_kwargs(self) -> dict:
+        """Convert to kwargs dict for generate()/stream_generate()."""
+        kw = {
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "min_p": self.min_p,
+            "enable_thinking": self.enable_thinking,
+        }
+        if self.seed is not None:
+            kw["seed"] = self.seed
+        if self.repetition_penalty is not None:
+            kw["repetition_penalty"] = self.repetition_penalty
+        if self.logit_bias is not None:
+            kw["logit_bias"] = self.logit_bias
+        if self.thinking_budget is not None:
+            kw["thinking_budget"] = self.thinking_budget
+        if self.thinking_end_token is not None:
+            kw["thinking_end_token"] = self.thinking_end_token
+        if self.thinking_start_token is not None:
+            kw["thinking_start_token"] = self.thinking_start_token
+        return kw
+
+    def to_template_kwargs(self) -> dict:
+        """Convert to kwargs for apply_chat_template()."""
+        kw = {"enable_thinking": self.enable_thinking}
+        if self.thinking_budget is not None:
+            kw["thinking_budget"] = self.thinking_budget
+        if self.thinking_end_token is not None:
+            kw["thinking_end_token"] = self.thinking_end_token
+        if self.thinking_start_token is not None:
+            kw["thinking_start_token"] = self.thinking_start_token
+        return kw
+
+
+@dataclass
+class GenerationContext:
+    """Context returned when a request is queued."""
+
+    uid: int
+    prompt_tokens: int
+
+
+@dataclass
+class StreamingToken:
+    """A single token response during streaming generation."""
+
+    text: str
+    token: int
+    logprobs: float
+    finish_reason: Optional[str]
+    peak_memory: float = 0.0
+
+
+class ResponseGenerator:
+    """
+    Continuous batching for concurrent requests via a single GPU thread.
+
+    A dedicated thread owns all GPU work (BatchGenerator). FastAPI async
+    handlers submit requests to a queue and read tokens back from
+    per-request queues. Multiple requests are batched together for
+    higher throughput — same pattern as mlx-lm's server.
+    """
+
+    def __init__(self, model, processor, stop_tokens=None, vision_cache=None):
+        self.model = model
+        self.processor = processor
+        self.stop_tokens = stop_tokens or set()
+        self.vision_cache = vision_cache
+        self.tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        self.requests: Queue = Queue()
+        self._stop = False
+        self._thread = Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop_and_join(self):
+        self._stop = True
+        self.requests.put(None)
+        self._thread.join(timeout=5.0)
+
+    def generate(
+        self,
+        prompt: str,
+        images: Optional[List] = None,
+        audio: Optional[List] = None,
+        args: Optional[GenerationArguments] = None,
+    ) -> Tuple[GenerationContext, Iterator[StreamingToken]]:
+        args = args or GenerationArguments()
+        rqueue: Queue = Queue()
+
+        # CPU preprocessing (tokenize, load images) on caller thread.
+        # GPU work (vision encoder) deferred to GPU thread.
+        raw_inputs = self._cpu_preprocess(prompt, images, audio)
+        prompt_tokens = (
+            raw_inputs["input_ids"].size
+            if hasattr(raw_inputs["input_ids"], "size")
+            else len(raw_inputs["input_ids"])
+        )
+
+        self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images))
+
+        # Block until the GPU thread sends back the context
+        ctx = rqueue.get()
+        if isinstance(ctx, Exception):
+            raise ctx
+
+        def token_iterator():
+            try:
+                while True:
+                    item = rqueue.get(timeout=60.0)
+                    if item is None:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item
+            finally:
+                pass  # batch cleanup happens in _run
+
+        return ctx, token_iterator()
+
+    def _cpu_preprocess(self, prompt, images=None, audio=None) -> dict:
+        """CPU-only: tokenize text, load/resize images. Thread-safe."""
+        add_special_tokens = (
+            getattr(self.processor, "chat_template", None) is None
+            if self.model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
+            else True
+        )
+        image_token_index = getattr(self.model.config, "image_token_index", None)
+        return prepare_inputs(
+            self.processor,
+            images=images,
+            audio=audio,
+            prompts=prompt,
+            image_token_index=image_token_index,
+            add_special_tokens=add_special_tokens,
+        )
+
+    # -- internals --
+
+    def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
+        if args.temperature == 0:
+            return None
+
+        def sampler(logprobs: mx.array) -> mx.array:
+            if args.top_p > 0 and args.top_p < 1.0:
+                return top_p_sampling(logprobs, args.top_p, args.temperature)
+            else:
+                return mx.random.categorical(logprobs * (1 / args.temperature))
+
+        return sampler
+
+    def _gpu_embed(self, raw_inputs: dict, images=None) -> Tuple[mx.array, dict]:
+        """GPU-only: run vision encoder if needed. Must run on GPU thread."""
+        input_ids = raw_inputs.get("input_ids")
+        pixel_values = raw_inputs.get("pixel_values")
+        mask = raw_inputs.get("attention_mask")
+        data_kwargs = {
+            k: v
+            for k, v in raw_inputs.items()
+            if k not in ["input_ids", "pixel_values", "attention_mask"]
+        }
+        # Pass vision cache for image feature caching
+        if (
+            pixel_values is not None
+            and self.vision_cache is not None
+            and images is not None
+        ):
+            data_kwargs["vision_cache"] = self.vision_cache
+            data_kwargs["_image_key"] = images
+
+        # Always call get_input_embeddings — BatchGenerator requires inputs_embeds
+        embed = self.model.get_input_embeddings(
+            input_ids, pixel_values, mask=mask, **data_kwargs
+        )
+        # Remove cache kwargs before passing to BatchGenerator
+        data_kwargs.pop("vision_cache", None)
+        data_kwargs.pop("_image_key", None)
+        gen_kwargs = {**data_kwargs, **embed.to_dict()}
+        return input_ids, gen_kwargs
+
+    def _run(self):
+        """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
+        batch_gen = None
+        # uid -> {rqueue, tokens, gen_kwargs}
+        active: dict = {}
+
+        while not self._stop:
+            try:
+                # Collect all pending requests from the queue
+                new_items = []
+                timeout = 0.001 if active else 0.1
+                try:
+                    item = self.requests.get(timeout=timeout)
+                    if item is None:
+                        if self._stop:
+                            break
+                    else:
+                        new_items.append(item)
+                except QueueEmpty:
+                    pass
+
+                # Drain any more that arrived
+                while True:
+                    try:
+                        item = self.requests.get_nowait()
+                        if item is not None:
+                            new_items.append(item)
+                    except QueueEmpty:
+                        break
+
+                # Insert new requests into batch
+                for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
+                    if batch_gen is None:
+                        batch_gen = BatchGenerator(
+                            self.model.language_model,
+                            self.processor,
+                            stop_tokens=self.stop_tokens,
+                            sampler=self._make_sampler(args),
+                        )
+
+                    # GPU work: vision encoder only (if images present)
+                    input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
+                    has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
+
+                    # Image request: flush pending text-only first
+                    if has_embeds and batch_gen.unprocessed_prompts:
+                        self._flush(batch_gen, active)
+
+                    try:
+                        (uid,) = batch_gen.insert(
+                            [input_ids.squeeze(0).tolist()],
+                            max_tokens=args.max_tokens,
+                        )
+                    except Exception as e:
+                        rqueue.put(e)
+                        continue
+
+                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+                    active[uid] = {
+                        "rqueue": rqueue,
+                        "tokens": [],
+                        "gen_kwargs": gen_kwargs if has_embeds else None,
+                    }
+
+                    # Prefill image request immediately with its embeddings
+                    if has_embeds:
+                        self._step(batch_gen, active, gen_kwargs)
+
+                if not active or batch_gen is None:
+                    continue
+
+                # Tight generation loop — run as many steps as we can
+                # in a time budget, then check for new requests.
+                deadline = time.time() + 0.5
+                while active and time.time() < deadline:
+                    self._step(batch_gen, active)
+
+            except Exception as e:
+                print(f"Error in generation thread: {e}")
+                traceback.print_exc()
+
+    def _step(self, batch_gen, active, gen_kwargs=None):
+        """One batch generation step: prefill + decode."""
+        kwargs = gen_kwargs or {}
+        responses = batch_gen.next(**kwargs)
+        if not responses:
+            return
+
+        for r in responses:
+            if r.uid not in active:
+                continue
+
+            info = active[r.uid]
+            rqueue = info["rqueue"]
+            tokens = info["tokens"]
+
+            if r.finish_reason == "stop":
+                text = ""
+            else:
+                tokens.append(r.token)
+                if len(tokens) >= 2:
+                    prev = self.tokenizer.decode(tokens[:-1])
+                    curr = self.tokenizer.decode(tokens)
+                    text = curr[len(prev) :]
+                else:
+                    text = self.tokenizer.decode(tokens)
+
+            tok = r.token
+            if hasattr(tok, "item"):
+                tok = tok.item()
+
+            lp = 0.0
+            if r.logprobs is not None:
+                try:
+                    v = r.logprobs[tok]
+                    lp = v.item() if hasattr(v, "item") else float(v)
+                except (IndexError, TypeError, ValueError):
+                    pass
+
+            rqueue.put(
+                StreamingToken(
+                    text=text,
+                    token=tok,
+                    logprobs=lp,
+                    finish_reason=r.finish_reason,
+                    peak_memory=mx.get_peak_memory() / 1e9,
+                )
+            )
+
+            if r.finish_reason is not None:
+                rqueue.put(None)
+                del active[r.uid]
+
+    def _flush(self, batch_gen, active):
+        """Drain all pending text-only prompts before inserting an image request."""
+        while batch_gen.unprocessed_prompts:
+            self._step(batch_gen, active)
+            if not batch_gen.unprocessed_prompts:
+                break
+
+
+def process_tool_calls(model_output: str, tool_module, tools):
+    """Parse tool calls from model output using the appropriate tool parser."""
+    called_tools = []
+    remaining = model_output
+
+    if tool_module.tool_call_start in model_output:
+        if tool_module.tool_call_end == "":
+            pattern = re.compile(
+                f"{re.escape(tool_module.tool_call_start)}.*?(?:\n|$)", re.DOTALL
+            )
+        else:
+            pattern = re.compile(
+                f"{re.escape(tool_module.tool_call_start)}.*?{re.escape(tool_module.tool_call_end)}",
+                re.DOTALL,
+            )
+
+        matches = re.findall(pattern, model_output)
+        if matches:
+            remaining = re.sub(pattern, " ", model_output).strip()
+            for i, match in enumerate(matches):
+                call = (
+                    match.strip()
+                    .removeprefix(tool_module.tool_call_start)
+                    .removesuffix(tool_module.tool_call_end)
+                )
+                try:
+                    tool_call = tool_module.parse_tool_call(call, tools)
+                    args = tool_call["arguments"]
+                    called_tools.append(
+                        {
+                            "type": "function",
+                            "index": i,
+                            "id": str(uuid.uuid4()),
+                            "function": {
+                                "name": tool_call["name"].strip(),
+                                "arguments": (
+                                    args
+                                    if isinstance(args, str)
+                                    else json.dumps(args, ensure_ascii=False)
+                                ),
+                            },
+                        }
+                    )
+                except Exception:
+                    print(f"Invalid tool call: {call}")
+    return dict(calls=called_tools, remaining_text=remaining)
+
+
+def _build_gen_args(request) -> GenerationArguments:
+    """Build GenerationArguments from an OpenAIRequest or ChatRequest."""
+    max_tokens = getattr(request, "max_tokens", None) or getattr(
+        request, "max_output_tokens", DEFAULT_MAX_TOKENS
+    )
+    logit_bias = getattr(request, "logit_bias", None)
+    if logit_bias is not None and isinstance(logit_bias, dict):
+        logit_bias = {int(k): v for k, v in logit_bias.items()}
+    return GenerationArguments(
+        max_tokens=max_tokens,
+        temperature=getattr(request, "temperature", DEFAULT_TEMPERATURE),
+        top_p=getattr(request, "top_p", DEFAULT_TOP_P),
+        top_k=getattr(request, "top_k", 0),
+        min_p=getattr(request, "min_p", 0.0),
+        seed=getattr(request, "seed", None),
+        repetition_penalty=getattr(request, "repetition_penalty", None),
+        logit_bias=logit_bias,
+        enable_thinking=getattr(request, "enable_thinking", True),
+        thinking_budget=getattr(request, "thinking_budget", None),
+        thinking_end_token=getattr(request, "thinking_end_token", None),
+        thinking_start_token=getattr(request, "thinking_start_token", None),
+    )
+
+
+def _merge_generation_args(
+    args: GenerationArguments, resolved_generation: dict[str, Any]
+) -> GenerationArguments:
+    for key in (
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "repetition_penalty",
+        "logit_bias",
+    ):
+        if key in resolved_generation:
+            value = resolved_generation[key]
+            if key == "logit_bias" and isinstance(value, dict):
+                value = {int(k): v for k, v in value.items()}
+            setattr(args, key, value)
+    return args
+
+
+def _build_generation_kwargs(
+    resolved_generation: dict[str, Any],
+    args: GenerationArguments,
+    extra: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    kwargs = resolved_generation.copy()
+    kwargs.update(args.to_generate_kwargs())
+    if extra:
+        kwargs.update(extra)
+    return kwargs
+
+
+def _count_thinking_tag_tokens(text: str) -> int:
+    """Count tokens consumed by thinking tags (excluded from completion_tokens)."""
+    count = 0
+    # <|channel>thought (2 tokens) + <channel|> (1 token) + EOS (1 token)
+    if "<|channel>thought" in text and "<channel|>" in text:
+        count = 4
+    elif "<think>" in text and "</think>" in text:
+        count = 2  # <think> and </think> are 1 token each typically
+    return count
+
+
+def _split_thinking(text: str) -> Tuple[Optional[str], str]:
+    """Split thinking tags from content. Returns (reasoning, content)."""
+    # Handle <|channel>thought...<channel|> format (gemma4)
+    # Also handle partial tag: text starting with "thought\n" (continuation)
+    if "<|channel>thought" in text or (
+        "<channel|>" in text and text.lstrip().startswith("thought")
+    ):
+        parts = text.split("<channel|>", 1)
+        if len(parts) == 2:
+            reasoning = (
+                parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
+            )
+            content = parts[1].strip()
+            return reasoning or None, content
+        reasoning = parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
+        return reasoning or None, ""
+    # Handle <think>...</think> format (qwen3.5 etc)
+    # Also handle partial: output starts with thinking text + </think> (no opening tag)
+    if "<think>" in text or "</think>" in text:
+        parts = text.split("</think>", 1)
+        if len(parts) == 2:
+            reasoning = parts[0].replace("<think>", "").strip()
+            content = parts[1].strip()
+            return reasoning or None, content
+        return parts[0].replace("<think>", "").strip(), ""
+    return None, text
+
+
+# Global response generator for continuous batching
+response_generator: Optional[ResponseGenerator] = None
+
+# Loading/unloading utilities
+model_cache = {}
+
+
+def _get_preload_model() -> Optional[str]:
+    return os.environ.get("PRELOAD_MODEL") or os.environ.get("MLX_VLM_PRELOAD_MODEL")
+
+
+def _get_preload_adapter() -> Optional[str]:
+    return os.environ.get("PRELOAD_ADAPTER") or os.environ.get(
+        "MLX_VLM_PRELOAD_ADAPTER"
+    )
+
+
 @asynccontextmanager
 async def lifespan(app):
-    model_path = os.environ.get("PRELOAD_MODEL")
-    adapter_path = os.environ.get("PRELOAD_ADAPTER") or None
+    model_path = _get_preload_model()
+    adapter_path = _get_preload_adapter()
     if model_path:
         try:
-            print(f"Preloading model: {model_path}")
+            print(f"Pre-loading model: {model_path}")
             get_cached_model(model_path, adapter_path)
+            print("Model ready, continuous batching enabled.")
         except Exception as e:
             print(f"Failed to preload model: {e}")
             print("Server will continue without a preloaded model.")
@@ -98,18 +609,11 @@ app.add_middleware(
 
 MAX_IMAGES = 10  # Maximum number of images to process at once
 
-# Loading/unloading utilities
-
-model_cache = {}
-
 
 class FlexibleBaseModel(BaseModel):
     """Base model that ignores/accepts any unknown OpenAI SDK fields."""
 
     model_config = ConfigDict(extra="allow")
-
-    def dump_kwargs(self, *fields: str) -> dict[str, Any]:
-        return self.model_dump(include=set(fields), exclude_none=True)
 
 
 def resolve_request_config(
@@ -122,7 +626,7 @@ def resolve_request_config(
         request_data["max_tokens"] = request_data.pop(max_tokens_field)
 
     request_model = getattr(request, "model", None)
-    model_path = request_model or os.environ.get("PRELOAD_MODEL")
+    model_path = request_model or _get_preload_model()
     if model_path is None:
         raise HTTPException(
             status_code=400,
@@ -131,7 +635,7 @@ def resolve_request_config(
 
     adapter_path = getattr(request, "adapter_path", None)
     if request_model is None and adapter_path is None:
-        adapter_path = os.environ.get("PRELOAD_ADAPTER") or None
+        adapter_path = _get_preload_adapter()
 
     generation = {
         **load_server_generation_defaults(),
@@ -172,8 +676,9 @@ def get_cached_model(
 ):
     """
     Factory function to get or load the appropriate model resources from cache or by loading.
+    Also creates/updates the ResponseGenerator for continuous batching.
     """
-    global model_cache
+    global model_cache, response_generator
 
     trust_remote_code = (
         os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
@@ -198,6 +703,24 @@ def get_cached_model(
         trust_remote_code=trust_remote_code,
     )
 
+    # Get stop tokens from model config
+    stop_tokens = set()
+    if hasattr(config, "eos_token_id"):
+        if isinstance(config.eos_token_id, list):
+            stop_tokens.update(config.eos_token_id)
+        elif config.eos_token_id is not None:
+            stop_tokens.add(config.eos_token_id)
+
+    # Create ResponseGenerator for continuous batching
+    vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
+    vision_cache = VisionFeatureCache(max_size=vision_cache_size)
+    response_generator = ResponseGenerator(
+        model=model,
+        processor=processor,
+        stop_tokens=stop_tokens,
+        vision_cache=vision_cache,
+    )
+
     model_cache = {
         "cache_key": cache_key,
         "model_path": model_path,
@@ -206,7 +729,7 @@ def get_cached_model(
         "model": model,
         "processor": processor,
         "config": config,
-        "vision_cache": VisionFeatureCache(),
+        "vision_cache": vision_cache,
     }
 
     return model, processor, config
@@ -214,13 +737,20 @@ def get_cached_model(
 
 # Synchronous unload function for internal use
 def unload_model_sync():
-    global model_cache
+    global model_cache, response_generator
     if not model_cache:
         return False
 
     print(
         f"Unloading model: {model_cache.get('model_path')}, Adapter: {model_cache.get('adapter_path')}"
     )
+
+    # Stop the ResponseGenerator if running
+    if response_generator is not None:
+        print("Stopping ResponseGenerator...")
+        response_generator.stop_and_join()
+        response_generator = None
+
     # Clear vision cache before dropping references
     if "vision_cache" in model_cache:
         model_cache["vision_cache"].clear()
@@ -250,7 +780,7 @@ class ResponseInputImageParam(TypedDict, total=False):
     )
     """The detail level of the image to be sent to the model.
 
-    One of `high`, `low`, or `auto`.
+    One of `high`, `low`, or `auto`. Defaults to `auto`.
     """
     type: Required[
         Literal["input_image"]
@@ -285,14 +815,14 @@ class ResponseImageUrlParam(TypedDict, total=False):
     image_url: Required[ImageUrl]
 
 
+ResizeShapeInput: TypeAlias = Union[Tuple[int], Tuple[int, int]]
+
 ResponseInputContentParam: TypeAlias = Union[
     ResponseInputTextParam,
     ResponseInputImageParam,
     ResponseImageUrlParam,
     ResponseInputAudioParam,
 ]
-
-ResizeShapeInput: TypeAlias = tuple[int] | tuple[int, int]
 
 ResponseInputMessageContentListParam: TypeAlias = List[ResponseInputContentParam]
 
@@ -310,73 +840,27 @@ ResponseOutputMessageContentList: TypeAlias = List[ResponseOutputText]
 class ChatMessage(FlexibleBaseModel):
     role: Literal["user", "assistant", "system", "developer", "tool"] = Field(
         ...,
-        description="Role of the message sender (e.g., 'system', 'user', 'assistant').",
+        description="Role of the message sender.",
     )
-    content: Optional[
-        Union[
-            str,
-            ResponseInputMessageContentListParam,
-            ResponseOutputMessageContentList,
-        ]
+    content: Union[
+        str,
+        None,
+        ResponseInputMessageContentListParam,
+        ResponseOutputMessageContentList,
     ] = Field(None, description="Content of the message.")
-    tool_calls: List = []
+    reasoning: Optional[str] = Field(
+        None, description="Thinking/reasoning content (when thinking is enabled)."
+    )
+    tool_calls: Optional[List[Any]] = Field(
+        None, description="Tool calls made by the assistant."
+    )
+    tool_call_id: Optional[str] = Field(
+        None, description="ID of the tool call this message is a response to."
+    )
+    name: Optional[str] = Field(None, description="Name of the tool/function.")
 
 
-class GenerationParams(FlexibleBaseModel):
-    temperature: float = Field(
-        DEFAULT_TEMPERATURE,
-        description="Temperature for sampling.",
-    )
-    top_p: float = Field(
-        DEFAULT_TOP_P,
-        description="Top-p sampling.",
-    )
-    top_k: Optional[int] = Field(
-        None,
-        description="Top-k sampling cutoff.",
-    )
-    min_p: Optional[float] = Field(
-        None,
-        description="Min-p sampling threshold.",
-    )
-    repetition_penalty: Optional[float] = Field(
-        None, description="Penalty applied to repeated tokens."
-    )
-    logit_bias: Optional[dict[int, float]] = Field(
-        None, description="Additive logit bias keyed by token id."
-    )
-
-
-class TemplateParams(FlexibleBaseModel):
-    enable_thinking: Optional[bool] = Field(
-        None,
-        description="Enable thinking mode in the chat template.",
-    )
-    thinking_budget: Optional[int] = Field(
-        None,
-        description="Maximum number of thinking tokens before forcing the end token.",
-    )
-    thinking_start_token: Optional[str] = Field(
-        DEFAULT_THINKING_START_TOKEN,
-        description="Token that marks the start of a thinking block.",
-    )
-    thinking_end_token: Optional[str] = Field(
-        DEFAULT_THINKING_END_TOKEN,
-        description="Token that marks the end of a thinking block.",
-    )
-
-    def template_kwargs(self) -> dict[str, Any]:
-        kwargs = self.dump_kwargs(
-            "enable_thinking",
-            "thinking_budget",
-            "thinking_start_token",
-            "thinking_end_token",
-        )
-        kwargs.setdefault("enable_thinking", False)
-        return kwargs
-
-
-class OpenAIRequest(GenerationParams, TemplateParams):
+class OpenAIRequest(FlexibleBaseModel):
     """
     OpenAI-compatible request structure.
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
@@ -390,8 +874,21 @@ class OpenAIRequest(GenerationParams, TemplateParams):
         description="Hugging Face repo or local MLX model path. If omitted, uses server default model if configured.",
     )
     max_output_tokens: int = Field(
-        DEFAULT_MAX_TOKENS,
-        description="Maximum number of tokens to generate.",
+        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
+    )
+    temperature: float = Field(
+        DEFAULT_TEMPERATURE, description="Temperature for sampling."
+    )
+    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    top_k: int = Field(0, description="Top-k sampling.")
+    min_p: float = Field(0.0, description="Min-p sampling.")
+    repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
+    logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
+    enable_thinking: bool = Field(True, description="Enable thinking mode.")
+    thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
+    thinking_end_token: Optional[str] = Field(None, description="Thinking end token.")
+    thinking_start_token: Optional[str] = Field(
+        None, description="Thinking start token."
     )
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
@@ -555,7 +1052,7 @@ StreamEvent = Union[
 # Models for /chat/completion endpoint
 
 
-class VLMRequest(GenerationParams, TemplateParams):
+class VLMRequest(FlexibleBaseModel):
     model: Optional[str] = Field(
         None,
         description="Hugging Face repo or local MLX model path. If omitted, uses server default model if configured.",
@@ -564,13 +1061,26 @@ class VLMRequest(GenerationParams, TemplateParams):
         None, description="The path to the adapter weights."
     )
     max_tokens: int = Field(
-        DEFAULT_MAX_TOKENS,
-        description="Maximum number of tokens to generate.",
+        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
     )
+    temperature: float = Field(
+        DEFAULT_TEMPERATURE, description="Temperature for sampling."
+    )
+    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    top_k: int = Field(0, description="Top-k sampling.")
+    min_p: float = Field(0.0, description="Min-p sampling.")
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
+    repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
+    logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
+    enable_thinking: bool = Field(True, description="Enable thinking mode.")
+    thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
+    thinking_end_token: Optional[str] = Field(None, description="Thinking end token.")
+    thinking_start_token: Optional[str] = Field(
+        None, description="Thinking start token."
+    )
     resize_shape: Optional[ResizeShapeInput] = Field(
         None,
-        description="Resize shape for the image. Provide one integer for a square resize or two integers for (height, width).",
+        description="Resize shape for the image. Provide one integer for square or two for (height, width).",
     )
 
     @field_validator("resize_shape", mode="before")
@@ -589,18 +1099,20 @@ class GenerationRequest(VLMRequest):
     )
 
 
-class UsageStats(OpenAIUsage):
-    """
-    Inherits from OpenAIUsage and adds additional fields for usage statistics.
-    """
+class PromptTokensDetails(BaseModel):
+    cached_tokens: int = 0
 
-    prompt_tps: float = Field(..., description="Tokens per second for the prompt.")
-    generation_tps: float = Field(
-        ..., description="Tokens per second for the generation."
-    )
-    peak_memory: float = Field(
-        ..., description="Peak memory usage during the generation."
-    )
+
+class UsageStats(BaseModel):
+    """OpenAI-compatible usage statistics for chat completions."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    prompt_tokens_details: PromptTokensDetails = PromptTokensDetails()
+    prompt_tps: float = 0.0
+    generation_tps: float = 0.0
+    peak_memory: float = 0.0
 
 
 class ChatRequest(GenerationRequest):
@@ -608,14 +1120,18 @@ class ChatRequest(GenerationRequest):
 
 
 class ChatChoice(BaseModel):
-    finish_reason: str
+    index: int = 0
+    finish_reason: str = "stop"
     message: ChatMessage
 
 
 class ChatResponse(BaseModel):
-    model: str
-    choices: List[ChatChoice]
-    usage: Optional[UsageStats]
+    id: str = ""
+    object: str = "chat.completion"
+    created: int = 0
+    model: str = ""
+    choices: List[ChatChoice] = []
+    usage: Optional[UsageStats] = None
 
 
 class ChatStreamChoice(BaseModel):
@@ -625,56 +1141,12 @@ class ChatStreamChoice(BaseModel):
 
 
 class ChatStreamChunk(BaseModel):
-    id: str
+    id: str = ""
     object: str = "chat.completion.chunk"
-    created: int
-    model: str
-    choices: List[ChatStreamChoice]
-    usage: Optional[UsageStats]
-
-
-def process_tool_calls(model_output: str, tool_module, tools):
-    called_tools = []
-    remaining = model_output
-
-    if tool_module.tool_call_start in model_output:
-        if tool_module.tool_call_end == "":
-            pattern = re.compile(
-                f"{re.escape(tool_module.tool_call_start)}.*?(?:\n|$)", re.DOTALL
-            )
-
-        else:
-            pattern = re.compile(
-                f"{re.escape(tool_module.tool_call_start)}.*?{re.escape(tool_module.tool_call_end)}",
-                re.DOTALL,
-            )
-
-        matches = re.findall(pattern, model_output)
-        if matches:
-            remaining = re.sub(pattern, " ", model_output).strip()
-            tool_call_index = 0
-            for match in matches:
-                call = (
-                    match.strip()
-                    .removeprefix(tool_module.tool_call_start)
-                    .removesuffix(tool_module.tool_call_end)
-                )
-                try:
-                    tool_call = tool_module.parse_tool_call(call, tools)
-                    called_tool = {}
-                    called_tool["type"] = "function"
-                    called_tool["index"] = tool_call_index
-                    called_tool["id"] = str(uuid.uuid4())
-                    called_tool["function"] = {}
-                    called_tool["function"]["name"] = tool_call["name"].strip()
-                    called_tool["function"]["arguments"] = json.dumps(
-                        tool_call["arguments"], ensure_ascii=False
-                    )
-                    called_tools.append(called_tool)
-                    tool_call_index += 1
-                except Exception:
-                    print(f"Invalid tool call: {call}")
-    return dict(calls=called_tools, remaining_text=remaining)
+    created: int = 0
+    model: str = ""
+    choices: List[ChatStreamChoice] = []
+    usage: Optional[UsageStats] = None
 
 
 # Models for /models endpoint
@@ -696,7 +1168,7 @@ class ModelsResponse(BaseModel):
 
 @app.post("/responses")
 @app.post("/v1/responses", include_in_schema=False)
-async def responses_endpoint(openai_request: OpenAIRequest):
+async def responses_endpoint(request: Request):
     """
     OpenAI-compatible endpoint for generating text based on a prompt and optional images.
 
@@ -751,6 +1223,9 @@ async def responses_endpoint(openai_request: OpenAIRequest):
 
     """
 
+    body = await request.json()
+    openai_request = OpenAIRequest(**body)
+
     try:
         model_path, adapter_path, resolved_generation = resolve_request_config(
             openai_request,
@@ -758,6 +1233,8 @@ async def responses_endpoint(openai_request: OpenAIRequest):
         )
 
         model, processor, config = get_cached_model(model_path, adapter_path)
+
+        kwargs = {}
 
         chat_messages = []
         images = []
@@ -770,9 +1247,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                 # If input is a list, treat it as a series of chat messages
                 for message in openai_request.input:
                     if isinstance(message, ChatMessage):
-                        if message.content is None:
-                            chat_messages.append({"role": message.role, "content": ""})
-                        elif isinstance(message.content, str):
+                        if isinstance(message.content, str):
                             chat_messages.append(
                                 {"role": message.role, "content": message.content}
                             )
@@ -828,15 +1303,18 @@ async def responses_endpoint(openai_request: OpenAIRequest):
             print("no input")
             raise HTTPException(status_code=400, detail="Missing input.")
 
-        template_kwargs = openai_request.template_kwargs()
+        gen_args = _merge_generation_args(
+            _build_gen_args(openai_request), resolved_generation
+        )
+        generation_kwargs = _build_generation_kwargs(resolved_generation, gen_args)
+
         formatted_prompt = apply_chat_template(
             processor,
             config,
             chat_messages,
             num_images=len(images),
-            **template_kwargs,
+            **gen_args.to_template_kwargs(),
         )
-        generation_kwargs = {**resolved_generation, **template_kwargs}
 
         generated_at = datetime.now().timestamp()
         response_id = f"resp_{uuid.uuid4().hex}"
@@ -846,6 +1324,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
             # Streaming response
             async def stream_generator():
                 token_iterator = None
+                token_iter = None  # For ResponseGenerator cleanup
                 try:
                     # Create base response object (to match the openai pipeline)
                     base_response = OpenAIResponse(
@@ -889,38 +1368,66 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     )
                     yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=0, content_index=0, part=content_part).model_dump_json()}\n\n"
 
-                    # Stream text deltas
-                    token_iterator = stream_generate(
-                        model=model,
-                        processor=processor,
-                        prompt=formatted_prompt,
-                        image=images,
-                        vision_cache=model_cache.get("vision_cache"),
-                        **generation_kwargs,
-                    )
-
+                    # Stream text deltas using ResponseGenerator (continuous batching)
                     full_text = ""
-                    for chunk in token_iterator:
-                        if chunk is None or not hasattr(chunk, "text"):
-                            continue
+                    usage_stats = {"input_tokens": 0, "output_tokens": 0}
 
-                        delta = chunk.text
-                        full_text += delta
+                    if response_generator is not None:
+                        ctx, token_iter = response_generator.generate(
+                            prompt=formatted_prompt,
+                            images=images if images else None,
+                            args=gen_args,
+                        )
 
-                        usage_stats = {
-                            "input_tokens": chunk.prompt_tokens,
-                            "output_tokens": chunk.generation_tokens,
-                        }
+                        output_tokens = 0
+                        for token in token_iter:
+                            output_tokens += 1
+                            delta = token.text
+                            full_text += delta
+                            usage_stats = {
+                                "input_tokens": ctx.prompt_tokens,
+                                "output_tokens": output_tokens,
+                            }
 
-                        # Send response.output_text.delta event
-                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                            await asyncio.sleep(0.01)
+
+                            if token.finish_reason:
+                                break
+                    else:
+                        # Fallback to stream_generate
+                        token_iterator = stream_generate(
+                            model=model,
+                            processor=processor,
+                            prompt=formatted_prompt,
+                            image=images,
+                            vision_cache=model_cache.get("vision_cache"),
+                            **generation_kwargs,
+                        )
+
+                        for chunk in token_iterator:
+                            if chunk is None or not hasattr(chunk, "text"):
+                                continue
+
+                            delta = chunk.text
+                            full_text += delta
+                            usage_stats = {
+                                "input_tokens": chunk.prompt_tokens,
+                                "output_tokens": chunk.generation_tokens,
+                            }
+
+                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                            await asyncio.sleep(0.01)
+
+                    # Split thinking from content for final events
+                    _, clean_text = _split_thinking(full_text)
 
                     # Send response.output_text.done event (to match the openai pipeline)
-                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=full_text).model_dump_json()}\n\n"
+                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text).model_dump_json()}\n\n"
 
                     # Send response.content_part.done event (to match the openai pipeline)
                     final_content_part = ContentPartOutputText(
-                        type="output_text", text=full_text, annotations=[]
+                        type="output_text", text=clean_text, annotations=[]
                     )
                     yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=0, content_index=0, part=final_content_part).model_dump_json()}\n\n"
 
@@ -956,6 +1463,11 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     yield f"data: {error_data}\n\n"
 
                 finally:
+                    if token_iter is not None:
+                        try:
+                            token_iter.close()
+                        except Exception:
+                            pass
                     mx.clear_cache()
                     gc.collect()
                     print("Stream finished, cleared cache.")
@@ -973,19 +1485,45 @@ async def responses_endpoint(openai_request: OpenAIRequest):
         else:
             # Non-streaming response
             try:
-                # Use generate from generate.py
-                result = generate(
-                    model=model,
-                    processor=processor,
-                    prompt=formatted_prompt,
-                    image=images,
-                    verbose=False,  # stats are passed in the response
-                    **generation_kwargs,
-                )
-                # Clean up resources
+                full_text = ""
+                prompt_tokens = 0
+                output_tokens = 0
+
+                if response_generator is not None:
+                    ctx, token_iter = response_generator.generate(
+                        prompt=formatted_prompt,
+                        images=images if images else None,
+                        args=gen_args,
+                    )
+                    prompt_tokens = ctx.prompt_tokens
+                    for token in token_iter:
+                        full_text += token.text
+                        output_tokens += 1
+                        if token.finish_reason:
+                            break
+                    try:
+                        token_iter.close()
+                    except Exception:
+                        pass
+                else:
+                    result = generate(
+                        model=model,
+                        processor=processor,
+                        prompt=formatted_prompt,
+                        image=images,
+                        verbose=False,
+                        vision_cache=model_cache.get("vision_cache"),
+                        **gen_args.to_generate_kwargs(),
+                        **kwargs,
+                    )
+                    full_text = result.text
+                    prompt_tokens = result.prompt_tokens
+                    output_tokens = result.generation_tokens
+
                 mx.clear_cache()
                 gc.collect()
-                print("Generation finished, cleared cache.")
+
+                reasoning, content = _split_thinking(full_text)
 
                 response = OpenAIResponse(
                     id=response_id,
@@ -1001,18 +1539,19 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                             "content": [
                                 {
                                     "type": "output_text",
-                                    "text": result.text,
+                                    "text": content,
                                 }
                             ],
+                            "reasoning": reasoning,
                         }
                     ],
-                    output_text=result.text,
+                    output_text=content,
                     temperature=resolved_generation["temperature"],
                     top_p=resolved_generation["top_p"],
                     usage={
-                        "input_tokens": result.prompt_tokens,
-                        "output_tokens": result.generation_tokens,
-                        "total_tokens": result.total_tokens,
+                        "input_tokens": prompt_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": prompt_tokens + output_tokens,
                     },
                 )
                 return response
@@ -1025,10 +1564,8 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
     except HTTPException as http_exc:
-        # Re-raise HTTP exceptions (like model loading failure)
         raise http_exc
     except Exception as e:
-        # Catch unexpected errors
         print(f"Unexpected error in /responses endpoint: {e}")
         traceback.print_exc()
         mx.clear_cache()
@@ -1038,9 +1575,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
         )
 
 
-@app.post(
-    "/chat/completions", response_model=None
-)  # Response model handled dynamically based on stream flag
+@app.post("/chat/completions", response_model=None)
 @app.post("/v1/chat/completions", response_model=None, include_in_schema=False)
 async def chat_completions_endpoint(request: ChatRequest):
     """
@@ -1054,47 +1589,89 @@ async def chat_completions_endpoint(request: ChatRequest):
         model_path, adapter_path, resolved_generation = resolve_request_config(request)
         model, processor, config = get_cached_model(model_path, adapter_path)
 
+        kwargs = {}
+
+        if request.resize_shape is not None:
+            if len(request.resize_shape) not in [1, 2]:
+                raise HTTPException(
+                    status_code=400,
+                    detail="resize_shape must contain exactly two integers (height, width)",
+                )
+            kwargs["resize_shape"] = (
+                (request.resize_shape[0],) * 2
+                if len(request.resize_shape) == 1
+                else tuple(request.resize_shape)
+            )
+
         images = []
         audio = []
         processed_messages = []
         for message in request.messages:
-            if message.content is None:
-                processed_messages.append({"role": message.role, "content": ""})
-            elif isinstance(message.content, str):
-                processed_messages.append(
-                    {"role": message.role, "content": message.content}
-                )
+            msg = {"role": message.role}
+
+            if isinstance(message.content, str):
+                msg["content"] = message.content
             elif isinstance(message.content, list):
                 text_content = ""
                 for item in message.content:
                     if isinstance(item, dict):
-                        # Only extract images/audio from user messages
                         if message.role == "user":
                             if item["type"] == "input_image":
-                                images = [item["image_url"]]
+                                images.append(item["image_url"])
                             elif item["type"] == "image_url":
-                                images = [item["image_url"]["url"]]
+                                images.append(item["image_url"]["url"])
                             elif item["type"] == "input_audio":
                                 audio.append(item["input_audio"]["data"])
                         if item["type"] in ("text", "input_text"):
                             text_content = item.get("text", "")
-                processed_messages.append(
-                    {"role": message.role, "content": text_content}
-                )
+                msg["content"] = text_content
+            else:
+                msg["content"] = message.content
 
-        tools = None
-        if hasattr(request, "tools"):
-            tools = request.tools
+            # Preserve tool-calling metadata.
+            # Ensure arguments are dicts (not JSON strings) for Jinja templates
+            # that iterate them with |items (e.g. Qwen3.5).
+            if message.tool_calls is not None:
+                normalized_calls = []
+                for tc in message.tool_calls:
+                    tc = dict(tc) if isinstance(tc, dict) else tc
+                    if isinstance(tc, dict) and "function" in tc:
+                        fn = dict(tc["function"])
+                        args = fn.get("arguments", {})
+                        if isinstance(args, str):
+                            try:
+                                fn["arguments"] = json.loads(args)
+                            except (json.JSONDecodeError, TypeError):
+                                fn["arguments"] = {}
+                        tc["function"] = fn
+                    normalized_calls.append(tc)
+                msg["tool_calls"] = normalized_calls
+            if message.tool_call_id is not None:
+                msg["tool_call_id"] = message.tool_call_id
+            if message.name is not None:
+                msg["name"] = message.name
 
+            processed_messages.append(msg)
+
+        # Detect tool parser from chat template
+        tools = getattr(request, "tools", None)
         tool_parser_type = None
+        tool_module = None
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
-        if hasattr(tokenizer, "chat_template"):
+        if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
             tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
             if tool_parser_type is not None:
                 tool_module = load_tool_module(tool_parser_type)
-        template_kwargs = request.template_kwargs()
+
+        gen_args = _merge_generation_args(_build_gen_args(request), resolved_generation)
+        generation_kwargs = _build_generation_kwargs(
+            resolved_generation,
+            gen_args,
+            extra=kwargs,
+        )
+
         formatted_prompt = apply_chat_template(
             processor,
             config,
@@ -1102,92 +1679,165 @@ async def chat_completions_endpoint(request: ChatRequest):
             num_images=len(images),
             num_audios=len(audio),
             tools=tools,
-            **template_kwargs,
+            **gen_args.to_template_kwargs(),
         )
-        generation_kwargs = {**resolved_generation, **template_kwargs}
 
         if request.stream:
-            # Streaming response
+            # Streaming response using ResponseGenerator for continuous batching
             async def stream_generator():
+                global response_generator
                 token_iterator = None
+                token_iter = None  # For ResponseGenerator cleanup
                 try:
-                    # Use stream_generate from utils
-                    token_iterator = stream_generate(
-                        model=model,
-                        processor=processor,
-                        prompt=formatted_prompt,
-                        image=images,
-                        audio=audio,
-                        vision_cache=model_cache.get("vision_cache"),
-                        **generation_kwargs,
-                    )
+                    # Use ResponseGenerator if available, otherwise fall back to stream_generate
+                    if response_generator is not None:
+                        # generate() does blocking Queue.get — run off event loop
+                        ctx, token_iter = await asyncio.to_thread(
+                            response_generator.generate,
+                            formatted_prompt,
+                            images if images else None,
+                            audio if audio else None,
+                            gen_args,
+                        )
 
-                    output_text = ""
-                    request_id = f"chatcmpl-{uuid.uuid4()}"
-                    for chunk in token_iterator:
-                        if chunk is None or not hasattr(chunk, "text"):
-                            print("Warning: Received unexpected chunk format:", chunk)
-                            continue
+                        output_tokens = 0
+                        request_id = f"chatcmpl-{uuid.uuid4()}"
+                        # Track thinking state for reasoning/content split
+                        in_thinking = False
+                        accumulated = ""
+                        full_output = ""  # raw output for tool call parsing
 
-                        output_text += chunk.text
+                        def _next_token():
+                            try:
+                                return next(token_iter)
+                            except StopIteration:
+                                return None
 
-                        # Yield chunks in Server-Sent Events (SSE) format
-                        usage_stats = {
-                            "input_tokens": chunk.prompt_tokens,
-                            "output_tokens": chunk.generation_tokens,
-                            "total_tokens": chunk.prompt_tokens
-                            + chunk.generation_tokens,
-                            "prompt_tps": chunk.prompt_tps,
-                            "generation_tps": chunk.generation_tps,
-                            "peak_memory": chunk.peak_memory,
-                        }
+                        while True:
+                            token = await asyncio.to_thread(_next_token)
+                            if token is None:
+                                break
+                            output_tokens += 1
+                            accumulated += token.text
+                            full_output += token.text
 
-                        choices = [
-                            ChatStreamChoice(
-                                delta=ChatMessage(role="assistant", content=chunk.text)
+                            # Detect thinking boundaries
+                            delta_reasoning = None
+                            delta_content = None
+
+                            if not in_thinking and (
+                                "<|channel>thought" in accumulated
+                                or "<think>" in accumulated
+                            ):
+                                in_thinking = True
+                                accumulated = ""
+                                # Don't emit opening tag tokens
+                            elif in_thinking and (
+                                "<channel|>" in accumulated or "</think>" in accumulated
+                            ):
+                                in_thinking = False
+                                accumulated = ""
+                                # Don't emit closing tag tokens
+                            elif in_thinking:
+                                delta_reasoning = token.text
+                            elif not in_thinking and (
+                                "<|channel>" in accumulated or "<think" in accumulated
+                            ):
+                                pass  # Partial tag, don't emit yet
+                            else:
+                                delta_content = token.text
+
+                            choices = [
+                                ChatStreamChoice(
+                                    finish_reason=token.finish_reason,
+                                    delta=ChatMessage(
+                                        role="assistant",
+                                        content=delta_content,
+                                        reasoning=delta_reasoning,
+                                    ),
+                                )
+                            ]
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=model_path,
+                                usage={
+                                    "prompt_tokens": ctx.prompt_tokens,
+                                    "completion_tokens": output_tokens,
+                                    "total_tokens": ctx.prompt_tokens + output_tokens,
+                                },
+                                choices=choices,
                             )
-                        ]
-                        chunk_data = ChatStreamChunk(
-                            id=request_id,
-                            created=int(time.time()),
-                            model=model_path,
-                            usage=usage_stats,
-                            choices=choices,
-                        )
 
-                        yield f"data: {chunk_data.model_dump_json()}\n\n"
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
 
-                    if tool_parser_type is not None:
-                        tool_calls = process_tool_calls(
-                            model_output=output_text,
-                            tool_module=tool_module,
-                            tools=tools,
-                        )
+                            if token.finish_reason:
+                                break
+
+                        # Parse tool calls from full output and emit final chunk
+                        if tool_module is not None:
+                            tc = process_tool_calls(full_output, tool_module, tools)
+                            if tc["calls"]:
+                                choices = [
+                                    ChatStreamChoice(
+                                        finish_reason="tool_calls",
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            tool_calls=tc["calls"],
+                                        ),
+                                    )
+                                ]
+                                chunk_data = ChatStreamChunk(
+                                    id=request_id,
+                                    created=int(time.time()),
+                                    model=model_path,
+                                    choices=choices,
+                                )
+                                yield f"data: {chunk_data.model_dump_json()}\n\n"
                     else:
-                        tool_calls = {}
-                        tool_calls["calls"] = []
+                        # Fallback to stream_generate
+                        token_iterator = stream_generate(
+                            model=model,
+                            processor=processor,
+                            prompt=formatted_prompt,
+                            image=images,
+                            audio=audio,
+                            vision_cache=model_cache.get("vision_cache"),
+                            **generation_kwargs,
+                        )
+
+                        request_id = f"chatcmpl-{uuid.uuid4()}"
+                        output_text = ""
+                        for chunk in token_iterator:
+                            if chunk is None or not hasattr(chunk, "text"):
+                                continue
+
+                            output_text += chunk.text
+
+                            choices = [
+                                ChatStreamChoice(
+                                    delta=ChatMessage(
+                                        role="assistant", content=chunk.text
+                                    )
+                                )
+                            ]
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=model_path,
+                                usage={
+                                    "prompt_tokens": chunk.prompt_tokens,
+                                    "completion_tokens": chunk.generation_tokens,
+                                    "total_tokens": chunk.prompt_tokens
+                                    + chunk.generation_tokens,
+                                },
+                                choices=choices,
+                            )
+
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+                            await asyncio.sleep(0.01)
 
                     # Signal stream end
-                    choices = [
-                        ChatStreamChoice(
-                            finish_reason="stop",
-                            delta=ChatMessage(
-                                role="assistant",
-                                content="",
-                                tool_calls=tool_calls["calls"],
-                            ),
-                        )
-                    ]
-
-                    chunk_data = ChatStreamChunk(
-                        id=request_id,
-                        created=int(time.time()),
-                        model=model_path,
-                        usage=usage_stats,
-                        choices=choices,
-                    )
-                    yield f"data: {chunk_data.model_dump_json()}\n\n"
-
                     yield "data: [DONE]\n\n"
 
                 except Exception as e:
@@ -1197,6 +1847,12 @@ async def chat_completions_endpoint(request: ChatRequest):
                     yield f"data: {error_data}\n\n"
 
                 finally:
+                    # Close the token iterator to trigger cleanup (important for ResponseGenerator)
+                    if token_iter is not None:
+                        try:
+                            token_iter.close()
+                        except Exception:
+                            pass
                     mx.clear_cache()
                     gc.collect()
                     print("Stream finished, cleared cache.")
@@ -1214,55 +1870,109 @@ async def chat_completions_endpoint(request: ChatRequest):
         else:
             # Non-streaming response
             try:
-                # Use generate from generate.py
-                gen_result = generate(
-                    model=model,
-                    processor=processor,
-                    prompt=formatted_prompt,
-                    image=images,
-                    audio=audio,
-                    verbose=False,  # Keep API output clean
-                    vision_cache=model_cache.get("vision_cache"),
-                    **generation_kwargs,
-                )
-                # Clean up resources
+                full_text = ""
+                prompt_tokens = 0
+                output_tokens = 0
+                peak_memory = 0.0
+
+                if response_generator is not None:
+
+                    def _blocking_generate():
+                        text = ""
+                        pt = gt = 0
+                        pm = 0.0
+                        ctx, token_iter = response_generator.generate(
+                            prompt=formatted_prompt,
+                            images=images if images else None,
+                            audio=audio if audio else None,
+                            args=gen_args,
+                        )
+                        pt = ctx.prompt_tokens
+                        for token in token_iter:
+                            text += token.text
+                            gt += 1
+                            pm = token.peak_memory
+                            if token.finish_reason:
+                                break
+                        try:
+                            token_iter.close()
+                        except Exception:
+                            pass
+                        return text, pt, gt, pm
+
+                    full_text, prompt_tokens, output_tokens, peak_memory = (
+                        await asyncio.to_thread(_blocking_generate)
+                    )
+                else:
+                    gen_result = generate(
+                        model=model,
+                        processor=processor,
+                        prompt=formatted_prompt,
+                        image=images,
+                        audio=audio,
+                        verbose=False,
+                        vision_cache=model_cache.get("vision_cache"),
+                        **gen_args.to_generate_kwargs(),
+                        **kwargs,
+                    )
+                    full_text = gen_result.text
+                    prompt_tokens = gen_result.prompt_tokens
+                    output_tokens = gen_result.generation_tokens
+                    peak_memory = gen_result.peak_memory
+
                 mx.clear_cache()
                 gc.collect()
-                print("Generation finished, cleared cache.")
 
-                usage_stats = UsageStats(
-                    input_tokens=gen_result.prompt_tokens,
-                    output_tokens=gen_result.generation_tokens,
-                    total_tokens=gen_result.total_tokens,
-                    prompt_tps=gen_result.prompt_tps,
-                    generation_tps=gen_result.generation_tps,
-                    peak_memory=gen_result.peak_memory,
+                reasoning, content = _split_thinking(full_text)
+
+                # Count raw generated tokens minus thinking tag tokens
+                completion_tokens = output_tokens - _count_thinking_tag_tokens(
+                    full_text
                 )
 
-                if tool_parser_type is not None:
-                    tool_calls = process_tool_calls(
-                        model_output=gen_result.text,
+                usage_stats = UsageStats(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                    peak_memory=peak_memory,
+                )
+
+                # Parse tool calls from generated output
+                parsed_tool_calls = None
+                if tool_module is not None:
+                    tc = process_tool_calls(
+                        model_output=full_text,
                         tool_module=tool_module,
                         tools=tools,
                     )
-                else:
-                    tool_calls = {}
-                    tool_calls["calls"] = []
-                    tool_calls["remaining_text"] = gen_result.text
+                    if tc["calls"]:
+                        parsed_tool_calls = tc["calls"]
+                        # Clean thinking tags and control tokens from remaining text
+                        _, clean_remaining = _split_thinking(tc["remaining_text"] or "")
+                        if clean_remaining:
+                            # Strip model control tokens
+                            clean_remaining = re.sub(
+                                r"<\|[^>]+\|>|<[^>]+>", "", clean_remaining
+                            ).strip()
+                        content = clean_remaining or None
 
                 choices = [
                     ChatChoice(
-                        finish_reason="stop",
+                        finish_reason="tool_calls" if parsed_tool_calls else "stop",
                         message=ChatMessage(
                             role="assistant",
-                            content=tool_calls["remaining_text"],
-                            tool_calls=tool_calls["calls"],
+                            content=content if content else None,
+                            reasoning=reasoning,
+                            tool_calls=parsed_tool_calls,
                         ),
                     )
                 ]
-
                 result = ChatResponse(
-                    model=model_path, usage=usage_stats, choices=choices
+                    id=f"chatcmpl-{uuid.uuid4()}",
+                    created=int(time.time()),
+                    model=model_path,
+                    usage=usage_stats,
+                    choices=choices,
                 )
 
                 return result
@@ -1332,6 +2042,7 @@ async def health_check():
         "status": "healthy",
         "loaded_model": model_cache.get("model_path", None),
         "loaded_adapter": model_cache.get("adapter_path", None),
+        "continuous_batching_enabled": response_generator is not None,
     }
 
 
@@ -1350,7 +2061,7 @@ async def unload_model_endpoint():
 
     return {
         "status": "success",
-        "message": "Model unloaded successfully",
+        "message": f"Model unloaded successfully",
         "unloaded": unloaded_info,
     }
 
@@ -1360,7 +2071,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        help="Optional path to the MLX model weights, tokenizer, and config",
+        help="Optional path to the MLX model weights, tokenizer, and config.",
     )
     parser.add_argument(
         "--adapter-path",
@@ -1424,6 +2135,12 @@ def main():
         help="Server default for repetition penalty.",
     )
     parser.add_argument(
+        "--vision-cache-size",
+        type=int,
+        default=20,
+        help="Max number of cached vision features (default: 20).",
+    )
+    parser.add_argument(
         "--prefill-step-size",
         type=int,
         default=None,
@@ -1468,21 +2185,24 @@ def main():
         action="store_true",
         default=False,
         help="Enable auto-reload on file changes (development only). "
-        "WARNING: watches the entire working directory — can cause excessive memory "
-        "usage with large models in repos with frequent file changes.",
+        "WARNING: watches the entire working directory and can increase memory "
+        "usage with large models in active repos.",
     )
     args = parser.parse_args()
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
     if args.model:
         os.environ["PRELOAD_MODEL"] = args.model
-    if args.adapter_path:
+        os.environ["PRELOAD_ADAPTER"] = args.adapter_path
+        os.environ["MLX_VLM_PRELOAD_MODEL"] = args.model
+        os.environ["MLX_VLM_PRELOAD_ADAPTER"] = args.adapter_path or ""
+    elif args.adapter_path:
         os.environ["PRELOAD_ADAPTER"] = args.adapter_path
     for key, (env_name, _) in _SERVER_GENERATION_ENV.items():
         value = getattr(args, key, None)
         if value is not None:
             os.environ[env_name] = str(value)
-
+    os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     uvicorn.run(
         "mlx_vlm.server:app",
         host=args.host,
