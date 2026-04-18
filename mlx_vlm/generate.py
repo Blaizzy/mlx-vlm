@@ -1091,8 +1091,6 @@ class GenerationBatch:
         max_tokens: List[int],
     ):
         self.model = model
-        # Skip VLM wrapper overhead (image/audio masking, per_layer_inputs)
-        # by calling language_model directly during generation.
         self._language_model = getattr(model, "language_model", model)
         self.uids = uids
         self.prompt_cache = prompt_cache
@@ -1102,22 +1100,12 @@ class GenerationBatch:
         self._num_tokens = [0] * len(uids)
         self.compute_logprobs = True
 
-        # Double-buffered pipeline: _next is the pending async computation,
-        # _current is the previous step's result being consumed. On
-        # construction _next holds the first token already sampled by
-        # prefill, so the first next() call emits it.
         self._current_tokens = None
         self._current_lps = None
         self._next_tokens = inputs
         self._next_lps = None
 
-        # Per-sequence MRoPE delta for models that compute it at prefill
-        # (Qwen2-VL / Qwen2.5-VL / Qwen3-VL / Qwen3.5). Captured by
-        # PromptProcessingBatch.generate on transition, concatenated by
-        # extend, sliced by filter, and passed into the language model as
-        # an explicit kwarg on every decode step. Avoids aliasing the
-        # single-slot _rope_deltas attribute when sequences with different
-        # deltas share a batch.
+        # Per-sequence MRoPE delta
         self._rope_deltas = None
 
     def __len__(self):
