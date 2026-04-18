@@ -180,8 +180,18 @@ class Phi4SigLipProcessor:
 
         from transformers import AutoTokenizer
 
+        # Phi-4 vision checkpoints ship an auto_map that points AutoConfig at
+        # a custom modeling_phi4_visionr.py. AutoTokenizer resolves its class
+        # via AutoConfig, which imports that file at class-definition time --
+        # and it depends on transformers internals (e.g.
+        # filter_out_non_signature_kwargs) that drift across releases. Our
+        # Phi4SigLipProcessor is self-contained, so skip the remote code path
+        # and load the plain tokenizer artifacts directly.
+        tokenizer_kwargs = {k: v for k, v in kwargs.items() if k != "trust_remote_code"}
         tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path, **kwargs
+            pretrained_model_name_or_path,
+            trust_remote_code=False,
+            **tokenizer_kwargs,
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
