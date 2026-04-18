@@ -284,6 +284,142 @@ class TestProcessToolCalls:
         assert result["remaining_text"] == "Just text."
 
 
+class TestStreamStateRouting:
+    """Tests for the streaming state machine that routes tokens between
+    ``delta.content`` / ``delta.reasoning`` / tool-call buffering.
+
+    These tests mirror the inline token-routing logic inside
+    ``stream_generator()`` in ``server.py``.  They verify the *contract*
+    that logic is supposed to uphold: thinking and tool-call markers
+    never leak into ``delta.content``.  If the streaming loop is
+    refactored, update the helper below to keep the tests in sync.
+    """
+
+    def _route_tokens(self, tokens, tc_start=None, tc_end=None):
+        """Simulate the stream_generator state machine for a token list.
+
+        Returns dict with ``content`` (joined delta.content),
+        ``reasoning`` (joined delta.reasoning), and ``full_output``
+        (raw concatenation used by process_tool_calls()).
+        """
+        in_thinking = False
+        in_tool = False
+        accumulated = ""
+        full_output = ""
+        content_parts = []
+        reasoning_parts = []
+
+        for text in tokens:
+            accumulated += text
+            full_output += text
+
+            delta_reasoning = None
+            delta_content = None
+
+            if (
+                not in_thinking
+                and not in_tool
+                and ("<|channel>thought" in accumulated or "<think>" in accumulated)
+            ):
+                in_thinking = True
+                accumulated = ""
+            elif in_thinking and (
+                "<channel|>" in accumulated or "</think>" in accumulated
+            ):
+                in_thinking = False
+                accumulated = ""
+            elif (
+                not in_thinking and not in_tool and tc_start and tc_start in accumulated
+            ):
+                in_tool = True
+                accumulated = ""
+            elif in_tool and tc_end and tc_end in accumulated:
+                in_tool = False
+                accumulated = ""
+            elif in_thinking:
+                delta_reasoning = text
+            elif in_tool:
+                pass
+            elif (
+                not in_thinking
+                and not in_tool
+                and ("<|channel>" in accumulated or "<think" in accumulated)
+            ):
+                pass
+            else:
+                delta_content = text
+
+            if delta_reasoning is not None:
+                reasoning_parts.append(delta_reasoning)
+            if delta_content is not None:
+                content_parts.append(delta_content)
+
+        return {
+            "content": "".join(content_parts),
+            "reasoning": "".join(reasoning_parts),
+            "full_output": full_output,
+        }
+
+    def test_tool_call_markers_stripped_from_content(self):
+        tokens = [
+            "Hello ",
+            "<|tool_call>",
+            'call:get_weather{location:<|"|>Nuremberg<|"|>}',
+            "<tool_call|>",
+            " done",
+        ]
+        result = self._route_tokens(
+            tokens, tc_start="<|tool_call>", tc_end="<tool_call|>"
+        )
+        # Neither start nor end marker should leak into delta.content
+        assert "<|tool_call>" not in result["content"]
+        assert "<tool_call|>" not in result["content"]
+        # Tool body is also not streamed — it is parsed from full_output
+        assert "call:get_weather" not in result["content"]
+        # Normal text before/after the tool call is preserved
+        assert result["content"] == "Hello  done"
+        # full_output retains the complete sequence for process_tool_calls()
+        assert "<|tool_call>" in result["full_output"]
+
+    def test_thinking_still_works_with_tool_parser_active(self):
+        tokens = [
+            "<|channel>thought\n",
+            "reasoning text",
+            "<channel|>",
+            "answer",
+        ]
+        result = self._route_tokens(
+            tokens, tc_start="<|tool_call>", tc_end="<tool_call|>"
+        )
+        assert result["reasoning"] == "reasoning text"
+        assert result["content"] == "answer"
+
+    def test_thinking_then_tool_call_gemma4_pattern(self):
+        # Gemma 4 commonly emits <|channel>thought ... <channel|><|tool_call>...
+        tokens = [
+            "<|channel>thought\n",
+            "reason about weather",
+            "<channel|>",
+            "<|tool_call>",
+            "call:get_weather{}",
+            "<tool_call|>",
+        ]
+        result = self._route_tokens(
+            tokens, tc_start="<|tool_call>", tc_end="<tool_call|>"
+        )
+        assert result["reasoning"] == "reason about weather"
+        # No tool markup leaks, no content emitted for this turn
+        assert result["content"] == ""
+        assert "<|tool_call>" not in result["content"]
+
+    def test_content_passes_through_without_tool_parser(self):
+        # If the model has no tool parser, the new branch is inert and
+        # existing behaviour is preserved.
+        tokens = ["Hello ", "world"]
+        result = self._route_tokens(tokens)
+        assert result["content"] == "Hello world"
+
+
 class TestCountThinkingTagTokens:
     """Tests for thinking tag token counting."""
 

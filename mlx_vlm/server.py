@@ -1607,10 +1607,26 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        # Track thinking state for reasoning/content split
+                        # Track thinking / tool-call state for content routing
                         in_thinking = False
+                        in_tool = False
                         accumulated = ""
                         full_output = ""  # raw output for tool call parsing
+
+                        # Marker strings for the active tool parser (if any).
+                        # Tokens emitted while in_tool is True are absorbed
+                        # into full_output for process_tool_calls() to parse,
+                        # and never streamed as delta.content.
+                        tc_start = (
+                            tool_module.tool_call_start
+                            if tool_module is not None
+                            else None
+                        )
+                        tc_end = (
+                            tool_module.tool_call_end
+                            if tool_module is not None
+                            else None
+                        )
 
                         def _next_token():
                             try:
@@ -1626,13 +1642,17 @@ async def chat_completions_endpoint(request: ChatRequest):
                             accumulated += token.text
                             full_output += token.text
 
-                            # Detect thinking boundaries
+                            # Detect thinking / tool-call boundaries
                             delta_reasoning = None
                             delta_content = None
 
-                            if not in_thinking and (
-                                "<|channel>thought" in accumulated
-                                or "<think>" in accumulated
+                            if (
+                                not in_thinking
+                                and not in_tool
+                                and (
+                                    "<|channel>thought" in accumulated
+                                    or "<think>" in accumulated
+                                )
                             ):
                                 in_thinking = True
                                 accumulated = ""
@@ -1643,10 +1663,30 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 in_thinking = False
                                 accumulated = ""
                                 # Don't emit closing tag tokens
+                            elif (
+                                not in_thinking
+                                and not in_tool
+                                and tc_start
+                                and tc_start in accumulated
+                            ):
+                                in_tool = True
+                                accumulated = ""
+                                # Don't emit tool-call opening tokens
+                            elif in_tool and tc_end and tc_end in accumulated:
+                                in_tool = False
+                                accumulated = ""
+                                # Don't emit tool-call closing tokens
                             elif in_thinking:
                                 delta_reasoning = token.text
-                            elif not in_thinking and (
-                                "<|channel>" in accumulated or "<think" in accumulated
+                            elif in_tool:
+                                pass  # Suppress: tool tokens are parsed from full_output
+                            elif (
+                                not in_thinking
+                                and not in_tool
+                                and (
+                                    "<|channel>" in accumulated
+                                    or "<think" in accumulated
+                                )
                             ):
                                 pass  # Partial tag, don't emit yet
                             else:
