@@ -10,6 +10,8 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
     - [Thinking Budget](#thinking-budget)
   - [Chat UI with Gradio](#chat-ui-with-gradio)
   - [Python Script](#python-script)
+  - [Server (FastAPI)](#server-fastapi)
+    - [Continuous Batching](#continuous-batching)
 - [Activation Quantization (CUDA)](#activation-quantization-cuda)
 - [Multi-Image Chat Support](#multi-image-chat-support)
   - [Supported Models](#supported-models)
@@ -208,6 +210,7 @@ mlx_vlm.server --trust-remote-code
 - `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
 - `--kv-bits`: Number of bits for KV cache quantization (e.g. `3.5` for TurboQuant)
 - `--kv-quant-scheme`: KV cache quantization backend (`uniform` or `turboquant`)
+- `--vision-cache-size`: Max number of cached vision features (default: `20`)
 
 You can also set trust remote code via environment variable:
 ```sh
@@ -215,6 +218,32 @@ MLX_TRUST_REMOTE_CODE=true mlx_vlm.server
 ```
 
 The server provides multiple endpoints for different use cases and supports dynamic model loading/unloading with caching (one model at a time).
+
+### Continuous Batching
+
+The server supports continuous batching for higher throughput when handling multiple concurrent requests. New requests join the active batch immediately without waiting for existing requests to finish, and mixed batches of image and text-only requests are supported.
+
+Continuous batching is enabled automatically when the server loads a model. You can pre-load a model at startup so it's ready to serve immediately:
+
+```sh
+mlx_vlm.server --port 8080 --model mlx-community/Qwen2.5-VL-3B-Instruct-4bit
+```
+
+Verify via the health endpoint:
+
+```sh
+curl http://localhost:8080/health
+# {"status":"healthy","loaded_model":"...","continuous_batching_enabled":true}
+```
+
+If `--model` is omitted, the model is loaded on the first request.
+
+#### How It Works
+
+- A dedicated generation thread runs a `BatchGenerator` that processes multiple requests in parallel
+- Image requests are prefilled individually with their own vision embeddings, then join the shared decoding batch
+- Text-only requests are batched together for efficient prefill
+- After prefill, all requests decode together in a single batch, sharing GPU compute
 
 #### Available Endpoints
 

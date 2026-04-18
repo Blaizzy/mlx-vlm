@@ -204,10 +204,14 @@ class Attention(nn.Module):
         if self.is_kv_shared_layer and cache is not None:
             state = cache.state
             keys, values = state[0], state[1]
-            offset = cache.offset
+            # Snapshot via + 0 so cache.update_and_fetch cannot mutate this
+            # local alias under batched caches where cache.offset is an
+            # mx.array (mx.array.__iadd__ is in place; int.__iadd__ rebinds,
+            # so + 0 is safe for both).
+            offset = cache.offset + 0
         else:
             if cache is not None:
-                offset = cache.offset
+                offset = cache.offset + 0
 
             keys = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
 
@@ -352,18 +356,6 @@ class DecoderLayer(nn.Module):
         return h
 
 
-class ScaledLinear(nn.Module):
-    """Linear layer with output scaling."""
-
-    def __init__(self, in_features: int, out_features: int, scalar: float):
-        super().__init__()
-        self.weight = mx.zeros((out_features, in_features))
-        self.scalar = scalar
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return (x @ self.weight.T) * self.scalar
-
-
 class Gemma4TextModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -418,10 +410,11 @@ class Gemma4TextModel(nn.Module):
             )
             self.embed_tokens_per_layer_scale = config.hidden_size_per_layer_input**0.5
             self.per_layer_input_scale = 2.0**-0.5
-            self.per_layer_model_projection = ScaledLinear(
+            self.per_layer_projection_scale = config.hidden_size**-0.5
+            self.per_layer_model_projection = nn.Linear(
                 config.hidden_size,
                 config.num_hidden_layers * config.hidden_size_per_layer_input,
-                scalar=config.hidden_size**-0.5,
+                bias=False,
             )
             self.per_layer_projection_norm = RMSNormZeroShift(
                 config.hidden_size_per_layer_input, eps=config.rms_norm_eps
@@ -429,6 +422,7 @@ class Gemma4TextModel(nn.Module):
         else:
             self.embed_tokens_per_layer = None
             self.per_layer_input_scale = None
+            self.per_layer_projection_scale = None
             self.per_layer_model_projection = None
             self.per_layer_projection_norm = None
 
@@ -447,6 +441,7 @@ class Gemma4TextModel(nn.Module):
         per_layer_inputs: Optional[mx.array] = None,
     ) -> mx.array:
         per_layer_projection = self.per_layer_model_projection(inputs_embeds)
+        per_layer_projection = per_layer_projection * self.per_layer_projection_scale
         per_layer_projection = per_layer_projection.reshape(
             *inputs_embeds.shape[:-1],
             self.config.num_hidden_layers,
@@ -458,6 +453,24 @@ class Gemma4TextModel(nn.Module):
             return per_layer_projection
 
         return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
+
+    def _make_masks(self, h, cache):
+        """Create attention masks, deduplicated by layer type."""
+        mask_by_type = {}
+        masks = []
+        for layer_idx, layer in enumerate(self.layers):
+            lt = layer.layer_type
+            if lt not in mask_by_type:
+                c_idx = self.layer_idx_to_cache_idx[layer_idx]
+                c = cache[c_idx] if c_idx < len(cache) else None
+                if lt == "sliding_attention":
+                    mask_by_type[lt] = create_attention_mask(
+                        h, c, window_size=self.window_size
+                    )
+                else:
+                    mask_by_type[lt] = create_attention_mask(h, c)
+            masks.append(mask_by_type[lt])
+        return masks
 
     def __call__(
         self,
@@ -472,14 +485,13 @@ class Gemma4TextModel(nn.Module):
             h = self.embed_tokens(inputs)
             h = h * self.embed_scale
         else:
-
             h = inputs_embeds
 
+        # Per-layer inputs (2B/4B models)
         if self.hidden_size_per_layer_input:
             if inputs is not None and per_layer_inputs is None:
                 per_layer_inputs = self.get_per_layer_inputs(inputs)
             elif per_layer_inputs is not None:
-                # Slice per_layer_inputs to match current chunk (chunked prefill)
                 target_len = h.shape[1]
                 if per_layer_inputs.shape[1] != target_len:
                     cache_offset = next(
@@ -496,48 +508,25 @@ class Gemma4TextModel(nn.Module):
             if per_layer_inputs is not None or inputs is not None:
                 per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
 
+        # Build cache + masks
         if cache is None:
             cache = [None] * self.first_kv_shared_layer_idx
 
         if mask is None:
-            global_mask = create_attention_mask(
-                h,
-                (
-                    cache[self.first_full_cache_idx]
-                    if self.first_full_cache_idx < len(cache)
-                    else None
-                ),
-            )
-            sliding_window_mask = create_attention_mask(
-                h,
-                (
-                    cache[self.first_sliding_cache_idx]
-                    if self.first_sliding_cache_idx < len(cache)
-                    else None
-                ),
-                window_size=self.window_size,
-            )
+            masks = self._make_masks(h, cache)
+        else:
+            masks = [mask] * len(self.layers)
 
-        for i, layer in enumerate(self.layers):
+        # Forward through layers
+        per_layer_list = (
+            [per_layer_inputs[:, :, i, :] for i in range(len(self.layers))]
+            if per_layer_inputs is not None
+            else [None] * len(self.layers)
+        )
+
+        for i, (layer, m, pli) in enumerate(zip(self.layers, masks, per_layer_list)):
             c = cache[self.layer_idx_to_cache_idx[i]]
-            is_global = layer.layer_type == "full_attention"
-
-            local_mask = mask
-            if mask is None and is_global:
-                local_mask = global_mask
-            elif mask is None:
-                local_mask = sliding_window_mask
-
-            per_layer_input = None
-            if per_layer_inputs is not None:
-                per_layer_input = per_layer_inputs[:, :, i, :]
-
-            h = layer(
-                h,
-                local_mask,
-                c,
-                per_layer_input=per_layer_input,
-            )
+            h = layer(h, m, c, per_layer_input=pli)
 
         return self.norm(h)
 
