@@ -169,6 +169,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: mx.array = None,
         mask: mx.array = None,
         cache=None,
+        **kwargs,
     ):
         out = self.model(inputs, inputs_embeds, mask, cache)
         out = self.model.embed_tokens.as_linear(out)
