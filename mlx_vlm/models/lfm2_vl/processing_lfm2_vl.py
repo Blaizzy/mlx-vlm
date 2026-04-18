@@ -15,13 +15,17 @@ This patch:
 5. Forces the use of the slow image processor to avoid PyTorch tensor requirements
 """
 
+import json
 import math
+from pathlib import Path
 
 import numpy as np
 from transformers.models.lfm2_vl.processing_lfm2_vl import (
     Lfm2VlProcessor,
     Lfm2VlProcessorKwargs,
 )
+
+from ..base import install_auto_processor_patch, load_chat_template
 
 
 def _num_image_tokens_from_patch_grid(
@@ -42,6 +46,19 @@ def _num_image_tokens_from_patch_grid(
     padded_rows = rows + (-rows % downsample_factor)
     padded_cols = cols + (-cols % downsample_factor)
     return (padded_rows // downsample_factor) * (padded_cols // downsample_factor)
+
+
+def _normalize_image_layout_axis(values, num_images: int) -> list[int]:
+    """Normalize scalar or array-like row/col metadata to a per-image list."""
+    if isinstance(values, np.ndarray):
+        if values.ndim == 0:
+            return [int(values.item())] * max(1, num_images)
+        return [int(v) for v in values.tolist()]
+
+    if np.isscalar(values):
+        return [int(values)] * max(1, num_images)
+
+    return [int(v) for v in values]
 
 
 # Try to import the slow image processor to force its use
@@ -119,6 +136,66 @@ def _patched_init(self, image_processor, tokenizer, chat_template=None, **kwargs
 
 # Apply the __init__ patch
 Lfm2VlProcessor.__init__ = _patched_init
+
+_original_from_pretrained = Lfm2VlProcessor.from_pretrained
+
+
+@classmethod
+def _patched_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+    """Load LFM2-VL with the slow Siglip2 image processor to avoid torch/torchvision."""
+    from huggingface_hub import hf_hub_download
+    from transformers import AutoTokenizer
+
+    kwargs.pop("trust_remote_code", None)
+    kwargs.pop("use_fast", None)
+
+    model_path = Path(pretrained_model_name_or_path)
+    is_local = model_path.exists() and model_path.is_dir()
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(model_path) if is_local else pretrained_model_name_or_path,
+        trust_remote_code=True,
+        local_files_only=is_local,
+    )
+    if is_local:
+        load_chat_template(tokenizer, model_path)
+
+    if not _SLOW_PROCESSOR_AVAILABLE:
+        return _original_from_pretrained.__func__(
+            cls, pretrained_model_name_or_path, **kwargs
+        )
+
+    config_path = (
+        model_path / "preprocessor_config.json"
+        if is_local
+        else Path(
+            hf_hub_download(pretrained_model_name_or_path, "preprocessor_config.json")
+        )
+    )
+
+    image_processor_config = {}
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            image_processor_config = json.load(f)
+
+    for key in (
+        "image_processor_type",
+        "processor_class",
+        "image_seq_length",
+        "return_row_col_info",
+        "device",
+        "disable_grouping",
+        "return_tensors",
+    ):
+        image_processor_config.pop(key, None)
+
+    # The upstream config is tuned for the fast processor; the slow Siglip2 path
+    # needs resizing enabled and no image splitting metadata.
+    image_processor_config["do_resize"] = True
+    image_processor_config["do_image_splitting"] = False
+
+    image_processor = Siglip2ImageProcessor(**image_processor_config)
+    return cls(image_processor=image_processor, tokenizer=tokenizer)
 
 
 def _compute_image_grid_info(pixel_values, patch_size: int = 16):
@@ -301,6 +378,8 @@ def _patched_call(self, images=None, text=None, **kwargs):
     for sample_text, sample_images, rows, cols, _sizes in zip(
         text, batched_images, image_rows, image_cols, image_sizes
     ):
+        rows = _normalize_image_layout_axis(rows, len(sample_images))
+        cols = _normalize_image_layout_axis(cols, len(sample_images))
         split_sample = sample_text.split(self.image_token)
         result = ""
         for i, _ in enumerate(sample_images):
@@ -343,4 +422,7 @@ def _patched_call(self, images=None, text=None, **kwargs):
 
 
 # Apply the patch
+Lfm2VlProcessor.from_pretrained = _patched_from_pretrained
 Lfm2VlProcessor.__call__ = _patched_call
+
+install_auto_processor_patch(["lfm2_vl", "lfm2-vl"], Lfm2VlProcessor)

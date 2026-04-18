@@ -8,21 +8,6 @@ from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
 
-try:
-    from transformers import AutoImageProcessor, AutoProcessor
-
-    from .processing_hunyuan_vl import HunYuanVLImageProcessor, HunYuanVLProcessor
-
-    MODEL_TYPE = "hunyuan_vl"
-
-    AutoImageProcessor.register(
-        MODEL_TYPE, slow_image_processor_class=HunYuanVLImageProcessor
-    )
-    AutoProcessor.register(MODEL_TYPE, HunYuanVLProcessor)
-
-except Exception as e:
-    raise e
-
 
 class Model(nn.Module):
 
@@ -53,8 +38,12 @@ class Model(nn.Module):
             self.language_model._position_ids = None
             return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
-        # Get vision features
-        vision_features = self.vision_tower(pixel_values, image_grid_thw)
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            vision_features = cached
+        else:
+            # Get vision features
+            vision_features = self.vision_tower(pixel_values, image_grid_thw)
 
         # Find image token positions and replace with vision features
         image_token_id = self.config.image_token_id

@@ -376,11 +376,13 @@ class Model(nn.Module):
 
         tgt_sizes = kwargs.get("tgt_sizes", None)
         image_bound = kwargs.get("image_bound", None)
-        vision_hidden_states = (
-            self.get_vision_embedding(pixel_values, tgt_sizes)
-            if pixel_values is not None
-            else None
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            vision_hidden_states = cached
+        elif pixel_values is not None:
+            vision_hidden_states = self.get_vision_embedding(pixel_values, tgt_sizes)
+        else:
+            vision_hidden_states = None
 
         audio_features = kwargs.get("audio_features", None)
         audio_feature_lens = kwargs.get("audio_feature_lens", None)

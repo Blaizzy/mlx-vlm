@@ -53,10 +53,14 @@ class Model(nn.Module):
         model_dtype = self.language_model.model.embed_tokens.weight.dtype
         pixel_values = pixel_values.astype(model_dtype)
 
-        _, image_features, _ = self.vision_tower(pixel_values.transpose(0, 2, 3, 1))
-        B, H, W, C = image_features.shape
-        image_features = image_features.reshape(B, H * W, C)
-        image_features = self.mm_projector(image_features)
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
+        else:
+            _, image_features, _ = self.vision_tower(pixel_values.transpose(0, 2, 3, 1))
+            B, H, W, C = image_features.shape
+            image_features = image_features.reshape(B, H * W, C)
+            image_features = self.mm_projector(image_features)
 
         final_inputs_embeds = self.prepare_inputs_for_multimodal(
             image_features, input_ids, mask

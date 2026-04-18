@@ -14,9 +14,10 @@ import mlx.core as mx
 
 from mlx_vlm import load
 
-from .generate import stream_generate
+from .generate import PromptCacheState, stream_generate
 from .prompt_utils import get_chat_template, get_message_json
 from .utils import load_config, load_image_processor
+from .vision_cache import VisionFeatureCache
 
 
 def parse_arguments():
@@ -40,6 +41,8 @@ class ModelState:
         self.config = None
         self.image_processor = None
         self.current_model_name = None
+        self.vision_cache = VisionFeatureCache()
+        self.prompt_cache_state = PromptCacheState()
 
     def load(self, model_name):
         """Load a model, clearing previous one from memory."""
@@ -59,6 +62,8 @@ class ModelState:
         )
         self.image_processor = load_image_processor(model_name)
         self.current_model_name = model_name
+        self.vision_cache.clear()
+        self.prompt_cache_state = PromptCacheState()
 
 
 state = ModelState()
@@ -216,6 +221,7 @@ def chat(
 
     image_file = extract_image_from_message(message)
     num_images = 1 if image_file else 0
+    image = [image_file] if image_file else None
 
     if state.config["model_type"] != "paligemma":
         chat_history = []
@@ -262,6 +268,7 @@ def chat(
             {"role": "user", "content": extract_text_from_message(message)}
         )
 
+        # Build messages with image token only on the last user message
         messages = []
         for i, m in enumerate(chat_history):
             skip_token = True
@@ -277,12 +284,12 @@ def chat(
                 )
             )
 
-        messages = get_chat_template(
+        prompt = get_chat_template(
             state.processor, messages, add_generation_prompt=True
         )
 
     else:
-        messages = extract_text_from_message(message)
+        prompt = extract_text_from_message(message)
 
     response = ""
     last_chunk = None
@@ -290,6 +297,8 @@ def chat(
     gen_kwargs = {
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "vision_cache": state.vision_cache,
+        "prompt_cache_state": state.prompt_cache_state,
     }
 
     if top_p < 1.0:
@@ -300,8 +309,8 @@ def chat(
     for chunk in stream_generate(
         state.model,
         state.processor,
-        messages,
-        image=image_file,
+        prompt,
+        image=image,
         **gen_kwargs,
     ):
         if stop_generation.is_set():
@@ -316,7 +325,7 @@ def chat(
     if last_chunk is not None:
         stats = (
             f"\n\n---\n"
-            f"<sub>📊 Prompt: {last_chunk.prompt_tokens} tokens @ {last_chunk.prompt_tps:.1f} t/s | "
+            f"<sub>Prompt: {last_chunk.prompt_tokens} tokens @ {last_chunk.prompt_tps:.1f} t/s | "
             f"Generation: {last_chunk.generation_tokens} tokens @ {last_chunk.generation_tps:.1f} t/s | "
             f"Peak memory: {last_chunk.peak_memory:.2f} GB</sub>"
         )

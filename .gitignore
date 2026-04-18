@@ -25,5 +25,5 @@ var/
 # virtual environment
 .myenv
 .venv
-
+.codex_tmp/
 .vscode

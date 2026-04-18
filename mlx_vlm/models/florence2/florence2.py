@@ -305,7 +305,11 @@ class Model(nn.Module):
 
         # Process image if provided
         if pixel_values is not None:
-            image_features = self._encode_image(pixel_values)
+            cached = kwargs.get("cached_image_features", None)
+            if cached is not None:
+                image_features = cached
+            else:
+                image_features = self._encode_image(pixel_values)
 
             # Merge image features with text embeddings (task prompt only)
             inputs_embeds, attention_mask = self._merge_input_ids_with_image_features(

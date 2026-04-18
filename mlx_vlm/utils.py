@@ -34,6 +34,13 @@ MODEL_REMAPPING = {
     "cohere2_vision": "aya_vision",
     "jvlm": "jina_vlm",
     "phi4-siglip": "phi4_siglip",
+    "sam3_video": "sam3",
+    "sam3.1_video": "sam3_1",
+    "granite-vision": "granite_vision",
+    "granite4-vision": "granite4_vision",
+    "granite4_vision": "granite4_vision",
+    "rf-detr": "rfdetr",
+    "falcon-perception": "falcon_perception",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -87,6 +94,7 @@ def skip_multimodal_module(path: str) -> bool:
         or "audio_model" in path
         or "audio_tower" in path
         or "code_predictor" in path
+        or "img_projector" in path
     )
 
 
@@ -344,7 +352,7 @@ def update_module_configs(model_config, model_class, config, modules):
     """
     for config_name in modules:
         config_attr = f"{config_name}_config"
-        if hasattr(model_config, config_attr):
+        if hasattr(model_config, config_attr) and config.get(config_attr) is not None:
             config_class = getattr(model_class, f"{config_name.title()}Config")
             setattr(
                 model_config, config_attr, config_class.from_dict(config[config_attr])
@@ -540,28 +548,66 @@ def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list
     return shards
 
 
-def upload_to_hub(path: str, upload_repo: str, hf_path: str):
+def create_model_card(
+    path: Union[str, Path], hf_path: Optional[Union[str, Path]] = None
+):
+    """
+    Create model card for a converted MLX model.
+
+    Args:
+        path (Union[str, Path]): Local path to the converted model.
+        hf_path (Optional[Union[str, Path]]): Original Hugging Face repo id or local path used for conversion.
+    """
+    from huggingface_hub import ModelCard, ModelCardData
+
+    if hf_path is None:
+        card = ModelCard.from_template(ModelCardData(language="en"))
+    else:
+        card = ModelCard.load(hf_path)
+    card.data.library_name = "mlx"
+    if card.data.pipeline_tag is None:
+        card.data.pipeline_tag = "image-text-to-text"
+    if card.data.tags is None:
+        card.data.tags = ["mlx"]
+    elif "mlx" not in card.data.tags:
+        card.data.tags += ["mlx"]
+    if hf_path is not None:
+        card.data.base_model = str(hf_path)
+    card.text = ""
+    card.save(Path(path) / "README.md")
+
+
+def upload_to_hub(path: str, upload_repo: str):
     """
     Uploads the model to Hugging Face hub.
 
     Args:
         path (str): Local path to the model.
         upload_repo (str): Name of the HF repo to upload to.
-        hf_path (str): Path to the original Hugging Face model.
     """
-    import os
-
     from huggingface_hub import HfApi, ModelCard, logging
 
     from . import __version__
 
-    card = ModelCard.load(hf_path)
-    card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"]
+    logging.set_verbosity_info()
+    card_path = Path(path) / "README.md"
+    card = ModelCard.load(card_path)
+
+    hf_path = card.data.base_model
+
+    if hf_path is not None:
+        provenance = f"""
+        This model was converted to MLX format from [`{hf_path}`](https://huggingface.co/{hf_path})
+        using mlx-vlm version **{__version__}**.
+        Refer to the [original model card](https://huggingface.co/{hf_path}) for more details on the model.
+        """
+    else:
+        provenance = ""
+
     card.text = dedent(
         f"""
         # {upload_repo}
-        This model was converted to MLX format from [`{hf_path}`]() using mlx-vlm version **{__version__}**.
-        Refer to the [original model card](https://huggingface.co/{hf_path}) for more details on the model.
+        {provenance}
         ## Use with mlx
 
         ```bash
@@ -573,9 +619,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         ```
         """
     )
-    card.save(os.path.join(path, "README.md"))
-
-    logging.set_verbosity_info()
+    card.save(card_path)
 
     api = HfApi()
     api.create_repo(repo_id=upload_repo, exist_ok=True)
@@ -743,36 +787,49 @@ def process_image(img, resize_shape, image_processor):
     return img
 
 
+def _resample_fft(signal: np.ndarray, n_target: int) -> np.ndarray:
+    """FFT-based resampling for a 1D signal (matches scipy.signal.resample)."""
+    n_orig = len(signal)
+    if n_orig == n_target:
+        return signal
+
+    X = np.fft.rfft(signal)
+    m = min(n_target, n_orig)
+    m2 = m // 2 + 1
+
+    # Truncate to relevant frequency bins
+    X = X[:m2].copy()
+
+    # Account for unpaired Nyquist bin (matches scipy exactly)
+    if m % 2 == 0 and n_target != n_orig:
+        X[m // 2] *= 2.0 if n_target < n_orig else 0.5
+
+    s_fac = n_orig / n_target
+    resampled = np.fft.irfft(X / s_fac, n=n_target)
+    return resampled.astype(signal.dtype)
+
+
 def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    """Resample audio using linear interpolation."""
+    """Resample audio using FFT (matches scipy.signal.resample)."""
     if orig_sr == target_sr:
         return audio
 
-    # Calculate the resampling ratio
     ratio = target_sr / orig_sr
 
-    # Handle different audio shapes
     if audio.ndim == 1:
-        # Mono audio - simple case
         new_length = int(len(audio) * ratio)
-        old_indices = np.arange(len(audio))
-        new_indices = np.linspace(0, len(audio) - 1, new_length)
-        resampled = np.interp(new_indices, old_indices, audio)
+        resampled = _resample_fft(audio, new_length)
 
     elif audio.ndim == 2:
-        # Multi-channel audio - transpose to (samples, channels) if needed
         if audio.shape[0] < audio.shape[1]:
             audio = audio.T
 
-        # Resample each channel
         n_samples, n_channels = audio.shape
         new_length = int(n_samples * ratio)
-        old_indices = np.arange(n_samples)
-        new_indices = np.linspace(0, n_samples - 1, new_length)
 
-        resampled = np.zeros((new_length, n_channels))
+        resampled = np.zeros((new_length, n_channels), dtype=audio.dtype)
         for i in range(n_channels):
-            resampled[:, i] = np.interp(new_indices, old_indices, audio[:, i])
+            resampled[:, i] = _resample_fft(audio[:, i], new_length)
     else:
         raise ValueError(f"Audio array has unsupported shape: {audio.shape}")
 
@@ -1359,13 +1416,17 @@ class StoppingCriteria:
             raise ValueError("Processor is not provided")
 
         if new_eos_token_ids is not None:
-            if isinstance(new_eos_token_ids, str):
+            if isinstance(new_eos_token_ids, (str, int)):
                 new_eos_token_ids = [new_eos_token_ids]
-            new_eos_token_ids = [
-                self.tokenizer.encode(" " + token, add_special_tokens=False)[-1]
-                for token in new_eos_token_ids
-            ]
-            self.eos_token_ids.extend(new_eos_token_ids)
+            resolved = []
+            for token in new_eos_token_ids:
+                if isinstance(token, int):
+                    resolved.append(token)
+                elif isinstance(token, str):
+                    resolved.append(
+                        self.tokenizer.encode(" " + token, add_special_tokens=False)[-1]
+                    )
+            self.eos_token_ids.extend(resolved)
 
     def reset(self, eos_token_ids: List[int] = None):
         eos_token_ids = (
