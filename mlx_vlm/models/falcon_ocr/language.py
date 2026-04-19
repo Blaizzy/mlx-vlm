@@ -438,6 +438,58 @@ class LanguageModel(nn.Module):
             logits=out.astype(self.model.embed_tokens.weight.dtype)
         )
 
+    def get_rope_index(
+        self,
+        input_ids: mx.array,
+        image_grid_hw=None,
+    ):
+        config = self.config
+        single_ids = input_ids[0] if input_ids.ndim == 2 else input_ids
+        ids = single_ids.reshape(-1).tolist()
+        start_id = config.image_cls_token_id
+        end_id = config.img_end_id
+
+        pos_t = []
+        in_image = False
+        next_pos = 0
+        for tok in ids:
+            if tok == start_id and not in_image:
+                in_image = True
+            pos_t.append(next_pos)
+            if not in_image:
+                next_pos += 1
+            if tok == end_id and in_image:
+                in_image = False
+                next_pos += 1
+
+        position_ids = mx.array(pos_t, dtype=mx.int32)
+        delta = int(mx.max(position_ids).item()) + 1 - len(ids)
+
+        grid_hws = None
+        if image_grid_hw is not None:
+            if isinstance(image_grid_hw, mx.array):
+                grid_hws = image_grid_hw.tolist()
+            elif isinstance(image_grid_hw, list):
+                grid_hws = image_grid_hw
+            if grid_hws:
+                grid_hws = [tuple(int(x) for x in g) for g in grid_hws]
+                if input_ids.ndim == 2:
+                    grid_hws = grid_hws[:1]
+
+        pos_hw = compute_pos_hw(
+            single_ids.reshape(-1),
+            image_token_id=config.img_id,
+            image_grid_hws=grid_hws,
+        )
+
+        full_attn_mask = create_falcon_ocr_mask(
+            single_ids if single_ids.ndim == 1 else single_ids[0],
+            config.image_cls_token_id,
+            config.img_end_id,
+        )
+
+        return position_ids, pos_hw, delta, full_attn_mask
+
     @property
     def layers(self):
         return self.model.layers

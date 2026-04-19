@@ -5,7 +5,7 @@ import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig, VisionConfig
-from .language import LanguageModel, compute_pos_hw, create_falcon_ocr_mask
+from .language import LanguageModel
 
 
 class VisionModel(nn.Module):
@@ -49,14 +49,8 @@ class Model(nn.Module):
             input_ids,
         )
 
-        position_ids, pos_hw, delta = self._precompute_positions(
-            input_ids, image_grid_hw
-        )
-        single_ids = input_ids[0:1] if input_ids.ndim == 2 else input_ids
-        full_attn_mask = create_falcon_ocr_mask(
-            single_ids,
-            self.config.image_cls_token_id,
-            self.config.img_end_id,
+        position_ids, pos_hw, delta, full_attn_mask = (
+            self.language_model.get_rope_index(input_ids, image_grid_hw)
         )
 
         return InputEmbeddingsFeatures(
@@ -66,47 +60,6 @@ class Model(nn.Module):
             rope_deltas=mx.array([[delta]], dtype=mx.int32),
             attention_mask_4d=full_attn_mask,
         )
-
-    def _precompute_positions(self, input_ids, image_grid_hw):
-        single_ids = input_ids[0] if input_ids.ndim == 2 else input_ids
-        ids = single_ids.reshape(-1).tolist()
-        start_id = self.config.image_cls_token_id
-        end_id = self.config.img_end_id
-
-        pos_t = []
-        in_image = False
-        next_pos = 0
-        for tok in ids:
-            if tok == start_id and not in_image:
-                in_image = True
-            pos_t.append(next_pos)
-            if not in_image:
-                next_pos += 1
-            if tok == end_id and in_image:
-                in_image = False
-                next_pos += 1
-
-        position_ids = mx.array(pos_t, dtype=mx.int32)
-        delta = int(mx.max(position_ids).item()) + 1 - len(ids)
-
-        grid_hws = None
-        if image_grid_hw is not None:
-            if isinstance(image_grid_hw, mx.array):
-                grid_hws = image_grid_hw.tolist()
-            elif isinstance(image_grid_hw, list):
-                grid_hws = image_grid_hw
-            if grid_hws:
-                grid_hws = [tuple(int(x) for x in g) for g in grid_hws]
-                if input_ids.ndim == 2:
-                    grid_hws = grid_hws[:1]
-
-        pos_hw = compute_pos_hw(
-            single_ids.reshape(-1),
-            image_token_id=self.config.img_id,
-            image_grid_hws=grid_hws,
-        )
-
-        return position_ids, pos_hw, delta
 
     def _patchify_and_project(self, pixel_values: mx.array) -> mx.array:
         ps = self.config.vision_config.spatial_patch_size
