@@ -1,16 +1,3 @@
-"""Lightweight smoke test: loads the MLX drafter and runs a single forward
-pass with a dummy target / cache to confirm weights are readable and the
-stack executes without errors.
-
-    python -m mlx_vlm.speculative.drafters.qwen3_dflash.parity_check \
-        --drafter z-lab/Qwen3.5-4B-DFlash
-
-The full HF-vs-MLX parity check is no longer meaningful now that the
-drafter wires through the target model's tied embed_tokens (which requires
-the target model to be loaded). End-to-end correctness is instead verified
-by the speculative decoding loop's accept rate against plain AR.
-"""
-
 import argparse
 
 import mlx.core as mx
@@ -39,15 +26,13 @@ def main():
     model = load_drafter(args.drafter)
     cfg = model.config
 
-    # Bind to a dummy embed for the smoke test. In real use this is the
-    # target model's tied embed_tokens (see DFlashDraftModel.bind).
     dummy = _DummyEmbed(cfg.vocab_size, cfg.hidden_size)
     model.embed_tokens = dummy
     model.lm_head = dummy.as_linear
 
     B = 1
     block = cfg.block_size
-    T = 16  # pretend-committed target context length
+    T = 16
 
     ids = mx.zeros((B, block), dtype=mx.int32)
     target_hidden = (

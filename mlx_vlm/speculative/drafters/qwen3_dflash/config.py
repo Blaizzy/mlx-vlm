@@ -26,11 +26,6 @@ class DFlashConfig(BaseModelConfig):
 
     @classmethod
     def from_dict(cls, params: dict) -> "DFlashConfig":
-        """Build from a raw HF config dict. Flattens the nested
-        ``dflash_config`` sub-dict (``mask_token_id``, ``target_layer_ids``)
-        so :func:`mlx_vlm.utils.load_model`'s generic
-        ``ModelConfig.from_dict(config)`` call works unmodified.
-        """
         flat = dict(params)
         dflash_cfg = flat.pop("dflash_config", None) or {}
         if "mask_token_id" in dflash_cfg:
@@ -40,5 +35,4 @@ class DFlashConfig(BaseModelConfig):
         sig = inspect.signature(cls).parameters
         return cls(**{k: v for k, v in flat.items() if k in sig})
 
-    # Legacy alias.
     from_hf_dict = from_dict
