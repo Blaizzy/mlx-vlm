@@ -408,6 +408,8 @@ class ResponseGenerator:
                     # already happened on the caller thread.
                     input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
+                    if has_embeds:
+                        mx.async_eval(gen_kwargs["inputs_embeds"])
 
                     # Image/embed requests can't share a prefill batch with
                     # pending text-only prompts — drain them first.

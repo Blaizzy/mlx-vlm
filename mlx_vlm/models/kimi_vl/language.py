@@ -398,7 +398,7 @@ class DeepseekV3Model(nn.Module):
             h = inputs_embeds
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            mask = create_attention_mask(h, cache[0])
 
         if cache is None:
             cache = [None] * self.num_layers
