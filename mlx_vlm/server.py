@@ -508,9 +508,7 @@ def suppress_tool_call_content(
     if not in_tool_call:
         if tc_start in full_output:
             return True, None
-        if any(
-            full_output.endswith(tc_start[:j]) for j in range(1, len(tc_start))
-        ):
+        if any(full_output.endswith(tc_start[:j]) for j in range(1, len(tc_start))):
             return False, None
     else:
         return True, None
@@ -1836,12 +1834,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content
                         in_tool_call = False
-                        tc_start = (
-                            tool_module.tool_call_start if tool_module else None
-                        )
-                        tc_end = (
-                            tool_module.tool_call_end if tool_module else None
-                        )
+                        tc_start = tool_module.tool_call_start if tool_module else None
+                        tc_end = tool_module.tool_call_end if tool_module else None
 
                         def _next_token():
                             try:
