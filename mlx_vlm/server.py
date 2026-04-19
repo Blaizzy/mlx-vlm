@@ -1889,30 +1889,39 @@ async def chat_completions_endpoint(request: ChatRequest):
                                     ]
                                 )
 
-                            choices = [
-                                ChatStreamChoice(
-                                    finish_reason=token.finish_reason,
-                                    delta=ChatMessage(
-                                        role="assistant",
-                                        content=delta_content,
-                                        reasoning=delta_reasoning,
-                                    ),
-                                    logprobs=chunk_logprobs,
-                                )
-                            ]
-                            chunk_data = ChatStreamChunk(
-                                id=request_id,
-                                created=int(time.time()),
-                                model=request.model,
-                                usage={
-                                    "prompt_tokens": ctx.prompt_tokens,
-                                    "completion_tokens": output_tokens,
-                                    "total_tokens": ctx.prompt_tokens + output_tokens,
-                                },
-                                choices=choices,
+                            # Skip empty deltas (e.g. suppressed tool-call tokens)
+                            has_payload = (
+                                delta_content is not None
+                                or delta_reasoning is not None
+                                or token.finish_reason is not None
+                                or chunk_logprobs is not None
                             )
+                            if has_payload:
+                                choices = [
+                                    ChatStreamChoice(
+                                        finish_reason=token.finish_reason,
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            content=delta_content,
+                                            reasoning=delta_reasoning,
+                                        ),
+                                        logprobs=chunk_logprobs,
+                                    )
+                                ]
+                                chunk_data = ChatStreamChunk(
+                                    id=request_id,
+                                    created=int(time.time()),
+                                    model=request.model,
+                                    usage={
+                                        "prompt_tokens": ctx.prompt_tokens,
+                                        "completion_tokens": output_tokens,
+                                        "total_tokens": ctx.prompt_tokens
+                                        + output_tokens,
+                                    },
+                                    choices=choices,
+                                )
 
-                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+                                yield f"data: {chunk_data.model_dump_json()}\n\n"
 
                             if token.finish_reason:
                                 break
