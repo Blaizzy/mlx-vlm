@@ -1693,8 +1693,6 @@ class BatchGenerator:
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 
-            # Chunk if the prompt is too long, otherwise transition straight
-            # to the generation batch.
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
                 n = self._prompt_batch.prompt_step()
