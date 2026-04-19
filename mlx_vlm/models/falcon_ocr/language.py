@@ -366,21 +366,13 @@ class LanguageModel(nn.Module):
         else:
             rope_deltas = self._rope_deltas
 
-        cache_offset = 0
-        cache_offset_array = None
-        if cache and cache[0] is not None:
-            offset = cache[0].offset
-            if isinstance(offset, int):
-                cache_offset = offset
-            elif isinstance(offset, mx.array):
-                if offset.ndim == 0:
-                    cache_offset = int(offset.item())
-                elif offset.size == 1:
-                    cache_offset = int(offset[0].item())
-                else:
-                    cache_offset_array = offset
-                    cache_offset = int(offset[0].item())
-            cache_offset = max(cache_offset, 0)
+        offset = cache[0].offset if cache and cache[0] is not None else 0
+        is_batch = isinstance(offset, mx.array) and offset.size > 1
+        if isinstance(offset, mx.array):
+            cache_offset = int(offset[0].item()) if offset.size > 0 else 0
+        else:
+            cache_offset = int(offset)
+        cache_offset = max(cache_offset, 0)
 
         if inputs_embeds is not None:
             L = inputs_embeds.shape[1]
@@ -389,7 +381,7 @@ class LanguageModel(nn.Module):
         else:
             L = 1
 
-        if inputs_embeds is not None and cache_offset_array is None:
+        if inputs_embeds is not None and not is_batch:
             if position_ids is not None:
                 if position_ids.ndim == 2:
                     position_ids = position_ids[:, cache_offset : cache_offset + L]
@@ -397,22 +389,17 @@ class LanguageModel(nn.Module):
                     position_ids = position_ids[cache_offset : cache_offset + L]
             if pos_hw is not None:
                 pos_hw = pos_hw[:, cache_offset : cache_offset + L, :]
-        elif (
-            cache_offset > 0 or cache_offset_array is not None
-        ) and rope_deltas is not None:
-            if cache_offset_array is not None:
-                base_offset = cache_offset_array.reshape(-1, 1)
-            else:
-                base_offset = mx.array([[cache_offset]], dtype=mx.int32)
+        elif (cache_offset > 0 or is_batch) and rope_deltas is not None:
+            base_offset = (
+                offset.reshape(-1, 1)
+                if is_batch
+                else mx.array([[cache_offset]], dtype=mx.int32)
+            )
             rd = rope_deltas
-            if rd.ndim == 0:
-                rd = rd.reshape(1, 1)
-            elif rd.ndim == 1:
+            if rd.ndim < 2:
                 rd = rd.reshape(-1, 1)
-            if rd.shape[0] == 1 and base_offset.shape[0] > 1:
-                rd = mx.broadcast_to(rd, base_offset.shape)
-            elif rd.shape[0] > base_offset.shape[0]:
-                rd = rd[: base_offset.shape[0]]
+            if rd.shape[0] != base_offset.shape[0]:
+                rd = mx.broadcast_to(rd[:1], base_offset.shape) if rd.shape[0] < base_offset.shape[0] else rd[: base_offset.shape[0]]
             start = base_offset + rd.astype(base_offset.dtype)
             position_ids = start + mx.arange(L, dtype=start.dtype).reshape(1, -1)
         else:
