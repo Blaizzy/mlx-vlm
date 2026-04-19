@@ -2579,6 +2579,8 @@ def main():
         type=int,
         default=None,
         help="Override the drafter's configured block size.",
+    )
+    parser.add_argument(
         "--top-logprobs-k",
         type=int,
         default=None,
