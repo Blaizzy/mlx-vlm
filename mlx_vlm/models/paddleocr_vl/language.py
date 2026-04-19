@@ -446,13 +446,6 @@ class LanguageModel(nn.Module):
         if pixel_values is not None:
             self._rope_deltas = None
             self._position_ids = None
-        # When caller plumbs the full-prompt MRoPE table via kwargs
-        # (InputEmbeddingsFeatures on the server's prompt_kwargs), install
-        # it as this request's _position_ids so the slice-by-cache-offset
-        # branch below picks up THIS request's state even when a concurrent
-        # request's get_input_embeddings has since clobbered the attr. The
-        # wrapper ships as (B, 3, L) so BatchGenerator's [:batch_size]
-        # slice stays a no-op; we transpose back to the internal (3, B, L).
         if position_ids is not None and position_ids.ndim == 3:
             self._position_ids = position_ids.transpose(1, 0, 2)
             position_ids = None
