@@ -1135,7 +1135,6 @@ class GenerationBatch:
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         sampled = self.sampler(logprobs)
 
-
         self._next_tokens = sampled
         prev_top_idx = self._next_top_idx
         prev_top_lp = self._next_top_lp
