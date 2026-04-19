@@ -1117,13 +1117,7 @@ class GenerationBatch:
         return len(self.uids)
 
     def _step(self):
-        """Perform one generation step with double buffering.
-
-        Pre-gathers per-token logprobs right after sampling so the full
-        vocab-size logprobs tensor stays as a GPU intermediate (never
-        materialized to CPU). Only the sampled token + its logprob are
-        async_eval'd, keeping memory pressure minimal.
-        """
+        """Perform one generation step with double buffering."""
         self._current_tokens = self._next_tokens
         self._current_lps = self._next_lps
         inputs = self._current_tokens
@@ -1141,11 +1135,8 @@ class GenerationBatch:
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         sampled = self.sampler(logprobs)
 
-        # Gather per-token logprobs in the same graph so the full vocab
-        # tensor stays a GPU intermediate instead of being materialized.
+
         self._next_tokens = sampled
-        # Snapshot the top buffers before we overwrite them — we emit the
-        # previous step's top-K, not the one we're about to compute.
         prev_top_idx = self._next_top_idx
         prev_top_lp = self._next_top_lp
 
@@ -1216,9 +1207,7 @@ class GenerationBatch:
             self._next_tokens = mx.concatenate([self._next_tokens, other._next_tokens])
             if self._next_lps is not None and other._next_lps is not None:
                 self._next_lps = mx.concatenate([self._next_lps, other._next_lps])
-            # Top-K buffers: concat when both sides have matching K; otherwise
-            # drop to None (the affected step will emit no top_logprobs for
-            # anyone and recompute cleanly on the next step).
+
             if (
                 self._next_top_idx is not None
                 and other._next_top_idx is not None
@@ -1434,9 +1423,6 @@ class PromptProcessingBatch:
         )
         gen_batch.compute_logprobs = compute_logprobs
 
-        # Populate _next_lps for the first tokens so extend() can concatenate
-        # logprobs correctly; without this, merging into an existing gen
-        # batch leaves a size mismatch that later trips IndexError in next().
         if compute_logprobs:
             gen_batch._next_lps = logprobs[
                 mx.arange(first_tokens.shape[0]), first_tokens
@@ -1451,9 +1437,6 @@ class PromptProcessingBatch:
             gen_batch._next_top_idx = top_idx
             gen_batch._next_top_lp = top_lp
 
-        # Snapshot the MRoPE delta the model produced for this prefill so
-        # the decode path can pass it back in per-sequence via kwargs,
-        # without aliasing self._rope_deltas when another sequence joins.
         language_model = getattr(self.model, "language_model", self.model)
         rope_deltas = getattr(language_model, "_rope_deltas", None)
         if rope_deltas is not None:
