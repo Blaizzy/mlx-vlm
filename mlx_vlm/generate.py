@@ -509,12 +509,9 @@ def _dflash_rounds(
             if emitted >= max_tokens:
                 return
 
-        # Rollback the target cache to the accepted prefix.
-        trim = bs - accepted - 1
-        if trim > 0:
-            lm.rollback_speculative_cache(
-                prompt_cache, verify_out.gdn_states, accepted, trim
-            )
+        lm.rollback_speculative_cache(
+            prompt_cache, verify_out.gdn_states, accepted, bs
+        )
 
         hidden = hidden[:, : accepted + 1, :]
         b = new_tokens[-1] if new_tokens else b
@@ -547,10 +544,10 @@ def _dflash_rounds_batch(
     to emit this step).
     """
     lm = model.language_model if hasattr(model, "language_model") else model
-    if not hasattr(lm, "rollback_speculative_cache_batch"):
+    if not hasattr(lm, "rollback_speculative_cache"):
         raise RuntimeError(
             f"{type(lm).__name__} does not implement "
-            "rollback_speculative_cache_batch."
+            "rollback_speculative_cache."
         )
 
     B = first_bonus.shape[0]
@@ -612,9 +609,8 @@ def _dflash_rounds_batch(
             draft_tokens, target_tokens, budgets
         )
 
-        # Rollback — trim to max(accepted), zero stale KV entries
         accepted_arr = mx.array(accepted_list)
-        max_a = lm.rollback_speculative_cache_batch(
+        max_a = lm.rollback_speculative_cache(
             prompt_cache, verify_out.gdn_states, accepted_arr, bs
         )
         hidden = hidden_full[:, : max_a + 1, :]

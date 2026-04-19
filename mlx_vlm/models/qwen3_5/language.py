@@ -451,69 +451,17 @@ class LanguageModel(nn.Module):
         self,
         caches: List[Any],
         gdn_states: List,
-        accepted: int,
-        trim: int,
-    ) -> None:
-        """Roll caches back to the first ``accepted + 1`` positions of
-        the last verify block.
-
-        Full-attention (trimmable) caches are sliced directly. Linear
-        (gated-delta) caches are restored by replaying
-        ``gated_delta_update`` on the captured pre-verify inputs in
-        ``gdn_states``.
-        """
-        n = accepted + 1
-        j = 0
-        for c in caches:
-            if c is None:
-                continue
-            if c.is_trimmable():
-                c.trim(trim)
-                continue
-            q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = gdn_states[
-                j
-            ]
-            _, state = gated_delta_update(
-                q[:, :n],
-                k[:, :n],
-                v[:, :n],
-                a[:, :n],
-                b[:, :n],
-                A_log,
-                dt_bias,
-                init_state,
-                None if mask is None else mask[:, :n],
-                use_kernel=True,
-            )
-            c[1] = state
-            c[0] = conv_input[:, accepted + 1 : accepted + K]
-            j += 1
-
-    def rollback_speculative_cache_batch(
-        self,
-        caches: List[Any],
-        gdn_states: List,
-        accepted: mx.array,
+        accepted,
         block_size: int,
     ) -> int:
-        """Batch rollback: trim to ``max(accepted)`` with stale-entry zeroing.
+        if isinstance(accepted, int):
+            accepted = mx.array([accepted])
 
-        Trims trimmable caches to ``max(accepted) + 1`` positions past
-        the pre-verify offset. For sequences with ``accepted[i] < max_a``
-        the KV entries at stale positions are zeroed so subsequent
-        attention assigns near-zero weight to them.
-
-        For GDN layers, the replay uses a per-sequence mask that zeros
-        out positions beyond each sequence's accepted count. Conv state
-        is gathered per-sequence.
-
-        Returns ``max_a`` so the caller uses it for hidden slicing and
-        full per-sequence token emission.
-        """
         max_a = int(accepted.max().item())
         n = max_a + 1
         trim = block_size - n
-        valid_ends = accepted + 1  # [B] per-sequence valid length in verify block
+        is_batch = accepted.size > 1
+        valid_ends = accepted + 1
 
         j = 0
         for c in caches:
@@ -522,23 +470,23 @@ class LanguageModel(nn.Module):
             if c.is_trimmable():
                 if trim > 0:
                     c.trim(trim)
-                # Zero stale KV entries for shorter-accepted sequences
-                if hasattr(c, "_idx") and c.keys is not None and max_a > 0:
+                if is_batch and hasattr(c, "_idx") and c.keys is not None and max_a > 0:
                     kv_len = c._idx
-                    B_cache = accepted.shape[0]
                     ve = valid_ends.tolist()
                     verify_start = kv_len - n
-                    for bi in range(B_cache):
+                    for bi in range(accepted.shape[0]):
                         start = verify_start + int(ve[bi])
                         if start < kv_len:
                             c.keys[bi, :, start:kv_len, :] = 0
                             c.values[bi, :, start:kv_len, :] = 0
                 continue
-            # GDN layer: masked replay to max_a+1 positions
-            q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = gdn_states[
-                j
-            ]
-            batch_mask = mx.arange(n)[None, :] <= accepted[:, None]
+            q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = (
+                gdn_states[j]
+            )
+            if is_batch:
+                replay_mask = mx.arange(n)[None, :] <= accepted[:, None]
+            else:
+                replay_mask = None if mask is None else mask[:, :n]
             _, state = gated_delta_update(
                 q[:, :n],
                 k[:, :n],
@@ -548,17 +496,22 @@ class LanguageModel(nn.Module):
                 A_log,
                 dt_bias,
                 init_state,
-                batch_mask,
+                replay_mask,
                 use_kernel=True,
             )
             c[1] = state
-            B = accepted.shape[0]
-            acc_list = accepted.tolist()
-            slices = [
-                conv_input[bi : bi + 1, int(acc_list[bi]) + 1 : int(acc_list[bi]) + K]
-                for bi in range(B)
-            ]
-            c[0] = mx.concatenate(slices, axis=0)
+            if is_batch:
+                acc_list = accepted.tolist()
+                slices = [
+                    conv_input[
+                        bi : bi + 1, int(acc_list[bi]) + 1 : int(acc_list[bi]) + K
+                    ]
+                    for bi in range(accepted.shape[0])
+                ]
+                c[0] = mx.concatenate(slices, axis=0)
+            else:
+                a0 = int(accepted[0].item())
+                c[0] = conv_input[:, a0 + 1 : a0 + K]
             j += 1
         return max_a
 
