@@ -36,17 +36,14 @@ class VisionDataset:
         """Process a single item from the dataset"""
         from mlx_vlm.utils import prepare_inputs, process_inputs_with_fallback
 
-        # Handle images
         images = item.get("images", item.get("image", []))
         if not isinstance(images, list):
             images = [images] if images else []
 
-        # Handle audio
         audio = item.get("audio", item.get("audios", []))
         if not isinstance(audio, list):
             audio = [audio] if audio else []
 
-        # Get conversations
         conversations = item.get("messages", item.get("conversations"))
 
         model_type = self.config.get("model_type")
@@ -87,7 +84,6 @@ class VisionDataset:
             )
             prompts.append(prompt)
 
-        # Prepare inputs - always pass images so the processor computes pixel values
         image_token_index = self.config.get("image_token_index") or self.config.get(
             "image_token_id"
         )
