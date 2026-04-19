@@ -210,7 +210,12 @@ class Attention(nn.Module):
             else:
                 values = self.v_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
 
-            offset = mx.array(cache.offset) if cache is not None else 0
+            if cache is not None:
+                offset = cache.offset
+                if isinstance(offset, mx.array):
+                    offset = mx.array(offset)
+            else:
+                offset = 0
 
             keys = self.k_norm(keys)
             keys = keys.transpose(0, 2, 1, 3)
