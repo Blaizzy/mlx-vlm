@@ -61,7 +61,7 @@ class TestDataset(unittest.TestCase):
         )
         self.assertTrue(mx.array_equal(result["attention_mask"], mx.array([1, 1, 1])))
         self.assertEqual(result["image_grid_thw"], (1, 1, 1))
-        self.assertEqual(result["image_sizes"], [224, 224])
+        self.assertTrue(mx.array_equal(result["image_sizes"], mx.array([224, 224])))
 
     @patch("mlx_vlm.trainer.datasets.apply_chat_template")
     @patch("mlx_vlm.utils.prepare_inputs")
