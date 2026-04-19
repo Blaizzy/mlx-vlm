@@ -442,13 +442,9 @@ class LanguageModel(nn.Module):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         rope_deltas_kw = kwargs.pop("rope_deltas", None)
-        # reset rope_deltas and position_ids when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None
             self._position_ids = None
-        if position_ids is not None and position_ids.ndim == 3:
-            self._position_ids = position_ids.transpose(1, 0, 2)
-            position_ids = None
         if rope_deltas_kw is not None:
             self._rope_deltas = rope_deltas_kw
 
