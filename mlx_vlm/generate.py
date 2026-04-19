@@ -1477,10 +1477,6 @@ class BatchGenerator:
     """
     Continuous batching with separate prompt processing and generation phases.
 
-    Follows mlx-lm's architecture: generation happens first (decode-first
-    ordering), then prompt processing for new sequences. This maximizes
-    generation throughput while interleaving prompt processing.
-
     next() returns (prompt_responses, generation_responses) where:
     - prompt_responses is currently always [] (reserved for progress tracking)
     - generation_responses is a list of GenerationBatch.Response objects
@@ -1539,8 +1535,6 @@ class BatchGenerator:
         self._gen_tokens_counter = 0
         self._steps_counter = 0
 
-        # Hold wired_limit open for the lifetime of this generator so GPU
-        # residency matches what stream_generate gets via its own context.
         self._wire_stack = contextlib.ExitStack()
         self._wire_stack.enter_context(wired_limit(model, [generation_stream]))
 
@@ -1577,18 +1571,7 @@ class BatchGenerator:
         return uids
 
     def remove(self, uid) -> bool:
-        """Remove a sequence from the batch by uid.
-
-        Removes from unprocessed_sequences, prompt_batch, or generation_batch
-        depending on where the sequence currently lives. Returns True if the
-        uid was found and removed. Runs inside the generation stream so cache
-        filter ops are ordered correctly against pending async evals.
-
-        When a PromptProcessingBatch holds multiple sequences, only the whole
-        batch can be discarded — so this only tears the prompt_batch down when
-        uid is its sole occupant, otherwise it falls through and catches the
-        uid in the generation batch after prefill transitions.
-        """
+        """Remove a sequence from the batch by uid."""
         with mx.stream(generation_stream):
             # Waiting in the queue.
             for i, (seq_uid, _, _, _) in enumerate(self._unprocessed_sequences):
@@ -1596,10 +1579,7 @@ class BatchGenerator:
                     self._unprocessed_sequences.pop(i)
                     return True
 
-            # Being prefilled — only safe to tear down when this uid is the
-            # sole occupant; otherwise we'd cancel its batch siblings too.
-            # Fall through so a multi-sequence prefill still has its transition
-            # caught in the generation batch below.
+            # Being prefilled
             if self._prompt_batch is not None and uid in self._prompt_batch.uids:
                 if len(self._prompt_batch.uids) == 1:
                     self._prompt_batch.uids = []
