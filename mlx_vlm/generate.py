@@ -18,7 +18,7 @@ from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
-from .turboquant import TurboQuantKVCache, turboquant_enabled
+from .turboquant import BatchTurboQuantKVCache, TurboQuantKVCache, turboquant_enabled
 from .utils import (
     StoppingCriteria,
     ThinkingBudgetCriteria,
@@ -934,18 +934,57 @@ def _left_pad_prompts(prompts, max_length=None):
     return mx.array([[0] * (max_length - len(p)) + p for p in prompts])
 
 
-def _make_cache(model, left_padding):
+def _extend_cache(cache_a, cache_b):
+    """Extend cache_a with cache_b along the batch dimension."""
+    if not cache_a:
+        return cache_b
+    if not cache_b:
+        return cache_a
+    for ca, cb in zip(cache_a, cache_b):
+        ca.extend(cb)
+    return cache_a
+
+
+def _make_cache(
+    model,
+    left_padding,
+    kv_bits=None,
+    kv_group_size=64,
+    kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
+):
     """
     Convert a list of regular caches into their corresponding
     batch-aware caches.
-    """
 
-    def to_batch_cache(c):
+    When *kv_bits* is set, a quantized batch cache is used instead of
+    ``BatchKVCache`` so that KV states are quantized on-the-fly during
+    generation, reducing memory usage for long sequences.
+
+    *kv_quant_scheme* selects the quantization backend:
+    - ``"uniform"`` → ``BatchQuantizedKVCache`` (``mx.quantize``)
+    - ``"turboquant"`` or fractional *kv_bits* → ``BatchTurboQuantKVCache``
+    """
+    use_turbo = kv_bits is not None and turboquant_enabled(kv_bits, kv_quant_scheme)
+
+    def _make_quant_cache(lp):
+        if use_turbo:
+            return BatchTurboQuantKVCache(lp, bits=kv_bits)
+        return cache.BatchQuantizedKVCache(
+            lp, group_size=kv_group_size, bits=int(kv_bits)
+        )
+
+    def to_batch_cache(c, quantize=True):
         if isinstance(c, cache.KVCache):
+            if kv_bits is not None and quantize:
+                return _make_quant_cache(left_padding)
             return cache.BatchKVCache(left_padding)
         elif isinstance(c, cache.ChunkedKVCache):
+            if kv_bits is not None and quantize:
+                return _make_quant_cache(left_padding)
             return cache.BatchKVCache(left_padding)
         elif isinstance(c, cache.SimpleKVCache):
+            if kv_bits is not None and quantize:
+                return _make_quant_cache(left_padding)
             return cache.BatchKVCache(left_padding)
         elif isinstance(c, cache.ArraysCache):
             c.left_padding = mx.array(left_padding)
@@ -963,8 +1002,23 @@ def _make_cache(model, left_padding):
 
     if hasattr(model, "make_cache"):
         model_cache = model.make_cache()
-        return [to_batch_cache(c) for c in model_cache]
+        n = len(model_cache)
+        # Skip quantizing the last layer — it's sensitive to quantization
+        return [
+            to_batch_cache(c, quantize=(i < n - 1 if n > 2 else True))
+            for i, c in enumerate(model_cache)
+        ]
     else:
+        if kv_bits is not None:
+            n = len(model.layers)
+            return [
+                (
+                    _make_quant_cache(left_padding)
+                    if i < n - 1 or n <= 2
+                    else cache.BatchKVCache(left_padding)
+                )
+                for i in range(n)
+            ]
         return [cache.BatchKVCache(left_padding) for _ in model.layers]
 
 
@@ -1010,45 +1064,405 @@ class BatchResponse:
     image_sizes: Optional[List[Tuple[int, int]]] = None
 
 
-@dataclass
-class Batch:
-    uids: List[int]
-    y: mx.array
-    logprobs: mx.array
-    max_tokens: List[int]
-    num_tokens: List[int]
-    cache: List[Any]
+class GenerationBatch:
+    """
+    Batched token generator with double-buffered pipelining.
 
-    def __len__(self):
-        return len(self.uids)
+    Manages the generation phase after prompt processing, with KV caches,
+    sampling, and stop detection for multiple sequences. Uses async_eval
+    to overlap GPU computation with CPU processing (decode-ahead pattern).
+    """
 
-    def filter(self, keep_idx: List[int]):
-        self.uids = [self.uids[k] for k in keep_idx]
-        self.max_tokens = [self.max_tokens[k] for k in keep_idx]
-        self.num_tokens = [self.num_tokens[k] for k in keep_idx]
-        keep_idx = mx.array(keep_idx, mx.int32)
-        self.y = self.y[keep_idx]
-        self.logprobs = self.logprobs[keep_idx]
-        for c in self.cache:
-            c.filter(keep_idx)
-
-    def extend(self, other):
-        self.uids.extend(other.uids)
-        self.y = mx.concatenate([self.y, other.y])
-        self.logprobs = mx.concatenate([self.logprobs, other.logprobs])
-        self.num_tokens.extend(other.num_tokens)
-        self.max_tokens.extend(other.max_tokens)
-        for c, o in zip(self.cache, other.cache):
-            c.extend(o)
-
-
-class BatchGenerator:
     @dataclass
     class Response:
         uid: int
         token: int
-        logprobs: mx.array
+        token_logprob: float
         finish_reason: Optional[str]
+        top_logprobs: Optional[List[Tuple[int, float]]] = None
+
+    def __init__(
+        self,
+        model: nn.Module,
+        uids: List[int],
+        inputs: mx.array,
+        prompt_cache: List[Any],
+        sampler: Callable[[mx.array], mx.array],
+        stop_criteria,
+        max_tokens: List[int],
+        top_logprobs_k: int = 0,
+    ):
+        self.model = model
+        self._language_model = getattr(model, "language_model", model)
+        self.uids = uids
+        self.prompt_cache = prompt_cache
+        self.sampler = sampler
+        self.stop_criteria = stop_criteria
+        self.max_tokens = max_tokens
+        self._num_tokens = [0] * len(uids)
+        self.compute_logprobs = True
+        self.top_logprobs_k = top_logprobs_k
+
+        self._current_tokens = None
+        self._current_lps = None
+        self._next_tokens = inputs
+        self._next_lps = None
+        self._next_top_idx = None
+        self._next_top_lp = None
+
+        # Per-sequence MRoPE delta
+        self._rope_deltas = None
+
+    def __len__(self):
+        return len(self.uids)
+
+    def _step(self):
+        """Perform one generation step with double buffering."""
+        self._current_tokens = self._next_tokens
+        self._current_lps = self._next_lps
+        inputs = self._current_tokens
+
+        fwd_kwargs = {}
+        if self._rope_deltas is not None:
+            fwd_kwargs["rope_deltas"] = self._rope_deltas
+
+        output = self._language_model(
+            inputs[:, None], cache=self.prompt_cache, **fwd_kwargs
+        )
+        logits = output.logits if hasattr(output, "logits") else output
+        logits = logits[:, -1, :]
+
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        sampled = self.sampler(logprobs)
+
+        self._next_tokens = sampled
+        prev_top_idx = self._next_top_idx
+        prev_top_lp = self._next_top_lp
+
+        eval_targets = [self._next_tokens]
+        if self.compute_logprobs:
+            self._next_lps = logprobs[mx.arange(sampled.shape[0]), sampled]
+            eval_targets.append(self._next_lps)
+        else:
+            self._next_lps = None
+
+        k = self.top_logprobs_k
+        if k > 0:
+            # argsort ascending; take last K columns and reverse for descending.
+            sort_idx = mx.argsort(logprobs, axis=-1)
+            top_idx = sort_idx[..., -k:][..., ::-1].astype(mx.int32)
+            top_lp = mx.take_along_axis(logprobs, top_idx, axis=-1)
+            self._next_top_idx = top_idx
+            self._next_top_lp = top_lp
+            eval_targets.extend([top_idx, top_lp])
+        else:
+            self._next_top_idx = None
+            self._next_top_lp = None
+
+        mx.async_eval(*eval_targets)
+
+        if self._current_lps is not None:
+            to_eval = [inputs, self._current_lps]
+            if prev_top_idx is not None:
+                to_eval.extend([prev_top_idx, prev_top_lp])
+            mx.eval(*to_eval)
+            top_idx_list = prev_top_idx.tolist() if prev_top_idx is not None else None
+            top_lp_list = prev_top_lp.tolist() if prev_top_lp is not None else None
+            return (
+                inputs.tolist(),
+                self._current_lps.tolist(),
+                top_idx_list,
+                top_lp_list,
+            )
+        else:
+            mx.eval(inputs)
+            return inputs.tolist(), None, None, None
+
+    def extend(self, other: "GenerationBatch"):
+        """Extend this batch with another generation batch."""
+        self.uids.extend(other.uids)
+        self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
+        self.max_tokens.extend(other.max_tokens)
+        self._num_tokens.extend(other._num_tokens)
+
+        if self._current_tokens is None:
+            self._current_tokens = other._current_tokens
+            self._current_lps = other._current_lps
+        elif other._current_tokens is not None:
+            self._current_tokens = mx.concatenate(
+                [self._current_tokens, other._current_tokens]
+            )
+            if self._current_lps is not None and other._current_lps is not None:
+                self._current_lps = mx.concatenate(
+                    [self._current_lps, other._current_lps]
+                )
+
+        if self._next_tokens is None:
+            self._next_tokens = other._next_tokens
+            self._next_lps = other._next_lps
+            self._next_top_idx = other._next_top_idx
+            self._next_top_lp = other._next_top_lp
+        elif other._next_tokens is not None:
+            self._next_tokens = mx.concatenate([self._next_tokens, other._next_tokens])
+            if self._next_lps is not None and other._next_lps is not None:
+                self._next_lps = mx.concatenate([self._next_lps, other._next_lps])
+
+            if (
+                self._next_top_idx is not None
+                and other._next_top_idx is not None
+                and self._next_top_idx.shape[-1] == other._next_top_idx.shape[-1]
+            ):
+                self._next_top_idx = mx.concatenate(
+                    [self._next_top_idx, other._next_top_idx]
+                )
+                self._next_top_lp = mx.concatenate(
+                    [self._next_top_lp, other._next_top_lp]
+                )
+            else:
+                self._next_top_idx = None
+                self._next_top_lp = None
+
+        if self._rope_deltas is None:
+            self._rope_deltas = other._rope_deltas
+        elif other._rope_deltas is not None:
+            self._rope_deltas = mx.concatenate([self._rope_deltas, other._rope_deltas])
+
+    def filter(self, keep: List[int]):
+        """Filter the batch to keep only the specified indices."""
+        self.uids = [self.uids[idx] for idx in keep]
+        self.max_tokens = [self.max_tokens[idx] for idx in keep]
+        self._num_tokens = [self._num_tokens[idx] for idx in keep]
+
+        if not keep:
+            self.prompt_cache.clear()
+            self._current_tokens = None
+            self._current_lps = None
+            self._next_tokens = None
+            self._next_lps = None
+            self._next_top_idx = None
+            self._next_top_lp = None
+            self._rope_deltas = None
+        else:
+            keep_arr = mx.array(keep, mx.int32)
+            for c in self.prompt_cache:
+                c.filter(keep_arr)
+            if self._next_tokens is not None:
+                self._next_tokens = self._next_tokens[keep_arr]
+            if self._next_lps is not None:
+                self._next_lps = self._next_lps[keep_arr]
+            if self._next_top_idx is not None:
+                self._next_top_idx = self._next_top_idx[keep_arr]
+                self._next_top_lp = self._next_top_lp[keep_arr]
+            if self._rope_deltas is not None:
+                self._rope_deltas = self._rope_deltas[keep_arr]
+
+    def next(self) -> List[Response]:
+        """Generate the next batch of tokens."""
+        if not self.uids:
+            return []
+
+        tokens, lp_list, top_idx_list, top_lp_list = self._step()
+
+        keep = []
+        responses = []
+        for i in range(len(self.uids)):
+            finish_reason = None
+            self._num_tokens[i] += 1
+            tok = tokens[i]
+
+            if self.stop_criteria(tok):
+                finish_reason = "stop"
+            elif self._num_tokens[i] >= self.max_tokens[i]:
+                finish_reason = "length"
+
+            if finish_reason is None:
+                keep.append(i)
+
+            top_lp = None
+            if top_idx_list is not None:
+                top_lp = list(zip(top_idx_list[i], top_lp_list[i]))
+
+            responses.append(
+                self.Response(
+                    uid=self.uids[i],
+                    token=tok,
+                    token_logprob=lp_list[i] if lp_list is not None else 0.0,
+                    finish_reason=finish_reason,
+                    top_logprobs=top_lp,
+                )
+            )
+
+        if len(keep) < len(self.uids):
+            self.filter(keep)
+
+        return responses
+
+    @classmethod
+    def empty(
+        cls, model, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
+    ):
+        """Create an empty generation batch."""
+        batch = cls.__new__(cls)
+        batch.model = model
+        batch._language_model = getattr(model, "language_model", model)
+        batch.uids = []
+        batch.prompt_cache = []
+        batch.sampler = sampler
+        batch.stop_criteria = stop_criteria
+        batch.max_tokens = []
+        batch._num_tokens = []
+        batch.compute_logprobs = compute_logprobs
+        batch.top_logprobs_k = top_logprobs_k
+        batch._current_tokens = None
+        batch._current_lps = None
+        batch._next_tokens = None
+        batch._next_lps = None
+        batch._next_top_idx = None
+        batch._next_top_lp = None
+        batch._rope_deltas = None
+        return batch
+
+
+class PromptProcessingBatch:
+    """
+    Handles VLM prompt processing with inputs_embeds and chunked prefill.
+
+    Processes prompt tokens incrementally (one chunk per step) to allow
+    interleaving with generation for continuous batching. Transitions to
+    a GenerationBatch when prompt processing is complete.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        uids: List[int],
+        input_ids: List[List[int]],
+        max_tokens: List[int],
+        inputs_embeds: mx.array,
+        prompt_kwargs: dict,
+        prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
+        kv_bits=None,
+        kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
+        kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
+    ):
+        self.model = model
+        self.uids = uids
+        self.max_tokens = max_tokens
+        self.prefill_step_size = prefill_step_size
+
+        lengths = [len(ids) for ids in input_ids]
+        max_length = max(lengths)
+        left_padding = [max_length - l for l in lengths]
+        self._total_prompt_tokens = sum(lengths)
+
+        self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
+        self._inputs_embeds = inputs_embeds
+        self._prompt_kwargs = prompt_kwargs
+
+        self.prompt_cache = _make_cache(
+            model,
+            left_padding,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            kv_quant_scheme=kv_quant_scheme,
+        )
+
+    def __len__(self):
+        return len(self.uids)
+
+    def needs_processing(self):
+        """True if prompt needs chunked processing before generate()."""
+        if self._inputs_embeds is None or self.prefill_step_size is None:
+            return False
+        return self._inputs_embeds.shape[1] > self.prefill_step_size
+
+    def prompt_step(self) -> int:
+        """Process one chunk of the prompt. Returns tokens processed."""
+        if not self.needs_processing():
+            return 0
+
+        n = min(self.prefill_step_size, self._inputs_embeds.shape[1] - 1)
+        self.model(
+            self._input_ids[:, :n],
+            cache=self.prompt_cache,
+            inputs_embeds=self._inputs_embeds[:, :n],
+            n_to_process=n,
+            **self._prompt_kwargs,
+        )
+        mx.eval([c.state for c in self.prompt_cache])
+        self._inputs_embeds = self._inputs_embeds[:, n:]
+        self._input_ids = self._input_ids[:, n:]
+        mx.clear_cache()
+        return n
+
+    def generate(
+        self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
+    ) -> GenerationBatch:
+        """Process final tokens and transition to GenerationBatch."""
+        output = self.model(
+            self._input_ids,
+            cache=self.prompt_cache,
+            inputs_embeds=self._inputs_embeds,
+            **self._prompt_kwargs,
+        )
+        logits = output.logits if hasattr(output, "logits") else output
+        logits = logits[:, -1, :]
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        first_tokens = sampler(logprobs)
+
+        gen_batch = GenerationBatch(
+            model=self.model,
+            uids=list(self.uids),
+            inputs=first_tokens,
+            prompt_cache=self.prompt_cache,
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=list(self.max_tokens),
+            top_logprobs_k=top_logprobs_k,
+        )
+        gen_batch.compute_logprobs = compute_logprobs
+
+        if compute_logprobs:
+            gen_batch._next_lps = logprobs[
+                mx.arange(first_tokens.shape[0]), first_tokens
+            ]
+
+        # Prime top-K buffers so the first token can emit top_logprobs too.
+        if top_logprobs_k > 0:
+            k = top_logprobs_k
+            sort_idx = mx.argsort(logprobs, axis=-1)
+            top_idx = sort_idx[..., -k:][..., ::-1].astype(mx.int32)
+            top_lp = mx.take_along_axis(logprobs, top_idx, axis=-1)
+            gen_batch._next_top_idx = top_idx
+            gen_batch._next_top_lp = top_lp
+
+        language_model = getattr(self.model, "language_model", self.model)
+        rope_deltas = getattr(language_model, "_rope_deltas", None)
+        if rope_deltas is not None:
+            # Normalize to shape (B, 1) so extend/filter stay consistent.
+            if rope_deltas.ndim == 0:
+                rope_deltas = rope_deltas.reshape(1, 1)
+            elif rope_deltas.ndim == 1:
+                rope_deltas = rope_deltas[:, None]
+            gen_batch._rope_deltas = rope_deltas
+
+        self.uids = []
+        self.prompt_cache = []
+        return gen_batch
+
+    @property
+    def total_prompt_tokens(self):
+        return self._total_prompt_tokens
+
+
+class BatchGenerator:
+    """
+    Continuous batching with separate prompt processing and generation phases.
+
+    next() returns (prompt_responses, generation_responses) where:
+    - prompt_responses is currently always [] (reserved for progress tracking)
+    - generation_responses is a list of GenerationBatch.Response objects
+    """
 
     def __init__(
         self,
@@ -1061,11 +1475,22 @@ class BatchGenerator:
         prefill_batch_size: int = DEFAULT_PREFILL_BATCH_SIZE,
         prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
         prompt_cache=None,
+        kv_bits=None,
+        kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
+        kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
+        quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
+        compute_logprobs: bool = True,
+        top_logprobs_k: int = 0,
     ):
         self.model = model
-        self.unprocessed_prompts = []
         self.max_tokens = max_tokens
         self.processor = processor
+        self.kv_bits = kv_bits
+        self.kv_group_size = kv_group_size
+        self.kv_quant_scheme = kv_quant_scheme
+        self.quantized_kv_start = quantized_kv_start
+        self.compute_logprobs = compute_logprobs
+        self.top_logprobs_k = top_logprobs_k
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1074,192 +1499,223 @@ class BatchGenerator:
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = completion_batch_size
-        self.prompt_cache = prompt_cache
-        self._stats = BatchStats()
 
         self.tokenizer.stopping_criteria.add_eos_token_ids(stop_tokens)
 
-        self.active_batch = None
+        self._generation_batch = GenerationBatch.empty(
+            self.model,
+            self.sampler,
+            self.tokenizer.stopping_criteria,
+            compute_logprobs=self.compute_logprobs,
+            top_logprobs_k=self.top_logprobs_k,
+        )
+        self._prompt_batch: Optional[PromptProcessingBatch] = None
+        self._unprocessed_sequences = []
 
-    def insert(self, prompts, max_tokens: Union[List[int], int, None] = None):
+        self._prompt_tokens_counter = 0
+        self._prompt_time_counter = 0
+        self._gen_tokens_counter = 0
+        self._steps_counter = 0
+
+        self._wire_stack = contextlib.ExitStack()
+        self._wire_stack.enter_context(wired_limit(model, [generation_stream]))
+
+    def close(self):
+        if self._wire_stack is not None:
+            self._wire_stack.close()
+            self._wire_stack = None
+
+    def __del__(self):
+        self.close()
+
+    def insert(
+        self,
+        prompts,
+        max_tokens: Union[List[int], int, None] = None,
+        prompt_kwargs: Optional[List[dict]] = None,
+    ):
         uids = []
 
         if max_tokens is None or isinstance(max_tokens, int):
             max_tokens = [max_tokens or self.max_tokens] * len(prompts)
 
-        for p, m in zip(prompts, max_tokens):
-            self.unprocessed_prompts.append((self.uid_count, p, m))
+        if prompt_kwargs is None:
+            prompt_kwargs = [{}] * len(prompts)
+
+        for p, m, kw in zip(prompts, max_tokens, prompt_kwargs):
+            self._unprocessed_sequences.append((self.uid_count, p, m, kw))
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
-        self.unprocessed_prompts = sorted(
-            self.unprocessed_prompts, key=lambda x: len(x[1])
+        self._unprocessed_sequences = sorted(
+            self._unprocessed_sequences, key=lambda x: len(x[1])
         )
         return uids
 
-    def _process_prompts(self, prompts, **kwargs) -> Batch:
-        uids, inputs, max_tokens = zip(*prompts)
-        lengths = [len(p) for p in inputs]
-        max_length = max(lengths)
+    def remove(self, uid) -> bool:
+        """Remove a sequence from the batch by uid."""
+        with mx.stream(generation_stream):
+            # Waiting in the queue.
+            for i, (seq_uid, _, _, _) in enumerate(self._unprocessed_sequences):
+                if seq_uid == uid:
+                    self._unprocessed_sequences.pop(i)
+                    return True
 
-        self._stats.prompt_tokens += sum(lengths)
-        left_padding = [max_length - l for l in lengths]
-        inputs = _left_pad_prompts(inputs, max_length=max_length)
+            # Being prefilled
+            if self._prompt_batch is not None and uid in self._prompt_batch.uids:
+                if len(self._prompt_batch.uids) == 1:
+                    self._prompt_batch.uids = []
+                    self._prompt_batch.prompt_cache = []
+                    self._prompt_batch = None
+                    mx.clear_cache()
+                    return True
 
-        # Reset cached position state from previous prefills
-        # (e.g. Qwen3.5 caches _position_ids / _rope_deltas on the model)
-        if hasattr(self.model, "_position_ids"):
-            self.model._position_ids = None
-        if hasattr(self.model, "_rope_deltas"):
-            self.model._rope_deltas = None
+            # Already decoding.
+            if uid in self._generation_batch.uids:
+                idx = self._generation_batch.uids.index(uid)
+                keep = [i for i in range(len(self._generation_batch.uids)) if i != idx]
+                self._generation_batch.filter(keep)
+                return True
 
-        if self.prompt_cache is not None:
-            prompt_cache = self.prompt_cache
-        else:
-            # Always use batch-aware caches so extend() works in
-            # continuous batching when new sequences join later.
-            prompt_cache = _make_cache(self.model, left_padding)
+            return False
 
-        # Slice batch data in kwargs to match current batch size
-        batch_size = len(uids)
-        for key, value in kwargs.items():
-            if isinstance(value, mx.array) and value.ndim > 0:
-                kwargs[key] = value[:batch_size]
+    @property
+    def unprocessed_prompts(self):
+        """Backward-compatible alias for server flush logic."""
+        return self._unprocessed_sequences
 
-        inputs_embeds = kwargs.pop("inputs_embeds", None)
-        if inputs_embeds is None:
-            raise ValueError("inputs_embeds is required")
+    @property
+    def has_pending_prompts(self):
+        """True if there are prompts waiting or being processed."""
+        return len(self._unprocessed_sequences) > 0 or self._prompt_batch is not None
 
-        if (
-            self.prefill_step_size is not None
-            and inputs_embeds.shape[1] > self.prefill_step_size
-        ):
-            # Chunked prefill with embeddings
-            while inputs_embeds.shape[1] > 1:
-                n_to_process = min(self.prefill_step_size, inputs_embeds.shape[1] - 1)
-                self.model(
-                    inputs[:, :n_to_process],
-                    cache=prompt_cache,
-                    inputs_embeds=inputs_embeds[:, :n_to_process],
-                    n_to_process=n_to_process,
-                    **kwargs,
-                )
-                mx.eval([c.state for c in prompt_cache])
-                inputs_embeds = inputs_embeds[:, n_to_process:]
-                inputs = inputs[:, n_to_process:]
-                mx.clear_cache()
-
-        y, logprobs = self._step(
-            inputs, prompt_cache, inputs_embeds=inputs_embeds, **kwargs
+    @property
+    def has_work(self):
+        """True if there is any remaining work."""
+        return (
+            len(self._generation_batch) > 0
+            or self._prompt_batch is not None
+            or len(self._unprocessed_sequences) > 0
         )
-
-        mx.async_eval(y, logprobs)
-        mx.clear_cache()
-        return Batch(
-            list(uids), y, logprobs, list(max_tokens), [0] * len(uids), prompt_cache
-        )
-
-    def _step(self, input_tokens: mx.array, prompt_cache: List[Any], **kwargs):
-        output = self.model(input_tokens, cache=prompt_cache, **kwargs)
-        logits = output.logits[:, -1, :]
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        sampled = self.sampler(logprobs)
-
-        # TODO: Add KV cache quantization if specified
-        return sampled, logprobs
 
     def stats(self):
-        self._stats.prompt_tps = self._stats.prompt_tokens / self._stats.prompt_time
-        self._stats.generation_tps = (
-            self._stats.generation_tokens / self._stats.generation_time
+        """Return accumulated batch statistics."""
+        stats = BatchStats()
+        stats.prompt_tokens = self._prompt_tokens_counter
+        stats.prompt_time = self._prompt_time_counter
+        stats.prompt_tps = (
+            self._prompt_tokens_counter / self._prompt_time_counter
+            if self._prompt_time_counter > 0
+            else 0
         )
-        self._stats.peak_memory = mx.get_peak_memory() / 1e9
-        return self._stats
+        stats.generation_tokens = self._gen_tokens_counter
+        stats.peak_memory = mx.get_peak_memory() / 1e9
+        return stats
 
     def _next(self, **kwargs):
-        tic = time.perf_counter()
+        generation_responses = []
+        prompt_responses = []
 
-        prompt_processing = False
-        batch = self.active_batch
-        num_active = len(batch) if batch else 0
-        num_to_add = self.completion_batch_size - num_active
-        while num_to_add >= self.prefill_batch_size:
-            prompts = self.unprocessed_prompts[: self.prefill_batch_size]
-            # Finish processing the last examples of the last batch
-            if len(prompts) == 0 and num_active > 0:
-                break
-            # No more prompts and no more completions, all done
-            elif len(prompts) == 0:
-                self.active_batch = None
-                return []
-            # Process prompts
-            if batch is not None and not prompt_processing:
-                # Finish any active completion tokens
-                mx.eval(batch.y, batch.logprobs)
-                self._stats.generation_time += time.perf_counter() - tic
+        # Decode-first: always emit a generation step before touching prefill.
+        if len(self._generation_batch) > 0:
+            generation_responses = self._generation_batch.next()
+            self._gen_tokens_counter += len(generation_responses)
+            self._steps_counter += 1
+            if self._steps_counter % 512 == 0:
+                mx.clear_cache()
+
+        if len(self._generation_batch) >= self.completion_batch_size:
+            return prompt_responses, generation_responses
+
+        if self._prompt_batch is not None:
+            if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
+                n = self._prompt_batch.prompt_step()
+                self._prompt_time_counter += time.perf_counter() - tic
+                self._prompt_tokens_counter += n
+                return prompt_responses, generation_responses
 
-            batch = self._process_prompts(prompts, **kwargs)
-            self.unprocessed_prompts = self.unprocessed_prompts[
-                self.prefill_batch_size :
-            ]
-            prompt_processing = True
-            # If there was no active batch, set it
-            if self.active_batch is None:
-                self.active_batch = batch
-            else:
-                self.active_batch.extend(batch)
-
-            num_active = len(self.active_batch)
-            num_to_add -= len(batch)
-
-        batch = self.active_batch
-        y, logprobs = batch.y, batch.logprobs
-        batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
-        mx.async_eval(batch.y, batch.logprobs)
-
-        y = y.tolist()
-        toc = time.perf_counter()
-        if prompt_processing:
-            self._stats.prompt_time += toc - tic
-        else:
-            self._stats.generation_time += toc - tic
-        keep_idx = []
-        end_idx = []
-        responses = []
-
-        for e, (t, uid, num_tok, max_tok) in enumerate(
-            zip(y, batch.uids, batch.num_tokens, batch.max_tokens)
-        ):
-            num_tok += 1
-            batch.num_tokens[e] = num_tok
-            if self.tokenizer.stopping_criteria(t):
-                finish_reason = "stop"
-                end_idx.append(e)
-            elif num_tok >= max_tok:
-                finish_reason = "length"
-                end_idx.append(e)
-            else:
-                finish_reason = None
-                keep_idx.append(e)
-            responses.append(self.Response(uid, t, logprobs[e], finish_reason))
-
-        # Remove any finished completions
-        if len(end_idx):
-            if len(keep_idx) > 0:
-                batch.filter(keep_idx)
-            else:
-                self.active_batch = None
-
-        self._stats.generation_tokens += len(responses)
-
-        if len(responses) > 0 and self._stats.generation_tokens % 100 == 0:
+            tic = time.perf_counter()
+            gen_batch = self._prompt_batch.generate(
+                self.sampler,
+                self.tokenizer.stopping_criteria,
+                compute_logprobs=self.compute_logprobs,
+                top_logprobs_k=self.top_logprobs_k,
+            )
+            self._prompt_time_counter += time.perf_counter() - tic
+            self._generation_batch.extend(gen_batch)
+            self._prompt_batch = None
             mx.clear_cache()
+            return prompt_responses, generation_responses
 
-        return responses
+        num_active = len(self._generation_batch)
+        num_to_add = self.completion_batch_size - num_active
+        if self._unprocessed_sequences and num_to_add >= self.prefill_batch_size:
+            n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
+            sequences = self._unprocessed_sequences[:n]
+            self._unprocessed_sequences = self._unprocessed_sequences[n:]
+
+            uids = [s[0] for s in sequences]
+            input_ids = [s[1] for s in sequences]
+            max_tokens_list = [s[2] for s in sequences]
+            prompt_kwargs_list = [s[3] for s in sequences]
+
+            inputs_embeds = None
+            merged_kwargs = {}
+            for kw in prompt_kwargs_list:
+                if kw:
+                    inputs_embeds = kw.get("inputs_embeds", inputs_embeds)
+                    merged_kwargs = {
+                        k: v for k, v in kw.items() if k != "inputs_embeds"
+                    }
+                    break
+
+            if inputs_embeds is None:
+                raise ValueError("inputs_embeds is required")
+
+            batch_size = len(uids)
+            for key, value in merged_kwargs.items():
+                if isinstance(value, mx.array) and value.ndim > 0:
+                    merged_kwargs[key] = value[:batch_size]
+
+            self._prompt_batch = PromptProcessingBatch(
+                model=self.model,
+                uids=uids,
+                input_ids=input_ids,
+                max_tokens=max_tokens_list,
+                inputs_embeds=inputs_embeds,
+                prompt_kwargs=merged_kwargs,
+                prefill_step_size=self.prefill_step_size,
+                kv_bits=self.kv_bits,
+                kv_group_size=self.kv_group_size,
+                kv_quant_scheme=self.kv_quant_scheme,
+            )
+            self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
+
+            if self._prompt_batch.needs_processing():
+                tic = time.perf_counter()
+                n = self._prompt_batch.prompt_step()
+                self._prompt_time_counter += time.perf_counter() - tic
+            else:
+                tic = time.perf_counter()
+                gen_batch = self._prompt_batch.generate(
+                    self.sampler,
+                    self.tokenizer.stopping_criteria,
+                    compute_logprobs=self.compute_logprobs,
+                    top_logprobs_k=self.top_logprobs_k,
+                )
+                self._prompt_time_counter += time.perf_counter() - tic
+                self._generation_batch.extend(gen_batch)
+                self._prompt_batch = None
+                mx.clear_cache()
+
+            return prompt_responses, generation_responses
+
+        return prompt_responses, generation_responses
 
     def next(self, **kwargs):
-        return self._next(**kwargs)
+        with mx.stream(generation_stream):
+            return self._next(**kwargs)
 
 
 def batch_generate(
@@ -1492,22 +1948,32 @@ def _generate_batch(
         processor,
         prefill_batch_size=batch_size,
         completion_batch_size=batch_size,
+        compute_logprobs=False,
         **kwargs,
     )
 
-    with wired_limit(model, [generation_stream]):
-        embedding_output = model.get_input_embeddings(
-            input_ids, pixel_values, mask=mask, **data_kwargs
-        )
+    embedding_output = model.get_input_embeddings(
+        input_ids, pixel_values, mask=mask, **data_kwargs
+    )
 
-        gen_kwargs = {**data_kwargs, **embedding_output.to_dict()}
+    gen_kwargs = {**data_kwargs, **embedding_output.to_dict()}
 
-        uids = gen.insert(input_ids.tolist(), max_tokens)
-        results = {uid: [] for uid in uids}
-        while responses := gen.next(**gen_kwargs):
-            for r in responses:
-                if r.finish_reason != "stop":
-                    results[r.uid].append(r.token)
+    uids = gen.insert(
+        input_ids.tolist(),
+        max_tokens,
+        prompt_kwargs=[gen_kwargs] * len(input_ids),
+    )
+    results = {uid: [] for uid in uids}
+
+    tic = time.perf_counter()
+    while gen.has_work:
+        _, generation_responses = gen.next()
+        for r in generation_responses:
+            if r.finish_reason != "stop":
+                results[r.uid].append(r.token)
+    total_time = time.perf_counter() - tic
+
+    gen.close()
 
     detokenizer = processor.detokenizer
     texts = []
@@ -1517,7 +1983,12 @@ def _generate_batch(
             detokenizer.add_token(t)
         detokenizer.finalize()
         texts.append(detokenizer.text)
-    return texts, gen.stats()
+
+    stats = gen.stats()
+    stats.generation_time = total_time - stats.prompt_time
+    if stats.generation_time > 0:
+        stats.generation_tps = stats.generation_tokens / stats.generation_time
+    return texts, stats
 
 
 def main():

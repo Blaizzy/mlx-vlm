@@ -257,7 +257,9 @@ class Qwen3VLModel(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            mask = create_attention_mask(
+                h, cache[0] if cache and cache[0] is not None else cache
+            )
         for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
             h = layer(h, mask, c, position_ids)
             # Add deepstack visual embeds
@@ -510,6 +512,7 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        rope_deltas_kw = kwargs.pop("rope_deltas", None)
         # reset rope_deltas and position_ids when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None
@@ -544,9 +547,7 @@ class LanguageModel(nn.Module):
                 or cache is None
             )
             if recalc_condition:
-                # Only reuse _position_ids for chunked prefill (cache_offset > 0)
-                # For new prompts (cache_offset == 0), always recalculate
-                if self._position_ids is not None and cache_offset > 0:
+                if self._position_ids is not None:
                     seq_length = inputs.shape[1]
                     position_ids = self._position_ids[
                         :, :, cache_offset : cache_offset + seq_length
@@ -568,9 +569,11 @@ class LanguageModel(nn.Module):
                 else:
                     base_offset = mx.array(cache_offset)
 
-                # Add rope_deltas if available
-                if self._rope_deltas is not None:
-                    rope_delta = self._rope_deltas
+                rope_delta_src = (
+                    rope_deltas_kw if rope_deltas_kw is not None else self._rope_deltas
+                )
+                if rope_delta_src is not None:
+                    rope_delta = rope_delta_src
                     if rope_delta.ndim == 0:
                         rope_delta = mx.expand_dims(rope_delta, axis=0)
                     if rope_delta.shape[0] < batch_size:
