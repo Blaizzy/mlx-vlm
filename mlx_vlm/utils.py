@@ -171,9 +171,6 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
-        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
-            to QQLinear layers for activation quantization. Only supported for models
-            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -199,7 +196,7 @@ Create safetensors using the following code:
 ```
 from transformers import AutoModelForCausalLM, AutoProcessor
 
-model_id= "<huggingface_model_id>"
+model_id = "<huggingface_model_id>"
 model = AutoModelForCausalLM.from_pretrained(model_id)
 processor = AutoProcessor.from_pretrained(model_id)
 
@@ -371,7 +368,7 @@ def load(
     Load the model and tokenizer from a given path or a huggingface repository.
 
     Args:
-        path_or_hf_repo (Path): The path or the huggingface repository to load the model from.
+        path_or_hf_repo (str): The path or the huggingface repository to load the model from.
         tokenizer_config (dict, optional): Configuration parameters specifically for the tokenizer.
             Defaults to an empty dictionary.
         adapter_path (str, optional): Path to the LoRA adapters. If provided, applies LoRA layers
@@ -381,10 +378,6 @@ def load(
             when needed. Default: ``False``
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
-        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
-            to QQLinear layers for activation quantization. Only supported for models
-            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
-
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
