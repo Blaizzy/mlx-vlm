@@ -741,6 +741,7 @@ class LanguageModel(nn.Module):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+        rope_deltas_kw = kwargs.pop("rope_deltas", None)
         if pixel_values is not None:
             self._rope_deltas = None
             self._position_ids = None
@@ -806,7 +807,6 @@ class LanguageModel(nn.Module):
                 or self._rope_deltas is None
                 or cache is None
             ):
-                # First prefill or fresh cache — compute position_ids
                 if (
                     self._position_ids is not None
                     and self._position_ids.shape[1] == batch_size
@@ -821,11 +821,13 @@ class LanguageModel(nn.Module):
                     self._rope_deltas = rope_deltas
                     self._position_ids = position_ids
             else:
-                # Generation step — build position_ids from cache offsets
                 if cache_offsets is not None and cache_offsets.size >= batch_size:
-                    # Batched: per-element offsets
                     offsets = cache_offsets[:batch_size]
-                    rope_deltas = self._rope_deltas
+                    rope_deltas = (
+                        rope_deltas_kw
+                        if rope_deltas_kw is not None
+                        else self._rope_deltas
+                    )
                     if rope_deltas.shape[0] > batch_size:
                         rope_deltas = rope_deltas[:batch_size]
                     delta = (offsets + rope_deltas.squeeze(-1))[:, None]

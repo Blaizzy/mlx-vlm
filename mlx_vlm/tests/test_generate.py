@@ -9,11 +9,11 @@ import mlx.core as mx
 import pytest
 
 from mlx_vlm.generate import (
-    Batch,
     BatchGenerationResult,
     BatchGenerator,
     BatchResponse,
     BatchStats,
+    GenerationBatch,
     GenerationResult,
     _left_pad_prompts,
     normalize_resize_shape,
@@ -282,72 +282,36 @@ class TestBatchResponse:
         assert response.image_sizes is None
 
 
-class TestBatch:
-    """Tests for Batch dataclass."""
+class TestGenerationBatch:
+    """Tests for GenerationBatch class."""
 
-    def test_creation(self):
-        batch = Batch(
-            uids=[0, 1, 2],
-            y=mx.array([10, 20, 30]),
-            logprobs=mx.zeros((3, 100)),
-            max_tokens=[50, 50, 50],
-            num_tokens=[5, 10, 15],
-            cache=[MagicMock()],
-        )
-        assert len(batch) == 3
-        assert batch.uids == [0, 1, 2]
-        assert batch.max_tokens == [50, 50, 50]
+    def test_empty_creation(self):
+        mock_model = MagicMock()
+        sampler = lambda x: mx.argmax(x, axis=-1)
+        stop_criteria = lambda tok: tok == 2
+        batch = GenerationBatch.empty(mock_model, sampler, stop_criteria)
+        assert len(batch) == 0
+        assert batch.uids == []
+        assert batch.max_tokens == []
 
     def test_filter(self):
-        # Create mock cache with filter method
-        mock_cache = MagicMock()
-        mock_cache.filter = MagicMock()
-
-        batch = Batch(
-            uids=[0, 1, 2],
-            y=mx.array([10, 20, 30]),
-            logprobs=mx.zeros((3, 100)),
-            max_tokens=[50, 60, 70],
-            num_tokens=[5, 10, 15],
-            cache=[mock_cache],
-        )
+        mock_model = MagicMock()
+        sampler = lambda x: mx.argmax(x, axis=-1)
+        stop_criteria = lambda tok: tok == 2
+        batch = GenerationBatch.empty(mock_model, sampler, stop_criteria)
+        batch.uids = [0, 1, 2]
+        batch.max_tokens = [50, 60, 70]
+        batch._num_tokens = [5, 10, 15]
+        batch._next_tokens = mx.array([10, 20, 30])
+        batch._next_logprobs = mx.zeros((3, 100))
 
         # Keep only indices 0 and 2
         batch.filter([0, 2])
 
         assert batch.uids == [0, 2]
         assert batch.max_tokens == [50, 70]
-        assert batch.num_tokens == [5, 15]
+        assert batch._num_tokens == [5, 15]
         assert len(batch) == 2
-
-    def test_extend(self):
-        mock_cache1 = MagicMock()
-        mock_cache1.extend = MagicMock()
-        mock_cache2 = MagicMock()
-
-        batch1 = Batch(
-            uids=[0, 1],
-            y=mx.array([10, 20]),
-            logprobs=mx.zeros((2, 100)),
-            max_tokens=[50, 50],
-            num_tokens=[5, 10],
-            cache=[mock_cache1],
-        )
-
-        batch2 = Batch(
-            uids=[2, 3],
-            y=mx.array([30, 40]),
-            logprobs=mx.zeros((2, 100)),
-            max_tokens=[60, 60],
-            num_tokens=[15, 20],
-            cache=[mock_cache2],
-        )
-
-        batch1.extend(batch2)
-
-        assert batch1.uids == [0, 1, 2, 3]
-        assert batch1.max_tokens == [50, 50, 60, 60]
-        assert len(batch1) == 4
 
 
 # ============================================================================
@@ -419,7 +383,7 @@ class TestBatchGenerator:
 
         assert gen.max_tokens == 128
         assert gen.model == mock_model.language_model
-        assert gen.active_batch is None
+        assert len(gen._generation_batch) == 0
         assert gen.uid_count == 0
 
     def test_insert_prompts(self, mock_model, mock_processor):
@@ -470,25 +434,49 @@ class TestBatchGenerator:
             processor=mock_processor,
         )
 
-        # Set some stats manually
-        gen._stats.prompt_tokens = 100
-        gen._stats.prompt_time = 0.5
-        gen._stats.generation_tokens = 50
-        gen._stats.generation_time = 0.25
+        # Set some stats manually via counters
+        gen._prompt_tokens_counter = 100
+        gen._prompt_time_counter = 0.5
+        gen._gen_tokens_counter = 50
 
         stats = gen.stats()
 
         assert stats.prompt_tps == 200.0  # 100 / 0.5
-        assert stats.generation_tps == 200.0  # 50 / 0.25
+        assert stats.prompt_tokens == 100
 
     def test_response_dataclass(self):
-        response = BatchGenerator.Response(
-            uid=0, token=42, logprobs=mx.array([0.1, 0.2]), finish_reason="stop"
+        response = GenerationBatch.Response(
+            uid=0, token=42, token_logprob=-0.5, finish_reason="stop"
         )
 
         assert response.uid == 0
         assert response.token == 42
         assert response.finish_reason == "stop"
+
+    def test_remove_from_unprocessed(self, mock_model, mock_processor):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+        )
+        uids = gen.insert([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+        assert len(gen.unprocessed_prompts) == 3
+
+        assert gen.remove(uids[1]) is True
+        assert len(gen.unprocessed_prompts) == 2
+        remaining_uids = [seq[0] for seq in gen.unprocessed_prompts]
+        assert uids[1] not in remaining_uids
+        assert uids[0] in remaining_uids
+        assert uids[2] in remaining_uids
+
+    def test_remove_missing_uid_returns_false(self, mock_model, mock_processor):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+        )
+        gen.insert([[1, 2, 3]])
+        assert gen.remove(9999) is False
 
 
 # ============================================================================

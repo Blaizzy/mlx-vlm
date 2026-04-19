@@ -72,14 +72,14 @@ class Attention(nn.Module):
 
         offset = cache.offset if cache else 0
 
-        if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., : keys.shape[-2]]
-
         queries = self.rotary_emb(queries, offset=offset)
         keys = self.rotary_emb(keys, offset=offset)
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
+
+        if mask is not None and isinstance(mask, mx.array):
+            mask = mask[..., : keys.shape[-2]]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache, scale=self.scale, mask=mask
@@ -154,7 +154,9 @@ class Qwen2Model(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            mask = create_attention_mask(
+                h, cache[0] if cache and cache[0] is not None else cache
+            )
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
