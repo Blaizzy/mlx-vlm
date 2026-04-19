@@ -399,7 +399,11 @@ class LanguageModel(nn.Module):
             if rd.ndim < 2:
                 rd = rd.reshape(-1, 1)
             if rd.shape[0] != base_offset.shape[0]:
-                rd = mx.broadcast_to(rd[:1], base_offset.shape) if rd.shape[0] < base_offset.shape[0] else rd[: base_offset.shape[0]]
+                rd = (
+                    mx.broadcast_to(rd[:1], base_offset.shape)
+                    if rd.shape[0] < base_offset.shape[0]
+                    else rd[: base_offset.shape[0]]
+                )
             start = base_offset + rd.astype(base_offset.dtype)
             position_ids = start + mx.arange(L, dtype=start.dtype).reshape(1, -1)
         else:
