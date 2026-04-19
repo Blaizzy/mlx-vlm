@@ -55,7 +55,6 @@ class VisionDataset:
         num_audios = len(audio)
 
         prompts = []
-        # Format prompt using apply_chat_template for consistency with inference
         if isinstance(conversations, list) and isinstance(conversations[0], list):
             for conversation in conversations:
                 if model_type == "pixtral":
@@ -97,8 +96,7 @@ class VisionDataset:
                 "Config must contain 'image_token_index' or 'image_token_id'"
             )
 
-        # Prefer native multimodal processor for known model families to keep
-        # image/audio placeholders and model-specific metadata aligned.
+        inputs = None
         if model_type in NATIVE_PREPROCESS_MODELS:
             try:
                 inputs = process_inputs_with_fallback(
@@ -111,17 +109,9 @@ class VisionDataset:
                 if "images" in inputs and "pixel_values" not in inputs:
                     inputs["pixel_values"] = inputs.pop("images")
             except Exception:
-                # Fall back to legacy preparation path when processor-native
-                # processing is unavailable for a specific model implementation.
-                inputs = prepare_inputs(
-                    processor=self.processor,
-                    images=images if images else None,
-                    audio=audio if audio else None,
-                    prompts=prompts,
-                    image_token_index=image_token_index,
-                    resize_shape=self.image_resize_shape,
-                )
-        else:
+                pass
+
+        if inputs is None:
             inputs = prepare_inputs(
                 processor=self.processor,
                 images=images if images else None,
@@ -131,8 +121,6 @@ class VisionDataset:
                 resize_shape=self.image_resize_shape,
             )
 
-        # Native preprocessing may return torch tensors when it falls back from
-        # return_tensors="mlx"; normalize all tensor-like outputs.
         inputs = to_mlx(inputs)
 
         return {
@@ -204,6 +192,7 @@ class PreferenceVisionDataset:
                     add_generation_prompt=False,
                     num_images=num_images,
                 )
+            inputs = None
             if model_type in NATIVE_PREPROCESS_MODELS:
                 try:
                     inputs = process_inputs_with_fallback(
@@ -216,15 +205,9 @@ class PreferenceVisionDataset:
                     if "images" in inputs and "pixel_values" not in inputs:
                         inputs["pixel_values"] = inputs.pop("images")
                 except Exception:
-                    inputs = prepare_inputs(
-                        processor=self.processor,
-                        images=images if images else None,
-                        audio=None,
-                        prompts=[prompt],
-                        image_token_index=image_token_index,
-                        resize_shape=self.image_resize_shape,
-                    )
-            else:
+                    pass
+
+            if inputs is None:
                 inputs = prepare_inputs(
                     processor=self.processor,
                     images=images if images else None,
