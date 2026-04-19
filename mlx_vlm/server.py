@@ -1810,6 +1810,14 @@ async def chat_completions_endpoint(request: ChatRequest):
                         in_thinking = False
                         accumulated = ""
                         full_output = ""  # raw output for tool call parsing
+                        # Track tool-call state to suppress markup from content
+                        in_tool_call = False
+                        tc_start = (
+                            tool_module.tool_call_start if tool_module else None
+                        )
+                        tc_end = (
+                            tool_module.tool_call_end if tool_module else None
+                        )
 
                         def _next_token():
                             try:
@@ -1850,6 +1858,21 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 pass  # Partial tag, don't emit yet
                             else:
                                 delta_content = token.text
+
+                            # Suppress tool-call markup from content
+                            if tc_start and not in_tool_call:
+                                if tc_start in full_output:
+                                    in_tool_call = True
+                                    delta_content = None
+                                elif full_output.endswith(
+                                    tc_start[:len(tc_start) - 1]
+                                ) or any(
+                                    full_output.endswith(tc_start[:j])
+                                    for j in range(1, len(tc_start))
+                                ):
+                                    delta_content = None
+                            elif in_tool_call:
+                                delta_content = None
 
                             chunk_logprobs = None
                             if request.logprobs and token.finish_reason != "stop":
