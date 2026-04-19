@@ -273,6 +273,59 @@ class TestChatMessageSchema:
         assert msg.reasoning == "thought"
 
 
+class TestSuppressToolCallContent:
+    """Tests for tool-call markup suppression in streaming."""
+
+    def test_no_tool_module(self):
+        in_tc, content = server.suppress_tool_call_content(
+            "Hello world", False, None, "world"
+        )
+        assert in_tc is False
+        assert content == "world"
+
+    def test_normal_text_before_tool_call(self):
+        in_tc, content = server.suppress_tool_call_content(
+            "I will call", False, "<tool_call>", "call"
+        )
+        assert in_tc is False
+        assert content == "call"
+
+    def test_suppresses_on_start_marker(self):
+        in_tc, content = server.suppress_tool_call_content(
+            "text<tool_call>", False, "<tool_call>", ">"
+        )
+        assert in_tc is True
+        assert content is None
+
+    def test_suppresses_partial_marker(self):
+        in_tc, content = server.suppress_tool_call_content(
+            "text<tool", False, "<tool_call>", "<tool"
+        )
+        assert in_tc is False
+        assert content is None
+
+    def test_stays_suppressed_after_entering(self):
+        in_tc, content = server.suppress_tool_call_content(
+            "text<tool_call>get_weather", True, "<tool_call>", "weather"
+        )
+        assert in_tc is True
+        assert content is None
+
+    def test_gemma4_marker(self):
+        in_tc, content = server.suppress_tool_call_content(
+            "text<|tool_call>call:get_weather", False, "<|tool_call>", "weather"
+        )
+        assert in_tc is True
+        assert content is None
+
+    def test_gemma4_partial_marker(self):
+        in_tc, content = server.suppress_tool_call_content(
+            "text<|tool", False, "<|tool_call>", "<|tool"
+        )
+        assert in_tc is False
+        assert content is None
+
+
 class TestProcessToolCalls:
     """Tests for tool call parsing from model output."""
 

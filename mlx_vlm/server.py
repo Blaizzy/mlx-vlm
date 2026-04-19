@@ -493,6 +493,30 @@ class ResponseGenerator:
             self._step(batch_gen, active)
 
 
+def suppress_tool_call_content(
+    full_output: str,
+    in_tool_call: bool,
+    tc_start: Optional[str],
+    delta_content: Optional[str],
+) -> Tuple[bool, Optional[str]]:
+    """Suppress tool-call markup from streamed delta.content.
+
+    Returns updated (in_tool_call, delta_content).
+    """
+    if not tc_start:
+        return in_tool_call, delta_content
+    if not in_tool_call:
+        if tc_start in full_output:
+            return True, None
+        if any(
+            full_output.endswith(tc_start[:j]) for j in range(1, len(tc_start))
+        ):
+            return False, None
+    else:
+        return True, None
+    return in_tool_call, delta_content
+
+
 def process_tool_calls(model_output: str, tool_module, tools):
     """Parse tool calls from model output using the appropriate tool parser."""
     called_tools = []
@@ -1860,19 +1884,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 delta_content = token.text
 
                             # Suppress tool-call markup from content
-                            if tc_start and not in_tool_call:
-                                if tc_start in full_output:
-                                    in_tool_call = True
-                                    delta_content = None
-                                elif full_output.endswith(
-                                    tc_start[:len(tc_start) - 1]
-                                ) or any(
-                                    full_output.endswith(tc_start[:j])
-                                    for j in range(1, len(tc_start))
-                                ):
-                                    delta_content = None
-                            elif in_tool_call:
-                                delta_content = None
+                            in_tool_call, delta_content = suppress_tool_call_content(
+                                full_output, in_tool_call, tc_start, delta_content
+                            )
 
                             chunk_logprobs = None
                             if request.logprobs and token.finish_reason != "stop":
