@@ -3,25 +3,10 @@ import warnings
 
 import mlx.core as mx
 
+from ..models.base import to_mlx
 from ..prompt_utils import MODEL_CONFIG, apply_chat_template
 
 NATIVE_PREPROCESS_MODELS = set(MODEL_CONFIG.keys())
-
-
-def _ensure_mx_array(value):
-    """Convert tensor-like values to MLX arrays while preserving metadata."""
-    if isinstance(value, dict):
-        return {k: _ensure_mx_array(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_ensure_mx_array(v) for v in value]
-    if isinstance(value, tuple):
-        return tuple(_ensure_mx_array(v) for v in value)
-    if value is None or isinstance(value, (str, bytes, bool, int, float, mx.array)):
-        return value
-    try:
-        return mx.array(value)
-    except Exception:
-        return value
 
 
 class VisionDataset:
@@ -148,7 +133,7 @@ class VisionDataset:
 
         # Native preprocessing may return torch tensors when it falls back from
         # return_tensors="mlx"; normalize all tensor-like outputs.
-        inputs = {k: _ensure_mx_array(v) for k, v in inputs.items()}
+        inputs = to_mlx(inputs)
 
         return {
             "pixel_values": inputs.get("pixel_values"),
@@ -249,7 +234,7 @@ class PreferenceVisionDataset:
                     resize_shape=self.image_resize_shape,
                 )
 
-            inputs = {k: _ensure_mx_array(v) for k, v in inputs.items()}
+            inputs = to_mlx(inputs)
 
             result[f"{key}_input_ids"] = inputs["input_ids"]
             result[f"{key}_attention_mask"] = inputs.get(
