@@ -311,14 +311,14 @@ class TestSuppressToolCallContent:
         assert in_tc is True
         assert content is None
 
-    def test_gemma4_marker(self):
+    def test_pipe_delimited_marker(self):
         in_tc, content = server.suppress_tool_call_content(
             "text<|tool_call>call:get_weather", False, "<|tool_call>", "weather"
         )
         assert in_tc is True
         assert content is None
 
-    def test_gemma4_partial_marker(self):
+    def test_pipe_delimited_partial_marker(self):
         in_tc, content = server.suppress_tool_call_content(
             "text<|tool", False, "<|tool_call>", "<|tool"
         )
