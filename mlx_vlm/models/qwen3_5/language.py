@@ -748,52 +748,24 @@ class LanguageModel(nn.Module):
 
         cache_offset = 0
         cache_offsets = None  # per-element offsets for batched caches
-        is_batch_offset = False
         if cache and cache[self.model.fa_idx] is not None:
             offset = cache[self.model.fa_idx].offset
             if isinstance(offset, int):
                 cache_offset = offset
             elif isinstance(offset, mx.array):
                 if offset.ndim > 0 and offset.size > 1:
-                    # BatchKVCache: per-element offsets (clamped for generation path)
                     cache_offsets = mx.maximum(offset, 0)
-                    # Raw offsets for batch speculative path (may be negative during prefill)
-                    cache_offset = offset
-                    is_batch_offset = True
+                    cache_offset = cache_offsets[0].item()
                 else:
                     cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
             else:
                 raise ValueError(f"Unexpected cache offset type: {type(offset)}")
-            if not is_batch_offset:
-                cache_offset = max(cache_offset, 0)
+            cache_offset = max(cache_offset, 0)
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask
         if mask is not None and mask.shape[-1] != inputs.shape[-1]:
             rope_mask = None
-
-        # Batch with per-sequence offsets: compute position_ids directly
-        # from the offset array. Each sequence gets arange(S) + offset[i],
-        # broadcast to the 3 mRoPE dims (text-only: all 3 equal).
-        # Batch with per-sequence offsets: only use the per-sequence
-        # path when all offsets are non-negative (= decode phase after
-        # prefill). During prefill, offsets can be negative due to
-        # BatchKVCache's left_padding initialization — fall through to
-        # the standard first-call branch which uses arange positions
-        # and lets the attention mask handle padding.
-        if position_ids is None and is_batch_offset and bool((cache_offset >= 0).all()):
-            batch_size, seq_length = inputs.shape
-            arange = mx.arange(seq_length).reshape(1, -1)
-            offsets = cache_offset[:batch_size, None]
-            if self._rope_deltas is not None:
-                offsets = offsets + self._rope_deltas[:batch_size]
-            position_ids = (arange + offsets)[None, ...]
-            position_ids = mx.broadcast_to(position_ids, (3, batch_size, seq_length))
-
-        if is_batch_offset and position_ids is None:
-            # Falling through to non-batch branch — extract scalar
-            # offset from the first sequence for position computation.
-            cache_offset = int(cache_offset[0].item())
 
         if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
             batch_size, seq_length = inputs.shape
