@@ -493,6 +493,28 @@ class ResponseGenerator:
             self._step(batch_gen, active)
 
 
+def suppress_tool_call_content(
+    full_output: str,
+    in_tool_call: bool,
+    tc_start: Optional[str],
+    delta_content: Optional[str],
+) -> Tuple[bool, Optional[str]]:
+    """Suppress tool-call markup from streamed delta.content.
+
+    Returns updated (in_tool_call, delta_content).
+    """
+    if not tc_start:
+        return in_tool_call, delta_content
+    if not in_tool_call:
+        if tc_start in full_output:
+            return True, None
+        if any(full_output.endswith(tc_start[:j]) for j in range(1, len(tc_start))):
+            return False, None
+    else:
+        return True, None
+    return in_tool_call, delta_content
+
+
 def process_tool_calls(model_output: str, tool_module, tools):
     """Parse tool calls from model output using the appropriate tool parser."""
     called_tools = []
@@ -1810,6 +1832,10 @@ async def chat_completions_endpoint(request: ChatRequest):
                         in_thinking = False
                         accumulated = ""
                         full_output = ""  # raw output for tool call parsing
+                        # Track tool-call state to suppress markup from content
+                        in_tool_call = False
+                        tc_start = tool_module.tool_call_start if tool_module else None
+                        tc_end = tool_module.tool_call_end if tool_module else None
 
                         def _next_token():
                             try:
@@ -1851,6 +1877,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                             else:
                                 delta_content = token.text
 
+                            # Suppress tool-call markup from content
+                            in_tool_call, delta_content = suppress_tool_call_content(
+                                full_output, in_tool_call, tc_start, delta_content
+                            )
+
                             chunk_logprobs = None
                             if request.logprobs and token.finish_reason != "stop":
                                 req_top_k = int(request.top_logprobs or 0)
@@ -1866,30 +1897,39 @@ async def chat_completions_endpoint(request: ChatRequest):
                                     ]
                                 )
 
-                            choices = [
-                                ChatStreamChoice(
-                                    finish_reason=token.finish_reason,
-                                    delta=ChatMessage(
-                                        role="assistant",
-                                        content=delta_content,
-                                        reasoning=delta_reasoning,
-                                    ),
-                                    logprobs=chunk_logprobs,
-                                )
-                            ]
-                            chunk_data = ChatStreamChunk(
-                                id=request_id,
-                                created=int(time.time()),
-                                model=request.model,
-                                usage={
-                                    "prompt_tokens": ctx.prompt_tokens,
-                                    "completion_tokens": output_tokens,
-                                    "total_tokens": ctx.prompt_tokens + output_tokens,
-                                },
-                                choices=choices,
+                            # Skip empty deltas (e.g. suppressed tool-call tokens)
+                            has_payload = (
+                                delta_content is not None
+                                or delta_reasoning is not None
+                                or token.finish_reason is not None
+                                or chunk_logprobs is not None
                             )
+                            if has_payload:
+                                choices = [
+                                    ChatStreamChoice(
+                                        finish_reason=token.finish_reason,
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            content=delta_content,
+                                            reasoning=delta_reasoning,
+                                        ),
+                                        logprobs=chunk_logprobs,
+                                    )
+                                ]
+                                chunk_data = ChatStreamChunk(
+                                    id=request_id,
+                                    created=int(time.time()),
+                                    model=request.model,
+                                    usage={
+                                        "prompt_tokens": ctx.prompt_tokens,
+                                        "completion_tokens": output_tokens,
+                                        "total_tokens": ctx.prompt_tokens
+                                        + output_tokens,
+                                    },
+                                    choices=choices,
+                                )
 
-                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+                                yield f"data: {chunk_data.model_dump_json()}\n\n"
 
                             if token.finish_reason:
                                 break
