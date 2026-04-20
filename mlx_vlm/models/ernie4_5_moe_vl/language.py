@@ -455,7 +455,9 @@ class Ernie4_5Model(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            mask = create_attention_mask(
+                h, cache[0] if cache and cache[0] is not None else cache
+            )
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c, position_ids, token_type_ids=token_type_ids)
@@ -613,30 +615,65 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        rope_deltas_kw = kwargs.pop("rope_deltas", None)
 
         if pixel_values is not None:
             self._rope_deltas = None
 
         cache_offset = 0
+        cache_offsets = None
         if cache and cache[0] is not None:
             offset = cache[0].offset
-            cache_offset = offset.item() if isinstance(offset, mx.array) else offset
+            if isinstance(offset, mx.array):
+                if offset.size == 1:
+                    cache_offset = offset.item()
+                else:
+                    # Per-sequence offsets from BatchKVCache: keep the array
+                    # for per-row position_ids + delta arithmetic.
+                    cache_offsets = offset
+                    cache_offset = 0
+            else:
+                cache_offset = offset
 
         if position_ids is None and (mask is None or mask.ndim == 2):
-            if (
-                cache is None or cache[0] is None or cache_offset == 0
-            ) or self._rope_deltas is None:
+            is_prefill = (
+                cache is None
+                or cache[0] is None
+                or (cache_offsets is None and cache_offset == 0)
+            )
+            if is_prefill or self._rope_deltas is None:
                 position_ids, rope_deltas = self.get_rope_index(
                     inputs, image_grid_thw, video_grid_thw, mask
                 )
                 self._rope_deltas = rope_deltas
             else:
                 batch_size, seq_length = inputs.shape
-                delta = cache_offset + self._rope_deltas if cache is not None else 0
-                position_ids = mx.arange(seq_length) + delta
-                position_ids = mx.broadcast_to(
-                    position_ids[None, :], (batch_size, seq_length)
+                rope_deltas_src = (
+                    rope_deltas_kw if rope_deltas_kw is not None else self._rope_deltas
                 )
+                # Per-sequence rope_deltas (shape (B,) or (B, 1)) need per-row
+                # broadcast; a scalar delta stays 0-D.
+                if isinstance(rope_deltas_src, mx.array) and rope_deltas_src.ndim >= 1:
+                    delta = rope_deltas_src
+                    if delta.ndim == 1:
+                        delta = delta[:, None]
+                    if delta.shape[0] > batch_size:
+                        delta = delta[:batch_size]
+                    if cache_offsets is not None:
+                        offsets = cache_offsets[:batch_size].reshape(-1, 1)
+                        delta = offsets + delta
+                    else:
+                        delta = cache_offset + delta
+                    arange = mx.arange(seq_length).reshape(1, -1)
+                    position_ids = (
+                        mx.broadcast_to(arange, (batch_size, seq_length)) + delta
+                    )
+                else:
+                    delta = cache_offset + rope_deltas_src if cache is not None else 0
+                    position_ids = mx.arange(seq_length) + delta
+                    position_ids = mx.broadcast_to(
+                        position_ids[None, :], (batch_size, seq_length)
+                    )
                 position_ids = mx.stack(
                     [position_ids, position_ids, position_ids], axis=-1
                 )
