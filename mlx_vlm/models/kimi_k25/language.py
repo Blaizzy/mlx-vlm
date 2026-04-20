@@ -25,6 +25,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         mask: Optional[mx.array] = None,
+        **kwargs,
     ):
         if inputs_embeds is None:
             h = self.model.embed_tokens(inputs)
@@ -35,7 +36,7 @@ class LanguageModel(nn.Module):
             cache = [None] * len(self.model.pipeline_layers)
 
         if mask is None:
-            mask = create_attention_mask(h, cache[0])
+            mask = create_attention_mask(h, cache[0], return_array=True)
 
         pipeline_rank = self.model.pipeline_rank
         pipeline_size = self.model.pipeline_size
