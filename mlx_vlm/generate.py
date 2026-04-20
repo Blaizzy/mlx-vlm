@@ -509,9 +509,7 @@ def _dflash_rounds(
             if emitted >= max_tokens:
                 return
 
-        lm.rollback_speculative_cache(
-            prompt_cache, verify_out.gdn_states, accepted, bs
-        )
+        lm.rollback_speculative_cache(prompt_cache, verify_out.gdn_states, accepted, bs)
 
         hidden = hidden[:, : accepted + 1, :]
         b = new_tokens[-1] if new_tokens else b
@@ -546,8 +544,7 @@ def _dflash_rounds_batch(
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
         raise RuntimeError(
-            f"{type(lm).__name__} does not implement "
-            "rollback_speculative_cache."
+            f"{type(lm).__name__} does not implement " "rollback_speculative_cache."
         )
 
     B = first_bonus.shape[0]

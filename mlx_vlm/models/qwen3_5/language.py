@@ -480,9 +480,9 @@ class LanguageModel(nn.Module):
                             c.keys[bi, :, start:kv_len, :] = 0
                             c.values[bi, :, start:kv_len, :] = 0
                 continue
-            q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = (
-                gdn_states[j]
-            )
+            q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = gdn_states[
+                j
+            ]
             if is_batch:
                 replay_mask = mx.arange(n)[None, :] <= accepted[:, None]
             else:
