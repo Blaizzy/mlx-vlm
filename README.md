@@ -730,7 +730,7 @@ mlx-vlm supports distributed inference across multiple computers. It works by sh
 
 The parallel implementation is compatible with [mlx-lm](https://github.com/ml-explore/mlx-lm) sharding primitives.
 
-See [docs/usage.md](docs/usage.md#Distributed-Inference) for command-line examples.
+See [docs/usage.md](https://github.com/Blaizzy/mlx-vlm/blob/main/docs/usage.md#distributed-inference) for command-line examples.
 
 # Fine-tuning
 
