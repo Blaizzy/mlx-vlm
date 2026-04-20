@@ -8,87 +8,18 @@ https://huggingface.co/moonshotai/Kimi-K2.5/blob/main/kimi_k25_vision_processing
 
 import json
 import math
-import warnings
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import List, Tuple
 
 import mlx.core as mx
-import transformers.processing_utils as processing_utils
 from PIL import Image
 from transformers import AutoTokenizer
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.image_utils import ImageInput, make_list_of_images, valid_images
 from transformers.processing_utils import ProcessorMixin
-from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from .config import ModelConfig
-
-
-def _validate_images_text_input_order(images, text):
-    if images is not None and text is not None:
-        images_is_text = isinstance(images, str) or (
-            isinstance(images, (list, tuple))
-            and len(images) > 0
-            and isinstance(images[0], str)
-        )
-        text_is_image = not isinstance(text, str) and not (
-            isinstance(text, (list, tuple))
-            and len(text) > 0
-            and isinstance(text[0], str)
-        )
-        if images_is_text and text_is_image:
-            warnings.warn(
-                "You passed text as the first argument and images as the second. "
-                "This is deprecated. Please pass images first and text second.",
-                FutureWarning,
-            )
-            return text, images
-    return images, text
-
-
-# Compatibility shims for transformers versions
-if not hasattr(processing_utils, "_validate_images_text_input_order"):
-    processing_utils._validate_images_text_input_order = (
-        _validate_images_text_input_order
-    )
-
-if not hasattr(processing_utils, "Unpack"):
-    try:
-        from typing import Unpack
-
-        processing_utils.Unpack = Unpack
-    except ImportError:
-        from typing_extensions import Unpack
-
-        processing_utils.Unpack = Unpack
-
-
-def _ensure_gpt2_bytes_to_unicode():
-    try:
-        import transformers.models.gpt2.tokenization_gpt2 as gpt2_tokenization
-    except Exception:
-        return
-    if hasattr(gpt2_tokenization, "bytes_to_unicode"):
-        return
-
-    def bytes_to_unicode():
-        bs = (
-            list(range(ord("!"), ord("~") + 1))
-            + list(range(ord("¡"), ord("¬") + 1))
-            + list(range(ord("®"), ord("ÿ") + 1))
-        )
-        cs = bs[:]
-        n = 0
-        for b in range(2**8):
-            if b not in bs:
-                bs.append(b)
-                cs.append(2**8 + n)
-                n += 1
-        cs = [chr(n) for n in cs]
-        return dict(zip(bs, cs))
-
-    gpt2_tokenization.bytes_to_unicode = bytes_to_unicode
 
 
 class KimiK25ImageProcessor(BaseImageProcessor):
@@ -201,12 +132,7 @@ class KimiK25ImageProcessor(BaseImageProcessor):
         patches, grid_hw = self.patchify(image)
         return patches, grid_hw
 
-    def preprocess(
-        self,
-        images: ImageInput,
-        return_tensors=None,
-        **kwargs,
-    ) -> BatchFeature:
+    def preprocess(self, images, return_tensors=None, **kwargs):
         """Process images and return BatchFeature."""
         images = make_list_of_images(images)
         if not valid_images(images):
@@ -216,16 +142,6 @@ class KimiK25ImageProcessor(BaseImageProcessor):
         image_grid_hws = []
 
         for image in images:
-            if isinstance(image, mx.array):
-                arr = image
-                if arr.ndim == 3 and arr.shape[0] in [1, 3, 4]:
-                    arr = arr.transpose(1, 2, 0)
-                if arr.dtype in [mx.float32, mx.float16, mx.bfloat16]:
-                    arr = (arr * 255).astype(mx.uint8)
-                h, w, _ = arr.shape
-                flat_data = arr.reshape(-1).tolist()
-                image = Image.frombytes("RGB", (w, h), bytes(flat_data))
-
             patches, grid_hw = self._preprocess(image)
             pixel_values_list.append(patches)
             image_grid_hws.append(grid_hw)
@@ -250,30 +166,19 @@ class KimiK25Processor(ProcessorMixin):
     image_processor_class = "KimiK25ImageProcessor"
     tokenizer_class = "AutoTokenizer"
 
-    def __init__(
-        self,
-        image_processor=None,
-        tokenizer=None,
-        chat_template=None,
-        **kwargs,
-    ):
+    def __init__(self, image_processor=None, tokenizer=None, **kwargs):
         self.image_token = "<|media_pad|>"
         if image_processor is None:
             image_processor = KimiK25ImageProcessor()
-        super().__init__(image_processor, tokenizer, chat_template=chat_template)
+        super().__init__(image_processor, tokenizer, **kwargs)
 
-    def __call__(
-        self,
-        images: ImageInput = None,
-        text: Union[
-            TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]
-        ] = None,
-        **kwargs,
-    ) -> BatchFeature:
+    def apply_chat_template(self, conversation, **kwargs):
+        return self.tokenizer.apply_chat_template(conversation, **kwargs)
+
+    def __call__(self, images=None, text=None, **kwargs):
         if images is None and text is None:
             raise ValueError("You have to specify at least one of `images` or `text`.")
 
-        images, text = _validate_images_text_input_order(images, text)
         kwargs.pop("return_tensors", None)
 
         # Process images
@@ -344,65 +249,17 @@ class KimiK25Processor(ProcessorMixin):
             text_inputs = {}
 
         data = {**text_inputs, **image_inputs}
-        image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_token)
-        if image_token_id is not None:
-            data["image_token_id"] = int(image_token_id)
-        return BatchFeature(data=data)
-
-    def batch_decode(self, *args, **kwargs):
-        return self.tokenizer.batch_decode(*args, **kwargs)
-
-    def decode(self, *args, **kwargs):
-        return self.tokenizer.decode(*args, **kwargs)
-
-    def apply_chat_template(
-        self,
-        conversation,
-        chat_template=None,
-        add_generation_prompt=False,
-        tokenize=False,
-        **kwargs,
-    ):
-        if chat_template is None:
-            chat_template = self.chat_template
-        if chat_template is None:
-            chat_template = getattr(self.tokenizer, "chat_template", None)
-        if chat_template is None:
-            raise ValueError(
-                "No chat template found. Please provide a chat_template argument "
-                "or ensure the tokenizer has a chat_template attribute."
+        if text is not None:
+            data["image_token_id"] = int(
+                self.tokenizer.convert_tokens_to_ids(self.image_token)
             )
-
-        try:
-            from jinja2 import Environment
-            from jinja2.ext import loopcontrols
-        except ImportError:
-            raise ImportError("jinja2 is required for apply_chat_template")
-
-        env = Environment(extensions=[loopcontrols])
-        template = env.from_string(chat_template)
-        rendered = template.render(
-            messages=conversation,
-            add_generation_prompt=add_generation_prompt,
-            **kwargs,
-        )
-
-        if tokenize:
-            return self.tokenizer.encode(rendered)
-        return rendered
-
-    @property
-    def model_input_names(self):
-        tokenizer_input_names = self.tokenizer.model_input_names
-        image_processor_input_names = self.image_processor.model_input_names
-        return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
+        return BatchFeature(data=data)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         from huggingface_hub import hf_hub_download
 
         kwargs.pop("trust_remote_code", None)
-        _ensure_gpt2_bytes_to_unicode()
 
         model_path = Path(pretrained_model_name_or_path)
         is_local = model_path.exists() and model_path.is_dir()
@@ -412,20 +269,9 @@ class KimiK25Processor(ProcessorMixin):
             local_files_only=is_local,
         )
 
-        # Read processor_config.json for chat template
-        proc_kwargs = {}
-        proc_cfg_path = model_path / "processor_config.json" if is_local else None
-        if proc_cfg_path and proc_cfg_path.exists():
-            with open(proc_cfg_path) as f:
-                proc_cfg = json.load(f)
-            for k in ("chat_template",):
-                if k in proc_cfg:
-                    proc_kwargs[k] = proc_cfg[k]
-
-        # Read image processor config from preprocessor_config.json and config.json
+        # Read image processor config from preprocessor_config.json
         image_processor_config = {}
         try:
-            # Read preprocessor_config.json (has media_proc_cfg for K2.5)
             if is_local:
                 preproc_path = model_path / "preprocessor_config.json"
             else:
@@ -462,56 +308,9 @@ class KimiK25Processor(ProcessorMixin):
         except Exception:
             pass
 
-        # Fallback: read vision_config from config.json
-        if not image_processor_config:
-            try:
-                if is_local:
-                    config_path = model_path / "config.json"
-                else:
-                    config_path = Path(
-                        hf_hub_download(pretrained_model_name_or_path, "config.json")
-                    )
-                with open(config_path, "r", encoding="utf-8") as f:
-                    config_dict = json.load(f)
-                config = ModelConfig.from_dict(config_dict)
-                if hasattr(config, "vision_config"):
-                    vc = config.vision_config
-                    if hasattr(vc, "patch_size"):
-                        image_processor_config["patch_size"] = vc.patch_size
-                    if hasattr(vc, "merge_kernel_size"):
-                        image_processor_config["merge_kernel_size"] = (
-                            vc.merge_kernel_size
-                        )
-            except Exception:
-                pass
-
-        image_processor = KimiK25ImageProcessor(**image_processor_config)
-
-        # Load chat template
-        chat_template = proc_kwargs.pop("chat_template", None)
-        if chat_template is None:
-            chat_template = getattr(tokenizer, "chat_template", None)
-        if chat_template is None:
-            try:
-                if is_local:
-                    jinja_path = model_path / "chat_template.jinja"
-                else:
-                    jinja_path = Path(
-                        hf_hub_download(
-                            pretrained_model_name_or_path, "chat_template.jinja"
-                        )
-                    )
-                if jinja_path.exists():
-                    chat_template = jinja_path.read_text(encoding="utf-8")
-                    tokenizer.chat_template = chat_template
-            except Exception:
-                pass
-
         return cls(
-            image_processor=image_processor,
+            image_processor=KimiK25ImageProcessor(**image_processor_config),
             tokenizer=tokenizer,
-            chat_template=chat_template,
-            **proc_kwargs,
         )
 
 
