@@ -98,20 +98,23 @@ class VisionDataset:
                 "Config must contain 'image_token_index' or 'image_token_id'"
             )
 
-        use_embedded_images = (
-            model_type.startswith("gemma")
-            or model_type.startswith("qwen")
-            or model_type == "smolvlm"
-        )
-
-        inputs = prepare_inputs(
-            processor=self.processor,
-            images=None if use_embedded_images else (images if images else None),
-            audio=audio if audio else None,
-            prompts=prompts,
-            image_token_index=image_token_index,
-            resize_shape=self.image_resize_shape,
-        )
+        try:
+            inputs = prepare_inputs(
+                processor=self.processor,
+                images=images if images else None,
+                audio=audio if audio else None,
+                prompts=prompts,
+                image_token_index=image_token_index,
+                resize_shape=self.image_resize_shape,
+            )
+        except (ValueError, IndexError) as e:
+            raise ValueError(
+                f"Failed to process images for model_type={model_type!r}. "
+                f"This model's processor may require image placeholder tokens "
+                f"(e.g. <image>) in the prompt template. "
+                f"See https://github.com/Blaizzy/mlx-vlm/issues/824 "
+                f"Original error: {e}"
+            ) from e
 
         return {
             "pixel_values": inputs.get("pixel_values"),
@@ -167,15 +170,6 @@ class PreferenceVisionDataset:
                 "Config must contain 'image_token_index' or 'image_token_id'"
             )
 
-        use_embedded_images = (
-            model_type.startswith("gemma")
-            or model_type.startswith("qwen")
-            or model_type == "smolvlm"
-        )
-        images_for_inputs = (
-            None if use_embedded_images else (images if images else None)
-        )
-
         result = {}
         for key in ("chosen", "rejected"):
             sequence = item[key]
@@ -184,14 +178,23 @@ class PreferenceVisionDataset:
                 if isinstance(sequence, str)
                 else get_prompt(model_type, self.processor, sequence)
             )
-            inputs = prepare_inputs(
-                processor=self.processor,
-                images=images_for_inputs,
-                audio=None,
-                prompts=[prompt],
-                image_token_index=image_token_index,
-                resize_shape=self.image_resize_shape,
-            )
+            try:
+                inputs = prepare_inputs(
+                    processor=self.processor,
+                    images=images if images else None,
+                    audio=None,
+                    prompts=[prompt],
+                    image_token_index=image_token_index,
+                    resize_shape=self.image_resize_shape,
+                )
+            except (ValueError, IndexError) as e:
+                raise ValueError(
+                    f"Failed to process images for model_type={model_type!r}. "
+                    f"This model's processor may require image placeholder tokens "
+                    f"(e.g. <image>) in the prompt template. "
+                    f"See https://github.com/Blaizzy/mlx-vlm/issues/824 "
+                    f"Original error: {e}"
+                ) from e
             result[f"{key}_input_ids"] = inputs["input_ids"]
             result[f"{key}_attention_mask"] = inputs.get(
                 "attention_mask", mx.ones_like(inputs["input_ids"])
