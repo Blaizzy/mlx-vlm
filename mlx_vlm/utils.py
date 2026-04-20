@@ -457,7 +457,8 @@ def sharded_load(
     if tensor_group is not None:
         model.shard(tensor_group)
 
-    mx.eval(model.parameters())
+    print("Materializing")
+    mx.eval(model.language_model.parameters())
     model.eval()
 
     # Synchronize processes to avoid timeout
