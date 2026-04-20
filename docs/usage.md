@@ -176,3 +176,25 @@ python -m mlx_vlm.server
 
 See `README.md` for a complete `curl` example.
 
+## Distributed Inference
+
+mlx-vlm supports distributed inference across multiple computers. It works by sharding the language model (not the vision tower), because the LLM is much larger and vision embeddings only need to be computed once.
+
+The parallel implementation is compatible with mlx-lm sharding primitives.
+
+The following command shows how you can run Kimi K2.6, a 1T parameter model, on several computers. For a smaller option, you can try `[mlx-community/Qwen3-VL-30B-A3B-Instruct-bf16](https://huggingface.co/mlx-community/Qwen3-VL-30B-A3B-Instruct-bf16)`.
+
+```bash
+mlx.launch \
+    --hostfile ring-thunderbolt.json \
+    --backend jaccl \
+    --hostfile /path/to/hosts.json \
+    --env MLX_METAL_FAST_SYNCH=1 \
+    -- \
+    mlx-vlm/examples/sharded_generate.py \
+    --model moonshotai/Kimi-K2.6 \
+    --prompt "Describe this image" \
+    --image mx-vlm/examples/images/scene_1.jpg
+```
+
+We recommend you use the JACCL protocol over Thunderbolt. For more information, please refer to [the MLX distributed communication guide](https://ml-explore.github.io/mlx/build/html/usage/distributed.html).
