@@ -65,7 +65,7 @@ if __name__ == "__main__":
         if rank == 0:
             print(*args, **kwargs)
 
-    model, processor = sharded_load(args.model, tensor_group)
+    model, processor = sharded_load(args.model, tensor_group, pipeline_group)
 
     prompt = apply_chat_template(
         processor,

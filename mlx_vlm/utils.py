@@ -426,6 +426,7 @@ def load(
 def sharded_load(
     repo,
     tensor_group: Optional[mx.distributed.Group] = None,
+    pipeline_group: Optional[mx.distributed.Group] = None,
 ):
     # Get model path with everything but weight safetensors
     model_path = get_model_path(repo)
@@ -442,7 +443,7 @@ def sharded_load(
             "The model does not support tensor parallelism but a tensor_group was provided"
         )
 
-    if tensor_group is None:
+    if tensor_group is None and pipeline_group is None:
         if has_tensor_parallel:
             tensor_group = mx.distributed.init()
 
@@ -456,6 +457,16 @@ def sharded_load(
 
     if tensor_group is not None:
         model.shard(tensor_group)
+
+    if pipeline_group is not None:
+        lm = model.language_model
+        # The underlying model (e.g. DeepseekV3Model) has PipelineMixin
+        inner = lm.model if hasattr(lm, "model") else lm
+        if not hasattr(inner, "pipeline"):
+            raise ValueError(
+                "The model does not support pipeline parallelism"
+            )
+        inner.pipeline(pipeline_group)
 
     print("Materializing")
     mx.eval(model.language_model.parameters())
