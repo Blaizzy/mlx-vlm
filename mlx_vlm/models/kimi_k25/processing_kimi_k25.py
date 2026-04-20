@@ -16,10 +16,8 @@ from PIL import Image
 from transformers import AutoTokenizer
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import BaseImageProcessor
-from transformers.image_utils import ImageInput, make_list_of_images, valid_images
+from transformers.image_utils import make_list_of_images, valid_images
 from transformers.processing_utils import ProcessorMixin
-
-from .config import ModelConfig
 
 
 class KimiK25ImageProcessor(BaseImageProcessor):
@@ -39,9 +37,6 @@ class KimiK25ImageProcessor(BaseImageProcessor):
         **kwargs,
     ):
         super().__init__(**kwargs)
-
-        # If a full model config dict is provided (from load_image_processor),
-        # extract vision params from it as fallbacks.
         if config is not None:
             vc = config.get("vision_config", {}) if isinstance(config, dict) else {}
             patch_size = vc.get("patch_size", patch_size)
@@ -179,9 +174,6 @@ class KimiK25Processor(ProcessorMixin):
         if images is None and text is None:
             raise ValueError("You have to specify at least one of `images` or `text`.")
 
-        kwargs.pop("return_tensors", None)
-
-        # Process images
         if images is not None:
             image_inputs = self.image_processor(images)
             image_grid_hws = image_inputs["image_grid_hws"]
@@ -189,13 +181,11 @@ class KimiK25Processor(ProcessorMixin):
             image_inputs = {}
             image_grid_hws = None
 
-        # Process text
         if isinstance(text, str):
             text = [text]
         elif text is not None and not isinstance(text, list):
             raise ValueError("Invalid input text. Please provide a string or list.")
 
-        # Compute per-image placeholder counts
         placeholder_counts = []
         if image_grid_hws is not None:
             merge_length = (
@@ -208,8 +198,6 @@ class KimiK25Processor(ProcessorMixin):
                 )
 
         # Tokenize text, then expand image placeholders at the token-ID level.
-        # This avoids a TikToken bug where very long runs of the same special
-        # token are partially byte-pair-encoded instead of matched as specials.
         if text is not None:
             image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_token)
             all_input_ids = []
@@ -258,8 +246,6 @@ class KimiK25Processor(ProcessorMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         from huggingface_hub import hf_hub_download
-
-        kwargs.pop("trust_remote_code", None)
 
         model_path = Path(pretrained_model_name_or_path)
         is_local = model_path.exists() and model_path.is_dir()
