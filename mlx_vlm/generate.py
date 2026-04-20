@@ -979,8 +979,6 @@ def stream_generate(
         input_ids = kwargs.pop("input_ids")
         pixel_values = kwargs.pop("pixel_values", None)
         mask = kwargs.pop("mask", None)
-        inputs_embeds = kwargs.pop("inputs_embeds", None)
-        embedding_kwargs = kwargs.pop("embedding_kwargs", None)
     else:
         inputs = prepare_inputs(
             processor,
@@ -1001,11 +999,6 @@ def stream_generate(
             if k not in ["input_ids", "pixel_values", "attention_mask"]
         }
         kwargs.update(data_kwargs)
-        inputs_embeds = kwargs.pop("inputs_embeds", None)
-        embedding_kwargs = kwargs.pop("embedding_kwargs", None)
-
-    if inputs_embeds is not None and input_ids is None:
-        raise ValueError("inputs_embeds requires input_ids")
 
     # Vision feature caching: reuse cached image features across turns
     if vision_cache is not None and image is not None and pixel_values is not None:
