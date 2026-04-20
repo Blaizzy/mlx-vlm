@@ -8,6 +8,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 - [Usage](#usage)
   - [Command Line Interface (CLI)](#command-line-interface-cli)
     - [Thinking Budget](#thinking-budget)
+  - [Speculative Decoding (DFlash)](#speculative-decoding-dflash)
   - [Chat UI with Gradio](#chat-ui-with-gradio)
   - [Python Script](#python-script)
   - [Server (FastAPI)](#server-fastapi)
@@ -92,6 +93,37 @@ mlx_vlm.generate --model mlx-community/Qwen3.5-2B-4bit \
 | `--thinking-end-token` | Token that closes a thinking block (default: `</think>`) |
 
 When the budget is exceeded, the model is forced to emit `\n</think>` and transition to the answer. If `--enable-thinking` is passed but the model's chat template does not support it, the budget is applied only if the model generates the start token on its own.
+
+### Speculative Decoding (DFlash)
+
+Speed up generation 2–3× using a lightweight block-diffusion drafter that predicts multiple tokens per round, verified in parallel by the target model.
+
+```sh
+# Text generation with speculative decoding
+mlx_vlm.generate --model Qwen/Qwen3.5-4B \
+  --draft-model z-lab/Qwen3.5-4B-DFlash \
+  --prompt "Write a quicksort in Python." \
+  --max-tokens 512 --temperature 0 --enable-thinking
+
+# Also works with images
+mlx_vlm.generate --model Qwen/Qwen3.5-4B \
+  --draft-model z-lab/Qwen3.5-4B-DFlash \
+  --image examples/images/cats.jpg \
+  --prompt "Describe this image." \
+  --max-tokens 256 --temperature 0 --enable-thinking
+
+# Server with speculative decoding
+mlx_vlm.server --model Qwen/Qwen3.5-4B \
+  --draft-model z-lab/Qwen3.5-4B-DFlash
+```
+
+| Flag | Description |
+|------|-------------|
+| `--draft-model` | HuggingFace repo or local path for the drafter |
+| `--draft-kind` | Drafter family (default: `dflash`) |
+| `--draft-block-size` | Override the drafter's configured block size |
+
+See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
 
 ### Chat UI with Gradio
 
@@ -206,6 +238,9 @@ mlx_vlm.server --trust-remote-code
 
 - `--model`: Preload a model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
+- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`) — enables DFlash speculative decoding for ~2× higher throughput
+- `--draft-kind`: Drafter family (default: `dflash`)
+- `--draft-block-size`: Override the drafter's configured block size
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
 - `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub

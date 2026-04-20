@@ -112,14 +112,24 @@ def get_model_and_args(config: dict):
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
-    try:
-        arch = importlib.import_module(f"mlx_vlm.models.{model_type}")
-    except ImportError as e:
-        msg = f"Model type {model_type} not supported. Error: {e}"
-        logging.error(msg)
-        raise ValueError(msg)
+    is_dflash = config.get("dflash_config", None) is not None
+    if is_dflash:
+        model_type += "_dflash"
 
-    return arch, model_type
+    last_err: Optional[ImportError] = None
+    for pkg in ("mlx_vlm.models", "mlx_vlm.speculative.drafters"):
+        try:
+            arch = importlib.import_module(f"{pkg}.{model_type}")
+            return arch, model_type
+        except ImportError as e:
+            if model_type not in str(e):
+                raise
+            last_err = e
+            continue
+
+    msg = f"Model type {model_type} not supported. Error: {last_err}"
+    logging.error(msg)
+    raise ValueError(msg)
 
 
 def get_model_path(
@@ -245,12 +255,14 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             weights = sanitize_weights(model.code2wav, weights)
             weights = sanitize_weights(model.talker, weights)
         else:
-            weights = sanitize_weights(
-                model_class.VisionModel, weights, model_config.vision_config
-            )
-            weights = sanitize_weights(
-                model_class.LanguageModel, weights, model_config.text_config
-            )
+            if hasattr(model_class, "VisionModel"):
+                weights = sanitize_weights(
+                    model_class.VisionModel, weights, model_config.vision_config
+                )
+            if hasattr(model_class, "LanguageModel"):
+                weights = sanitize_weights(
+                    model_class.LanguageModel, weights, model_config.text_config
+                )
             if hasattr(model_class, "AudioModel"):
                 weights = sanitize_weights(
                     model_class.AudioModel, weights, model_config.audio_config
