@@ -195,6 +195,24 @@ def parse_arguments():
         "Try 512 or 256 if you hit GPU memory errors during prefill.",
     )
     parser.add_argument(
+        "--draft-model",
+        type=str,
+        default=None,
+        help="Speculative drafter path or HF id (e.g. z-lab/Qwen3.5-4B-DFlash).",
+    )
+    parser.add_argument(
+        "--draft-kind",
+        type=str,
+        default="dflash",
+        help="Drafter family. Currently only 'dflash' is supported.",
+    )
+    parser.add_argument(
+        "--draft-block-size",
+        type=int,
+        default=None,
+        help="Override the drafter's configured block size.",
+    )
+    parser.add_argument(
         "--enable-thinking",
         action="store_true",
         help="Enable thinking mode in the chat template (e.g. for Qwen3.5).",
@@ -371,6 +389,272 @@ class PromptCacheState:
         self.cache = kv_cache
 
 
+def _speculative_walk(
+    draft_tokens: mx.array,
+    target_tokens: mx.array,
+    budget: int,
+) -> Tuple[int, List[int]]:
+    """Exact-greedy speculative-decoding walk.
+
+    Accept drafted tokens up to the first mismatch with the target's
+    greedy choice, then take the target's bonus at that position.
+    Returns ``(accepted_count, new_tokens)`` with ``new_tokens``
+    truncated to ``budget``.
+    """
+    d = draft_tokens[0].tolist()
+    t = target_tokens[0].tolist()
+    accepted = next((i for i in range(len(d)) if d[i] != t[i]), len(d))
+    new_tokens = (d[:accepted] + [t[accepted]])[:budget]
+    return accepted, new_tokens
+
+
+def _speculative_walk_batch(
+    draft_tokens: mx.array,
+    target_tokens: mx.array,
+    budgets: List[int],
+) -> Tuple[List[int], List[List[int]]]:
+    """Per-sequence speculative walk for B > 1.
+
+    Returns ``(accepted_list, new_tokens_list)`` where each entry
+    corresponds to one sequence in the batch.
+    """
+    B = draft_tokens.shape[0]
+    d_batch = draft_tokens.tolist()
+    t_batch = target_tokens.tolist()
+    accepted_list: List[int] = []
+    new_tokens_list: List[List[int]] = []
+    for i in range(B):
+        d, t = d_batch[i], t_batch[i]
+        acc = next((j for j in range(len(d)) if d[j] != t[j]), len(d))
+        new = (d[:acc] + [t[acc]])[: budgets[i]]
+        accepted_list.append(acc)
+        new_tokens_list.append(new)
+    return accepted_list, new_tokens_list
+
+
+def _dflash_rounds(
+    model: nn.Module,
+    draft_model: nn.Module,
+    prompt_cache: List[Any],
+    hidden: mx.array,
+    *,
+    first_bonus: int,
+    max_tokens: int,
+    sampler: Callable[[mx.array], mx.array],
+    draft_block_size: Optional[int] = None,
+    token_dtype: mx.Dtype = mx.int32,
+) -> Generator[Tuple[int, None], None, None]:
+    """DFlash speculative-decoding **round loop**.
+
+    draft → verify → walk → rollback. ``generate_step`` is responsible
+    for prefill, sampling the first bonus token, and packaging the
+    captured hidden states into ``hidden``.
+    """
+    lm = model.language_model if hasattr(model, "language_model") else model
+    if not hasattr(lm, "rollback_speculative_cache"):
+        raise RuntimeError(
+            f"{type(lm).__name__} does not implement rollback_speculative_cache. "
+            "Speculative decoding with a DFlash drafter currently only "
+            "supports mlx_vlm.models.qwen3_5."
+        )
+
+    target_layer_ids = list(draft_model.config.target_layer_ids)
+    block_total = (
+        draft_block_size
+        if draft_block_size is not None
+        else int(draft_model.config.block_size)
+    )
+    draft_cache = draft_model.reset(model)
+
+    b = first_bonus
+    emitted = 1  # the first bonus has already been yielded by the caller
+
+    while emitted < max_tokens:
+        bs = min(block_total, max_tokens - emitted + 1)
+        if bs <= 1:
+            break
+
+        # Draft
+        with mx.stream(generation_stream):
+            draft_tokens = draft_model.draft_block(
+                b, hidden, draft_cache, bs, sampler, token_dtype
+            )
+        mx.async_eval(draft_tokens)
+
+        # Verify
+        with mx.stream(generation_stream):
+            verify_input = mx.concatenate(
+                [mx.array([[b]], dtype=token_dtype), draft_tokens],
+                axis=1,
+            )
+            verify_out = lm(
+                verify_input,
+                cache=prompt_cache,
+                capture_layer_ids=target_layer_ids,
+            )
+            hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
+            target_tokens = sampler(verify_out.logits)
+        mx.async_eval(target_tokens, hidden)
+
+        # Walk
+        accepted, new_tokens = _speculative_walk(
+            draft_tokens, target_tokens, max_tokens - emitted
+        )
+        draft_model.accept_lens.append(accepted)
+
+        # Emit
+        for tok in new_tokens:
+            yield tok, None
+            emitted += 1
+            if emitted >= max_tokens:
+                return
+
+        lm.rollback_speculative_cache(prompt_cache, verify_out.gdn_states, accepted, bs)
+
+        hidden = hidden[:, : accepted + 1, :]
+        b = new_tokens[-1] if new_tokens else b
+
+
+def _dflash_rounds_batch(
+    model: nn.Module,
+    draft_model: nn.Module,
+    prompt_cache: List[Any],
+    hidden: mx.array,
+    *,
+    first_bonus: mx.array,
+    max_tokens: int,
+    sampler: Callable[[mx.array], mx.array],
+    draft_block_size: Optional[int] = None,
+    token_dtype: mx.Dtype = mx.int32,
+    stop_check: Optional[Callable[[int, int], bool]] = None,
+) -> Generator[Tuple[List[Optional[int]], None], None, None]:
+    """Batch DFlash speculative-decoding round loop (B > 1).
+
+    Supports continuous batching: when a sequence finishes (EOS or
+    max_tokens), it is filtered out of the target caches and the
+    drafter cache is reinitialized for the new batch size.
+
+    ``stop_check(seq_idx, token_id) -> bool`` is an optional callback
+    that returns True to stop a sequence (e.g. EOS detection).
+
+    Yields ``(tokens_list, None)`` where ``tokens_list[i]`` is the
+    token for sequence ``i`` (or ``None`` if that sequence has nothing
+    to emit this step).
+    """
+    lm = model.language_model if hasattr(model, "language_model") else model
+    if not hasattr(lm, "rollback_speculative_cache"):
+        raise RuntimeError(
+            f"{type(lm).__name__} does not implement " "rollback_speculative_cache."
+        )
+
+    B = first_bonus.shape[0]
+    target_layer_ids = list(draft_model.config.target_layer_ids)
+    block_total = (
+        draft_block_size
+        if draft_block_size is not None
+        else int(draft_model.config.block_size)
+    )
+    draft_cache = draft_model.reset(model)
+
+    # Per-sequence state tracked by ORIGINAL index so the caller sees
+    # stable indices in the yielded token lists.
+    b = first_bonus.tolist()  # active bonus tokens
+    emitted = [1] * B
+    finished = [False] * B
+    active_idx = list(range(B))  # maps active-slot → original-index
+
+    def _reinit_drafter():
+        """Cold-restart the drafter cache after a batch change."""
+        nonlocal draft_cache
+        draft_cache = draft_model.make_cache()
+
+    while len(active_idx) > 0:
+        remaining = [
+            max(1, max_tokens - emitted[active_idx[j]] + 1)
+            for j in range(len(active_idx))
+        ]
+        bs = min(block_total, min(remaining))
+        if bs <= 1:
+            break
+
+        n_active = len(active_idx)
+        b_active = [b[active_idx[j]] for j in range(n_active)]
+        b_arr = mx.array(b_active, dtype=token_dtype)
+
+        # Draft
+        with mx.stream(generation_stream):
+            draft_tokens = draft_model.draft_block(
+                b_arr, hidden, draft_cache, bs, sampler, token_dtype
+            )
+        mx.async_eval(draft_tokens)
+
+        # Verify
+        with mx.stream(generation_stream):
+            verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
+            verify_out = lm(
+                verify_input,
+                cache=prompt_cache,
+                capture_layer_ids=target_layer_ids,
+            )
+            hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
+            target_tokens = sampler(verify_out.logits)
+        mx.async_eval(target_tokens, hidden_full)
+
+        # Walk (per-sequence)
+        budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
+        accepted_list, new_tokens_list = _speculative_walk_batch(
+            draft_tokens, target_tokens, budgets
+        )
+
+        accepted_arr = mx.array(accepted_list)
+        max_a = lm.rollback_speculative_cache(
+            prompt_cache, verify_out.gdn_states, accepted_arr, bs
+        )
+        hidden = hidden_full[:, : max_a + 1, :]
+
+        for a in accepted_list:
+            draft_model.accept_lens.append(a)
+
+        # Emit (map active slots back to original indices)
+        max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
+        for pos in range(max_new):
+            tokens_out: List[Optional[int]] = [None] * B
+            for j in range(n_active):
+                orig = active_idx[j]
+                if pos < len(new_tokens_list[j]) and not finished[orig]:
+                    tok = new_tokens_list[j][pos]
+                    tokens_out[orig] = tok
+                    emitted[orig] += 1
+                    if emitted[orig] >= max_tokens:
+                        finished[orig] = True
+                    if stop_check is not None and stop_check(orig, tok):
+                        finished[orig] = True
+            yield tokens_out, None
+
+        # Update bonus tokens
+        for j in range(n_active):
+            orig = active_idx[j]
+            if new_tokens_list[j]:
+                b[orig] = new_tokens_list[j][-1]
+
+        # --- Continuous batching: filter out finished sequences ---
+        keep_slots = [j for j in range(n_active) if not finished[active_idx[j]]]
+        if len(keep_slots) < n_active:
+            if len(keep_slots) == 0:
+                break
+            # Filter target caches (BatchKVCache supports this)
+            keep_mx = mx.array(keep_slots, dtype=mx.int32)
+            for c in prompt_cache:
+                if hasattr(c, "filter"):
+                    c.filter(keep_mx)
+            # Filter hidden
+            hidden = hidden[keep_mx]
+            # Update active index mapping
+            active_idx = [active_idx[j] for j in keep_slots]
+            # Cold-restart drafter for the new batch size
+            _reinit_drafter()
+
+
 def generate_step(
     input_ids: mx.array,
     model: nn.Module,
@@ -394,6 +678,9 @@ def generate_step(
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
+    draft_model: Optional[nn.Module] = None,
+    draft_kind: str = "dflash",
+    draft_block_size: Optional[int] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -430,6 +717,15 @@ def generate_step(
         prefill_step_size (int): Number of tokens to process per prefill step.
           Chunked prefill processes prompts in smaller chunks to reduce peak
           memory usage.
+        draft_model (nn.Module, optional): A drafter for speculative decoding.
+          When set, the decode loop is replaced by the drafter's speculative
+          loop (e.g. DFlash block-diffusion). VLM prefill with image/audio
+          is supported via the same ``get_input_embeddings`` path the normal
+          decoder uses; decode itself is text-only. ``temperature`` and
+          ``sampler`` are respected; ``logprobs`` is always ``None`` on the
+          speculative path.
+        draft_block_size (int, optional): Override the drafter's configured
+          block size.
 
     Yields:
         Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
@@ -470,8 +766,20 @@ def generate_step(
             max_kv_size=max_kv_size,
         )
 
+    # Speculative decoding setup
+    last_outputs = None
+    if draft_model is not None:
+        kwargs["capture_layer_ids"] = list(draft_model.config.target_layer_ids)
+        prefill_step_size = None
+        # Reset stale mRoPE state from any previous generation.
+        lm = model.language_model if hasattr(model, "language_model") else model
+        if hasattr(lm, "_position_ids"):
+            lm._position_ids = None
+        if hasattr(lm, "_rope_deltas"):
+            lm._rope_deltas = None
+
     def _step(y, inputs_embeds=None):
-        nonlocal tokens, kwargs
+        nonlocal tokens, kwargs, last_outputs
 
         with mx.stream(generation_stream):
             if "decoder_input_ids" in kwargs:
@@ -487,6 +795,7 @@ def generate_step(
                     **kwargs,
                 )
 
+            last_outputs = outputs
             logits = outputs.logits[:, -1, :]
 
             if len(processors) > 0 and len(y) > 0:
@@ -551,6 +860,45 @@ def generate_step(
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
     mx.async_eval(y)
+
+    # Speculative decoding
+    if draft_model is not None:
+        hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
+        B = input_ids.shape[0]
+        if draft_kind != "dflash":
+            raise ValueError(
+                f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash']"
+            )
+        if B == 1:
+            mx.eval(y)
+            yield y.item(), logprobs
+            yield from _dflash_rounds(
+                model,
+                draft_model,
+                prompt_cache,
+                hidden,
+                first_bonus=y.item(),
+                max_tokens=max_tokens,
+                sampler=sampler,
+                draft_block_size=draft_block_size,
+                token_dtype=input_ids.dtype,
+            )
+        else:
+            mx.eval(y)
+            first_bonus = y.squeeze(-1)
+            yield first_bonus.tolist(), logprobs
+            yield from _dflash_rounds_batch(
+                model,
+                draft_model,
+                prompt_cache,
+                hidden,
+                first_bonus=first_bonus,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                draft_block_size=draft_block_size,
+                token_dtype=input_ids.dtype,
+            )
+        return
 
     n = 0
     while True:
@@ -714,7 +1062,7 @@ def stream_generate(
     else:
         tokenizer.thinking_budget_criteria = None
 
-    # Ensure we have a prompt_cache we can track for reuse
+    # Ensure we have a prompt_cache we can track for reuse.
     if "prompt_cache" not in kwargs:
         kwargs["prompt_cache"] = cache.make_prompt_cache(
             model.language_model,
@@ -2005,6 +2353,13 @@ def main():
     )
     config = model.config
 
+    draft_model = None
+    if args.draft_model is not None:
+        from .speculative.drafters import load_drafter
+
+        print(f"Loading drafter ({args.draft_kind}): {args.draft_model}")
+        draft_model = load_drafter(args.draft_model, kind=args.draft_kind)
+
     prompt = args.prompt
 
     num_images = len(args.image) if args.image is not None else 0
@@ -2109,6 +2464,11 @@ def main():
             gen_kwargs["resize_shape"] = args.resize_shape
         if args.prefill_step_size is not None:
             gen_kwargs["prefill_step_size"] = args.prefill_step_size
+        if draft_model is not None:
+            gen_kwargs["draft_model"] = draft_model
+            gen_kwargs["draft_kind"] = args.draft_kind
+            if args.draft_block_size is not None:
+                gen_kwargs["draft_block_size"] = args.draft_block_size
 
         result = generate(
             model,
@@ -2118,6 +2478,14 @@ def main():
         )
         if not args.verbose:
             print(result.text)
+
+        if draft_model is not None:
+            lens = getattr(draft_model, "accept_lens", None) or []
+            if lens:
+                mean_accept = round(sum(lens) / len(lens), 2)
+                print(
+                    f"Speculative decoding: {mean_accept} accepted tokens over {len(lens)} rounds"
+                )
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
-from typing import Any, Optional
+from functools import partial
+from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -58,7 +59,7 @@ class Qwen3_5RotaryEmbedding:
         cos = mx.cos(emb)
         sin = mx.sin(emb)
 
-        return cos.astype(x.dtype), sin.astype(x.dtype)
+        return cos, sin
 
 
 def rotate_half(x):
@@ -78,8 +79,9 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
     k_rot = k[..., :rotary_dim]
     k_pass = k[..., rotary_dim:]
 
-    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    dtype = q.dtype
+    q_embed = ((q_rot * cos) + (rotate_half(q_rot) * sin)).astype(dtype)
+    k_embed = ((k_rot * cos) + (rotate_half(k_rot) * sin)).astype(dtype)
 
     q_embed = mx.concatenate([q_embed, q_pass], axis=-1)
     k_embed = mx.concatenate([k_embed, k_pass], axis=-1)
@@ -98,8 +100,15 @@ class Qwen3_5RMSNormGated(nn.Module):
     ) -> mx.array:
         x = mx.fast.rms_norm(hidden_states, self.weight, self.eps)
         if gate is not None:
-            x = swiglu(gate, x)
+            return _precise_swiglu(hidden_states, gate, x)
         return x.astype(hidden_states.dtype)
+
+
+@partial(mx.compile, shapeless=True)
+def _precise_swiglu(h, gate, x):
+    gate = nn.silu(gate.astype(mx.float32))
+    x = x.astype(mx.float32)
+    return (gate * x).astype(h.dtype)
 
 
 class Qwen3_5Attention(nn.Module):
@@ -256,6 +265,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         inputs: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        gdn_sink: Optional[list] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
 
@@ -306,6 +316,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
+        if gdn_sink is not None:
+            # Tuple layout consumed by ``rollback_speculative_cache`` below.
+            gdn_sink.append(
+                (
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    self.A_log,
+                    self.dt_bias,
+                    state,
+                    mask,
+                    conv_input,
+                    self.conv_kernel_size,
+                )
+            )
+
         out, state = gated_delta_update(
             q,
             k,
@@ -321,6 +349,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         if cache is not None:
             cache[1] = state
+            if hasattr(cache, "advance"):
+                cache.advance(S)
 
         out = self.norm(out, z)
         return self.out_proj(out.reshape(B, S, -1))
@@ -347,14 +377,16 @@ class Qwen3_5DecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
+        gdn_sink: Optional[list] = None,
     ) -> mx.array:
         if self.is_linear:
-            r = self.linear_attn(self.input_layernorm(x), mask, cache)
+            r = self.linear_attn(
+                self.input_layernorm(x), mask, cache, gdn_sink=gdn_sink
+            )
         else:
             r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
         h = x + r
-        out = h + self.mlp(self.post_attention_layernorm(h))
-        return out
+        return h + self.mlp(self.post_attention_layernorm(h))
 
 
 class Qwen3_5Model(nn.Module):
@@ -377,6 +409,9 @@ class Qwen3_5Model(nn.Module):
         mask: Optional[mx.array] = None,
         cache=None,
         position_ids: Optional[mx.array] = None,
+        capture_layer_ids: Optional[List[int]] = None,
+        hidden_sink: Optional[list] = None,
+        gdn_sink: Optional[list] = None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -389,9 +424,12 @@ class Qwen3_5Model(nn.Module):
         fa_mask = create_attention_mask(h, cache[self.fa_idx])
         ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        capture_set = set(capture_layer_ids) if capture_layer_ids else set()
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
-            h = layer(h, mask, c, position_ids)
+            h = layer(h, mask, c, position_ids, gdn_sink=gdn_sink)
+            if hidden_sink is not None and i in capture_set:
+                hidden_sink.append(h)
 
         return self.norm(h)
 
@@ -408,6 +446,74 @@ class LanguageModel(nn.Module):
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def rollback_speculative_cache(
+        self,
+        caches: List[Any],
+        gdn_states: List,
+        accepted,
+        block_size: int,
+    ) -> int:
+        if isinstance(accepted, int):
+            accepted = mx.array([accepted])
+
+        max_a = int(accepted.max().item())
+        n = max_a + 1
+        trim = block_size - n
+        is_batch = accepted.size > 1
+        valid_ends = accepted + 1
+
+        j = 0
+        for c in caches:
+            if c is None:
+                continue
+            if c.is_trimmable():
+                if trim > 0:
+                    c.trim(trim)
+                if is_batch and hasattr(c, "_idx") and c.keys is not None and max_a > 0:
+                    kv_len = c._idx
+                    ve = valid_ends.tolist()
+                    verify_start = kv_len - n
+                    for bi in range(accepted.shape[0]):
+                        start = verify_start + int(ve[bi])
+                        if start < kv_len:
+                            c.keys[bi, :, start:kv_len, :] = 0
+                            c.values[bi, :, start:kv_len, :] = 0
+                continue
+            q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = gdn_states[
+                j
+            ]
+            if is_batch:
+                replay_mask = mx.arange(n)[None, :] <= accepted[:, None]
+            else:
+                replay_mask = None if mask is None else mask[:, :n]
+            _, state = gated_delta_update(
+                q[:, :n],
+                k[:, :n],
+                v[:, :n],
+                a[:, :n],
+                b[:, :n],
+                A_log,
+                dt_bias,
+                init_state,
+                replay_mask,
+                use_kernel=True,
+            )
+            c[1] = state
+            if is_batch:
+                acc_list = accepted.tolist()
+                slices = [
+                    conv_input[
+                        bi : bi + 1, int(acc_list[bi]) + 1 : int(acc_list[bi]) + K
+                    ]
+                    for bi in range(accepted.shape[0])
+                ]
+                c[0] = mx.concatenate(slices, axis=0)
+            else:
+                a0 = int(accepted[0].item())
+                c[0] = conv_input[:, a0 + 1 : a0 + K]
+            j += 1
+        return max_a
 
     def get_rope_index(
         self,
@@ -587,6 +693,7 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
         rope_deltas_kw = kwargs.pop("rope_deltas", None)
         if pixel_values is not None:
             self._rope_deltas = None
@@ -667,17 +774,29 @@ class LanguageModel(nn.Module):
                     position_ids, (3, batch_size, seq_length)
                 )
 
+        hidden_sink: Optional[List[mx.array]] = (
+            [] if capture_layer_ids is not None else None
+        )
+        gdn_sink: Optional[list] = [] if capture_layer_ids is not None else None
+
         out = self.model(
             inputs,
             cache=cache,
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
+            capture_layer_ids=capture_layer_ids,
+            hidden_sink=hidden_sink,
+            gdn_sink=gdn_sink,
         )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(
+            logits=out,
+            hidden_states=hidden_sink,
+            gdn_states=gdn_sink,
+        )
 
     @property
     def layers(self):

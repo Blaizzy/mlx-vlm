@@ -59,6 +59,7 @@ class VisionFeatureCache:
 
     def put(self, image_source: Any, features: mx.array) -> None:
         """Store features in the cache, evicting LRU if full."""
+        mx.eval(features)
         key = self._make_key(image_source)
         if key in self._cache:
             self._cache.move_to_end(key)

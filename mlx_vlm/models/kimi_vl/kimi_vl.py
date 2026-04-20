@@ -62,7 +62,16 @@ class Model(nn.Module):
             inputs_embeds = self.language_model.embed_tokens(input_ids)
             return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
+        # Use precomputed positions (from caller thread) when available
+        image_positions = kwargs.pop("_precomputed_image_positions", None)
+        if image_positions is None:
+            image_positions = self._compute_image_positions(
+                input_ids, image_token_id
+            )
+
         inputs_embeds = self.language_model.embed_tokens(input_ids)
+
+        precomputed_grid = kwargs.pop("_precomputed_grid_shapes", None)
 
         cached = kwargs.get("cached_image_features", None)
         if cached is not None:
@@ -72,17 +81,57 @@ class Model(nn.Module):
                 pixel_values.transpose(0, 2, 3, 1),
                 output_hidden_states=True,
                 grid_thw=grid_thw,
+                grid_shapes=precomputed_grid,
             )
 
             image_features = self.multi_modal_projector(hidden_state)
 
-        final_inputs_embeds = self._prepare_inputs_for_multimodal(
-            image_features,
-            inputs_embeds,
-            input_ids,
-            image_token_id=image_token_id,
-        )
-        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
+        inputs_embeds[:, image_positions, :] = image_features
+        return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
+
+    def _compute_image_positions(self, input_ids, image_token_id=None):
+        """Compute image token positions (forces mx.eval via numpy)."""
+        candidate_ids = []
+        for t in [
+            image_token_id,
+            self.config.image_token_index,
+            getattr(self.config, "media_placeholder_token_id", None),
+        ]:
+            if t is None:
+                continue
+            if isinstance(t, mx.array):
+                if t.size == 0:
+                    continue
+                t = t.item()
+            candidate_ids.append(int(t))
+
+        ids_np = np.array(input_ids)
+        mask_np = np.zeros(ids_np.shape, dtype=bool)
+        for tid in candidate_ids:
+            mask_np |= ids_np == tid
+        return np.where(mask_np)[1].tolist()
+
+    def precompute_indices(self, raw_inputs: dict):
+        """Precompute image positions on the caller thread.
+
+        Must run before the GPU thread to avoid mx.eval conflicts
+        with the generation stream's wired Metal resources.
+        """
+        input_ids = raw_inputs.get("input_ids")
+        pixel_values = raw_inputs.get("pixel_values")
+        if input_ids is None or pixel_values is None:
+            return
+        image_token_id = raw_inputs.get("image_token_id")
+        positions = self._compute_image_positions(input_ids, image_token_id)
+        raw_inputs["_precomputed_image_positions"] = positions
+
+        # Precompute grid shapes as Python tuples to avoid .tolist() on GPU thread
+        for key in ("image_grid_hws", "video_grid_hws"):
+            v = raw_inputs.get(key)
+            if v is not None and hasattr(v, "tolist"):
+                raw_inputs["_precomputed_grid_shapes"] = [
+                    (int(s[0]), int(s[1])) for s in v.tolist()
+                ]
 
     def _prepare_inputs_for_multimodal(
         self,
