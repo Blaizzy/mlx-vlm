@@ -7,10 +7,10 @@ from typing import Callable, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map_with_path
-from mlx_lm.utils import dequantize_model, quantize_model
 
 from .utils import (
     MODEL_CONVERSION_DTYPES,
+    create_model_card,
     fetch_from_hub,
     get_model_path,
     save_config,
@@ -121,9 +121,13 @@ def convert(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
 
+    model_quant_predicate = getattr(model, "quant_predicate", None)
+
     def base_quant_predicate(path, module):
         if skip_multimodal_module(path):
             return False
+        if model_quant_predicate is not None:
+            return model_quant_predicate(path, module)
         return True
 
     if isinstance(quant_predicate, str):
@@ -152,6 +156,8 @@ def convert(
         raise ValueError("Choose either quantize or dequantize, not both.")
 
     if quantize:
+        from mlx_lm.utils import quantize_model
+
         print("[INFO] Quantizing")
         config.setdefault("vision_config", {})
         model, config = quantize_model(
@@ -164,6 +170,8 @@ def convert(
         )
 
     if dequantize:
+        from mlx_lm.utils import dequantize_model
+
         print("[INFO] Dequantizing")
         model = dequantize_model(model)
 
@@ -181,12 +189,23 @@ def convert(
                 continue
             shutil.copy(file, mlx_path)
 
+    # Copy folders from the model path to the MLX path
+    for item in model_path.iterdir():
+        if item.is_dir():
+            dest = mlx_path / item.name
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(item, dest)
+
     processor.save_pretrained(mlx_path)
 
     save_config(config, config_path=mlx_path / "config.json")
 
+    hf_repo = None if Path(hf_path).exists() else hf_path
+    create_model_card(mlx_path, hf_repo)
+
     if upload_repo is not None:
-        upload_to_hub(mlx_path, upload_repo, hf_path)
+        upload_to_hub(mlx_path, upload_repo)
 
 
 def configure_parser() -> argparse.ArgumentParser:

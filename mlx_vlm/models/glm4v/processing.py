@@ -198,6 +198,9 @@ class Glm46VProcessor(ProcessorMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         """Load processor from pretrained model path."""
+        import json
+        from pathlib import Path
+
         from transformers import AutoTokenizer, Glm4vImageProcessor
 
         trust_remote_code = kwargs.pop("trust_remote_code", True)
@@ -207,6 +210,16 @@ class Glm46VProcessor(ProcessorMixin):
             trust_remote_code=trust_remote_code,
             **kwargs,
         )
+        from ..base import load_chat_template
+
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
+
+        # Read processor_config.json for correct init kwargs
+        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
+        proc_kwargs = {}
+        if proc_cfg_path.exists():
+            with open(proc_cfg_path) as f:
+                proc_cfg = json.load(f)
 
         image_processor = Glm4vImageProcessor.from_pretrained(
             pretrained_model_name_or_path,
@@ -214,7 +227,16 @@ class Glm46VProcessor(ProcessorMixin):
             **kwargs,
         )
 
-        return cls(image_processor=image_processor, tokenizer=tokenizer, **kwargs)
+        return cls(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            **proc_kwargs,
+            **kwargs,
+        )
 
 
 __all__ = ["Glm46VProcessor"]
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch("glm4v", Glm46VProcessor)

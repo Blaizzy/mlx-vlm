@@ -28,10 +28,17 @@ class Attention(nn.Module):
         )
         self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
+        attention_bias = getattr(args, "attention_bias", True)
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=attention_bias)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
+
+        # QK normalization (used by Qwen3 and similar)
+        self._use_qk_norm = not attention_bias
+        if self._use_qk_norm:
+            self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
+            self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
 
         self.rotary_emb = nn.RoPE(
             head_dim,
@@ -50,24 +57,29 @@ class Attention(nn.Module):
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
         # Prepare the queries, keys and values for the attention computation
-        queries = queries.reshape(B, L, self.n_heads, self.head_dim).transpose(
-            0, 2, 1, 3
-        )
-        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, self.n_heads, self.head_dim)
+        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim)
+
+        if self._use_qk_norm:
+            queries = self.q_norm(queries)
+            keys = self.k_norm(keys)
+
+        queries = queries.transpose(0, 2, 1, 3)
+        keys = keys.transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(
             0, 2, 1, 3
         )
 
         offset = cache.offset if cache else 0
 
-        if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., : keys.shape[-2]]
-
         queries = self.rotary_emb(queries, offset=offset)
         keys = self.rotary_emb(keys, offset=offset)
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
+
+        if mask is not None and isinstance(mask, mx.array):
+            mask = mask[..., : keys.shape[-2]]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache, scale=self.scale, mask=mask
@@ -142,7 +154,9 @@ class Qwen2Model(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            mask = create_attention_mask(
+                h, cache[0] if cache and cache[0] is not None else cache
+            )
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -166,6 +180,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        **kwargs,
     ):
         out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
         if self.args.tie_word_embeddings:

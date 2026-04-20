@@ -5,6 +5,7 @@ import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
 from ..pixtral import VisionModel
+from . import processing_mistral3  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 
@@ -241,29 +242,35 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the output hidden states from the vision model
-        if isinstance(pixel_values, list):
-            pixel_values = mx.concatenate(
-                [mx.array(pv)[None, ...] for pv in pixel_values], axis=0
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
+        else:
+            # Get the output hidden states from the vision model
+            if isinstance(pixel_values, list):
+                pixel_values = mx.concatenate(
+                    [mx.array(pv)[None, ...] for pv in pixel_values], axis=0
+                )
+            if pixel_values.ndim == 3:
+                pixel_values = pixel_values[None, ...]
+
+            *_, hidden_states = self.vision_tower(
+                pixel_values.transpose(0, 2, 3, 1),
+                output_hidden_states=True,
+                image_sizes=image_sizes,
             )
-        if pixel_values.ndim == 3:
-            pixel_values = pixel_values[None, ...]
+            # Select the hidden states from the desired layer
+            selected_image_feature = hidden_states[self.vision_feature_layer]
+            if (
+                selected_image_feature.ndim == 3
+                and selected_image_feature.shape[0] == 1
+            ):
+                selected_image_feature = selected_image_feature.squeeze(0)
 
-        # Pass pixel_values as list of images, as each image is individually run through conv2d and position encoding
-        # Reference code from transformers: https://github.com/huggingface/transformers/blob/main/src/transformers/models/pixtral/modeling_pixtral.py#L479C9-L479C21
-        # and mistral_inference: https://github.com/mistralai/mistral-inference/blob/main/src/mistral_inference/vision_encoder.py#L85
-        *_, hidden_states = self.vision_tower(
-            pixel_values.transpose(0, 2, 3, 1),
-            output_hidden_states=True,
-            image_sizes=image_sizes,
-        )
-        # Select the hidden states from the desired layer
-        selected_image_feature = hidden_states[self.vision_feature_layer]
-        if selected_image_feature.ndim == 3 and selected_image_feature.shape[0] == 1:
-            selected_image_feature = selected_image_feature.squeeze(0)
-
-        # Pass image features through the multi-modal projector
-        image_features = self.multi_modal_projector(selected_image_feature, image_sizes)
+            # Pass image features through the multi-modal projector
+            image_features = self.multi_modal_projector(
+                selected_image_feature, image_sizes
+            )
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self.merge_input_ids_with_image_features(
@@ -401,12 +408,12 @@ class Model(nn.Module):
 
             # Handle different scale_inv shapes:
             # - Scalar (0-dim): per-tensor scaling
-            # - 2D: block-wise scaling
+            # - 2D: block-wise scaling for 2D weights
             if scale_inv.ndim == 0:
                 # Per-tensor scaling (scalar)
                 return (weight * scale_inv).astype(dtype)
-            else:
-                # Block-wise scaling
+            elif weight.ndim == 2:
+                # 2D block-wise scaling
                 bs = 128  # block size
                 m, n = weight.shape
                 pad_bottom = (-m) % bs
@@ -420,6 +427,9 @@ class Model(nn.Module):
                     m + pad_bottom, n + pad_side
                 )
                 return weight[:m, :n].astype(dtype)
+            else:
+                # 3D+ tensors (e.g., fused expert weights): broadcast multiply
+                return (weight * scale_inv).astype(dtype)
 
         # Transform keys first
         weights = {transform_key(k): v for k, v in weights.items()}
@@ -437,6 +447,10 @@ class Model(nn.Module):
                 new_weights[k] = v
 
         return new_weights
+
+    @property
+    def quant_predicate(self):
+        return self.language_model.quant_predicate
 
     @property
     def layers(self):

@@ -59,15 +59,13 @@ class Florence2Attention(nn.Module):
             else hidden_states.shape[1]
         )
 
-        if (
-            is_cross_attention
-            and cache is not None
-            and cache.cache_length > 0
-            and cache.keys.shape[2] == key_value_states.shape[1]
-        ):
+        if is_cross_attention and cache is not None and cache.keys is not None:
             # Cross-attention with cached keys/values - reuse them
-            k = cache.keys
-            v = cache.values
+            if hasattr(cache, "state"):
+                state = cache.state
+                k, v = state[0], state[1]
+            else:
+                k, v = cache.keys, cache.values
 
         elif is_cross_attention:
             # Cross attention - compute and cache keys/values from encoder
@@ -83,7 +81,7 @@ class Florence2Attention(nn.Module):
             )
             # Cache the cross-attention keys/values
             if cache is not None:
-                cache.update(k, v)
+                cache.update_and_fetch(k, v)
 
         elif cache is not None:
             # Self-attention with cache - compute new k,v and concatenate with cache
@@ -311,7 +309,15 @@ class Florence2Decoder(nn.Module):
         if positions.ndim == 1:
             positions = mx.expand_dims(positions, axis=0)
 
-        cache_length = cache[0][0].keys.shape[2] if cache[0][0].cache_length > 0 else 0
+        first_cache = cache[0][0]
+        if first_cache.keys is not None:
+            cache_length = (
+                first_cache._idx
+                if hasattr(first_cache, "_idx")
+                else first_cache.cache_length
+            )
+        else:
+            cache_length = 0
 
         bsz, seq_len = inputs_embeds.shape[:2]
         positions = mx.arange(

@@ -12,7 +12,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import requests
-import soundfile as sf
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
@@ -21,7 +20,7 @@ from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
 from .tokenizer_utils import load_tokenizer
-from .trainer import apply_lora_layers
+from .trainer.utils import apply_lora_layers
 
 # Modes that support activation quantization
 ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
@@ -34,6 +33,14 @@ MODEL_REMAPPING = {
     "lfm2-vl": "lfm2_vl",
     "cohere2_vision": "aya_vision",
     "jvlm": "jina_vlm",
+    "phi4-siglip": "phi4_siglip",
+    "sam3_video": "sam3",
+    "sam3.1_video": "sam3_1",
+    "granite-vision": "granite_vision",
+    "granite4-vision": "granite4_vision",
+    "granite4_vision": "granite4_vision",
+    "rf-detr": "rfdetr",
+    "falcon-perception": "falcon_perception",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -87,6 +94,7 @@ def skip_multimodal_module(path: str) -> bool:
         or "audio_model" in path
         or "audio_tower" in path
         or "code_predictor" in path
+        or "img_projector" in path
     )
 
 
@@ -104,14 +112,24 @@ def get_model_and_args(config: dict):
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
-    try:
-        arch = importlib.import_module(f"mlx_vlm.models.{model_type}")
-    except ImportError as e:
-        msg = f"Model type {model_type} not supported. Error: {e}"
-        logging.error(msg)
-        raise ValueError(msg)
+    is_dflash = config.get("dflash_config", None) is not None
+    if is_dflash:
+        model_type += "_dflash"
 
-    return arch, model_type
+    last_err: Optional[ImportError] = None
+    for pkg in ("mlx_vlm.models", "mlx_vlm.speculative.drafters"):
+        try:
+            arch = importlib.import_module(f"{pkg}.{model_type}")
+            return arch, model_type
+        except ImportError as e:
+            if model_type not in str(e):
+                raise
+            last_err = e
+            continue
+
+    msg = f"Model type {model_type} not supported. Error: {last_err}"
+    logging.error(msg)
+    raise ValueError(msg)
 
 
 def get_model_path(
@@ -163,9 +181,6 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
-        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
-            to QQLinear layers for activation quantization. Only supported for models
-            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -191,7 +206,7 @@ Create safetensors using the following code:
 ```
 from transformers import AutoModelForCausalLM, AutoProcessor
 
-model_id= "<huggingface_model_id>"
+model_id = "<huggingface_model_id>"
 model = AutoModelForCausalLM.from_pretrained(model_id)
 processor = AutoProcessor.from_pretrained(model_id)
 
@@ -217,7 +232,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     model_class, _ = get_model_and_args(config=config)
 
     # Initialize text and vision configs if not present
-    config.setdefault("text_config", {})
+    config.setdefault("text_config", config.pop("llm_config", {}))
     config.setdefault("vision_config", {})
     config.setdefault("audio_config", {})
 
@@ -240,12 +255,14 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             weights = sanitize_weights(model.code2wav, weights)
             weights = sanitize_weights(model.talker, weights)
         else:
-            weights = sanitize_weights(
-                model_class.VisionModel, weights, model_config.vision_config
-            )
-            weights = sanitize_weights(
-                model_class.LanguageModel, weights, model_config.text_config
-            )
+            if hasattr(model_class, "VisionModel"):
+                weights = sanitize_weights(
+                    model_class.VisionModel, weights, model_config.vision_config
+                )
+            if hasattr(model_class, "LanguageModel"):
+                weights = sanitize_weights(
+                    model_class.LanguageModel, weights, model_config.text_config
+                )
             if hasattr(model_class, "AudioModel"):
                 weights = sanitize_weights(
                     model_class.AudioModel, weights, model_config.audio_config
@@ -344,7 +361,7 @@ def update_module_configs(model_config, model_class, config, modules):
     """
     for config_name in modules:
         config_attr = f"{config_name}_config"
-        if hasattr(model_config, config_attr):
+        if hasattr(model_config, config_attr) and config.get(config_attr) is not None:
             config_class = getattr(model_class, f"{config_name.title()}Config")
             setattr(
                 model_config, config_attr, config_class.from_dict(config[config_attr])
@@ -363,7 +380,7 @@ def load(
     Load the model and tokenizer from a given path or a huggingface repository.
 
     Args:
-        path_or_hf_repo (Path): The path or the huggingface repository to load the model from.
+        path_or_hf_repo (str): The path or the huggingface repository to load the model from.
         tokenizer_config (dict, optional): Configuration parameters specifically for the tokenizer.
             Defaults to an empty dictionary.
         adapter_path (str, optional): Path to the LoRA adapters. If provided, applies LoRA layers
@@ -373,10 +390,6 @@ def load(
             when needed. Default: ``False``
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
-        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
-            to QQLinear layers for activation quantization. Only supported for models
-            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
-
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
@@ -406,6 +419,50 @@ def load(
 
     if image_processor is not None:
         processor.image_processor = image_processor
+
+    return model, processor
+
+
+def sharded_load(
+    repo,
+    tensor_group: Optional[mx.distributed.Group] = None,
+):
+    # Get model path with everything but weight safetensors
+    model_path = get_model_path(repo)
+
+    # Lazy load model to figure out what type of sharding we can do and which
+    # weights we need to download.
+    model = load_model(model_path, lazy=True, strict=False)
+    config = model.config.to_dict()
+
+    has_tensor_parallel = hasattr(model, "shard")
+
+    if tensor_group is not None and not has_tensor_parallel:
+        raise ValueError(
+            "The model does not support tensor parallelism but a tensor_group was provided"
+        )
+
+    if tensor_group is None:
+        if has_tensor_parallel:
+            tensor_group = mx.distributed.init()
+
+    processor = load_processor(
+        model_path, True, eos_token_ids=config.get("eos_token_id", None)
+    )
+
+    image_processor = load_image_processor(model_path)
+    if image_processor is not None:
+        processor.image_processor = image_processor
+
+    if tensor_group is not None:
+        model.shard(tensor_group)
+
+    print("Materializing")
+    mx.eval(model.language_model.parameters())
+    model.eval()
+
+    # Synchronize processes to avoid timeout
+    mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
 
     return model, processor
 
@@ -540,28 +597,66 @@ def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list
     return shards
 
 
-def upload_to_hub(path: str, upload_repo: str, hf_path: str):
+def create_model_card(
+    path: Union[str, Path], hf_path: Optional[Union[str, Path]] = None
+):
+    """
+    Create model card for a converted MLX model.
+
+    Args:
+        path (Union[str, Path]): Local path to the converted model.
+        hf_path (Optional[Union[str, Path]]): Original Hugging Face repo id or local path used for conversion.
+    """
+    from huggingface_hub import ModelCard, ModelCardData
+
+    if hf_path is None:
+        card = ModelCard.from_template(ModelCardData(language="en"))
+    else:
+        card = ModelCard.load(hf_path)
+    card.data.library_name = "mlx"
+    if card.data.pipeline_tag is None:
+        card.data.pipeline_tag = "image-text-to-text"
+    if card.data.tags is None:
+        card.data.tags = ["mlx"]
+    elif "mlx" not in card.data.tags:
+        card.data.tags += ["mlx"]
+    if hf_path is not None:
+        card.data.base_model = str(hf_path)
+    card.text = ""
+    card.save(Path(path) / "README.md")
+
+
+def upload_to_hub(path: str, upload_repo: str):
     """
     Uploads the model to Hugging Face hub.
 
     Args:
         path (str): Local path to the model.
         upload_repo (str): Name of the HF repo to upload to.
-        hf_path (str): Path to the original Hugging Face model.
     """
-    import os
-
     from huggingface_hub import HfApi, ModelCard, logging
 
     from . import __version__
 
-    card = ModelCard.load(hf_path)
-    card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"]
+    logging.set_verbosity_info()
+    card_path = Path(path) / "README.md"
+    card = ModelCard.load(card_path)
+
+    hf_path = card.data.base_model
+
+    if hf_path is not None:
+        provenance = f"""
+        This model was converted to MLX format from [`{hf_path}`](https://huggingface.co/{hf_path})
+        using mlx-vlm version **{__version__}**.
+        Refer to the [original model card](https://huggingface.co/{hf_path}) for more details on the model.
+        """
+    else:
+        provenance = ""
+
     card.text = dedent(
         f"""
         # {upload_repo}
-        This model was converted to MLX format from [`{hf_path}`]() using mlx-vlm version **{__version__}**.
-        Refer to the [original model card](https://huggingface.co/{hf_path}) for more details on the model.
+        {provenance}
         ## Use with mlx
 
         ```bash
@@ -573,9 +668,7 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
         ```
         """
     )
-    card.save(os.path.join(path, "README.md"))
-
-    logging.set_verbosity_info()
+    card.save(card_path)
 
     api = HfApi()
     api.create_repo(repo_id=upload_repo, exist_ok=True)
@@ -694,48 +787,36 @@ def save_config(
 
 def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     """
-    Helper function to load an image from either a URL or file.
+    Helper function to load an image from either a URL, file path, data URI,
+    or BytesIO object.
     """
-    if (
-        isinstance(image_source, BytesIO)
-        or (isinstance(image_source, str) and image_source.startswith("data:image/"))
-        or Path(image_source).is_file()
-    ):
-        # for base64 encoded images
-        try:
-            if image_source.startswith("data:image/"):
-                import base64
+    import base64
 
-                if "," not in image_source:
-                    raise ValueError(
-                        "Invalid data URI format - missing comma separator"
-                    )
-
-                _, data = image_source.split(",", 1)
-                image_source = BytesIO(base64.b64decode(data))
-
-            image = Image.open(image_source)
-        except IOError as e:
+    try:
+        if not isinstance(image_source, (str, Path, BytesIO)):
             raise ValueError(
-                f"Failed to load image from {image_source} with error: {e}"
-            ) from e
-    elif image_source.startswith(("http://", "https://")):
-        try:
+                f"Unsupported image source type: {type(image_source).__name__}"
+            )
+        if isinstance(image_source, str) and image_source.startswith("data:image/"):
+            if "," not in image_source:
+                raise ValueError("Invalid data URI format - missing comma separator")
+            _, data = image_source.split(",", 1)
+            image_source = BytesIO(base64.b64decode(data))
+        if isinstance(image_source, str) and image_source.startswith(
+            ("http://", "https://")
+        ):
             response = requests.get(image_source, stream=True, timeout=timeout)
             response.raise_for_status()
-            image = Image.open(response.raw)
-        except Exception as e:
-            raise ValueError(
-                f"Failed to load image from URL: {image_source} with error {e}"
-            ) from e
-    else:
-        raise ValueError(
-            f"The image {image_source} must be a valid URL or existing file."
-        )
+            image_source = response.raw
+
+        image = Image.open(image_source)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Failed to load image from {image_source}: {e}") from e
 
     image = ImageOps.exif_transpose(image)
-    image = image.convert("RGB")
-    return image
+    return image.convert("RGB")
 
 
 def resize_image(img, max_size):
@@ -748,66 +829,230 @@ def resize_image(img, max_size):
 def process_image(img, resize_shape, image_processor):
     if isinstance(img, str):
         img = load_image(img)
+    if hasattr(img, "mode") and img.mode != "RGB":
+        img = img.convert("RGB")
     if resize_shape is not None and not isinstance(image_processor, BaseImageProcessor):
         img = resize_image(img, resize_shape)
     return img
 
 
+def _resample_fft(signal: np.ndarray, n_target: int) -> np.ndarray:
+    """FFT-based resampling for a 1D signal (matches scipy.signal.resample)."""
+    n_orig = len(signal)
+    if n_orig == n_target:
+        return signal
+
+    X = np.fft.rfft(signal)
+    m = min(n_target, n_orig)
+    m2 = m // 2 + 1
+
+    # Truncate to relevant frequency bins
+    X = X[:m2].copy()
+
+    # Account for unpaired Nyquist bin (matches scipy exactly)
+    if m % 2 == 0 and n_target != n_orig:
+        X[m // 2] *= 2.0 if n_target < n_orig else 0.5
+
+    s_fac = n_orig / n_target
+    resampled = np.fft.irfft(X / s_fac, n=n_target)
+    return resampled.astype(signal.dtype)
+
+
 def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    """Resample audio using linear interpolation."""
+    """Resample audio using FFT (matches scipy.signal.resample)."""
     if orig_sr == target_sr:
         return audio
 
-    # Calculate the resampling ratio
     ratio = target_sr / orig_sr
 
-    # Handle different audio shapes
     if audio.ndim == 1:
-        # Mono audio - simple case
         new_length = int(len(audio) * ratio)
-        old_indices = np.arange(len(audio))
-        new_indices = np.linspace(0, len(audio) - 1, new_length)
-        resampled = np.interp(new_indices, old_indices, audio)
+        resampled = _resample_fft(audio, new_length)
 
     elif audio.ndim == 2:
-        # Multi-channel audio - transpose to (samples, channels) if needed
         if audio.shape[0] < audio.shape[1]:
             audio = audio.T
 
-        # Resample each channel
         n_samples, n_channels = audio.shape
         new_length = int(n_samples * ratio)
-        old_indices = np.arange(n_samples)
-        new_indices = np.linspace(0, n_samples - 1, new_length)
 
-        resampled = np.zeros((new_length, n_channels))
+        resampled = np.zeros((new_length, n_channels), dtype=audio.dtype)
         for i in range(n_channels):
-            resampled[:, i] = np.interp(new_indices, old_indices, audio[:, i])
+            resampled[:, i] = _resample_fft(audio[:, i], new_length)
     else:
         raise ValueError(f"Audio array has unsupported shape: {audio.shape}")
 
     return resampled
 
 
+def read_audio(file) -> tuple:
+    """Read an audio file using miniaudio (or ffmpeg for m4a/aac/ogg/opus).
+
+    Returns (samples_float32, sample_rate) where samples is always 2D (samples, channels).
+    """
+    import io as _io
+
+    if isinstance(file, bytes):
+        file = _io.BytesIO(file)
+
+    # Check if ffmpeg is needed for certain formats
+    use_ffmpeg = False
+    if isinstance(file, (str, Path)):
+        ext = Path(file).suffix.lstrip(".").lower()
+        if ext in ("m4a", "aac", "ogg", "opus"):
+            use_ffmpeg = True
+    elif isinstance(file, _io.BytesIO):
+        pos = file.tell()
+        header = file.read(12)
+        file.seek(pos)
+        if header[4:8] == b"ftyp" or header[:4] == b"OggS":
+            use_ffmpeg = True
+
+    if use_ffmpeg:
+        import json as _json
+        import shutil
+        import subprocess
+
+        ffmpeg_path = shutil.which("ffmpeg")
+        ffprobe_path = shutil.which("ffprobe")
+        if ffmpeg_path is None:
+            raise RuntimeError(
+                "ffmpeg not found. Install it: brew install ffmpeg (macOS) "
+                "or sudo apt install ffmpeg (Linux)"
+            )
+
+        if isinstance(file, _io.BytesIO):
+            file.seek(0)
+            input_data = file.read()
+        else:
+            input_data = None
+
+        # Get info via ffprobe
+        if ffprobe_path and input_data is not None:
+            probe = subprocess.run(
+                [
+                    ffprobe_path,
+                    "-v",
+                    "quiet",
+                    "-print_format",
+                    "json",
+                    "-show_streams",
+                    "-select_streams",
+                    "a:0",
+                    "-i",
+                    "pipe:0",
+                ],
+                input=input_data,
+                capture_output=True,
+            )
+        elif ffprobe_path:
+            probe = subprocess.run(
+                [
+                    ffprobe_path,
+                    "-v",
+                    "quiet",
+                    "-print_format",
+                    "json",
+                    "-show_streams",
+                    "-select_streams",
+                    "a:0",
+                    str(file),
+                ],
+                capture_output=True,
+            )
+        else:
+            probe = None
+
+        sample_rate, nchannels = 44100, 1
+        if probe and probe.returncode == 0:
+            info = _json.loads(probe.stdout)
+            if info.get("streams"):
+                stream = info["streams"][0]
+                sample_rate = int(stream.get("sample_rate", 44100))
+                nchannels = int(stream.get("channels", 1))
+
+        # Decode via ffmpeg to raw PCM s16le
+        cmd = [ffmpeg_path, "-v", "quiet"]
+        if input_data is not None:
+            cmd += ["-i", "pipe:0"]
+        else:
+            cmd += ["-i", str(file)]
+        cmd += ["-f", "s16le", "-acodec", "pcm_s16le", "-ac", str(nchannels), "pipe:1"]
+
+        result = subprocess.run(cmd, input=input_data, capture_output=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg decoding failed: {result.stderr.decode()}")
+
+        samples = np.frombuffer(result.stdout, dtype=np.int16)
+    else:
+        import miniaudio
+
+        if isinstance(file, (str, Path)):
+            info = miniaudio.get_file_info(str(file))
+            decoded = miniaudio.decode_file(
+                str(file),
+                nchannels=info.nchannels,
+                sample_rate=info.sample_rate,
+            )
+        elif isinstance(file, _io.BytesIO):
+            file.seek(0)
+            data = file.read()
+            # Detect format from magic bytes
+            if data[:4] == b"RIFF":
+                info = miniaudio.wav_get_info(data)
+            elif data[:3] == b"ID3" or data[:2] in (b"\xff\xfb", b"\xff\xfa"):
+                info = miniaudio.mp3_get_info(data)
+            elif data[:4] == b"fLaC":
+                info = miniaudio.flac_get_info(data)
+            else:
+                info = miniaudio.vorbis_get_info(data)
+            decoded = miniaudio.decode(
+                data,
+                nchannels=info.nchannels,
+                sample_rate=info.sample_rate,
+            )
+        else:
+            raise TypeError(f"Unsupported file type: {type(file)}")
+
+        sample_rate = decoded.sample_rate
+        nchannels = decoded.nchannels
+        samples = np.array(decoded.samples, dtype=np.int16)
+
+    # Reshape multi-channel and convert to float32
+    if nchannels > 1:
+        samples = samples.reshape(-1, nchannels)
+    audio = samples.astype(np.float32) / 32768.0
+
+    # Ensure always 2D
+    if audio.ndim == 1:
+        audio = audio[:, np.newaxis]
+
+    return audio, sample_rate
+
+
 def load_audio(
-    file: str,
+    file,
     sr: int,
     timeout: int = 10,
 ):
     """
-    Helper function to load audio from either a URL or file.
+    Helper function to load audio from either a URL, file path, or numpy array.
     """
-    if file.startswith(("http://", "https://")):
+    if isinstance(file, np.ndarray):
+        return file
+    if isinstance(file, Path):
+        file = str(file)
+    if isinstance(file, str) and file.startswith(("http://", "https://")):
         try:
             response = requests.get(file, stream=True, timeout=timeout)
             response.raise_for_status()
-            audio, sample_rate = sf.read(BytesIO(response.content), always_2d=True)
+            audio, sample_rate = read_audio(BytesIO(response.content))
         except Exception as e:
             raise ValueError(
                 f"Failed to load audio from URL: {file} with error {e}"
             ) from e
     else:
-        audio, sample_rate = sf.read(file, always_2d=True)
+        audio, sample_rate = read_audio(file)
 
     if sample_rate != sr:
         audio = resample_audio(audio, sample_rate, sr)
@@ -856,8 +1101,12 @@ def process_inputs(
     if audio is not None and len(audio) > 0:
         if "audio" in parameters:
             args["audio"] = audio
+        elif "audios" in parameters:
+            args["audios"] = audio
         else:
-            raise ValueError(f"Processor {processor} does not support audio parameter")
+            raise ValueError(
+                f"Processor {processor.__class__.__name__} does not support audio parameter"
+            )
 
     return process_method(**args)
 
@@ -883,23 +1132,6 @@ def process_inputs_with_fallback(
             **kwargs,
         )
     except Exception as e:
-        # Fallback to PyTorch tensors if MLX fails
-        if return_tensors != "pt":
-            try:
-                return process_inputs(
-                    processor,
-                    prompts=prompts,
-                    images=images,
-                    audio=audio,
-                    add_special_tokens=add_special_tokens,
-                    return_tensors="pt",
-                    **kwargs,
-                )
-            except Exception as fallback_error:
-                raise ValueError(
-                    f"Failed to process inputs with error: {fallback_error}"
-                ) from fallback_error
-
         raise ValueError(f"Failed to process inputs with error: {e}")
 
 
@@ -914,10 +1146,15 @@ def prepare_inputs(
     padding=True,
     padding_side="left",
     pad_to_uniform_size=False,
+    return_tensors="mlx",
     **kwargs,
 ):
 
-    if not images and not audio:
+    has_images = images is not None and (
+        not hasattr(images, "__len__") or len(images) > 0
+    )
+    has_audio = audio is not None and (not hasattr(audio, "__len__") or len(audio) > 0)
+    if not has_images and not has_audio:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -929,9 +1166,18 @@ def prepare_inputs(
             add_special_tokens=add_special_tokens,
             padding=padding,
             padding_side=padding_side,
+            return_tensors=return_tensors,
         )
-        input_ids = mx.array([inputs.input_ids])
-        mask = mx.array([inputs.attention_mask])
+        input_ids = (
+            inputs.input_ids
+            if isinstance(inputs.input_ids, mx.array)
+            else mx.array(inputs.input_ids)
+        )
+        mask = (
+            inputs.attention_mask
+            if isinstance(inputs.attention_mask, mx.array)
+            else mx.array(inputs.attention_mask)
+        )
         return {
             "input_ids": input_ids,
             "attention_mask": mask,
@@ -1049,16 +1295,12 @@ def prepare_inputs(
             )
         else:
             feature_extractor = getattr(processor, "feature_extractor", None)
-            if feature_extractor is not None:
-                audio = [
-                    load_audio(audio_file, sr=feature_extractor.sampling_rate)
-                    for audio_file in audio
-                ]
-            else:
-                audio = [
-                    load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
-                    for audio_file in audio
-                ]
+            sr = (
+                getattr(feature_extractor, "sampling_rate", 16000)
+                if feature_extractor is not None
+                else 16000
+            )
+            audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
     model_inputs = {}
 
@@ -1118,7 +1360,9 @@ def prepare_inputs(
         # Convert inputs to model_inputs with mx.array if present
         for key, value in inputs.items():
             if key not in model_inputs:
-                if isinstance(value, (str, list, mx.array)):
+                if value is None:
+                    model_inputs[key] = value
+                elif isinstance(value, (str, list, mx.array)):
                     model_inputs[key] = value
                 else:
                     model_inputs[key] = mx.array(value)
@@ -1221,13 +1465,17 @@ class StoppingCriteria:
             raise ValueError("Processor is not provided")
 
         if new_eos_token_ids is not None:
-            if isinstance(new_eos_token_ids, str):
+            if isinstance(new_eos_token_ids, (str, int)):
                 new_eos_token_ids = [new_eos_token_ids]
-            new_eos_token_ids = [
-                self.tokenizer.encode(" " + token, add_special_tokens=False)[-1]
-                for token in new_eos_token_ids
-            ]
-            self.eos_token_ids.extend(new_eos_token_ids)
+            resolved = []
+            for token in new_eos_token_ids:
+                if isinstance(token, int):
+                    resolved.append(token)
+                elif isinstance(token, str):
+                    resolved.append(
+                        self.tokenizer.encode(" " + token, add_special_tokens=False)[-1]
+                    )
+            self.eos_token_ids.extend(resolved)
 
     def reset(self, eos_token_ids: List[int] = None):
         eos_token_ids = (
@@ -1242,6 +1490,87 @@ class StoppingCriteria:
 
     def __call__(self, input_ids: mx.array) -> bool:
         return input_ids in self.eos_token_ids
+
+
+class ThinkingBudgetCriteria:
+    """
+    Enforces a budget on thinking tokens.
+
+    Tracks tokens within thinking blocks (between start and end tokens) and
+    forces a closing sequence (e.g. ``\\n</think>``) when budget is exceeded.
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        thinking_budget: int,
+        thinking_end_token: str = "</think>",
+        thinking_start_token: Optional[str] = None,
+        enable_thinking: bool = False,
+    ):
+        self.tokenizer = tokenizer
+        self.thinking_budget = thinking_budget
+        self.enable_thinking = enable_thinking
+
+        # Resolve token IDs from strings
+        self.thinking_end_token_id = tokenizer.encode(
+            thinking_end_token, add_special_tokens=False
+        )[-1]
+
+        self.thinking_start_token_id = tokenizer.encode(
+            thinking_start_token, add_special_tokens=False
+        )[-1]
+
+        self._forced_sequence: List[int] = []
+        newline_ids = tokenizer.encode("\n", add_special_tokens=False)
+        if newline_ids:
+            self._forced_sequence.append(newline_ids[-1])
+        self._forced_sequence.append(self.thinking_end_token_id)
+        self._forced_index = 0
+
+        self.in_thinking = self.enable_thinking
+        self.thinking_token_count = 0
+        self.budget_exceeded = False
+
+    def reset_thinking_state(self):
+        """Reset thinking state between generations."""
+        self.in_thinking = self.enable_thinking
+        self.thinking_token_count = 0
+        self.budget_exceeded = False
+        self._forced_index = 0
+
+    def __call__(self, token_id: int) -> Optional[int]:
+        """Process a token and return a forced token ID if budget exceeded, else None."""
+        if self.enable_thinking and token_id == self.thinking_start_token_id:
+            self.in_thinking = True
+            return None
+
+        if token_id == self.thinking_end_token_id:
+            self.in_thinking = False
+            self.budget_exceeded = False
+            self._forced_index = 0
+            return None
+
+        if self.in_thinking:
+            self.thinking_token_count += 1
+            if self.thinking_token_count > self.thinking_budget:
+                self.budget_exceeded = True
+
+        if self.budget_exceeded and self._forced_index < len(self._forced_sequence):
+            forced = self._forced_sequence[self._forced_index]
+            self._forced_index += 1
+            self.forced_token_id = forced
+            return forced
+
+        self.forced_token_id = None
+        return None
+
+    def apply_forced_token(self, next_y: mx.array) -> Optional[mx.array]:
+        if self.forced_token_id is not None and self.enable_thinking:
+            next_y = mx.array([self.forced_token_id])
+            self.forced_token_id = None
+            return next_y
+        return next_y
 
 
 def print_array_report(t: mx.array, label: Optional[str]) -> dict:

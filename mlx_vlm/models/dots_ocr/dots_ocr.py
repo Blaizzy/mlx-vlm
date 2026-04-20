@@ -35,9 +35,13 @@ class Model(nn.Module):
         pixel_values = pixel_values.astype(dtype)
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
-        hidden_states = self.vision_tower(
-            pixel_values, image_grid_thw, output_hidden_states=False
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            hidden_states = cached
+        else:
+            hidden_states = self.vision_tower(
+                pixel_values, image_grid_thw, output_hidden_states=False
+            )
 
         final_inputs_embeds = self.merge_input_ids_with_image_features(
             self.config.image_token_id,

@@ -5,6 +5,7 @@ import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
 from ..qwen3_vl import Model as Qwen3VLModel
+from ..qwen3_vl import processing_qwen3_vl  # noqa: F401
 from ..qwen3_vl.qwen3_vl import masked_scatter
 from .config import ModelConfig
 from .language import LanguageModel
@@ -32,9 +33,7 @@ class Model(Qwen3VLModel):
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
-            # Reset position state for text-only generation
             self.language_model._position_ids = None
-            self.language_model._rope_deltas = None
             return InputEmbeddingsFeatures(
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids)
             )
@@ -45,8 +44,18 @@ class Model(Qwen3VLModel):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the ouptut hidden states from the vision model
-        hidden_states, _ = self.vision_tower(pixel_values, grid_thw)
+        vision_cache = kwargs.get("vision_cache", None)
+        cached = kwargs.get("cached_image_features", None)
+        if cached is None and vision_cache is not None:
+            cached = vision_cache.get(kwargs.get("_image_key"))
+        if cached is not None:
+            hidden_states = cached
+        else:
+            # Get the ouptut hidden states from the vision model
+            hidden_states, _ = self.vision_tower(pixel_values, grid_thw)
+            if vision_cache is not None and kwargs.get("_image_key") is not None:
+                mx.eval(hidden_states)
+                vision_cache.put(kwargs["_image_key"], hidden_states)
 
         # Insert special image tokens in the input_ids
         inputs_embeds, _ = self.merge_input_ids_with_image_features(

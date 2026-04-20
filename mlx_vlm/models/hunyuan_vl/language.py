@@ -202,12 +202,21 @@ class Attention(nn.Module):
         offset = 0
         if cache is not None:
             offset = cache.offset
-            kv_seq_len += offset
+            # Handle array-valued offset from BatchKVCache
+            if isinstance(offset, mx.array):
+                offset_scalar = (
+                    offset.max().item() if offset.ndim > 0 else offset.item()
+                )
+            else:
+                offset_scalar = int(offset)
+            kv_seq_len += offset_scalar
+        else:
+            offset_scalar = 0
 
         cos, sin = self.rotary_emb(values, seq_len=kv_seq_len)
 
         # Apply rotary embeddings
-        if self.xdrope_section is not None and (cache is None or offset == 0):
+        if self.xdrope_section is not None and (cache is None or offset_scalar == 0):
             # XD RoPE for prefill (first forward pass)
             output_size = (B, self.n_heads, L, L)
             queries, keys = apply_rotary_pos_emb_xdrope(
@@ -221,7 +230,7 @@ class Attention(nn.Module):
             )
         else:
             # Standard RoPE for decode (subsequent tokens)
-            if cache is not None and offset > 0:
+            if cache is not None and offset_scalar > 0:
                 cos = cos[-L:]
                 sin = sin[-L:]
             queries, keys = apply_rotary_pos_emb(queries, keys, cos, sin)

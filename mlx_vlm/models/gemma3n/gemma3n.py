@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
+from . import processing_gemma3n  # noqa: F401
 from .audio import AudioModel
 from .config import ModelConfig, TextConfig
 from .language import Gemma3nRMSNorm, LanguageModel
@@ -166,9 +167,13 @@ class Model(nn.Module):
 
         # Vision features
         if pixel_values is not None:
-            image_features = self.get_image_features(
-                pixel_values, self.vision_tower, self.config, self.embed_vision
-            )
+            cached = kwargs.get("cached_image_features", None)
+            if cached is not None:
+                image_features = cached
+            else:
+                image_features = self.get_image_features(
+                    pixel_values, self.vision_tower, self.config, self.embed_vision
+                )
 
             modality = "image"
             inputs_embeds = self.merge_multimodal_and_text(
@@ -287,12 +292,23 @@ class Model(nn.Module):
     def __call__(
         self,
         input_ids: mx.array,
-        pixel_values: mx.array,
+        pixel_values: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache: Optional[mx.array] = None,
         **kwargs,
     ):
-        # Audio features
+        inputs_embeds = kwargs.pop("inputs_embeds", None)
+        if inputs_embeds is not None:
+            per_layer_inputs = kwargs.pop("per_layer_inputs", None)
+            return self.language_model(
+                input_ids=input_ids,
+                cache=cache,
+                mask=mask,
+                inputs_embeds=inputs_embeds,
+                per_layer_inputs=per_layer_inputs,
+                **kwargs,
+            )
+
         input_embeddings_features = self.get_input_embeddings(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -316,6 +332,9 @@ class Model(nn.Module):
             else:
                 sanitized_weights[k] = v
         return sanitized_weights
+
+    def make_cache(self):
+        return self.language_model.make_cache()
 
     @property
     def layers(self):

@@ -5,6 +5,7 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import InputEmbeddingsFeatures
+from . import processing_qwen3_vl  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -50,9 +51,7 @@ class Model(nn.Module):
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
-            # Reset position state for text-only generation
             self.language_model._position_ids = None
-            self.language_model._rope_deltas = None
             return InputEmbeddingsFeatures(
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids)
             )
@@ -63,10 +62,15 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the ouptut hidden states from the vision model
-        hidden_states, deepstack_image_embeds = self.vision_tower(
-            pixel_values, grid_thw
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            hidden_states = cached
+            deepstack_image_embeds = None
+        else:
+            # Get the ouptut hidden states from the vision model
+            hidden_states, deepstack_image_embeds = self.vision_tower(
+                pixel_values, grid_thw
+            )
 
         visual_pos_masks = None
         deepstack_visual_embeds = None

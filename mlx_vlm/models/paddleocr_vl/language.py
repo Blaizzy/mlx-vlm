@@ -229,7 +229,10 @@ class PaddleOCRModel(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            head = cache[0] if cache and cache[0] is not None else None
+            mask = create_attention_mask(
+                h, head if head is not None else cache, return_array=head is not None
+            )
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c, position_embeddings)
@@ -438,20 +441,28 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
-        # reset rope_deltas and position_ids when processing a new image/video
+        rope_deltas_kw = kwargs.pop("rope_deltas", None)
         if pixel_values is not None:
             self._rope_deltas = None
             self._position_ids = None
+        if rope_deltas_kw is not None:
+            self._rope_deltas = rope_deltas_kw
 
         cache_offset = 0
+        cache_offsets = None  # per-element offsets for batched caches
         if cache and cache[0] is not None:
             offset = cache[0].offset
             if isinstance(offset, int):
                 cache_offset = offset
             elif isinstance(offset, mx.array):
-                cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
+                if offset.ndim > 0 and offset.size > 1:
+                    cache_offsets = mx.maximum(offset, 0)
+                    cache_offset = cache_offsets[0].item()
+                else:
+                    cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
             else:
                 raise ValueError(f"Unexpected cache offset type: {type(offset)}")
+            cache_offset = max(cache_offset, 0)
 
         # Check if mask shape matches input shape
         rope_mask = mask
@@ -465,7 +476,6 @@ class LanguageModel(nn.Module):
                 or self._rope_deltas is None
                 or cache is None
             ):
-                # Check if we have stored position_ids from chunked prefill
                 if self._position_ids is not None:
                     # Use stored position_ids, sliced for current chunk
                     seq_length = inputs.shape[1]
@@ -480,23 +490,35 @@ class LanguageModel(nn.Module):
                     # Store full position_ids for chunked prefill
                     self._position_ids = position_ids
             else:
-                # Use the prev pre-calculated rope-deltas to get the correct position ids
                 batch_size, seq_length = inputs.shape
-                delta = mx.array(
-                    cache_offset + self._rope_deltas if cache is not None else 0
-                )
-                position_ids = mx.arange(seq_length).reshape(1, -1)
-                position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
-
-                if cache_offset is not None:
+                if cache_offsets is not None and cache_offsets.size >= batch_size:
+                    offsets = cache_offsets[:batch_size]
+                    rope_deltas = (
+                        rope_deltas_kw
+                        if rope_deltas_kw is not None
+                        else self._rope_deltas
+                    )
+                    if rope_deltas.shape[0] > batch_size:
+                        rope_deltas = rope_deltas[:batch_size]
+                    delta = (offsets + rope_deltas.squeeze(-1))[:, None]
+                else:
+                    delta = mx.array(
+                        cache_offset + self._rope_deltas if cache is not None else 0
+                    )
                     if delta.ndim == 0:
                         delta = mx.expand_dims(delta, axis=0)
-
                     if delta.shape[0] < batch_size:
                         delta = mx.tile(delta, (batch_size, 1))
                     else:
-                        # Slice delta to match batch
                         delta = delta[:batch_size]
+
+                position_ids = mx.arange(seq_length).reshape(1, -1)
+                position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
+
+                if delta.ndim == 0:
+                    delta = mx.expand_dims(delta, axis=0)
+                if delta.ndim == 1:
+                    delta = delta.reshape(-1, 1)
 
                 position_ids = mx.add(position_ids, delta)[None, ...]
                 position_ids = mx.broadcast_to(

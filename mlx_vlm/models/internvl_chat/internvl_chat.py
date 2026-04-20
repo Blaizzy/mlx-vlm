@@ -46,44 +46,54 @@ class Model(nn.Module):
         dtype = self.vision_model.embeddings.patch_embedding.weight.dtype
         pixel_values = pixel_values.astype(dtype)
 
-        # TODO: Remove this after transformers implementation is merged
+        # Handle batched pixel values
         if pixel_values.ndim == 5:
             pixel_values = pixel_values[0]
 
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the ouptut hidden states from the vision model
-        hidden_states, _, _ = self.vision_model(
-            pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            hidden_states = cached
+        else:
+            # Get the output hidden states from the vision model
+            hidden_states, _, _ = self.vision_model(
+                pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
+            )
+
+            # Extract vision embeddings, removing the class token (first token)
+            hidden_states = hidden_states[:, 1:, :]
+
+            # Apply pixel shuffle with downsampling
+            hidden_states = pixel_shuffle(
+                hidden_states, shuffle_ratio=self.downsample_ratio
+            )
+
+            # Apply MLP transformation
+            for layer in self.mlp1:
+                hidden_states = layer(hidden_states)
+
+        # Use dynamic image_token_index from processor if available
+        image_token_index = kwargs.get(
+            "image_token_index", self.config.image_token_index
         )
-
-        # Extract vision embeddings, removing the class token (first token)
-        hidden_states = hidden_states[:, 1:, :]
-
-        # Apply pixel shuffle with downsampling
-        hidden_states = pixel_shuffle(
-            hidden_states, shuffle_ratio=self.downsample_ratio
-        )
-
-        # Apply MLP transformation
-        for layer in self.mlp1:
-            hidden_states = layer(hidden_states)
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self._merge_input_ids_with_image_features(
-            hidden_states, inputs_embeds, input_ids
+            hidden_states, inputs_embeds, input_ids, image_token_index
         )
         return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
     def _merge_input_ids_with_image_features(
-        self, image_features, inputs_embeds, input_ids
+        self, image_features, inputs_embeds, input_ids, image_token_index=None
     ):
         B, N, C = inputs_embeds.shape
-        image_token_index = self.config.image_token_index
+        if image_token_index is None:
+            image_token_index = self.config.image_token_index
         video_token_index = self.config.video_token_index
 
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
+        # Positions of <IMG_CONTEXT> tokens in input_ids
         image_positions = input_ids == image_token_index
         if mx.sum(image_positions) == 0:
             image_positions = input_ids == video_token_index

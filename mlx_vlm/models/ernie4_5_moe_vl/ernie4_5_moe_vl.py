@@ -5,22 +5,11 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
-from .processor import Ernie4_5_VLProcessor, Ernie4_5_VLTokenizer, ImageProcessor
 from .vision import VisionModel
-
-# Register custom processor classes for ernie4_5_moe_vl model type
-MODEL_TYPE = "ernie4_5_moe_vl"
-try:
-    AutoImageProcessor.register(MODEL_TYPE, slow_image_processor_class=ImageProcessor)
-    AutoTokenizer.register(MODEL_TYPE, slow_tokenizer_class=Ernie4_5_VLTokenizer)
-    AutoProcessor.register(MODEL_TYPE, Ernie4_5_VLProcessor)
-except Exception:
-    pass  # Already registered or registration not needed
 
 
 class TokenType:
@@ -188,10 +177,14 @@ class Model(nn.Module):
         pixel_values = pixel_values.astype(dtype)
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
-        hidden_states = self.vision_tower(
-            pixel_values, grid_thw, output_hidden_states=False
-        )
-        image_features = self.resampler_model(hidden_states, image_grid_thw)
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
+        else:
+            hidden_states = self.vision_tower(
+                pixel_values, grid_thw, output_hidden_states=False
+            )
+            image_features = self.resampler_model(hidden_states, image_grid_thw)
         final_inputs_embeds = self._merge_input_ids_with_image_features(
             image_features,
             inputs_embeds,

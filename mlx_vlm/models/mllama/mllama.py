@@ -5,6 +5,7 @@ import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
 from ..cache import KVCache
+from . import processing_mllama  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -44,25 +45,29 @@ class Model(nn.Module):
 
         # Process vision input if provided
         if pixel_values is not None:
-            if aspect_ratio_ids is None:
-                raise ValueError(
-                    "`aspect_ratio_ids` must be provided if `pixel_values` is provided"
+            cached = kwargs.get("cached_image_features", None)
+            if cached is not None:
+                cross_attention_states = cached
+            else:
+                if aspect_ratio_ids is None:
+                    raise ValueError(
+                        "`aspect_ratio_ids` must be provided if `pixel_values` is provided"
+                    )
+
+                vision_outputs = self.vision_tower(
+                    pixel_values=pixel_values,
+                    aspect_ratio_ids=aspect_ratio_ids,
+                    aspect_ratio_mask=aspect_ratio_mask,
                 )
+                cross_attention_states = vision_outputs[0]
 
-            vision_outputs = self.vision_tower(
-                pixel_values=pixel_values,
-                aspect_ratio_ids=aspect_ratio_ids,
-                aspect_ratio_mask=aspect_ratio_mask,
-            )
-            cross_attention_states = vision_outputs[0]
-
-            cross_attention_states = self.multi_modal_projector(
-                cross_attention_states
-            ).reshape(
-                -1,
-                cross_attention_states.shape[-2],
-                self.config.text_config.hidden_size,
-            )
+                cross_attention_states = self.multi_modal_projector(
+                    cross_attention_states
+                ).reshape(
+                    input_ids.shape[0],
+                    -1,
+                    self.config.text_config.hidden_size,
+                )
 
         # Prepare cross attention mask
         if cross_attention_mask is not None:
@@ -123,8 +128,8 @@ class Model(nn.Module):
             cross_attention_states = self.multi_modal_projector(
                 cross_attention_states
             ).reshape(
+                input_ids.shape[0],
                 -1,
-                cross_attention_states.shape[-2],
                 self.config.text_config.hidden_size,
             )
 

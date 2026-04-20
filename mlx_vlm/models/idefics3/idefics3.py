@@ -6,6 +6,7 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import InputEmbeddingsFeatures
+from . import processing_idefics3  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -111,8 +112,8 @@ class Model(nn.Module):
 
         if pixel_attention_mask is None:
             pixel_attention_mask = mx.ones(
-                (pixel_values.size(0), pixel_values.size(2), pixel_values.size(3)),
-                dtype=mx.bool,
+                (pixel_values.shape[0], pixel_values.shape[2], pixel_values.shape[3]),
+                dtype=mx.bool_,
             )
         else:
             # Remove padding images from the mask
@@ -142,14 +143,18 @@ class Model(nn.Module):
         # Sum over patch dimensions and check if any pixels are active
         patch_attention_mask = reshaped.sum(axis=(-1, -2)) > 0
 
-        pooler_output, *_ = self.vision_model(
-            pixel_values.transpose(0, 2, 3, 1),
-            patch_attention_mask=patch_attention_mask,
-            output_hidden_states=True,
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
+        else:
+            pooler_output, *_ = self.vision_model(
+                pixel_values.transpose(0, 2, 3, 1),
+                patch_attention_mask=patch_attention_mask,
+                output_hidden_states=True,
+            )
 
-        image_features = pooler_output.astype(pixel_values.dtype)
-        image_features = self.connector(image_features)
+            image_features = pooler_output.astype(pixel_values.dtype)
+            image_features = self.connector(image_features)
 
         final_inputs_embeds = self._prepare_inputs_for_multimodal(
             image_features, inputs_embeds, input_ids

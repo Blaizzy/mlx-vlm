@@ -128,14 +128,16 @@ class Gemma3nAttention(nn.Module):
 
         offset = 0
         if self.is_kv_shared_layer and cache is not None:
-            # For shared layers, retrieve KV from the designated cache layer
-            keys, values = cache.state
+            state = cache.state
+            keys, values = state[0], state[1]
             offset = cache.offset
 
         else:
 
             if cache is not None:
                 offset = cache.offset
+                if isinstance(offset, mx.array):
+                    offset = mx.array(offset)
 
             keys = self.k_proj(x).reshape(B, L, -1, self.head_dim)
             keys = self.k_norm(keys)
@@ -280,8 +282,8 @@ class Gemma3nAltUp(nn.Module):
         active_x = predictions[self.config.altup_active_idx]
         innovation = activated - active_x
 
-        all_coefs = all_coefs.transpose(2, 1, 0)
-        corrected = innovation[None] * all_coefs[:, None]
+        all_coefs = all_coefs.transpose(2, 0, 1)[..., None]
+        corrected = innovation[None] * all_coefs
         corrected += predictions
 
         return corrected.astype(activated.dtype)
@@ -465,8 +467,6 @@ class Gemma3Model(nn.Module):
     ):
         per_layer_inputs = kwargs.pop("per_layer_inputs", None)
         n_to_process = kwargs.pop("n_to_process", None)
-        if per_layer_inputs is not None and n_to_process is not None:
-            per_layer_inputs = per_layer_inputs[:, :n_to_process]
 
         if inputs_embeds is None:
             h = self.embed_tokens(inputs) * (self.hidden_size**0.5)
@@ -475,6 +475,30 @@ class Gemma3Model(nn.Module):
 
         if per_layer_inputs is None and inputs is not None:
             per_layer_inputs = self.get_per_layer_inputs(inputs)
+        elif per_layer_inputs is not None:
+            target_len = n_to_process if n_to_process is not None else h.shape[1]
+            if target_len != h.shape[1]:
+                target_len = h.shape[1]
+
+            raw_offset = next(
+                (
+                    c.offset
+                    for c in (cache or [])
+                    if c is not None and hasattr(c, "offset")
+                ),
+                0,
+            )
+            if isinstance(raw_offset, mx.array):
+                cache_offset = (
+                    int(raw_offset.max().item())
+                    if raw_offset.size > 1
+                    else int(raw_offset.item())
+                )
+            else:
+                cache_offset = int(raw_offset)
+            max_start = max(per_layer_inputs.shape[1] - target_len, 0)
+            start = min(cache_offset, max_start)
+            per_layer_inputs = per_layer_inputs[:, start : start + target_len]
 
         per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
 
@@ -484,11 +508,12 @@ class Gemma3Model(nn.Module):
         if mask is None:
             full_mask = create_attention_mask(
                 h,
-                cache[self.first_full_idx :],
+                cache[self.first_full_idx],
             )
             sliding_window_mask = create_attention_mask(
                 h,
-                cache[self.first_sliding_idx :],
+                cache[self.first_sliding_idx],
+                window_size=self.config.sliding_window,
             )
         h0 = h
 

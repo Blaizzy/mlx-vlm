@@ -1,20 +1,24 @@
 """Tests for batch generation functionality in mlx_vlm.generate module."""
 
 import sys
+from argparse import Namespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
 
 from mlx_vlm.generate import (
-    Batch,
     BatchGenerationResult,
     BatchGenerator,
     BatchResponse,
     BatchStats,
+    GenerationBatch,
     GenerationResult,
     _left_pad_prompts,
+    normalize_resize_shape,
 )
+from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
 
@@ -278,72 +282,36 @@ class TestBatchResponse:
         assert response.image_sizes is None
 
 
-class TestBatch:
-    """Tests for Batch dataclass."""
+class TestGenerationBatch:
+    """Tests for GenerationBatch class."""
 
-    def test_creation(self):
-        batch = Batch(
-            uids=[0, 1, 2],
-            y=mx.array([10, 20, 30]),
-            logprobs=mx.zeros((3, 100)),
-            max_tokens=[50, 50, 50],
-            num_tokens=[5, 10, 15],
-            cache=[MagicMock()],
-        )
-        assert len(batch) == 3
-        assert batch.uids == [0, 1, 2]
-        assert batch.max_tokens == [50, 50, 50]
+    def test_empty_creation(self):
+        mock_model = MagicMock()
+        sampler = lambda x: mx.argmax(x, axis=-1)
+        stop_criteria = lambda tok: tok == 2
+        batch = GenerationBatch.empty(mock_model, sampler, stop_criteria)
+        assert len(batch) == 0
+        assert batch.uids == []
+        assert batch.max_tokens == []
 
     def test_filter(self):
-        # Create mock cache with filter method
-        mock_cache = MagicMock()
-        mock_cache.filter = MagicMock()
-
-        batch = Batch(
-            uids=[0, 1, 2],
-            y=mx.array([10, 20, 30]),
-            logprobs=mx.zeros((3, 100)),
-            max_tokens=[50, 60, 70],
-            num_tokens=[5, 10, 15],
-            cache=[mock_cache],
-        )
+        mock_model = MagicMock()
+        sampler = lambda x: mx.argmax(x, axis=-1)
+        stop_criteria = lambda tok: tok == 2
+        batch = GenerationBatch.empty(mock_model, sampler, stop_criteria)
+        batch.uids = [0, 1, 2]
+        batch.max_tokens = [50, 60, 70]
+        batch._num_tokens = [5, 10, 15]
+        batch._next_tokens = mx.array([10, 20, 30])
+        batch._next_logprobs = mx.zeros((3, 100))
 
         # Keep only indices 0 and 2
         batch.filter([0, 2])
 
         assert batch.uids == [0, 2]
         assert batch.max_tokens == [50, 70]
-        assert batch.num_tokens == [5, 15]
+        assert batch._num_tokens == [5, 15]
         assert len(batch) == 2
-
-    def test_extend(self):
-        mock_cache1 = MagicMock()
-        mock_cache1.extend = MagicMock()
-        mock_cache2 = MagicMock()
-
-        batch1 = Batch(
-            uids=[0, 1],
-            y=mx.array([10, 20]),
-            logprobs=mx.zeros((2, 100)),
-            max_tokens=[50, 50],
-            num_tokens=[5, 10],
-            cache=[mock_cache1],
-        )
-
-        batch2 = Batch(
-            uids=[2, 3],
-            y=mx.array([30, 40]),
-            logprobs=mx.zeros((2, 100)),
-            max_tokens=[60, 60],
-            num_tokens=[15, 20],
-            cache=[mock_cache2],
-        )
-
-        batch1.extend(batch2)
-
-        assert batch1.uids == [0, 1, 2, 3]
-        assert batch1.max_tokens == [50, 50, 60, 60]
-        assert len(batch1) == 4
 
 
 # ============================================================================
@@ -415,7 +383,7 @@ class TestBatchGenerator:
 
         assert gen.max_tokens == 128
         assert gen.model == mock_model.language_model
-        assert gen.active_batch is None
+        assert len(gen._generation_batch) == 0
         assert gen.uid_count == 0
 
     def test_insert_prompts(self, mock_model, mock_processor):
@@ -466,25 +434,49 @@ class TestBatchGenerator:
             processor=mock_processor,
         )
 
-        # Set some stats manually
-        gen._stats.prompt_tokens = 100
-        gen._stats.prompt_time = 0.5
-        gen._stats.generation_tokens = 50
-        gen._stats.generation_time = 0.25
+        # Set some stats manually via counters
+        gen._prompt_tokens_counter = 100
+        gen._prompt_time_counter = 0.5
+        gen._gen_tokens_counter = 50
 
         stats = gen.stats()
 
         assert stats.prompt_tps == 200.0  # 100 / 0.5
-        assert stats.generation_tps == 200.0  # 50 / 0.25
+        assert stats.prompt_tokens == 100
 
     def test_response_dataclass(self):
-        response = BatchGenerator.Response(
-            uid=0, token=42, logprobs=mx.array([0.1, 0.2]), finish_reason="stop"
+        response = GenerationBatch.Response(
+            uid=0, token=42, token_logprob=-0.5, finish_reason="stop"
         )
 
         assert response.uid == 0
         assert response.token == 42
         assert response.finish_reason == "stop"
+
+    def test_remove_from_unprocessed(self, mock_model, mock_processor):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+        )
+        uids = gen.insert([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+        assert len(gen.unprocessed_prompts) == 3
+
+        assert gen.remove(uids[1]) is True
+        assert len(gen.unprocessed_prompts) == 2
+        remaining_uids = [seq[0] for seq in gen.unprocessed_prompts]
+        assert uids[1] not in remaining_uids
+        assert uids[0] in remaining_uids
+        assert uids[2] in remaining_uids
+
+    def test_remove_missing_uid_returns_false(self, mock_model, mock_processor):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+        )
+        gen.insert([[1, 2, 3]])
+        assert gen.remove(9999) is False
 
 
 # ============================================================================
@@ -896,6 +888,219 @@ class TestEdgeCases:
 
         assert response.texts == []
         assert response.image_sizes is None
+
+
+# ============================================================================
+# Tests for ThinkingBudgetCriteria
+# ============================================================================
+
+
+class FakeTokenizer:
+    """Mock tokenizer that maps token strings to fixed IDs."""
+
+    TOKEN_MAP = {"<think>": 99, "</think>": 100, "\n": 10}
+
+    def encode(self, text, add_special_tokens=False):
+        if text in self.TOKEN_MAP:
+            return [self.TOKEN_MAP[text]]
+        return [0]
+
+
+class TestThinkingBudgetCriteria:
+    """Tests for ThinkingBudgetCriteria class."""
+
+    def test_thinking_model(self):
+        """Test thinking budget for thinking models (enable_thinking=True)."""
+        criteria = ThinkingBudgetCriteria(
+            tokenizer=FakeTokenizer(),
+            thinking_budget=5,
+            thinking_end_token="</think>",
+            thinking_start_token="<think>",
+            enable_thinking=True,
+        )
+
+        # enable_thinking=True — already in thinking mode
+        assert criteria.in_thinking is True
+
+        # Tokens within budget return None
+        for i in range(5):
+            assert criteria(50 + i) is None
+        assert criteria.thinking_token_count == 5
+        assert criteria.budget_exceeded is False
+
+        # Exceeding budget forces \n then </think>
+        assert criteria(60) == 10  # \n
+        assert criteria(60) == 100  # </think>
+        assert criteria.budget_exceeded is True
+
+        # End token resets state
+        assert criteria(100) is None
+        assert criteria.in_thinking is False
+        assert criteria.budget_exceeded is False
+
+    def test_non_thinking_model(self):
+        """Test thinking budget for non-thinking models (enable_thinking=False)."""
+        criteria = ThinkingBudgetCriteria(
+            tokenizer=FakeTokenizer(),
+            thinking_budget=3,
+            thinking_end_token="</think>",
+            thinking_start_token="<think>",
+            enable_thinking=False,
+        )
+
+        # Not in thinking initially
+        assert criteria.in_thinking is False
+
+        # Tokens are not counted — model is not in thinking mode
+        criteria(50)
+        criteria(51)
+        assert criteria.thinking_token_count == 0
+
+        # Start token does NOT enter thinking mode when enable_thinking=False
+        assert criteria(99) is None
+        assert criteria.in_thinking is False
+
+        # Tokens still not counted
+        for i in range(3):
+            assert criteria(50 + i) is None
+        assert criteria.thinking_token_count == 0
+        assert criteria.budget_exceeded is False
+
+
+class TestSamplerArgs:
+    """Tests for sampler argument forwarding."""
+
+    @patch.object(generate_module.cache, "make_prompt_cache", return_value=[])
+    @patch.object(generate_module, "make_logits_processors", return_value=[])
+    @patch.object(generate_module, "make_sampler")
+    def test_generate_step_passes_sampling_and_logits_processor_args(
+        self,
+        mock_make_sampler,
+        mock_make_logits_processors,
+        _mock_prompt_cache,
+    ):
+        mock_make_sampler.return_value = lambda logprobs: mx.array([0])
+
+        model = MagicMock()
+        model.language_model.return_value = MagicMock(
+            logits=mx.zeros((1, 1, 4)),
+            cross_attention_states=None,
+            encoder_outputs=None,
+        )
+
+        embedding_output = MagicMock()
+        embedding_output.inputs_embeds = mx.zeros((1, 1, 4))
+        embedding_output.to_dict.return_value = {}
+        model.get_input_embeddings.return_value = embedding_output
+
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            max_tokens=1,
+            temperature=0.7,
+            top_p=0.9,
+            min_p=0.05,
+            top_k=32,
+            repetition_penalty=1.15,
+            logit_bias={3: -0.75},
+        )
+
+        next(gen)
+
+        mock_make_sampler.assert_called_once_with(
+            temp=0.7,
+            top_p=0.9,
+            min_p=0.05,
+            top_k=32,
+        )
+        mock_make_logits_processors.assert_called_once_with({3: -0.75}, 1.15, 20)
+
+
+def test_normalize_resize_shape_expands_single_value():
+    assert normalize_resize_shape([224]) == (224, 224)
+
+
+def test_normalize_resize_shape_accepts_two_values():
+    assert normalize_resize_shape((224, 448)) == (224, 448)
+
+
+@pytest.mark.parametrize("value", [224, "22", [1.5], [True], [1, 2, 3]])
+def test_normalize_resize_shape_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="resize_shape must contain 1 or 2 integers"):
+        normalize_resize_shape(value)
+
+
+def test_generate_cli_smoke(capsys):
+    import importlib
+
+    generate_module = importlib.import_module("mlx_vlm.generate")
+
+    args = Namespace(
+        model="demo",
+        adapter_path=None,
+        image=["image.png"],
+        audio=None,
+        resize_shape=[224],
+        prompt=["Describe this image."],
+        system=None,
+        max_tokens=12,
+        temperature=0.7,
+        chat=False,
+        verbose=False,
+        eos_tokens=None,
+        max_kv_size=None,
+        kv_bits=None,
+        kv_group_size=64,
+        quantized_kv_start=512,
+        skip_special_tokens=False,
+        force_download=False,
+        revision="main",
+        trust_remote_code=False,
+        quantize_activations=False,
+        processor_kwargs={},
+        prefill_step_size=128,
+        enable_thinking=False,
+        thinking_budget=None,
+        thinking_start_token="<think>",
+        thinking_end_token="</think>",
+        draft_model=None,
+        draft_kind="dflash",
+        draft_block_size=None,
+    )
+    model = SimpleNamespace(config=SimpleNamespace(model_type="demo"))
+    processor = SimpleNamespace()
+
+    with (
+        patch.object(generate_module, "parse_arguments", return_value=args),
+        patch.object(generate_module, "load", return_value=(model, processor)),
+        patch.object(
+            generate_module, "apply_chat_template", return_value="prompt"
+        ) as mock_apply_chat_template,
+        patch.object(
+            generate_module,
+            "generate",
+            return_value=SimpleNamespace(text="done"),
+        ) as mock_generate,
+    ):
+        generate_module.main()
+
+    assert mock_apply_chat_template.call_args.kwargs["enable_thinking"] is False
+    assert mock_generate.call_args.kwargs["enable_thinking"] is False
+    assert mock_generate.call_args.kwargs["max_tokens"] == 12
+    assert mock_generate.call_args.kwargs["temperature"] == pytest.approx(0.7)
+    assert mock_generate.call_args.kwargs["prefill_step_size"] == 128
+    assert capsys.readouterr().out.strip() == "done"
+
+
+def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["mlx_vlm.generate"])
+
+    args = generate_module.parse_arguments()
+
+    assert args.thinking_start_token == "<think>"
+    assert args.thinking_end_token == "</think>"
 
 
 if __name__ == "__main__":
