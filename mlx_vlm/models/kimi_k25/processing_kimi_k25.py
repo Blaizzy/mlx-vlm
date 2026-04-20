@@ -93,9 +93,7 @@ class KimiK25ImageProcessor(BaseImageProcessor):
     def to_mlx(self, image: Image.Image) -> mx.array:
         """Convert PIL image to MLX array in CHW format, normalized to [0, 1]."""
         w, h = image.size
-        arr = (
-            mx.array(list(image.getdata()), dtype=mx.float32).reshape(h, w, 3) / 255.0
-        )
+        arr = mx.array(list(image.getdata()), dtype=mx.float32).reshape(h, w, 3) / 255.0
         arr = arr.transpose(2, 0, 1)  # HWC -> CHW
         return arr
 
@@ -193,9 +191,7 @@ class KimiK25Processor(ProcessorMixin):
                 * self.image_processor.merge_kernel_size[1]
             )
             for grid_hw in image_grid_hws:
-                placeholder_counts.append(
-                    int(mx.prod(grid_hw).item()) // merge_length
-                )
+                placeholder_counts.append(int(mx.prod(grid_hw).item()) // merge_length)
 
         # Tokenize text, then expand image placeholders at the token-ID level.
         if text is not None:

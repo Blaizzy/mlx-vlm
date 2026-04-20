@@ -463,9 +463,7 @@ def sharded_load(
         # The underlying model (e.g. DeepseekV3Model) has PipelineMixin
         inner = lm.model if hasattr(lm, "model") else lm
         if not hasattr(inner, "pipeline"):
-            raise ValueError(
-                "The model does not support pipeline parallelism"
-            )
+            raise ValueError("The model does not support pipeline parallelism")
         inner.pipeline(pipeline_group)
 
     print("Materializing")
