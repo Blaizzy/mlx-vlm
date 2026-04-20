@@ -112,14 +112,24 @@ def get_model_and_args(config: dict):
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
-    try:
-        arch = importlib.import_module(f"mlx_vlm.models.{model_type}")
-    except ImportError as e:
-        msg = f"Model type {model_type} not supported. Error: {e}"
-        logging.error(msg)
-        raise ValueError(msg)
+    is_dflash = config.get("dflash_config", None) is not None
+    if is_dflash:
+        model_type += "_dflash"
 
-    return arch, model_type
+    last_err: Optional[ImportError] = None
+    for pkg in ("mlx_vlm.models", "mlx_vlm.speculative.drafters"):
+        try:
+            arch = importlib.import_module(f"{pkg}.{model_type}")
+            return arch, model_type
+        except ImportError as e:
+            if model_type not in str(e):
+                raise
+            last_err = e
+            continue
+
+    msg = f"Model type {model_type} not supported. Error: {last_err}"
+    logging.error(msg)
+    raise ValueError(msg)
 
 
 def get_model_path(
@@ -171,9 +181,6 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
-        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
-            to QQLinear layers for activation quantization. Only supported for models
-            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -199,7 +206,7 @@ Create safetensors using the following code:
 ```
 from transformers import AutoModelForCausalLM, AutoProcessor
 
-model_id= "<huggingface_model_id>"
+model_id = "<huggingface_model_id>"
 model = AutoModelForCausalLM.from_pretrained(model_id)
 processor = AutoProcessor.from_pretrained(model_id)
 
@@ -248,12 +255,14 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             weights = sanitize_weights(model.code2wav, weights)
             weights = sanitize_weights(model.talker, weights)
         else:
-            weights = sanitize_weights(
-                model_class.VisionModel, weights, model_config.vision_config
-            )
-            weights = sanitize_weights(
-                model_class.LanguageModel, weights, model_config.text_config
-            )
+            if hasattr(model_class, "VisionModel"):
+                weights = sanitize_weights(
+                    model_class.VisionModel, weights, model_config.vision_config
+                )
+            if hasattr(model_class, "LanguageModel"):
+                weights = sanitize_weights(
+                    model_class.LanguageModel, weights, model_config.text_config
+                )
             if hasattr(model_class, "AudioModel"):
                 weights = sanitize_weights(
                     model_class.AudioModel, weights, model_config.audio_config
@@ -371,7 +380,7 @@ def load(
     Load the model and tokenizer from a given path or a huggingface repository.
 
     Args:
-        path_or_hf_repo (Path): The path or the huggingface repository to load the model from.
+        path_or_hf_repo (str): The path or the huggingface repository to load the model from.
         tokenizer_config (dict, optional): Configuration parameters specifically for the tokenizer.
             Defaults to an empty dictionary.
         adapter_path (str, optional): Path to the LoRA adapters. If provided, applies LoRA layers
@@ -381,10 +390,6 @@ def load(
             when needed. Default: ``False``
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
-        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
-            to QQLinear layers for activation quantization. Only supported for models
-            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
-
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
