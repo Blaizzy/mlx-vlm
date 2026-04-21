@@ -71,7 +71,9 @@ def _detection_to_metadata(det, orig_h, orig_w, mask_id):
     }
 
 
-def run_ground_expression(fp_model, fp_processor, image, expression, max_new_tokens=1024):
+def run_ground_expression(
+    fp_model, fp_processor, image, expression, max_new_tokens=1024
+):
     """Run Falcon Perception on image with expression.
 
     Returns a dict mapping 1-indexed mask IDs to metadata dicts.

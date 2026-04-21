@@ -11,10 +11,10 @@ All functions take ``all_masks`` as their first argument — the flat dict of
 
 import math
 
-
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _slot_masks(all_masks, slot):
     """Return a list of mask metadata dicts for the given slot, or raise."""
@@ -22,8 +22,7 @@ def _slot_masks(all_masks, slot):
     if not ms:
         available = sorted({m.get("slot") for m in all_masks.values()})
         raise KeyError(
-            f"Slot '{slot}' has no active masks. "
-            f"Available slots: {available}"
+            f"Slot '{slot}' has no active masks. " f"Available slots: {available}"
         )
     return ms
 
@@ -59,6 +58,7 @@ def _summary(m):
 # ---------------------------------------------------------------------------
 # Ranking / ordering
 # ---------------------------------------------------------------------------
+
 
 def rank_by_x(all_masks, slot):
     """Rank all masks in *slot* by x-coordinate, left to right.
@@ -97,6 +97,7 @@ def rank_by_y(all_masks, slot):
 # ---------------------------------------------------------------------------
 # Single-mask extremes
 # ---------------------------------------------------------------------------
+
 
 def extreme_mask(all_masks, slot, direction):
     """Return the single mask at the given positional extreme.
@@ -141,6 +142,7 @@ def nth_from(all_masks, slot, n, direction):
 # Filtering
 # ---------------------------------------------------------------------------
 
+
 def exclude_extremes(all_masks, slot, axis="x", n=1):
     """Remove the *n* masks from each end along *axis*, return the rest.
 
@@ -165,8 +167,8 @@ def exclude_extremes(all_masks, slot, axis="x", n=1):
             f"only {len(ms_sorted)} mask(s) available."
         )
 
-    excluded = ms_sorted[:n] + ms_sorted[len(ms_sorted) - n:]
-    kept = ms_sorted[n: len(ms_sorted) - n]
+    excluded = ms_sorted[:n] + ms_sorted[len(ms_sorted) - n :]
+    kept = ms_sorted[n : len(ms_sorted) - n]
     return {
         "slot": slot,
         "axis": axis,
@@ -206,6 +208,7 @@ def filter_by_size(all_masks, slot, top_n=None, min_area=None, max_area=None):
 # ---------------------------------------------------------------------------
 # Cross-slot comparison
 # ---------------------------------------------------------------------------
+
 
 def compare_slot_positions(all_masks, slot_a, slot_b, axis="x"):
     """Compare the positional distributions of two slots along *axis*.

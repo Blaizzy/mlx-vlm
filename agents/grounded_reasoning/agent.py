@@ -47,13 +47,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import mlx.core as mx
-from PIL import Image
-
-from mlx_vlm import load, generate
 from fp_tools import compute_relations, masks_to_json, run_ground_expression
-from mask_ops import SPATIAL_OPS, dispatch as spatial_dispatch
+from mask_ops import SPATIAL_OPS
+from mask_ops import dispatch as spatial_dispatch
+from PIL import Image
 from viz import get_crop, render_final, render_som
 
+from mlx_vlm import generate, load
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -249,6 +249,7 @@ _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 # Result container
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class TraceStep:
     """A single step in the agent's reasoning trace."""
@@ -277,6 +278,7 @@ class GroundedReasoningResult:
 # Local VLM client
 # ---------------------------------------------------------------------------
 
+
 class LocalVLMClient:
     """Local VLM wrapper — works with any mlx-vlm compatible model.
 
@@ -304,8 +306,11 @@ class LocalVLMClient:
             return images
         target_w, target_h = images[0].size
         return [
-            img if img.size == (target_w, target_h)
-            else img.resize((target_w, target_h), Image.LANCZOS)
+            (
+                img
+                if img.size == (target_w, target_h)
+                else img.resize((target_w, target_h), Image.LANCZOS)
+            )
             for img in images
         ]
 
@@ -335,11 +340,13 @@ class LocalVLMClient:
 
             if role == "user" and pil_imgs:
                 # Image tokens come first — matches Gemma4 / most VLM chat templates
-                vlm_messages.append({
-                    "role": "user",
-                    "content": [{"type": "image"}] * len(pil_imgs)
-                    + [{"type": "text", "text": text}],
-                })
+                vlm_messages.append(
+                    {
+                        "role": "user",
+                        "content": [{"type": "image"}] * len(pil_imgs)
+                        + [{"type": "text", "text": text}],
+                    }
+                )
             elif role == "assistant":
                 vlm_messages.append({"role": "assistant", "content": text})
             else:
@@ -373,6 +380,7 @@ class LocalVLMClient:
 # Tool-call parsing
 # ---------------------------------------------------------------------------
 
+
 def _parse_tool_call(text):
     """Extract and parse the JSON inside the first <tool>...</tool> block."""
     m = _TOOL_RE.search(text)
@@ -388,6 +396,7 @@ def _parse_tool_call(text):
 # ---------------------------------------------------------------------------
 # Context management
 # ---------------------------------------------------------------------------
+
 
 def _is_som_message(msg):
     """Return True if msg is a user message containing a SoM image."""
@@ -436,10 +445,12 @@ def _prune_context(messages):
             new_content = []
             for item in msg["content"]:
                 if item.get("type") == "pil_image" and item.get("is_som"):
-                    new_content.append({
-                        "type": "text",
-                        "text": "[Previous Set-of-Marks image — superseded by latest SoM]",
-                    })
+                    new_content.append(
+                        {
+                            "type": "text",
+                            "text": "[Previous Set-of-Marks image — superseded by latest SoM]",
+                        }
+                    )
                 else:
                     new_content.append(item)
             cleaned.append({**msg, "content": new_content})
@@ -452,6 +463,7 @@ def _prune_context(messages):
 # ---------------------------------------------------------------------------
 # Baseline (no grounding)
 # ---------------------------------------------------------------------------
+
 
 def run_baseline(image, query, vlm_client):
     """Direct VLM answer with no Falcon Perception grounding.
@@ -501,6 +513,7 @@ def run_baseline(image, query, vlm_client):
 # ---------------------------------------------------------------------------
 # Main agent loop
 # ---------------------------------------------------------------------------
+
 
 def run_agent(
     image,
@@ -622,7 +635,9 @@ def run_agent(
                 )
 
             if verbose:
-                print(f"  [warn] No <tool> tag (attempt {correction_depth}), sending correction ...")
+                print(
+                    f"  [warn] No <tool> tag (attempt {correction_depth}), sending correction ..."
+                )
 
             # On the first attempt, give a generic reminder.
             # On subsequent attempts, show an explicit fill-in-the-blank answer template
@@ -644,21 +659,25 @@ def run_agent(
                     '"supporting_mask_ids": [<comma-separated mask IDs>]}}</tool>'
                 )
 
-            messages.append({
-                "role": "assistant",
-                "content": [{"type": "text", "text": response_text}],
-            })
-            messages.append({
-                "role": "user",
-                "content": [{"type": "text", "text": correction_text}],
-            })
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": response_text}],
+                }
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": correction_text}],
+                }
+            )
             # Prune context during correction loops to prevent unbounded growth
             messages = _prune_context(messages)
             continue
 
         # Successful parse — remove any pending correction messages from context
         if correction_depth > 0:
-            messages = messages[:len(messages) - 2 * correction_depth]
+            messages = messages[: len(messages) - 2 * correction_depth]
             correction_depth = 0
 
         tool_name = tool_call.get("name", "")
@@ -672,10 +691,12 @@ def run_agent(
             tool_params=params,
         )
 
-        messages.append({
-            "role": "assistant",
-            "content": [{"type": "text", "text": response_text}],
-        })
+        messages.append(
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": response_text}],
+            }
+        )
 
         # --- ground_expression ---
         if tool_name == "ground_expression":
@@ -685,7 +706,10 @@ def run_agent(
                 print(f"  → ground_expression({expression!r}, slot={slot!r})")
 
             raw_masks = run_ground_expression(
-                fp_model, fp_processor, pil_image, expression,
+                fp_model,
+                fp_processor,
+                pil_image,
+                expression,
                 max_new_tokens=fp_max_tokens,
             )
             n_fp_calls += 1
@@ -717,13 +741,15 @@ def run_agent(
                 )
 
             if n_new == 0:
-                tool_result = [{
-                    "type": "text",
-                    "text": (
-                        f"ground_expression({expression!r}) returned 0 masks. "
-                        "Try a more general expression."
-                    ),
-                }]
+                tool_result = [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"ground_expression({expression!r}) returned 0 masks. "
+                            "Try a more general expression."
+                        ),
+                    }
+                ]
             else:
                 # Render combined SoM of ALL active slots
                 som_image = render_som(pil_image, all_masks)
@@ -748,14 +774,16 @@ def run_agent(
                 new_ids = list(new_slot_masks.keys())
                 if 2 <= len(new_ids) <= auto_relations_max:
                     relations = compute_relations(all_masks, new_ids)
-                    tool_result.append({
-                        "type": "text",
-                        "text": (
-                            f"Pairwise relations (auto-computed for "
-                            f"{len(new_ids)} new masks in slot '{slot}'):\n"
-                            + json.dumps(relations, indent=2)
-                        ),
-                    })
+                    tool_result.append(
+                        {
+                            "type": "text",
+                            "text": (
+                                f"Pairwise relations (auto-computed for "
+                                f"{len(new_ids)} new masks in slot '{slot}'):\n"
+                                + json.dumps(relations, indent=2)
+                            ),
+                        }
+                    )
 
             messages.append({"role": "user", "content": tool_result})
 
@@ -781,28 +809,37 @@ def run_agent(
                     f"get_crop failed: mask_id={mask_id} not found. "
                     f"Active IDs: {sorted(all_masks.keys())}"
                 )
-                messages.append({
-                    "role": "user",
-                    "content": [{"type": "text", "text": _crop_text}],
-                })
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": _crop_text}],
+                    }
+                )
                 _ts.result_text = _crop_text
             else:
                 crop_img = get_crop(pil_image, all_masks[mask_id])
                 slot_label = all_masks[mask_id].get("slot", "?")
-                messages.append({
-                    "role": "user",
-                    "content": [
-                        {"type": "pil_image", "image": crop_img},
-                        {"type": "text", "text": f"Zoomed crop of mask {mask_id} (slot: {slot_label})."},
-                    ],
-                })
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "pil_image", "image": crop_img},
+                            {
+                                "type": "text",
+                                "text": f"Zoomed crop of mask {mask_id} (slot: {slot_label}).",
+                            },
+                        ],
+                    }
+                )
                 _ts.result_text = f"Zoomed crop of mask {mask_id} (slot: {slot_label})."
             trace.append(_ts)
 
         # --- spatial operations (mask_ops.py) ---
         elif tool_name in SPATIAL_OPS:
             if verbose:
-                print(f"  → {tool_name}({', '.join(f'{k}={v!r}' for k, v in params.items())})")
+                print(
+                    f"  → {tool_name}({', '.join(f'{k}={v!r}' for k, v in params.items())})"
+                )
             try:
                 result = spatial_dispatch(tool_name, all_masks, params)
                 result_text = f"{tool_name} result:\n{json.dumps(result, indent=2)}"
@@ -811,10 +848,12 @@ def run_agent(
                 if verbose:
                     print(f"  [warn] {result_text}")
 
-            messages.append({
-                "role": "user",
-                "content": [{"type": "text", "text": result_text}],
-            })
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": result_text}],
+                }
+            )
             _ts.result_text = result_text
             trace.append(_ts)
 
@@ -826,10 +865,12 @@ def run_agent(
 
             relations = compute_relations(all_masks, mask_ids)
             rel_text = f"compute_relations result:\n{json.dumps(relations, indent=2)}"
-            messages.append({
-                "role": "user",
-                "content": [{"type": "text", "text": rel_text}],
-            })
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": rel_text}],
+                }
+            )
             _ts.result_text = rel_text
             trace.append(_ts)
 
@@ -884,6 +925,7 @@ def run_agent(
 # Results export
 # ---------------------------------------------------------------------------
 
+
 def save_run_results(
     result: GroundedReasoningResult,
     baseline_answer: str,
@@ -920,7 +962,11 @@ def save_run_results(
 
     # ── core images ───────────────────────────────────────────────────────────
     original_path = _save_img(original_image, f"{run_name}_original.png")
-    final_path = _save_img(result.final_image, f"{run_name}_final.png") if result.final_image else None
+    final_path = (
+        _save_img(result.final_image, f"{run_name}_final.png")
+        if result.final_image
+        else None
+    )
 
     # ── trace steps ──────────────────────────────────────────────────────────
     trace_records = []
@@ -965,6 +1011,7 @@ def save_run_results(
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+
 def main():
     import argparse
 
@@ -972,11 +1019,13 @@ def main():
         description="Grounded visual reasoning with Falcon Perception + local VLM."
     )
     parser.add_argument(
-        "--fp-model", default="tiiuae/Falcon-Perception",
+        "--fp-model",
+        default="tiiuae/Falcon-Perception",
         help="Falcon Perception model ID or local path.",
     )
     parser.add_argument(
-        "--vlm-model", default="mlx-community/gemma-4-26b-a4b-it-4bit",
+        "--vlm-model",
+        default="mlx-community/gemma-4-26b-a4b-it-4bit",
         help="Orchestrator VLM model ID or local path.",
     )
     parser.add_argument("--image", required=True, help="Path or URL to input image.")
@@ -996,13 +1045,18 @@ def main():
     if args.image.startswith("http"):
         import io
         import urllib.request
+
         with urllib.request.urlopen(args.image) as resp:
             image = Image.open(io.BytesIO(resp.read())).convert("RGB")
     else:
         image = Image.open(args.image).convert("RGB")
 
     result = run_agent(
-        image, args.query, fp_model, fp_processor, vlm_client,
+        image,
+        args.query,
+        fp_model,
+        fp_processor,
+        vlm_client,
         fp_max_tokens=args.fp_max_tokens,
         auto_relations_max=args.auto_relations_max,
         max_corrections=args.max_corrections,

@@ -5,16 +5,16 @@ from PIL import Image, ImageDraw, ImageFont
 
 # Colour palette — each mask gets a distinct colour (cycles after 10)
 _PALETTE = [
-    (255, 80, 80),    # red
-    (80, 200, 80),    # green
-    (80, 120, 255),   # blue
-    (255, 220, 50),   # yellow
-    (220, 80, 220),   # magenta
-    (50, 210, 210),   # cyan
-    (255, 150, 40),   # orange
-    (160, 80, 255),   # purple
-    (50, 210, 140),   # spring-green
-    (255, 80, 160),   # deep-pink
+    (255, 80, 80),  # red
+    (80, 200, 80),  # green
+    (80, 120, 255),  # blue
+    (255, 220, 50),  # yellow
+    (220, 80, 220),  # magenta
+    (50, 210, 210),  # cyan
+    (255, 150, 40),  # orange
+    (160, 80, 255),  # purple
+    (50, 210, 140),  # spring-green
+    (255, 80, 160),  # deep-pink
 ]
 
 
@@ -67,7 +67,9 @@ def render_som(image, masks, interior_opacity=0.40, label_radius=13):
         palette_np = np.array(_PALETTE, dtype=np.uint8)
         P = len(palette_np)
         ordered_colors = palette_np[
-            np.array([int(draw_order[i]) % P for i in range(len(sorted_ids))], dtype=np.intp)
+            np.array(
+                [int(draw_order[i]) % P for i in range(len(sorted_ids))], dtype=np.intp
+            )
         ]
 
         clamped = np.where(has_mask, idx_map, 0)
