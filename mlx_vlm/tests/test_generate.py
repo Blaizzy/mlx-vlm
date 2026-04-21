@@ -1042,6 +1042,8 @@ def test_generate_cli_smoke(capsys):
         adapter_path=None,
         image=["image.png"],
         audio=None,
+        video=None,
+        fps=2.0,
         resize_shape=[224],
         prompt=["Describe this image."],
         system=None,
