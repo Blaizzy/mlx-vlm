@@ -8,8 +8,12 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 - [Usage](#usage)
   - [Command Line Interface (CLI)](#command-line-interface-cli)
     - [Thinking Budget](#thinking-budget)
+  - [Speculative Decoding (DFlash)](#speculative-decoding-dflash)
   - [Chat UI with Gradio](#chat-ui-with-gradio)
   - [Python Script](#python-script)
+  - [Server (FastAPI)](#server-fastapi)
+    - [Continuous Batching](#continuous-batching)
+    - [KV Cache Quantization](#kv-cache-quantization)
 - [Activation Quantization (CUDA)](#activation-quantization-cuda)
 - [Multi-Image Chat Support](#multi-image-chat-support)
   - [Supported Models](#supported-models)
@@ -17,6 +21,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 - [Model-Specific Documentation](#model-specific-documentation)
 - [Vision Feature Caching](#vision-feature-caching)
 - [TurboQuant KV Cache](#turboquant-kv-cache)
+- [Distributed Inference](#distributed-inference)
 - [Fine-tuning](#fine-tuning)
 
 ## Model-Specific Documentation
@@ -89,6 +94,37 @@ mlx_vlm.generate --model mlx-community/Qwen3.5-2B-4bit \
 | `--thinking-end-token` | Token that closes a thinking block (default: `</think>`) |
 
 When the budget is exceeded, the model is forced to emit `\n</think>` and transition to the answer. If `--enable-thinking` is passed but the model's chat template does not support it, the budget is applied only if the model generates the start token on its own.
+
+### Speculative Decoding (DFlash)
+
+Speed up generation 2–3× using a lightweight block-diffusion drafter that predicts multiple tokens per round, verified in parallel by the target model.
+
+```sh
+# Text generation with speculative decoding
+mlx_vlm.generate --model Qwen/Qwen3.5-4B \
+  --draft-model z-lab/Qwen3.5-4B-DFlash \
+  --prompt "Write a quicksort in Python." \
+  --max-tokens 512 --temperature 0 --enable-thinking
+
+# Also works with images
+mlx_vlm.generate --model Qwen/Qwen3.5-4B \
+  --draft-model z-lab/Qwen3.5-4B-DFlash \
+  --image examples/images/cats.jpg \
+  --prompt "Describe this image." \
+  --max-tokens 256 --temperature 0 --enable-thinking
+
+# Server with speculative decoding
+mlx_vlm.server --model Qwen/Qwen3.5-4B \
+  --draft-model z-lab/Qwen3.5-4B-DFlash
+```
+
+| Flag | Description |
+|------|-------------|
+| `--draft-model` | HuggingFace repo or local path for the drafter |
+| `--draft-kind` | Drafter family (default: `dflash`) |
+| `--draft-block-size` | Override the drafter's configured block size |
+
+See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
 
 ### Chat UI with Gradio
 
@@ -203,11 +239,18 @@ mlx_vlm.server --trust-remote-code
 
 - `--model`: Preload a model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
+- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`) — enables DFlash speculative decoding for ~2× higher throughput
+- `--draft-kind`: Drafter family (default: `dflash`)
+- `--draft-block-size`: Override the drafter's configured block size
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
 - `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
-- `--kv-bits`: Number of bits for KV cache quantization (e.g. `3.5` for TurboQuant)
+- `--kv-bits`: Number of bits for KV cache quantization (e.g. `8` for uniform, `3.5` for TurboQuant)
 - `--kv-quant-scheme`: KV cache quantization backend (`uniform` or `turboquant`)
+- `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
+- `--max-kv-size`: Maximum KV cache size in tokens
+- `--vision-cache-size`: Max number of cached vision features (default: `20`)
+- `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
 
 You can also set trust remote code via environment variable:
 ```sh
@@ -215,6 +258,84 @@ MLX_TRUST_REMOTE_CODE=true mlx_vlm.server
 ```
 
 The server provides multiple endpoints for different use cases and supports dynamic model loading/unloading with caching (one model at a time).
+
+### Continuous Batching
+
+The server supports continuous batching for higher throughput when handling multiple concurrent requests. New requests join the active batch immediately without waiting for existing requests to finish, and mixed batches of image and text-only requests are supported.
+
+Continuous batching is enabled automatically when the server loads a model. You can pre-load a model at startup so it's ready to serve immediately:
+
+```sh
+mlx_vlm.server --port 8080 --model mlx-community/Qwen2.5-VL-3B-Instruct-4bit
+```
+
+Verify via the health endpoint:
+
+```sh
+curl http://localhost:8080/health
+# {"status":"healthy","loaded_model":"...","continuous_batching_enabled":true}
+```
+
+If `--model` is omitted, the model is loaded on the first request.
+
+#### KV Cache Quantization
+
+Reduce KV cache memory during continuous batching with `--kv-bits`. Both uniform quantization and TurboQuant are supported:
+
+```sh
+# Uniform 8-bit KV cache quantization
+mlx_vlm.server --model google/gemma-4-26b-a4b-it --kv-bits 8
+
+# TurboQuant 3.5-bit (3-bit keys + 4-bit values)
+mlx_vlm.server --model google/gemma-4-26b-a4b-it --kv-bits 3.5 --kv-quant-scheme turboquant
+```
+
+Full-attention layers use quantized batch caches while sliding-window layers keep their fixed-size rotating caches. The last full-attention layer stays unquantized (sensitive in deep models).
+
+Tested with gemma-4-26b-a4b-it at 20K context:
+
+| Config | Gen tok/s | KV Cache | KV Reduction |
+|--------|-----------|----------|--------------|
+| No quant | 50.3 | 0.624 GB | 1x |
+| Uniform 8-bit | 52.6 | 0.469 GB | **1.33x** |
+| TurboQuant 3.5-bit | 25.6 | 0.365 GB | **1.71x** |
+
+> Models with all full-attention layers (e.g. Qwen, LLaMA) see larger reductions — up to 3.6x at 8-bit and 6.4x at 4-bit.
+
+#### Log Probabilities
+
+The `/chat/completions` endpoint supports OpenAI-compatible per-token log probabilities. Pass `logprobs: true` (and optionally `top_logprobs: N`, up to 20) in the request:
+
+```sh
+curl -X POST "http://localhost:8080/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen2-VL-2B-Instruct-4bit",
+    "messages": [{"role":"user","content":"Say hi in 3 words."}],
+    "max_tokens": 8,
+    "logprobs": true,
+    "top_logprobs": 3
+  }'
+```
+
+Each choice gets a `logprobs.content[]` list with one entry per generated token: `{token, logprob, bytes, top_logprobs: [{token, logprob, bytes}, ...]}`. Works for both streaming and non-streaming.
+
+`top_logprobs` requires the server to be started with a non-zero cap on how many alternatives it will compute per token (default `0` = disabled, max `20`). Set it via the `--top-logprobs-k` flag or the `TOP_LOGPROBS_K` env var:
+
+```sh
+mlx_vlm.server --model mlx-community/Qwen2-VL-2B-Instruct-4bit --top-logprobs-k 5
+# or
+TOP_LOGPROBS_K=5 mlx_vlm.server --model mlx-community/Qwen2-VL-2B-Instruct-4bit
+```
+
+Per-request `top_logprobs` is clamped to `TOP_LOGPROBS_K`. When `TOP_LOGPROBS_K=0`, requests with `logprobs: true` still return chosen-token logprobs; only the `top_logprobs` list stays empty. Leaving the cap at `0` keeps the vocab-wide sort out of the decode graph, so deployments that don't need logprobs pay zero overhead.
+
+#### How It Works
+
+- A dedicated generation thread runs a `BatchGenerator` that processes multiple requests in parallel
+- Image requests are prefilled individually with their own vision embeddings, then join the shared decoding batch
+- Text-only requests are batched together for efficient prefill
+- After prefill, all requests decode together in a single batch, sharing GPU compute
 
 #### Available Endpoints
 
@@ -600,6 +721,16 @@ Tested on gemma-4-31b-it at 128k context:
 ### Compatibility
 
 TurboQuant automatically quantizes `KVCache` layers (global attention). Models with `RotatingKVCache` (sliding window) or `ArraysCache` (MLA/absorbed keys) keep their native cache format for those layers since they are already memory-efficient.
+
+TurboQuant is supported in both single-request generation and continuous batching on the server. In continuous batching mode, KV states are stored in TurboQuant's compressed format and dequantized at attention time (custom Metal kernels are not yet batch-aware).
+
+## Distributed Inference
+
+mlx-vlm supports distributed inference across multiple computers. It works by sharding the language model (not the vision tower), because the LLM is much larger and vision embeddings only need to be computed once.
+
+The parallel implementation is compatible with [mlx-lm](https://github.com/ml-explore/mlx-lm) sharding primitives.
+
+See [docs/usage.md](https://github.com/Blaizzy/mlx-vlm/blob/main/docs/usage.md#distributed-inference) for command-line examples.
 
 # Fine-tuning
 

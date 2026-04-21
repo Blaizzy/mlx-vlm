@@ -15,6 +15,11 @@ from .config import TextConfig
 from .rope_utils import initialize_rope
 
 
+@partial(mx.compile, shapeless=True)
+def geglu(gate, x):
+    return nn.gelu_approx(gate) * x
+
+
 class RMSNormNoScale(nn.Module):
     """RMSNorm without learnable scale (with_scale=False, scale_shift=0.0)."""
 
@@ -60,7 +65,7 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.gelu_approx(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(geglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Router(nn.Module):
@@ -69,27 +74,26 @@ class Router(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
-        self.norm = RMSNormNoScale(config.hidden_size, eps=config.rms_norm_eps)
+        self.eps = config.rms_norm_eps
         self.proj = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.scale = mx.ones((config.hidden_size,))
         self.per_expert_scale = mx.ones((config.num_experts,))
         self._root_size = config.hidden_size**-0.5
 
     def __call__(self, x: mx.array):
-        x = self.norm(x)
-        x = x * self._root_size
-        x = x * self.scale
+        x = mx.fast.rms_norm(x, self.scale * self._root_size, self.eps)
 
         expert_scores = self.proj(x)
-        router_probs = mx.softmax(expert_scores, axis=-1)
 
         top_k_indices = mx.argpartition(
-            -expert_scores, kth=self.config.top_k_experts - 1, axis=-1
-        )[..., : self.config.top_k_experts]
+            expert_scores, kth=-self.config.top_k_experts, axis=-1
+        )
+        top_k_indices = top_k_indices[..., -self.config.top_k_experts :]
 
-        top_k_weights = mx.take_along_axis(router_probs, top_k_indices, axis=-1)
-        top_k_weights = top_k_weights / mx.sum(top_k_weights, axis=-1, keepdims=True)
+        top_k_weights = mx.take_along_axis(expert_scores, top_k_indices, axis=-1)
+        top_k_weights = mx.softmax(top_k_weights, axis=-1)
         top_k_weights = top_k_weights * self.per_expert_scale[top_k_indices]
+
         return top_k_indices, top_k_weights
 
 
@@ -97,7 +101,7 @@ class GeGLU(nn.Module):
     """GELU-gated linear unit activation for SwitchGLU."""
 
     def __call__(self, x, gate):
-        return nn.gelu_approx(gate) * x
+        return geglu(gate, x)
 
 
 class Experts(nn.Module):
@@ -118,16 +122,9 @@ class Experts(nn.Module):
     def __call__(
         self, x: mx.array, top_k_indices: mx.array, top_k_weights: mx.array
     ) -> mx.array:
-        B, S, H = x.shape
-        K = top_k_indices.shape[-1]
-
-        x_flat = x.reshape(B * S, H)
-        indices_flat = top_k_indices.reshape(B * S, K)
-
-        expert_out = self.switch_glu(x_flat, indices_flat)
-
-        weights = top_k_weights.reshape(B * S, K)[..., None]
-        return (expert_out * weights).sum(axis=-2).reshape(B, S, H)
+        w = mx.expand_dims(top_k_weights, -1)
+        y = self.switch_glu(x, top_k_indices)
+        return (w * y).sum(-2)
 
 
 class Attention(nn.Module):
@@ -194,21 +191,17 @@ class Attention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        shared_kv: Optional[tuple] = None,
+        offset: Optional[Any] = None,
     ) -> mx.array:
         B, L, _ = x.shape
 
         queries = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
         queries = self.q_norm(queries)
 
-        offset = 0
-        if self.is_kv_shared_layer and cache is not None:
-            state = cache.state
-            keys, values = state[0], state[1]
-            offset = cache.offset
+        if shared_kv is not None:
+            keys, values = shared_kv
         else:
-            if cache is not None:
-                offset = cache.offset
-
             keys = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
 
             # k_eq_v: values from raw k_proj (before k_norm)
@@ -217,12 +210,14 @@ class Attention(nn.Module):
             else:
                 values = self.v_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
 
-            keys = self.k_norm(keys)
-            values = self.v_norm(values)
-            values = values.transpose(0, 2, 1, 3)
+            offset = mx.array(cache.offset) if cache is not None else 0
 
+            keys = self.k_norm(keys)
             keys = keys.transpose(0, 2, 1, 3)
             keys = self.rope(keys, offset=offset)
+
+            values = self.v_norm(values)
+            values = values.transpose(0, 2, 1, 3)
 
             if cache is not None:
                 keys, values = cache.update_and_fetch(keys, values)
@@ -230,15 +225,12 @@ class Attention(nn.Module):
         queries = queries.transpose(0, 2, 1, 3)
         queries = self.rope(queries, offset=offset)
 
-        if mask is not None and isinstance(mask, mx.array):
-            if mask.shape[-1] != keys.shape[-2]:
-                mask = mask[..., -keys.shape[-2] :]
-
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+
+        return self.o_proj(output), (keys, values), offset
 
 
 class DecoderLayer(nn.Module):
@@ -303,11 +295,15 @@ class DecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         per_layer_input: Optional[mx.array] = None,
+        shared_kv: Optional[tuple] = None,
+        offset: Optional[Any] = None,
     ) -> mx.array:
         residual = x
 
         h = self.input_layernorm(x)
-        h = self.self_attn(h, mask, cache)
+        h, shared_kv, offset = self.self_attn(
+            h, mask, cache, shared_kv=shared_kv, offset=offset
+        )
         h = self.post_attention_layernorm(h)
         h = residual + h
 
@@ -349,19 +345,7 @@ class DecoderLayer(nn.Module):
         if self.layer_scalar is not None:
             h = h * self.layer_scalar
 
-        return h
-
-
-class ScaledLinear(nn.Module):
-    """Linear layer with output scaling."""
-
-    def __init__(self, in_features: int, out_features: int, scalar: float):
-        super().__init__()
-        self.weight = mx.zeros((out_features, in_features))
-        self.scalar = scalar
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return (x @ self.weight.T) * self.scalar
+        return h, shared_kv, offset
 
 
 class Gemma4TextModel(nn.Module):
@@ -380,34 +364,17 @@ class Gemma4TextModel(nn.Module):
         ]
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # KV sharing: only non-shared layers own a cache
-        self.first_kv_shared_layer_idx = config.num_hidden_layers - getattr(
-            config, "num_kv_shared_layers", 0
-        )
-        concrete_layers = config.layer_types[: self.first_kv_shared_layer_idx]
-        self.layer_idx_to_cache_idx = list(range(self.first_kv_shared_layer_idx))
-        if self.first_kv_shared_layer_idx < config.num_hidden_layers:
-            shared_full_idx = (
-                len(concrete_layers) - 1 - concrete_layers[::-1].index("full_attention")
-            )
-            shared_sliding_idx = (
-                len(concrete_layers)
-                - 1
-                - concrete_layers[::-1].index("sliding_attention")
-            )
-            for i in range(self.first_kv_shared_layer_idx, config.num_hidden_layers):
-                if config.layer_types[i] == "full_attention":
-                    self.layer_idx_to_cache_idx.append(shared_full_idx)
-                else:
-                    self.layer_idx_to_cache_idx.append(shared_sliding_idx)
-
-        # First cache indices by attention type (for mask creation)
-        self.first_full_cache_idx = next(
-            (i for i, t in enumerate(concrete_layers) if t == "full_attention"), 0
-        )
-        self.first_sliding_cache_idx = next(
-            (i for i, t in enumerate(concrete_layers) if t == "sliding_attention"), 0
-        )
+        num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
+        self.first_kv_shared_layer_idx = config.num_hidden_layers - num_kv_shared
+        self.previous_kvs = list(range(len(self.layers)))
+        if num_kv_shared > 0:
+            N = len(self.layers)
+            M = N - num_kv_shared
+            kvs_by_type = {}
+            for i in range(M):
+                kvs_by_type[self.layers[i].layer_type] = i
+            for j in range(M, N):
+                self.previous_kvs[j] = kvs_by_type[self.layers[j].layer_type]
 
         # Per-layer input embeddings (2B/4B models)
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
@@ -418,10 +385,11 @@ class Gemma4TextModel(nn.Module):
             )
             self.embed_tokens_per_layer_scale = config.hidden_size_per_layer_input**0.5
             self.per_layer_input_scale = 2.0**-0.5
-            self.per_layer_model_projection = ScaledLinear(
+            self.per_layer_projection_scale = config.hidden_size**-0.5
+            self.per_layer_model_projection = nn.Linear(
                 config.hidden_size,
                 config.num_hidden_layers * config.hidden_size_per_layer_input,
-                scalar=config.hidden_size**-0.5,
+                bias=False,
             )
             self.per_layer_projection_norm = RMSNormZeroShift(
                 config.hidden_size_per_layer_input, eps=config.rms_norm_eps
@@ -429,6 +397,7 @@ class Gemma4TextModel(nn.Module):
         else:
             self.embed_tokens_per_layer = None
             self.per_layer_input_scale = None
+            self.per_layer_projection_scale = None
             self.per_layer_model_projection = None
             self.per_layer_projection_norm = None
 
@@ -447,6 +416,7 @@ class Gemma4TextModel(nn.Module):
         per_layer_inputs: Optional[mx.array] = None,
     ) -> mx.array:
         per_layer_projection = self.per_layer_model_projection(inputs_embeds)
+        per_layer_projection = per_layer_projection * self.per_layer_projection_scale
         per_layer_projection = per_layer_projection.reshape(
             *inputs_embeds.shape[:-1],
             self.config.num_hidden_layers,
@@ -458,6 +428,21 @@ class Gemma4TextModel(nn.Module):
             return per_layer_projection
 
         return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
+
+    def _make_masks(self, h, cache):
+        """Create attention masks, deduplicated by layer type."""
+        mask = {}
+        masks = []
+        for l, c in zip(self.layers, cache):
+            if l.layer_type not in mask:
+                if l.layer_type == "full_attention":
+                    mask["full_attention"] = create_attention_mask(h, c)
+                elif l.layer_type == "sliding_attention":
+                    mask["sliding_attention"] = create_attention_mask(
+                        h, c, window_size=self.window_size
+                    )
+            masks.append(mask[l.layer_type])
+        return masks
 
     def __call__(
         self,
@@ -472,14 +457,13 @@ class Gemma4TextModel(nn.Module):
             h = self.embed_tokens(inputs)
             h = h * self.embed_scale
         else:
-
             h = inputs_embeds
 
+        # Per-layer inputs (2B/4B models)
         if self.hidden_size_per_layer_input:
             if inputs is not None and per_layer_inputs is None:
                 per_layer_inputs = self.get_per_layer_inputs(inputs)
             elif per_layer_inputs is not None:
-                # Slice per_layer_inputs to match current chunk (chunked prefill)
                 target_len = h.shape[1]
                 if per_layer_inputs.shape[1] != target_len:
                     cache_offset = next(
@@ -496,48 +480,40 @@ class Gemma4TextModel(nn.Module):
             if per_layer_inputs is not None or inputs is not None:
                 per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
 
+        # Build cache + masks
         if cache is None:
-            cache = [None] * self.first_kv_shared_layer_idx
+            cache = [None] * len(self.layers)
+        else:
+            cache = cache + [None] * (len(self.layers) - len(cache))
 
         if mask is None:
-            global_mask = create_attention_mask(
-                h,
-                (
-                    cache[self.first_full_cache_idx]
-                    if self.first_full_cache_idx < len(cache)
-                    else None
-                ),
+            masks = self._make_masks(h, cache)
+        else:
+            masks = [mask] * len(self.layers)
+
+        # Forward through layers
+        if per_layer_inputs is not None:
+            per_layer_inputs = [
+                per_layer_inputs[:, :, i, :] for i, _ in enumerate(self.layers)
+            ]
+        else:
+            per_layer_inputs = [None] * len(self.layers)
+
+        intermediates = [(None, None)] * len(self.layers)
+        for idx, (layer, c, m, prev_idx, pli) in enumerate(
+            zip(
+                self.layers,
+                cache,
+                masks,
+                self.previous_kvs,
+                per_layer_inputs,
             )
-            sliding_window_mask = create_attention_mask(
-                h,
-                (
-                    cache[self.first_sliding_cache_idx]
-                    if self.first_sliding_cache_idx < len(cache)
-                    else None
-                ),
-                window_size=self.window_size,
+        ):
+            kvs, offset = intermediates[prev_idx]
+            h, kvs, offset = layer(
+                h, m, c, per_layer_input=pli, shared_kv=kvs, offset=offset
             )
-
-        for i, layer in enumerate(self.layers):
-            c = cache[self.layer_idx_to_cache_idx[i]]
-            is_global = layer.layer_type == "full_attention"
-
-            local_mask = mask
-            if mask is None and is_global:
-                local_mask = global_mask
-            elif mask is None:
-                local_mask = sliding_window_mask
-
-            per_layer_input = None
-            if per_layer_inputs is not None:
-                per_layer_input = per_layer_inputs[:, :, i, :]
-
-            h = layer(
-                h,
-                local_mask,
-                c,
-                per_layer_input=per_layer_input,
-            )
+            intermediates[idx] = (kvs, offset)
 
         return self.norm(h)
 

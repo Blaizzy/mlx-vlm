@@ -7,7 +7,6 @@ from mlx.utils import tree_map
 
 
 class TestModels(unittest.TestCase):
-
     def language_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(model.model_type, model_type)
         self.assertEqual(len(model.layers), num_layers)
@@ -71,7 +70,13 @@ class TestModels(unittest.TestCase):
                 )
 
             batch_size = kwargs.pop("batch_size", 1)
-            if model_type in ["qwen2_5_vl", "glm4v_moe", "glm4v", "hunyuan_vl"]:
+            if model_type in [
+                "qwen2_5_vl",
+                "glm4v_moe",
+                "glm4v",
+                "hunyuan_vl",
+                "siglip2_vision_model",
+            ]:
                 input_tensor = mx.random.uniform(shape=(image_size[0], image_size[1]))
             else:
                 shape = (
@@ -103,7 +108,6 @@ class TestModels(unittest.TestCase):
             # Check vision hidden feature layer's shape matches the expected hidden size
             if channel_first:
                 if model_type == "llama4_vision_model":
-
                     self.assertEqual(hidden_states.shape[1], vision_hidden_size)
                 else:
                     self.assertEqual(hidden_states.shape[1], vision_hidden_size)
@@ -1926,7 +1930,13 @@ class TestModels(unittest.TestCase):
         )
 
     def test_gemma4(self):
+        import tempfile
+        from pathlib import Path
+
+        from mlx_lm.utils import quantize_model
+
         from mlx_vlm.models import gemma4
+        from mlx_vlm.utils import load_model, save_config, save_weights
 
         text_config = gemma4.TextConfig(
             model_type="gemma4_text",
@@ -1998,6 +2008,52 @@ class TestModels(unittest.TestCase):
         pixel_values = mx.random.uniform(shape=(1, 3, 64, 64))
         output = model(input_ids_with_img, pixel_values=pixel_values)
         self.assertEqual(output.logits.shape, (1, 6, config.text_config.vocab_size))
+
+        # Quantized save/load regression for per-layer projection.
+        quant_model = gemma4.Model(config)
+
+        def quantize_per_layer_projection(path: str, _module: nn.Module):
+            return path == "language_model.model.per_layer_model_projection"
+
+        quant_model, quantized_config = quantize_model(
+            quant_model,
+            {
+                "model_type": "gemma4",
+                "vocab_size": config.vocab_size,
+                "image_token_id": config.image_token_id,
+                "audio_config": None,
+                "text_config": vars(text_config).copy(),
+                "vision_config": vars(vision_config).copy(),
+            },
+            group_size=32,
+            bits=4,
+            quant_predicate=quantize_per_layer_projection,
+        )
+        self.assertTrue(
+            hasattr(
+                quant_model.language_model.model.per_layer_model_projection, "scales"
+            )
+        )
+        quantized_config["quantization"][
+            "language_model.model.per_layer_model_projection"
+        ] = {
+            "group_size": 32,
+            "bits": 4,
+            "mode": "affine",
+        }
+
+        with tempfile.TemporaryDirectory() as model_dir:
+            model_path = Path(model_dir)
+            save_weights(model_path, quant_model)
+            save_config(quantized_config, model_path / "config.json")
+            loaded = load_model(model_path)
+
+        self.assertTrue(
+            hasattr(loaded.language_model.model.per_layer_model_projection, "scales")
+        )
+        logits = loaded(mx.array([[1, 2, 3]], dtype=mx.int32)).logits
+        mx.eval(logits)
+        self.assertEqual(logits.shape, (1, 3, config.vocab_size))
 
         # Full model forward: text + audio tokens
         audio_config = gemma4.AudioConfig(
@@ -2130,6 +2186,93 @@ class TestModels(unittest.TestCase):
         pixel_values = mx.random.uniform(shape=(1, 3, 64, 64))
         output = model(input_ids_with_img, pixel_values=pixel_values)
         self.assertEqual(output.logits.shape, (1, 6, config.text_config.vocab_size))
+
+    def test_gemma4_attention_snapshots_cache_offset(self):
+        """Gemma 4 Attention must snapshot cache.offset to prevent in-place
+        mutation aliasing under batched caches where cache.offset is an
+        mx.array. Without the snapshot, cache.update_and_fetch would mutate
+        the local offset variable between K-rope and Q-rope, producing a
+        one-position shift and a deterministic decode loop. See the equivalent
+        defense in mlx_lm/models/gemma4_text.py (offset = mx.array(cache.offset)).
+        """
+        from mlx_vlm.models.gemma4 import language
+
+        text_config = language.TextConfig(
+            model_type="gemma4_text",
+            hidden_size=32,
+            num_hidden_layers=4,
+            intermediate_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            global_head_dim=16,
+            rms_norm_eps=1e-6,
+            vocab_size=64,
+            vocab_size_per_layer_input=64,
+            hidden_size_per_layer_input=8,
+            num_kv_shared_layers=0,
+            sliding_window=32,
+            sliding_window_pattern=3,
+            final_logit_softcapping=30.0,
+        )
+        attn = language.Attention(text_config, layer_idx=0)
+
+        # Stub cache mirroring the BatchRotatingKVCache shape: cache.offset
+        # is an mx.array, update_and_fetch advances it in place via +=.
+        class _StubMxArrayCache:
+            def __init__(self, start):
+                self.offset = mx.array([start])
+                self.state = (
+                    mx.zeros((1, 1, 0, 16)),
+                    mx.zeros((1, 1, 0, 16)),
+                )
+                self.max_size = 2048
+
+            def update_and_fetch(self, keys, values):
+                self.offset += keys.shape[-2]
+                new_keys = mx.concatenate([self.state[0], keys], axis=-2)
+                new_values = mx.concatenate([self.state[1], values], axis=-2)
+                self.state = (new_keys, new_values)
+                return new_keys, new_values
+
+        cache = _StubMxArrayCache(start=21)
+        cache_offset_id = id(cache.offset)
+
+        rope_ids = []
+        rope_values = []
+        original_rope = attn.rope
+
+        def _recording_rope(x, offset=None):
+            rope_ids.append(id(offset) if offset is not None else None)
+            rope_values.append(offset.tolist() if hasattr(offset, "tolist") else offset)
+            return original_rope(x, offset=offset)
+
+        attn.rope = _recording_rope
+
+        x = mx.random.uniform(shape=(1, 1, text_config.hidden_size))
+        output = attn(x, mask=None, cache=cache)
+        mx.eval(output)
+
+        # Both K-rope and Q-rope must fire.
+        self.assertGreaterEqual(len(rope_ids), 2)
+
+        # The offset object passed to rope must not alias cache.offset;
+        # otherwise cache.update_and_fetch would mutate it between K-rope
+        # and Q-rope.
+        for i, oid in enumerate(rope_ids):
+            self.assertNotEqual(
+                oid,
+                cache_offset_id,
+                f"rope call #{i} aliased cache.offset instead of snapshotting",
+            )
+
+        # Stub advanced in place, confirming the mx.array mutation path.
+        self.assertEqual(cache.offset.tolist(), [22])
+
+        # Both rope calls must see the same pre-update value.
+        self.assertEqual(rope_values[0], [21])
+        self.assertEqual(rope_values[1], [21])
+        self.assertEqual(rope_values[0], rope_values[1])
 
     def test_gemma4_dense(self):
         """Gemma 4 dense variant: K-eq-V, no per-layer inputs, no MoE."""
@@ -3091,6 +3234,96 @@ class TestModels(unittest.TestCase):
             config.text_config.model_type,
             config.text_config.vocab_size,
             config.text_config.num_hidden_layers,
+        )
+
+    def test_youtu_vl(self):
+        from mlx_vlm.models import youtu_vl
+
+        text_config = youtu_vl.TextConfig(
+            model_type="youtu_vl",
+            hidden_size=256,
+            intermediate_size=512,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=1024,
+            q_lora_rank=128,
+            kv_lora_rank=64,
+            qk_rope_head_dim=16,
+            v_head_dim=32,
+            qk_nope_head_dim=32,
+            rope_theta=500000.0,
+            rope_interleave=True,
+            max_position_embeddings=2048,
+            tie_word_embeddings=True,
+        )
+        vision_config = youtu_vl.VisionConfig(
+            model_type="siglip2_vision_model",
+            hidden_size=128,
+            out_hidden_size=256,
+            intermediate_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_channels=3,
+            patch_size=16,
+            spatial_merge_size=2,
+            window_size=64,
+            fullatt_block_indexes=[1],
+        )
+        config = youtu_vl.ModelConfig(
+            model_type="youtu_vl",
+            text_config=text_config,
+            vision_config=vision_config,
+            image_token_id=100,
+            video_token_id=101,
+            vocab_size=1024,
+        )
+        model = youtu_vl.Model(config)
+
+        # Language model: MLA with absorb — fp32/fp16 forward + cached decode check
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        # Vision tower takes packed patches + spatial_shapes:
+        #   pixel_values: (num_patches, patch_size**2 * channels)
+        #   spatial_shapes: (batch, 2) — (h_patches, w_patches)
+        patch_dim = vision_config.patch_size**2 * vision_config.num_channels
+        h_p, w_p = 4, 4
+        num_patches = h_p * w_p
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.out_hidden_size,
+            config.vision_config.num_channels,
+            (num_patches, patch_dim),
+            vision_feature_layer=-1,
+            spatial_shapes=mx.array([[h_p, w_p]], dtype=mx.int32),
+        )
+
+        # sanitize splits kv_b_proj per-head into embed_q (k) + unembed_out (v)
+        H, nope, v_head = 4, 32, 32
+        kv_rank = text_config.kv_lora_rank
+        w = mx.arange(H * (nope + v_head) * kv_rank, dtype=mx.float32).reshape(
+            H * (nope + v_head), kv_rank
+        )
+        sanitized = model.sanitize(
+            {
+                "model.layers.0.self_attn.kv_b_proj.weight": w,
+                "lm_head.weight": mx.zeros((1, 1)),  # tied; must be dropped
+            }
+        )
+        prefix = "language_model.model.layers.0.self_attn"
+        self.assertNotIn(f"{prefix}.kv_b_proj.weight", sanitized)
+        self.assertNotIn("language_model.lm_head.weight", sanitized)
+        self.assertEqual(
+            sanitized[f"{prefix}.embed_q.weight"].shape, (H, kv_rank, nope)
+        )
+        self.assertEqual(
+            sanitized[f"{prefix}.unembed_out.weight"].shape, (H, v_head, kv_rank)
         )
 
 
@@ -4766,7 +4999,6 @@ class TestChunkedPrefillRoPE(unittest.TestCase):
 
 
 class TestMiniCPMO(unittest.TestCase):
-
     @staticmethod
     def _tiny_config():
         from mlx_vlm.models import minicpmo
@@ -4873,7 +5105,6 @@ class TestMiniCPMO(unittest.TestCase):
 
 
 class TestPhi4MM(unittest.TestCase):
-
     @staticmethod
     def _tiny_config():
         from mlx_vlm.models.phi4mm.config import ModelConfig, TextConfig, VisionConfig
@@ -5050,7 +5281,6 @@ class TestPhi4MM(unittest.TestCase):
 
 
 class TestSam3(unittest.TestCase):
-
     # ─── SAM3 Tests ────────────────────────────────────────────
 
     def test_sam3_config(self):

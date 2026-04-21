@@ -51,6 +51,7 @@ MODEL_CONFIG = {
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
+    "kimi_k25": MessageFormat.LIST_WITH_IMAGE,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,
     "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "gemma4": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
@@ -58,6 +59,8 @@ MODEL_CONFIG = {
     "smolvlm": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "llava": MessageFormat.LIST_WITH_IMAGE,
     "llava_next": MessageFormat.LIST_WITH_IMAGE,
+    "granite_vision": MessageFormat.LIST_WITH_IMAGE,
+    "granite4_vision": MessageFormat.LIST_WITH_IMAGE,
     "mllama": MessageFormat.LIST_WITH_IMAGE,
     "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "molmo2": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -74,6 +77,7 @@ MODEL_CONFIG = {
     "deepseekocr": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "phi4-siglip": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "hunyuan_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "youtu_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Prompt-only models
     "florence2": MessageFormat.PROMPT_ONLY,
     "molmo": MessageFormat.PROMPT_ONLY,
@@ -563,11 +567,11 @@ def get_chat_template(
         for message in normalized:
             role = message.get("role", "user")
             content = message.get("content", "")
-            if role in ("system", "user", "assistant"):
+            if role in ("system", "user", "assistant", "tool"):
                 prefix = role.capitalize()
                 lines.append(f"{prefix}: {content}" if content else f"{prefix}:")
             else:
-                lines.append(content)
+                lines.append(content if content else "")
 
         if add_generation_prompt:
             lines.append("Assistant:")
@@ -693,7 +697,7 @@ def apply_chat_template(
             if isinstance(p, str):
                 last_user_idx = i
             elif (rc := _get_role_content(p)) is not None:
-                if rc[0] not in ("system", "assistant"):
+                if rc[0] not in ("system", "assistant", "tool"):
                     last_user_idx = i
 
         for i, p in enumerate(prompt):
@@ -712,23 +716,31 @@ def apply_chat_template(
                 )
             elif (role_content := _get_role_content(p)) is not None:
                 role, content = role_content
-                # Handle multimodal content: extract only text, skip image/audio URLs
-                content = extract_text_from_content(content)
-                is_target = i == last_user_idx
-                messages.append(
-                    get_message_json(
-                        model_type,
-                        content,
-                        role,
-                        skip_image_token=not is_target
-                        or role in ["system", "assistant"],
-                        skip_audio_token=not is_target
-                        or role in ["system", "assistant"],
-                        num_images=num_images,
-                        num_audios=num_audios,
-                        **kwargs,
-                    )
+                # Tool-calling messages: pass through as-is to preserve
+                # tool_calls, tool_call_id, name for the Jinja template.
+                has_tool_metadata = isinstance(p, dict) and (
+                    "tool_calls" in p or "tool_call_id" in p or role == "tool"
                 )
+                if has_tool_metadata:
+                    messages.append(p)
+                else:
+                    # Handle multimodal content: extract only text, skip image/audio URLs
+                    content = extract_text_from_content(content)
+                    is_target = i == last_user_idx
+                    messages.append(
+                        get_message_json(
+                            model_type,
+                            content,
+                            role,
+                            skip_image_token=not is_target
+                            or role in ["system", "assistant"],
+                            skip_audio_token=not is_target
+                            or role in ["system", "assistant"],
+                            num_images=num_images,
+                            num_audios=num_audios,
+                            **kwargs,
+                        )
+                    )
 
     if return_messages:
         return messages
