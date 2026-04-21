@@ -31,6 +31,7 @@ def test_turboquant_mse_matches_paper_small_bit_distortions():
 
 
 def test_turboquant_prod_is_nearly_unbiased_across_seeds():
+    mx.random.seed(42)
     keys = _sample_unit_vectors(128, 64)
     queries = mx.random.normal((128, 64))
     true_inner_products = mx.sum(keys * queries, axis=-1)

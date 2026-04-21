@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import gc
 import json
+import logging
 import os
 import re
 import time
@@ -12,8 +13,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Callable, Iterator, List, Literal, Optional, Tuple, Union
+
+logger = logging.getLogger("mlx_vlm.server")
 
 import mlx.core as mx
 import uvicorn
@@ -35,7 +38,10 @@ from .generate import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     BatchGenerator,
+    _dflash_rounds_batch,
+    _make_cache,
     generate,
+    generation_stream,
     normalize_resize_shape,
     stream_generate,
 )
@@ -84,6 +90,16 @@ def get_max_kv_size(model: str):
 
 def get_quantized_kv_start():
     return int(os.environ.get("QUANTIZED_KV_START", DEFAULT_QUANTIZED_KV_START))
+
+
+def get_top_logprobs_k():
+    """Max per-token top_logprobs honored by the server (0 = disabled).
+
+    Set via TOP_LOGPROBS_K env var. OpenAI caps this at 20. When 0, requests
+    with top_logprobs>0 still succeed but the top_logprobs list stays empty.
+    """
+    k = int(os.environ.get("TOP_LOGPROBS_K", 0))
+    return max(0, min(k, 20))
 
 
 # =============================================================================
@@ -154,6 +170,7 @@ class StreamingToken:
     logprobs: float
     finish_reason: Optional[str]
     peak_memory: float = 0.0
+    top_logprobs: Optional[List[Tuple[int, float]]] = None
 
 
 class ResponseGenerator:
@@ -166,16 +183,36 @@ class ResponseGenerator:
     higher throughput — same pattern as mlx-lm's server.
     """
 
-    def __init__(self, model, processor, stop_tokens=None, vision_cache=None):
+    def __init__(
+        self,
+        model,
+        processor,
+        stop_tokens=None,
+        vision_cache=None,
+        draft_model=None,
+        kv_bits=None,
+        kv_group_size=DEFAULT_KV_GROUP_SIZE,
+        kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
+        quantized_kv_start=DEFAULT_QUANTIZED_KV_START,
+        top_logprobs_k=0,
+    ):
         self.model = model
         self.processor = processor
         self.stop_tokens = stop_tokens or set()
         self.vision_cache = vision_cache
+        self.draft_model = draft_model
+        self.kv_bits = kv_bits
+        self.kv_group_size = kv_group_size
+        self.kv_quant_scheme = kv_quant_scheme
+        self.quantized_kv_start = quantized_kv_start
+        self.top_logprobs_k = top_logprobs_k
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
         self.requests: Queue = Queue()
         self._stop = False
+        self._cancelled: set = set()
+        self._cancel_lock = Lock()
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -183,6 +220,15 @@ class ResponseGenerator:
         self._stop = True
         self.requests.put(None)
         self._thread.join(timeout=5.0)
+
+    def _cancel(self, uid):
+        with self._cancel_lock:
+            self._cancelled.add(uid)
+
+    def _drain_cancellations(self) -> set:
+        with self._cancel_lock:
+            pending, self._cancelled = self._cancelled, set()
+            return pending
 
     def generate(
         self,
@@ -210,17 +256,30 @@ class ResponseGenerator:
         if isinstance(ctx, Exception):
             raise ctx
 
+        uid = ctx.uid
+
         def token_iterator():
+            # Mark ended before yielding the final token so a consumer that
+            # closes immediately after seeing finish_reason isn't treated
+            # as a client abort.
+            ended = False
             try:
                 while True:
                     item = rqueue.get(timeout=60.0)
                     if item is None:
+                        ended = True
                         break
                     if isinstance(item, Exception):
+                        ended = True
                         raise item
+                    if getattr(item, "finish_reason", None):
+                        ended = True
                     yield item
+                    if ended:
+                        break
             finally:
-                pass  # batch cleanup happens in _run
+                if not ended:
+                    self._cancel(uid)
 
         return ctx, token_iterator()
 
@@ -286,26 +345,40 @@ class ResponseGenerator:
 
     def _run(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
+        if self.draft_model is not None:
+            self._run_speculative()
+            return
+
         batch_gen = None
         # uid -> {rqueue, tokens, gen_kwargs}
         active: dict = {}
 
         while not self._stop:
             try:
-                # Collect all pending requests from the queue
+                # Poll the request queue — non-blocking when generating, short
+                # blocking wait when idle so we don't spin.
                 new_items = []
-                timeout = 0.001 if active else 0.1
-                try:
-                    item = self.requests.get(timeout=timeout)
-                    if item is None:
-                        if self._stop:
-                            break
-                    else:
-                        new_items.append(item)
-                except QueueEmpty:
-                    pass
+                if active:
+                    try:
+                        item = self.requests.get_nowait()
+                        if item is None:
+                            if self._stop:
+                                break
+                        else:
+                            new_items.append(item)
+                    except QueueEmpty:
+                        pass
+                else:
+                    try:
+                        item = self.requests.get(timeout=0.1)
+                        if item is None:
+                            if self._stop:
+                                break
+                        else:
+                            new_items.append(item)
+                    except QueueEmpty:
+                        pass
 
-                # Drain any more that arrived
                 while True:
                     try:
                         item = self.requests.get_nowait()
@@ -314,7 +387,18 @@ class ResponseGenerator:
                     except QueueEmpty:
                         break
 
-                # Insert new requests into batch
+                # Drop abandoned requests before doing more work.
+                cancelled = self._drain_cancellations()
+                if cancelled and batch_gen is not None:
+                    for uid in cancelled:
+                        if uid in active:
+                            batch_gen.remove(uid)
+                            info = active.pop(uid)
+                            try:
+                                info["rqueue"].put(None)
+                            except Exception:
+                                pass
+
                 for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
@@ -322,13 +406,20 @@ class ResponseGenerator:
                             self.processor,
                             stop_tokens=self.stop_tokens,
                             sampler=self._make_sampler(args),
+                            kv_bits=self.kv_bits,
+                            kv_group_size=self.kv_group_size,
+                            kv_quant_scheme=self.kv_quant_scheme,
+                            quantized_kv_start=self.quantized_kv_start,
+                            top_logprobs_k=self.top_logprobs_k,
                         )
 
-                    # GPU work: vision encoder only (if images present)
+                    # Vision encoder runs on the GPU thread; text tokenization
+                    # already happened on the caller thread.
                     input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
 
-                    # Image request: flush pending text-only first
+                    # Image/embed requests can't share a prefill batch with
+                    # pending text-only prompts — drain them first.
                     if has_embeds and batch_gen.unprocessed_prompts:
                         self._flush(batch_gen, active)
 
@@ -336,6 +427,7 @@ class ResponseGenerator:
                         (uid,) = batch_gen.insert(
                             [input_ids.squeeze(0).tolist()],
                             max_tokens=args.max_tokens,
+                            prompt_kwargs=[gen_kwargs],
                         )
                     except Exception as e:
                         rqueue.put(e)
@@ -345,30 +437,211 @@ class ResponseGenerator:
                     active[uid] = {
                         "rqueue": rqueue,
                         "tokens": [],
+                        "prev_text": "",
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                     }
 
-                    # Prefill image request immediately with its embeddings
                     if has_embeds:
-                        self._step(batch_gen, active, gen_kwargs)
+                        self._step(batch_gen, active)
 
                 if not active or batch_gen is None:
                     continue
 
-                # Tight generation loop — run as many steps as we can
-                # in a time budget, then check for new requests.
-                deadline = time.time() + 0.5
-                while active and time.time() < deadline:
-                    self._step(batch_gen, active)
+                self._step(batch_gen, active)
 
             except Exception as e:
                 print(f"Error in generation thread: {e}")
                 traceback.print_exc()
 
+    def _run_speculative(self):
+        """GPU thread loop with DFlash speculative decoding.
+
+        Collects incoming requests, prefills them as a batch with
+        ``capture_layer_ids``, then runs ``_dflash_rounds_batch`` for
+        decode. Between speculative rounds the loop checks for new
+        requests — new arrivals trigger a batch rebuild (re-prefill
+        for the new sequences, extend target caches, cold-restart
+        drafter). Finished sequences are filtered out automatically
+        by ``_dflash_rounds_batch``'s ``stop_check`` callback.
+        """
+        from mlx_lm.sample_utils import make_sampler as _make_sampler
+
+        lm = self.model.language_model
+        drafter = self.draft_model
+        target_layer_ids = list(drafter.config.target_layer_ids)
+        sampler = _make_sampler(temp=0)
+        draft_block_size_str = os.environ.get("MLX_VLM_DRAFT_BLOCK_SIZE")
+        draft_block_size = int(draft_block_size_str) if draft_block_size_str else None
+
+        while not self._stop:
+            try:
+                # --- Phase 1: collect pending requests ---
+                pending = []
+                timeout = 0.1
+                try:
+                    item = self.requests.get(timeout=timeout)
+                    if item is None and self._stop:
+                        break
+                    if item is not None:
+                        pending.append(item)
+                except QueueEmpty:
+                    pass
+                while True:
+                    try:
+                        item = self.requests.get_nowait()
+                        if item is not None:
+                            pending.append(item)
+                    except QueueEmpty:
+                        break
+
+                if not pending:
+                    continue
+
+                # --- Phase 2: prefill new batch ---
+                uids = []
+                rqueues = {}
+                token_lists = {}
+                max_tokens_map = {}
+                all_input_ids = []
+
+                for rqueue, raw_inputs, prompt_tokens, args, images in pending:
+                    input_ids, _ = self._gpu_embed(raw_inputs, images)
+                    uid = id(rqueue)
+                    uids.append(uid)
+                    rqueues[uid] = rqueue
+                    token_lists[uid] = []
+                    max_tokens_map[uid] = args.max_tokens
+                    all_input_ids.append(input_ids.squeeze(0).tolist())
+                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+                    sampler = self._make_sampler(args) or _make_sampler(temp=0)
+
+                B = len(uids)
+                max_len = max(len(ids) for ids in all_input_ids)
+                padded = [[0] * (max_len - len(ids)) + ids for ids in all_input_ids]
+                input_mx = mx.array(padded, dtype=mx.int32)
+
+                prompt_cache = _make_cache(lm, [0] * B)
+                lm._position_ids = None
+                lm._rope_deltas = None
+
+                with mx.stream(generation_stream):
+                    out = lm(
+                        input_mx,
+                        cache=prompt_cache,
+                        capture_layer_ids=target_layer_ids,
+                    )
+                hidden = mx.concatenate(out.hidden_states, axis=-1)
+                first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
+                mx.eval(first_bonus, hidden, out.logits)
+
+                # Send first bonus tokens to clients
+                fb_list = first_bonus.tolist()
+                for j, uid in enumerate(uids):
+                    tok = int(fb_list[j])
+                    token_lists[uid].append(tok)
+                    text = self.tokenizer.decode([tok])
+                    rqueues[uid].put(
+                        StreamingToken(
+                            text=text,
+                            token=tok,
+                            logprobs=0.0,
+                            finish_reason=None,
+                            peak_memory=mx.get_peak_memory() / 1e9,
+                        )
+                    )
+
+                # --- Phase 3: speculative decode rounds ---
+                max_tok = max(max_tokens_map[u] for u in uids)
+                finished_uids = set()
+
+                def stop_check(seq_idx, token_id):
+                    uid = uids[seq_idx]
+                    if uid in finished_uids:
+                        return True
+                    if token_id in self.stop_tokens:
+                        return True
+                    if len(token_lists[uid]) >= max_tokens_map[uid]:
+                        return True
+                    return False
+
+                for tok_list, _ in _dflash_rounds_batch(
+                    self.model,
+                    drafter,
+                    prompt_cache,
+                    hidden,
+                    first_bonus=first_bonus,
+                    max_tokens=max_tok,
+                    sampler=sampler,
+                    draft_block_size=draft_block_size,
+                    token_dtype=mx.int32,
+                    stop_check=stop_check,
+                ):
+                    for j, tok in enumerate(tok_list):
+                        if tok is None:
+                            continue
+                        uid = uids[j]
+                        if uid in finished_uids:
+                            continue
+
+                        token_lists[uid].append(tok)
+                        tokens = token_lists[uid]
+
+                        if len(tokens) >= 2:
+                            prev = self.tokenizer.decode(tokens[:-1])
+                            curr = self.tokenizer.decode(tokens)
+                            text = curr[len(prev) :]
+                        else:
+                            text = self.tokenizer.decode(tokens)
+
+                        is_stop = tok in self.stop_tokens
+                        is_max = len(tokens) >= max_tokens_map[uid]
+                        finish = "stop" if is_stop else "length" if is_max else None
+
+                        rqueues[uid].put(
+                            StreamingToken(
+                                text="" if is_stop else text,
+                                token=tok,
+                                logprobs=0.0,
+                                finish_reason=finish,
+                                peak_memory=mx.get_peak_memory() / 1e9,
+                            )
+                        )
+
+                        if finish is not None:
+                            rqueues[uid].put(None)
+                            finished_uids.add(uid)
+
+                # Log acceptance stats
+                al = drafter.accept_lens
+                if al:
+                    mean_a = sum(al) / len(al)
+                    print(
+                        f"[DFlash] batch={B} tokens={sum(len(token_lists[u]) for u in uids)} "
+                        f"accept={mean_a:.2f} rounds={len(al)}"
+                    )
+
+                # Finalize any remaining
+                for uid in uids:
+                    if uid not in finished_uids:
+                        rqueues[uid].put(
+                            StreamingToken(
+                                text="",
+                                token=0,
+                                logprobs=0.0,
+                                finish_reason="length",
+                                peak_memory=mx.get_peak_memory() / 1e9,
+                            )
+                        )
+                        rqueues[uid].put(None)
+
+            except Exception as e:
+                print(f"Error in speculative generation thread: {e}")
+                traceback.print_exc()
+
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""
         kwargs = gen_kwargs or {}
-        responses = batch_gen.next(**kwargs)
+        _, responses = batch_gen.next(**kwargs)
         if not responses:
             return
 
@@ -378,30 +651,20 @@ class ResponseGenerator:
 
             info = active[r.uid]
             rqueue = info["rqueue"]
-            tokens = info["tokens"]
-
-            if r.finish_reason == "stop":
-                text = ""
-            else:
-                tokens.append(r.token)
-                if len(tokens) >= 2:
-                    prev = self.tokenizer.decode(tokens[:-1])
-                    curr = self.tokenizer.decode(tokens)
-                    text = curr[len(prev) :]
-                else:
-                    text = self.tokenizer.decode(tokens)
 
             tok = r.token
             if hasattr(tok, "item"):
                 tok = tok.item()
 
-            lp = 0.0
-            if r.logprobs is not None:
-                try:
-                    v = r.logprobs[tok]
-                    lp = v.item() if hasattr(v, "item") else float(v)
-                except (IndexError, TypeError, ValueError):
-                    pass
+            if r.finish_reason == "stop":
+                text = ""
+            else:
+                info["tokens"].append(tok)
+                curr = self.tokenizer.decode(info["tokens"])
+                text = curr[len(info["prev_text"]) :]
+                info["prev_text"] = curr
+
+            lp = r.token_logprob
 
             rqueue.put(
                 StreamingToken(
@@ -409,7 +672,8 @@ class ResponseGenerator:
                     token=tok,
                     logprobs=lp,
                     finish_reason=r.finish_reason,
-                    peak_memory=mx.get_peak_memory() / 1e9,
+                    peak_memory=mx.get_peak_memory() / 1e9 if r.finish_reason else 0,
+                    top_logprobs=getattr(r, "top_logprobs", None),
                 )
             )
 
@@ -419,10 +683,30 @@ class ResponseGenerator:
 
     def _flush(self, batch_gen, active):
         """Drain all pending text-only prompts before inserting an image request."""
-        while batch_gen.unprocessed_prompts:
+        while batch_gen.has_pending_prompts:
             self._step(batch_gen, active)
-            if not batch_gen.unprocessed_prompts:
-                break
+
+
+def suppress_tool_call_content(
+    full_output: str,
+    in_tool_call: bool,
+    tc_start: Optional[str],
+    delta_content: Optional[str],
+) -> Tuple[bool, Optional[str]]:
+    """Suppress tool-call markup from streamed delta.content.
+
+    Returns updated (in_tool_call, delta_content).
+    """
+    if not tc_start:
+        return in_tool_call, delta_content
+    if not in_tool_call:
+        if tc_start in full_output:
+            return True, None
+        if any(full_output.endswith(tc_start[:j]) for j in range(1, len(tc_start))):
+            return False, None
+    else:
+        return True, None
+    return in_tool_call, delta_content
 
 
 def process_tool_calls(model_output: str, tool_module, tools):
@@ -534,6 +818,41 @@ def _split_thinking(text: str) -> Tuple[Optional[str], str]:
     return None, text
 
 
+def _decode_token(tokenizer, token_id: int) -> Tuple[str, Optional[List[int]]]:
+    """Decode a single token id to its string + UTF-8 bytes."""
+    try:
+        text = tokenizer.decode([int(token_id)])
+    except Exception:
+        text = ""
+    try:
+        token_bytes = list(text.encode("utf-8"))
+    except Exception:
+        token_bytes = None
+    return text, token_bytes
+
+
+def _make_logprob_content(
+    tokenizer,
+    token_id: int,
+    logprob: float,
+    top_logprobs: Optional[List[Tuple[int, float]]] = None,
+    top_k: int = 0,
+) -> "ChatLogprobContent":
+    """Build an OpenAI-style logprob entry for a single token."""
+    token_text, token_bytes = _decode_token(tokenizer, token_id)
+    top_list: List[TopLogprob] = []
+    if top_k > 0 and top_logprobs:
+        for tid, lp in top_logprobs[:top_k]:
+            t_text, t_bytes = _decode_token(tokenizer, tid)
+            top_list.append(TopLogprob(token=t_text, logprob=float(lp), bytes=t_bytes))
+    return ChatLogprobContent(
+        token=token_text,
+        logprob=float(logprob),
+        bytes=token_bytes,
+        top_logprobs=top_list,
+    )
+
+
 # Global response generator for continuous batching
 response_generator: Optional[ResponseGenerator] = None
 
@@ -546,9 +865,13 @@ async def lifespan(app):
     model_path = os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
     if model_path:
         adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
-        print(f"Pre-loading model: {model_path}")
+        logger.info("Pre-loading model: %s", model_path)
         get_cached_model(model_path, adapter_path)
-        print("Model ready, continuous batching enabled.")
+        kv_bits = os.environ.get("KV_BITS")
+        kv_scheme = os.environ.get("KV_QUANT_SCHEME", "uniform")
+        if kv_bits:
+            logger.info("KV cache quantization: bits=%s scheme=%s", kv_bits, kv_scheme)
+        logger.info("Model ready, continuous batching enabled.")
     yield
 
 
@@ -601,12 +924,19 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         raise HTTPException(status_code=500, detail=f"Failed to load model: {e}")
 
 
-def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
+_INHERIT_ADAPTER = object()
+
+
+def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     """
     Factory function to get or load the appropriate model resources from cache or by loading.
     Also creates/updates the ResponseGenerator for continuous batching.
     """
     global model_cache, response_generator
+
+    if adapter_path is _INHERIT_ADAPTER:
+        cached = model_cache.get("cache_key")
+        adapter_path = cached[1] if cached and cached[0] == model_path else None
 
     cache_key = (model_path, adapter_path)
 
@@ -631,14 +961,38 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
         elif config.eos_token_id is not None:
             stop_tokens.add(config.eos_token_id)
 
+    # Load speculative drafter if configured
+    draft_model = None
+    draft_model_path = os.environ.get("MLX_VLM_DRAFT_MODEL")
+    if draft_model_path:
+        from .speculative.drafters import load_drafter
+
+        draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND", "dflash")
+        print(f"Loading speculative drafter ({draft_kind}): {draft_model_path}")
+        draft_model = load_drafter(draft_model_path, kind=draft_kind)
+        print("Drafter ready — speculative decoding enabled.")
+
     # Create ResponseGenerator for continuous batching
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
+
+    # KV cache quantization (uniform or TurboQuant)
+    kv_bits = get_quantized_kv_bits(model_path)
+    kv_group_size = get_kv_group_size()
+    quantized_kv_start = get_quantized_kv_start()
+    kv_quant_scheme = get_kv_quant_scheme()
+
     response_generator = ResponseGenerator(
         model=model,
         processor=processor,
         stop_tokens=stop_tokens,
         vision_cache=vision_cache,
+        draft_model=draft_model,
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        kv_quant_scheme=kv_quant_scheme,
+        quantized_kv_start=quantized_kv_start,
+        top_logprobs_k=get_top_logprobs_k(),
     )
 
     model_cache = {
@@ -992,6 +1346,18 @@ class VLMRequest(FlexibleBaseModel):
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
     )
+    logprobs: Optional[bool] = Field(
+        None,
+        description="Return log-probabilities for each output token.",
+    )
+    top_logprobs: Optional[int] = Field(
+        None,
+        description=(
+            "Number of most-likely tokens to return at each position "
+            "(0-20). Requires logprobs=true. The server-side cap is set by "
+            "the TOP_LOGPROBS_K env var; values above the cap are clamped."
+        ),
+    )
     resize_shape: Optional[ResizeShapeInput] = Field(
         None,
         description="Resize shape for the image. Provide one integer for square or two for (height, width).",
@@ -1033,10 +1399,28 @@ class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
 
 
+class TopLogprob(BaseModel):
+    token: str
+    logprob: float
+    bytes: Optional[List[int]] = None
+
+
+class ChatLogprobContent(BaseModel):
+    token: str
+    logprob: float
+    bytes: Optional[List[int]] = None
+    top_logprobs: List[TopLogprob] = []
+
+
+class ChatLogprobs(BaseModel):
+    content: List[ChatLogprobContent] = []
+
+
 class ChatChoice(BaseModel):
     index: int = 0
     finish_reason: str = "stop"
     message: ChatMessage
+    logprobs: Optional[ChatLogprobs] = None
 
 
 class ChatResponse(BaseModel):
@@ -1052,6 +1436,7 @@ class ChatStreamChoice(BaseModel):
     index: int = 0
     finish_reason: Optional[str] = None
     delta: ChatMessage
+    logprobs: Optional[ChatLogprobs] = None
 
 
 class ChatStreamChunk(BaseModel):
@@ -1137,6 +1522,7 @@ async def responses_endpoint(request: Request):
 
     """
 
+    request_start = time.perf_counter()
     body = await request.json()
     openai_request = OpenAIRequest(**body)
 
@@ -1221,6 +1607,15 @@ async def responses_endpoint(request: Request):
             chat_messages,
             num_images=len(images),
             **gen_args.to_template_kwargs(),
+        )
+
+        logger.debug(
+            "responses request: model=%s images=%d max_tokens=%s temp=%s stream=%s",
+            openai_request.model,
+            len(images),
+            gen_args.max_tokens,
+            gen_args.temperature,
+            openai_request.stream,
         )
 
         generated_at = datetime.now().timestamp()
@@ -1421,7 +1816,7 @@ async def responses_endpoint(request: Request):
                         processor=processor,
                         prompt=formatted_prompt,
                         image=images,
-                        verbose=False,
+                        verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=model_cache.get("vision_cache"),
                         **gen_args.to_generate_kwargs(),
                         **kwargs,
@@ -1464,6 +1859,22 @@ async def responses_endpoint(request: Request):
                         "total_tokens": prompt_tokens + output_tokens,
                     },
                 )
+
+                elapsed = time.perf_counter() - request_start
+                logger.debug(
+                    "responses done: prompt_tokens=%d output_tokens=%d "
+                    "total_time=%.2fs",
+                    prompt_tokens,
+                    output_tokens,
+                    elapsed,
+                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    resp_text = content or ""
+                    logger.debug(
+                        "  response: %s",
+                        resp_text[:200] + ("..." if len(resp_text) > 200 else ""),
+                    )
+
                 return response
 
             except Exception as e:
@@ -1495,9 +1906,14 @@ async def chat_completions_endpoint(request: ChatRequest):
     Can operate in streaming or non-streaming mode.
     """
 
+    request_start = time.perf_counter()
     try:
-        # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(request.model, request.adapter_path)
+        adapter_path = (
+            request.adapter_path
+            if "adapter_path" in request.model_fields_set
+            else _INHERIT_ADAPTER
+        )
+        model, processor, config = get_cached_model(request.model, adapter_path)
 
         kwargs = {}
 
@@ -1587,6 +2003,17 @@ async def chat_completions_endpoint(request: ChatRequest):
             **gen_args.to_template_kwargs(),
         )
 
+        logger.debug(
+            "chat/completions request: model=%s images=%d audio=%d "
+            "max_tokens=%s temp=%s stream=%s",
+            request.model,
+            len(images),
+            len(audio),
+            gen_args.max_tokens,
+            gen_args.temperature,
+            request.stream,
+        )
+
         if request.stream:
             # Streaming response using ResponseGenerator for continuous batching
             async def stream_generator():
@@ -1611,6 +2038,10 @@ async def chat_completions_endpoint(request: ChatRequest):
                         in_thinking = False
                         accumulated = ""
                         full_output = ""  # raw output for tool call parsing
+                        # Track tool-call state to suppress markup from content
+                        in_tool_call = False
+                        tc_start = tool_module.tool_call_start if tool_module else None
+                        tc_end = tool_module.tool_call_end if tool_module else None
 
                         def _next_token():
                             try:
@@ -1652,29 +2083,59 @@ async def chat_completions_endpoint(request: ChatRequest):
                             else:
                                 delta_content = token.text
 
-                            choices = [
-                                ChatStreamChoice(
-                                    finish_reason=token.finish_reason,
-                                    delta=ChatMessage(
-                                        role="assistant",
-                                        content=delta_content,
-                                        reasoning=delta_reasoning,
-                                    ),
-                                )
-                            ]
-                            chunk_data = ChatStreamChunk(
-                                id=request_id,
-                                created=int(time.time()),
-                                model=request.model,
-                                usage={
-                                    "prompt_tokens": ctx.prompt_tokens,
-                                    "completion_tokens": output_tokens,
-                                    "total_tokens": ctx.prompt_tokens + output_tokens,
-                                },
-                                choices=choices,
+                            # Suppress tool-call markup from content
+                            in_tool_call, delta_content = suppress_tool_call_content(
+                                full_output, in_tool_call, tc_start, delta_content
                             )
 
-                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+                            chunk_logprobs = None
+                            if request.logprobs and token.finish_reason != "stop":
+                                req_top_k = int(request.top_logprobs or 0)
+                                chunk_logprobs = ChatLogprobs(
+                                    content=[
+                                        _make_logprob_content(
+                                            response_generator.tokenizer,
+                                            token.token,
+                                            token.logprobs,
+                                            top_logprobs=token.top_logprobs,
+                                            top_k=req_top_k,
+                                        )
+                                    ]
+                                )
+
+                            # Skip empty deltas (e.g. suppressed tool-call tokens)
+                            has_payload = (
+                                delta_content is not None
+                                or delta_reasoning is not None
+                                or token.finish_reason is not None
+                                or chunk_logprobs is not None
+                            )
+                            if has_payload:
+                                choices = [
+                                    ChatStreamChoice(
+                                        finish_reason=token.finish_reason,
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            content=delta_content,
+                                            reasoning=delta_reasoning,
+                                        ),
+                                        logprobs=chunk_logprobs,
+                                    )
+                                ]
+                                chunk_data = ChatStreamChunk(
+                                    id=request_id,
+                                    created=int(time.time()),
+                                    model=request.model,
+                                    usage={
+                                        "prompt_tokens": ctx.prompt_tokens,
+                                        "completion_tokens": output_tokens,
+                                        "total_tokens": ctx.prompt_tokens
+                                        + output_tokens,
+                                    },
+                                    choices=choices,
+                                )
+
+                                yield f"data: {chunk_data.model_dump_json()}\n\n"
 
                             if token.finish_reason:
                                 break
@@ -1748,6 +2209,13 @@ async def chat_completions_endpoint(request: ChatRequest):
                     # Signal stream end
                     yield "data: [DONE]\n\n"
 
+                    elapsed = time.perf_counter() - request_start
+                    logger.debug(
+                        "chat/completions stream done: tokens=%d " "total_time=%.2fs",
+                        output_tokens,
+                        elapsed,
+                    )
+
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
@@ -1783,6 +2251,10 @@ async def chat_completions_endpoint(request: ChatRequest):
                 output_tokens = 0
                 peak_memory = 0.0
 
+                collected_logprobs: List[
+                    Tuple[int, float, Optional[List[Tuple[int, float]]]]
+                ] = []
+
                 if response_generator is not None:
 
                     def _blocking_generate():
@@ -1800,6 +2272,10 @@ async def chat_completions_endpoint(request: ChatRequest):
                             text += token.text
                             gt += 1
                             pm = token.peak_memory
+                            if request.logprobs and token.finish_reason != "stop":
+                                collected_logprobs.append(
+                                    (token.token, token.logprobs, token.top_logprobs)
+                                )
                             if token.finish_reason:
                                 break
                         try:
@@ -1818,7 +2294,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         prompt=formatted_prompt,
                         image=images,
                         audio=audio,
-                        verbose=False,
+                        verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=model_cache.get("vision_cache"),
                         **gen_args.to_generate_kwargs(),
                         **kwargs,
@@ -1864,6 +2340,27 @@ async def chat_completions_endpoint(request: ChatRequest):
                             ).strip()
                         content = clean_remaining or None
 
+                response_logprobs = None
+                if request.logprobs and collected_logprobs:
+                    tokenizer = (
+                        processor.tokenizer
+                        if hasattr(processor, "tokenizer")
+                        else processor
+                    )
+                    req_top_k = int(request.top_logprobs or 0)
+                    response_logprobs = ChatLogprobs(
+                        content=[
+                            _make_logprob_content(
+                                tokenizer,
+                                tid,
+                                lp,
+                                top_logprobs=top_lps,
+                                top_k=req_top_k,
+                            )
+                            for tid, lp, top_lps in collected_logprobs
+                        ]
+                    )
+
                 choices = [
                     ChatChoice(
                         finish_reason="tool_calls" if parsed_tool_calls else "stop",
@@ -1873,6 +2370,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             reasoning=reasoning,
                             tool_calls=parsed_tool_calls,
                         ),
+                        logprobs=response_logprobs,
                     )
                 ]
                 result = ChatResponse(
@@ -1882,6 +2380,22 @@ async def chat_completions_endpoint(request: ChatRequest):
                     usage=usage_stats,
                     choices=choices,
                 )
+
+                elapsed = time.perf_counter() - request_start
+                logger.debug(
+                    "chat/completions done: prompt_tokens=%d completion_tokens=%d "
+                    "total_time=%.2fs peak_memory=%.2fGB",
+                    prompt_tokens,
+                    completion_tokens,
+                    elapsed,
+                    peak_memory,
+                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    resp_text = content or ""
+                    logger.debug(
+                        "  response: %s",
+                        resp_text[:200] + ("..." if len(resp_text) > 200 else ""),
+                    )
 
                 return result
 
@@ -2049,10 +2563,44 @@ def main():
         help="Start index for quantized KV cache.",
     )
     parser.add_argument(
+        "--draft-model",
+        type=str,
+        default=None,
+        help="Speculative drafter path or HF id (e.g. z-lab/Qwen3.5-4B-DFlash).",
+    )
+    parser.add_argument(
+        "--draft-kind",
+        type=str,
+        default="dflash",
+        help="Drafter family (default: dflash).",
+    )
+    parser.add_argument(
+        "--draft-block-size",
+        type=int,
+        default=None,
+        help="Override the drafter's configured block size.",
+    )
+    parser.add_argument(
+        "--top-logprobs-k",
+        type=int,
+        default=None,
+        help=(
+            "Server-side cap for per-token top_logprobs (0-20, default 0 = "
+            "disabled). Maps to the TOP_LOGPROBS_K env var."
+        ),
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
         help="Enable auto-reload for development.",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the logging level (default: INFO).",
     )
     args = parser.parse_args()
     if args.trust_remote_code:
@@ -2062,6 +2610,11 @@ def main():
         if args.adapter_path:
             os.environ["MLX_VLM_PRELOAD_ADAPTER"] = args.adapter_path
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
+    if args.draft_model:
+        os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
+        os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
+        if args.draft_block_size is not None:
+            os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     if args.kv_bits is not None:
@@ -2071,6 +2624,17 @@ def main():
     if args.max_kv_size is not None:
         os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    if args.top_logprobs_k is not None:
+        os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
+
+    # Configure logging
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+    logger.setLevel(log_level)
+
     uvicorn.run(
         "mlx_vlm.server:app",
         host=args.host,

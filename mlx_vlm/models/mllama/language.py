@@ -67,7 +67,10 @@ class MllamaTextCrossAttention(nn.Module):
                 .transpose(0, 2, 1, 3)
             )
             key_states = self.k_norm(key_states)
-        elif cache is not None and cache.offset > 0:
+        elif cache is not None and (
+            (isinstance(cache.offset, mx.array) and cache.offset.max().item() > 0)
+            or (not isinstance(cache.offset, mx.array) and cache.offset > 0)
+        ):
             key_states, value_states = cache.fetch()
         else:
             key_states, value_states = mx.split(query, 2, axis=1)
@@ -141,8 +144,13 @@ class MllamaTextSelfAttention(nn.Module):
         )
 
         if cache is not None:
-            query_states = self.rope(query_states, offset=cache.offset)
-            key_states = self.rope(key_states, offset=cache.offset)
+            offset = cache.offset
+            if isinstance(offset, mx.array):
+                offset = (
+                    int(offset.max().item()) if offset.size > 1 else int(offset.item())
+                )
+            query_states = self.rope(query_states, offset=offset)
+            key_states = self.rope(key_states, offset=offset)
             key_states, value_states = cache.update_and_fetch(key_states, value_states)
         else:
             query_states = self.rope(query_states)
