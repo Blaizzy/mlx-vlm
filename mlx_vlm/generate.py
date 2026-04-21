@@ -30,6 +30,7 @@ from .utils import (
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
 DEFAULT_AUDIO = None
+DEFAULT_VIDEO = None
 DEFAULT_PROMPT = "What are these?"
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TEMPERATURE = 0.0
@@ -77,6 +78,19 @@ def parse_arguments():
         nargs="+",
         default=DEFAULT_AUDIO,
         help="URL or path of the audio to process.",
+    )
+    parser.add_argument(
+        "--video",
+        type=str,
+        nargs="+",
+        default=DEFAULT_VIDEO,
+        help="URL or path of the video to process.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=2.0,
+        help="Frames-per-second to sample from --video.",
     )
     parser.add_argument(
         "--resize-shape",
@@ -2373,6 +2387,12 @@ def main():
     )  # TODO: Support multiple audio files
 
     chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    if args.video:
+        # The MessageFormatter video path expects a single video path in
+        # `video=`; pass the first (and for now only) value.
+        video_arg = args.video[0] if isinstance(args.video, list) else args.video
+        chat_template_kwargs["video"] = video_arg
+        chat_template_kwargs["fps"] = args.fps
 
     prompt = apply_chat_template(
         processor,
@@ -2453,6 +2473,8 @@ def main():
         gen_kwargs = {
             "image": args.image,
             "audio": args.audio,
+            "video": args.video,
+            "fps": args.fps,
             "temperature": args.temperature,
             "max_tokens": args.max_tokens,
             "verbose": args.verbose,

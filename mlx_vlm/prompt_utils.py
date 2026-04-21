@@ -224,8 +224,9 @@ class MessageFormatter:
             "qwen3_5",
             "qwen3_5_moe",
             "qwen3_omni_moe",
+            "gemma4",
         ] and kwargs.get("video"):
-            return self._format_video_message(prompt, kwargs)
+            return self._format_video_message(prompt, role, **kwargs)
 
         # Route to appropriate formatter
         formatter_map = {
