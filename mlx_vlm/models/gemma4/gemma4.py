@@ -142,6 +142,7 @@ class Model(nn.Module):
         )
 
         if self.audio_tower is not None and self.embed_audio is not None:
+
             def _encode_audio(feat):
                 mask = (
                     audio_mask

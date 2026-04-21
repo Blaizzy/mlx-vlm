@@ -259,9 +259,7 @@ class Gemma4VideoProcessor:
         idx = np.linspace(0, T - 1, num=num_frames).round().astype(np.int64)
         return video[idx]
 
-    def _resize_frames(
-        self, video: np.ndarray, max_patches: int
-    ) -> np.ndarray:
+    def _resize_frames(self, video: np.ndarray, max_patches: int) -> np.ndarray:
         from PIL import Image
 
         T, C, H, W = video.shape
@@ -544,9 +542,7 @@ class Gemma4Processor(ProcessorMixin):
                 replacements_iter = iter(replacements)
                 video_pattern = re.escape(self.video_token)
                 text = [
-                    re.sub(
-                        video_pattern, lambda _: next(replacements_iter), prompt
-                    )
+                    re.sub(video_pattern, lambda _: next(replacements_iter), prompt)
                     for prompt in text
                 ]
 
@@ -630,9 +626,7 @@ class Gemma4Processor(ProcessorMixin):
             )
 
         # Merge all inputs and convert to MLX arrays
-        merged = to_mlx(
-            {**text_inputs, **image_inputs, **audio_inputs, **video_inputs}
-        )
+        merged = to_mlx({**text_inputs, **image_inputs, **audio_inputs, **video_inputs})
         merged.update(video_meta)
         return BatchFeature(data=merged)
 
