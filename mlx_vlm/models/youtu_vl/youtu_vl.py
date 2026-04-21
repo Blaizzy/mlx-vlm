@@ -160,4 +160,22 @@ class Model(nn.Module):
         if self.config.text_config.tie_word_embeddings:
             sanitized.pop("language_model.lm_head.weight", None)
 
+        # Split kv_b_proj into per-head embed_q (k) and unembed_out (v)
+        tcfg = self.config.text_config
+        num_heads = tcfg.num_attention_heads
+        qk_nope = tcfg.qk_nope_head_dim
+        v_head = tcfg.v_head_dim
+        head_dim = qk_nope + v_head
+        for layer_idx in range(tcfg.num_hidden_layers):
+            prefix = f"language_model.model.layers.{layer_idx}.self_attn"
+            kv_b_key = f"{prefix}.kv_b_proj.weight"
+            if kv_b_key not in sanitized:
+                continue
+            w = sanitized.pop(kv_b_key)
+            w = w.reshape(num_heads, head_dim, -1)
+            wk = mx.contiguous(w[:, :qk_nope, :].swapaxes(-1, -2))
+            wv = mx.contiguous(w[:, qk_nope:, :])
+            sanitized[f"{prefix}.embed_q.weight"] = wk
+            sanitized[f"{prefix}.unembed_out.weight"] = wv
+
         return sanitized

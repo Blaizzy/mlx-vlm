@@ -1,4 +1,3 @@
-from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -37,8 +36,7 @@ class VisionRoPE(nn.Module):
         if isinstance(seqlen, mx.array):
             seqlen = seqlen.item()
         inv_freq = 1.0 / (
-            self.theta
-            ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
+            self.theta ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
         )
         seq = mx.arange(seqlen, dtype=mx.float32)
         freqs = mx.outer(seq, inv_freq)
@@ -178,8 +176,7 @@ class Siglip2Encoder(nn.Module):
         super().__init__()
         self.config = config
         self.layers = [
-            Siglip2EncoderLayer(config)
-            for _ in range(config.num_hidden_layers)
+            Siglip2EncoderLayer(config) for _ in range(config.num_hidden_layers)
         ]
         self.spatial_merge_size = config.spatial_merge_size
         self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
@@ -246,8 +243,12 @@ class Siglip2Encoder(nn.Module):
                 grid_t, llm_grid_h, llm_grid_w
             )
 
-            pad_h = (vit_merger_window_size - llm_grid_h % vit_merger_window_size) % vit_merger_window_size
-            pad_w = (vit_merger_window_size - llm_grid_w % vit_merger_window_size) % vit_merger_window_size
+            pad_h = (
+                vit_merger_window_size - llm_grid_h % vit_merger_window_size
+            ) % vit_merger_window_size
+            pad_w = (
+                vit_merger_window_size - llm_grid_w % vit_merger_window_size
+            ) % vit_merger_window_size
             num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
             num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
 
@@ -413,4 +414,3 @@ class VisionModel(nn.Module):
         hidden_states = self.post_layernorm(hidden_states)
         hidden_states = self.merger(hidden_states)
         return hidden_states
-
