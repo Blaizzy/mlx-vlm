@@ -38,6 +38,7 @@ from .generate import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     BatchGenerator,
+    PromptCacheState,
     _dflash_rounds_batch,
     _make_cache,
     generate,
@@ -46,6 +47,7 @@ from .generate import (
     stream_generate,
 )
 from .prompt_utils import apply_chat_template
+from .responses_store import ResponseStore
 from .sample_utils import top_p_sampling
 from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load, prepare_inputs
@@ -54,6 +56,7 @@ from .vision_cache import VisionFeatureCache
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
+DEFAULT_PROMPT_CACHE_TTL = 300
 
 
 def get_prefill_step_size():
@@ -105,6 +108,11 @@ def get_top_logprobs_k():
 def get_max_context_tokens() -> int:
     """Maximum prompt tokens before rejecting a request. 0 = no limit."""
     return int(os.environ.get("MAX_CONTEXT_TOKENS", 0))
+
+
+def get_request_timeout() -> int:
+    """Maximum seconds for a generation request. 0 = no timeout."""
+    return int(os.environ.get("REQUEST_TIMEOUT", 300))
 
 
 def check_context_length(prompt: str, processor, max_context: int) -> None:
@@ -180,6 +188,82 @@ def resolve_response_format(
             },
         )
     return messages
+
+
+def get_prompt_cache_ttl() -> int:
+    """Prompt cache TTL in seconds. 0 = no expiry."""
+    return int(os.environ.get("PROMPT_CACHE_TTL", DEFAULT_PROMPT_CACHE_TTL))
+
+
+_PROMPT_CACHE_MAX_ENTRIES = 64
+_prompt_cache_states: dict[str, PromptCacheState] = {}
+_generation_semaphore: Optional[asyncio.Semaphore] = None
+_responses_store = ResponseStore()
+
+
+def get_max_concurrent_requests() -> int:
+    return int(os.environ.get("MAX_CONCURRENT_REQUESTS", 1))
+
+
+def get_generation_semaphore() -> asyncio.Semaphore:
+    """Get or create the generation semaphore."""
+    global _generation_semaphore
+    if _generation_semaphore is None:
+        _generation_semaphore = asyncio.Semaphore(get_max_concurrent_requests())
+    return _generation_semaphore
+
+
+async def acquire_semaphore() -> asyncio.Semaphore:
+    """Acquire the generation semaphore with timeout."""
+    sem = get_generation_semaphore()
+    timeout = get_request_timeout()
+    try:
+        if timeout > 0:
+            await asyncio.wait_for(sem.acquire(), timeout=timeout)
+        else:
+            await sem.acquire()
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail="Server busy: generation request timed out waiting for GPU.",
+        )
+    return sem
+
+
+def get_prompt_cache_state(
+    model_name: str,
+    cache_key: Optional[str] = None,
+) -> PromptCacheState:
+    """Get or create a PromptCacheState for the given model and cache key."""
+    key = f"{model_name}::{cache_key}" if cache_key else model_name
+    if (
+        key not in _prompt_cache_states
+        and len(_prompt_cache_states) >= _PROMPT_CACHE_MAX_ENTRIES
+    ):
+        lru_key = min(_prompt_cache_states, key=lambda k: _prompt_cache_states[k].last_used)
+        evicted = _prompt_cache_states.pop(lru_key)
+        evicted.invalidate()
+    state = _prompt_cache_states.setdefault(key, PromptCacheState())
+    state.touch()
+    return state
+
+
+def evict_stale_prompt_caches() -> int:
+    """Remove prompt cache entries that exceed the TTL. Returns count evicted."""
+    ttl = get_prompt_cache_ttl()
+    if ttl <= 0:
+        return 0
+    now = time.time()
+    stale_keys = [
+        k for k, v in _prompt_cache_states.items() if (now - v.last_used) > ttl
+    ]
+    for k in stale_keys:
+        entry = _prompt_cache_states.pop(k)
+        entry.invalidate()
+    if stale_keys:
+        gc.collect()
+        mx.clear_cache()
+    return len(stale_keys)
 
 
 # =============================================================================
@@ -840,6 +924,127 @@ def process_tool_calls(model_output: str, tool_module, tools):
     return dict(calls=called_tools, remaining_text=remaining)
 
 
+def responses_input_to_messages(
+    input_items: Union[str, list],
+    instructions: Optional[str] = None,
+    previous_response_id: Optional[str] = None,
+) -> tuple[list[dict], list[str]]:
+    """Convert Responses API input items to chat messages and image URLs."""
+    chat_messages: list[dict] = []
+    images: list[str] = []
+
+    if previous_response_id:
+        replayed = _responses_store.replay_input(previous_response_id)
+        if replayed is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Previous response not found: {previous_response_id}",
+            )
+        prev_messages, prev_images = responses_input_to_messages(replayed)
+        chat_messages.extend(prev_messages)
+        images.extend(prev_images)
+
+    if instructions:
+        chat_messages.insert(0, {"role": "system", "content": instructions})
+
+    if isinstance(input_items, str):
+        chat_messages.append({"role": "user", "content": input_items})
+        return chat_messages, images
+
+    for item in input_items:
+        if isinstance(item, dict):
+            item_type = item.get("type", "")
+            role = item.get("role", "")
+
+            if item_type == "function_call_output":
+                chat_messages.append(
+                    {
+                        "role": "tool",
+                        "content": item.get("output", ""),
+                        "tool_call_id": item.get("call_id", "unknown"),
+                    }
+                )
+                continue
+
+            if item_type == "function_call":
+                chat_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": item.get("call_id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": item.get("arguments", ""),
+                                },
+                            }
+                        ],
+                    }
+                )
+                continue
+
+            if role:
+                msg_role = "system" if role == "developer" else role
+                content = item.get("content", "")
+                if isinstance(content, str):
+                    chat_messages.append({"role": msg_role, "content": content})
+                elif isinstance(content, list):
+                    text_parts = []
+                    for ci in content:
+                        if not isinstance(ci, dict):
+                            continue
+                        ci_type = ci.get("type", "")
+                        if ci_type in ("input_text", "text"):
+                            text_parts.append(ci.get("text", ""))
+                        elif ci_type == "input_image":
+                            images.append(ci.get("image_url", ""))
+                        elif ci_type == "image_url":
+                            img = ci.get("image_url", {})
+                            images.append(img.get("url", "") if isinstance(img, dict) else img)
+                        elif ci_type == "output_text":
+                            chat_messages.append(
+                                {"role": "assistant", "content": ci.get("text", "")}
+                            )
+                    if text_parts:
+                        chat_messages.append(
+                            {"role": msg_role, "content": "\n".join(text_parts)}
+                        )
+                else:
+                    chat_messages.append(
+                        {"role": msg_role, "content": str(content) if content else ""}
+                    )
+                continue
+
+        elif hasattr(item, "role"):
+            msg_role = "system" if item.role == "developer" else item.role
+            content = item.content
+            if content is None:
+                chat_messages.append({"role": msg_role, "content": ""})
+            elif isinstance(content, str):
+                chat_messages.append({"role": msg_role, "content": content})
+            elif isinstance(content, list):
+                text_parts = []
+                for ci in content:
+                    if not isinstance(ci, dict):
+                        continue
+                    ci_type = ci.get("type", "")
+                    if ci_type in ("input_text", "text"):
+                        text_parts.append(ci.get("text", ""))
+                    elif ci_type == "input_image":
+                        images.append(ci.get("image_url", ""))
+                    elif ci_type == "image_url":
+                        img = ci.get("image_url", {})
+                        images.append(img.get("url", "") if isinstance(img, dict) else img)
+                if text_parts:
+                    chat_messages.append(
+                        {"role": msg_role, "content": "\n".join(text_parts)}
+                    )
+
+    return chat_messages, images
+
+
 def _build_gen_args(request) -> GenerationArguments:
     """Build GenerationArguments from an OpenAIRequest or ChatRequest."""
     max_tokens = getattr(request, "max_tokens", None) or getattr(
@@ -1099,7 +1304,7 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
 
 # Synchronous unload function for internal use
 def unload_model_sync():
-    global model_cache, response_generator
+    global model_cache, response_generator, _prompt_cache_states
     if not model_cache:
         return False
 
@@ -1116,6 +1321,7 @@ def unload_model_sync():
     # Clear vision cache before dropping references
     if "vision_cache" in model_cache:
         model_cache["vision_cache"].clear()
+    _prompt_cache_states.clear()
     model_cache = {}
     # Force garbage collection
     gc.collect()
@@ -1228,7 +1434,7 @@ class OpenAIRequest(FlexibleBaseModel):
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
     """
 
-    input: Union[str, List[ChatMessage]] = Field(
+    input: Union[str, List[Any]] = Field(
         ..., description="Input text or list of chat messages."
     )
     model: str = Field(..., description="The model to use for generation.")
@@ -1253,6 +1459,19 @@ class OpenAIRequest(FlexibleBaseModel):
     )
     response_format: Optional[dict[str, Any]] = Field(
         None, description="Structured output request such as json_object."
+    )
+    tools: Optional[List[Any]] = Field(None, description="Available function tools.")
+    tool_choice: Optional[Any] = Field(None, description="Tool selection policy.")
+    parallel_tool_calls: bool = Field(True, description="Allow parallel tool calls.")
+    previous_response_id: Optional[str] = Field(
+        None, description="Previous response for context replay."
+    )
+    instructions: Optional[str] = Field(
+        None, description="System or developer instructions."
+    )
+    metadata: Optional[dict[str, Any]] = Field(None, description="Extra metadata.")
+    prompt_cache_key: Optional[str] = Field(
+        None, description="Stable key for prompt cache routing."
     )
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
@@ -1500,6 +1719,9 @@ class ChatRequest(GenerationRequest):
     response_format: Optional[dict[str, Any]] = Field(
         None, description="Structured output request such as json_object."
     )
+    prompt_cache_key: Optional[str] = Field(
+        None, description="Stable key for prompt cache routing."
+    )
 
 
 class TopLogprob(BaseModel):
@@ -1626,95 +1848,51 @@ async def responses_endpoint(request: Request):
     """
 
     request_start = time.perf_counter()
-    body = await request.json()
-    openai_request = OpenAIRequest(**body)
+    if isinstance(request, Request):
+        body = await request.json()
+        openai_request = OpenAIRequest(**body)
+    else:
+        openai_request = request
 
     try:
         # Get model, processor, config - loading if necessary
         model, processor, config = get_cached_model(openai_request.model)
 
         kwargs = {}
-
-        chat_messages = []
-        images = []
-        instructions = None
-        if openai_request.input:
-            if isinstance(openai_request.input, str):
-                # If input is a string, treat it as a single text message
-                chat_messages.append({"role": "user", "content": openai_request.input})
-            elif isinstance(openai_request.input, list):
-                # If input is a list, treat it as a series of chat messages
-                for message in openai_request.input:
-                    if isinstance(message, ChatMessage):
-                        if isinstance(message.content, str):
-                            chat_messages.append(
-                                {"role": message.role, "content": message.content}
-                            )
-                            if message.role == "system":
-                                instructions = message.content
-                        elif isinstance(message.content, list):
-                            # Handle list of content items
-                            for item in message.content:
-                                if isinstance(item, dict):
-                                    if item["type"] == "input_text":
-                                        chat_messages.append(
-                                            {
-                                                "role": message.role,
-                                                "content": item["text"],
-                                            }
-                                        )
-                                        if message.role == "system":
-                                            instructions = item["text"]
-                                    # examples for multiple images (https://platform.openai.com/docs/guides/images?api-mode=responses)
-                                    elif item["type"] == "input_image":
-                                        images.append(item["image_url"])
-                                    else:
-                                        print(
-                                            f"invalid input item type: {item['type']}"
-                                        )
-                                        raise HTTPException(
-                                            status_code=400,
-                                            detail="Invalid input item type.",
-                                        )
-                                else:
-                                    print(
-                                        f"Invalid message content item format: {item}"
-                                    )
-                                    raise HTTPException(
-                                        status_code=400,
-                                        detail="Missing type in input item.",
-                                    )
-                        else:
-                            print("Invalid message content format.")
-                            raise HTTPException(
-                                status_code=400, detail="Invalid input format."
-                            )
-                    else:
-                        print("not a ChatMessage")
-                        raise HTTPException(
-                            status_code=400, detail="Invalid input format."
-                        )
-            else:
-                print("neither string not list")
-                raise HTTPException(status_code=400, detail="Invalid input format.")
-
-        else:
-            print("no input")
+        instructions = openai_request.instructions
+        if not openai_request.input:
             raise HTTPException(status_code=400, detail="Missing input.")
-
-        chat_messages = resolve_response_format(
-            chat_messages, openai_request.response_format
+        chat_messages, images = responses_input_to_messages(
+            openai_request.input,
+            instructions=instructions,
+            previous_response_id=openai_request.previous_response_id,
         )
+        chat_messages = resolve_response_format(chat_messages, openai_request.response_format)
+        tools = getattr(openai_request, "tools", None)
+        tools, tool_instruction = resolve_tool_choice(tools, openai_request.tool_choice)
+        if tool_instruction:
+            chat_messages.insert(0, {"role": "system", "content": tool_instruction})
         gen_args = _build_gen_args(openai_request)
         stop_seqs = resolve_stop_sequences(openai_request.stop)
         if stop_seqs:
             kwargs["eos_tokens"] = stop_seqs
+
+        tool_parser_type = None
+        tool_module = None
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        if hasattr(tokenizer, "chat_template") and tools:
+            tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
+            if tool_parser_type is not None:
+                tool_module = load_tool_module(tool_parser_type)
 
         formatted_prompt = apply_chat_template(
             processor,
             config,
             chat_messages,
             num_images=len(images),
+            tools=tools,
             **gen_args.to_template_kwargs(),
         )
         check_context_length(formatted_prompt, processor, get_max_context_tokens())
@@ -1737,7 +1915,10 @@ async def responses_endpoint(request: Request):
             async def stream_generator():
                 token_iterator = None
                 token_iter = None  # For ResponseGenerator cleanup
+                sem = None
+                output_tokens = 0
                 try:
+                    sem = await acquire_semaphore()
                     # Create base response object (to match the openai pipeline)
                     base_response = OpenAIResponse(
                         id=response_id,
@@ -1784,6 +1965,11 @@ async def responses_endpoint(request: Request):
                     full_text = ""
                     usage_stats = {"input_tokens": 0, "output_tokens": 0}
 
+                    cache_state = get_prompt_cache_state(
+                        openai_request.model,
+                        getattr(openai_request, "prompt_cache_key", None),
+                    )
+
                     if response_generator is not None and not stop_seqs:
                         ctx, token_iter = response_generator.generate(
                             prompt=formatted_prompt,
@@ -1791,7 +1977,6 @@ async def responses_endpoint(request: Request):
                             args=gen_args,
                         )
 
-                        output_tokens = 0
                         for token in token_iter:
                             output_tokens += 1
                             delta = token.text
@@ -1814,6 +1999,7 @@ async def responses_endpoint(request: Request):
                             prompt=formatted_prompt,
                             image=images,
                             vision_cache=model_cache.get("vision_cache"),
+                            prompt_cache_state=cache_state,
                             **gen_args.to_generate_kwargs(),
                             **kwargs,
                         )
@@ -1824,6 +2010,7 @@ async def responses_endpoint(request: Request):
 
                             delta = chunk.text
                             full_text += delta
+                            output_tokens = chunk.generation_tokens
                             usage_stats = {
                                 "input_tokens": chunk.prompt_tokens,
                                 "output_tokens": chunk.generation_tokens,
@@ -1881,6 +2068,8 @@ async def responses_endpoint(request: Request):
                             token_iter.close()
                         except Exception:
                             pass
+                    if sem is not None:
+                        sem.release()
                     mx.clear_cache()
                     gc.collect()
                     print("Stream finished, cleared cache.")
@@ -1897,10 +2086,16 @@ async def responses_endpoint(request: Request):
 
         else:
             # Non-streaming response
+            sem = None
             try:
+                sem = await acquire_semaphore()
                 full_text = ""
                 prompt_tokens = 0
                 output_tokens = 0
+                cache_state = get_prompt_cache_state(
+                    openai_request.model,
+                    getattr(openai_request, "prompt_cache_key", None),
+                )
 
                 if response_generator is not None and not stop_seqs:
                     ctx, token_iter = response_generator.generate(
@@ -1926,6 +2121,7 @@ async def responses_endpoint(request: Request):
                         image=images,
                         verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=model_cache.get("vision_cache"),
+                        prompt_cache_state=cache_state,
                         **gen_args.to_generate_kwargs(),
                         **kwargs,
                     )
@@ -1991,6 +2187,9 @@ async def responses_endpoint(request: Request):
                 mx.clear_cache()
                 gc.collect()
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+            finally:
+                if sem is not None:
+                    sem.release()
 
     except HTTPException as http_exc:
         raise http_exc
@@ -2101,7 +2300,7 @@ async def chat_completions_endpoint(request: ChatRequest):
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
-        if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+        if hasattr(tokenizer, "chat_template") and tools:
             tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
             if tool_parser_type is not None:
                 tool_module = load_tool_module(tool_parser_type)
@@ -2139,7 +2338,13 @@ async def chat_completions_endpoint(request: ChatRequest):
                 global response_generator
                 token_iterator = None
                 token_iter = None  # For ResponseGenerator cleanup
+                sem = None
+                output_tokens = 0
                 try:
+                    sem = await acquire_semaphore()
+                    cache_state = get_prompt_cache_state(
+                        request.model, getattr(request, "prompt_cache_key", None)
+                    )
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
                     if response_generator is not None and not stop_seqs:
                         # generate() does blocking Queue.get — run off event loop
@@ -2288,6 +2493,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             image=images,
                             audio=audio,
                             vision_cache=model_cache.get("vision_cache"),
+                            prompt_cache_state=cache_state,
                             **gen_args.to_generate_kwargs(),
                             **kwargs,
                         )
@@ -2299,6 +2505,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 continue
 
                             output_text += chunk.text
+                            output_tokens = chunk.generation_tokens
 
                             choices = [
                                 ChatStreamChoice(
@@ -2323,6 +2530,26 @@ async def chat_completions_endpoint(request: ChatRequest):
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
                             await asyncio.sleep(0.01)
 
+                        if tool_module is not None:
+                            tc = process_tool_calls(output_text, tool_module, tools)
+                            if tc["calls"]:
+                                choices = [
+                                    ChatStreamChoice(
+                                        finish_reason="tool_calls",
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            tool_calls=tc["calls"],
+                                        ),
+                                    )
+                                ]
+                                chunk_data = ChatStreamChunk(
+                                    id=request_id,
+                                    created=int(time.time()),
+                                    model=request.model,
+                                    choices=choices,
+                                )
+                                yield f"data: {chunk_data.model_dump_json()}\n\n"
+
                     # Signal stream end
                     yield "data: [DONE]\n\n"
 
@@ -2346,6 +2573,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                             token_iter.close()
                         except Exception:
                             pass
+                    if sem is not None:
+                        sem.release()
                     mx.clear_cache()
                     gc.collect()
                     print("Stream finished, cleared cache.")
@@ -2362,11 +2591,16 @@ async def chat_completions_endpoint(request: ChatRequest):
 
         else:
             # Non-streaming response
+            sem = None
             try:
+                sem = await acquire_semaphore()
                 full_text = ""
                 prompt_tokens = 0
                 output_tokens = 0
                 peak_memory = 0.0
+                cache_state = get_prompt_cache_state(
+                    request.model, getattr(request, "prompt_cache_key", None)
+                )
 
                 collected_logprobs: List[
                     Tuple[int, float, Optional[List[Tuple[int, float]]]]
@@ -2413,6 +2647,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         audio=audio,
                         verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=model_cache.get("vision_cache"),
+                        prompt_cache_state=cache_state,
                         **gen_args.to_generate_kwargs(),
                         **kwargs,
                     )
@@ -2522,6 +2757,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                 mx.clear_cache()
                 gc.collect()
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+            finally:
+                if sem is not None:
+                    sem.release()
 
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions (like model loading failure)

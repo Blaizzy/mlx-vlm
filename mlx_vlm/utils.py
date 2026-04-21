@@ -99,6 +99,39 @@ def skip_multimodal_module(path: str) -> bool:
     )
 
 
+def get_class_predicate(
+    skip_vision: bool = False,
+    weights: Optional[Dict[str, Any]] = None,
+    quantization: Optional[Dict[str, Any]] = None,
+):
+    """Build the default quantization predicate used during model loading.
+
+    Args:
+        skip_vision: Whether multimodal modules should be excluded.
+        weights: Optional loaded weight dict for legacy quantization detection.
+        quantization: Optional per-module quantization overrides.
+
+    Returns:
+        Callable predicate compatible with ``nn.quantize(..., class_predicate=...)``.
+    """
+
+    weights = weights or {}
+    quantization = quantization or {}
+
+    def predicate(path: str, module: nn.Module) -> bool:
+        if skip_multimodal_module(path) and skip_vision:
+            return False
+        if path in quantization:
+            return quantization[path]
+        if not hasattr(module, "to_quantized"):
+            return False
+        if hasattr(module, "weight") and module.weight.size % 64 != 0:
+            return False
+        return f"{path}.scales" in weights if weights else True
+
+    return predicate
+
+
 def get_model_and_args(config: dict):
     """
     Retrieve the model object based on the configuration.
@@ -403,9 +436,10 @@ def load(
         ValueError: If model class or args class are not found.
     """
     force_download = kwargs.get("force_download", False)
-    model_path = get_model_path(
-        path_or_hf_repo, force_download=force_download, revision=revision
-    )
+    get_model_path_kwargs = {"revision": revision}
+    if force_download:
+        get_model_path_kwargs["force_download"] = True
+    model_path = get_model_path(path_or_hf_repo, **get_model_path_kwargs)
     model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
         model = apply_lora_layers(model, adapter_path)
@@ -823,6 +857,8 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     except ValueError:
         raise
     except Exception as e:
+        if isinstance(image_source, str) and image_source.startswith(("http://", "https://")):
+            raise ValueError(f"Failed to load image from URL: {e}") from e
         raise ValueError(f"Failed to load image from {image_source}: {e}") from e
 
     image = ImageOps.exif_transpose(image)
@@ -1240,23 +1276,40 @@ def prepare_inputs(
         # Ensure pad_token exists when padding text-only inputs
         if padding and tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        inputs = tokenizer(
-            prompts,
-            add_special_tokens=add_special_tokens,
-            padding=padding,
-            padding_side=padding_side,
-            return_tensors=return_tensors,
+        if callable(tokenizer):
+            inputs = tokenizer(
+                prompts,
+                add_special_tokens=add_special_tokens,
+                padding=padding,
+                padding_side=padding_side,
+                return_tensors=return_tensors,
+            )
+        else:
+            inputs = process_inputs(
+                processor,
+                prompts=prompts,
+                add_special_tokens=add_special_tokens,
+                padding=padding,
+                padding_side=padding_side,
+                return_tensors=return_tensors,
+                **kwargs,
+            )
+        raw_input_ids = inputs["input_ids"] if isinstance(inputs, dict) else inputs.input_ids
+        raw_attention_mask = (
+            inputs["attention_mask"] if isinstance(inputs, dict) else inputs.attention_mask
         )
         input_ids = (
-            inputs.input_ids
-            if isinstance(inputs.input_ids, mx.array)
-            else mx.array(inputs.input_ids)
+            raw_input_ids if isinstance(raw_input_ids, mx.array) else mx.array(raw_input_ids)
         )
         mask = (
-            inputs.attention_mask
-            if isinstance(inputs.attention_mask, mx.array)
-            else mx.array(inputs.attention_mask)
+            raw_attention_mask
+            if isinstance(raw_attention_mask, mx.array)
+            else mx.array(raw_attention_mask)
         )
+        if input_ids.ndim == 1:
+            input_ids = mx.expand_dims(input_ids, axis=0)
+        if mask.ndim == 1:
+            mask = mx.expand_dims(mask, axis=0)
         return {
             "input_ids": input_ids,
             "attention_mask": mask,
