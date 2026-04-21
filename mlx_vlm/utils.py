@@ -1148,6 +1148,7 @@ def prepare_inputs(
     processor,
     images=None,
     audio=None,
+    videos=None,
     prompts=None,
     image_token_index=None,
     resize_shape=None,
@@ -1163,7 +1164,10 @@ def prepare_inputs(
         not hasattr(images, "__len__") or len(images) > 0
     )
     has_audio = audio is not None and (not hasattr(audio, "__len__") or len(audio) > 0)
-    if not has_images and not has_audio:
+    has_videos = videos is not None and (
+        not hasattr(videos, "__len__") or len(videos) > 0
+    )
+    if not has_images and not has_audio and not has_videos:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1311,6 +1315,30 @@ def prepare_inputs(
             )
             audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
+    # Process videos: if paths are given, load into (T, C, H, W) numpy arrays
+    # using the existing cv2-based loader from video_generate.
+    video_fps = None
+    if has_videos:
+        if not isinstance(videos, list):
+            videos = [videos]
+        needs_load = any(isinstance(v, (str, bytes)) for v in videos)
+        if needs_load:
+            from .video_generate import load_video
+
+            loaded = []
+            sample_fps = []
+            fps_hint = kwargs.pop("fps", 2.0)
+            for v in videos:
+                if isinstance(v, (str, bytes)):
+                    arr, s_fps = load_video({"video": str(v), "fps": fps_hint})
+                    loaded.append(arr)
+                    sample_fps.append(s_fps)
+                else:
+                    loaded.append(v)
+                    sample_fps.append(fps_hint)
+            videos = loaded
+            video_fps = sample_fps
+
     model_inputs = {}
 
     if hasattr(processor, "image_processor") and isinstance(
@@ -1349,12 +1377,18 @@ def prepare_inputs(
         if hasattr(processor, "tokenizer") and processor.tokenizer.pad_token is None:
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
+        extra = {}
+        if has_videos:
+            extra["videos"] = videos
+            if video_fps is not None:
+                extra["fps"] = video_fps
         inputs = process_inputs_with_fallback(
             processor,
             images=images,
             audio=audio,
             prompts=prompts,
             add_special_tokens=add_special_tokens,
+            **extra,
             **kwargs,
         )
 

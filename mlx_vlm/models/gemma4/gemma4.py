@@ -71,6 +71,7 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        pixel_values_videos: Optional[mx.array] = None,
         audio_features: Optional[mx.array] = None,
         audio_mask: Optional[mx.array] = None,
         input_features: Optional[mx.array] = None,
@@ -84,11 +85,16 @@ class Model(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         inputs_embeds = inputs_embeds * self.language_model.model.embed_scale
 
+        video_token_id = getattr(self.config, "video_token_id", None)
+
         per_layer_inputs = None
         if self.language_model.model.hidden_size_per_layer_input:
             image_mask_ids = input_ids == self.config.image_token_id
             audio_mask_ids = input_ids == self.config.audio_token_id
-            text_mask = ~(image_mask_ids | audio_mask_ids)
+            mm_mask = image_mask_ids | audio_mask_ids
+            if video_token_id is not None:
+                mm_mask = mm_mask | (input_ids == video_token_id)
+            text_mask = ~mm_mask
             per_layer_inputs_tokens = mx.where(
                 text_mask, input_ids, mx.zeros_like(input_ids)
             )
@@ -96,51 +102,59 @@ class Model(nn.Module):
                 per_layer_inputs_tokens
             )
 
-        if pixel_values is not None:
-            vision_cache = kwargs.get("vision_cache", None)
-            cached = kwargs.get("cached_image_features", None)
+        def _scatter(source, token_id, encode, cached_kw=None, key_kw=None):
+            if source is None or token_id is None:
+                return inputs_embeds
+            vision_cache = kwargs.get("vision_cache", None) if key_kw else None
+            cache_key = kwargs.get(key_kw) if key_kw else None
+            cached = kwargs.get(cached_kw, None) if cached_kw else None
             if cached is None and vision_cache is not None:
-                cached = vision_cache.get(kwargs.get("_image_key"))
+                cached = vision_cache.get(cache_key)
             if cached is not None:
-                image_features = cached.astype(inputs_embeds.dtype)
+                features = cached.astype(inputs_embeds.dtype)
             else:
-                image_features = self.vision_tower(pixel_values)
-                image_features = self.embed_vision(image_features)
-                image_features = image_features.astype(inputs_embeds.dtype)
-                if vision_cache is not None and kwargs.get("_image_key") is not None:
-                    mx.eval(image_features)
-                    vision_cache.put(kwargs["_image_key"], image_features)
+                features = encode(source).astype(inputs_embeds.dtype)
+                if vision_cache is not None and cache_key is not None:
+                    mx.eval(features)
+                    vision_cache.put(cache_key, features)
 
-            image_mask = input_ids == self.config.image_token_id
-            image_mask_expanded = mx.expand_dims(image_mask, -1)
-            image_mask_expanded = mx.broadcast_to(
-                image_mask_expanded, inputs_embeds.shape
+            mask_expanded = mx.broadcast_to(
+                mx.expand_dims(input_ids == token_id, -1), inputs_embeds.shape
             )
+            return masked_scatter(inputs_embeds, mask_expanded, features)
 
-            inputs_embeds = masked_scatter(
-                inputs_embeds, image_mask_expanded, image_features
-            )
+        def _encode_vision(pixels):
+            return self.embed_vision(self.vision_tower(pixels))
 
-        # Scatter audio features
-        if (
-            audio_features is not None
-            and self.audio_tower is not None
-            and self.embed_audio is not None
-        ):
-            if audio_mask is None:
-                audio_mask = mx.zeros(audio_features.shape[:2], dtype=mx.bool_)
-            audio_encodings, _ = self.audio_tower(audio_features, audio_mask)
-            audio_encodings = self.embed_audio(audio_encodings)
-            audio_encodings = audio_encodings.astype(inputs_embeds.dtype)
+        inputs_embeds = _scatter(
+            pixel_values,
+            self.config.image_token_id,
+            _encode_vision,
+            "cached_image_features",
+            "_image_key",
+        )
+        inputs_embeds = _scatter(
+            pixel_values_videos,
+            video_token_id,
+            _encode_vision,
+            "cached_video_features",
+            "_video_key",
+        )
 
-            audio_token_mask = input_ids == self.config.audio_token_id
-            audio_mask_expanded = mx.expand_dims(audio_token_mask, -1)
-            audio_mask_expanded = mx.broadcast_to(
-                audio_mask_expanded, inputs_embeds.shape
-            )
+        if self.audio_tower is not None and self.embed_audio is not None:
+            def _encode_audio(feat):
+                mask = (
+                    audio_mask
+                    if audio_mask is not None
+                    else mx.zeros(feat.shape[:2], dtype=mx.bool_)
+                )
+                enc, _ = self.audio_tower(feat, mask)
+                return self.embed_audio(enc)
 
-            inputs_embeds = masked_scatter(
-                inputs_embeds, audio_mask_expanded, audio_encodings
+            inputs_embeds = _scatter(
+                audio_features,
+                self.config.audio_token_id,
+                _encode_audio,
             )
 
         return InputEmbeddingsFeatures(

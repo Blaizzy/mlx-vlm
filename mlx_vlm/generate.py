@@ -926,6 +926,7 @@ def stream_generate(
     prompt: str,
     image: Union[str, List[str]] = None,
     audio: Union[str, List[str]] = None,
+    video: Union[str, List[str]] = None,
     **kwargs,
 ) -> Union[str, Generator[str, None, None]]:
     """
@@ -984,6 +985,7 @@ def stream_generate(
             processor,
             images=image,
             audio=audio,
+            videos=video,
             prompts=prompt,
             image_token_index=image_token_index,
             resize_shape=resize_shape,
@@ -1141,6 +1143,7 @@ def generate(
     prompt: str,
     image: Union[str, List[str]] = None,
     audio: Union[str, List[str]] = None,
+    video: Union[str, List[str]] = None,
     verbose: bool = False,
     **kwargs,
 ) -> GenerationResult:
@@ -1168,8 +1171,8 @@ def generate(
             files.extend(image)
         if audio is not None:
             files.extend(audio)
-        if kwargs.get("video") is not None:
-            files.extend(kwargs.get("video"))
+        if video is not None:
+            files.extend(video if isinstance(video, list) else [video])
 
         print(f"Files: {files}", "\n")
 
@@ -1201,7 +1204,9 @@ def generate(
     else:
         tokenizer.stopping_criteria.reset(model.config.eos_token_id)
 
-    for response in stream_generate(model, processor, prompt, image, audio, **kwargs):
+    for response in stream_generate(
+        model, processor, prompt, image, audio, video, **kwargs
+    ):
         if verbose:
             print(response.text, end="", flush=True)
         text += response.text
