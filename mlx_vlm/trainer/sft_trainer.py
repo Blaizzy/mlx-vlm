@@ -23,6 +23,11 @@ def _squeeze_leading_batch_dim(value):
     return value
 
 
+def _flat_seq_len(value):
+    """Return token sequence length for values shaped as (seq,) or (1, seq)."""
+    return np.array(_squeeze_leading_batch_dim(value)).reshape(-1).shape[0]
+
+
 @dataclass
 class TrainingArgs:
     batch_size: int = field(default=4, metadata={"help": "Minibatch size."})
@@ -178,7 +183,9 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
         )
         for b in order:
             items = [dataset[idx] for idx in batch_indices[b]]
-            lengths = [min(len(x["input_ids"]), max_seq_length) for x in items]
+            lengths = [
+                min(_flat_seq_len(x["input_ids"]), max_seq_length) for x in items
+            ]
 
             max_len = min(max(lengths), max_seq_length)
             pad_to = 32
@@ -189,12 +196,16 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
             attention_mask_batch = np.zeros((len(items), padded_len), dtype=np.int32)
 
             for i, item in enumerate(items):
-                arr = np.array(item["input_ids"]).reshape(-1)
+                arr = np.array(_squeeze_leading_batch_dim(item["input_ids"])).reshape(
+                    -1
+                )
                 L = min(len(arr), padded_len)
                 input_ids_batch[i, :L] = arr[:L]
 
                 if "attention_mask" in item:
-                    mask = np.array(item["attention_mask"]).reshape(-1)
+                    mask = np.array(
+                        _squeeze_leading_batch_dim(item["attention_mask"])
+                    ).reshape(-1)
                     attention_mask_batch[i, :L] = mask[:L]
                 else:
                     attention_mask_batch[i, :L] = 1

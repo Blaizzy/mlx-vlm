@@ -70,7 +70,13 @@ class TestModels(unittest.TestCase):
                 )
 
             batch_size = kwargs.pop("batch_size", 1)
-            if model_type in ["qwen2_5_vl", "glm4v_moe", "glm4v", "hunyuan_vl"]:
+            if model_type in [
+                "qwen2_5_vl",
+                "glm4v_moe",
+                "glm4v",
+                "hunyuan_vl",
+                "siglip2_vision_model",
+            ]:
                 input_tensor = mx.random.uniform(shape=(image_size[0], image_size[1]))
             else:
                 shape = (
@@ -3228,6 +3234,96 @@ class TestModels(unittest.TestCase):
             config.text_config.model_type,
             config.text_config.vocab_size,
             config.text_config.num_hidden_layers,
+        )
+
+    def test_youtu_vl(self):
+        from mlx_vlm.models import youtu_vl
+
+        text_config = youtu_vl.TextConfig(
+            model_type="youtu_vl",
+            hidden_size=256,
+            intermediate_size=512,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=1024,
+            q_lora_rank=128,
+            kv_lora_rank=64,
+            qk_rope_head_dim=16,
+            v_head_dim=32,
+            qk_nope_head_dim=32,
+            rope_theta=500000.0,
+            rope_interleave=True,
+            max_position_embeddings=2048,
+            tie_word_embeddings=True,
+        )
+        vision_config = youtu_vl.VisionConfig(
+            model_type="siglip2_vision_model",
+            hidden_size=128,
+            out_hidden_size=256,
+            intermediate_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_channels=3,
+            patch_size=16,
+            spatial_merge_size=2,
+            window_size=64,
+            fullatt_block_indexes=[1],
+        )
+        config = youtu_vl.ModelConfig(
+            model_type="youtu_vl",
+            text_config=text_config,
+            vision_config=vision_config,
+            image_token_id=100,
+            video_token_id=101,
+            vocab_size=1024,
+        )
+        model = youtu_vl.Model(config)
+
+        # Language model: MLA with absorb — fp32/fp16 forward + cached decode check
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        # Vision tower takes packed patches + spatial_shapes:
+        #   pixel_values: (num_patches, patch_size**2 * channels)
+        #   spatial_shapes: (batch, 2) — (h_patches, w_patches)
+        patch_dim = vision_config.patch_size**2 * vision_config.num_channels
+        h_p, w_p = 4, 4
+        num_patches = h_p * w_p
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.out_hidden_size,
+            config.vision_config.num_channels,
+            (num_patches, patch_dim),
+            vision_feature_layer=-1,
+            spatial_shapes=mx.array([[h_p, w_p]], dtype=mx.int32),
+        )
+
+        # sanitize splits kv_b_proj per-head into embed_q (k) + unembed_out (v)
+        H, nope, v_head = 4, 32, 32
+        kv_rank = text_config.kv_lora_rank
+        w = mx.arange(H * (nope + v_head) * kv_rank, dtype=mx.float32).reshape(
+            H * (nope + v_head), kv_rank
+        )
+        sanitized = model.sanitize(
+            {
+                "model.layers.0.self_attn.kv_b_proj.weight": w,
+                "lm_head.weight": mx.zeros((1, 1)),  # tied; must be dropped
+            }
+        )
+        prefix = "language_model.model.layers.0.self_attn"
+        self.assertNotIn(f"{prefix}.kv_b_proj.weight", sanitized)
+        self.assertNotIn("language_model.lm_head.weight", sanitized)
+        self.assertEqual(
+            sanitized[f"{prefix}.embed_q.weight"].shape, (H, kv_rank, nope)
+        )
+        self.assertEqual(
+            sanitized[f"{prefix}.unembed_out.weight"].shape, (H, v_head, kv_rank)
         )
 
 

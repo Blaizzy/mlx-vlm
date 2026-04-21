@@ -2,17 +2,25 @@ import argparse
 import asyncio
 import gc
 import json
+import logging
 import os
 import re
 import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, List, Literal, Optional, Union
+from dataclasses import dataclass
+from datetime import datetime
+from queue import Empty as QueueEmpty
+from queue import Queue
+from threading import Lock, Thread
+from typing import Any, Callable, Iterator, List, Literal, Optional, Tuple, Union
+
+logger = logging.getLogger("mlx_vlm.server")
 
 import mlx.core as mx
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
@@ -28,104 +36,28 @@ from .generate import (
     DEFAULT_QUANTIZED_KV_START,
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
-    DEFAULT_THINKING_END_TOKEN,
-    DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
-    PromptCacheState,
+    BatchGenerator,
+    _dflash_rounds_batch,
+    _make_cache,
     generate,
+    generation_stream,
     normalize_resize_shape,
     stream_generate,
 )
 from .prompt_utils import apply_chat_template
-from .responses_models import ContentPartOutputText as ResponseContentPartOutputText
-from .responses_models import InputTokensDetails
-from .responses_models import ResponseCompletedEvent as ResponsesCompletedEvent
-from .responses_models import (
-    ResponseContentPartAddedEvent as ResponsesContentPartAddedEvent,
-)
-from .responses_models import (
-    ResponseContentPartDoneEvent as ResponsesContentPartDoneEvent,
-)
-from .responses_models import ResponseCreatedEvent as ResponsesCreatedEvent
-from .responses_models import (
-    ResponseFunctionCallArgumentsDeltaEvent as ResponsesFunctionCallArgumentsDeltaEvent,
-)
-from .responses_models import (
-    ResponseFunctionCallArgumentsDoneEvent as ResponsesFunctionCallArgumentsDoneEvent,
-)
-from .responses_models import ResponseFunctionCallItem, ResponseIncompleteDetails
-from .responses_models import ResponseInProgressEvent as ResponsesInProgressEvent
-from .responses_models import ResponseMessageItem, ResponseObject
-from .responses_models import (
-    ResponseOutputItemAddedEvent as ResponsesOutputItemAddedEvent,
-)
-from .responses_models import (
-    ResponseOutputItemDoneEvent as ResponsesOutputItemDoneEvent,
-)
-from .responses_models import (
-    ResponseOutputTextDeltaEvent as ResponsesOutputTextDeltaEvent,
-)
-from .responses_models import (
-    ResponseOutputTextDoneEvent as ResponsesOutputTextDoneEvent,
-)
-from .responses_models import ResponsesRequest, ResponseUsage
-from .responses_store import ResponseStore
+from .sample_utils import top_p_sampling
 from .tool_parsers import _infer_tool_parser, load_tool_module
-from .utils import load
+from .utils import load, prepare_inputs
 from .version import __version__
 from .vision_cache import VisionFeatureCache
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 
-def _is_verbose() -> bool:
-    return os.environ.get("VERBOSE", "").lower() in ("1", "true", "yes")
-
-
-class _VerboseFlag:
-    """Lazy flag that checks env var on each access, so --verbose works after import."""
-    def __bool__(self) -> bool:
-        return _is_verbose()
-
-
-_verbose = _VerboseFlag()
-
-
-def get_default_max_tokens() -> int:
-    """Server-side default max tokens for API responses.
-    The upstream generate.py default (256) is too low for agentic use.
-    Configurable via --default-max-tokens CLI flag or DEFAULT_MAX_TOKENS env var."""
-    return int(os.environ.get("DEFAULT_MAX_TOKENS", DEFAULT_MAX_TOKENS))
-
-_responses_store = ResponseStore()
-
 
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
-
-
-def get_max_context_tokens() -> int:
-    """Maximum prompt tokens before rejecting a request. 0 = no limit."""
-    return int(os.environ.get("MAX_CONTEXT_TOKENS", 0))
-
-
-def get_request_timeout() -> int:
-    """Maximum seconds for a generation request. 0 = no timeout."""
-    return int(os.environ.get("REQUEST_TIMEOUT", 300))
-
-
-def check_context_length(prompt: str, processor, max_context: int) -> None:
-    """Raise HTTP 400 if the tokenized prompt exceeds *max_context* tokens."""
-    if max_context <= 0:
-        return
-    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    token_count = len(tokenizer.encode(prompt, add_special_tokens=False))
-    if token_count > max_context:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Prompt length ({token_count} tokens) exceeds maximum context "
-            f"window ({max_context} tokens).",
-        )
 
 
 def get_quantized_kv_bits(model: str):
@@ -133,9 +65,7 @@ def get_quantized_kv_bits(model: str):
     if kv_bits == 0:
         return None
     if "qat" in model:
-        print(
-            f"Model {model} is quantization aware, (Rotating)KVCache cache will not be quantized to {kv_bits} bits, use --max-kv-size [tokens] instead."
-        )
+        print(f"Model {model} is quantization aware, KV cache will not be quantized.")
         return None
     return kv_bits
 
@@ -153,9 +83,7 @@ def get_max_kv_size(model: str):
     if max_kv_tokens == 0:
         return None
     if get_quantized_kv_bits(model) is not None:
-        print(
-            f"Model {model} uses QuantizedKVCache cache, can't set max KV size, use --kv-bits [bits] instead."
-        )
+        print(f"Model {model} uses QuantizedKVCache, can't set max KV size.")
         return None
     return max_kv_tokens
 
@@ -164,47 +92,876 @@ def get_quantized_kv_start():
     return int(os.environ.get("QUANTIZED_KV_START", DEFAULT_QUANTIZED_KV_START))
 
 
-async def _prompt_cache_cleanup_loop():
-    """Background task that periodically evicts stale prompt caches."""
-    while True:
-        await asyncio.sleep(60)
-        try:
-            evict_stale_prompt_caches()
-        except Exception as e:
-            print(f"[prompt_cache] Cleanup error: {e}")
+def get_top_logprobs_k():
+    """Max per-token top_logprobs honored by the server (0 = disabled).
+
+    Set via TOP_LOGPROBS_K env var. OpenAI caps this at 20. When 0, requests
+    with top_logprobs>0 still succeed but the top_logprobs list stays empty.
+    """
+    k = int(os.environ.get("TOP_LOGPROBS_K", 0))
+    return max(0, min(k, 20))
+
+
+def get_max_context_tokens() -> int:
+    """Maximum prompt tokens before rejecting a request. 0 = no limit."""
+    return int(os.environ.get("MAX_CONTEXT_TOKENS", 0))
+
+
+def check_context_length(prompt: str, processor, max_context: int) -> None:
+    """Raise HTTP 400 if the tokenized prompt exceeds *max_context* tokens."""
+    if max_context <= 0:
+        return
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    token_count = len(tokenizer.encode(prompt, add_special_tokens=False))
+    if token_count > max_context:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Prompt length ({token_count} tokens) exceeds maximum context "
+            f"window ({max_context} tokens).",
+        )
+
+
+def resolve_stop_sequences(stop: Optional[Union[str, List[str]]]) -> Optional[List[str]]:
+    """Normalize the request stop parameter to at most 4 non-empty strings."""
+    if not stop:
+        return None
+    if isinstance(stop, str):
+        stop = [stop]
+    sequences = [s for s in stop[:4] if isinstance(s, str) and s]
+    return sequences if sequences else None
+
+
+def resolve_tool_choice(
+    tools: Optional[list],
+    tool_choice: Optional[Any],
+) -> tuple[Optional[list], Optional[str]]:
+    """Apply tool_choice policy to the tools list."""
+    if not tools or tool_choice is None or tool_choice == "auto":
+        return tools, None
+
+    if tool_choice == "none":
+        return None, None
+
+    if tool_choice == "required":
+        return tools, "You must call one of the available tools to answer this request."
+
+    if isinstance(tool_choice, dict):
+        func = tool_choice.get("function", {})
+        name = func.get("name") if isinstance(func, dict) else None
+        if name:
+            filtered = [
+                t
+                for t in tools
+                if (t.get("function", {}) or {}).get("name") == name
+                or t.get("name") == name
+            ]
+            return (
+                filtered or tools,
+                f'You must call the "{name}" tool to answer this request.',
+            )
+
+    return tools, None
+
+
+def resolve_response_format(
+    messages: list,
+    response_format: Optional[dict],
+) -> list:
+    """Inject JSON-only instruction if json_object format is requested."""
+    if not response_format:
+        return messages
+    fmt_type = response_format.get("type", "text")
+    if fmt_type == "json_object":
+        messages.insert(
+            0,
+            {
+                "role": "system",
+                "content": "You must respond with valid JSON only. Do not include any text outside the JSON object.",
+            },
+        )
+    return messages
+
+
+# =============================================================================
+# ResponseGenerator - Concurrent Request Handling with Threaded Batching
+# =============================================================================
+
+
+@dataclass
+class GenerationArguments:
+    """Arguments for a generation request."""
+
+    max_tokens: int = DEFAULT_MAX_TOKENS
+    temperature: float = DEFAULT_TEMPERATURE
+    top_p: float = DEFAULT_TOP_P
+    top_k: int = 0
+    min_p: float = 0.0
+    seed: Optional[int] = None
+    repetition_penalty: Optional[float] = None
+    logit_bias: Optional[dict] = None
+    enable_thinking: bool = True
+    thinking_budget: Optional[int] = None
+    thinking_start_token: Optional[str] = None
+
+    def to_generate_kwargs(self) -> dict:
+        """Convert to kwargs dict for generate()/stream_generate()."""
+        kw = {
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "min_p": self.min_p,
+            "enable_thinking": self.enable_thinking,
+        }
+        if self.repetition_penalty is not None:
+            kw["repetition_penalty"] = self.repetition_penalty
+        if self.logit_bias is not None:
+            kw["logit_bias"] = self.logit_bias
+        if self.thinking_budget is not None:
+            kw["thinking_budget"] = self.thinking_budget
+        if self.thinking_start_token is not None:
+            kw["thinking_start_token"] = self.thinking_start_token
+        return kw
+
+    def to_template_kwargs(self) -> dict:
+        """Convert to kwargs for apply_chat_template()."""
+        kw = {"enable_thinking": self.enable_thinking}
+        if self.thinking_budget is not None:
+            kw["thinking_budget"] = self.thinking_budget
+        if self.thinking_start_token is not None:
+            kw["thinking_start_token"] = self.thinking_start_token
+        return kw
+
+
+DEFAULT_REPETITION_PENALTY = 1.1
+
+
+@dataclass
+class GenerationContext:
+    """Context returned when a request is queued."""
+
+    uid: int
+    prompt_tokens: int
+
+
+@dataclass
+class StreamingToken:
+    """A single token response during streaming generation."""
+
+    text: str
+    token: int
+    logprobs: float
+    finish_reason: Optional[str]
+    peak_memory: float = 0.0
+    top_logprobs: Optional[List[Tuple[int, float]]] = None
+
+
+class ResponseGenerator:
+    """
+    Continuous batching for concurrent requests via a single GPU thread.
+
+    A dedicated thread owns all GPU work (BatchGenerator). FastAPI async
+    handlers submit requests to a queue and read tokens back from
+    per-request queues. Multiple requests are batched together for
+    higher throughput — same pattern as mlx-lm's server.
+    """
+
+    def __init__(
+        self,
+        model,
+        processor,
+        stop_tokens=None,
+        vision_cache=None,
+        draft_model=None,
+        kv_bits=None,
+        kv_group_size=DEFAULT_KV_GROUP_SIZE,
+        kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
+        quantized_kv_start=DEFAULT_QUANTIZED_KV_START,
+        top_logprobs_k=0,
+    ):
+        self.model = model
+        self.processor = processor
+        self.stop_tokens = stop_tokens or set()
+        self.vision_cache = vision_cache
+        self.draft_model = draft_model
+        self.kv_bits = kv_bits
+        self.kv_group_size = kv_group_size
+        self.kv_quant_scheme = kv_quant_scheme
+        self.quantized_kv_start = quantized_kv_start
+        self.top_logprobs_k = top_logprobs_k
+        self.tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        self.requests: Queue = Queue()
+        self._stop = False
+        self._cancelled: set = set()
+        self._cancel_lock = Lock()
+        self._thread = Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop_and_join(self):
+        self._stop = True
+        self.requests.put(None)
+        self._thread.join(timeout=5.0)
+
+    def _cancel(self, uid):
+        with self._cancel_lock:
+            self._cancelled.add(uid)
+
+    def _drain_cancellations(self) -> set:
+        with self._cancel_lock:
+            pending, self._cancelled = self._cancelled, set()
+            return pending
+
+    def generate(
+        self,
+        prompt: str,
+        images: Optional[List] = None,
+        audio: Optional[List] = None,
+        args: Optional[GenerationArguments] = None,
+    ) -> Tuple[GenerationContext, Iterator[StreamingToken]]:
+        args = args or GenerationArguments()
+        rqueue: Queue = Queue()
+
+        # CPU preprocessing (tokenize, load images) on caller thread.
+        # GPU work (vision encoder) deferred to GPU thread.
+        raw_inputs = self._cpu_preprocess(prompt, images, audio)
+        prompt_tokens = (
+            raw_inputs["input_ids"].size
+            if hasattr(raw_inputs["input_ids"], "size")
+            else len(raw_inputs["input_ids"])
+        )
+
+        self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images))
+
+        # Block until the GPU thread sends back the context
+        ctx = rqueue.get()
+        if isinstance(ctx, Exception):
+            raise ctx
+
+        uid = ctx.uid
+
+        def token_iterator():
+            # Mark ended before yielding the final token so a consumer that
+            # closes immediately after seeing finish_reason isn't treated
+            # as a client abort.
+            ended = False
+            try:
+                while True:
+                    item = rqueue.get(timeout=60.0)
+                    if item is None:
+                        ended = True
+                        break
+                    if isinstance(item, Exception):
+                        ended = True
+                        raise item
+                    if getattr(item, "finish_reason", None):
+                        ended = True
+                    yield item
+                    if ended:
+                        break
+            finally:
+                if not ended:
+                    self._cancel(uid)
+
+        return ctx, token_iterator()
+
+    def _cpu_preprocess(self, prompt, images=None, audio=None) -> dict:
+        """CPU-only: tokenize text, load/resize images. Thread-safe."""
+        add_special_tokens = (
+            getattr(self.processor, "chat_template", None) is None
+            if self.model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
+            else True
+        )
+        image_token_index = getattr(self.model.config, "image_token_index", None)
+        return prepare_inputs(
+            self.processor,
+            images=images,
+            audio=audio,
+            prompts=prompt,
+            image_token_index=image_token_index,
+            add_special_tokens=add_special_tokens,
+        )
+
+    # -- internals --
+
+    def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
+        if args.temperature == 0:
+            return None
+
+        def sampler(logprobs: mx.array) -> mx.array:
+            if args.top_p > 0 and args.top_p < 1.0:
+                return top_p_sampling(logprobs, args.top_p, args.temperature)
+            else:
+                return mx.random.categorical(logprobs * (1 / args.temperature))
+
+        return sampler
+
+    def _gpu_embed(self, raw_inputs: dict, images=None) -> Tuple[mx.array, dict]:
+        """GPU-only: run vision encoder if needed. Must run on GPU thread."""
+        input_ids = raw_inputs.get("input_ids")
+        pixel_values = raw_inputs.get("pixel_values")
+        mask = raw_inputs.get("attention_mask")
+        data_kwargs = {
+            k: v
+            for k, v in raw_inputs.items()
+            if k not in ["input_ids", "pixel_values", "attention_mask"]
+        }
+        # Pass vision cache for image feature caching
+        if (
+            pixel_values is not None
+            and self.vision_cache is not None
+            and images is not None
+        ):
+            data_kwargs["vision_cache"] = self.vision_cache
+            data_kwargs["_image_key"] = images
+
+        # Always call get_input_embeddings — BatchGenerator requires inputs_embeds
+        embed = self.model.get_input_embeddings(
+            input_ids, pixel_values, mask=mask, **data_kwargs
+        )
+        # Remove cache kwargs before passing to BatchGenerator
+        data_kwargs.pop("vision_cache", None)
+        data_kwargs.pop("_image_key", None)
+        gen_kwargs = {**data_kwargs, **embed.to_dict()}
+        return input_ids, gen_kwargs
+
+    def _run(self):
+        """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
+        if self.draft_model is not None:
+            self._run_speculative()
+            return
+
+        batch_gen = None
+        # uid -> {rqueue, tokens, gen_kwargs}
+        active: dict = {}
+
+        while not self._stop:
+            try:
+                # Poll the request queue — non-blocking when generating, short
+                # blocking wait when idle so we don't spin.
+                new_items = []
+                if active:
+                    try:
+                        item = self.requests.get_nowait()
+                        if item is None:
+                            if self._stop:
+                                break
+                        else:
+                            new_items.append(item)
+                    except QueueEmpty:
+                        pass
+                else:
+                    try:
+                        item = self.requests.get(timeout=0.1)
+                        if item is None:
+                            if self._stop:
+                                break
+                        else:
+                            new_items.append(item)
+                    except QueueEmpty:
+                        pass
+
+                while True:
+                    try:
+                        item = self.requests.get_nowait()
+                        if item is not None:
+                            new_items.append(item)
+                    except QueueEmpty:
+                        break
+
+                # Drop abandoned requests before doing more work.
+                cancelled = self._drain_cancellations()
+                if cancelled and batch_gen is not None:
+                    for uid in cancelled:
+                        if uid in active:
+                            batch_gen.remove(uid)
+                            info = active.pop(uid)
+                            try:
+                                info["rqueue"].put(None)
+                            except Exception:
+                                pass
+
+                for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
+                    if batch_gen is None:
+                        batch_gen = BatchGenerator(
+                            self.model.language_model,
+                            self.processor,
+                            stop_tokens=self.stop_tokens,
+                            sampler=self._make_sampler(args),
+                            kv_bits=self.kv_bits,
+                            kv_group_size=self.kv_group_size,
+                            kv_quant_scheme=self.kv_quant_scheme,
+                            quantized_kv_start=self.quantized_kv_start,
+                            top_logprobs_k=self.top_logprobs_k,
+                        )
+
+                    # Vision encoder runs on the GPU thread; text tokenization
+                    # already happened on the caller thread.
+                    input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
+                    has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
+
+                    # Image/embed requests can't share a prefill batch with
+                    # pending text-only prompts — drain them first.
+                    if has_embeds and batch_gen.unprocessed_prompts:
+                        self._flush(batch_gen, active)
+
+                    try:
+                        (uid,) = batch_gen.insert(
+                            [input_ids.squeeze(0).tolist()],
+                            max_tokens=args.max_tokens,
+                            prompt_kwargs=[gen_kwargs],
+                        )
+                    except Exception as e:
+                        rqueue.put(e)
+                        continue
+
+                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+                    active[uid] = {
+                        "rqueue": rqueue,
+                        "tokens": [],
+                        "prev_text": "",
+                        "gen_kwargs": gen_kwargs if has_embeds else None,
+                    }
+
+                    if has_embeds:
+                        self._step(batch_gen, active)
+
+                if not active or batch_gen is None:
+                    continue
+
+                self._step(batch_gen, active)
+
+            except Exception as e:
+                print(f"Error in generation thread: {e}")
+                traceback.print_exc()
+
+    def _run_speculative(self):
+        """GPU thread loop with DFlash speculative decoding.
+
+        Collects incoming requests, prefills them as a batch with
+        ``capture_layer_ids``, then runs ``_dflash_rounds_batch`` for
+        decode. Between speculative rounds the loop checks for new
+        requests — new arrivals trigger a batch rebuild (re-prefill
+        for the new sequences, extend target caches, cold-restart
+        drafter). Finished sequences are filtered out automatically
+        by ``_dflash_rounds_batch``'s ``stop_check`` callback.
+        """
+        from mlx_lm.sample_utils import make_sampler as _make_sampler
+
+        lm = self.model.language_model
+        drafter = self.draft_model
+        target_layer_ids = list(drafter.config.target_layer_ids)
+        sampler = _make_sampler(temp=0)
+        draft_block_size_str = os.environ.get("MLX_VLM_DRAFT_BLOCK_SIZE")
+        draft_block_size = int(draft_block_size_str) if draft_block_size_str else None
+
+        while not self._stop:
+            try:
+                # --- Phase 1: collect pending requests ---
+                pending = []
+                timeout = 0.1
+                try:
+                    item = self.requests.get(timeout=timeout)
+                    if item is None and self._stop:
+                        break
+                    if item is not None:
+                        pending.append(item)
+                except QueueEmpty:
+                    pass
+                while True:
+                    try:
+                        item = self.requests.get_nowait()
+                        if item is not None:
+                            pending.append(item)
+                    except QueueEmpty:
+                        break
+
+                if not pending:
+                    continue
+
+                # --- Phase 2: prefill new batch ---
+                uids = []
+                rqueues = {}
+                token_lists = {}
+                max_tokens_map = {}
+                all_input_ids = []
+
+                for rqueue, raw_inputs, prompt_tokens, args, images in pending:
+                    input_ids, _ = self._gpu_embed(raw_inputs, images)
+                    uid = id(rqueue)
+                    uids.append(uid)
+                    rqueues[uid] = rqueue
+                    token_lists[uid] = []
+                    max_tokens_map[uid] = args.max_tokens
+                    all_input_ids.append(input_ids.squeeze(0).tolist())
+                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+                    sampler = self._make_sampler(args) or _make_sampler(temp=0)
+
+                B = len(uids)
+                max_len = max(len(ids) for ids in all_input_ids)
+                padded = [[0] * (max_len - len(ids)) + ids for ids in all_input_ids]
+                input_mx = mx.array(padded, dtype=mx.int32)
+
+                prompt_cache = _make_cache(lm, [0] * B)
+                lm._position_ids = None
+                lm._rope_deltas = None
+
+                with mx.stream(generation_stream):
+                    out = lm(
+                        input_mx,
+                        cache=prompt_cache,
+                        capture_layer_ids=target_layer_ids,
+                    )
+                hidden = mx.concatenate(out.hidden_states, axis=-1)
+                first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
+                mx.eval(first_bonus, hidden, out.logits)
+
+                # Send first bonus tokens to clients
+                fb_list = first_bonus.tolist()
+                for j, uid in enumerate(uids):
+                    tok = int(fb_list[j])
+                    token_lists[uid].append(tok)
+                    text = self.tokenizer.decode([tok])
+                    rqueues[uid].put(
+                        StreamingToken(
+                            text=text,
+                            token=tok,
+                            logprobs=0.0,
+                            finish_reason=None,
+                            peak_memory=mx.get_peak_memory() / 1e9,
+                        )
+                    )
+
+                # --- Phase 3: speculative decode rounds ---
+                max_tok = max(max_tokens_map[u] for u in uids)
+                finished_uids = set()
+
+                def stop_check(seq_idx, token_id):
+                    uid = uids[seq_idx]
+                    if uid in finished_uids:
+                        return True
+                    if token_id in self.stop_tokens:
+                        return True
+                    if len(token_lists[uid]) >= max_tokens_map[uid]:
+                        return True
+                    return False
+
+                for tok_list, _ in _dflash_rounds_batch(
+                    self.model,
+                    drafter,
+                    prompt_cache,
+                    hidden,
+                    first_bonus=first_bonus,
+                    max_tokens=max_tok,
+                    sampler=sampler,
+                    draft_block_size=draft_block_size,
+                    token_dtype=mx.int32,
+                    stop_check=stop_check,
+                ):
+                    for j, tok in enumerate(tok_list):
+                        if tok is None:
+                            continue
+                        uid = uids[j]
+                        if uid in finished_uids:
+                            continue
+
+                        token_lists[uid].append(tok)
+                        tokens = token_lists[uid]
+
+                        if len(tokens) >= 2:
+                            prev = self.tokenizer.decode(tokens[:-1])
+                            curr = self.tokenizer.decode(tokens)
+                            text = curr[len(prev) :]
+                        else:
+                            text = self.tokenizer.decode(tokens)
+
+                        is_stop = tok in self.stop_tokens
+                        is_max = len(tokens) >= max_tokens_map[uid]
+                        finish = "stop" if is_stop else "length" if is_max else None
+
+                        rqueues[uid].put(
+                            StreamingToken(
+                                text="" if is_stop else text,
+                                token=tok,
+                                logprobs=0.0,
+                                finish_reason=finish,
+                                peak_memory=mx.get_peak_memory() / 1e9,
+                            )
+                        )
+
+                        if finish is not None:
+                            rqueues[uid].put(None)
+                            finished_uids.add(uid)
+
+                # Log acceptance stats
+                al = drafter.accept_lens
+                if al:
+                    mean_a = sum(al) / len(al)
+                    print(
+                        f"[DFlash] batch={B} tokens={sum(len(token_lists[u]) for u in uids)} "
+                        f"accept={mean_a:.2f} rounds={len(al)}"
+                    )
+
+                # Finalize any remaining
+                for uid in uids:
+                    if uid not in finished_uids:
+                        rqueues[uid].put(
+                            StreamingToken(
+                                text="",
+                                token=0,
+                                logprobs=0.0,
+                                finish_reason="length",
+                                peak_memory=mx.get_peak_memory() / 1e9,
+                            )
+                        )
+                        rqueues[uid].put(None)
+
+            except Exception as e:
+                print(f"Error in speculative generation thread: {e}")
+                traceback.print_exc()
+
+    def _step(self, batch_gen, active, gen_kwargs=None):
+        """One batch generation step: prefill + decode."""
+        kwargs = gen_kwargs or {}
+        _, responses = batch_gen.next(**kwargs)
+        if not responses:
+            return
+
+        for r in responses:
+            if r.uid not in active:
+                continue
+
+            info = active[r.uid]
+            rqueue = info["rqueue"]
+
+            tok = r.token
+            if hasattr(tok, "item"):
+                tok = tok.item()
+
+            if r.finish_reason == "stop":
+                text = ""
+            else:
+                info["tokens"].append(tok)
+                curr = self.tokenizer.decode(info["tokens"])
+                text = curr[len(info["prev_text"]) :]
+                info["prev_text"] = curr
+
+            lp = r.token_logprob
+
+            rqueue.put(
+                StreamingToken(
+                    text=text,
+                    token=tok,
+                    logprobs=lp,
+                    finish_reason=r.finish_reason,
+                    peak_memory=mx.get_peak_memory() / 1e9 if r.finish_reason else 0,
+                    top_logprobs=getattr(r, "top_logprobs", None),
+                )
+            )
+
+            if r.finish_reason is not None:
+                rqueue.put(None)
+                del active[r.uid]
+
+    def _flush(self, batch_gen, active):
+        """Drain all pending text-only prompts before inserting an image request."""
+        while batch_gen.has_pending_prompts:
+            self._step(batch_gen, active)
+
+
+def suppress_tool_call_content(
+    full_output: str,
+    in_tool_call: bool,
+    tc_start: Optional[str],
+    delta_content: Optional[str],
+) -> Tuple[bool, Optional[str]]:
+    """Suppress tool-call markup from streamed delta.content.
+
+    Returns updated (in_tool_call, delta_content).
+    """
+    if not tc_start:
+        return in_tool_call, delta_content
+    if not in_tool_call:
+        if tc_start in full_output:
+            return True, None
+        if any(full_output.endswith(tc_start[:j]) for j in range(1, len(tc_start))):
+            return False, None
+    else:
+        return True, None
+    return in_tool_call, delta_content
+
+
+def process_tool_calls(model_output: str, tool_module, tools):
+    """Parse tool calls from model output using the appropriate tool parser."""
+    called_tools = []
+    remaining = model_output
+
+    if tool_module.tool_call_start in model_output:
+        if tool_module.tool_call_end == "":
+            pattern = re.compile(
+                f"{re.escape(tool_module.tool_call_start)}.*?(?:\n|$)", re.DOTALL
+            )
+        else:
+            pattern = re.compile(
+                f"{re.escape(tool_module.tool_call_start)}.*?{re.escape(tool_module.tool_call_end)}",
+                re.DOTALL,
+            )
+
+        matches = re.findall(pattern, model_output)
+        if matches:
+            remaining = re.sub(pattern, " ", model_output).strip()
+            for i, match in enumerate(matches):
+                call = (
+                    match.strip()
+                    .removeprefix(tool_module.tool_call_start)
+                    .removesuffix(tool_module.tool_call_end)
+                )
+                try:
+                    tool_call = tool_module.parse_tool_call(call, tools)
+                    args = tool_call["arguments"]
+                    called_tools.append(
+                        {
+                            "type": "function",
+                            "index": i,
+                            "id": str(uuid.uuid4()),
+                            "function": {
+                                "name": tool_call["name"].strip(),
+                                "arguments": (
+                                    args
+                                    if isinstance(args, str)
+                                    else json.dumps(args, ensure_ascii=False)
+                                ),
+                            },
+                        }
+                    )
+                except Exception:
+                    print(f"Invalid tool call: {call}")
+    return dict(calls=called_tools, remaining_text=remaining)
+
+
+def _build_gen_args(request) -> GenerationArguments:
+    """Build GenerationArguments from an OpenAIRequest or ChatRequest."""
+    max_tokens = getattr(request, "max_tokens", None) or getattr(
+        request, "max_output_tokens", DEFAULT_MAX_TOKENS
+    )
+    repetition_penalty = getattr(request, "repetition_penalty", None)
+    if repetition_penalty is None:
+        default_rp = float(
+            os.environ.get("DEFAULT_REPETITION_PENALTY", DEFAULT_REPETITION_PENALTY)
+        )
+        repetition_penalty = default_rp if default_rp > 0 else None
+    logit_bias = getattr(request, "logit_bias", None)
+    if logit_bias is not None and isinstance(logit_bias, dict):
+        logit_bias = {int(k): v for k, v in logit_bias.items()}
+    return GenerationArguments(
+        max_tokens=max_tokens,
+        temperature=getattr(request, "temperature", DEFAULT_TEMPERATURE),
+        top_p=getattr(request, "top_p", DEFAULT_TOP_P),
+        top_k=getattr(request, "top_k", 0),
+        min_p=getattr(request, "min_p", 0.0),
+        repetition_penalty=repetition_penalty,
+        logit_bias=logit_bias,
+        enable_thinking=getattr(request, "enable_thinking", True),
+        thinking_budget=getattr(request, "thinking_budget", None),
+        thinking_start_token=getattr(request, "thinking_start_token", None),
+    )
+
+
+def _count_thinking_tag_tokens(text: str) -> int:
+    """Count tokens consumed by thinking tags (excluded from completion_tokens)."""
+    count = 0
+    # <|channel>thought (2 tokens) + <channel|> (1 token) + EOS (1 token)
+    if "<|channel>thought" in text and "<channel|>" in text:
+        count = 4
+    elif "<think>" in text and "</think>" in text:
+        count = 2  # <think> and </think> are 1 token each typically
+    return count
+
+
+def _split_thinking(text: str) -> Tuple[Optional[str], str]:
+    """Split thinking tags from content. Returns (reasoning, content)."""
+    # Handle <|channel>thought...<channel|> format (gemma4)
+    # Also handle partial tag: text starting with "thought\n" (continuation)
+    if "<|channel>thought" in text or (
+        "<channel|>" in text and text.lstrip().startswith("thought")
+    ):
+        parts = text.split("<channel|>", 1)
+        if len(parts) == 2:
+            reasoning = (
+                parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
+            )
+            content = parts[1].strip()
+            return reasoning or None, content
+        reasoning = parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
+        return reasoning or None, ""
+    # Handle <think>...</think> format (qwen3.5 etc)
+    # Also handle partial: output starts with thinking text + </think> (no opening tag)
+    if "<think>" in text or "</think>" in text:
+        parts = text.split("</think>", 1)
+        if len(parts) == 2:
+            reasoning = parts[0].replace("<think>", "").strip()
+            content = parts[1].strip()
+            return reasoning or None, content
+        return parts[0].replace("<think>", "").strip(), ""
+    return None, text
+
+
+def _decode_token(tokenizer, token_id: int) -> Tuple[str, Optional[List[int]]]:
+    """Decode a single token id to its string + UTF-8 bytes."""
+    try:
+        text = tokenizer.decode([int(token_id)])
+    except Exception:
+        text = ""
+    try:
+        token_bytes = list(text.encode("utf-8"))
+    except Exception:
+        token_bytes = None
+    return text, token_bytes
+
+
+def _make_logprob_content(
+    tokenizer,
+    token_id: int,
+    logprob: float,
+    top_logprobs: Optional[List[Tuple[int, float]]] = None,
+    top_k: int = 0,
+) -> "ChatLogprobContent":
+    """Build an OpenAI-style logprob entry for a single token."""
+    token_text, token_bytes = _decode_token(tokenizer, token_id)
+    top_list: List[TopLogprob] = []
+    if top_k > 0 and top_logprobs:
+        for tid, lp in top_logprobs[:top_k]:
+            t_text, t_bytes = _decode_token(tokenizer, tid)
+            top_list.append(TopLogprob(token=t_text, logprob=float(lp), bytes=t_bytes))
+    return ChatLogprobContent(
+        token=token_text,
+        logprob=float(logprob),
+        bytes=token_bytes,
+        top_logprobs=top_list,
+    )
+
+
+# Global response generator for continuous batching
+response_generator: Optional[ResponseGenerator] = None
+
+# Loading/unloading utilities
+model_cache = {}
 
 
 @asynccontextmanager
 async def lifespan(app):
-    # Startup
-    model_path = os.environ.get("PRELOAD_MODEL")
-    adapter_path = os.environ.get("PRELOAD_ADAPTER") or None
+    model_path = os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
     if model_path:
-        try:
-            print(f"Preloading model: {model_path}")
-            get_cached_model(model_path, adapter_path)
-        except Exception as e:
-            print(f"Failed to preload model: {e}")
-            print("Server will continue without a preloaded model.")
-
-    # Start prompt cache cleanup task
-    ttl = get_prompt_cache_ttl()
-    cleanup_task = None
-    if ttl > 0:
-        cleanup_task = asyncio.create_task(_prompt_cache_cleanup_loop())
-        if _verbose:
-            print(f"[prompt_cache] Cleanup task started (TTL={ttl}s, check every 60s)")
-
+        adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
+        logger.info("Pre-loading model: %s", model_path)
+        get_cached_model(model_path, adapter_path)
+        kv_bits = os.environ.get("KV_BITS")
+        kv_scheme = os.environ.get("KV_QUANT_SCHEME", "uniform")
+        if kv_bits:
+            logger.info("KV cache quantization: bits=%s scheme=%s", kv_bits, kv_scheme)
+        logger.info("Model ready, continuous batching enabled.")
     yield
-
-    # Shutdown
-    if cleanup_task is not None:
-        cleanup_task.cancel()
-        try:
-            await cleanup_task
-        except asyncio.CancelledError:
-            pass
-    unload_model_sync()
 
 
 app = FastAPI(
@@ -224,124 +981,11 @@ app.add_middleware(
 
 MAX_IMAGES = 10  # Maximum number of images to process at once
 
-# Loading/unloading utilities
-
-model_cache = {}
-
-# Prompt cache: reuse KV state across requests with the same prompt prefix.
-# Keyed by (model_name, cache_key) — supports both:
-#   - OpenClaw: sends `prompt_cache_key` for per-session routing
-#   - Hermes: relies on stable system prompt prefix for automatic matching
-# When no cache_key is provided, falls back to model name only.
-DEFAULT_PROMPT_CACHE_TTL = 300  # seconds
-
-
-def get_prompt_cache_ttl() -> int:
-    """Prompt cache TTL in seconds. 0 = no expiry."""
-    return int(os.environ.get("PROMPT_CACHE_TTL", DEFAULT_PROMPT_CACHE_TTL))
-
-
-_PROMPT_CACHE_MAX_ENTRIES = 64
-_prompt_cache_states: dict[str, PromptCacheState] = {}
-
-# Concurrency guard: MLX generation is single-threaded on Metal.
-# Concurrent requests would corrupt shared GPU state. The semaphore
-# serializes access to the generation pipeline.
-_generation_semaphore: Optional[asyncio.Semaphore] = None
-
-
-def get_max_concurrent_requests() -> int:
-    return int(os.environ.get("MAX_CONCURRENT_REQUESTS", 1))
-
-
-def get_generation_semaphore() -> asyncio.Semaphore:
-    """Get or create the generation semaphore."""
-    global _generation_semaphore
-    if _generation_semaphore is None:
-        _generation_semaphore = asyncio.Semaphore(get_max_concurrent_requests())
-    return _generation_semaphore
-
-
-async def acquire_semaphore() -> asyncio.Semaphore:
-    """Acquire the generation semaphore with timeout. Returns the semaphore for release."""
-    sem = get_generation_semaphore()
-    timeout = get_request_timeout()
-    try:
-        if timeout > 0:
-            await asyncio.wait_for(sem.acquire(), timeout=timeout)
-        else:
-            await sem.acquire()
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            status_code=503,
-            detail="Server busy: generation request timed out waiting for GPU.",
-        )
-    return sem
-
-
-def get_prompt_cache_state(
-    model_name: str,
-    cache_key: Optional[str] = None,
-) -> PromptCacheState:
-    """Get or create a PromptCacheState for the given model and cache key.
-
-    Supports two caching patterns:
-
-    **OpenClaw**: Sends ``prompt_cache_key`` per session so that requests
-    from the same conversation share a KV cache.  The system prompt prefix
-    is stable across turns, so prefix matching works.
-
-    **Hermes**: Relies on a stable system prompt and ``cache_control``
-    breakpoints.  No ``prompt_cache_key`` is sent, so we fall back to
-    a single cache per model.  The ``PromptCacheState.find_prefix_length``
-    in generate.py will still match the common system-prompt prefix.
-
-    Args:
-        model_name: The model identifier.
-        cache_key: Optional routing key (e.g., ``prompt_cache_key`` from the
-            request).  When provided, each key gets its own cache state.
-    """
-    key = f"{model_name}::{cache_key}" if cache_key else model_name
-    # Evict LRU entry if at capacity and key is new
-    if key not in _prompt_cache_states and len(_prompt_cache_states) >= _PROMPT_CACHE_MAX_ENTRIES:
-        lru_key = min(_prompt_cache_states, key=lambda k: _prompt_cache_states[k].last_used)
-        evicted = _prompt_cache_states.pop(lru_key)
-        evicted.invalidate()
-    state = _prompt_cache_states.setdefault(key, PromptCacheState())
-    state.touch()
-    return state
-
-
-def evict_stale_prompt_caches() -> int:
-    """Remove prompt cache entries that exceed the TTL. Returns count evicted."""
-    ttl = get_prompt_cache_ttl()
-    if ttl <= 0:
-        return 0
-    now = time.time()
-    stale_keys = [
-        k for k, v in _prompt_cache_states.items()
-        if (now - v.last_used) > ttl
-    ]
-    for k in stale_keys:
-        entry = _prompt_cache_states.pop(k)
-        tokens = entry.token_count
-        idle = now - entry.last_used
-        entry.invalidate()
-        if _verbose:
-            print(f"[prompt_cache] Evicted '{k}' ({tokens} tokens, idle {idle:.0f}s)")
-    if stale_keys:
-        gc.collect()
-        mx.clear_cache()
-    return len(stale_keys)
-
 
 class FlexibleBaseModel(BaseModel):
     """Base model that ignores/accepts any unknown OpenAI SDK fields."""
 
     model_config = ConfigDict(extra="allow")
-
-    def dump_kwargs(self, *fields: str) -> dict[str, Any]:
-        return self.model_dump(include=set(fields), exclude_none=True)
 
 
 def load_model_resources(model_path: str, adapter_path: Optional[str]):
@@ -369,11 +1013,19 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         raise HTTPException(status_code=500, detail=f"Failed to load model: {e}")
 
 
-def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
+_INHERIT_ADAPTER = object()
+
+
+def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     """
     Factory function to get or load the appropriate model resources from cache or by loading.
+    Also creates/updates the ResponseGenerator for continuous batching.
     """
-    global model_cache
+    global model_cache, response_generator
+
+    if adapter_path is _INHERIT_ADAPTER:
+        cached = model_cache.get("cache_key")
+        adapter_path = cached[1] if cached and cached[0] == model_path else None
 
     cache_key = (model_path, adapter_path)
 
@@ -390,6 +1042,48 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
     # Load the model resources
     model, processor, config = load_model_resources(model_path, adapter_path)
 
+    # Get stop tokens from model config
+    stop_tokens = set()
+    if hasattr(config, "eos_token_id"):
+        if isinstance(config.eos_token_id, list):
+            stop_tokens.update(config.eos_token_id)
+        elif config.eos_token_id is not None:
+            stop_tokens.add(config.eos_token_id)
+
+    # Load speculative drafter if configured
+    draft_model = None
+    draft_model_path = os.environ.get("MLX_VLM_DRAFT_MODEL")
+    if draft_model_path:
+        from .speculative.drafters import load_drafter
+
+        draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND", "dflash")
+        print(f"Loading speculative drafter ({draft_kind}): {draft_model_path}")
+        draft_model = load_drafter(draft_model_path, kind=draft_kind)
+        print("Drafter ready — speculative decoding enabled.")
+
+    # Create ResponseGenerator for continuous batching
+    vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
+    vision_cache = VisionFeatureCache(max_size=vision_cache_size)
+
+    # KV cache quantization (uniform or TurboQuant)
+    kv_bits = get_quantized_kv_bits(model_path)
+    kv_group_size = get_kv_group_size()
+    quantized_kv_start = get_quantized_kv_start()
+    kv_quant_scheme = get_kv_quant_scheme()
+
+    response_generator = ResponseGenerator(
+        model=model,
+        processor=processor,
+        stop_tokens=stop_tokens,
+        vision_cache=vision_cache,
+        draft_model=draft_model,
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        kv_quant_scheme=kv_quant_scheme,
+        quantized_kv_start=quantized_kv_start,
+        top_logprobs_k=get_top_logprobs_k(),
+    )
+
     model_cache = {
         "cache_key": cache_key,
         "model_path": model_path,
@@ -397,7 +1091,7 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
         "model": model,
         "processor": processor,
         "config": config,
-        "vision_cache": VisionFeatureCache(),
+        "vision_cache": vision_cache,
     }
 
     return model, processor, config
@@ -405,19 +1099,24 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
 
 # Synchronous unload function for internal use
 def unload_model_sync():
-    global model_cache
+    global model_cache, response_generator
     if not model_cache:
         return False
 
     print(
         f"Unloading model: {model_cache.get('model_path')}, Adapter: {model_cache.get('adapter_path')}"
     )
+
+    # Stop the ResponseGenerator if running
+    if response_generator is not None:
+        print("Stopping ResponseGenerator...")
+        response_generator.stop_and_join()
+        response_generator = None
+
     # Clear vision cache before dropping references
     if "vision_cache" in model_cache:
         model_cache["vision_cache"].clear()
     model_cache = {}
-    # Clear prompt cache states
-    _prompt_cache_states.clear()
     # Force garbage collection
     gc.collect()
     mx.clear_cache()
@@ -443,7 +1142,7 @@ class ResponseInputImageParam(TypedDict, total=False):
     )
     """The detail level of the image to be sent to the model.
 
-    One of `high`, `low`, or `auto`.
+    One of `high`, `low`, or `auto`. Defaults to `auto`.
     """
     type: Required[
         Literal["input_image"]
@@ -478,14 +1177,14 @@ class ResponseImageUrlParam(TypedDict, total=False):
     image_url: Required[ImageUrl]
 
 
+ResizeShapeInput: TypeAlias = Union[Tuple[int], Tuple[int, int]]
+
 ResponseInputContentParam: TypeAlias = Union[
     ResponseInputTextParam,
     ResponseInputImageParam,
     ResponseImageUrlParam,
     ResponseInputAudioParam,
 ]
-
-ResizeShapeInput: TypeAlias = tuple[int] | tuple[int, int]
 
 ResponseInputMessageContentListParam: TypeAlias = List[ResponseInputContentParam]
 
@@ -503,83 +1202,27 @@ ResponseOutputMessageContentList: TypeAlias = List[ResponseOutputText]
 class ChatMessage(FlexibleBaseModel):
     role: Literal["user", "assistant", "system", "developer", "tool"] = Field(
         ...,
-        description="Role of the message sender (e.g., 'system', 'user', 'assistant').",
+        description="Role of the message sender.",
     )
-    content: Optional[
-        Union[
-            str,
-            ResponseInputMessageContentListParam,
-            ResponseOutputMessageContentList,
-        ]
+    content: Union[
+        str,
+        None,
+        ResponseInputMessageContentListParam,
+        ResponseOutputMessageContentList,
     ] = Field(None, description="Content of the message.")
-    tool_calls: List = []
+    reasoning: Optional[str] = Field(
+        None, description="Thinking/reasoning content (when thinking is enabled)."
+    )
+    tool_calls: Optional[List[Any]] = Field(
+        None, description="Tool calls made by the assistant."
+    )
+    tool_call_id: Optional[str] = Field(
+        None, description="ID of the tool call this message is a response to."
+    )
+    name: Optional[str] = Field(None, description="Name of the tool/function.")
 
 
-class GenerationParams(FlexibleBaseModel):
-    temperature: float = Field(
-        DEFAULT_TEMPERATURE,
-        description="Temperature for sampling.",
-    )
-    top_p: float = Field(
-        DEFAULT_TOP_P,
-        description="Top-p sampling.",
-    )
-    top_k: Optional[int] = Field(
-        None,
-        description="Top-k sampling cutoff.",
-    )
-    min_p: Optional[float] = Field(
-        None,
-        description="Min-p sampling threshold.",
-    )
-    repetition_penalty: Optional[float] = Field(
-        None, description="Penalty applied to repeated tokens."
-    )
-    logit_bias: Optional[dict[int, float]] = Field(
-        None, description="Additive logit bias keyed by token id."
-    )
-
-    def shared_generation_kwargs(self) -> dict[str, Any]:
-        return self.dump_kwargs(
-            "temperature",
-            "top_p",
-            "top_k",
-            "min_p",
-            "repetition_penalty",
-            "logit_bias",
-        )
-
-
-class TemplateParams(FlexibleBaseModel):
-    enable_thinking: Optional[bool] = Field(
-        None,
-        description="Enable thinking mode in the chat template.",
-    )
-    thinking_budget: Optional[int] = Field(
-        None,
-        description="Maximum number of thinking tokens before forcing the end token.",
-    )
-    thinking_start_token: Optional[str] = Field(
-        DEFAULT_THINKING_START_TOKEN,
-        description="Token that marks the start of a thinking block.",
-    )
-    thinking_end_token: Optional[str] = Field(
-        DEFAULT_THINKING_END_TOKEN,
-        description="Token that marks the end of a thinking block.",
-    )
-
-    def template_kwargs(self) -> dict[str, Any]:
-        kwargs = self.dump_kwargs(
-            "enable_thinking",
-            "thinking_budget",
-            "thinking_start_token",
-            "thinking_end_token",
-        )
-        kwargs.setdefault("enable_thinking", False)
-        return kwargs
-
-
-class OpenAIRequest(GenerationParams, TemplateParams):
+class OpenAIRequest(FlexibleBaseModel):
     """
     OpenAI-compatible request structure.
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
@@ -590,21 +1233,30 @@ class OpenAIRequest(GenerationParams, TemplateParams):
     )
     model: str = Field(..., description="The model to use for generation.")
     max_output_tokens: int = Field(
-        None,
-        description="Maximum number of tokens to generate.",
+        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
+    )
+    temperature: float = Field(
+        DEFAULT_TEMPERATURE, description="Temperature for sampling."
+    )
+    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    top_k: int = Field(0, description="Top-k sampling.")
+    min_p: float = Field(0.0, description="Min-p sampling.")
+    repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
+    logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
+    enable_thinking: bool = Field(True, description="Enable thinking mode.")
+    thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
+    thinking_start_token: Optional[str] = Field(
+        None, description="Thinking start token."
+    )
+    stop: Optional[Union[str, List[str]]] = Field(
+        None, description="Up to 4 stop sequences."
+    )
+    response_format: Optional[dict[str, Any]] = Field(
+        None, description="Structured output request such as json_object."
     )
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
-    stop: Optional[Union[str, List[str]]] = Field(
-        None,
-        description="Up to 4 sequences where the API will stop generating further tokens.",
-    )
-
-    def generation_kwargs(self) -> dict[str, Any]:
-        kwargs = self.dump_kwargs("max_output_tokens")
-        kwargs["max_tokens"] = kwargs.pop("max_output_tokens")
-        return {**kwargs, **self.shared_generation_kwargs()}
 
 
 class OpenAIUsage(BaseModel):
@@ -764,7 +1416,7 @@ StreamEvent = Union[
 # Models for /chat/completion endpoint
 
 
-class VLMRequest(GenerationParams, TemplateParams):
+class VLMRequest(FlexibleBaseModel):
     model: str = Field(
         DEFAULT_MODEL_PATH,
         description="The path to the local model directory or Hugging Face repo.",
@@ -772,30 +1424,44 @@ class VLMRequest(GenerationParams, TemplateParams):
     adapter_path: Optional[str] = Field(
         None, description="The path to the adapter weights."
     )
-    max_tokens: Optional[int] = Field(
-        None,
-        description="Maximum number of tokens to generate. Uses server default if not specified.",
+    max_tokens: int = Field(
+        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
     )
+    temperature: float = Field(
+        DEFAULT_TEMPERATURE, description="Temperature for sampling."
+    )
+    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    top_k: int = Field(0, description="Top-k sampling.")
+    min_p: float = Field(0.0, description="Min-p sampling.")
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
-    stop: Optional[Union[str, List[str]]] = Field(
+    repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
+    logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
+    enable_thinking: bool = Field(True, description="Enable thinking mode.")
+    thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
+    thinking_start_token: Optional[str] = Field(
+        None, description="Thinking start token."
+    )
+    logprobs: Optional[bool] = Field(
         None,
-        description="Up to 4 sequences where the API will stop generating further tokens.",
+        description="Return log-probabilities for each output token.",
+    )
+    top_logprobs: Optional[int] = Field(
+        None,
+        description=(
+            "Number of most-likely tokens to return at each position "
+            "(0-20). Requires logprobs=true. The server-side cap is set by "
+            "the TOP_LOGPROBS_K env var; values above the cap are clamped."
+        ),
     )
     resize_shape: Optional[ResizeShapeInput] = Field(
         None,
-        description="Resize shape for the image. Provide one integer for a square resize or two integers for (height, width).",
+        description="Resize shape for the image. Provide one integer for square or two for (height, width).",
     )
 
     @field_validator("resize_shape", mode="before")
     @classmethod
     def normalize_resize_shape_field(cls, value):
         return normalize_resize_shape(value)
-
-    def generation_kwargs(self) -> dict[str, Any]:
-        return {
-            **self.dump_kwargs("max_tokens", "resize_shape"),
-            **self.shared_generation_kwargs(),
-        }
 
 
 class GenerationRequest(VLMRequest):
@@ -808,234 +1474,81 @@ class GenerationRequest(VLMRequest):
     )
 
 
-class UsageStats(OpenAIUsage):
-    """
-    Inherits from OpenAIUsage and adds additional fields for usage statistics.
-    """
+class PromptTokensDetails(BaseModel):
+    cached_tokens: int = 0
 
-    prompt_tps: float = Field(..., description="Tokens per second for the prompt.")
-    generation_tps: float = Field(
-        ..., description="Tokens per second for the generation."
-    )
-    peak_memory: float = Field(
-        ..., description="Peak memory usage during the generation."
-    )
+
+class UsageStats(BaseModel):
+    """OpenAI-compatible usage statistics for chat completions."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    prompt_tokens_details: PromptTokensDetails = PromptTokensDetails()
+    prompt_tps: float = 0.0
+    generation_tps: float = 0.0
+    peak_memory: float = 0.0
 
 
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
-    logprobs: Optional[bool] = Field(
-        None, description="Whether to return log probabilities."
+    tools: Optional[List[Any]] = Field(None, description="Available function tools.")
+    tool_choice: Optional[Any] = Field(None, description="Tool selection policy.")
+    stop: Optional[Union[str, List[str]]] = Field(
+        None, description="Up to 4 stop sequences."
     )
-    top_logprobs: Optional[int] = Field(
-        None,
-        ge=0,
-        le=20,
-        description="Number of most likely tokens to return at each position.",
+    response_format: Optional[dict[str, Any]] = Field(
+        None, description="Structured output request such as json_object."
     )
 
-    @field_validator("top_logprobs")
-    @classmethod
-    def validate_top_logprobs_supported(cls, value):
-        if value is not None:
-            raise ValueError(
-                "`top_logprobs` is not supported by this server and must be omitted."
-            )
-        return value
 
-
-class TokenLogprob(BaseModel):
+class TopLogprob(BaseModel):
     token: str
     logprob: float
     bytes: Optional[List[int]] = None
 
 
-class ChoiceLogprobs(BaseModel):
-    content: Optional[List[TokenLogprob]] = None
+class ChatLogprobContent(BaseModel):
+    token: str
+    logprob: float
+    bytes: Optional[List[int]] = None
+    top_logprobs: List[TopLogprob] = []
+
+
+class ChatLogprobs(BaseModel):
+    content: List[ChatLogprobContent] = []
 
 
 class ChatChoice(BaseModel):
-    finish_reason: str
+    index: int = 0
+    finish_reason: str = "stop"
     message: ChatMessage
-    logprobs: Optional[ChoiceLogprobs] = None
+    logprobs: Optional[ChatLogprobs] = None
 
 
 class ChatResponse(BaseModel):
-    model: str
-    choices: List[ChatChoice]
-    usage: Optional[UsageStats]
+    id: str = ""
+    object: str = "chat.completion"
+    created: int = 0
+    model: str = ""
+    choices: List[ChatChoice] = []
+    usage: Optional[UsageStats] = None
 
 
 class ChatStreamChoice(BaseModel):
     index: int = 0
     finish_reason: Optional[str] = None
     delta: ChatMessage
-    logprobs: Optional[ChoiceLogprobs] = None
+    logprobs: Optional[ChatLogprobs] = None
 
 
 class ChatStreamChunk(BaseModel):
-    id: str
+    id: str = ""
     object: str = "chat.completion.chunk"
-    created: int
-    model: str
-    choices: List[ChatStreamChoice]
-    usage: Optional[UsageStats]
-
-
-def resolve_stop_sequences(
-    stop: Optional[Union[str, list]],
-) -> Optional[list]:
-    """Normalize stop sequences for the generation stopping criteria.
-
-    The generation pipeline's ``add_eos_token_ids`` accepts strings
-    and handles tokenization internally.
-
-    Args:
-        stop: A single stop string or list of stop strings, or None.
-
-    Returns:
-        A list of stop strings (max 4), or None.
-    """
-    if not stop:
-        return None
-    if isinstance(stop, str):
-        stop = [stop]
-    sequences = [s for s in stop[:4] if isinstance(s, str) and s]
-    return sequences if sequences else None
-
-
-def resolve_tool_choice(
-    tools: Optional[list],
-    tool_choice: Optional[Any],
-) -> tuple[Optional[list], Optional[str]]:
-    """Apply tool_choice policy to the tools list.
-
-    Args:
-        tools: The original tools list from the request.
-        tool_choice: ``"none"``, ``"auto"``, ``"required"``, or a dict
-            specifying a particular tool.
-
-    Returns:
-        Tuple of ``(filtered_tools, system_instruction)``.
-    """
-    if not tools or tool_choice is None or tool_choice == "auto":
-        return tools, None
-
-    if tool_choice == "none":
-        return None, None
-
-    if tool_choice == "required":
-        return tools, "You must call one of the available tools to answer this request."
-
-    if isinstance(tool_choice, dict):
-        func = tool_choice.get("function", {})
-        name = func.get("name") if isinstance(func, dict) else None
-        if name:
-            filtered = [
-                t
-                for t in tools
-                if (t.get("function", {}) or {}).get("name") == name
-                or t.get("name") == name
-            ]
-            return (
-                filtered or tools,
-                f'You must call the "{name}" tool to answer this request.',
-            )
-
-    return tools, None
-
-
-def resolve_response_format(
-    messages: list,
-    response_format: Optional[dict],
-) -> list:
-    """Inject JSON instruction if json_object format is requested."""
-    if not response_format:
-        return messages
-    fmt_type = response_format.get("type", "text")
-    if fmt_type == "json_object":
-        messages.insert(
-            0,
-            {
-                "role": "system",
-                "content": "You must respond with valid JSON only. Do not include any text outside the JSON object.",
-            },
-        )
-    return messages
-
-
-DEFAULT_REPETITION_PENALTY = 1.1
-
-
-def build_generation_kwargs(
-    request: Any,
-    template_kwargs: dict[str, Any],
-) -> dict[str, Any]:
-    gen_kwargs = request.generation_kwargs()
-    # Apply server-side default max_tokens if not specified in request.
-    default_max = get_default_max_tokens()
-    if "max_tokens" not in gen_kwargs or gen_kwargs["max_tokens"] is None:
-        gen_kwargs["max_tokens"] = default_max
-    # Apply server-side default repetition penalty if not specified in request.
-    # Prevents MoE models from degenerating into repetition loops.
-    if "repetition_penalty" not in gen_kwargs or gen_kwargs["repetition_penalty"] is None:
-        default_rp = float(os.environ.get("DEFAULT_REPETITION_PENALTY", DEFAULT_REPETITION_PENALTY))
-        if default_rp > 0:
-            gen_kwargs["repetition_penalty"] = default_rp
-    return {
-        "prefill_step_size": get_prefill_step_size(),
-        "kv_bits": get_quantized_kv_bits(request.model),
-        "kv_group_size": get_kv_group_size(),
-        "kv_quant_scheme": get_kv_quant_scheme(),
-        "max_kv_size": get_max_kv_size(request.model),
-        "quantized_kv_start": get_quantized_kv_start(),
-        **gen_kwargs,
-        **template_kwargs,
-    }
-
-
-def process_tool_calls(model_output: str, tool_module, tools):
-    called_tools = []
-    remaining = model_output
-
-    if tool_module.tool_call_start in model_output:
-        if tool_module.tool_call_end == "":
-            pattern = re.compile(
-                f"{re.escape(tool_module.tool_call_start)}.*?(?:\n|$)", re.DOTALL
-            )
-
-        else:
-            pattern = re.compile(
-                f"{re.escape(tool_module.tool_call_start)}.*?{re.escape(tool_module.tool_call_end)}",
-                re.DOTALL,
-            )
-
-        matches = re.findall(pattern, model_output)
-        if matches:
-            remaining = re.sub(pattern, " ", model_output).strip()
-            tool_call_index = 0
-            for match in matches:
-                call = (
-                    match.strip()
-                    .removeprefix(tool_module.tool_call_start)
-                    .removesuffix(tool_module.tool_call_end)
-                )
-                try:
-                    tool_call = tool_module.parse_tool_call(call, tools)
-                    called_tool = {}
-                    called_tool["type"] = "function"
-                    called_tool["index"] = tool_call_index
-                    called_tool["id"] = str(uuid.uuid4())
-                    called_tool["function"] = {}
-                    called_tool["function"]["name"] = tool_call["name"].strip()
-                    called_tool["function"]["arguments"] = json.dumps(
-                        tool_call["arguments"], ensure_ascii=False
-                    )
-                    called_tools.append(called_tool)
-                    tool_call_index += 1
-                except Exception:
-                    print(f"Invalid tool call: {call}")
-    return dict(calls=called_tools, remaining_text=remaining)
+    created: int = 0
+    model: str = ""
+    choices: List[ChatStreamChoice] = []
+    usage: Optional[UsageStats] = None
 
 
 # Models for /models endpoint
@@ -1052,949 +1565,325 @@ class ModelsResponse(BaseModel):
     data: List[ModelInfo]
 
 
-# ---------------------------------------------------------------------------
-# Responses API helpers
-# ---------------------------------------------------------------------------
-
-
-def responses_input_to_messages(
-    input_items: Union[str, list],
-    instructions: Optional[str] = None,
-    previous_response_id: Optional[str] = None,
-) -> tuple[list[dict], list[str]]:
-    """Convert Responses API input items to chat messages and images.
-
-    Args:
-        input_items: String input or list of input items.
-        instructions: Optional system instructions to prepend.
-        previous_response_id: Optional previous response ID for context replay.
-
-    Returns:
-        Tuple of (chat_messages, image_urls).
-    """
-    chat_messages: list[dict] = []
-    images: list[str] = []
-
-    # Replay previous response context
-    if previous_response_id:
-        replayed = _responses_store.replay_input(previous_response_id)
-        if replayed is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Previous response not found: {previous_response_id}",
-            )
-        # Recursively process replayed items
-        prev_messages, prev_images = responses_input_to_messages(replayed)
-        chat_messages.extend(prev_messages)
-        images.extend(prev_images)
-
-    # Prepend instructions as system message
-    if instructions:
-        chat_messages.insert(0, {"role": "system", "content": instructions})
-
-    # Handle string input
-    if isinstance(input_items, str):
-        chat_messages.append({"role": "user", "content": input_items})
-        return chat_messages, images
-
-    # Handle list of input items
-    for item in input_items:
-        if isinstance(item, dict):
-            item_type = item.get("type", "")
-            role = item.get("role", "")
-
-            # Function call output item
-            if item_type == "function_call_output":
-                call_id = item.get("call_id", "unknown")
-                output = item.get("output", "")
-                chat_messages.append(
-                    {
-                        "role": "tool",
-                        "content": output,
-                        "tool_call_id": call_id,
-                    }
-                )
-                continue
-
-            # Function call item (from previous assistant turn)
-            if item_type == "function_call":
-                chat_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": item.get("call_id", ""),
-                                "type": "function",
-                                "function": {
-                                    "name": item.get("name", ""),
-                                    "arguments": item.get("arguments", ""),
-                                },
-                            }
-                        ],
-                    }
-                )
-                continue
-
-            # Regular message with role and content
-            if role:
-                content = item.get("content", "")
-
-                # Normalize developer role to system
-                msg_role = "system" if role == "developer" else role
-
-                if isinstance(content, str):
-                    chat_messages.append({"role": msg_role, "content": content})
-                elif isinstance(content, list):
-                    # Process content items
-                    text_parts = []
-                    for ci in content:
-                        if isinstance(ci, dict):
-                            ci_type = ci.get("type", "")
-                            if ci_type in ("input_text", "text"):
-                                text_parts.append(ci.get("text", ""))
-                            elif ci_type == "input_image":
-                                images.append(ci.get("image_url", ""))
-                            elif ci_type == "image_url":
-                                img = ci.get("image_url", {})
-                                if isinstance(img, dict):
-                                    images.append(img.get("url", ""))
-                                elif isinstance(img, str):
-                                    images.append(img)
-                            elif ci_type == "output_text":
-                                # Multi-turn: previous assistant output
-                                chat_messages.append(
-                                    {
-                                        "role": "assistant",
-                                        "content": ci.get("text", ""),
-                                    }
-                                )
-                            elif ci_type == "input_audio":
-                                pass  # Audio not yet supported in responses
-                            else:
-                                pass  # Skip unsupported content types gracefully
-
-                    if text_parts:
-                        chat_messages.append(
-                            {
-                                "role": msg_role,
-                                "content": "\n".join(text_parts),
-                            }
-                        )
-                else:
-                    chat_messages.append(
-                        {
-                            "role": msg_role,
-                            "content": str(content) if content else "",
-                        }
-                    )
-                continue
-
-        # Handle Pydantic ChatMessage objects
-        elif hasattr(item, "role"):
-            role = item.role
-            msg_role = "system" if role == "developer" else role
-            content = item.content
-
-            if content is None:
-                chat_messages.append({"role": msg_role, "content": ""})
-            elif isinstance(content, str):
-                chat_messages.append({"role": msg_role, "content": content})
-            elif isinstance(content, list):
-                text_parts = []
-                for ci in content:
-                    if isinstance(ci, dict):
-                        ci_type = ci.get("type", "")
-                        if ci_type in ("input_text", "text"):
-                            text_parts.append(ci.get("text", ""))
-                        elif ci_type == "input_image":
-                            images.append(ci.get("image_url", ""))
-                        elif ci_type == "image_url":
-                            img = ci.get("image_url", {})
-                            if isinstance(img, dict):
-                                images.append(img.get("url", ""))
-                            elif isinstance(img, str):
-                                images.append(img)
-                        elif ci_type == "output_text":
-                            chat_messages.append(
-                                {
-                                    "role": "assistant",
-                                    "content": ci.get("text", ""),
-                                }
-                            )
-
-                if text_parts:
-                    chat_messages.append(
-                        {
-                            "role": msg_role,
-                            "content": "\n".join(text_parts),
-                        }
-                    )
-
-    return chat_messages, images
-
-
-def build_responses_output(
-    raw_text: str,
-    tool_parser_type: Optional[str],
-    tool_module: Optional[Any],
-    tools: Optional[list],
-) -> list[Union[ResponseMessageItem, ResponseFunctionCallItem]]:
-    """Build structured Responses API output items from raw model text.
-
-    Parses tool calls from the raw text if a tool parser is available,
-    creating ResponseFunctionCallItem for each detected call and a
-    ResponseMessageItem for any remaining text.
-
-    Args:
-        raw_text: The raw text output from the model.
-        tool_parser_type: The detected tool parser type (e.g., "gemma4"), or None.
-        tool_module: The loaded tool parser module, or None.
-        tools: The tool definitions from the request, or None.
-
-    Returns:
-        List of output items (message items and/or function call items).
-    """
-    output_items: list[Union[ResponseMessageItem, ResponseFunctionCallItem]] = []
-    remaining_text = raw_text
-
-    # Try to parse tool calls
-    if tool_parser_type and tool_module and tools:
-        try:
-            result = process_tool_calls(raw_text, tool_module, tools)
-            if result["calls"]:
-                for call in result["calls"]:
-                    func_info = call.get("function", {})
-                    output_items.append(
-                        ResponseFunctionCallItem(
-                            name=func_info.get("name", ""),
-                            arguments=func_info.get("arguments", "{}"),
-                            call_id=call.get("id", f"call_{uuid.uuid4().hex[:24]}"),
-                        )
-                    )
-                remaining_text = result.get("remaining_text", "").strip()
-        except Exception:
-            # If tool parsing fails, fall through to plain text
-            remaining_text = raw_text
-
-    # Create message item for any remaining text
-    if remaining_text or not output_items:
-        msg_item = ResponseMessageItem(
-            content=(
-                [ResponseContentPartOutputText(text=remaining_text)]
-                if remaining_text
-                else []
-            ),
-        )
-        # Insert message before function calls (matching OpenAI ordering)
-        output_items.insert(0, msg_item)
-
-    return output_items
-
-
-# OpenAI compatible endpoints
+# OpenAI compatile endpoints
 
 
 @app.post("/responses")
 @app.post("/v1/responses", include_in_schema=False)
-async def responses_endpoint(request: ResponsesRequest):
-    """OpenAI-compatible Responses API endpoint.
-
-    Supports tool calling, multi-turn via previous_response_id, and streaming
-    with proper SSE event sequences including function_call argument events.
+async def responses_endpoint(request: Request):
     """
-    # Resolve default max tokens if not specified in request
-    if request.max_output_tokens is None:
-        request.max_output_tokens = get_default_max_tokens()
+    OpenAI-compatible endpoint for generating text based on a prompt and optional images.
+
+    using client.responses.create method.
+
+    example:
+
+    from openai import OpenAI
+
+    API_URL = "http://0.0.0.0:8000"
+    API_KEY = 'any'
+
+    def run_openai(prompt, img_url,system, stream=False, max_output_tokens=512, model="mlx-community/Qwen2.5-VL-3B-Instruct-8bit"):
+        ''' Calls the OpenAI API
+        '''
+
+        client = OpenAI(base_url=f"{API_URL}", api_key=API_KEY)
+
+        try :
+            response = client.responses.create(
+                model=model,
+                input=[
+                    {"role":"system",
+                    "content": f"{system}"
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": prompt},
+                            {"type": "input_image", "image_url": f"{img_url}"},
+                        ],
+                    }
+                ],
+                max_output_tokens=max_output_tokens,
+                stream=stream
+            )
+            if not stream:
+                print(response.output[0].content[0].text)
+                print(response.usage)
+            else:
+                for event in response:
+                    # Process different event types if needed
+                    if hasattr(event, 'delta') and event.delta:
+                        print(event.delta, end="", flush=True)
+                    elif event.type == 'response.completed':
+                        print("\n--- Usage ---")
+                        print(event.response.usage)
+
+        except Exception as e:
+            # building a response object to match the one returned when request is successful so that it can be processed in the same way
+            return {"model - error":str(e),"content":{}, "model":model}
+
+    """
+
+    request_start = time.perf_counter()
+    body = await request.json()
+    openai_request = OpenAIRequest(**body)
 
     try:
         # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(request.model)
+        model, processor, config = get_cached_model(openai_request.model)
 
-        # Debug: log incoming request details
-        _tools_count = len(request.tools) if request.tools else 0
-        _tool_names = [t.get("name", t.get("function", {}).get("name", "?")) if isinstance(t, dict) else "?" for t in (request.tools or [])]
-        _input_len = len(str(request.input))
-        _instructions_len = len(request.instructions) if request.instructions else 0
-        if _verbose:
-            print(f"[responses] tools={_tools_count} names={_tool_names} stream={request.stream} input_chars={_input_len} instructions_chars={_instructions_len}")
+        kwargs = {}
 
-        # Convert input to chat messages
-        chat_messages, images = responses_input_to_messages(
-            request.input,
-            instructions=request.instructions,
-            previous_response_id=request.previous_response_id,
+        chat_messages = []
+        images = []
+        instructions = None
+        if openai_request.input:
+            if isinstance(openai_request.input, str):
+                # If input is a string, treat it as a single text message
+                chat_messages.append({"role": "user", "content": openai_request.input})
+            elif isinstance(openai_request.input, list):
+                # If input is a list, treat it as a series of chat messages
+                for message in openai_request.input:
+                    if isinstance(message, ChatMessage):
+                        if isinstance(message.content, str):
+                            chat_messages.append(
+                                {"role": message.role, "content": message.content}
+                            )
+                            if message.role == "system":
+                                instructions = message.content
+                        elif isinstance(message.content, list):
+                            # Handle list of content items
+                            for item in message.content:
+                                if isinstance(item, dict):
+                                    if item["type"] == "input_text":
+                                        chat_messages.append(
+                                            {
+                                                "role": message.role,
+                                                "content": item["text"],
+                                            }
+                                        )
+                                        if message.role == "system":
+                                            instructions = item["text"]
+                                    # examples for multiple images (https://platform.openai.com/docs/guides/images?api-mode=responses)
+                                    elif item["type"] == "input_image":
+                                        images.append(item["image_url"])
+                                    else:
+                                        print(
+                                            f"invalid input item type: {item['type']}"
+                                        )
+                                        raise HTTPException(
+                                            status_code=400,
+                                            detail="Invalid input item type.",
+                                        )
+                                else:
+                                    print(
+                                        f"Invalid message content item format: {item}"
+                                    )
+                                    raise HTTPException(
+                                        status_code=400,
+                                        detail="Missing type in input item.",
+                                    )
+                        else:
+                            print("Invalid message content format.")
+                            raise HTTPException(
+                                status_code=400, detail="Invalid input format."
+                            )
+                    else:
+                        print("not a ChatMessage")
+                        raise HTTPException(
+                            status_code=400, detail="Invalid input format."
+                        )
+            else:
+                print("neither string not list")
+                raise HTTPException(status_code=400, detail="Invalid input format.")
+
+        else:
+            print("no input")
+            raise HTTPException(status_code=400, detail="Missing input.")
+
+        chat_messages = resolve_response_format(
+            chat_messages, openai_request.response_format
         )
+        gen_args = _build_gen_args(openai_request)
+        stop_seqs = resolve_stop_sequences(openai_request.stop)
+        if stop_seqs:
+            kwargs["eos_tokens"] = stop_seqs
 
-        # Apply JSON mode if requested
-        response_format = getattr(request, "response_format", None)
-        chat_messages = resolve_response_format(chat_messages, response_format)
-
-        # Set up tool parser (apply tool_choice policy)
-        tools = request.tools
-        tool_choice_val = getattr(request, "tool_choice", "auto")
-        tools, tool_instruction = resolve_tool_choice(tools, tool_choice_val)
-        if tool_instruction:
-            chat_messages.insert(0, {"role": "system", "content": tool_instruction})
-
-        tool_parser_type = None
-        tool_module = None
-        tokenizer = (
-            processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        )
-        if hasattr(tokenizer, "chat_template") and tools:
-            tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
-            if tool_parser_type is not None:
-                tool_module = load_tool_module(tool_parser_type)
-        if _verbose:
-            print(f"[responses] tool_parser={tool_parser_type} tool_module={'yes' if tool_module else 'no'} tools_after_choice={len(tools) if tools else 0}")
-
-        # Build template kwargs
-        template_kwargs = request.template_kwargs()
-
-        # Apply chat template (pass tools so the template can include tool defs)
         formatted_prompt = apply_chat_template(
             processor,
             config,
             chat_messages,
             num_images=len(images),
-            tools=tools,
-            **template_kwargs,
+            **gen_args.to_template_kwargs(),
         )
-        generation_kwargs = build_generation_kwargs(request, template_kwargs)
-
-        if _verbose:
-            _prompt_str = formatted_prompt if isinstance(formatted_prompt, str) else str(formatted_prompt)
-            print(f"[responses] prompt_chars={len(_prompt_str)} last_300=...{_prompt_str[-300:]!r}")
-
         check_context_length(formatted_prompt, processor, get_max_context_tokens())
 
-        # Resolve stop sequences to token IDs
-        stop_seqs = resolve_stop_sequences(getattr(request, "stop", None))
-        if stop_seqs:
-            generation_kwargs["eos_tokens"] = stop_seqs
-
-        generated_at = int(time.time())
-        response_id = f"resp_{uuid.uuid4().hex[:24]}"
-        message_id = f"msg_{uuid.uuid4().hex[:24]}"
-
-        if request.stream:
-            # ----------------------------------------------------------
-            # Streaming response
-            # ----------------------------------------------------------
-            async def stream_responses_generator():
-                seq = 0  # sequence_number counter
-
-                def _evt(event_type: str, event_obj) -> str:
-                    nonlocal seq
-                    event_obj.sequence_number = seq
-                    seq += 1
-                    return (
-                        f"event: {event_type}\ndata: {event_obj.model_dump_json()}\n\n"
-                    )
-
-                sem = None
-                try:
-                    sem = await acquire_semaphore()
-                    # Build base ResponseObject (in_progress, empty output)
-                    base_response = ResponseObject(
-                        id=response_id,
-                        created_at=generated_at,
-                        status="in_progress",
-                        model=request.model,
-                        output=[],
-                        instructions=request.instructions,
-                        max_output_tokens=request.max_output_tokens,
-                        temperature=request.temperature,
-                        top_p=request.top_p,
-                        tools=tools or [],
-                        tool_choice=request.tool_choice,
-                        parallel_tool_calls=request.parallel_tool_calls,
-                        previous_response_id=request.previous_response_id,
-                        metadata=request.metadata,
-                        usage=ResponseUsage(
-                            input_tokens=0, output_tokens=0, total_tokens=0
-                        ),
-                    )
-
-                    # response.created
-                    yield _evt(
-                        "response.created",
-                        ResponsesCreatedEvent(response=base_response),
-                    )
-                    # response.in_progress
-                    yield _evt(
-                        "response.in_progress",
-                        ResponsesInProgressEvent(response=base_response),
-                    )
-
-                    # output_item.added (message)
-                    msg_item = ResponseMessageItem(
-                        id=message_id, status="in_progress", content=[]
-                    )
-                    yield _evt(
-                        "response.output_item.added",
-                        ResponsesOutputItemAddedEvent(output_index=0, item=msg_item),
-                    )
-
-                    # content_part.added
-                    empty_part = ResponseContentPartOutputText(text="")
-                    yield _evt(
-                        "response.content_part.added",
-                        ResponsesContentPartAddedEvent(
-                            item_id=message_id,
-                            output_index=0,
-                            content_index=0,
-                            part=empty_part,
-                        ),
-                    )
-                    cache_state = get_prompt_cache_state(
-                        request.model, getattr(request, "prompt_cache_key", None)
-                    )
-                    token_iterator = stream_generate(
-                        model=model,
-                        processor=processor,
-                        prompt=formatted_prompt,
-                        image=images,
-                        vision_cache=model_cache.get("vision_cache"),
-                        prompt_cache_state=cache_state,
-                        **generation_kwargs,
-                    )
-
-                    full_text = ""
-                    visible_text = ""
-                    usage_stats = {"input_tokens": 0, "output_tokens": 0}
-                    in_tool_call = False
-                    tool_call_start_tag = (
-                        tool_module.tool_call_start if tool_module else "<tool_call>"
-                    )
-
-                    for chunk in token_iterator:
-                        if chunk is None or not hasattr(chunk, "text"):
-                            continue
-
-                        delta = chunk.text
-                        full_text += delta
-                        usage_stats = {
-                            "input_tokens": chunk.prompt_tokens,
-                            "output_tokens": chunk.generation_tokens,
-                        }
-
-                        # Suppress tool call tokens from being streamed as text
-                        if not in_tool_call and tool_call_start_tag in full_text:
-                            in_tool_call = True
-                        if in_tool_call:
-                            continue
-
-                        # Check if this delta starts a tool call tag
-                        # (partial match: buffer might end with "<tool" before "_call>")
-                        if tools and tool_call_start_tag[:1] in delta:
-                            pending = full_text[
-                                -(len(delta) + len(tool_call_start_tag)) :
-                            ]
-                            if any(
-                                tool_call_start_tag[:i] == pending[-i:]
-                                for i in range(2, len(tool_call_start_tag) + 1)
-                            ):
-                                continue
-
-                        visible_text += delta
-                        yield _evt(
-                            "response.output_text.delta",
-                            ResponsesOutputTextDeltaEvent(
-                                item_id=message_id,
-                                output_index=0,
-                                content_index=0,
-                                delta=delta,
-                            ),
-                        )
-
-                    # Determine finish reason
-                    max_tok = request.max_output_tokens
-                    is_length = usage_stats["output_tokens"] >= max_tok
-                    status = "incomplete" if is_length else "completed"
-
-                    # Use visible_text (sans tool call markup) for text events
-                    display_text = visible_text
-
-                    # output_text.done
-                    yield _evt(
-                        "response.output_text.done",
-                        ResponsesOutputTextDoneEvent(
-                            item_id=message_id,
-                            output_index=0,
-                            content_index=0,
-                            text=display_text,
-                        ),
-                    )
-
-                    # content_part.done
-                    final_part = ResponseContentPartOutputText(text=display_text)
-                    yield _evt(
-                        "response.content_part.done",
-                        ResponsesContentPartDoneEvent(
-                            item_id=message_id,
-                            output_index=0,
-                            content_index=0,
-                            part=final_part,
-                        ),
-                    )
-
-                    # output_item.done (message)
-                    final_msg = ResponseMessageItem(
-                        id=message_id,
-                        status="completed",
-                        content=[final_part],
-                    )
-                    yield _evt(
-                        "response.output_item.done",
-                        ResponsesOutputItemDoneEvent(output_index=0, item=final_msg),
-                    )
-
-                    # Collect all output items for final response
-                    all_output_items: list = [final_msg]
-
-                    # Parse tool calls from accumulated text
-                    if tool_parser_type and tool_module and tools:
-                        try:
-                            tc_result = process_tool_calls(
-                                full_text, tool_module, tools
-                            )
-                            if tc_result["calls"]:
-                                for idx, call in enumerate(tc_result["calls"]):
-                                    func_info = call.get("function", {})
-                                    fc_item = ResponseFunctionCallItem(
-                                        name=func_info.get("name", ""),
-                                        arguments=func_info.get("arguments", "{}"),
-                                        call_id=call.get(
-                                            "id", f"call_{uuid.uuid4().hex[:24]}"
-                                        ),
-                                    )
-                                    out_idx = len(all_output_items)
-
-                                    # output_item.added (function_call)
-                                    yield _evt(
-                                        "response.output_item.added",
-                                        ResponsesOutputItemAddedEvent(
-                                            output_index=out_idx, item=fc_item
-                                        ),
-                                    )
-
-                                    # function_call_arguments.delta (full arguments in one shot)
-                                    yield _evt(
-                                        "response.function_call_arguments.delta",
-                                        ResponsesFunctionCallArgumentsDeltaEvent(
-                                            item_id=fc_item.id,
-                                            output_index=out_idx,
-                                            delta=fc_item.arguments,
-                                        ),
-                                    )
-
-                                    # function_call_arguments.done
-                                    yield _evt(
-                                        "response.function_call_arguments.done",
-                                        ResponsesFunctionCallArgumentsDoneEvent(
-                                            item_id=fc_item.id,
-                                            output_index=out_idx,
-                                            arguments=fc_item.arguments,
-                                        ),
-                                    )
-
-                                    # output_item.done (function_call)
-                                    yield _evt(
-                                        "response.output_item.done",
-                                        ResponsesOutputItemDoneEvent(
-                                            output_index=out_idx, item=fc_item
-                                        ),
-                                    )
-
-                                    all_output_items.append(fc_item)
-                        except Exception:
-                            pass  # Tool parsing failure is non-fatal in streaming
-
-                    # response.completed
-                    total_tokens = (
-                        usage_stats["input_tokens"] + usage_stats["output_tokens"]
-                    )
-                    completed_response = base_response.model_copy(
-                        update={
-                            "status": status,
-                            "output": all_output_items,
-                            "incomplete_details": (
-                                ResponseIncompleteDetails(reason="max_output_tokens")
-                                if status == "incomplete"
-                                else None
-                            ),
-                            "usage": ResponseUsage(
-                                input_tokens=usage_stats["input_tokens"],
-                                output_tokens=usage_stats["output_tokens"],
-                                total_tokens=total_tokens,
-                            ),
-                        }
-                    )
-                    yield _evt(
-                        "response.completed",
-                        ResponsesCompletedEvent(response=completed_response),
-                    )
-
-                    # Save to store for previous_response_id
-                    _responses_store.save(
-                        response_id,
-                        (
-                            request.input
-                            if isinstance(request.input, str)
-                            else [
-                                (
-                                    item.model_dump()
-                                    if hasattr(item, "model_dump")
-                                    else item
-                                )
-                                for item in request.input
-                            ]
-                        ),
-                        [item.model_dump() for item in all_output_items],
-                    )
-
-                    # Final sentinel
-                    yield "data: [DONE]\n\n"
-
-                except Exception as e:
-                    print(f"Error during stream generation: {e}")
-                    traceback.print_exc()
-                    error_data = json.dumps({"error": "Internal generation error"})
-                    yield f"data: {error_data}\n\n"
-
-                finally:
-                    mx.clear_cache()
-                    gc.collect()
-                    if sem is not None:
-                        sem.release()
-                    if _verbose:
-                        print("Stream finished, cleared cache.")
-
-            return StreamingResponse(
-                stream_responses_generator(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
-            )
-
-        else:
-            # ----------------------------------------------------------
-            # Non-streaming response
-            # ----------------------------------------------------------
-            sem = None
-            try:
-                sem = await acquire_semaphore()
-                cache_state = get_prompt_cache_state(
-                    request.model, getattr(request, "prompt_cache_key", None)
-                )
-                result = generate(
-                    model=model,
-                    processor=processor,
-                    prompt=formatted_prompt,
-                    image=images,
-                    verbose=False,
-                    vision_cache=model_cache.get("vision_cache"),
-                    prompt_cache_state=cache_state,
-                    **generation_kwargs,
-                )
-                mx.clear_cache()
-                gc.collect()
-                if _verbose:
-                    print("Generation finished, cleared cache.")
-
-                # Build output items (with tool call parsing)
-                output_items = build_responses_output(
-                    result.text,
-                    tool_parser_type,
-                    tool_module,
-                    tools,
-                )
-
-                # Determine status
-                is_length = result.generation_tokens >= request.max_output_tokens
-                status = "incomplete" if is_length else "completed"
-                incomplete_details = (
-                    ResponseIncompleteDetails(reason="max_output_tokens")
-                    if status == "incomplete"
-                    else None
-                )
-
-                response_obj = ResponseObject(
-                    id=response_id,
-                    created_at=generated_at,
-                    model=request.model,
-                    output=output_items,
-                    status=status,
-                    incomplete_details=incomplete_details,
-                    instructions=request.instructions,
-                    max_output_tokens=request.max_output_tokens,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    tools=tools or [],
-                    tool_choice=request.tool_choice,
-                    parallel_tool_calls=request.parallel_tool_calls,
-                    previous_response_id=request.previous_response_id,
-                    metadata=request.metadata,
-                    usage=ResponseUsage(
-                        input_tokens=result.prompt_tokens,
-                        output_tokens=result.generation_tokens,
-                        total_tokens=result.total_tokens,
-                        input_tokens_details=InputTokensDetails(
-                            cached_tokens=getattr(result, "cached_tokens", 0),
-                        ),
-                    ),
-                )
-
-                # Save to store for previous_response_id support
-                _responses_store.save(
-                    response_obj.id,
-                    (
-                        request.input
-                        if isinstance(request.input, str)
-                        else [
-                            item.model_dump() if hasattr(item, "model_dump") else item
-                            for item in request.input
-                        ]
-                    ),
-                    [item.model_dump() for item in output_items],
-                )
-
-                return response_obj.model_dump()
-
-            except Exception as e:
-                print(f"Error during generation: {e}")
-                traceback.print_exc()
-                mx.clear_cache()
-                gc.collect()
-                raise HTTPException(status_code=500, detail="Generation failed. Check server logs for details.")
-            finally:
-                if sem is not None:
-                    sem.release()
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Unexpected error in /responses endpoint: {e}")
-        traceback.print_exc()
-        mx.clear_cache()
-        gc.collect()
-        raise HTTPException(
-            status_code=500, detail=f"An unexpected error occurred: {e}"
+        logger.debug(
+            "responses request: model=%s images=%d max_tokens=%s temp=%s stream=%s",
+            openai_request.model,
+            len(images),
+            gen_args.max_tokens,
+            gen_args.temperature,
+            openai_request.stream,
         )
 
+        generated_at = datetime.now().timestamp()
+        response_id = f"resp_{uuid.uuid4().hex}"
+        message_id = f"msg_{uuid.uuid4().hex}"
 
-@app.post(
-    "/chat/completions", response_model=None
-)  # Response model handled dynamically based on stream flag
-@app.post("/v1/chat/completions", response_model=None, include_in_schema=False)
-async def chat_completions_endpoint(request: ChatRequest):
-    """
-    Generate text based on a prompt and optional images.
-    Prompt must be a list of chat messages, including system, user, and assistant messages.
-    System message will be ignored if not already in the prompt.
-    Can operate in streaming or non-streaming mode.
-    """
-    # Resolve default max tokens if not specified in request
-    if request.max_tokens is None:
-        request.max_tokens = get_default_max_tokens()
-
-    try:
-        # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(request.model, request.adapter_path)
-
-        images = []
-        audio = []
-        processed_messages = []
-        for message in request.messages:
-            if message.content is None:
-                processed_messages.append({"role": message.role, "content": ""})
-            elif isinstance(message.content, str):
-                processed_messages.append(
-                    {"role": message.role, "content": message.content}
-                )
-            elif isinstance(message.content, list):
-                text_content = ""
-                for item in message.content:
-                    if isinstance(item, dict):
-                        # Only extract images/audio from user messages
-                        if message.role == "user":
-                            if item["type"] == "input_image":
-                                images = [item["image_url"]]
-                            elif item["type"] == "image_url":
-                                images = [item["image_url"]["url"]]
-                            elif item["type"] == "input_audio":
-                                audio.append(item["input_audio"]["data"])
-                        if item["type"] in ("text", "input_text"):
-                            text_content = item.get("text", "")
-                processed_messages.append(
-                    {"role": message.role, "content": text_content}
-                )
-
-        tools = None
-        if hasattr(request, "tools"):
-            tools = request.tools
-
-        # Apply tool_choice policy
-        tool_choice = getattr(request, "tool_choice", None)
-        tools, tool_instruction = resolve_tool_choice(tools, tool_choice)
-        if tool_instruction:
-            processed_messages.insert(
-                0, {"role": "system", "content": tool_instruction}
-            )
-
-        tool_parser_type = None
-        tokenizer = (
-            processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        )
-        if hasattr(tokenizer, "chat_template"):
-            tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
-            if tool_parser_type is not None:
-                tool_module = load_tool_module(tool_parser_type)
-        template_kwargs = request.template_kwargs()
-        formatted_prompt = apply_chat_template(
-            processor,
-            config,
-            processed_messages,
-            num_images=len(images),
-            num_audios=len(audio),
-            tools=tools,
-            **template_kwargs,
-        )
-        generation_kwargs = build_generation_kwargs(request, template_kwargs)
-
-        check_context_length(formatted_prompt, processor, get_max_context_tokens())
-
-        # Resolve stop sequences to token IDs
-        stop_seqs = resolve_stop_sequences(getattr(request, "stop", None))
-        if stop_seqs:
-            generation_kwargs["eos_tokens"] = stop_seqs
-
-        if request.stream:
+        if openai_request.stream:
             # Streaming response
             async def stream_generator():
-                sem = None
                 token_iterator = None
+                token_iter = None  # For ResponseGenerator cleanup
                 try:
-                    sem = await acquire_semaphore()
-                    # Use stream_generate with prompt cache reuse
-                    cache_state = get_prompt_cache_state(
-                        request.model, getattr(request, "prompt_cache_key", None)
+                    # Create base response object (to match the openai pipeline)
+                    base_response = OpenAIResponse(
+                        id=response_id,
+                        object="response",
+                        created_at=int(generated_at),
+                        status="in_progress",
+                        instructions=instructions,
+                        max_output_tokens=openai_request.max_output_tokens,
+                        model=openai_request.model,
+                        output=[],
+                        output_text="",
+                        temperature=openai_request.temperature,
+                        top_p=openai_request.top_p,
+                        usage={
+                            "input_tokens": 0,  # get prompt tokens
+                            "output_tokens": 0,
+                            "total_tokens": 0,
+                        },
                     )
-                    token_iterator = stream_generate(
-                        model=model,
-                        processor=processor,
-                        prompt=formatted_prompt,
-                        image=images,
-                        audio=audio,
-                        vision_cache=model_cache.get("vision_cache"),
-                        prompt_cache_state=cache_state,
-                        **generation_kwargs,
+
+                    # Send response.created event  (to match the openai pipeline)
+                    yield f"event: response.created\ndata: {ResponseCreatedEvent(type='response.created', response=base_response).model_dump_json()}\n\n"
+
+                    # Send response.in_progress event  (to match the openai pipeline)
+                    yield f"event: response.in_progress\ndata: {ResponseInProgressEvent(type='response.in_progress', response=base_response).model_dump_json()}\n\n"
+
+                    # Send response.output_item.added event  (to match the openai pipeline)
+                    message_item = MessageItem(
+                        id=message_id,
+                        type="message",
+                        status="in_progress",
+                        role="assistant",
+                        content=[],
                     )
+                    yield f"event: response.output_item.added\ndata: {ResponseOutputItemAddedEvent(type='response.output_item.added', output_index=0, item=message_item).model_dump_json()}\n\n"
 
-                    output_text = ""
-                    request_id = f"chatcmpl-{uuid.uuid4()}"
-                    want_logprobs = getattr(request, "logprobs", None)
-                    for chunk in token_iterator:
-                        if chunk is None or not hasattr(chunk, "text"):
-                            if _verbose:
-                                print("Warning: Received unexpected chunk format:", chunk)
-                            continue
+                    # Send response.content_part.added event
+                    content_part = ContentPartOutputText(
+                        type="output_text", text="", annotations=[]
+                    )
+                    yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=0, content_index=0, part=content_part).model_dump_json()}\n\n"
 
-                        output_text += chunk.text
+                    # Stream text deltas using ResponseGenerator (continuous batching)
+                    full_text = ""
+                    usage_stats = {"input_tokens": 0, "output_tokens": 0}
 
-                        # Yield chunks in Server-Sent Events (SSE) format
-                        usage_stats = {
-                            "input_tokens": chunk.prompt_tokens,
-                            "output_tokens": chunk.generation_tokens,
-                            "total_tokens": chunk.prompt_tokens
-                            + chunk.generation_tokens,
-                            "prompt_tps": chunk.prompt_tps,
-                            "generation_tps": chunk.generation_tps,
-                            "peak_memory": chunk.peak_memory,
-                        }
-
-                        chunk_logprobs = None
-                        if want_logprobs and chunk.token is not None and chunk.logprobs is not None:
-                            token_text = tokenizer.decode([chunk.token])
-                            chosen_logprob = float(chunk.logprobs[chunk.token])
-                            chunk_logprobs = ChoiceLogprobs(
-                                content=[
-                                    TokenLogprob(
-                                        token=token_text,
-                                        logprob=chosen_logprob,
-                                        bytes=list(token_text.encode("utf-8")),
-                                    )
-                                ]
-                            )
-
-                        choices = [
-                            ChatStreamChoice(
-                                delta=ChatMessage(role="assistant", content=chunk.text),
-                                logprobs=chunk_logprobs,
-                            )
-                        ]
-                        chunk_data = ChatStreamChunk(
-                            id=request_id,
-                            created=int(time.time()),
-                            model=request.model,
-                            usage=usage_stats,
-                            choices=choices,
+                    if response_generator is not None and not stop_seqs:
+                        ctx, token_iter = response_generator.generate(
+                            prompt=formatted_prompt,
+                            images=images if images else None,
+                            args=gen_args,
                         )
 
-                        yield f"data: {chunk_data.model_dump_json()}\n\n"
+                        output_tokens = 0
+                        for token in token_iter:
+                            output_tokens += 1
+                            delta = token.text
+                            full_text += delta
+                            usage_stats = {
+                                "input_tokens": ctx.prompt_tokens,
+                                "output_tokens": output_tokens,
+                            }
 
-                    if tool_parser_type is not None:
-                        tool_calls = process_tool_calls(
-                            model_output=output_text,
-                            tool_module=tool_module,
-                            tools=tools,
-                        )
+                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                            await asyncio.sleep(0.01)
+
+                            if token.finish_reason:
+                                break
                     else:
-                        tool_calls = {}
-                        tool_calls["calls"] = []
-
-                    # Signal stream end with correct finish_reason
-                    stream_finish = "tool_calls" if tool_calls.get("calls") else "stop"
-                    choices = [
-                        ChatStreamChoice(
-                            finish_reason=stream_finish,
-                            delta=ChatMessage(
-                                role="assistant",
-                                content="",
-                                tool_calls=tool_calls["calls"],
-                            ),
+                        # Fallback to stream_generate
+                        token_iterator = stream_generate(
+                            model=model,
+                            processor=processor,
+                            prompt=formatted_prompt,
+                            image=images,
+                            vision_cache=model_cache.get("vision_cache"),
+                            **gen_args.to_generate_kwargs(),
+                            **kwargs,
                         )
-                    ]
 
-                    chunk_data = ChatStreamChunk(
-                        id=request_id,
-                        created=int(time.time()),
-                        model=request.model,
-                        usage=usage_stats,
-                        choices=choices,
+                        for chunk in token_iterator:
+                            if chunk is None or not hasattr(chunk, "text"):
+                                continue
+
+                            delta = chunk.text
+                            full_text += delta
+                            usage_stats = {
+                                "input_tokens": chunk.prompt_tokens,
+                                "output_tokens": chunk.generation_tokens,
+                            }
+
+                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                            await asyncio.sleep(0.01)
+
+                    # Split thinking from content for final events
+                    _, clean_text = _split_thinking(full_text)
+
+                    # Send response.output_text.done event (to match the openai pipeline)
+                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text).model_dump_json()}\n\n"
+
+                    # Send response.content_part.done event (to match the openai pipeline)
+                    final_content_part = ContentPartOutputText(
+                        type="output_text", text=clean_text, annotations=[]
                     )
-                    yield f"data: {chunk_data.model_dump_json()}\n\n"
+                    yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=0, content_index=0, part=final_content_part).model_dump_json()}\n\n"
 
-                    yield "data: [DONE]\n\n"
+                    # Send response.output_item.done event (to match the openai pipeline)
+                    final_message_item = MessageItem(
+                        id=message_id,
+                        type="message",
+                        status="completed",
+                        role="assistant",
+                        content=[final_content_part],
+                    )
+                    yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_item).model_dump_json()}\n\n"
+
+                    # Send response.completed event (to match the openai pipeline)
+                    completed_response = base_response.model_copy(
+                        update={
+                            "status": "completed",
+                            "output": [final_message_item],
+                            "usage": {
+                                "input_tokens": usage_stats["input_tokens"],
+                                "output_tokens": usage_stats["output_tokens"],
+                                "total_tokens": usage_stats["input_tokens"]
+                                + usage_stats["output_tokens"],
+                            },
+                        }
+                    )
+                    yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
 
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
-                    error_data = json.dumps({"error": "Internal generation error"})
+                    error_data = json.dumps({"error": str(e)})
                     yield f"data: {error_data}\n\n"
 
                 finally:
+                    if token_iter is not None:
+                        try:
+                            token_iter.close()
+                        except Exception:
+                            pass
                     mx.clear_cache()
                     gc.collect()
-                    if sem is not None:
-                        sem.release()
-                    if _verbose:
-                        print("Stream finished, cleared cache.")
+                    print("Stream finished, cleared cache.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -2008,44 +1897,513 @@ async def chat_completions_endpoint(request: ChatRequest):
 
         else:
             # Non-streaming response
-            sem = None
             try:
-                sem = await acquire_semaphore()
-                want_logprobs = getattr(request, "logprobs", None)
-                cache_state = get_prompt_cache_state(
-                    request.model, getattr(request, "prompt_cache_key", None)
-                )
-                token_logprobs = []
+                full_text = ""
+                prompt_tokens = 0
+                output_tokens = 0
 
-                if want_logprobs:
-                    # Use stream_generate to collect per-token logprobs
-                    full_text = ""
-                    gen_result = None
-                    for chunk in stream_generate(
+                if response_generator is not None and not stop_seqs:
+                    ctx, token_iter = response_generator.generate(
+                        prompt=formatted_prompt,
+                        images=images if images else None,
+                        args=gen_args,
+                    )
+                    prompt_tokens = ctx.prompt_tokens
+                    for token in token_iter:
+                        full_text += token.text
+                        output_tokens += 1
+                        if token.finish_reason:
+                            break
+                    try:
+                        token_iter.close()
+                    except Exception:
+                        pass
+                else:
+                    result = generate(
                         model=model,
                         processor=processor,
                         prompt=formatted_prompt,
                         image=images,
-                        audio=audio,
+                        verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=model_cache.get("vision_cache"),
-                        prompt_cache_state=cache_state,
-                        **generation_kwargs,
-                    ):
-                        if chunk is None or not hasattr(chunk, "text"):
-                            continue
-                        full_text += chunk.text
-                        if chunk.token is not None and chunk.logprobs is not None:
-                            token_text = tokenizer.decode([chunk.token])
-                            chosen_logprob = float(chunk.logprobs[chunk.token])
-                            token_logprobs.append(
-                                TokenLogprob(
-                                    token=token_text,
-                                    logprob=chosen_logprob,
-                                    bytes=list(token_text.encode("utf-8")),
-                                )
+                        **gen_args.to_generate_kwargs(),
+                        **kwargs,
+                    )
+                    full_text = result.text
+                    prompt_tokens = result.prompt_tokens
+                    output_tokens = result.generation_tokens
+
+                mx.clear_cache()
+                gc.collect()
+
+                reasoning, content = _split_thinking(full_text)
+
+                response = OpenAIResponse(
+                    id=response_id,
+                    object="response",
+                    created_at=int(generated_at),
+                    status="completed",
+                    instructions=instructions,
+                    max_output_tokens=openai_request.max_output_tokens,
+                    model=openai_request.model,
+                    output=[
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": content,
+                                }
+                            ],
+                            "reasoning": reasoning,
+                        }
+                    ],
+                    output_text=content,
+                    temperature=openai_request.temperature,
+                    top_p=openai_request.top_p,
+                    usage={
+                        "input_tokens": prompt_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": prompt_tokens + output_tokens,
+                    },
+                )
+
+                elapsed = time.perf_counter() - request_start
+                logger.debug(
+                    "responses done: prompt_tokens=%d output_tokens=%d "
+                    "total_time=%.2fs",
+                    prompt_tokens,
+                    output_tokens,
+                    elapsed,
+                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    resp_text = content or ""
+                    logger.debug(
+                        "  response: %s",
+                        resp_text[:200] + ("..." if len(resp_text) > 200 else ""),
+                    )
+
+                return response
+
+            except Exception as e:
+                print(f"Error during generation: {e}")
+                traceback.print_exc()
+                mx.clear_cache()
+                gc.collect()
+                raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        print(f"Unexpected error in /responses endpoint: {e}")
+        traceback.print_exc()
+        mx.clear_cache()
+        gc.collect()
+        raise HTTPException(
+            status_code=500, detail=f"An unexpected error occurred: {e}"
+        )
+
+
+@app.post("/chat/completions", response_model=None)
+@app.post("/v1/chat/completions", response_model=None, include_in_schema=False)
+async def chat_completions_endpoint(request: ChatRequest):
+    """
+    Generate text based on a prompt and optional images.
+    Prompt must be a list of chat messages, including system, user, and assistant messages.
+    System message will be ignored if not already in the prompt.
+    Can operate in streaming or non-streaming mode.
+    """
+
+    request_start = time.perf_counter()
+    try:
+        adapter_path = (
+            request.adapter_path
+            if "adapter_path" in request.model_fields_set
+            else _INHERIT_ADAPTER
+        )
+        model, processor, config = get_cached_model(request.model, adapter_path)
+
+        kwargs = {}
+
+        if request.resize_shape is not None:
+            if len(request.resize_shape) not in [1, 2]:
+                raise HTTPException(
+                    status_code=400,
+                    detail="resize_shape must contain exactly two integers (height, width)",
+                )
+            kwargs["resize_shape"] = (
+                (request.resize_shape[0],) * 2
+                if len(request.resize_shape) == 1
+                else tuple(request.resize_shape)
+            )
+
+        images = []
+        audio = []
+        processed_messages = []
+        for message in request.messages:
+            msg = {"role": message.role}
+
+            if isinstance(message.content, str):
+                msg["content"] = message.content
+            elif isinstance(message.content, list):
+                text_content = ""
+                for item in message.content:
+                    if isinstance(item, dict):
+                        if message.role == "user":
+                            if item["type"] == "input_image":
+                                images.append(item["image_url"])
+                            elif item["type"] == "image_url":
+                                images.append(item["image_url"]["url"])
+                            elif item["type"] == "input_audio":
+                                audio.append(item["input_audio"]["data"])
+                        if item["type"] in ("text", "input_text"):
+                            text_content = item.get("text", "")
+                msg["content"] = text_content
+            else:
+                msg["content"] = message.content
+
+            # Preserve tool-calling metadata.
+            # Ensure arguments are dicts (not JSON strings) for Jinja templates
+            # that iterate them with |items (e.g. Qwen3.5).
+            if message.tool_calls is not None:
+                normalized_calls = []
+                for tc in message.tool_calls:
+                    tc = dict(tc) if isinstance(tc, dict) else tc
+                    if isinstance(tc, dict) and "function" in tc:
+                        fn = dict(tc["function"])
+                        args = fn.get("arguments", {})
+                        if isinstance(args, str):
+                            try:
+                                fn["arguments"] = json.loads(args)
+                            except (json.JSONDecodeError, TypeError):
+                                fn["arguments"] = {}
+                        tc["function"] = fn
+                    normalized_calls.append(tc)
+                msg["tool_calls"] = normalized_calls
+            if message.tool_call_id is not None:
+                msg["tool_call_id"] = message.tool_call_id
+            if message.name is not None:
+                msg["name"] = message.name
+
+            processed_messages.append(msg)
+
+        tools = getattr(request, "tools", None)
+        tools, tool_instruction = resolve_tool_choice(tools, request.tool_choice)
+        if tool_instruction:
+            processed_messages.insert(0, {"role": "system", "content": tool_instruction})
+        processed_messages = resolve_response_format(
+            processed_messages, request.response_format
+        )
+
+        # Detect tool parser from chat template
+        tool_parser_type = None
+        tool_module = None
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+            tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
+            if tool_parser_type is not None:
+                tool_module = load_tool_module(tool_parser_type)
+
+        gen_args = _build_gen_args(request)
+        stop_seqs = resolve_stop_sequences(request.stop)
+        if stop_seqs:
+            kwargs["eos_tokens"] = stop_seqs
+
+        formatted_prompt = apply_chat_template(
+            processor,
+            config,
+            processed_messages,
+            num_images=len(images),
+            num_audios=len(audio),
+            tools=tools,
+            **gen_args.to_template_kwargs(),
+        )
+        check_context_length(formatted_prompt, processor, get_max_context_tokens())
+
+        logger.debug(
+            "chat/completions request: model=%s images=%d audio=%d "
+            "max_tokens=%s temp=%s stream=%s",
+            request.model,
+            len(images),
+            len(audio),
+            gen_args.max_tokens,
+            gen_args.temperature,
+            request.stream,
+        )
+
+        if request.stream:
+            # Streaming response using ResponseGenerator for continuous batching
+            async def stream_generator():
+                global response_generator
+                token_iterator = None
+                token_iter = None  # For ResponseGenerator cleanup
+                try:
+                    # Use ResponseGenerator if available, otherwise fall back to stream_generate
+                    if response_generator is not None and not stop_seqs:
+                        # generate() does blocking Queue.get — run off event loop
+                        ctx, token_iter = await asyncio.to_thread(
+                            response_generator.generate,
+                            formatted_prompt,
+                            images if images else None,
+                            audio if audio else None,
+                            gen_args,
+                        )
+
+                        output_tokens = 0
+                        request_id = f"chatcmpl-{uuid.uuid4()}"
+                        # Track thinking state for reasoning/content split
+                        in_thinking = False
+                        accumulated = ""
+                        full_output = ""  # raw output for tool call parsing
+                        # Track tool-call state to suppress markup from content
+                        in_tool_call = False
+                        tc_start = tool_module.tool_call_start if tool_module else None
+                        tc_end = tool_module.tool_call_end if tool_module else None
+
+                        def _next_token():
+                            try:
+                                return next(token_iter)
+                            except StopIteration:
+                                return None
+
+                        while True:
+                            token = await asyncio.to_thread(_next_token)
+                            if token is None:
+                                break
+                            output_tokens += 1
+                            accumulated += token.text
+                            full_output += token.text
+
+                            # Detect thinking boundaries
+                            delta_reasoning = None
+                            delta_content = None
+
+                            if not in_thinking and (
+                                "<|channel>thought" in accumulated
+                                or "<think>" in accumulated
+                            ):
+                                in_thinking = True
+                                accumulated = ""
+                                # Don't emit opening tag tokens
+                            elif in_thinking and (
+                                "<channel|>" in accumulated or "</think>" in accumulated
+                            ):
+                                in_thinking = False
+                                accumulated = ""
+                                # Don't emit closing tag tokens
+                            elif in_thinking:
+                                delta_reasoning = token.text
+                            elif not in_thinking and (
+                                "<|channel>" in accumulated or "<think" in accumulated
+                            ):
+                                pass  # Partial tag, don't emit yet
+                            else:
+                                delta_content = token.text
+
+                            # Suppress tool-call markup from content
+                            in_tool_call, delta_content = suppress_tool_call_content(
+                                full_output, in_tool_call, tc_start, delta_content
                             )
-                        gen_result = chunk
-                    gen_result.text = full_text
+
+                            chunk_logprobs = None
+                            if request.logprobs and token.finish_reason != "stop":
+                                req_top_k = int(request.top_logprobs or 0)
+                                chunk_logprobs = ChatLogprobs(
+                                    content=[
+                                        _make_logprob_content(
+                                            response_generator.tokenizer,
+                                            token.token,
+                                            token.logprobs,
+                                            top_logprobs=token.top_logprobs,
+                                            top_k=req_top_k,
+                                        )
+                                    ]
+                                )
+
+                            # Skip empty deltas (e.g. suppressed tool-call tokens)
+                            has_payload = (
+                                delta_content is not None
+                                or delta_reasoning is not None
+                                or token.finish_reason is not None
+                                or chunk_logprobs is not None
+                            )
+                            if has_payload:
+                                choices = [
+                                    ChatStreamChoice(
+                                        finish_reason=token.finish_reason,
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            content=delta_content,
+                                            reasoning=delta_reasoning,
+                                        ),
+                                        logprobs=chunk_logprobs,
+                                    )
+                                ]
+                                chunk_data = ChatStreamChunk(
+                                    id=request_id,
+                                    created=int(time.time()),
+                                    model=request.model,
+                                    usage={
+                                        "prompt_tokens": ctx.prompt_tokens,
+                                        "completion_tokens": output_tokens,
+                                        "total_tokens": ctx.prompt_tokens
+                                        + output_tokens,
+                                    },
+                                    choices=choices,
+                                )
+
+                                yield f"data: {chunk_data.model_dump_json()}\n\n"
+
+                            if token.finish_reason:
+                                break
+
+                        # Parse tool calls from full output and emit final chunk
+                        if tool_module is not None:
+                            tc = process_tool_calls(full_output, tool_module, tools)
+                            if tc["calls"]:
+                                choices = [
+                                    ChatStreamChoice(
+                                        finish_reason="tool_calls",
+                                        delta=ChatMessage(
+                                            role="assistant",
+                                            tool_calls=tc["calls"],
+                                        ),
+                                    )
+                                ]
+                                chunk_data = ChatStreamChunk(
+                                    id=request_id,
+                                    created=int(time.time()),
+                                    model=request.model,
+                                    choices=choices,
+                                )
+                                yield f"data: {chunk_data.model_dump_json()}\n\n"
+                    else:
+                        # Fallback to stream_generate
+                        token_iterator = stream_generate(
+                            model=model,
+                            processor=processor,
+                            prompt=formatted_prompt,
+                            image=images,
+                            audio=audio,
+                            vision_cache=model_cache.get("vision_cache"),
+                            **gen_args.to_generate_kwargs(),
+                            **kwargs,
+                        )
+
+                        request_id = f"chatcmpl-{uuid.uuid4()}"
+                        output_text = ""
+                        for chunk in token_iterator:
+                            if chunk is None or not hasattr(chunk, "text"):
+                                continue
+
+                            output_text += chunk.text
+
+                            choices = [
+                                ChatStreamChoice(
+                                    delta=ChatMessage(
+                                        role="assistant", content=chunk.text
+                                    )
+                                )
+                            ]
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                usage={
+                                    "prompt_tokens": chunk.prompt_tokens,
+                                    "completion_tokens": chunk.generation_tokens,
+                                    "total_tokens": chunk.prompt_tokens
+                                    + chunk.generation_tokens,
+                                },
+                                choices=choices,
+                            )
+
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+                            await asyncio.sleep(0.01)
+
+                    # Signal stream end
+                    yield "data: [DONE]\n\n"
+
+                    elapsed = time.perf_counter() - request_start
+                    logger.debug(
+                        "chat/completions stream done: tokens=%d " "total_time=%.2fs",
+                        output_tokens,
+                        elapsed,
+                    )
+
+                except Exception as e:
+                    print(f"Error during stream generation: {e}")
+                    traceback.print_exc()
+                    error_data = json.dumps({"error": str(e)})
+                    yield f"data: {error_data}\n\n"
+
+                finally:
+                    # Close the token iterator to trigger cleanup (important for ResponseGenerator)
+                    if token_iter is not None:
+                        try:
+                            token_iter.close()
+                        except Exception:
+                            pass
+                    mx.clear_cache()
+                    gc.collect()
+                    print("Stream finished, cleared cache.")
+
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        else:
+            # Non-streaming response
+            try:
+                full_text = ""
+                prompt_tokens = 0
+                output_tokens = 0
+                peak_memory = 0.0
+
+                collected_logprobs: List[
+                    Tuple[int, float, Optional[List[Tuple[int, float]]]]
+                ] = []
+
+                if response_generator is not None and not stop_seqs:
+
+                    def _blocking_generate():
+                        text = ""
+                        pt = gt = 0
+                        pm = 0.0
+                        ctx, token_iter = response_generator.generate(
+                            prompt=formatted_prompt,
+                            images=images if images else None,
+                            audio=audio if audio else None,
+                            args=gen_args,
+                        )
+                        pt = ctx.prompt_tokens
+                        for token in token_iter:
+                            text += token.text
+                            gt += 1
+                            pm = token.peak_memory
+                            if request.logprobs and token.finish_reason != "stop":
+                                collected_logprobs.append(
+                                    (token.token, token.logprobs, token.top_logprobs)
+                                )
+                            if token.finish_reason:
+                                break
+                        try:
+                            token_iter.close()
+                        except Exception:
+                            pass
+                        return text, pt, gt, pm
+
+                    full_text, prompt_tokens, output_tokens, peak_memory = (
+                        await asyncio.to_thread(_blocking_generate)
+                    )
                 else:
                     gen_result = generate(
                         model=model,
@@ -2053,56 +2411,108 @@ async def chat_completions_endpoint(request: ChatRequest):
                         prompt=formatted_prompt,
                         image=images,
                         audio=audio,
-                        verbose=False,
+                        verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=model_cache.get("vision_cache"),
-                        prompt_cache_state=cache_state,
-                        **generation_kwargs,
+                        **gen_args.to_generate_kwargs(),
+                        **kwargs,
                     )
+                    full_text = gen_result.text
+                    prompt_tokens = gen_result.prompt_tokens
+                    output_tokens = gen_result.generation_tokens
+                    peak_memory = gen_result.peak_memory
 
-                # Clean up resources
                 mx.clear_cache()
                 gc.collect()
 
-                usage_stats = UsageStats(
-                    input_tokens=gen_result.prompt_tokens,
-                    output_tokens=gen_result.generation_tokens,
-                    total_tokens=gen_result.total_tokens,
-                    prompt_tps=gen_result.prompt_tps,
-                    generation_tps=gen_result.generation_tps,
-                    peak_memory=gen_result.peak_memory,
+                reasoning, content = _split_thinking(full_text)
+
+                # Count raw generated tokens minus thinking tag tokens
+                completion_tokens = output_tokens - _count_thinking_tag_tokens(
+                    full_text
                 )
 
-                if tool_parser_type is not None:
-                    tool_calls = process_tool_calls(
-                        model_output=gen_result.text,
+                usage_stats = UsageStats(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                    peak_memory=peak_memory,
+                )
+
+                # Parse tool calls from generated output
+                parsed_tool_calls = None
+                if tool_module is not None:
+                    tc = process_tool_calls(
+                        model_output=full_text,
                         tool_module=tool_module,
                         tools=tools,
                     )
-                else:
-                    tool_calls = {}
-                    tool_calls["calls"] = []
-                    tool_calls["remaining_text"] = gen_result.text
+                    if tc["calls"]:
+                        parsed_tool_calls = tc["calls"]
+                        # Clean thinking tags and control tokens from remaining text
+                        _, clean_remaining = _split_thinking(tc["remaining_text"] or "")
+                        if clean_remaining:
+                            # Strip model control tokens
+                            clean_remaining = re.sub(
+                                r"<\|[^>]+\|>|<[^>]+>", "", clean_remaining
+                            ).strip()
+                        content = clean_remaining or None
 
-                choice_logprobs = None
-                if want_logprobs and token_logprobs:
-                    choice_logprobs = ChoiceLogprobs(content=token_logprobs)
+                response_logprobs = None
+                if request.logprobs and collected_logprobs:
+                    tokenizer = (
+                        processor.tokenizer
+                        if hasattr(processor, "tokenizer")
+                        else processor
+                    )
+                    req_top_k = int(request.top_logprobs or 0)
+                    response_logprobs = ChatLogprobs(
+                        content=[
+                            _make_logprob_content(
+                                tokenizer,
+                                tid,
+                                lp,
+                                top_logprobs=top_lps,
+                                top_k=req_top_k,
+                            )
+                            for tid, lp, top_lps in collected_logprobs
+                        ]
+                    )
 
-                finish = "tool_calls" if tool_calls.get("calls") else "stop"
                 choices = [
                     ChatChoice(
-                        finish_reason=finish,
+                        finish_reason="tool_calls" if parsed_tool_calls else "stop",
                         message=ChatMessage(
                             role="assistant",
-                            content=tool_calls["remaining_text"],
-                            tool_calls=tool_calls["calls"],
+                            content=content if content else None,
+                            reasoning=reasoning,
+                            tool_calls=parsed_tool_calls,
                         ),
-                        logprobs=choice_logprobs,
+                        logprobs=response_logprobs,
                     )
                 ]
-
                 result = ChatResponse(
-                    model=request.model, usage=usage_stats, choices=choices
+                    id=f"chatcmpl-{uuid.uuid4()}",
+                    created=int(time.time()),
+                    model=request.model,
+                    usage=usage_stats,
+                    choices=choices,
                 )
+
+                elapsed = time.perf_counter() - request_start
+                logger.debug(
+                    "chat/completions done: prompt_tokens=%d completion_tokens=%d "
+                    "total_time=%.2fs peak_memory=%.2fGB",
+                    prompt_tokens,
+                    completion_tokens,
+                    elapsed,
+                    peak_memory,
+                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    resp_text = content or ""
+                    logger.debug(
+                        "  response: %s",
+                        resp_text[:200] + ("..." if len(resp_text) > 200 else ""),
+                    )
 
                 return result
 
@@ -2111,10 +2521,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 traceback.print_exc()
                 mx.clear_cache()
                 gc.collect()
-                raise HTTPException(status_code=500, detail="Generation failed. Check server logs for details.")
-            finally:
-                if sem is not None:
-                    sem.release()
+                raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions (like model loading failure)
@@ -2174,6 +2581,7 @@ async def health_check():
         "status": "healthy",
         "loaded_model": model_cache.get("model_path", None),
         "loaded_adapter": model_cache.get("adapter_path", None),
+        "continuous_batching_enabled": response_generator is not None,
     }
 
 
@@ -2192,7 +2600,7 @@ async def unload_model_endpoint():
 
     return {
         "status": "success",
-        "message": "Model unloaded successfully",
+        "message": f"Model unloaded successfully",
         "unloaded": unloaded_info,
     }
 
@@ -2200,26 +2608,16 @@ async def unload_model_endpoint():
 def main():
     parser = argparse.ArgumentParser(description="MLX VLM Http Server.")
     parser.add_argument(
-        "--model",
-        type=str,
-        help="Optional path to the MLX model weights, tokenizer, and config",
-    )
-    parser.add_argument(
-        "--adapter-path",
-        type=str,
-        help="Optional path for the trained adapter weights and config.",
-    )
-    parser.add_argument(
         "--host",
         type=str,
-        default=DEFAULT_SERVER_HOST,
-        help="Host for the HTTP server (default: %(default)s)",
+        default="0.0.0.0",
+        help="Host for the HTTP server (default:0.0.0.0)",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=DEFAULT_SERVER_PORT,
-        help="Port for the HTTP server (default: %(default)s)",
+        default=8080,
+        help="Port for the HTTP server (default: 8080)",
     )
     parser.add_argument(
         "--trust-remote-code",
@@ -2227,26 +2625,41 @@ def main():
         help="Trust remote code when loading models from Hugging Face Hub.",
     )
     parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Pre-load a model at startup (e.g. mlx-community/Qwen2.5-VL-3B-Instruct-4bit).",
+    )
+    parser.add_argument(
+        "--adapter-path",
+        type=str,
+        default=None,
+        help="Adapter weights to load with the model.",
+    )
+    parser.add_argument(
+        "--vision-cache-size",
+        type=int,
+        default=20,
+        help="Max number of cached vision features (default: 20).",
+    )
+    parser.add_argument(
         "--prefill-step-size",
         type=int,
         default=DEFAULT_PREFILL_STEP_SIZE,
-        help="Number of tokens to process per prefill step. "
-        "Lower values reduce peak memory usage but may be slower. "
-        "Try 512 or 256 if you hit GPU memory errors during prefill.",
+        help="Tokens per prefill step (default: %(default)s).",
     )
     parser.add_argument(
         "--kv-bits",
         type=float,
-        default=0,
-        help="Number of bits for KV cache quantization.",
+        default=None,
+        help="Number of bits for KV cache quantization (e.g. 3.5 for TurboQuant).",
     )
     parser.add_argument(
         "--kv-quant-scheme",
         type=str,
         choices=("uniform", "turboquant"),
         default=DEFAULT_KV_QUANT_SCHEME,
-        help="KV cache quantization backend. Fractional --kv-bits values use "
-        "TurboQuant automatically.",
+        help="KV cache quantization backend.",
     )
     parser.add_argument(
         "--kv-group-size",
@@ -2257,85 +2670,87 @@ def main():
     parser.add_argument(
         "--max-kv-size",
         type=int,
-        default=0,
-        help="Maximum KV size for the prompt cache (tokens).",
+        default=None,
+        help="Maximum KV cache size in tokens.",
     )
     parser.add_argument(
         "--quantized-kv-start",
         type=int,
         default=DEFAULT_QUANTIZED_KV_START,
-        help="Start index (of token) for the quantized KV cache.",
+        help="Start index for quantized KV cache.",
     )
     parser.add_argument(
-        "--max-concurrent-requests",
+        "--draft-model",
+        type=str,
+        default=None,
+        help="Speculative drafter path or HF id (e.g. z-lab/Qwen3.5-4B-DFlash).",
+    )
+    parser.add_argument(
+        "--draft-kind",
+        type=str,
+        default="dflash",
+        help="Drafter family (default: dflash).",
+    )
+    parser.add_argument(
+        "--draft-block-size",
         type=int,
-        default=1,
-        help="Maximum number of concurrent generation requests. "
-        "MLX runs single-threaded on Metal; values > 1 may cause GPU errors. "
-        "(default: %(default)s)",
+        default=None,
+        help="Override the drafter's configured block size.",
     )
     parser.add_argument(
-        "--max-context-tokens",
+        "--top-logprobs-k",
         type=int,
-        default=0,
-        help="Maximum context window in tokens. 0 = no limit. (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--request-timeout",
-        type=int,
-        default=300,
-        help="Maximum seconds per generation request. (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--default-max-tokens",
-        type=int,
-        default=DEFAULT_MAX_TOKENS,
-        help="Default max tokens for API responses when not specified in the request. "
-        "The upstream default (256) is too low for agentic use. "
-        "(default: %(default)s)",
-    )
-    parser.add_argument(
-        "--prompt-cache-ttl",
-        type=int,
-        default=DEFAULT_PROMPT_CACHE_TTL,
-        help="Seconds of idle time before a prompt cache entry is evicted. "
-        "Frees GPU memory from stale KV caches. 0 = no expiry. "
-        "(default: %(default)s)",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        default=False,
-        help="Enable verbose debug logging (prompt content, cache state, tool detection).",
+        default=None,
+        help=(
+            "Server-side cap for per-token top_logprobs (0-20, default 0 = "
+            "disabled). Maps to the TOP_LOGPROBS_K env var."
+        ),
     )
     parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
-        help="Enable auto-reload on file changes (development only). "
-        "WARNING: watches the entire working directory — can cause excessive memory "
-        "usage with large models in repos with frequent file changes.",
+        help="Enable auto-reload for development.",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the logging level (default: INFO).",
     )
     args = parser.parse_args()
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
     if args.model:
-        os.environ["PRELOAD_MODEL"] = args.model
-    if args.adapter_path:
-        os.environ["PRELOAD_ADAPTER"] = args.adapter_path
-    os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
-    os.environ["KV_BITS"] = str(args.kv_bits)
+        os.environ["MLX_VLM_PRELOAD_MODEL"] = args.model
+        if args.adapter_path:
+            os.environ["MLX_VLM_PRELOAD_ADAPTER"] = args.adapter_path
+    os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
+    if args.draft_model:
+        os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
+        os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
+        if args.draft_block_size is not None:
+            os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
+    if args.prefill_step_size:
+        os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
+    if args.kv_bits is not None:
+        os.environ["KV_BITS"] = str(args.kv_bits)
     os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
-    os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
+    if args.max_kv_size is not None:
+        os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
-    os.environ["MAX_CONCURRENT_REQUESTS"] = str(args.max_concurrent_requests)
-    os.environ["MAX_CONTEXT_TOKENS"] = str(args.max_context_tokens)
-    os.environ["REQUEST_TIMEOUT"] = str(args.request_timeout)
-    os.environ["PROMPT_CACHE_TTL"] = str(args.prompt_cache_ttl)
-    os.environ["DEFAULT_MAX_TOKENS"] = str(args.default_max_tokens)
-    if args.verbose:
-        os.environ["VERBOSE"] = "1"
+    if args.top_logprobs_k is not None:
+        os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
+
+    # Configure logging
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+    logger.setLevel(log_level)
 
     uvicorn.run(
         "mlx_vlm.server:app",

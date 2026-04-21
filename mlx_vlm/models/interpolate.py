@@ -19,11 +19,6 @@ def gaussian_blur_axis(image, sigma, axis):
 
     # Helper function to apply 1D convolution along specific axis
     def conv_1d(array, kernel, axis):
-        # Reshape kernel to broadcast along the right dimensions
-        kernel_shape = [1] * image.ndim
-        kernel_shape[axis] = len(kernel)
-        kernel_reshaped = kernel.reshape(kernel_shape)
-
         # Pad the array
         pad_width = [(0, 0)] * image.ndim
         pad_width[axis] = (radius, radius)
@@ -35,7 +30,10 @@ def gaussian_blur_axis(image, sigma, axis):
 
         for i in range(2 * radius + 1):
             slices[axis] = slice(i, i + array.shape[axis])
-            result = result + padded[tuple(slices)] * kernel_reshaped
+            # Reshape kernel element to broadcast along all dims
+            k_shape = [1] * image.ndim
+            k_val = kernel[i].reshape(k_shape)
+            result = result + padded[tuple(slices)] * k_val
 
         return result
 

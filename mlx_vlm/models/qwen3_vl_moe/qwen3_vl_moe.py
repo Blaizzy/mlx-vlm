@@ -51,9 +51,7 @@ class Model(nn.Module):
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
-            # Reset position state for text-only generation
             self.language_model._position_ids = None
-            self.language_model._rope_deltas = None
             return InputEmbeddingsFeatures(
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids),
                 visual_pos_masks=None,
@@ -188,3 +186,6 @@ class Model(nn.Module):
             sanitized_weights[key] = value
 
         return sanitized_weights
+
+    def shard(self, group: Optional[mx.distributed.Group] = None) -> None:
+        self.language_model.shard(group)

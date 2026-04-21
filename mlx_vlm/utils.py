@@ -3,6 +3,7 @@ import importlib
 import inspect
 import json
 import logging
+import math
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -112,14 +113,24 @@ def get_model_and_args(config: dict):
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
-    try:
-        arch = importlib.import_module(f"mlx_vlm.models.{model_type}")
-    except ImportError as e:
-        msg = f"Model type {model_type} not supported. Error: {e}"
-        logging.error(msg)
-        raise ValueError(msg)
+    is_dflash = config.get("dflash_config", None) is not None
+    if is_dflash:
+        model_type += "_dflash"
 
-    return arch, model_type
+    last_err: Optional[ImportError] = None
+    for pkg in ("mlx_vlm.models", "mlx_vlm.speculative.drafters"):
+        try:
+            arch = importlib.import_module(f"{pkg}.{model_type}")
+            return arch, model_type
+        except ImportError as e:
+            if model_type not in str(e):
+                raise
+            last_err = e
+            continue
+
+    msg = f"Model type {model_type} not supported. Error: {last_err}"
+    logging.error(msg)
+    raise ValueError(msg)
 
 
 def get_model_path(
@@ -171,9 +182,6 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
-        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
-            to QQLinear layers for activation quantization. Only supported for models
-            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -199,7 +207,7 @@ Create safetensors using the following code:
 ```
 from transformers import AutoModelForCausalLM, AutoProcessor
 
-model_id= "<huggingface_model_id>"
+model_id = "<huggingface_model_id>"
 model = AutoModelForCausalLM.from_pretrained(model_id)
 processor = AutoProcessor.from_pretrained(model_id)
 
@@ -248,12 +256,14 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             weights = sanitize_weights(model.code2wav, weights)
             weights = sanitize_weights(model.talker, weights)
         else:
-            weights = sanitize_weights(
-                model_class.VisionModel, weights, model_config.vision_config
-            )
-            weights = sanitize_weights(
-                model_class.LanguageModel, weights, model_config.text_config
-            )
+            if hasattr(model_class, "VisionModel"):
+                weights = sanitize_weights(
+                    model_class.VisionModel, weights, model_config.vision_config
+                )
+            if hasattr(model_class, "LanguageModel"):
+                weights = sanitize_weights(
+                    model_class.LanguageModel, weights, model_config.text_config
+                )
             if hasattr(model_class, "AudioModel"):
                 weights = sanitize_weights(
                     model_class.AudioModel, weights, model_config.audio_config
@@ -371,7 +381,7 @@ def load(
     Load the model and tokenizer from a given path or a huggingface repository.
 
     Args:
-        path_or_hf_repo (Path): The path or the huggingface repository to load the model from.
+        path_or_hf_repo (str): The path or the huggingface repository to load the model from.
         tokenizer_config (dict, optional): Configuration parameters specifically for the tokenizer.
             Defaults to an empty dictionary.
         adapter_path (str, optional): Path to the LoRA adapters. If provided, applies LoRA layers
@@ -381,10 +391,6 @@ def load(
             when needed. Default: ``False``
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
-        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
-            to QQLinear layers for activation quantization. Only supported for models
-            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
-
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
@@ -414,6 +420,59 @@ def load(
 
     if image_processor is not None:
         processor.image_processor = image_processor
+
+    return model, processor
+
+
+def sharded_load(
+    repo,
+    tensor_group: Optional[mx.distributed.Group] = None,
+    pipeline_group: Optional[mx.distributed.Group] = None,
+):
+    # Get model path with everything but weight safetensors
+    model_path = get_model_path(repo)
+
+    # Lazy load model to figure out what type of sharding we can do and which
+    # weights we need to download.
+    model = load_model(model_path, lazy=True, strict=False)
+    config = model.config.to_dict()
+
+    has_tensor_parallel = hasattr(model, "shard")
+
+    if tensor_group is not None and not has_tensor_parallel:
+        raise ValueError(
+            "The model does not support tensor parallelism but a tensor_group was provided"
+        )
+
+    if tensor_group is None and pipeline_group is None:
+        if has_tensor_parallel:
+            tensor_group = mx.distributed.init()
+
+    processor = load_processor(
+        model_path, True, eos_token_ids=config.get("eos_token_id", None)
+    )
+
+    image_processor = load_image_processor(model_path)
+    if image_processor is not None:
+        processor.image_processor = image_processor
+
+    if tensor_group is not None:
+        model.shard(tensor_group)
+
+    if pipeline_group is not None:
+        lm = model.language_model
+        # The underlying model (e.g. DeepseekV3Model) has PipelineMixin
+        inner = lm.model if hasattr(lm, "model") else lm
+        if not hasattr(inner, "pipeline"):
+            raise ValueError("The model does not support pipeline parallelism")
+        inner.pipeline(pipeline_group)
+
+    print("Materializing")
+    mx.eval(model.language_model.parameters())
+    model.eval()
+
+    # Synchronize processes to avoid timeout
+    mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
 
     return model, processor
 
@@ -1015,6 +1074,71 @@ def normalize_audio_features(features: mx.array) -> mx.array:
     return (features - mx.mean(features)) / (mx.std(features) + 1e-6)
 
 
+def load_video(
+    video_path: str,
+    fps: float = 2.0,
+    nframes: Optional[int] = None,
+    min_frames: int = 4,
+    max_frames: int = 768,
+    frame_factor: int = 2,
+) -> Tuple[np.ndarray, float]:
+    """Read a video file as a (T, C, H, W) numpy array.
+
+    Uniformly samples ``nframes`` frames — either a fixed count or derived
+    from ``fps`` — and returns the sampled frames alongside the effective
+    sampling fps.
+    """
+    import cv2
+
+    if video_path.startswith("file://"):
+        video_path = video_path[7:]
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
+
+    def _round(n):
+        return round(n / frame_factor) * frame_factor
+
+    def _floor(n):
+        return math.floor(n / frame_factor) * frame_factor
+
+    def _ceil(n):
+        return math.ceil(n / frame_factor) * frame_factor
+
+    if nframes is not None:
+        n = _round(nframes)
+    else:
+        lo = _ceil(min_frames)
+        hi = _floor(min(max_frames, total_frames))
+        n = total_frames / video_fps * fps
+        n = min(max(n, lo), hi, total_frames)
+        n = _floor(n)
+    if not (frame_factor <= n <= total_frames):
+        cap.release()
+        raise ValueError(
+            f"nframes must be in [{frame_factor}, {total_frames}], got {n}."
+        )
+
+    indices = np.linspace(0, total_frames - 1, n).round().astype(int)
+    frames = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    cap.release()
+    if not frames:
+        raise ValueError("No frames read from the video.")
+
+    video_np = np.transpose(np.stack(frames, axis=0), (0, 3, 1, 2))
+    sample_fps = n / max(total_frames, 1e-6) * video_fps
+    return video_np, sample_fps
+
+
 def process_inputs(
     processor,
     prompts,
@@ -1090,6 +1214,7 @@ def prepare_inputs(
     processor,
     images=None,
     audio=None,
+    videos=None,
     prompts=None,
     image_token_index=None,
     resize_shape=None,
@@ -1105,7 +1230,10 @@ def prepare_inputs(
         not hasattr(images, "__len__") or len(images) > 0
     )
     has_audio = audio is not None and (not hasattr(audio, "__len__") or len(audio) > 0)
-    if not has_images and not has_audio:
+    has_videos = videos is not None and (
+        not hasattr(videos, "__len__") or len(videos) > 0
+    )
+    if not has_images and not has_audio and not has_videos:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1253,6 +1381,22 @@ def prepare_inputs(
             )
             audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
+    video_fps = None
+    if has_videos:
+        if not isinstance(videos, list):
+            videos = [videos]
+        fps_hint = kwargs.pop("fps", 2.0)
+        loaded, video_fps = [], []
+        for v in videos:
+            arr, s_fps = (
+                load_video(str(v), fps=fps_hint)
+                if isinstance(v, (str, bytes))
+                else (v, fps_hint)
+            )
+            loaded.append(arr)
+            video_fps.append(s_fps)
+        videos = loaded
+
     model_inputs = {}
 
     if hasattr(processor, "image_processor") and isinstance(
@@ -1291,12 +1435,18 @@ def prepare_inputs(
         if hasattr(processor, "tokenizer") and processor.tokenizer.pad_token is None:
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
+        extra = {}
+        if has_videos:
+            extra["videos"] = videos
+            if video_fps is not None:
+                extra["fps"] = video_fps
         inputs = process_inputs_with_fallback(
             processor,
             images=images,
             audio=audio,
             prompts=prompts,
             add_special_tokens=add_special_tokens,
+            **extra,
             **kwargs,
         )
 
@@ -1416,13 +1566,17 @@ class StoppingCriteria:
             raise ValueError("Processor is not provided")
 
         if new_eos_token_ids is not None:
-            if isinstance(new_eos_token_ids, str):
+            if isinstance(new_eos_token_ids, (str, int)):
                 new_eos_token_ids = [new_eos_token_ids]
-            new_eos_token_ids = [
-                self.tokenizer.encode(" " + token, add_special_tokens=False)[-1]
-                for token in new_eos_token_ids
-            ]
-            self.eos_token_ids.extend(new_eos_token_ids)
+            resolved = []
+            for token in new_eos_token_ids:
+                if isinstance(token, int):
+                    resolved.append(token)
+                elif isinstance(token, str):
+                    resolved.append(
+                        self.tokenizer.encode(" " + token, add_special_tokens=False)[-1]
+                    )
+            self.eos_token_ids.extend(resolved)
 
     def reset(self, eos_token_ids: List[int] = None):
         eos_token_ids = (
