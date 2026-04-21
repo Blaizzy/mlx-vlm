@@ -149,9 +149,12 @@ def test_get_prompt_cache_ttl_from_env(monkeypatch):
 
 def test_prompt_cache_state_touch():
     from mlx_vlm.generate import PromptCacheState
+
     state = PromptCacheState()
     old_time = state.last_used
+
     import time
+
     time.sleep(0.01)
     state.touch()
     assert state.last_used > old_time
@@ -159,10 +162,9 @@ def test_prompt_cache_state_touch():
 
 def test_evict_stale_prompt_caches(monkeypatch):
     monkeypatch.setenv("PROMPT_CACHE_TTL", "1")
-    # Clear and populate
     server._prompt_cache_states.clear()
     state = server.get_prompt_cache_state("test-model")
-    state.last_used = 0  # Force stale (epoch = very old)
+    state.last_used = 0
     assert len(server._prompt_cache_states) == 1
     evicted = server.evict_stale_prompt_caches()
     assert evicted == 1
@@ -185,40 +187,35 @@ def test_evict_disabled_when_ttl_zero(monkeypatch):
     state = server.get_prompt_cache_state("test-model")
     state.last_used = 0
     evicted = server.evict_stale_prompt_caches()
-    assert evicted == 0  # TTL=0 means no expiry
+    assert evicted == 0
     server._prompt_cache_states.clear()
 
 
 # ---------------------------------------------------------------------------
-# Prompt cache TTL — real-world scenario tests
+# Prompt cache TTL - scenario tests
 # ---------------------------------------------------------------------------
 
 
 def test_telegram_idle_13_hours_evicted(monkeypatch):
-    """Simulate: user sends image at 7:42 AM, bot responds, then 13 hours
-    of silence. The stale KV cache should be evicted before the next request."""
-    monkeypatch.setenv("PROMPT_CACHE_TTL", "300")  # 5 min TTL
+    monkeypatch.setenv("PROMPT_CACHE_TTL", "300")
     server._prompt_cache_states.clear()
 
     import time
-    now = time.time()
 
-    # Simulate the 7:42 AM image analysis — cache populated with tokens
+    now = time.time()
     state = server.get_prompt_cache_state("qwen3.5-35b")
-    state.token_ids = list(range(12000))  # 12K tokens from image + response
-    state.cache = ["fake_kv_layer"]  # placeholder for KV cache
-    state.last_used = now - (13 * 3600)  # 13 hours ago
+    state.token_ids = list(range(12000))
+    state.cache = ["fake_kv_layer"]
+    state.last_used = now - (13 * 3600)
     state.created_at = now - (13 * 3600)
 
     assert len(server._prompt_cache_states) == 1
     assert state.token_count == 12000
 
-    # Cleanup runs — should evict the 13-hour-old entry
     evicted = server.evict_stale_prompt_caches()
     assert evicted == 1
     assert len(server._prompt_cache_states) == 0
 
-    # Next request creates a fresh cache — no stale KV to corrupt
     fresh = server.get_prompt_cache_state("qwen3.5-35b")
     assert fresh.cache is None
     assert fresh.token_ids is None
@@ -226,45 +223,38 @@ def test_telegram_idle_13_hours_evicted(monkeypatch):
 
 
 def test_active_conversation_not_evicted(monkeypatch):
-    """Simulate: user is actively chatting every 30 seconds.
-    Cache should never be evicted during an active conversation."""
     monkeypatch.setenv("PROMPT_CACHE_TTL", "300")
     server._prompt_cache_states.clear()
 
     import time
-    now = time.time()
 
+    now = time.time()
     state = server.get_prompt_cache_state("qwen3.5-35b")
     state.token_ids = list(range(8000))
     state.cache = ["fake_kv"]
 
-    # Simulate 10 messages, 30s apart — each touches the cache
     for i in range(10):
-        state.last_used = now - (30 * (10 - i))  # most recent was 30s ago
+        state.last_used = now - (30 * (10 - i))
 
-    # Last used 30s ago — well within 300s TTL
     evicted = server.evict_stale_prompt_caches()
     assert evicted == 0
-    assert state.token_count == 8000  # cache intact
+    assert state.token_count == 8000
     server._prompt_cache_states.clear()
 
 
 def test_multiple_users_only_stale_evicted(monkeypatch):
-    """Simulate: two users with different cache keys. One idle 10 min,
-    one active 1 min ago. Only the stale one should be evicted."""
     monkeypatch.setenv("PROMPT_CACHE_TTL", "300")
     server._prompt_cache_states.clear()
 
     import time
+
     now = time.time()
 
-    # User A: active 1 min ago
     active = server.get_prompt_cache_state("model", cache_key="user-a")
     active.token_ids = list(range(5000))
     active.cache = ["kv_a"]
     active.last_used = now - 60
 
-    # User B: idle 10 min
     stale = server.get_prompt_cache_state("model", cache_key="user-b")
     stale.token_ids = list(range(9000))
     stale.cache = ["kv_b"]
@@ -276,23 +266,21 @@ def test_multiple_users_only_stale_evicted(monkeypatch):
     assert evicted == 1
     assert "model::user-a" in server._prompt_cache_states
     assert "model::user-b" not in server._prompt_cache_states
-    # Active user's cache untouched
     assert server._prompt_cache_states["model::user-a"].token_count == 5000
     server._prompt_cache_states.clear()
 
 
 def test_cache_just_under_ttl_not_evicted(monkeypatch):
-    """Cache idle for just under TTL should NOT be evicted."""
     monkeypatch.setenv("PROMPT_CACHE_TTL", "300")
     server._prompt_cache_states.clear()
 
     import time
-    now = time.time()
 
+    now = time.time()
     state = server.get_prompt_cache_state("model")
     state.token_ids = list(range(1000))
     state.cache = ["kv"]
-    state.last_used = now - 299  # 1 second under TTL
+    state.last_used = now - 299
 
     evicted = server.evict_stale_prompt_caches()
     assert evicted == 0
@@ -300,29 +288,24 @@ def test_cache_just_under_ttl_not_evicted(monkeypatch):
 
 
 def test_invalidated_cache_cleared_on_eviction(monkeypatch):
-    """Evicted entries should have their cache and token_ids set to None."""
     monkeypatch.setenv("PROMPT_CACHE_TTL", "60")
     server._prompt_cache_states.clear()
 
     import time
 
     state = server.get_prompt_cache_state("model")
-    state.token_ids = list(range(20000))  # 20K tokens of KV cache
+    state.token_ids = list(range(20000))
     state.cache = ["big_kv_layer_1", "big_kv_layer_2"]
-    state.last_used = time.time() - 120  # 2 min idle, TTL is 1 min
+    state.last_used = time.time() - 120
 
-    # Keep a reference to verify invalidation
     evicted = server.evict_stale_prompt_caches()
     assert evicted == 1
-    # The state object should be invalidated
     assert state.cache is None
     assert state.token_ids is None
     server._prompt_cache_states.clear()
 
 
 def test_short_ttl_evicts_between_requests(monkeypatch):
-    """With a very short TTL (e.g., 5s), cache should be evicted if user
-    pauses for just a few seconds — useful for testing/dev."""
     monkeypatch.setenv("PROMPT_CACHE_TTL", "5")
     server._prompt_cache_states.clear()
 
@@ -331,9 +314,133 @@ def test_short_ttl_evicts_between_requests(monkeypatch):
     state = server.get_prompt_cache_state("model")
     state.token_ids = list(range(3000))
     state.cache = ["kv"]
-    state.last_used = time.time() - 10  # 10s ago, TTL is 5s
+    state.last_used = time.time() - 10
 
     evicted = server.evict_stale_prompt_caches()
     assert evicted == 1
     assert len(server._prompt_cache_states) == 0
     server._prompt_cache_states.clear()
+
+
+# ---------------------------------------------------------------------------
+# Stop sequences tests
+# ---------------------------------------------------------------------------
+
+
+def test_chat_completions_stop_passed_as_eos_tokens(client):
+    """stop parameter should be passed as eos_tokens strings to generate."""
+    model = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=""))
+    config = SimpleNamespace(model_type="test")
+    result = SimpleNamespace(
+        text="Hello",
+        prompt_tokens=5,
+        generation_tokens=1,
+        total_tokens=6,
+        prompt_tps=100.0,
+        generation_tps=50.0,
+        peak_memory=1.0,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result) as mock_gen,
+    ):
+        resp = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stop": ["\n\n", "</s>"],
+            },
+        )
+    assert resp.status_code == 200
+    assert "eos_tokens" in mock_gen.call_args.kwargs
+    assert mock_gen.call_args.kwargs["eos_tokens"] == ["\n\n", "</s>"]
+
+
+def test_chat_completions_no_stop_no_eos_tokens(client):
+    """Without stop parameter, eos_tokens should not be in kwargs."""
+    model = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=""))
+    config = SimpleNamespace(model_type="test")
+    result = SimpleNamespace(
+        text="Hi",
+        prompt_tokens=5,
+        generation_tokens=1,
+        total_tokens=6,
+        prompt_tps=100.0,
+        generation_tps=50.0,
+        peak_memory=1.0,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result) as mock_gen,
+    ):
+        resp = client.post(
+            "/chat/completions",
+            json={"model": "demo", "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert resp.status_code == 200
+    assert "eos_tokens" not in mock_gen.call_args.kwargs
+
+
+def test_responses_stop_passed_as_eos_tokens(client):
+    """stop parameter on /responses should pass strings as eos_tokens."""
+    model = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=""))
+    config = SimpleNamespace(model_type="test")
+    result = SimpleNamespace(
+        text="Hello",
+        prompt_tokens=5,
+        generation_tokens=1,
+        total_tokens=6,
+        prompt_tps=100.0,
+        generation_tps=50.0,
+        peak_memory=1.0,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result) as mock_gen,
+    ):
+        resp = client.post(
+            "/responses",
+            json={"model": "demo", "input": "hi", "stop": "STOP"},
+        )
+    assert resp.status_code == 200
+    assert "eos_tokens" in mock_gen.call_args.kwargs
+    assert mock_gen.call_args.kwargs["eos_tokens"] == ["STOP"]
+
+
+def test_resolve_stop_sequences_single_string():
+    """resolve_stop_sequences should normalize a single string to a list."""
+    result = server.resolve_stop_sequences("hello")
+    assert result == ["hello"]
+
+
+def test_resolve_stop_sequences_list():
+    """resolve_stop_sequences should pass through a list."""
+    result = server.resolve_stop_sequences(["a", "b"])
+    assert result == ["a", "b"]
+
+
+def test_resolve_stop_sequences_none():
+    """resolve_stop_sequences should return None for None input."""
+    assert server.resolve_stop_sequences(None) is None
+
+
+def test_resolve_stop_sequences_limits_to_four():
+    """resolve_stop_sequences should process at most 4 sequences."""
+    result = server.resolve_stop_sequences(["a", "b", "c", "d", "e", "f"])
+    assert len(result) == 4
