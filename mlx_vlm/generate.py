@@ -2388,10 +2388,7 @@ def main():
 
     chat_template_kwargs = {"enable_thinking": args.enable_thinking}
     if args.video:
-        # The MessageFormatter video path expects a single video path in
-        # `video=`; pass the first (and for now only) value.
-        video_arg = args.video[0] if isinstance(args.video, list) else args.video
-        chat_template_kwargs["video"] = video_arg
+        chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps
 
     prompt = apply_chat_template(
