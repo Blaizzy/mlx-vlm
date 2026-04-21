@@ -1,6 +1,6 @@
 import inspect
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
 from ..base import BaseModelConfig
 
@@ -21,9 +21,7 @@ class VisionConfig(BaseModelConfig):
     attention_dropout: float = 0.0
     spatial_merge_size: int = 2
     window_size: int = 256
-    fullatt_block_indexes: list = field(
-        default_factory=lambda: [7, 15, 23, 26]
-    )
+    fullatt_block_indexes: list = field(default_factory=lambda: [7, 15, 23, 26])
 
 
 @dataclass
