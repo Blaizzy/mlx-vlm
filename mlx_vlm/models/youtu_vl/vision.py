@@ -393,6 +393,7 @@ class VisionModel(nn.Module):
     def __init__(self, config: VisionConfig) -> None:
         super().__init__()
         self.config = config
+        self.model_type = config.model_type
         self.embeddings = Siglip2VisionEmbeddings(config)
         self.encoder = Siglip2Encoder(config)
         self.post_layernorm = nn.LayerNorm(
