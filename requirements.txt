@@ -1,5 +1,7 @@
 mlx>=0.31.1
-transformers>=5.5.0
+# transformers>=5.5.0  # Original requirement
+# Downgraded for omlx compatibility (<5.4.0 due to VLM breaking changes in 5.4.0)
+transformers>=5.0.0,<5.4.0
 datasets>=2.19.1
 miniaudio>=1.59
 tqdm>=4.66.2
