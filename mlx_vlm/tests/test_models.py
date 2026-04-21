@@ -3291,7 +3291,7 @@ class TestModels(unittest.TestCase):
         # Vision tower takes packed patches + spatial_shapes:
         #   pixel_values: (num_patches, patch_size**2 * channels)
         #   spatial_shapes: (batch, 2) — (h_patches, w_patches)
-        patch_dim = vision_config.patch_size ** 2 * vision_config.num_channels
+        patch_dim = vision_config.patch_size**2 * vision_config.num_channels
         h_p, w_p = 4, 4
         num_patches = h_p * w_p
         self.vision_test_runner(
@@ -3303,7 +3303,6 @@ class TestModels(unittest.TestCase):
             vision_feature_layer=-1,
             spatial_shapes=mx.array([[h_p, w_p]], dtype=mx.int32),
         )
-
 
         # sanitize splits kv_b_proj per-head into embed_q (k) + unembed_out (v)
         H, nope, v_head = 4, 32, 32
@@ -3320,8 +3319,12 @@ class TestModels(unittest.TestCase):
         prefix = "language_model.model.layers.0.self_attn"
         self.assertNotIn(f"{prefix}.kv_b_proj.weight", sanitized)
         self.assertNotIn("language_model.lm_head.weight", sanitized)
-        self.assertEqual(sanitized[f"{prefix}.embed_q.weight"].shape, (H, kv_rank, nope))
-        self.assertEqual(sanitized[f"{prefix}.unembed_out.weight"].shape, (H, v_head, kv_rank))
+        self.assertEqual(
+            sanitized[f"{prefix}.embed_q.weight"].shape, (H, kv_rank, nope)
+        )
+        self.assertEqual(
+            sanitized[f"{prefix}.unembed_out.weight"].shape, (H, v_head, kv_rank)
+        )
 
 
 class TestGetInputEmbeddings(unittest.TestCase):
