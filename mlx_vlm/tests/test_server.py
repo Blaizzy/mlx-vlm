@@ -132,6 +132,196 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
 
 
+# ---------------------------------------------------------------------------
+# Prompt cache TTL tests
+# ---------------------------------------------------------------------------
+
+
+def test_get_prompt_cache_ttl_default(monkeypatch):
+    monkeypatch.delenv("PROMPT_CACHE_TTL", raising=False)
+    assert server.get_prompt_cache_ttl() == 300
+
+
+def test_get_prompt_cache_ttl_from_env(monkeypatch):
+    monkeypatch.setenv("PROMPT_CACHE_TTL", "600")
+    assert server.get_prompt_cache_ttl() == 600
+
+
+def test_prompt_cache_state_touch():
+    from mlx_vlm.generate import PromptCacheState
+
+    state = PromptCacheState()
+    old_time = state.last_used
+
+    import time
+
+    time.sleep(0.01)
+    state.touch()
+    assert state.last_used > old_time
+
+
+def test_evict_stale_prompt_caches(monkeypatch):
+    monkeypatch.setenv("PROMPT_CACHE_TTL", "1")
+    server._prompt_cache_states.clear()
+    state = server.get_prompt_cache_state("test-model")
+    state.last_used = 0
+    assert len(server._prompt_cache_states) == 1
+    evicted = server.evict_stale_prompt_caches()
+    assert evicted == 1
+    assert len(server._prompt_cache_states) == 0
+
+
+def test_evict_skips_fresh_caches(monkeypatch):
+    monkeypatch.setenv("PROMPT_CACHE_TTL", "9999")
+    server._prompt_cache_states.clear()
+    server.get_prompt_cache_state("fresh-model")
+    evicted = server.evict_stale_prompt_caches()
+    assert evicted == 0
+    assert len(server._prompt_cache_states) == 1
+    server._prompt_cache_states.clear()
+
+
+def test_evict_disabled_when_ttl_zero(monkeypatch):
+    monkeypatch.setenv("PROMPT_CACHE_TTL", "0")
+    server._prompt_cache_states.clear()
+    state = server.get_prompt_cache_state("test-model")
+    state.last_used = 0
+    evicted = server.evict_stale_prompt_caches()
+    assert evicted == 0
+    server._prompt_cache_states.clear()
+
+
+# ---------------------------------------------------------------------------
+# Prompt cache TTL - scenario tests
+# ---------------------------------------------------------------------------
+
+
+def test_telegram_idle_13_hours_evicted(monkeypatch):
+    monkeypatch.setenv("PROMPT_CACHE_TTL", "300")
+    server._prompt_cache_states.clear()
+
+    import time
+
+    now = time.time()
+    state = server.get_prompt_cache_state("qwen3.5-35b")
+    state.token_ids = list(range(12000))
+    state.cache = ["fake_kv_layer"]
+    state.last_used = now - (13 * 3600)
+    state.created_at = now - (13 * 3600)
+
+    assert len(server._prompt_cache_states) == 1
+    assert state.token_count == 12000
+
+    evicted = server.evict_stale_prompt_caches()
+    assert evicted == 1
+    assert len(server._prompt_cache_states) == 0
+
+    fresh = server.get_prompt_cache_state("qwen3.5-35b")
+    assert fresh.cache is None
+    assert fresh.token_ids is None
+    server._prompt_cache_states.clear()
+
+
+def test_active_conversation_not_evicted(monkeypatch):
+    monkeypatch.setenv("PROMPT_CACHE_TTL", "300")
+    server._prompt_cache_states.clear()
+
+    import time
+
+    now = time.time()
+    state = server.get_prompt_cache_state("qwen3.5-35b")
+    state.token_ids = list(range(8000))
+    state.cache = ["fake_kv"]
+
+    for i in range(10):
+        state.last_used = now - (30 * (10 - i))
+
+    evicted = server.evict_stale_prompt_caches()
+    assert evicted == 0
+    assert state.token_count == 8000
+    server._prompt_cache_states.clear()
+
+
+def test_multiple_users_only_stale_evicted(monkeypatch):
+    monkeypatch.setenv("PROMPT_CACHE_TTL", "300")
+    server._prompt_cache_states.clear()
+
+    import time
+
+    now = time.time()
+
+    active = server.get_prompt_cache_state("model", cache_key="user-a")
+    active.token_ids = list(range(5000))
+    active.cache = ["kv_a"]
+    active.last_used = now - 60
+
+    stale = server.get_prompt_cache_state("model", cache_key="user-b")
+    stale.token_ids = list(range(9000))
+    stale.cache = ["kv_b"]
+    stale.last_used = now - 600
+
+    assert len(server._prompt_cache_states) == 2
+
+    evicted = server.evict_stale_prompt_caches()
+    assert evicted == 1
+    assert "model::user-a" in server._prompt_cache_states
+    assert "model::user-b" not in server._prompt_cache_states
+    assert server._prompt_cache_states["model::user-a"].token_count == 5000
+    server._prompt_cache_states.clear()
+
+
+def test_cache_just_under_ttl_not_evicted(monkeypatch):
+    monkeypatch.setenv("PROMPT_CACHE_TTL", "300")
+    server._prompt_cache_states.clear()
+
+    import time
+
+    now = time.time()
+    state = server.get_prompt_cache_state("model")
+    state.token_ids = list(range(1000))
+    state.cache = ["kv"]
+    state.last_used = now - 299
+
+    evicted = server.evict_stale_prompt_caches()
+    assert evicted == 0
+    server._prompt_cache_states.clear()
+
+
+def test_invalidated_cache_cleared_on_eviction(monkeypatch):
+    monkeypatch.setenv("PROMPT_CACHE_TTL", "60")
+    server._prompt_cache_states.clear()
+
+    import time
+
+    state = server.get_prompt_cache_state("model")
+    state.token_ids = list(range(20000))
+    state.cache = ["big_kv_layer_1", "big_kv_layer_2"]
+    state.last_used = time.time() - 120
+
+    evicted = server.evict_stale_prompt_caches()
+    assert evicted == 1
+    assert state.cache is None
+    assert state.token_ids is None
+    server._prompt_cache_states.clear()
+
+
+def test_short_ttl_evicts_between_requests(monkeypatch):
+    monkeypatch.setenv("PROMPT_CACHE_TTL", "5")
+    server._prompt_cache_states.clear()
+
+    import time
+
+    state = server.get_prompt_cache_state("model")
+    state.token_ids = list(range(3000))
+    state.cache = ["kv"]
+    state.last_used = time.time() - 10
+
+    evicted = server.evict_stale_prompt_caches()
+    assert evicted == 1
+    assert len(server._prompt_cache_states) == 0
+    server._prompt_cache_states.clear()
+
+
 # ── Continuous batching / ResponseGenerator tests ─────────────────────
 
 
