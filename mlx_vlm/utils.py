@@ -1381,27 +1381,21 @@ def prepare_inputs(
             )
             audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
-    # Process videos: if paths are given, load into (T, C, H, W) numpy arrays
-    # using the existing cv2-based loader from video_generate.
     video_fps = None
     if has_videos:
         if not isinstance(videos, list):
             videos = [videos]
-        needs_load = any(isinstance(v, (str, bytes)) for v in videos)
-        if needs_load:
-            loaded = []
-            sample_fps = []
-            fps_hint = kwargs.pop("fps", 2.0)
-            for v in videos:
-                if isinstance(v, (str, bytes)):
-                    arr, s_fps = load_video(str(v), fps=fps_hint)
-                    loaded.append(arr)
-                    sample_fps.append(s_fps)
-                else:
-                    loaded.append(v)
-                    sample_fps.append(fps_hint)
-            videos = loaded
-            video_fps = sample_fps
+        fps_hint = kwargs.pop("fps", 2.0)
+        loaded, video_fps = [], []
+        for v in videos:
+            arr, s_fps = (
+                load_video(str(v), fps=fps_hint)
+                if isinstance(v, (str, bytes))
+                else (v, fps_hint)
+            )
+            loaded.append(arr)
+            video_fps.append(s_fps)
+        videos = loaded
 
     model_inputs = {}
 
