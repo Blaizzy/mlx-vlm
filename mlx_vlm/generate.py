@@ -30,6 +30,7 @@ from .utils import (
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
 DEFAULT_AUDIO = None
+DEFAULT_VIDEO = None
 DEFAULT_PROMPT = "What are these?"
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TEMPERATURE = 0.0
@@ -77,6 +78,19 @@ def parse_arguments():
         nargs="+",
         default=DEFAULT_AUDIO,
         help="URL or path of the audio to process.",
+    )
+    parser.add_argument(
+        "--video",
+        type=str,
+        nargs="+",
+        default=DEFAULT_VIDEO,
+        help="URL or path of the video to process.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=2.0,
+        help="Frames-per-second to sample from --video.",
     )
     parser.add_argument(
         "--resize-shape",
@@ -926,6 +940,7 @@ def stream_generate(
     prompt: str,
     image: Union[str, List[str]] = None,
     audio: Union[str, List[str]] = None,
+    video: Union[str, List[str]] = None,
     **kwargs,
 ) -> Union[str, Generator[str, None, None]]:
     """
@@ -984,6 +999,7 @@ def stream_generate(
             processor,
             images=image,
             audio=audio,
+            videos=video,
             prompts=prompt,
             image_token_index=image_token_index,
             resize_shape=resize_shape,
@@ -1141,6 +1157,7 @@ def generate(
     prompt: str,
     image: Union[str, List[str]] = None,
     audio: Union[str, List[str]] = None,
+    video: Union[str, List[str]] = None,
     verbose: bool = False,
     **kwargs,
 ) -> GenerationResult:
@@ -1168,8 +1185,8 @@ def generate(
             files.extend(image)
         if audio is not None:
             files.extend(audio)
-        if kwargs.get("video") is not None:
-            files.extend(kwargs.get("video"))
+        if video is not None:
+            files.extend(video if isinstance(video, list) else [video])
 
         print(f"Files: {files}", "\n")
 
@@ -1201,7 +1218,9 @@ def generate(
     else:
         tokenizer.stopping_criteria.reset(model.config.eos_token_id)
 
-    for response in stream_generate(model, processor, prompt, image, audio, **kwargs):
+    for response in stream_generate(
+        model, processor, prompt, image, audio, video, **kwargs
+    ):
         if verbose:
             print(response.text, end="", flush=True)
         text += response.text
@@ -2368,6 +2387,9 @@ def main():
     )  # TODO: Support multiple audio files
 
     chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    if args.video:
+        chat_template_kwargs["video"] = args.video
+        chat_template_kwargs["fps"] = args.fps
 
     prompt = apply_chat_template(
         processor,
@@ -2448,6 +2470,8 @@ def main():
         gen_kwargs = {
             "image": args.image,
             "audio": args.audio,
+            "video": args.video,
+            "fps": args.fps,
             "temperature": args.temperature,
             "max_tokens": args.max_tokens,
             "verbose": args.verbose,
