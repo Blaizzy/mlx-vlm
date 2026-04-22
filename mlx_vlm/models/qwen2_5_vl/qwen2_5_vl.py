@@ -27,6 +27,12 @@ class Model(nn.Module):
         video_grid_thw = kwargs.get("video_grid_thw", None)
         mask = kwargs.get("mask", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+
+        # Video inputs flow in via pixel_values_videos from the generic
+        # prepare_inputs path; alias to pixel_values for the unified encoder.
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
+
         if pixel_values is None:
             self.language_model._position_ids = None
             return InputEmbeddingsFeatures(

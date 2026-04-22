@@ -351,6 +351,101 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
         }
 
 
+def _load_qwen_vl_json(pretrained_model_name_or_path, relative_name: str):
+    """Load ``<checkpoint>/<relative_name>`` from disk or the Hub, or None."""
+    import json
+    from pathlib import Path
+
+    local = Path(pretrained_model_name_or_path) / relative_name
+    if local.exists():
+        return json.loads(local.read_text())
+    try:
+        from huggingface_hub import hf_hub_download
+
+        fetched = Path(
+            hf_hub_download(pretrained_model_name_or_path, relative_name)
+        )
+        return json.loads(fetched.read_text())
+    except Exception:
+        return None
+
+
+def _qwen_vl_image_kwargs(pretrained_model_name_or_path, default_patch_size: int = 16):
+    """Read Qwen-VL image processor kwargs out of a checkpoint."""
+    proc_cfg = _load_qwen_vl_json(
+        pretrained_model_name_or_path, "processor_config.json"
+    ) or {}
+    raw = _load_qwen_vl_json(
+        pretrained_model_name_or_path, "preprocessor_config.json"
+    ) or {}
+    raw.update(proc_cfg.get("image_processor", {}) or {})
+    out = {"patch_size": default_patch_size}
+    for k in (
+        "patch_size",
+        "temporal_patch_size",
+        "merge_size",
+        "image_mean",
+        "image_std",
+        "rescale_factor",
+        "do_rescale",
+        "do_normalize",
+        "do_convert_rgb",
+    ):
+        if k in raw:
+            out[k] = raw[k]
+    size = raw.get("size", {})
+    if "shortest_edge" in size:
+        out["min_pixels"] = size["shortest_edge"]
+    if "longest_edge" in size:
+        out["max_pixels"] = size["longest_edge"]
+    # legacy flat-key forms (some Qwen2 checkpoints)
+    if "min_pixels" in raw:
+        out["min_pixels"] = raw["min_pixels"]
+    if "max_pixels" in raw:
+        out["max_pixels"] = raw["max_pixels"]
+    return out
+
+
+def _qwen_vl_video_kwargs(pretrained_model_name_or_path, default_patch_size: int = 16):
+    """Read Qwen-VL video processor kwargs out of a checkpoint."""
+    raw = _load_qwen_vl_json(
+        pretrained_model_name_or_path, "video_preprocessor_config.json"
+    )
+    if raw is None:
+        # Older checkpoints (e.g. qwen2_vl) keep video settings inside
+        # preprocessor_config.json alongside the image settings.
+        raw = _load_qwen_vl_json(
+            pretrained_model_name_or_path, "preprocessor_config.json"
+        ) or {}
+    out = {"patch_size": default_patch_size}
+    for k in (
+        "patch_size",
+        "temporal_patch_size",
+        "merge_size",
+        "fps",
+        "min_frames",
+        "max_frames",
+        "image_mean",
+        "image_std",
+        "rescale_factor",
+        "do_rescale",
+        "do_normalize",
+        "do_convert_rgb",
+    ):
+        if k in raw:
+            out[k] = raw[k]
+    size = raw.get("size", {})
+    if "shortest_edge" in size:
+        out["min_pixels"] = size["shortest_edge"]
+    if "longest_edge" in size:
+        out["max_pixels"] = size["longest_edge"]
+    if "min_pixels" in raw:
+        out["min_pixels"] = raw["min_pixels"]
+    if "max_pixels" in raw:
+        out["max_pixels"] = raw["max_pixels"]
+    return out
+
+
 class Qwen3VLProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer", "video_processor"]
     valid_kwargs = ["chat_template"]
@@ -517,9 +612,6 @@ class Qwen3VLProcessor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        import json
-        from pathlib import Path
-
         from transformers import AutoTokenizer
 
         kwargs.pop("use_fast", None)
@@ -528,89 +620,29 @@ class Qwen3VLProcessor(ProcessorMixin):
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
-        local_path = Path(pretrained_model_name_or_path)
+        image_processor = Qwen3VLImageProcessor(
+            **_qwen_vl_image_kwargs(
+                pretrained_model_name_or_path, default_patch_size=16
+            )
+        )
+        video_processor = Qwen3VLVideoProcessor(
+            **_qwen_vl_video_kwargs(
+                pretrained_model_name_or_path, default_patch_size=16
+            )
+        )
 
-        def _load_json(relative_name: str):
-            local = local_path / relative_name
-            if local.exists():
-                return json.loads(local.read_text())
-            try:
-                from huggingface_hub import hf_hub_download
-
-                fetched = Path(
-                    hf_hub_download(pretrained_model_name_or_path, relative_name)
-                )
-                return json.loads(fetched.read_text())
-            except Exception:
-                return None
-
-        # Read processor_config.json for correct init kwargs
-        proc_cfg = _load_json("processor_config.json") or {}
-        proc_kwargs = {}
-        for k in ("chat_template",):
-            if k in proc_cfg:
-                proc_kwargs[k] = proc_cfg[k]
-
-        # Use our numpy-only image processor, pulling defaults from
-        # preprocessor_config.json (or processor_config.image_processor).
-        ip_cfg_raw = _load_json("preprocessor_config.json") or {}
-        ip_cfg_raw.update(proc_cfg.get("image_processor", {}) or {})
-        ip_cfg = {}
-        for k in (
-            "patch_size",
-            "temporal_patch_size",
-            "merge_size",
-            "image_mean",
-            "image_std",
-            "rescale_factor",
-            "do_rescale",
-            "do_normalize",
-            "do_convert_rgb",
-        ):
-            if k in ip_cfg_raw:
-                ip_cfg[k] = ip_cfg_raw[k]
-        size = ip_cfg_raw.get("size", {})
-        if "shortest_edge" in size:
-            ip_cfg["min_pixels"] = size["shortest_edge"]
-        if "longest_edge" in size:
-            ip_cfg["max_pixels"] = size["longest_edge"]
-        image_processor = Qwen3VLImageProcessor(**ip_cfg)
-
-        vp_raw = _load_json("video_preprocessor_config.json") or {}
-        vp_cfg = {}
-        for k in (
-            "patch_size",
-            "temporal_patch_size",
-            "merge_size",
-            "fps",
-            "min_frames",
-            "max_frames",
-            "image_mean",
-            "image_std",
-            "rescale_factor",
-            "do_rescale",
-            "do_normalize",
-            "do_convert_rgb",
-        ):
-            if k in vp_raw:
-                vp_cfg[k] = vp_raw[k]
-        size = vp_raw.get("size", {})
-        if "shortest_edge" in size:
-            vp_cfg["min_pixels"] = size["shortest_edge"]
-        if "longest_edge" in size:
-            vp_cfg["max_pixels"] = size["longest_edge"]
-        video_processor = Qwen3VLVideoProcessor(**vp_cfg)
-
-        if "chat_template" not in proc_kwargs:
-            chat_template = getattr(tokenizer, "chat_template", None)
-            if chat_template is not None:
-                proc_kwargs["chat_template"] = chat_template
+        proc_cfg = _load_qwen_vl_json(
+            pretrained_model_name_or_path, "processor_config.json"
+        ) or {}
+        chat_template = proc_cfg.get(
+            "chat_template", getattr(tokenizer, "chat_template", None)
+        )
 
         return cls(
             image_processor=image_processor,
             tokenizer=tokenizer,
             video_processor=video_processor,
-            **proc_kwargs,  # may include chat_template from processor_config.json
+            chat_template=chat_template,
         )
 
 
