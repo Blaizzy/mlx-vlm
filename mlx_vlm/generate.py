@@ -482,6 +482,7 @@ def _dflash_rounds(
 
     b = first_bonus
     emitted = 1  # the first bonus has already been yielded by the caller
+    rounds = 0
 
     while emitted < max_tokens:
         bs = min(block_total, max_tokens - emitted + 1)
@@ -523,10 +524,18 @@ def _dflash_rounds(
             if emitted >= max_tokens:
                 return
 
-        lm.rollback_speculative_cache(prompt_cache, verify_out.gdn_states, accepted, bs)
-
-        hidden = hidden[:, : accepted + 1, :]
+        # Rollback on the same stream as draft/verify to avoid
+        # cross-stream Metal command buffer issues.
+        with mx.stream(generation_stream):
+            lm.rollback_speculative_cache(
+                prompt_cache, verify_out.gdn_states, accepted, bs
+            )
+            hidden = hidden[:, : accepted + 1, :]
         b = new_tokens[-1] if new_tokens else b
+
+        rounds += 1
+        if rounds % 16 == 0:
+            mx.clear_cache()
 
 
 def _dflash_rounds_batch(
@@ -582,6 +591,8 @@ def _dflash_rounds_batch(
         nonlocal draft_cache
         draft_cache = draft_model.make_cache()
 
+    rounds = 0
+
     while len(active_idx) > 0:
         remaining = [
             max(1, max_tokens - emitted[active_idx[j]] + 1)
@@ -620,11 +631,14 @@ def _dflash_rounds_batch(
             draft_tokens, target_tokens, budgets
         )
 
+        # Rollback on the same stream as draft/verify to avoid
+        # cross-stream Metal command buffer issues.
         accepted_arr = mx.array(accepted_list)
-        max_a = lm.rollback_speculative_cache(
-            prompt_cache, verify_out.gdn_states, accepted_arr, bs
-        )
-        hidden = hidden_full[:, : max_a + 1, :]
+        with mx.stream(generation_stream):
+            max_a = lm.rollback_speculative_cache(
+                prompt_cache, verify_out.gdn_states, accepted_arr, bs
+            )
+            hidden = hidden_full[:, : max_a + 1, :]
 
         for a in accepted_list:
             draft_model.accept_lens.append(a)
@@ -667,6 +681,10 @@ def _dflash_rounds_batch(
             active_idx = [active_idx[j] for j in keep_slots]
             # Cold-restart drafter for the new batch size
             _reinit_drafter()
+
+        rounds += 1
+        if rounds % 16 == 0:
+            mx.clear_cache()
 
 
 def generate_step(
