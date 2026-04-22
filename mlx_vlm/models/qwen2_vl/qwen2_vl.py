@@ -31,7 +31,6 @@ class Model(nn.Module):
         mask = kwargs.get("mask", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
-
         if pixel_values is None:
             self.language_model._position_ids = None
             return InputEmbeddingsFeatures(

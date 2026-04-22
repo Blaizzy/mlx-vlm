@@ -182,9 +182,10 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
             )
         )
 
-        proc_cfg = _load_qwen_vl_json(
-            pretrained_model_name_or_path, "processor_config.json"
-        ) or {}
+        proc_cfg = (
+            _load_qwen_vl_json(pretrained_model_name_or_path, "processor_config.json")
+            or {}
+        )
         chat_template = proc_cfg.get(
             "chat_template", getattr(tokenizer, "chat_template", None)
         )

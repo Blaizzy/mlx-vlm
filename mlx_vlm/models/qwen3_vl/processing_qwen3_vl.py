@@ -57,9 +57,7 @@ def _smart_resize_video(
     return h_bar, w_bar
 
 
-def _resize_video_frames(
-    video: np.ndarray, target_h: int, target_w: int
-) -> np.ndarray:
+def _resize_video_frames(video: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
     """Bicubic resize each frame of a ``(T, C, H, W)`` video."""
     from PIL import Image
 
@@ -172,7 +170,8 @@ class Qwen3VLImageProcessor(ImageProcessingMixin):
     def _process_one(self, image: np.ndarray) -> Tuple[np.ndarray, List[int]]:
         C, H, W = image.shape
         resized_h, resized_w = _smart_resize_image(
-            H, W,
+            H,
+            W,
             factor=self.patch_size * self.merge_size,
             min_pixels=self.min_pixels,
             max_pixels=self.max_pixels,
@@ -199,21 +198,30 @@ class Qwen3VLImageProcessor(ImageProcessingMixin):
         grid_w = resized_w // ps
 
         patches = patches.reshape(
-            1, grid_t, tps, C,
-            grid_h // ms, ms, ps,
-            grid_w // ms, ms, ps,
+            1,
+            grid_t,
+            tps,
+            C,
+            grid_h // ms,
+            ms,
+            ps,
+            grid_w // ms,
+            ms,
+            ps,
         )
         patches = patches.transpose(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
-        flatten = patches.reshape(
-            1, grid_t * grid_h * grid_w, C * tps * ps * ps
-        )
+        flatten = patches.reshape(1, grid_t * grid_h * grid_w, C * tps * ps * ps)
         return flatten[0], [grid_t, grid_h, grid_w]
 
     def __call__(self, images, **kwargs):
         if not isinstance(images, list):
             images = [images]
         imgs = [
-            img if (isinstance(img, np.ndarray) and img.ndim == 3) else _to_numpy_image(img)
+            (
+                img
+                if (isinstance(img, np.ndarray) and img.ndim == 3)
+                else _to_numpy_image(img)
+            )
             for img in images
         ]
         all_patches = []
@@ -324,14 +332,19 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
 
         patches = video_f[None, ...]  # (1, T_padded, C, H, W)
         patches = patches.reshape(
-            1, grid_t, tps, C,
-            grid_h // ms, ms, ps,
-            grid_w // ms, ms, ps,
+            1,
+            grid_t,
+            tps,
+            C,
+            grid_h // ms,
+            ms,
+            ps,
+            grid_w // ms,
+            ms,
+            ps,
         )
         patches = patches.transpose(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
-        flatten = patches.reshape(
-            1, grid_t * grid_h * grid_w, C * tps * ps * ps
-        )
+        flatten = patches.reshape(1, grid_t * grid_h * grid_w, C * tps * ps * ps)
         return flatten[0], [grid_t, grid_h, grid_w]
 
     def __call__(self, videos, **kwargs):
@@ -362,9 +375,7 @@ def _load_qwen_vl_json(pretrained_model_name_or_path, relative_name: str):
     try:
         from huggingface_hub import hf_hub_download
 
-        fetched = Path(
-            hf_hub_download(pretrained_model_name_or_path, relative_name)
-        )
+        fetched = Path(hf_hub_download(pretrained_model_name_or_path, relative_name))
         return json.loads(fetched.read_text())
     except Exception:
         return None
@@ -372,12 +383,13 @@ def _load_qwen_vl_json(pretrained_model_name_or_path, relative_name: str):
 
 def _qwen_vl_image_kwargs(pretrained_model_name_or_path, default_patch_size: int = 16):
     """Read Qwen-VL image processor kwargs out of a checkpoint."""
-    proc_cfg = _load_qwen_vl_json(
-        pretrained_model_name_or_path, "processor_config.json"
-    ) or {}
-    raw = _load_qwen_vl_json(
-        pretrained_model_name_or_path, "preprocessor_config.json"
-    ) or {}
+    proc_cfg = (
+        _load_qwen_vl_json(pretrained_model_name_or_path, "processor_config.json") or {}
+    )
+    raw = (
+        _load_qwen_vl_json(pretrained_model_name_or_path, "preprocessor_config.json")
+        or {}
+    )
     raw.update(proc_cfg.get("image_processor", {}) or {})
     out = {"patch_size": default_patch_size}
     for k in (
@@ -414,9 +426,12 @@ def _qwen_vl_video_kwargs(pretrained_model_name_or_path, default_patch_size: int
     if raw is None:
         # Older checkpoints (e.g. qwen2_vl) keep video settings inside
         # preprocessor_config.json alongside the image settings.
-        raw = _load_qwen_vl_json(
-            pretrained_model_name_or_path, "preprocessor_config.json"
-        ) or {}
+        raw = (
+            _load_qwen_vl_json(
+                pretrained_model_name_or_path, "preprocessor_config.json"
+            )
+            or {}
+        )
     out = {"patch_size": default_patch_size}
     for k in (
         "patch_size",
@@ -631,9 +646,10 @@ class Qwen3VLProcessor(ProcessorMixin):
             )
         )
 
-        proc_cfg = _load_qwen_vl_json(
-            pretrained_model_name_or_path, "processor_config.json"
-        ) or {}
+        proc_cfg = (
+            _load_qwen_vl_json(pretrained_model_name_or_path, "processor_config.json")
+            or {}
+        )
         chat_template = proc_cfg.get(
             "chat_template", getattr(tokenizer, "chat_template", None)
         )

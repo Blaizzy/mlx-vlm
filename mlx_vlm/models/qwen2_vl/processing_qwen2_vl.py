@@ -154,7 +154,6 @@ class Qwen2VLProcessor(ProcessorMixin):
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
-
         ip_cfg = _qwen_vl_image_kwargs(
             pretrained_model_name_or_path,
             default_patch_size=14,
@@ -167,9 +166,10 @@ class Qwen2VLProcessor(ProcessorMixin):
         image_processor = Qwen3VLImageProcessor(**ip_cfg)
         video_processor = Qwen3VLVideoProcessor(**vp_cfg)
 
-        proc_cfg = _load_qwen_vl_json(
-            pretrained_model_name_or_path, "processor_config.json"
-        ) or {}
+        proc_cfg = (
+            _load_qwen_vl_json(pretrained_model_name_or_path, "processor_config.json")
+            or {}
+        )
         chat_template = proc_cfg.get(
             "chat_template", getattr(tokenizer, "chat_template", None)
         )
