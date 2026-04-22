@@ -45,28 +45,51 @@ from mlx_vlm.models.sam3d_body.estimator import write_obj
 write_obj(result["pred_vertices"], faces, "output.obj")
 ```
 
+## Single-Image Overlay
+
+Two flavors of overlay on the original frame — skeleton-only (pure OpenCV,
+no extra deps) and full photorealistic mesh (requires `pyrender` + `trimesh`).
+
+```python
+import cv2
+from mlx_vlm.models.sam3d_body.overlay import (
+    draw_skeleton_overlay, render_mesh_overlay, load_faces,
+)
+
+frame_bgr = cv2.imread("photo.jpg")
+
+# Skeleton only (fast, no extra deps)
+skel_bgr = draw_skeleton_overlay(result, frame_bgr)
+cv2.imwrite("photo_skeleton.jpg", skel_bgr)
+
+# Full mesh overlay (requires: pip install pyrender trimesh)
+faces = load_faces("/path/to/sam3d-mlx-weights")
+mesh_bgr = render_mesh_overlay(result, frame_bgr, faces)
+cv2.imwrite("photo_mesh.jpg", mesh_bgr)
+```
+
 ## Video Pipeline
 
 Frame-by-frame body estimation with skeleton overlay rendering:
 
-```python
-python -m sam3d_mlx.video --input pitch.mp4 --output pitch_overlay.mp4
+```bash
+python -m mlx_vlm.models.sam3d_body.video --input pitch.mp4 --output pitch_overlay.mp4
 ```
 
 ## CLI
 
 ```bash
 # Single image → OBJ mesh
-python -m sam3d_mlx --image photo.jpg --output mesh.obj
+python -m mlx_vlm.models.sam3d_body.generate --image photo.jpg --output mesh.obj
 
 # With bounding box
-python -m sam3d_mlx --image photo.jpg --bbox 100,50,400,500 --output mesh.obj
+python -m mlx_vlm.models.sam3d_body.generate --image photo.jpg --bbox 100,50,400,500 --output mesh.obj
 
 # Custom weights directory
-python -m sam3d_mlx --image photo.jpg --weights /path/to/weights/ --output mesh.obj
+python -m mlx_vlm.models.sam3d_body.generate --image photo.jpg --weights /path/to/weights/ --output mesh.obj
 
 # Save 3D keypoints alongside mesh
-python -m sam3d_mlx --image photo.jpg --output mesh.obj --save-keypoints
+python -m mlx_vlm.models.sam3d_body.generate --image photo.jpg --output mesh.obj --save-keypoints
 ```
 
 ## Architecture
@@ -189,10 +212,10 @@ mlx_vlm/models/sam3d_body/
 ├── estimator.py           # SAM3DBodyEstimator — preprocessing + inference + OBJ export
 ├── generate.py            # SAM3DPredictor — mlx-vlm from_pretrained/predict API
 ├── video.py               # Video pipeline with skeleton overlay rendering
+├── overlay.py             # Single-image skeleton + pyrender mesh overlay helpers
 ├── convert_weights.py     # PyTorch .ckpt + JIT .pt → safetensors converter
 ├── vision.py              # VisionModel stub (wraps backbone for mlx-vlm compat)
-├── language.py            # LanguageModel stub (raises NotImplementedError)
-└── __main__.py            # CLI: python -m sam3d_mlx
+└── language.py            # LanguageModel stub (raises NotImplementedError)
 ```
 
 ### mlx-vlm Integration
@@ -202,6 +225,18 @@ This package follows mlx-vlm model conventions:
 - `VisionModel` wraps the DINOv3 backbone; `LanguageModel` is a stub (SAM 3D Body is vision-only)
 - `sanitize()` static method for mlx-vlm's weight loading path
 - `model_type: "sam3d_body"` in config, intended for mlx-vlm's `MODEL_REMAPPING`
+
+## Future Work
+
+- **Hand pose refinement pass.** The upstream model ships a second decoder stage
+  that refines each hand independently using detected hand-box crops
+  (`decoder_hand.*`, `head_pose_hand.*`, etc. in the checkpoint). This port
+  filters those weights out and runs the body-only pass, which is accurate for
+  full-body poses but leaves the fingers at the body head's coarser prediction.
+  A follow-up PR will wire the hand refinement decoder.
+- **Hand box detection head.** The body decoder already emits predicted hand
+  bounding boxes (`hand_cls_embed`, `bbox_embed`) but they are unused until
+  the hand pass lands.
 
 ## License
 
