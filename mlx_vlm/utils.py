@@ -3,6 +3,7 @@ import importlib
 import inspect
 import json
 import logging
+import math
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -1073,6 +1074,71 @@ def normalize_audio_features(features: mx.array) -> mx.array:
     return (features - mx.mean(features)) / (mx.std(features) + 1e-6)
 
 
+def load_video(
+    video_path: str,
+    fps: float = 2.0,
+    nframes: Optional[int] = None,
+    min_frames: int = 4,
+    max_frames: int = 768,
+    frame_factor: int = 2,
+) -> Tuple[np.ndarray, float]:
+    """Read a video file as a (T, C, H, W) numpy array.
+
+    Uniformly samples ``nframes`` frames — either a fixed count or derived
+    from ``fps`` — and returns the sampled frames alongside the effective
+    sampling fps.
+    """
+    import cv2
+
+    if video_path.startswith("file://"):
+        video_path = video_path[7:]
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
+
+    def _round(n):
+        return round(n / frame_factor) * frame_factor
+
+    def _floor(n):
+        return math.floor(n / frame_factor) * frame_factor
+
+    def _ceil(n):
+        return math.ceil(n / frame_factor) * frame_factor
+
+    if nframes is not None:
+        n = _round(nframes)
+    else:
+        lo = _ceil(min_frames)
+        hi = _floor(min(max_frames, total_frames))
+        n = total_frames / video_fps * fps
+        n = min(max(n, lo), hi, total_frames)
+        n = _floor(n)
+    if not (frame_factor <= n <= total_frames):
+        cap.release()
+        raise ValueError(
+            f"nframes must be in [{frame_factor}, {total_frames}], got {n}."
+        )
+
+    indices = np.linspace(0, total_frames - 1, n).round().astype(int)
+    frames = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    cap.release()
+    if not frames:
+        raise ValueError("No frames read from the video.")
+
+    video_np = np.transpose(np.stack(frames, axis=0), (0, 3, 1, 2))
+    sample_fps = n / max(total_frames, 1e-6) * video_fps
+    return video_np, sample_fps
+
+
 def process_inputs(
     processor,
     prompts,
@@ -1148,6 +1214,7 @@ def prepare_inputs(
     processor,
     images=None,
     audio=None,
+    videos=None,
     prompts=None,
     image_token_index=None,
     resize_shape=None,
@@ -1163,7 +1230,10 @@ def prepare_inputs(
         not hasattr(images, "__len__") or len(images) > 0
     )
     has_audio = audio is not None and (not hasattr(audio, "__len__") or len(audio) > 0)
-    if not has_images and not has_audio:
+    has_videos = videos is not None and (
+        not hasattr(videos, "__len__") or len(videos) > 0
+    )
+    if not has_images and not has_audio and not has_videos:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1311,6 +1381,22 @@ def prepare_inputs(
             )
             audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
+    video_fps = None
+    if has_videos:
+        if not isinstance(videos, list):
+            videos = [videos]
+        fps_hint = kwargs.pop("fps", 2.0)
+        loaded, video_fps = [], []
+        for v in videos:
+            arr, s_fps = (
+                load_video(str(v), fps=fps_hint)
+                if isinstance(v, (str, bytes))
+                else (v, fps_hint)
+            )
+            loaded.append(arr)
+            video_fps.append(s_fps)
+        videos = loaded
+
     model_inputs = {}
 
     if hasattr(processor, "image_processor") and isinstance(
@@ -1349,12 +1435,18 @@ def prepare_inputs(
         if hasattr(processor, "tokenizer") and processor.tokenizer.pad_token is None:
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
+        extra = {}
+        if has_videos:
+            extra["videos"] = videos
+            if video_fps is not None:
+                extra["fps"] = video_fps
         inputs = process_inputs_with_fallback(
             processor,
             images=images,
             audio=audio,
             prompts=prompts,
             add_special_tokens=add_special_tokens,
+            **extra,
             **kwargs,
         )
 
