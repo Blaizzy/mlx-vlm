@@ -268,8 +268,9 @@ def normalize_resize_shape(
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
-# A stream on the default device just for generation
-generation_stream = mx.new_stream(mx.default_device())
+# A stream on the default device just for generation.
+_new_generation_stream = getattr(mx, "new_thread_local_stream", mx.new_stream)
+generation_stream = _new_generation_stream(mx.default_device())
 
 
 def maybe_quantize_kv_cache(
