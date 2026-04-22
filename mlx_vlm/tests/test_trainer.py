@@ -197,6 +197,46 @@ class TestTrainer(unittest.TestCase):
         self.mock_optimizer.update.assert_called()
         mock_save_safetensors.assert_called()
 
+    @patch("mlx_vlm.trainer.sft_trainer.iterate_batches")
+    @patch("mlx_vlm.trainer.sft_trainer.mx.save_safetensors")
+    def test_train_handles_none_adapter_file(
+        self, mock_save_safetensors, mock_iterate_batches
+    ):
+        """Regression test for issue #908.
+
+        When `args.adapter_file` is None, the train loop previously
+        crashed at the first checkpoint or final save with
+        `TypeError: argument should be a str ... not 'NoneType'`.
+        It should now fall back to a sensible default and complete
+        the run, with the save still being invoked.
+        """
+        mock_batch = {
+            "input_ids": mx.array([[1, 2, 3], [1, 2, 3], [1, 2, 3], [1, 2, 3]]),
+            "attention_mask": mx.array([[1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1]]),
+            "pixel_values": mx.array(
+                [[[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]]]
+            ),
+            "labels": mx.array([[0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1, 2]]),
+        }
+        mock_iterate_batches.return_value = iter([mock_batch])
+
+        args = TrainingArgs(iters=1, batch_size=4)
+        args.adapter_file = None  # the buggy state from issue #908
+
+        train(
+            model=self.mock_model,
+            optimizer=self.mock_optimizer,
+            train_dataset=MagicMock(__len__=lambda self: 4),
+            val_dataset=None,
+            args=args,
+        )
+
+        # The defensive default should have been applied.
+        self.assertIsNotNone(args.adapter_file)
+        self.assertTrue(args.adapter_file.endswith("adapters.safetensors"))
+        # And the save should still have run without crashing.
+        mock_save_safetensors.assert_called()
+
 
 class TestLoRaScaling(unittest.TestCase):
     """Verify LoRaLayer uses alpha/rank scaling (standard LoRA convention)."""

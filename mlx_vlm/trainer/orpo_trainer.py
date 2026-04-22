@@ -312,6 +312,15 @@ def train_orpo(
     """
     Main training function for vision-language models.
     """
+    # Defensive default — see issue #908. Same fix as sft_trainer.train.
+    if getattr(args, "adapter_file", None) is None:
+        args.adapter_file = "adapters.safetensors"
+        if mx.distributed.init().rank() == 0:
+            print(
+                f"{Colors.WARNING}[warning] args.adapter_file was None — "
+                f"defaulting to '{args.adapter_file}'.{Colors.ENDC}"
+            )
+
     # Set memory limit if using Metal
     if mx.metal.is_available():
         mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
