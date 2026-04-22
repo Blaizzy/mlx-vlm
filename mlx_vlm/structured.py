@@ -1,24 +1,8 @@
 import json
 import warnings
-from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
-
-
-@dataclass(frozen=True)
-class Regex:
-    pattern: str
-
-
-@dataclass(frozen=True)
-class CFG:
-    grammar: str
-
-
-@dataclass(frozen=True)
-class JsonSchema:
-    schema: str | dict[str, Any]
 
 
 class LLGuidanceLogitsProcessor:
@@ -90,7 +74,7 @@ def _serialize_schema(schema: str | dict[str, Any]) -> str:
     return json.dumps(schema)
 
 
-def build_logits_processor(tokenizer, output_type: Regex | CFG | JsonSchema | dict):
+def build_json_schema_logits_processor(tokenizer, schema: str | dict[str, Any]):
     try:
         import llguidance as llg
         import llguidance.hf
@@ -101,23 +85,5 @@ def build_logits_processor(tokenizer, output_type: Regex | CFG | JsonSchema | di
         ) from exc
 
     llg_tokenizer = llguidance.hf.from_tokenizer(tokenizer)
-
-    if isinstance(output_type, Regex):
-        grammar = llg.grammar_from("regex", output_type.pattern)
-    elif isinstance(output_type, CFG):
-        try:
-            grammar = llg.grammar_from("grammar", output_type.grammar)
-        except ValueError:
-            grammar = llg.grammar_from("lark", output_type.grammar)
-    elif isinstance(output_type, JsonSchema):
-        grammar = llg.grammar_from("json_schema", _serialize_schema(output_type.schema))
-    elif isinstance(output_type, dict):
-        grammar = llg.grammar_from("json_schema", json.dumps(output_type))
-    else:
-        raise TypeError(f"Unsupported structured output type: {type(output_type)!r}")
-
+    grammar = llg.grammar_from("json_schema", _serialize_schema(schema))
     return LLGuidanceLogitsProcessor(grammar, llg_tokenizer)
-
-
-def build_json_schema_logits_processor(tokenizer, schema: str | dict[str, Any]):
-    return build_logits_processor(tokenizer, JsonSchema(schema))
