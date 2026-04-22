@@ -415,8 +415,13 @@ def _speculative_walk(
     Returns ``(accepted_count, new_tokens)`` with ``new_tokens``
     truncated to ``budget``.
     """
-    d = draft_tokens[0].tolist()
-    t = target_tokens[0].tolist()
+    # Single GPU→CPU transfer instead of two separate .tolist() calls.
+    n_draft = draft_tokens.shape[1]
+    combined = mx.concatenate(
+        [draft_tokens.reshape(-1), target_tokens.reshape(-1)]
+    ).tolist()
+    d = combined[:n_draft]
+    t = combined[n_draft:]
     accepted = next((i for i in range(len(d)) if d[i] != t[i]), len(d))
     new_tokens = (d[:accepted] + [t[accepted]])[:budget]
     return accepted, new_tokens
@@ -433,12 +438,16 @@ def _speculative_walk_batch(
     corresponds to one sequence in the batch.
     """
     B = draft_tokens.shape[0]
-    d_batch = draft_tokens.tolist()
-    t_batch = target_tokens.tolist()
+    n_draft = draft_tokens.shape[1]
+    # Single GPU→CPU transfer.
+    combined = mx.concatenate(
+        [draft_tokens.reshape(B, -1), target_tokens.reshape(B, -1)], axis=1
+    ).tolist()
     accepted_list: List[int] = []
     new_tokens_list: List[List[int]] = []
     for i in range(B):
-        d, t = d_batch[i], t_batch[i]
+        d = combined[i][:n_draft]
+        t = combined[i][n_draft:]
         acc = next((j for j in range(len(d)) if d[j] != t[j]), len(d))
         new = (d[:acc] + [t[acc]])[: budgets[i]]
         accepted_list.append(acc)
@@ -489,14 +498,12 @@ def _dflash_rounds(
         if bs <= 1:
             break
 
-        # Draft
-        with mx.stream(generation_stream):
-            draft_tokens = draft_model.draft_block(
-                b, hidden, draft_cache, bs, sampler, token_dtype
-            )
+
+        draft_tokens = draft_model.draft_block(
+            b, hidden, draft_cache, bs, sampler, token_dtype
+        )
         mx.async_eval(draft_tokens)
 
-        # Verify
         with mx.stream(generation_stream):
             verify_input = mx.concatenate(
                 [mx.array([[b]], dtype=token_dtype), draft_tokens],
@@ -524,14 +531,15 @@ def _dflash_rounds(
             if emitted >= max_tokens:
                 return
 
-        # Rollback on the same stream as draft/verify to avoid
-        # cross-stream Metal command buffer issues.
-        with mx.stream(generation_stream):
-            lm.rollback_speculative_cache(
-                prompt_cache, verify_out.gdn_states, accepted, bs
-            )
+        if accepted < bs - 1:
             hidden = hidden[:, : accepted + 1, :]
         b = new_tokens[-1] if new_tokens else b
+
+        if accepted < bs - 1:
+            with mx.stream(generation_stream):
+                lm.rollback_speculative_cache(
+                    prompt_cache, verify_out.gdn_states, accepted, bs
+                )
 
         rounds += 1
         if rounds % 16 == 0:
@@ -607,10 +615,9 @@ def _dflash_rounds_batch(
         b_arr = mx.array(b_active, dtype=token_dtype)
 
         # Draft
-        with mx.stream(generation_stream):
-            draft_tokens = draft_model.draft_block(
-                b_arr, hidden, draft_cache, bs, sampler, token_dtype
-            )
+        draft_tokens = draft_model.draft_block(
+            b_arr, hidden, draft_cache, bs, sampler, token_dtype
+        )
         mx.async_eval(draft_tokens)
 
         # Verify
@@ -631,14 +638,15 @@ def _dflash_rounds_batch(
             draft_tokens, target_tokens, budgets
         )
 
-        # Rollback on the same stream as draft/verify to avoid
-        # cross-stream Metal command buffer issues.
+        min_accepted = min(accepted_list)
         accepted_arr = mx.array(accepted_list)
-        with mx.stream(generation_stream):
-            max_a = lm.rollback_speculative_cache(
-                prompt_cache, verify_out.gdn_states, accepted_arr, bs
-            )
+
+        if min_accepted < bs - 1:
+            max_a = int(accepted_arr.max().item())
             hidden = hidden_full[:, : max_a + 1, :]
+        else:
+            max_a = bs - 1
+            hidden = hidden_full
 
         for a in accepted_list:
             draft_model.accept_lens.append(a)
@@ -664,6 +672,12 @@ def _dflash_rounds_batch(
             orig = active_idx[j]
             if new_tokens_list[j]:
                 b[orig] = new_tokens_list[j][-1]
+
+        if min_accepted < bs - 1:
+            with mx.stream(generation_stream):
+                lm.rollback_speculative_cache(
+                    prompt_cache, verify_out.gdn_states, accepted_arr, bs
+                )
 
         # --- Continuous batching: filter out finished sequences ---
         keep_slots = [j for j in range(n_active) if not finished[active_idx[j]]]
