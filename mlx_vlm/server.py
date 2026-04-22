@@ -47,6 +47,7 @@ from .generate import (
 )
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
+from .structured import build_json_schema_logits_processor
 from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load, prepare_inputs
 from .version import __version__
@@ -122,6 +123,7 @@ class GenerationArguments:
     enable_thinking: bool = True
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
 
     def to_generate_kwargs(self) -> dict:
         """Convert to kwargs dict for generate()/stream_generate()."""
@@ -141,6 +143,8 @@ class GenerationArguments:
             kw["thinking_budget"] = self.thinking_budget
         if self.thinking_start_token is not None:
             kw["thinking_start_token"] = self.thinking_start_token
+        if self.logits_processors is not None:
+            kw["logits_processors"] = self.logits_processors
         return kw
 
     def to_template_kwargs(self) -> dict:
@@ -238,6 +242,10 @@ class ResponseGenerator:
         args: Optional[GenerationArguments] = None,
     ) -> Tuple[GenerationContext, Iterator[StreamingToken]]:
         args = args or GenerationArguments()
+        if self.draft_model is not None and args.logits_processors is not None:
+            raise ValueError(
+                "Structured response_format is not supported with speculative decoding."
+            )
         rqueue: Queue = Queue()
 
         # CPU preprocessing (tokenize, load images) on caller thread.
@@ -428,6 +436,7 @@ class ResponseGenerator:
                             [input_ids.squeeze(0).tolist()],
                             max_tokens=args.max_tokens,
                             prompt_kwargs=[gen_kwargs],
+                            logits_processors=[args.logits_processors],
                         )
                     except Exception as e:
                         rqueue.put(e)
@@ -777,6 +786,53 @@ def _build_gen_args(request) -> GenerationArguments:
         thinking_budget=getattr(request, "thinking_budget", None),
         thinking_start_token=getattr(request, "thinking_start_token", None),
     )
+
+
+def _as_plain_dict(value):
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        return value.model_dump(exclude_none=True)
+    return value
+
+
+def _extract_response_format_schema(request) -> Optional[Union[str, dict]]:
+    response_format = _as_plain_dict(getattr(request, "response_format", None))
+
+    text_config = _as_plain_dict(getattr(request, "text", None))
+    if response_format is None and isinstance(text_config, dict):
+        response_format = _as_plain_dict(text_config.get("format"))
+
+    if response_format is None:
+        return None
+
+    format_type = response_format.get("type")
+    if format_type in (None, "text"):
+        return None
+    if format_type != "json_schema":
+        raise ValueError(f"Unsupported response_format type: {format_type!r}")
+
+    json_schema = _as_plain_dict(response_format.get("json_schema"))
+    if json_schema is None:
+        # Responses API text.format places schema directly on the format object.
+        json_schema = response_format
+
+    schema = json_schema.get("schema") if isinstance(json_schema, dict) else None
+    if schema is None:
+        raise ValueError("response_format json_schema must include a schema field")
+    return schema
+
+
+def _build_structured_logits_processors(request, processor):
+    schema = _extract_response_format_schema(request)
+    if schema is None:
+        return None
+
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    processor = build_json_schema_logits_processor(tokenizer, schema)
+    return [processor]
 
 
 def _count_thinking_tag_tokens(text: str) -> int:
@@ -1162,6 +1218,12 @@ class OpenAIRequest(FlexibleBaseModel):
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
+    response_format: Optional[Any] = Field(
+        None, description="OpenAI-compatible response_format for structured outputs."
+    )
+    text: Optional[Any] = Field(
+        None, description="Responses API text format configuration."
+    )
 
 
 class OpenAIUsage(BaseModel):
@@ -1361,6 +1423,9 @@ class VLMRequest(FlexibleBaseModel):
     resize_shape: Optional[ResizeShapeInput] = Field(
         None,
         description="Resize shape for the image. Provide one integer for square or two for (height, width).",
+    )
+    response_format: Optional[Any] = Field(
+        None, description="OpenAI-compatible response_format for structured outputs."
     )
 
     @field_validator("resize_shape", mode="before")
@@ -1600,6 +1665,12 @@ async def responses_endpoint(request: Request):
             raise HTTPException(status_code=400, detail="Missing input.")
 
         gen_args = _build_gen_args(openai_request)
+        try:
+            gen_args.logits_processors = _build_structured_logits_processors(
+                openai_request, processor
+            )
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
         formatted_prompt = apply_chat_template(
             processor,
@@ -1707,6 +1778,7 @@ async def responses_endpoint(request: Request):
                             max_tokens=openai_request.max_output_tokens,
                             top_p=openai_request.top_p,
                             vision_cache=model_cache.get("vision_cache"),
+                            logits_processors=gen_args.logits_processors,
                             **kwargs,
                         )
 
@@ -1992,6 +2064,12 @@ async def chat_completions_endpoint(request: ChatRequest):
                 tool_module = load_tool_module(tool_parser_type)
 
         gen_args = _build_gen_args(request)
+        try:
+            gen_args.logits_processors = _build_structured_logits_processors(
+                request, processor
+            )
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
         formatted_prompt = apply_chat_template(
             processor,
@@ -2172,6 +2250,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             max_tokens=request.max_tokens,
                             top_p=request.top_p,
                             vision_cache=model_cache.get("vision_cache"),
+                            logits_processors=gen_args.logits_processors,
                             **kwargs,
                         )
 

@@ -1458,6 +1458,10 @@ class GenerationBatch:
         stop_criteria,
         max_tokens: List[int],
         top_logprobs_k: int = 0,
+        token_context: Optional[List[mx.array]] = None,
+        logits_processors: Optional[
+            List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
+        ] = None,
     ):
         self.model = model
         self._language_model = getattr(model, "language_model", model)
@@ -1469,6 +1473,8 @@ class GenerationBatch:
         self._num_tokens = [0] * len(uids)
         self.compute_logprobs = True
         self.top_logprobs_k = top_logprobs_k
+        self.token_context = token_context or []
+        self.logits_processors = logits_processors or []
 
         self._current_tokens = None
         self._current_lps = None
@@ -1498,6 +1504,22 @@ class GenerationBatch:
         )
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits[:, -1, :]
+
+        if self.token_context:
+            self.token_context = [
+                mx.concatenate([self.token_context[i], mx.array([inputs[i]])])
+                for i in range(len(self.uids))
+            ]
+
+        if self.logits_processors and any(self.logits_processors):
+            processed_logits = []
+            for i in range(logits.shape[0]):
+                sample_logits = logits[i : i + 1]
+                processors = self.logits_processors[i] or []
+                for processor in processors:
+                    sample_logits = processor(self.token_context[i], sample_logits)
+                processed_logits.append(sample_logits)
+            logits = mx.concatenate(processed_logits, axis=0)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         sampled = self.sampler(logprobs)
@@ -1551,6 +1573,8 @@ class GenerationBatch:
         self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
         self.max_tokens.extend(other.max_tokens)
         self._num_tokens.extend(other._num_tokens)
+        self.token_context.extend(other.token_context)
+        self.logits_processors.extend(other.logits_processors)
 
         if self._current_tokens is None:
             self._current_tokens = other._current_tokens
@@ -1599,6 +1623,10 @@ class GenerationBatch:
         self.uids = [self.uids[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self._num_tokens = [self._num_tokens[idx] for idx in keep]
+        if self.token_context:
+            self.token_context = [self.token_context[idx] for idx in keep]
+        if self.logits_processors:
+            self.logits_processors = [self.logits_processors[idx] for idx in keep]
 
         if not keep:
             self.prompt_cache.clear()
@@ -1609,6 +1637,8 @@ class GenerationBatch:
             self._next_top_idx = None
             self._next_top_lp = None
             self._rope_deltas = None
+            self.token_context = []
+            self.logits_processors = []
         else:
             keep_arr = mx.array(keep, mx.int32)
             for c in self.prompt_cache:
@@ -1680,6 +1710,8 @@ class GenerationBatch:
         batch._num_tokens = []
         batch.compute_logprobs = compute_logprobs
         batch.top_logprobs_k = top_logprobs_k
+        batch.token_context = []
+        batch.logits_processors = []
         batch._current_tokens = None
         batch._current_lps = None
         batch._next_tokens = None
@@ -1707,6 +1739,9 @@ class PromptProcessingBatch:
         max_tokens: List[int],
         inputs_embeds: mx.array,
         prompt_kwargs: dict,
+        logits_processors: Optional[
+            List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
+        ] = None,
         prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
         kv_bits=None,
         kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
@@ -1723,6 +1758,8 @@ class PromptProcessingBatch:
         self._total_prompt_tokens = sum(lengths)
 
         self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
+        self._token_context = [mx.array(ids) for ids in input_ids]
+        self.logits_processors = logits_processors or []
         self._inputs_embeds = inputs_embeds
         self._prompt_kwargs = prompt_kwargs
 
@@ -1774,6 +1811,16 @@ class PromptProcessingBatch:
         )
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits[:, -1, :]
+        if self.logits_processors and any(self.logits_processors):
+            processed_logits = []
+            for i in range(logits.shape[0]):
+                sample_logits = logits[i : i + 1]
+                processors = self.logits_processors[i] or []
+                for processor in processors:
+                    sample_logits = processor(self._token_context[i], sample_logits)
+                processed_logits.append(sample_logits)
+            logits = mx.concatenate(processed_logits, axis=0)
+
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         first_tokens = sampler(logprobs)
 
@@ -1786,6 +1833,8 @@ class PromptProcessingBatch:
             stop_criteria=stop_criteria,
             max_tokens=list(self.max_tokens),
             top_logprobs_k=top_logprobs_k,
+            token_context=list(self._token_context),
+            logits_processors=list(self.logits_processors),
         )
         gen_batch.compute_logprobs = compute_logprobs
 
@@ -1815,6 +1864,8 @@ class PromptProcessingBatch:
 
         self.uids = []
         self.prompt_cache = []
+        self._token_context = []
+        self.logits_processors = []
         return gen_batch
 
     @property
@@ -1848,6 +1899,9 @@ class BatchGenerator:
         quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
         compute_logprobs: bool = True,
         top_logprobs_k: int = 0,
+        logits_processors: Optional[
+            List[Callable[[mx.array, mx.array], mx.array]]
+        ] = None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1858,6 +1912,7 @@ class BatchGenerator:
         self.quantized_kv_start = quantized_kv_start
         self.compute_logprobs = compute_logprobs
         self.top_logprobs_k = top_logprobs_k
+        self.logits_processors = logits_processors or []
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1900,6 +1955,9 @@ class BatchGenerator:
         prompts,
         max_tokens: Union[List[int], int, None] = None,
         prompt_kwargs: Optional[List[dict]] = None,
+        logits_processors: Optional[
+            List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
+        ] = None,
     ):
         uids = []
 
@@ -1908,9 +1966,13 @@ class BatchGenerator:
 
         if prompt_kwargs is None:
             prompt_kwargs = [{}] * len(prompts)
+        if logits_processors is None:
+            logits_processors = [self.logits_processors] * len(prompts)
+        elif len(logits_processors) != len(prompts):
+            raise ValueError("Insufficient number of logits_processors provided")
 
-        for p, m, kw in zip(prompts, max_tokens, prompt_kwargs):
-            self._unprocessed_sequences.append((self.uid_count, p, m, kw))
+        for p, m, kw, lp in zip(prompts, max_tokens, prompt_kwargs, logits_processors):
+            self._unprocessed_sequences.append((self.uid_count, p, m, kw, lp))
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
@@ -1923,7 +1985,7 @@ class BatchGenerator:
         """Remove a sequence from the batch by uid."""
         with mx.stream(generation_stream):
             # Waiting in the queue.
-            for i, (seq_uid, _, _, _) in enumerate(self._unprocessed_sequences):
+            for i, (seq_uid, _, _, _, _) in enumerate(self._unprocessed_sequences):
                 if seq_uid == uid:
                     self._unprocessed_sequences.pop(i)
                     return True
@@ -2026,6 +2088,7 @@ class BatchGenerator:
             input_ids = [s[1] for s in sequences]
             max_tokens_list = [s[2] for s in sequences]
             prompt_kwargs_list = [s[3] for s in sequences]
+            logits_processors = [s[4] for s in sequences]
 
             inputs_embeds = None
             merged_kwargs = {}
@@ -2052,6 +2115,7 @@ class BatchGenerator:
                 max_tokens=max_tokens_list,
                 inputs_embeds=inputs_embeds,
                 prompt_kwargs=merged_kwargs,
+                logits_processors=logits_processors,
                 prefill_step_size=self.prefill_step_size,
                 kv_bits=self.kv_bits,
                 kv_group_size=self.kv_group_size,
@@ -2200,6 +2264,16 @@ def batch_generate(
         else:
             group_max_tokens = max_tokens
 
+        group_kwargs = dict(kwargs)
+        logits_processors = group_kwargs.get("logits_processors")
+        if logits_processors is not None and isinstance(logits_processors, list):
+            if not logits_processors or all(callable(p) for p in logits_processors):
+                group_kwargs["logits_processors"] = logits_processors
+            else:
+                group_kwargs["logits_processors"] = [
+                    logits_processors[i] for i in indices
+                ]
+
         # Process the entire group at once (same shape = no padding needed)
         chunk_texts, chunk_stats = _generate_batch(
             model,
@@ -2207,7 +2281,7 @@ def batch_generate(
             group_prompts,
             group_images,
             group_max_tokens,
-            **kwargs,
+            **group_kwargs,
         )
 
         # Store results in original order
@@ -2261,6 +2335,7 @@ def _generate_batch(
 
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     batch_size = len(prompts)
+    logits_processors = kwargs.pop("logits_processors", None)
 
     num_images_list = [
         1 if i < (len(images) if images is not None else 0) else 0
@@ -2325,10 +2400,18 @@ def _generate_batch(
 
     gen_kwargs = {**data_kwargs, **embedding_output.to_dict()}
 
+    if logits_processors and all(
+        callable(processor) for processor in logits_processors
+    ):
+        logits_processors = [
+            [p.clone() for p in logits_processors] for _ in range(batch_size)
+        ]
+
     uids = gen.insert(
         input_ids.tolist(),
         max_tokens,
         prompt_kwargs=[gen_kwargs] * len(input_ids),
+        logits_processors=logits_processors,
     )
     results = {uid: [] for uid in uids}
 
