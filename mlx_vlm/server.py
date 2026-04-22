@@ -41,7 +41,6 @@ from .generate import (
     _dflash_rounds_batch,
     _make_cache,
     generate,
-    generation_stream,
     normalize_resize_shape,
     stream_generate,
 )
@@ -349,6 +348,8 @@ class ResponseGenerator:
             self._run_speculative()
             return
 
+        generation_stream = mx.default_stream(mx.default_device())
+
         batch_gen = None
         # uid -> {rqueue, tokens, gen_kwargs}
         active: dict = {}
@@ -411,6 +412,7 @@ class ResponseGenerator:
                             kv_quant_scheme=self.kv_quant_scheme,
                             quantized_kv_start=self.quantized_kv_start,
                             top_logprobs_k=self.top_logprobs_k,
+                            stream=generation_stream,
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
@@ -465,6 +467,8 @@ class ResponseGenerator:
         by ``_dflash_rounds_batch``'s ``stop_check`` callback.
         """
         from mlx_lm.sample_utils import make_sampler as _make_sampler
+
+        generation_stream = mx.default_stream(mx.default_device())
 
         lm = self.model.language_model
         drafter = self.draft_model
