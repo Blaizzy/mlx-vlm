@@ -621,10 +621,23 @@ class SAM3DBody(nn.Module):
     def sanitize(weights):
         """Remap weight keys for mlx-vlm compatibility.
 
-        Handles: hand module filtering, bare param renaming, backbone
-        bias_mask/k_proj.bias removal, mhr prefix handling.
+        This is the single source of truth for key naming. Handles both:
+          * Raw PyTorch checkpoint keys (post-`convert_weights` output with
+            `--raw`): QKV splitting, backbone `encoder.*` prefix rewriting,
+            Conv2d (O,I,H,W)→(O,H,W,I) transposition, MHR JIT prefix mapping.
+          * Already-sanitized keys (legacy convert_weights output): passes
+            through the rename pipeline untouched.
+
+        Detection is by canary: presence of `backbone.encoder.cls_token` or
+        `character_torch.*` keys means the input is raw and needs full remap.
+        Also drops hand-only modules (not implemented yet — see README) and
+        renames bare array params that sit on the model as attributes.
         """
-        sanitized = {}
+        is_raw = ("backbone.encoder.cls_token" in weights) or any(
+            k.startswith("character_torch.") for k in weights
+        )
+        if is_raw:
+            weights = SAM3DBody._remap_raw_pytorch_keys(weights)
 
         hand_prefixes = (
             "decoder_hand.", "head_pose_hand.", "head_camera_hand.",
@@ -634,7 +647,6 @@ class SAM3DBody(nn.Module):
             "keypoint_posemb_linear_hand.", "keypoint3d_posemb_linear_hand.",
             "keypoint_feat_linear_hand.", "ray_cond_emb_hand.",
         )
-
         bare_param_keys = {
             "init_pose.weight": "init_pose",
             "init_camera.weight": "init_camera",
@@ -642,9 +654,9 @@ class SAM3DBody(nn.Module):
             "keypoint3d_embedding.weight": "keypoint3d_embedding",
             "hand_box_embedding.weight": "hand_box_embedding",
         }
-
         skip_prefixes = ("prompt_encoder.mask_downscaling.",)
 
+        sanitized = {}
         for key, tensor in weights.items():
             if any(key.startswith(p) for p in hand_prefixes):
                 continue
@@ -656,8 +668,90 @@ class SAM3DBody(nn.Module):
                 sanitized[bare_param_keys[key]] = tensor
                 continue
             sanitized[key] = tensor
-
         return sanitized
+
+    @staticmethod
+    def _remap_raw_pytorch_keys(weights):
+        """Convert raw PyTorch checkpoint keys to MLX-native module paths.
+
+        Pulled out of convert_weights.py so key naming lives with the model.
+        The inverse transformations (dtype conversion, JIT model extraction,
+        safetensors sharding) stay in convert_weights.py — only key names and
+        Conv2d layouts belong to the model architecture.
+        """
+        import re
+
+        qkv_pattern = re.compile(
+            r"backbone\.encoder\.blocks\.(\d+)\.attn\.qkv\.(weight|bias|bias_mask)"
+        )
+        backbone_block_pattern = re.compile(r"backbone\.encoder\.blocks\.(\d+)\.(.+)")
+        backbone_simple = {
+            "backbone.encoder.cls_token": "backbone.cls_token",
+            "backbone.encoder.storage_tokens": "backbone.storage_tokens",
+            "backbone.encoder.patch_embed.proj.weight": "backbone.patch_embed.projection.weight",
+            "backbone.encoder.patch_embed.proj.bias": "backbone.patch_embed.projection.bias",
+            "backbone.encoder.rope_embed.periods": "backbone.rope_embed.periods",
+            "backbone.encoder.norm.weight": "backbone.norm.weight",
+            "backbone.encoder.norm.bias": "backbone.norm.bias",
+        }
+
+        result = {}
+        for key, value in weights.items():
+            # Fused QKV -> split q/k/v
+            m = qkv_pattern.match(key)
+            if m:
+                block_idx, ptype = m.group(1), m.group(2)
+                dim = value.shape[0] // 3
+                q, k, v = value[:dim], value[dim : 2 * dim], value[2 * dim :]
+                prefix = f"backbone.blocks.{block_idx}.attention"
+                if ptype == "bias_mask":
+                    result[f"{prefix}.q_bias_mask"] = q
+                    result[f"{prefix}.k_bias_mask"] = k
+                    result[f"{prefix}.v_bias_mask"] = v
+                else:
+                    result[f"{prefix}.q_proj.{ptype}"] = q
+                    result[f"{prefix}.k_proj.{ptype}"] = k
+                    result[f"{prefix}.v_proj.{ptype}"] = v
+                continue
+
+            # Simple backbone prefix renames (+ Conv2d transpose for patch_embed)
+            if key in backbone_simple:
+                new_key = backbone_simple[key]
+                if value.ndim == 4 and "patch_embed" in key:
+                    value = value.transpose(0, 2, 3, 1)
+                result[new_key] = value
+                continue
+
+            # Backbone block pattern (non-QKV): encoder.blocks.N.X -> blocks.N.X
+            m = backbone_block_pattern.match(key)
+            if m:
+                block_idx, rest = m.group(1), m.group(2)
+                if rest.startswith("attn.proj."):
+                    new_key = (
+                        f"backbone.blocks.{block_idx}.attention.o_proj."
+                        + rest[len("attn.proj.") :]
+                    )
+                else:
+                    new_key = f"backbone.blocks.{block_idx}.{rest}"
+                result[new_key] = value
+                continue
+
+            # Conv2d (O,I,H,W) -> (O,H,W,I) for mask_downscaling and ray_cond_emb
+            if "mask_downscaling" in key and value.ndim == 4:
+                result[key] = value.transpose(0, 2, 3, 1)
+                continue
+            if "ray_cond_emb" in key and key.endswith("conv.weight") and value.ndim == 4:
+                result[key] = value.transpose(0, 2, 3, 1)
+                continue
+
+            # MHR JIT prefix renames
+            new_key = key
+            new_key = new_key.replace("character_torch.", "mhr.character.")
+            new_key = new_key.replace("face_expressions_model.", "mhr.face_expressions.")
+            new_key = new_key.replace("pose_correctives_model.", "mhr.pose_correctives.")
+            result[new_key] = value
+
+        return result
 
 
 # mlx-vlm convention alias

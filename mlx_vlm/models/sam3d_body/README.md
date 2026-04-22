@@ -178,7 +178,7 @@ Video processing at ~2 FPS sustained on M3 Max.
 SAM 3D Body weights come as a PyTorch `.ckpt` plus a TorchScript JIT `.pt` file for the MHR body model. The converter handles both:
 
 ```bash
-python -m sam3d_mlx.convert_weights \
+python -m mlx_vlm.models.sam3d_body.convert_weights \
     --checkpoint /path/to/model.ckpt \
     --mhr-model /path/to/assets/mhr_model.pt \
     --output /path/to/sam3d-mlx-weights/

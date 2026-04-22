@@ -1,10 +1,17 @@
 """Convert SAM 3D Body PyTorch checkpoint + JIT MHR model to MLX safetensors.
 
 Usage:
-    python -m sam3d_mlx.convert_weights \
+    python -m mlx_vlm.models.sam3d_body.convert_weights \
         --checkpoint /tmp/sam3d-weights/model.ckpt \
         --mhr-model /tmp/sam3d-weights/assets/mhr_model.pt \
         --output /tmp/sam3d-mlx-weights/
+
+Notes:
+    The QKV split, backbone prefix remaps, Conv2d layout conversion, and MHR
+    JIT prefix remaps performed below are kept here for backward compatibility
+    with existing `/tmp/sam3d-mlx-weights/` layouts. The canonical key naming
+    lives in `Model.sanitize()` (see model.py), which is invoked automatically
+    by `mlx_vlm.utils.load()`. Either path produces the same load result.
 """
 
 import argparse
