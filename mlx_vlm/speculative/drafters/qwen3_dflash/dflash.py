@@ -23,24 +23,28 @@ class DFlashAttention(nn.Module):
         self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-    def __call__(self, x: mx.array, x_ctx: mx.array, rope: nn.RoPE, cache: KVCache):
+    def __call__(self, x: mx.array, x_ctx: mx.array, rope, cache: KVCache):
         B, L, _ = x.shape
         S = x_ctx.shape[1]
-        c = mx.concatenate([x_ctx, x], axis=1)
-        q = self.q_proj(x)
-        k = self.k_proj(c)
-        v = self.v_proj(c)
-        q = self.q_norm(q.reshape(B, L, self.n_heads, self.head_dim)).transpose(
-            0, 2, 1, 3
-        )
-        k = self.k_norm(k.reshape(B, S + L, self.n_kv_heads, self.head_dim)).transpose(
-            0, 2, 1, 3
-        )
-        v = v.reshape(B, S + L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-        q = rope(q, offset=cache.offset + S)
-        k = rope(k, offset=cache.offset)
-        k, v = cache.update_and_fetch(k, v)
-        o = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        # Project context and proposal separately so only context KV
+        # enters the cache (matches upstream z-lab implementation).
+        queries = self.q_proj(x)
+        ctx_keys = self.k_proj(x_ctx)
+        ctx_values = self.v_proj(x_ctx)
+        prop_keys = self.k_proj(x)
+        prop_values = self.v_proj(x)
+        queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3)
+        ctx_keys = self.k_norm(ctx_keys.reshape(B, S, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
+        ctx_values = ctx_values.reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        prop_keys = self.k_norm(prop_keys.reshape(B, L, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
+        prop_values = prop_values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        queries = rope(queries, offset=cache.offset + S)
+        ctx_keys = rope(ctx_keys, offset=cache.offset)
+        prop_keys = rope(prop_keys, offset=cache.offset + S)
+        keys, values = cache.update_and_fetch(ctx_keys, ctx_values)
+        keys = mx.concatenate([keys, prop_keys], axis=2)
+        values = mx.concatenate([values, prop_values], axis=2)
+        o = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale)
         return self.o_proj(o.transpose(0, 2, 1, 3).reshape(B, L, -1))
 
 
@@ -131,8 +135,6 @@ class DFlashDraftModel(nn.Module):
                 [last_bonus[:, None].astype(token_dtype), masks], axis=1
             )
         draft_logits = self(block, hidden, cache)
-        for c in cache:
-            c.trim(block_size)
         return sampler(draft_logits[:, 1 - block_size :])
 
     def __call__(
