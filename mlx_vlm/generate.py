@@ -415,7 +415,6 @@ def _speculative_walk(
     Returns ``(accepted_count, new_tokens)`` with ``new_tokens``
     truncated to ``budget``.
     """
-    # Single GPU→CPU transfer instead of two separate .tolist() calls.
     n_draft = draft_tokens.shape[1]
     combined = mx.concatenate(
         [draft_tokens.reshape(-1), target_tokens.reshape(-1)]
@@ -439,7 +438,6 @@ def _speculative_walk_batch(
     """
     B = draft_tokens.shape[0]
     n_draft = draft_tokens.shape[1]
-    # Single GPU→CPU transfer.
     combined = mx.concatenate(
         [draft_tokens.reshape(B, -1), target_tokens.reshape(B, -1)], axis=1
     ).tolist()
