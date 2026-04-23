@@ -3,6 +3,7 @@ import codecs
 import contextlib
 import functools
 import json
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -269,8 +270,26 @@ def normalize_resize_shape(
 
 
 # A stream on the default device just for generation.
-_new_generation_stream = getattr(mx, "new_thread_local_stream", mx.new_stream)
-generation_stream = _new_generation_stream(mx.default_device())
+_thread_local_generation_stream = (
+    mx.new_thread_local_stream(mx.default_device())
+    if hasattr(mx, "new_thread_local_stream")
+    else None
+)
+_generation_stream_local = threading.local()
+
+
+def get_generation_stream():
+    if _thread_local_generation_stream is not None:
+        return _thread_local_generation_stream
+
+    stream = getattr(_generation_stream_local, "stream", None)
+    if stream is None:
+        stream = mx.new_stream(mx.default_device())
+        _generation_stream_local.stream = stream
+    return stream
+
+
+generation_stream = get_generation_stream()
 
 
 def maybe_quantize_kv_cache(
@@ -490,14 +509,14 @@ def _dflash_rounds(
             break
 
         # Draft
-        with mx.stream(generation_stream):
+        with mx.stream(get_generation_stream()):
             draft_tokens = draft_model.draft_block(
                 b, hidden, draft_cache, bs, sampler, token_dtype
             )
         mx.async_eval(draft_tokens)
 
         # Verify
-        with mx.stream(generation_stream):
+        with mx.stream(get_generation_stream()):
             verify_input = mx.concatenate(
                 [mx.array([[b]], dtype=token_dtype), draft_tokens],
                 axis=1,
@@ -559,7 +578,7 @@ def _dflash_rounds_batch(
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
         raise RuntimeError(
-            f"{type(lm).__name__} does not implement " "rollback_speculative_cache."
+            f"{type(lm).__name__} does not implement rollback_speculative_cache."
         )
 
     B = first_bonus.shape[0]
@@ -597,14 +616,14 @@ def _dflash_rounds_batch(
         b_arr = mx.array(b_active, dtype=token_dtype)
 
         # Draft
-        with mx.stream(generation_stream):
+        with mx.stream(get_generation_stream()):
             draft_tokens = draft_model.draft_block(
                 b_arr, hidden, draft_cache, bs, sampler, token_dtype
             )
         mx.async_eval(draft_tokens)
 
         # Verify
-        with mx.stream(generation_stream):
+        with mx.stream(get_generation_stream()):
             verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
             verify_out = lm(
                 verify_input,
@@ -796,7 +815,7 @@ def generate_step(
     def _step(y, inputs_embeds=None):
         nonlocal tokens, kwargs, last_outputs
 
-        with mx.stream(generation_stream):
+        with mx.stream(get_generation_stream()):
             if "decoder_input_ids" in kwargs:
                 outputs = model.language_model(
                     cache=prompt_cache,
@@ -833,7 +852,7 @@ def generate_step(
 
             return y, logprobs.squeeze(0)
 
-    with mx.stream(generation_stream):
+    with mx.stream(get_generation_stream()):
         # Get input embeddings (handles both multimodal and text-only)
         embedding_output = model.get_input_embeddings(
             input_ids, pixel_values, mask=mask, **kwargs
@@ -1089,7 +1108,7 @@ def stream_generate(
 
     total_prompt_tokens = reused_prefix_len + input_ids.size
 
-    with wired_limit(model, [generation_stream]):
+    with wired_limit(model, [get_generation_stream()]):
         detokenizer = processor.detokenizer
         detokenizer.reset()
         thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
@@ -1885,8 +1904,9 @@ class BatchGenerator:
         self._gen_tokens_counter = 0
         self._steps_counter = 0
 
+        self._stream = get_generation_stream()
         self._wire_stack = contextlib.ExitStack()
-        self._wire_stack.enter_context(wired_limit(model, [generation_stream]))
+        self._wire_stack.enter_context(wired_limit(model, [self._stream]))
 
     def close(self):
         if self._wire_stack is not None:
@@ -1922,7 +1942,7 @@ class BatchGenerator:
 
     def remove(self, uid) -> bool:
         """Remove a sequence from the batch by uid."""
-        with mx.stream(generation_stream):
+        with mx.stream(self._stream):
             # Waiting in the queue.
             for i, (seq_uid, _, _, _) in enumerate(self._unprocessed_sequences):
                 if seq_uid == uid:
@@ -2082,7 +2102,7 @@ class BatchGenerator:
         return prompt_responses, generation_responses
 
     def next(self, **kwargs):
-        with mx.stream(generation_stream):
+        with mx.stream(self._stream):
             return self._next(**kwargs)
 
 

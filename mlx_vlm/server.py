@@ -19,6 +19,7 @@ from typing import Any, Callable, Iterator, List, Literal, Optional, Tuple, Unio
 logger = logging.getLogger("mlx_vlm.server")
 
 import mlx.core as mx
+import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,7 +42,7 @@ from .generate import (
     _dflash_rounds_batch,
     _make_cache,
     generate,
-    generation_stream,
+    get_generation_stream,
     normalize_resize_shape,
     stream_generate,
 )
@@ -173,6 +174,43 @@ class StreamingToken:
     top_logprobs: Optional[List[Tuple[int, float]]] = None
 
 
+@dataclass(frozen=True)
+class _DetachedMxArray:
+    data: np.ndarray
+    dtype: mx.Dtype
+
+
+def _detach_mx_arrays(value):
+    if isinstance(value, mx.array):
+        dtype = value.dtype
+        host_value = value.astype(mx.float32) if dtype == mx.bfloat16 else value
+        return _DetachedMxArray(np.array(host_value), dtype)
+    if isinstance(value, dict):
+        return {key: _detach_mx_arrays(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_detach_mx_arrays(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_mx_arrays(item) for item in value)
+    return value
+
+
+def _restore_mx_arrays(value):
+    if isinstance(value, _DetachedMxArray):
+        restored = mx.array(value.data)
+        return (
+            restored.astype(value.dtype) if restored.dtype != value.dtype else restored
+        )
+    if isinstance(value, np.ndarray):
+        return mx.array(value)
+    if isinstance(value, dict):
+        return {key: _restore_mx_arrays(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_restore_mx_arrays(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_restore_mx_arrays(item) for item in value)
+    return value
+
+
 class ResponseGenerator:
     """
     Continuous batching for concurrent requests via a single GPU thread.
@@ -230,6 +268,19 @@ class ResponseGenerator:
             pending, self._cancelled = self._cancelled, set()
             return pending
 
+    @staticmethod
+    def _fail_queue(rqueue: Queue, error: Exception):
+        try:
+            rqueue.put(error)
+            rqueue.put(None)
+        except Exception:
+            pass
+
+    def _fail_active(self, active: dict, error: Exception):
+        for info in list(active.values()):
+            self._fail_queue(info["rqueue"], error)
+        active.clear()
+
     def generate(
         self,
         prompt: str,
@@ -249,6 +300,7 @@ class ResponseGenerator:
             else len(raw_inputs["input_ids"])
         )
 
+        raw_inputs = _detach_mx_arrays(raw_inputs)
         self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images))
 
         # Block until the GPU thread sends back the context
@@ -316,6 +368,7 @@ class ResponseGenerator:
 
     def _gpu_embed(self, raw_inputs: dict, images=None) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
+        raw_inputs = _restore_mx_arrays(raw_inputs)
         input_ids = raw_inputs.get("input_ids")
         pixel_values = raw_inputs.get("pixel_values")
         mask = raw_inputs.get("attention_mask")
@@ -400,28 +453,36 @@ class ResponseGenerator:
                                 pass
 
                 for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
-                    if batch_gen is None:
-                        batch_gen = BatchGenerator(
-                            self.model.language_model,
-                            self.processor,
-                            stop_tokens=self.stop_tokens,
-                            sampler=self._make_sampler(args),
-                            kv_bits=self.kv_bits,
-                            kv_group_size=self.kv_group_size,
-                            kv_quant_scheme=self.kv_quant_scheme,
-                            quantized_kv_start=self.quantized_kv_start,
-                            top_logprobs_k=self.top_logprobs_k,
-                        )
+                    try:
+                        if batch_gen is None:
+                            batch_gen = BatchGenerator(
+                                self.model.language_model,
+                                self.processor,
+                                stop_tokens=self.stop_tokens,
+                                sampler=self._make_sampler(args),
+                                kv_bits=self.kv_bits,
+                                kv_group_size=self.kv_group_size,
+                                kv_quant_scheme=self.kv_quant_scheme,
+                                quantized_kv_start=self.quantized_kv_start,
+                                top_logprobs_k=self.top_logprobs_k,
+                            )
 
-                    # Vision encoder runs on the GPU thread; text tokenization
-                    # already happened on the caller thread.
-                    input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
-                    has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
+                        # Vision encoder runs on the GPU thread; text tokenization
+                        # already happened on the caller thread.
+                        input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
+                        has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
+                    except Exception as e:
+                        self._fail_queue(rqueue, e)
+                        continue
 
                     # Image/embed requests can't share a prefill batch with
                     # pending text-only prompts — drain them first.
                     if has_embeds and batch_gen.unprocessed_prompts:
-                        self._flush(batch_gen, active)
+                        try:
+                            self._flush(batch_gen, active)
+                        except Exception as e:
+                            self._fail_queue(rqueue, e)
+                            raise
 
                     try:
                         (uid,) = batch_gen.insert(
@@ -430,7 +491,7 @@ class ResponseGenerator:
                             prompt_kwargs=[gen_kwargs],
                         )
                     except Exception as e:
-                        rqueue.put(e)
+                        self._fail_queue(rqueue, e)
                         continue
 
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
@@ -452,6 +513,8 @@ class ResponseGenerator:
             except Exception as e:
                 print(f"Error in generation thread: {e}")
                 traceback.print_exc()
+                self._fail_active(active, e)
+                batch_gen = None
 
     def _run_speculative(self):
         """GPU thread loop with DFlash speculative decoding.
@@ -474,9 +537,10 @@ class ResponseGenerator:
         draft_block_size = int(draft_block_size_str) if draft_block_size_str else None
 
         while not self._stop:
+            pending = []
+            rqueues = {}
             try:
                 # --- Phase 1: collect pending requests ---
-                pending = []
                 timeout = 0.1
                 try:
                     item = self.requests.get(timeout=timeout)
@@ -499,7 +563,6 @@ class ResponseGenerator:
 
                 # --- Phase 2: prefill new batch ---
                 uids = []
-                rqueues = {}
                 token_lists = {}
                 max_tokens_map = {}
                 all_input_ids = []
@@ -524,7 +587,7 @@ class ResponseGenerator:
                 lm._position_ids = None
                 lm._rope_deltas = None
 
-                with mx.stream(generation_stream):
+                with mx.stream(get_generation_stream()):
                     out = lm(
                         input_mx,
                         cache=prompt_cache,
@@ -637,6 +700,10 @@ class ResponseGenerator:
             except Exception as e:
                 print(f"Error in speculative generation thread: {e}")
                 traceback.print_exc()
+                failed = set(rqueues.values())
+                failed.update(item[0] for item in pending if item is not None)
+                for rqueue in failed:
+                    self._fail_queue(rqueue, e)
 
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""
@@ -2211,7 +2278,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                     elapsed = time.perf_counter() - request_start
                     logger.debug(
-                        "chat/completions stream done: tokens=%d " "total_time=%.2fs",
+                        "chat/completions stream done: tokens=%d total_time=%.2fs",
                         output_tokens,
                         elapsed,
                     )
@@ -2284,9 +2351,12 @@ async def chat_completions_endpoint(request: ChatRequest):
                             pass
                         return text, pt, gt, pm
 
-                    full_text, prompt_tokens, output_tokens, peak_memory = (
-                        await asyncio.to_thread(_blocking_generate)
-                    )
+                    (
+                        full_text,
+                        prompt_tokens,
+                        output_tokens,
+                        peak_memory,
+                    ) = await asyncio.to_thread(_blocking_generate)
                 else:
                     gen_result = generate(
                         model=model,

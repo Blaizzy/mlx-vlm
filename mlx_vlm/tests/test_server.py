@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -137,6 +138,34 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
 
 class TestResponseGenerator:
     """Tests for the ResponseGenerator continuous batching engine."""
+
+    def test_detach_and_restore_mx_arrays(self):
+        payload = {
+            "input_ids": server.mx.array([[1, 2, 3]]),
+            "nested": [
+                server.mx.array([4]),
+                (server.mx.array([5], dtype=server.mx.bfloat16), "keep"),
+            ],
+            "plain": "value",
+        }
+
+        detached = server._detach_mx_arrays(payload)
+
+        assert isinstance(detached["input_ids"], server._DetachedMxArray)
+        assert isinstance(detached["nested"][0], server._DetachedMxArray)
+        assert isinstance(detached["nested"][1][0], server._DetachedMxArray)
+        assert detached["nested"][1][0].data.dtype == np.float32
+        assert detached["nested"][1][0].dtype == server.mx.bfloat16
+        assert detached["plain"] == "value"
+
+        restored = server._restore_mx_arrays(detached)
+
+        assert isinstance(restored["input_ids"], server.mx.array)
+        assert isinstance(restored["nested"][0], server.mx.array)
+        assert isinstance(restored["nested"][1][0], server.mx.array)
+        assert restored["nested"][1][0].dtype == server.mx.bfloat16
+        assert restored["input_ids"].tolist() == [[1, 2, 3]]
+        assert restored["nested"][1][1] == "keep"
 
     def test_generate_arguments_defaults(self):
         args = server.GenerationArguments()

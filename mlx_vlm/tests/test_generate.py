@@ -2,6 +2,7 @@
 
 import sys
 from argparse import Namespace
+from threading import Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -363,6 +364,25 @@ class TestLeftPadPrompts:
 
         assert padded.shape == (2, 2)
         assert mx.array_equal(padded[1], mx.array([0, 0]))
+
+
+def test_generation_stream_is_available_in_worker_thread():
+    errors = []
+
+    def worker():
+        try:
+            with mx.stream(generate_module.get_generation_stream()):
+                value = mx.array([1])
+                mx.eval(value)
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = Thread(target=worker)
+    thread.start()
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert not errors
 
 
 # ============================================================================
