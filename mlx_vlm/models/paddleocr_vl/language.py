@@ -448,8 +448,7 @@ class LanguageModel(nn.Module):
         if rope_deltas_kw is not None:
             self._rope_deltas = rope_deltas_kw
 
-        # Use ``_idx`` — the Python-int token counter — instead of syncing
-        # on ``cache[0].offset``. See Qwen2.5-VL for details.
+
         cache_offset = 0
         cache_offsets = None  # per-element offsets for batched caches
         if cache and cache[0] is not None:
