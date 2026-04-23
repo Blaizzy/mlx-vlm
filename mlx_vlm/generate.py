@@ -489,7 +489,6 @@ def _dflash_rounds(
 
     b = first_bonus
     emitted = 1  # the first bonus has already been yielded by the caller
-    rounds = 0
 
     while emitted < max_tokens:
         bs = min(block_total, max_tokens - emitted + 1)
@@ -538,8 +537,7 @@ def _dflash_rounds(
                     prompt_cache, verify_out.gdn_states, accepted, bs
                 )
 
-        rounds += 1
-        if rounds % 16 == 0:
+        if emitted % 256 == 0:
             mx.clear_cache()
 
 
@@ -596,7 +594,7 @@ def _dflash_rounds_batch(
         nonlocal draft_cache
         draft_cache = draft_model.make_cache()
 
-    rounds = 0
+    total_emitted = sum(emitted)
 
     while len(active_idx) > 0:
         remaining = [
@@ -693,9 +691,10 @@ def _dflash_rounds_batch(
             # Cold-restart drafter for the new batch size
             _reinit_drafter()
 
-        rounds += 1
-        if rounds % 16 == 0:
+        new_total = sum(emitted)
+        if new_total // 256 > total_emitted // 256:
             mx.clear_cache()
+        total_emitted = new_total
 
 
 def generate_step(
