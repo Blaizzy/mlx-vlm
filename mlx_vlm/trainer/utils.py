@@ -105,18 +105,39 @@ def get_peft_model(
 
 
 def freeze_model(model):
+    # Gemma 4 (and other multimodal models with an audio tower) also expose
+    # ``audio_tower`` / ``embed_audio`` / ``embed_vision`` at the top level;
+    # omitting them leaves hundreds of MB of unrelated weights marked
+    # trainable, which bloats adapter files and invites gradient leakage.
+    top_level_to_freeze = {
+        "language_model",
+        "vision_model",
+        "vision_tower",
+        "aligner",
+        "connector",
+        "multi_modal_projector",
+        "mm_projector",
+        "audio_tower",
+        "embed_audio",
+        "embed_vision",
+    }
     for name, module in model.named_modules():
         name = name.split(".")[0]
-        if name in [
-            "language_model",
-            "vision_model",
-            "vision_tower",
-            "aligner",
-            "connector",
-            "multi_modal_projector",
-            "mm_projector",
-        ]:
-            model[f"{name}"].freeze()
+        if name in top_level_to_freeze and hasattr(model, name):
+            try:
+                model[f"{name}"].freeze()
+            except Exception:
+                # Some multimodal towers have custom sub-modules (e.g.
+                # AudioRelativePositionEmbedding) whose ``freeze`` errors out
+                # on non-Module buffers. Fall back to walking leaf modules.
+                try:
+                    from mlx.utils import tree_flatten
+                    top = model[f"{name}"]
+                    leaves = tree_flatten(top.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module))
+                    for _, m in leaves:
+                        m.freeze(recurse=False)
+                except Exception:
+                    pass
 
 
 def find_all_linear_names(model):
