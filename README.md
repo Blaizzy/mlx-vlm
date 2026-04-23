@@ -330,6 +330,104 @@ TOP_LOGPROBS_K=5 mlx_vlm.server --model mlx-community/Qwen2-VL-2B-Instruct-4bit
 
 Per-request `top_logprobs` is clamped to `TOP_LOGPROBS_K`. When `TOP_LOGPROBS_K=0`, requests with `logprobs: true` still return chosen-token logprobs; only the `top_logprobs` list stays empty. Leaving the cap at `0` keeps the vocab-wide sort out of the decode graph, so deployments that don't need logprobs pay zero overhead.
 
+#### Structured Outputs
+
+The `/v1/chat/completions` and `/v1/responses` endpoints support OpenAI-compatible `json_schema` structured outputs. The server constrains generation to the supplied JSON schema and supports both streaming and non-streaming responses.
+
+You can define the schema with Pydantic:
+
+```python
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class AnimalResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    animal: Literal["dog", "cat", "bird", "unknown"]
+    species: str = Field(max_length=60)
+    description: str = Field(max_length=200)
+
+
+schema = AnimalResult.model_json_schema()
+```
+
+Call the local server with the OpenAI Python client:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="not-needed")
+
+response = client.chat.completions.create(
+    model="mlx-community/Qwen3.5-4B-MLX-4bit",
+    messages=[
+        {"role": "user", "content": "Return a dog object."},
+    ],
+    response_format={
+        "type": "json_schema",
+        "json_schema": {
+            "name": "AnimalResult",
+            "strict": True,
+            "schema": schema,
+        },
+    },
+)
+
+result = AnimalResult.model_validate_json(response.choices[0].message.content)
+print(result)
+```
+
+Example output:
+
+```text
+animal='dog' species='Canis lupus familiaris' description='A domesticated canine known for companionship and loyalty.'
+```
+
+Chat completions use top-level `response_format`. The same format works for text-only and multimodal requests:
+
+```sh
+curl -X POST "http://localhost:8080/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen3.5-4B-MLX-4bit",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Identify the main animal in this image."},
+        {"type": "image_url", "image_url": {"url": "/path/to/image.jpg"}}
+      ]
+    }],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "AnimalResult",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "animal": {"type": "string", "enum": ["dog", "cat", "bird", "unknown"]},
+            "species": {"type": "string", "maxLength": 60},
+            "description": {"type": "string", "maxLength": 200}
+          },
+          "required": ["animal", "species", "description"],
+          "additionalProperties": false
+        }
+      }
+    },
+    "max_tokens": 256
+  }'
+```
+
+Structured outputs are also supported with:
+
+- Streaming chat completions by setting `"stream": true`
+- The responses API via `text.format` on `/v1/responses`
+- Text-only requests using the same `response_format` shape
+
+Structured outputs are not currently supported with speculative decoding.
+
 #### How It Works
 
 - A dedicated generation thread runs a `BatchGenerator` that processes multiple requests in parallel
