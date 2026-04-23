@@ -201,14 +201,15 @@ class Attention(nn.Module):
         kv_seq_len = L
         offset = 0
         if cache is not None:
-            offset = cache.offset
-            # Handle array-valued offset from BatchKVCache
-            if isinstance(offset, mx.array):
-                offset_scalar = (
-                    offset.max().item() if offset.ndim > 0 else offset.item()
-                )
+            # Prefer cache._idx (Python int) to avoid a per-step GPU sync.
+            if hasattr(cache, "_idx"):
+                offset_scalar = int(cache._idx)
+                offset = cache.offset
             else:
-                offset_scalar = int(offset)
+                offset = cache.offset
+                offset_scalar = int(offset) if isinstance(offset, int) else (
+                    int(offset.max().item()) if offset.ndim > 0 else int(offset.item())
+                )
             kv_seq_len += offset_scalar
         else:
             offset_scalar = 0
