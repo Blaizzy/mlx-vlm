@@ -506,7 +506,11 @@ class VisionModel(nn.Module):
         # Build bidirectional attention mask [B, 1, L, L] for SDPA
         valid_mask = ~padding_positions
         attn_mask = mx.expand_dims(valid_mask, 1) * mx.expand_dims(valid_mask, 2)
-        neg_inf = mx.array(float("-inf"), dtype=inputs_embeds.dtype)
+        # Use large finite negative instead of -inf to prevent NaN in softmax
+        # backward pass. float("-inf") causes 0 * -inf = NaN in the gradient
+        # when all-padding rows hit softmax. Use -1e4 which is safe for both
+        # float16 (max ~65504) and float32.
+        neg_inf = mx.array(-1e4, dtype=inputs_embeds.dtype)
         attn_mask = mx.where(
             attn_mask, mx.array(0.0, dtype=inputs_embeds.dtype), neg_inf
         )
@@ -523,12 +527,15 @@ class VisionModel(nn.Module):
         else:
             valid_mask = ~pool_mask
 
-        all_real = []
-        for i in range(B):
-            n_valid = int(valid_mask[i].astype(mx.int32).sum().item())
-            all_real.append(pooled[i, :n_valid])
+        # Use mask multiplication to zero out padding while preserving the
+        # autograd graph and avoiding .item() calls (which break mx.compile).
+        valid_mask_expanded = mx.expand_dims(valid_mask, -1).astype(pooled.dtype)
+        masked_pooled = pooled * valid_mask_expanded
 
-        hidden_states = mx.concatenate(all_real, axis=0)[None]
+        # The pooler always outputs default_output_length tokens (via
+        # _avg_pool_by_positions). Padding tokens are already zeroed by
+        # mask multiplication above, so we can take the full output.
+        hidden_states = masked_pooled[:, :self.default_output_length, :]
 
         if self.config.standardize:
             hidden_states = (hidden_states - self.std_bias) * self.std_scale

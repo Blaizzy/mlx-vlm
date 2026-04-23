@@ -400,7 +400,8 @@ def chunked_attention(
     return mx.concatenate(outputs, axis=2)  # (B, n_heads, L, head_dim)
 
 
-@mx.compile
+# Not compiled: @mx.compile caches a forward-only trace that produces
+# NaN gradients during vision encoder backward passes in training.
 def ensure_fused_sdpa(q, k, v, scale, mask=None):
     fused_dims = (64, 80, 128)  # supported by MLX's fused SDPA kernel
     d = q.shape[-1]
