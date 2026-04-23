@@ -831,8 +831,8 @@ def _build_structured_logits_processors(request, processor):
         return None
 
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    processor = build_json_schema_logits_processor(tokenizer, schema)
-    return [processor]
+    logits_processor = build_json_schema_logits_processor(tokenizer, schema)
+    return [logits_processor]
 
 
 def _count_thinking_tag_tokens(text: str) -> int:
