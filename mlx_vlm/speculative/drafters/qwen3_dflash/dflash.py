@@ -26,8 +26,8 @@ class DFlashAttention(nn.Module):
     def __call__(self, x: mx.array, x_ctx: mx.array, rope, cache: KVCache):
         B, L, _ = x.shape
         S = x_ctx.shape[1]
+
         # Project context and proposal separately so only context KV
-        # enters the cache (matches upstream z-lab implementation).
         queries = self.q_proj(x)
         ctx_keys = self.k_proj(x_ctx)
         ctx_values = self.v_proj(x_ctx)
