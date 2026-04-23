@@ -1459,7 +1459,7 @@ class GenerationBatch:
         stop_criteria,
         max_tokens: List[int],
         top_logprobs_k: int = 0,
-        token_context: Optional[List[mx.array]] = None,
+        token_context: Optional[List[List[int]]] = None,
         logits_processors: Optional[
             List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
         ] = None,
@@ -1474,8 +1474,8 @@ class GenerationBatch:
         self._num_tokens = [0] * len(uids)
         self.compute_logprobs = True
         self.top_logprobs_k = top_logprobs_k
-        self.token_context = token_context or []
         self.logits_processors = logits_processors or []
+        self.token_context = [list(ctx) for ctx in (token_context or [])]
 
         self._current_tokens = None
         self._current_lps = None
@@ -1506,19 +1506,26 @@ class GenerationBatch:
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits[:, -1, :]
 
-        if self.token_context:
-            self.token_context = [
-                mx.concatenate([self.token_context[i], mx.array([inputs[i]])])
-                for i in range(len(self.uids))
-            ]
-
         if self.logits_processors and any(self.logits_processors):
+            last_tokens = inputs.tolist()
+            if not self.token_context:
+                self.token_context = [[] for _ in self.uids]
+            for i, token in enumerate(last_tokens):
+                self.token_context[i].append(token)
+
             processed_logits = []
             for i in range(logits.shape[0]):
                 sample_logits = logits[i : i + 1]
                 processors = self.logits_processors[i] or []
                 for processor in processors:
-                    sample_logits = processor(self.token_context[i], sample_logits)
+                    if hasattr(processor, "process_last_token"):
+                        sample_logits = processor.process_last_token(
+                            last_tokens[i], sample_logits
+                        )
+                    else:
+                        sample_logits = processor(
+                            mx.array(self.token_context[i]), sample_logits
+                        )
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
@@ -1759,8 +1766,12 @@ class PromptProcessingBatch:
         self._total_prompt_tokens = sum(lengths)
 
         self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
-        self._token_context = [mx.array(ids) for ids in input_ids]
         self.logits_processors = logits_processors or []
+        self._token_context = (
+            [list(ids) for ids in input_ids]
+            if self.logits_processors and any(self.logits_processors)
+            else []
+        )
         self._inputs_embeds = inputs_embeds
         self._prompt_kwargs = prompt_kwargs
 
@@ -1818,7 +1829,9 @@ class PromptProcessingBatch:
                 sample_logits = logits[i : i + 1]
                 processors = self.logits_processors[i] or []
                 for processor in processors:
-                    sample_logits = processor(self._token_context[i], sample_logits)
+                    sample_logits = processor(
+                        mx.array(self._token_context[i]), sample_logits
+                    )
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
@@ -1834,7 +1847,7 @@ class PromptProcessingBatch:
             stop_criteria=stop_criteria,
             max_tokens=list(self.max_tokens),
             top_logprobs_k=top_logprobs_k,
-            token_context=list(self._token_context),
+            token_context=[list(ctx) for ctx in self._token_context],
             logits_processors=list(self.logits_processors),
         )
         gen_batch.compute_logprobs = compute_logprobs

@@ -37,29 +37,19 @@ class LLGuidanceLogitsProcessor:
             batch_size, self.llg_tokenizer.vocab_size
         )
 
-    def __call__(self, input_ids: mx.array, logits: mx.array) -> mx.array:
+    def _consume_tokens(self, last_tokens: list[int]) -> None:
+        for i, last_token in enumerate(last_tokens):
+            self.ll_matchers[i].consume_token(last_token)
+            error = self.ll_matchers[i].get_error()
+            if error:
+                raise ValueError(f"LLGuidance matcher error: {error}")
+
+    def _apply_bitmask(self, logits: mx.array) -> mx.array:
         import llguidance.mlx
         import llguidance.numpy
 
-        if input_ids.ndim == 1 and logits.ndim == 2 and logits.shape[0] == 1:
-            input_ids = mx.expand_dims(input_ids, 0)
-        elif logits.ndim == 1:
-            return self(mx.expand_dims(input_ids, 0), mx.expand_dims(logits, 0))[0]
-
-        batch_size = input_ids.shape[0]
-        if self.is_first_token:
-            self._setup(batch_size)
-            self.is_first_token = False
-        else:
-            for i in range(batch_size):
-                last_token = input_ids[i][-1].item()
-                self.ll_matchers[i].consume_token(last_token)
-                error = self.ll_matchers[i].get_error()
-                if error:
-                    raise ValueError(f"LLGuidance matcher error: {error}")
-
         biased_logits = []
-        for i in range(batch_size):
+        for i in range(logits.shape[0]):
             llguidance.numpy.fill_next_token_bitmask(
                 self.ll_matchers[i], self.bitmask, i
             )
@@ -70,6 +60,33 @@ class LLGuidanceLogitsProcessor:
         return mx.concatenate(
             [mx.array(logit)[None, :] for logit in biased_logits], axis=0
         )
+
+    def process_last_token(self, last_token: int, logits: mx.array) -> mx.array:
+        if logits.ndim == 1:
+            return self.process_last_token(last_token, mx.expand_dims(logits, 0))[0]
+
+        if self.is_first_token:
+            self._setup(logits.shape[0])
+            self.is_first_token = False
+        else:
+            self._consume_tokens([last_token])
+
+        return self._apply_bitmask(logits)
+
+    def __call__(self, input_ids: mx.array, logits: mx.array) -> mx.array:
+        if input_ids.ndim == 1 and logits.ndim == 2 and logits.shape[0] == 1:
+            input_ids = mx.expand_dims(input_ids, 0)
+        elif logits.ndim == 1:
+            return self(mx.expand_dims(input_ids, 0), mx.expand_dims(logits, 0))[0]
+
+        batch_size = input_ids.shape[0]
+        if self.is_first_token:
+            self._setup(batch_size)
+            self.is_first_token = False
+        else:
+            self._consume_tokens(input_ids[:, -1].tolist())
+
+        return self._apply_bitmask(logits)
 
 
 def _serialize_schema(schema: str | dict[str, Any]) -> str:
