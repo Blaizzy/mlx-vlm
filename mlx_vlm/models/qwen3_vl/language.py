@@ -281,10 +281,7 @@ class Qwen3VLModel(nn.Module):
         visual_pos_masks: mx.array,
         visual_embeds: mx.array,
     ):
-        # ``visual_embeds`` is the concatenation of visual tokens across the
-        # whole batch; slice per-sample so the scatter-add shape matches each
-        # sample's visual-position count. Without this, bs>1 or multi-image
-        # inputs crash with "Shapes (N,D) and (M,D) cannot be broadcast".
+
         batch_size = hidden_states.shape[0]
 
         updated_batches = []

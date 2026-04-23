@@ -151,7 +151,9 @@ class MllamaTextSelfAttention(nn.Module):
                 offset = cache.offset
                 if isinstance(offset, mx.array):
                     offset = (
-                        int(offset.max().item()) if offset.size > 1 else int(offset.item())
+                        int(offset.max().item())
+                        if offset.size > 1
+                        else int(offset.item())
                     )
             query_states = self.rope(query_states, offset=offset)
             key_states = self.rope(key_states, offset=offset)

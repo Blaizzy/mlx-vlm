@@ -207,8 +207,14 @@ class Attention(nn.Module):
                 offset = cache.offset
             else:
                 offset = cache.offset
-                offset_scalar = int(offset) if isinstance(offset, int) else (
-                    int(offset.max().item()) if offset.ndim > 0 else int(offset.item())
+                offset_scalar = (
+                    int(offset)
+                    if isinstance(offset, int)
+                    else (
+                        int(offset.max().item())
+                        if offset.ndim > 0
+                        else int(offset.item())
+                    )
                 )
             kv_seq_len += offset_scalar
         else:

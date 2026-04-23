@@ -699,7 +699,6 @@ class LanguageModel(nn.Module):
             self._rope_deltas = None
             self._position_ids = None
 
-
         cache_offset = 0
         cache_offsets = None  # per-element offsets for batched caches
         if cache and cache[self.model.fa_idx] is not None:
