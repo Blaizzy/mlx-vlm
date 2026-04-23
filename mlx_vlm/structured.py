@@ -5,7 +5,12 @@ import mlx.core as mx
 
 
 class LLGuidanceLogitsProcessor:
-    """MLX logits processor backed by llguidance."""
+    """MLX logits processor backed by llguidance.
+
+    Accepts a single sequence or a batch. Expected shapes are input_ids as
+    (seq_len,) or (batch, seq_len), and logits as (vocab,), (1, vocab), or
+    (batch, vocab).
+    """
 
     def __init__(self, grammar: str, llg_tokenizer) -> None:
         self.grammar = grammar

@@ -4,6 +4,7 @@ import contextlib
 import functools
 import json
 import time
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
@@ -2323,6 +2324,19 @@ def batch_generate(
     return response
 
 
+def _clone_or_share_logits_processor(processor):
+    if hasattr(processor, "clone"):
+        return processor.clone()
+    warnings.warn(
+        "Sharing logits processor across batch entries because it does not "
+        "implement clone(). Stateful logits processors should implement clone() "
+        "to avoid shared state across sequences.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return processor
+
+
 def _generate_batch(
     model,
     processor,
@@ -2404,7 +2418,11 @@ def _generate_batch(
         callable(processor) for processor in logits_processors
     ):
         logits_processors = [
-            [p.clone() for p in logits_processors] for _ in range(batch_size)
+            [
+                _clone_or_share_logits_processor(p)
+                for p in logits_processors
+            ]
+            for _ in range(batch_size)
         ]
 
     uids = gen.insert(
